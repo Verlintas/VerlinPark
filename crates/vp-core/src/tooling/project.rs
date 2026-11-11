@@ -17,7 +17,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::tools::{
-    AgentTool, ToolContext, ToolOutput, run_sandboxed_shell_captured, safe_existing_path, truncate,
+    AgentTool, ToolContext, ToolOutput, run_sandboxed_shell_captured, safe_existing_path,
 };
 
 const MAX_SCAN_FILES: usize = 30_000;
@@ -134,7 +134,9 @@ impl AgentTool for ProjectProfile {
             }
         );
         let structured = serde_json::to_value(&profile).unwrap_or_else(|_| json!({}));
-        Ok(ToolOutput::ok_structured(truncate(text), structured))
+        Ok(ToolOutput::ok_structured_preserving(
+            text, structured, false,
+        ))
     }
 }
 
@@ -442,12 +444,7 @@ impl AgentTool for RunProjectTask {
             "affected_tests": affected,
             "next_actions": next_actions,
         });
-        let text = truncate(text);
-        if ok {
-            Ok(ToolOutput::ok_structured(text, structured))
-        } else {
-            Ok(ToolOutput::error_structured(text, structured))
-        }
+        Ok(ToolOutput::ok_structured_preserving(text, structured, !ok))
     }
 }
 

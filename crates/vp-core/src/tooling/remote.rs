@@ -452,8 +452,8 @@ impl AgentTool for RemoteExec {
             text.push_str("--- stderr ---\n");
             text.push_str(&result.stderr);
         }
-        Ok(ToolOutput::ok_structured(
-            truncate(text),
+        Ok(ToolOutput::ok_structured_preserving(
+            text,
             json!({
                 "remote": true,
                 "exit_code": result.exit_code,
@@ -466,6 +466,7 @@ impl AgentTool for RemoteExec {
                 "duration_ms": result.duration_ms,
                 "replayed": result.replayed,
             }),
+            false,
         ))
     }
 }

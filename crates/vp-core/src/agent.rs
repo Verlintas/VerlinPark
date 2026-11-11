@@ -15,11 +15,11 @@ use tokio::sync::{oneshot, watch};
 use tokio::time::timeout;
 use vp_protocol::types::{
     AgentInfo, AgentProbeResult, ApprovalMode, CapacityInfo, ConfigureAgentParams,
-    ContextCompactionSummary, ContextMeasurement, IntakeDispatchResult, IntakeTask,
-    MergeQueueEntry, OrchestrationRecovery, PlanDepartment, PlanRevisionDetailResult, PlanTask,
-    Program, ProgramMilestone, ProgramTickResult, Project, ReviseTeamPlanResult, RoleModels,
-    RunBudgetSnapshot, ScheduledTask, SchedulerProjectStatus, SchedulerStatusResult, Session,
-    SessionCheckpoint, SessionCheckpointDiffResult, SessionCheckpointRestoreResult,
+    ContextCompactionSummary, ContextMeasurement, ContextStructuredState, IntakeDispatchResult,
+    IntakeTask, MergeQueueEntry, OrchestrationRecovery, PlanDepartment, PlanRevisionDetailResult,
+    PlanTask, Program, ProgramMilestone, ProgramTickResult, Project, ReviseTeamPlanResult,
+    RoleModels, RunBudgetSnapshot, ScheduledTask, SchedulerProjectStatus, SchedulerStatusResult,
+    Session, SessionCheckpoint, SessionCheckpointDiffResult, SessionCheckpointRestoreResult,
     SessionCompactResult, SessionForkResult, SessionMergeForkResult, SessionRunCancelResult,
     SessionRunResumeResult, Skill, SourceCitation, SourceSearchHit, StallRecoveryMode,
     StoredMessage, TeamPlan, TodoItem,
@@ -86,6 +86,27 @@ fn compact_keep_messages() -> usize {
         .and_then(|value| value.parse().ok())
         .unwrap_or(8)
         .clamp(2, 100)
+}
+
+/// Token budget for the retained tail. `0` disables the token constraint and
+/// leaves message-count selection in charge.
+fn compact_keep_tokens() -> u64 {
+    env::var("VERLINPARK_COMPACT_KEEP_TOKENS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(15_000)
+        .min(2_000_000)
+}
+
+/// Fraction of the compaction threshold at which a summary snapshot may be
+/// prepared in the run loop. It is never a second agent run.
+fn compact_prepare_ratio() -> f64 {
+    env::var("VERLINPARK_COMPACT_PREPARE_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.6)
+        .clamp(0.3, 0.95)
 }
 
 fn auto_expand_workers() -> bool {
@@ -161,6 +182,12 @@ pub struct AgentConfig {
     pub compact_after_tokens: u64,
     /// Number of recent messages to retain outside the compacted summary.
     pub compact_keep_messages: usize,
+    /// Approximate token budget for the retained tail. The deterministic cut
+    /// never splits a message and always keeps at least one message.
+    pub compact_keep_tokens: u64,
+    /// Fraction of the compaction threshold at which a prepared summary may
+    /// be built. The swap still happens synchronously at the threshold.
+    pub compact_prepare_ratio: f64,
     /// Base model context window in tokens. Zero disables automatic context
     /// management. Per-role role_models can override this.
     pub context_window: u64,
@@ -966,6 +993,7 @@ impl AgentRole {
                         | "read_image"
                         | "read_document"
                         | "data_query"
+                        | "read_tool_output"
                         | "remote_read"
                         | "remote_list"
                         | "remote_git"
@@ -994,6 +1022,7 @@ impl AgentRole {
                         | "read_image"
                         | "read_document"
                         | "data_query"
+                        | "read_tool_output"
                         | "shell"
                         | "run_project_task"
                         | "code_diagnostics"
@@ -1028,6 +1057,7 @@ impl AgentRole {
                     | "list_sources"
                     | "search_sources"
                     | "read_source"
+                    | "read_tool_output"
                     | "recall"
                     | "team_status"
                     | "remote_read"
@@ -1063,6 +1093,7 @@ impl AgentRole {
                         | "read_image"
                         | "read_document"
                         | "data_query"
+                        | "read_tool_output"
                         | "code_diagnostics"
                         | "process"
                         | "wait_for"
@@ -1099,6 +1130,7 @@ impl AgentRole {
                         | "read_image"
                         | "read_document"
                         | "data_query"
+                        | "read_tool_output"
                         | "web_search"
                         | "local_http"
                         | "remote_read"
@@ -1130,6 +1162,7 @@ impl AgentRole {
                         | "read_image"
                         | "read_document"
                         | "data_query"
+                        | "read_tool_output"
                         | "code_diagnostics"
                         | "process"
                         | "wait_for"
@@ -1160,6 +1193,7 @@ impl AgentRole {
                         | "read_image"
                         | "read_document"
                         | "data_query"
+                        | "read_tool_output"
                         | "remote_read"
                         | "remote_list"
                         | "remote_git"
@@ -1945,6 +1979,8 @@ impl AgentService {
                     .clamp(10, 86400),
                 compact_after_tokens: compact_after_tokens(),
                 compact_keep_messages: compact_keep_messages(),
+                compact_keep_tokens: compact_keep_tokens(),
+                compact_prepare_ratio: compact_prepare_ratio(),
                 context_window: context_window(),
             },
         )
@@ -2055,6 +2091,8 @@ impl AgentService {
                 .clamp(10, 86400),
             compact_after_tokens: compact_after_tokens(),
             compact_keep_messages: compact_keep_messages(),
+            compact_keep_tokens: compact_keep_tokens(),
+            compact_prepare_ratio: compact_prepare_ratio(),
             context_window: params
                 .context_window
                 .map(|value| value.min(10_000_000))
@@ -6025,6 +6063,14 @@ impl AgentService {
             if budget.exhausted() {
                 anyhow::bail!("session budget is exhausted; compaction needs provider tokens");
             }
+            let prefix_hash = crate::sha256_hex(
+                format!(
+                    "{system}\n{}",
+                    serde_json::to_string(&tools).unwrap_or_default()
+                )
+                .as_bytes(),
+            );
+            let mut compaction_runtime = CompactionRuntime::default();
             let changed = compact_context_if_needed(
                 &self.engine,
                 &config,
@@ -6039,6 +6085,9 @@ impl AgentService {
                 system_tokens.saturating_add(tool_tokens),
                 calibration.factor,
                 true,
+                &prefix_hash,
+                config.compact_prepare_ratio,
+                &mut compaction_runtime,
                 context_strategy(spec.role),
             )
             .await?;
@@ -9491,14 +9540,481 @@ async fn collect_compaction_completion(
     Ok((text, usage))
 }
 
-fn safe_context_cut(conversation: &[ChatMessage], keep: usize, floor: usize) -> Option<usize> {
+fn estimate_message_tokens(message: &ChatMessage) -> u64 {
+    let tool_tokens = message
+        .tool_calls
+        .as_ref()
+        .and_then(|calls| serde_json::to_string(calls).ok())
+        .map(|calls| estimate_context_tokens(&calls))
+        .unwrap_or(0);
+    estimate_context_tokens(&message.content).saturating_add(tool_tokens)
+}
+
+/// Deterministic token-aware cut. The retained tail must satisfy both the
+/// message-count window and the token window. `keep_tokens == 0` disables the
+/// token constraint and preserves the legacy message-count behavior.
+fn safe_context_cut_with_tokens(
+    conversation: &[ChatMessage],
+    keep_messages: usize,
+    keep_tokens: u64,
+    floor: usize,
+) -> Option<usize> {
     let len = conversation.len();
-    if len <= keep.saturating_add(floor).saturating_add(1) {
+    if len <= floor.saturating_add(2) {
         return None;
     }
-    let min_cut = len.saturating_sub(keep).max(floor.saturating_add(1));
-    (min_cut..len.saturating_sub(1))
+    let keep_messages = keep_messages.max(2);
+    let count_cut = len
+        .saturating_sub(keep_messages)
+        .max(floor.saturating_add(1));
+    let token_cut = if keep_tokens == 0 {
+        floor.saturating_add(1)
+    } else {
+        let mut tokens = 0u64;
+        let mut index = len;
+        while index > floor + 1 {
+            let token = estimate_message_tokens(&conversation[index - 1]);
+            if tokens.saturating_add(token) > keep_tokens {
+                break;
+            }
+            tokens = tokens.saturating_add(token);
+            index -= 1;
+        }
+        index.max(floor.saturating_add(1))
+    };
+    let mut proposed = count_cut.max(token_cut);
+    if proposed >= len {
+        proposed = len.saturating_sub(1);
+    }
+    if proposed <= floor {
+        proposed = floor.saturating_add(1);
+    }
+    (proposed..len.saturating_sub(1))
         .find(|index| matches!(conversation[*index].role.as_str(), "user" | "assistant"))
+}
+
+#[cfg(test)]
+fn safe_context_cut(conversation: &[ChatMessage], keep: usize, floor: usize) -> Option<usize> {
+    safe_context_cut_with_tokens(conversation, keep, 0, floor)
+}
+
+const STRUCTURED_STATE_START: &str = "[structured task state - authoritative]";
+const STRUCTURED_STATE_END: &str = "[/structured task state]";
+
+/// Deterministic state derived from the stored TeamPlan and task scheduler
+/// rows. This block is authoritative; the model summary is advisory free text.
+async fn load_compaction_structured_state(
+    engine: &Engine,
+    session: &Session,
+    spec: &AgentSpec,
+) -> ContextStructuredState {
+    let plan = engine.get_team_plan(&session.id).await.ok().flatten();
+    let store = engine.store().clone();
+    let session_id = session.id.clone();
+    let tasks = tokio::task::spawn_blocking(move || store.list_plan_tasks(None, Some(&session_id)))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    let store = engine.store().clone();
+    let session_id = session.id.clone();
+    let plan_revision = tokio::task::spawn_blocking(move || store.plan_revision_count(&session_id))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(0);
+    let statuses = tasks
+        .iter()
+        .map(|task| (task.task_id.clone(), task.status.clone()))
+        .collect::<HashMap<_, _>>();
+    let active_id = spec
+        .task_id
+        .clone()
+        .or_else(|| {
+            tasks
+                .iter()
+                .filter(|task| {
+                    matches!(
+                        task.status.as_str(),
+                        "running" | "claimed" | "paused" | "cancelling" | "pausing"
+                    )
+                })
+                .min_by(|left, right| {
+                    left.plan_seq
+                        .cmp(&right.plan_seq)
+                        .then_with(|| left.task_id.cmp(&right.task_id))
+                })
+                .map(|task| task.task_id.clone())
+        })
+        .or_else(|| {
+            plan.as_ref().and_then(|plan| {
+                plan.tasks
+                    .iter()
+                    .find(|task| {
+                        !matches!(
+                            statuses.get(&task.id).map(String::as_str),
+                            Some("completed" | "failed" | "blocked" | "cancelled" | "skipped")
+                        )
+                    })
+                    .map(|task| task.id.clone())
+            })
+        });
+    let active_task = active_id.as_ref().and_then(|active_id| {
+        plan.as_ref()
+            .and_then(|plan| plan.tasks.iter().find(|task| &task.id == active_id))
+    });
+    let mut completed = tasks
+        .iter()
+        .filter(|task| task.status == "completed")
+        .collect::<Vec<_>>();
+    completed.sort_by(|left, right| {
+        right
+            .finished_at
+            .cmp(&left.finished_at)
+            .then_with(|| left.task_id.cmp(&right.task_id))
+    });
+    let mut recent_completed_task_ids = Vec::new();
+    for task in completed {
+        if recent_completed_task_ids.len() >= 8 {
+            break;
+        }
+        if !recent_completed_task_ids.contains(&task.task_id) {
+            recent_completed_task_ids.push(task.task_id.clone());
+        }
+    }
+    ContextStructuredState {
+        goal: plan
+            .as_ref()
+            .map(|plan| plan.goal.clone())
+            .filter(|goal| !goal.trim().is_empty())
+            .unwrap_or_else(|| session.goal.clone()),
+        plan_revision,
+        active_task_id: active_id,
+        active_task_title: active_task.map(|task| task.title.clone()),
+        active_task_department: active_task.map(|task| task.department.clone()),
+        active_task_acceptance: active_task
+            .map(|task| task.acceptance.clone())
+            .unwrap_or_default(),
+        active_task_write_scope: active_task
+            .map(|task| task.write_scope.clone())
+            .unwrap_or_default(),
+        recent_completed_task_ids,
+        generated_at: vp_protocol::now_rfc3339(),
+    }
+}
+
+fn structured_state_line(value: &str) -> String {
+    value.replace(['\n', '\r'], " ").trim().to_string()
+}
+
+fn render_structured_state(state: &ContextStructuredState) -> String {
+    let mut rendered = String::new();
+    rendered.push_str(STRUCTURED_STATE_START);
+    rendered.push('\n');
+    rendered.push_str(&format!("Goal: {}\n", structured_state_line(&state.goal)));
+    rendered.push_str(&format!("Plan revision: {}\n", state.plan_revision));
+    match &state.active_task_id {
+        Some(task_id) => {
+            rendered.push_str(&format!(
+                "Active task: {task_id} - {}\n",
+                structured_state_line(
+                    state
+                        .active_task_title
+                        .as_deref()
+                        .unwrap_or("(untitled task)")
+                )
+            ));
+            rendered.push_str(&format!(
+                "Department: {}\n",
+                structured_state_line(state.active_task_department.as_deref().unwrap_or("(none)"))
+            ));
+            if state.active_task_acceptance.is_empty() {
+                rendered.push_str("Acceptance: (none recorded)\n");
+            } else {
+                rendered.push_str("Acceptance:\n");
+                for item in &state.active_task_acceptance {
+                    rendered.push_str(&format!("- {}\n", structured_state_line(item)));
+                }
+            }
+            if state.active_task_write_scope.is_empty() {
+                rendered.push_str("Write scope: (none recorded)\n");
+            } else {
+                rendered.push_str("Write scope:\n");
+                for item in &state.active_task_write_scope {
+                    rendered.push_str(&format!("- {}\n", structured_state_line(item)));
+                }
+            }
+        }
+        None => {
+            rendered.push_str("Active task: (none)\n");
+        }
+    }
+    if state.recent_completed_task_ids.is_empty() {
+        rendered.push_str("Recently completed tasks: (none)\n");
+    } else {
+        rendered.push_str(&format!(
+            "Recently completed tasks: {}\n",
+            state.recent_completed_task_ids.join(", ")
+        ));
+    }
+    rendered.push_str(&format!("Generated at: {}\n", state.generated_at));
+    rendered.push_str(STRUCTURED_STATE_END);
+    rendered
+}
+
+/// Replace a previous structured block with the current one while preserving
+/// the surrounding model summary. If no block exists, prepend one.
+fn refresh_structured_state(existing: &str, state_block: &str) -> String {
+    if let Some(start) = existing.find(STRUCTURED_STATE_START)
+        && let Some(relative_end) = existing[start..].find(STRUCTURED_STATE_END)
+    {
+        let end = start + relative_end + STRUCTURED_STATE_END.len();
+        let mut refreshed = String::new();
+        refreshed.push_str(&existing[..start]);
+        refreshed.push_str(state_block);
+        refreshed.push_str(&existing[end..]);
+        return refreshed;
+    }
+    format!("{state_block}\n\n{existing}")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedSummaryKey {
+    provider: String,
+    model: String,
+    prefix_hash: String,
+    plan_revision: u32,
+    cut: usize,
+    cursor_hash: String,
+}
+
+impl PreparedSummaryKey {
+    fn stable_id(&self) -> String {
+        format!(
+            "{}|{}|{}|{}|{}|{}",
+            self.provider,
+            self.model,
+            self.prefix_hash,
+            self.plan_revision,
+            self.cut,
+            self.cursor_hash
+        )
+    }
+}
+
+#[derive(Clone)]
+struct PreparedSummary {
+    key: PreparedSummaryKey,
+    summary: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    estimated_usage: bool,
+}
+
+#[derive(Default)]
+struct CompactionRuntime {
+    prepared: Option<PreparedSummary>,
+    failed_prepare_keys: HashSet<String>,
+}
+
+impl CompactionRuntime {
+    /// Remove and return the prepared summary only when every key component
+    /// still matches the live run and the exact message prefix is unchanged.
+    fn take_reusable(
+        &mut self,
+        config: &AgentConfig,
+        spec: &AgentSpec,
+        prefix_hash: &str,
+        plan_revision: u32,
+        conversation: &[ChatMessage],
+    ) -> (Option<PreparedSummary>, bool) {
+        let was_present = self.prepared.is_some();
+        match self.prepared.take() {
+            Some(prepared)
+                if prepared.key.provider == config.provider_name
+                    && prepared.key.model == model_for(config, spec.role)
+                    && prepared.key.prefix_hash == prefix_hash
+                    && prepared.key.plan_revision == plan_revision
+                    && prepared.key.cut <= conversation.len()
+                    && message_cursor_hash(conversation, prepared.key.cut)
+                        == prepared.key.cursor_hash =>
+            {
+                (Some(prepared), true)
+            }
+            Some(_) => (None, was_present),
+            None => (None, false),
+        }
+    }
+}
+
+fn message_cursor_hash(messages: &[ChatMessage], cut: usize) -> String {
+    let mut material = String::new();
+    for message in messages.iter().take(cut) {
+        material.push_str(&message.role);
+        material.push('\u{1f}');
+        material.push_str(&message.content.len().to_string());
+        material.push('\u{1f}');
+        material.push_str(&message.content);
+        material.push('\u{1f}');
+        if let Some(calls) = &message.tool_calls {
+            material.push_str(&serde_json::to_string(calls).unwrap_or_default());
+        }
+        material.push('\u{1f}');
+        if let Some(call_id) = &message.tool_call_id {
+            material.push_str(call_id);
+        }
+        material.push('\u{1e}');
+    }
+    crate::sha256_hex(material.as_bytes())
+}
+
+fn prepared_summary_key(
+    config: &AgentConfig,
+    spec: &AgentSpec,
+    prefix_hash: &str,
+    plan_revision: u32,
+    conversation: &[ChatMessage],
+    cut: usize,
+) -> PreparedSummaryKey {
+    PreparedSummaryKey {
+        provider: config.provider_name.clone(),
+        model: model_for(config, spec.role),
+        prefix_hash: prefix_hash.to_string(),
+        plan_revision,
+        cut,
+        cursor_hash: message_cursor_hash(conversation, cut),
+    }
+}
+
+fn compaction_transcript_budget(config: &AgentConfig, spec: &AgentSpec, calibration: f64) -> u64 {
+    let summary_window = context_window_for(config, spec.role);
+    if summary_window > 0 {
+        let budget = summary_window
+            .saturating_sub(1024)
+            .saturating_sub(estimate_context_tokens(COMPACTION_SYSTEM_PROMPT))
+            .saturating_sub(512)
+            .max(512);
+        if calibration > 1.0 {
+            (budget as f64 / calibration).round().max(512.0) as u64
+        } else {
+            budget
+        }
+    } else {
+        60_000
+    }
+}
+
+struct SummaryCall {
+    summary: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    estimated: bool,
+}
+
+/// Run exactly one summarizer call under the session budget. `Ok(None)` means
+/// a token reservation could not be granted; the caller falls back to a rolling
+/// trim. This never starts a second agent run.
+#[allow(clippy::too_many_arguments)]
+async fn run_compaction_summary(
+    engine: &Engine,
+    config: &AgentConfig,
+    session: &Session,
+    spec: &AgentSpec,
+    budget: &SessionBudget,
+    control: &RunControl,
+    transcript: String,
+) -> Result<Option<SummaryCall>> {
+    if transcript.trim().is_empty() {
+        return Ok(None);
+    }
+    let request = ChatRequest {
+        model: model_for(config, spec.role),
+        messages: vec![ChatMessage::user(transcript)],
+        system: Some(COMPACTION_SYSTEM_PROMPT.to_string()),
+        system_stable_prefix: Some(COMPACTION_SYSTEM_PROMPT.to_string()),
+        max_tokens: Some(1024),
+        temperature: Some(0.2),
+        tools: Vec::new(),
+    };
+    let reservation = budget
+        .limit
+        .is_some()
+        .then(|| budget.reserve_tokens(estimate_request_tokens(&request).saturating_add(1024)))
+        .flatten();
+    if !(budget.is_unlimited() || budget.limit.is_none() || reservation.is_some()) {
+        return Ok(None);
+    }
+    let outcome = collect_compaction_completion(
+        config.provider.as_ref(),
+        &request,
+        Duration::from_secs(config.provider_idle_timeout_secs),
+        control,
+    )
+    .await;
+    let (summary, usage) = match outcome {
+        Ok(value) => value,
+        Err(error) => {
+            drop(reservation);
+            return Err(error);
+        }
+    };
+    let summary = summary.trim();
+    if summary.is_empty() {
+        drop(reservation);
+        return Ok(None);
+    }
+    let (input_tokens, output_tokens, cache_read, cache_write, estimated_usage) =
+        if !usage.is_empty() {
+            (
+                usage.input,
+                usage.output,
+                usage.cache_read,
+                usage.cache_write,
+                false,
+            )
+        } else {
+            (
+                estimate_request_tokens(&request),
+                estimate_text_tokens(summary),
+                0,
+                0,
+                true,
+            )
+        };
+    let cost = usage_cost(
+        input_tokens,
+        output_tokens,
+        cache_read,
+        cache_write,
+        role_prices(config, spec.role),
+    );
+    engine
+        .record_agent_usage_with_cache(
+            &session.id,
+            &spec.id,
+            &spec.name,
+            "compaction",
+            spec.task_id.clone(),
+            spec.department.clone(),
+            &request.model,
+            input_tokens,
+            output_tokens,
+            cache_read,
+            cache_write,
+            estimated_usage,
+            cost,
+        )
+        .await?;
+    if let Some(reservation) = reservation {
+        let _ = reservation.settle(input_tokens.saturating_add(output_tokens));
+    }
+    budget.add_cost(cost);
+    Ok(Some(SummaryCall {
+        summary: summary.to_string(),
+        input_tokens,
+        output_tokens,
+        estimated: estimated_usage,
+    }))
 }
 
 /// Keep the active context under the model window. The primary strategy is a
@@ -9506,6 +10022,12 @@ fn safe_context_cut(conversation: &[ChatMessage], keep: usize, floor: usize) -> 
 /// fails, or the summarized context is still above the hard limit, older
 /// messages are dropped at safe user/assistant boundaries as a rolling-window
 /// fallback. Original messages remain in SQLite for search and audit.
+///
+/// A prepared summary is a bounded in-run cache, not a background agent run.
+/// It is prepared at `prepare_ratio * compact_threshold`, keyed by provider,
+/// model, stable prefix hash, plan revision, and the exact message-prefix
+/// cursor. It is reused only if every key component still matches; the swap
+/// itself is synchronous.
 #[allow(clippy::too_many_arguments)]
 async fn compact_context_if_needed(
     engine: &Engine,
@@ -9521,22 +10043,25 @@ async fn compact_context_if_needed(
     base_tokens: u64,
     calibration: f64,
     force: bool,
+    prefix_hash: &str,
+    prepare_ratio: f64,
+    runtime: &mut CompactionRuntime,
     strategy: ContextStrategy,
 ) -> Result<bool> {
+    let started = Instant::now();
     if budget.exhausted() {
         return Ok(false);
     }
     if !force && compact_threshold == 0 && hard_limit == u64::MAX {
         return Ok(false);
     }
-    let keep = config.compact_keep_messages.max(2);
-    if conversation.len() <= keep {
+    let keep_messages = config.compact_keep_messages.max(2);
+    let keep_tokens = config.compact_keep_tokens;
+    if conversation.len() <= keep_messages {
         return Ok(false);
     }
     // Thresholds and the hard limit describe the whole active request, so the
-    // comparison must include the system prompt and tool schemas too. Using
-    // messages alone could defer compaction until the provider request is
-    // already over the model window.
+    // comparison must include the system prompt and tool schemas too.
     let estimated_before = calibrate_context_tokens(
         estimate_messages_tokens(conversation).saturating_add(base_tokens),
         calibration,
@@ -9547,14 +10072,98 @@ async fn compact_context_if_needed(
         }
         ContextStrategy::Trim => estimated_before > hard_limit,
     };
+    let prepare_threshold = if compact_threshold > 0 {
+        (compact_threshold as f64 * prepare_ratio.clamp(0.3, 0.95)).round() as u64
+    } else {
+        0
+    };
     if !force && !triggered {
+        if strategy == ContextStrategy::Summarize
+            && prepare_threshold > 0
+            && estimated_before >= prepare_threshold
+            && let Some(cut) =
+                safe_context_cut_with_tokens(conversation, keep_messages, keep_tokens, 0)
+        {
+            let state = load_compaction_structured_state(engine, session, spec).await;
+            let key = prepared_summary_key(
+                config,
+                spec,
+                prefix_hash,
+                state.plan_revision,
+                conversation,
+                cut,
+            );
+            let already_valid = runtime
+                .prepared
+                .as_ref()
+                .is_some_and(|prepared| prepared.key == key);
+            if !already_valid && !runtime.failed_prepare_keys.contains(&key.stable_id()) {
+                let transcript = compaction_transcript(
+                    &conversation[..cut],
+                    compaction_transcript_budget(config, spec, calibration),
+                );
+                match run_compaction_summary(
+                    engine, config, session, spec, budget, control, transcript,
+                )
+                .await
+                {
+                    Ok(Some(call)) => {
+                        runtime.prepared = Some(PreparedSummary {
+                            key: key.clone(),
+                            summary: call.summary,
+                            input_tokens: call.input_tokens,
+                            output_tokens: call.output_tokens,
+                            estimated_usage: call.estimated,
+                        });
+                        emit(
+                            engine,
+                            &session.id,
+                            spec,
+                            "context.compaction_prepared",
+                            serde_json::json!({
+                                "cut_messages": cut,
+                                "plan_revision": key.plan_revision,
+                                "model": key.model,
+                                "prefix_hash": key.prefix_hash,
+                                "cursor_hash": key.cursor_hash,
+                                "compaction_threshold": compact_threshold,
+                                "prepare_threshold": prepare_threshold,
+                                "input_tokens": call.input_tokens,
+                                "output_tokens": call.output_tokens,
+                                "estimated": call.estimated,
+                            }),
+                        )
+                        .await?;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        runtime.failed_prepare_keys.insert(key.stable_id());
+                        emit(
+                            engine,
+                            &session.id,
+                            spec,
+                            "context.compaction_prepare_failed",
+                            serde_json::json!({
+                                "cut_messages": cut,
+                                "error": truncate(&format!("{error:#}")),
+                            }),
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
         return Ok(false);
     }
+
+    let state = load_compaction_structured_state(engine, session, spec).await;
     let mut estimated = estimated_before;
     let mut summarized_messages = 0usize;
     let mut dropped_messages = 0usize;
-    // Preserve a summary already loaded at the head of the conversation. A
-    // trim-only pass must carry it into the new event, or resume would lose it.
+    let mut has_model_summary = conversation
+        .first()
+        .is_some_and(|message| message.content.starts_with("Earlier conversation summary"));
+    // Preserve a summary already loaded at the head of the conversation.
     let mut summary_text = if conversation_ids.first().is_some_and(Option::is_none) {
         conversation.first().map(|message| message.content.clone())
     } else {
@@ -9563,142 +10172,60 @@ async fn compact_context_if_needed(
     let mut through_id: Option<String> = None;
     let mut usage_tokens = (0u64, 0u64);
     let mut usage_estimated = true;
+    let mut background_reuse = false;
+    let mut fallback_to_sync = false;
 
     if strategy == ContextStrategy::Summarize
         && (force || (compact_threshold > 0 && estimated >= compact_threshold))
-        && let Some(cut) = safe_context_cut(conversation, keep, 0)
-        && let Some(through) = (if conversation_ids.is_empty() {
-            Some(None)
-        } else {
-            conversation_ids
-                .get(cut.saturating_sub(1))
-                .cloned()
-                .flatten()
-                .map(Some)
-        })
     {
-        let summary_window = context_window_for(config, spec.role);
-        let summary_budget = if summary_window > 0 {
-            let budget = summary_window
-                .saturating_sub(1024)
-                .saturating_sub(estimate_context_tokens(COMPACTION_SYSTEM_PROMPT))
-                .saturating_sub(512)
-                .max(512);
-            // If provider usage showed that the heuristic undercounts, leave
-            // proportionally more room for the summary request too.
-            if calibration > 1.0 {
-                (budget as f64 / calibration).round().max(512.0) as u64
+        // A prepared summary covers a fixed prefix. Newer messages appended
+        // after it stay in the retained tail, so reuse does not require the
+        // current ideal cut to equal the prepared cut.
+        let (prepared, had_prepared) =
+            runtime.take_reusable(config, spec, prefix_hash, state.plan_revision, conversation);
+        let cut = prepared
+            .as_ref()
+            .map(|prepared| prepared.key.cut)
+            .or_else(|| safe_context_cut_with_tokens(conversation, keep_messages, keep_tokens, 0));
+        fallback_to_sync = had_prepared && prepared.is_none();
+        if let Some(cut) = cut
+            && let Some(through) = if conversation_ids.is_empty() {
+                Some(None)
             } else {
-                budget
+                conversation_ids
+                    .get(cut.saturating_sub(1))
+                    .cloned()
+                    .flatten()
+                    .map(Some)
             }
-        } else {
-            60_000
-        };
-        let transcript = compaction_transcript(&conversation[..cut], summary_budget);
-        if !transcript.trim().is_empty() {
-            let request = ChatRequest {
-                model: model_for(config, spec.role),
-                messages: vec![ChatMessage::user(transcript)],
-                system: Some(COMPACTION_SYSTEM_PROMPT.to_string()),
-                system_stable_prefix: Some(COMPACTION_SYSTEM_PROMPT.to_string()),
-                max_tokens: Some(1024),
-                temperature: Some(0.2),
-                tools: Vec::new(),
-            };
-            let reservation = budget
-                .limit
-                .is_some()
-                .then(|| {
-                    budget.reserve_tokens(estimate_request_tokens(&request).saturating_add(1024))
-                })
-                .flatten();
-            // When a token limit exists but the reservation cannot be granted,
-            // skip the summary call; the rolling trim below still protects the
-            // provider context and keeps the run alive.
-            if budget.is_unlimited() || budget.limit.is_none() || reservation.is_some() {
-                let outcome = collect_compaction_completion(
-                    config.provider.as_ref(),
-                    &request,
-                    Duration::from_secs(config.provider_idle_timeout_secs),
-                    control,
+        {
+            let state_block = render_structured_state(&state);
+            let mut model_summary: Option<String> = None;
+            let mut call_usage = None;
+            if let Some(prepared) = prepared {
+                model_summary = Some(prepared.summary);
+                call_usage = Some((
+                    prepared.input_tokens,
+                    prepared.output_tokens,
+                    prepared.estimated_usage,
+                ));
+                background_reuse = true;
+            } else {
+                let transcript = compaction_transcript(
+                    &conversation[..cut],
+                    compaction_transcript_budget(config, spec, calibration),
+                );
+                match run_compaction_summary(
+                    engine, config, session, spec, budget, control, transcript,
                 )
-                .await;
-                match outcome {
-                    Ok((summary, usage)) => {
-                        let summary = summary.trim();
-                        if !summary.is_empty() {
-                            let (
-                                input_tokens,
-                                output_tokens,
-                                cache_read,
-                                cache_write,
-                                estimated_usage,
-                            ) = if !usage.is_empty() {
-                                (
-                                    usage.input,
-                                    usage.output,
-                                    usage.cache_read,
-                                    usage.cache_write,
-                                    false,
-                                )
-                            } else {
-                                (
-                                    estimate_request_tokens(&request),
-                                    estimate_text_tokens(summary),
-                                    0,
-                                    0,
-                                    true,
-                                )
-                            };
-                            let cost = usage_cost(
-                                input_tokens,
-                                output_tokens,
-                                cache_read,
-                                cache_write,
-                                role_prices(config, spec.role),
-                            );
-                            engine
-                                .record_agent_usage_with_cache(
-                                    &session.id,
-                                    &spec.id,
-                                    &spec.name,
-                                    "compaction",
-                                    spec.task_id.clone(),
-                                    spec.department.clone(),
-                                    &request.model,
-                                    input_tokens,
-                                    output_tokens,
-                                    cache_read,
-                                    cache_write,
-                                    estimated_usage,
-                                    cost,
-                                )
-                                .await?;
-                            if let Some(reservation) = reservation {
-                                let _ =
-                                    reservation.settle(input_tokens.saturating_add(output_tokens));
-                            }
-                            budget.add_cost(cost);
-                            let prefixed = format!(
-                                "Earlier conversation summary (auto-compacted from {cut} messages):\n{summary}"
-                            );
-                            conversation.drain(..cut);
-                            conversation_ids.drain(..cut);
-                            conversation.insert(0, ChatMessage::user(prefixed.clone()));
-                            conversation_ids.insert(0, None);
-                            summarized_messages = cut;
-                            summary_text = Some(prefixed);
-                            through_id = through;
-                            usage_tokens = (input_tokens, output_tokens);
-                            usage_estimated = estimated_usage;
-                            estimated = calibrate_context_tokens(
-                                estimate_messages_tokens(conversation).saturating_add(base_tokens),
-                                calibration,
-                            );
-                        }
+                .await
+                {
+                    Ok(Some(call)) => {
+                        model_summary = Some(call.summary);
+                        call_usage = Some((call.input_tokens, call.output_tokens, call.estimated));
                     }
+                    Ok(None) => {}
                     Err(error) => {
-                        drop(reservation);
                         emit(
                             engine,
                             &session.id,
@@ -9712,29 +10239,68 @@ async fn compact_context_if_needed(
                     }
                 }
             }
+            if let Some(model_summary) = model_summary {
+                let prefixed = format!(
+                    "Earlier conversation summary (auto-compacted from {cut} messages):\n{state_block}\n\n{model_summary}"
+                );
+                conversation.drain(..cut);
+                conversation_ids.drain(..cut);
+                conversation.insert(0, ChatMessage::user(prefixed.clone()));
+                conversation_ids.insert(0, None);
+                summarized_messages = cut;
+                summary_text = Some(prefixed);
+                through_id = through;
+                has_model_summary = true;
+                if let Some((input_tokens, output_tokens, estimated_usage)) = call_usage {
+                    usage_tokens = (input_tokens, output_tokens);
+                    usage_estimated = estimated_usage;
+                }
+                estimated = calibrate_context_tokens(
+                    estimate_messages_tokens(conversation).saturating_add(base_tokens),
+                    calibration,
+                );
+            }
         }
     }
 
-    // Rolling-window fallback: keep the summary at index 0 when one exists,
-    // otherwise drop from the beginning at safe message boundaries. A manual
-    // compaction that could not produce a summary still creates headroom by
-    // trimming to half of the hard limit instead of doing nothing.
-    let floor = usize::from(summary_text.is_some());
-    let trim_target = if force && summary_text.is_none() {
-        // A manual compaction that could not produce a summary still makes
-        // headroom. Cap the target at `estimated - 1` so even a small context
-        // produces a deterministic trim instead of reporting failure without
-        // changing anything.
+    // Rolling-window fallback. The structured state block is authoritative and
+    // is preserved even when summarization failed; a trim-only compaction
+    // still carries it at index 0.
+    let trim_target = if force && !has_model_summary {
         (hard_limit / 2).max(1_024).min(estimated.saturating_sub(1))
     } else {
         hard_limit
     };
-    let mut retention = keep;
+    let state_block = render_structured_state(&state);
+    // A pathological tiny model window cannot fit the authoritative block and
+    // a usable tail. Preserve the block when it fits; otherwise fall back to a
+    // pure rolling trim rather than making the request larger than the window.
+    let state_can_fit = hard_limit == u64::MAX
+        || estimate_context_tokens(&state_block).saturating_add(base_tokens)
+            <= hard_limit.saturating_div(2);
+    if estimated > trim_target && state_can_fit {
+        if let Some(existing) = summary_text.as_mut() {
+            *existing = refresh_structured_state(existing, &state_block);
+            if let Some(first) = conversation.first_mut() {
+                first.content = existing.clone();
+            }
+        } else {
+            conversation.insert(0, ChatMessage::user(state_block.clone()));
+            conversation_ids.insert(0, None);
+            summary_text = Some(state_block);
+        }
+        estimated = calibrate_context_tokens(
+            estimate_messages_tokens(conversation).saturating_add(base_tokens),
+            calibration,
+        );
+    }
+    let floor = usize::from(summary_text.is_some());
+    let mut retention = keep_messages;
     loop {
         if estimated <= trim_target {
             break;
         }
-        let cut = match safe_context_cut(conversation, retention, floor) {
+        let cut = match safe_context_cut_with_tokens(conversation, retention, keep_tokens, floor) {
             Some(cut) => cut,
             None if retention > 2 => {
                 retention = 2;
@@ -9754,13 +10320,8 @@ async fn compact_context_if_needed(
             break;
         }
         let removed = cut - floor;
-        if floor == 0 {
-            conversation.drain(..cut);
-            conversation_ids.drain(..cut);
-        } else {
-            conversation.drain(floor..cut);
-            conversation_ids.drain(floor..cut);
-        }
+        conversation.drain(floor..cut);
+        conversation_ids.drain(floor..cut);
         dropped_messages = dropped_messages.saturating_add(removed);
         if through.is_some() {
             through_id = through;
@@ -9774,12 +10335,13 @@ async fn compact_context_if_needed(
     if summarized_messages == 0 && dropped_messages == 0 {
         return Ok(false);
     }
-    let mode = if summary_text.is_some() {
-        "summary"
-    } else {
-        "trim"
-    };
+    let mode = if has_model_summary { "summary" } else { "trim" };
     let kept_messages = conversation.len();
+    let latency_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    let compaction_count = engine
+        .count_events_of_kind(&session.id, "context.compacted")
+        .await?
+        .saturating_add(1);
     emit(
         engine,
         &session.id,
@@ -9800,6 +10362,38 @@ async fn compact_context_if_needed(
             "input_tokens": usage_tokens.0,
             "output_tokens": usage_tokens.1,
             "estimated": usage_estimated,
+            "latency_ms": latency_ms,
+            "background_reuse": background_reuse,
+            "fallback_to_sync": fallback_to_sync,
+            "compaction_count": compaction_count,
+            "structured_state": state,
+            "background_prepared": runtime.prepared.is_some(),
+        }),
+    )
+    .await?;
+    // Operational metrics event. It deliberately omits the summary text; the
+    // compatibility event above remains the audit record.
+    emit(
+        engine,
+        &session.id,
+        spec,
+        "context.compaction",
+        serde_json::json!({
+            "mode": mode,
+            "latency_ms": latency_ms,
+            "estimated_tokens_before": estimated_before,
+            "estimated_tokens_after": estimated,
+            "summarized_messages": summarized_messages,
+            "dropped_messages": dropped_messages,
+            "kept_messages": kept_messages,
+            "threshold_tokens": compact_threshold,
+            "hard_limit_tokens": hard_limit,
+            "input_tokens": usage_tokens.0,
+            "output_tokens": usage_tokens.1,
+            "estimated": usage_estimated,
+            "background_reuse": background_reuse,
+            "fallback_to_sync": fallback_to_sync,
+            "compaction_count": compaction_count,
         }),
     )
     .await?;
@@ -10138,8 +10732,14 @@ async fn run_loop_body(
         &project.id,
     );
     let mut warned_project = false;
+    // Bounded in-run prepared-summary cache. It is discarded at run end and
+    // never starts a second agent run.
+    let mut compaction_runtime = CompactionRuntime::default();
 
     for turn in 0..config.max_turns {
+        // Provider-facing bytes retained for tool results in this assistant
+        // turn. It resets each turn and feeds the per-turn aggregate budget.
+        let mut turn_tool_bytes = 0u64;
         if !wait_for_task_resume(engine, &session.id, spec, control).await? {
             return Ok(LoopOutcome::Cancelled);
         }
@@ -10185,6 +10785,9 @@ async fn run_loop_body(
                 system_tokens.saturating_add(tool_tokens),
                 calibration.factor,
                 false,
+                &prompt_prefix.prefix_hash,
+                config.compact_prepare_ratio,
+                &mut compaction_runtime,
                 context_strategy(spec.role),
             )
             .await?;
@@ -10675,7 +11278,7 @@ async fn run_loop_body(
                     && active_skill
                         .as_ref()
                         .is_none_or(|skill| skill_allows_tool(skill, &call.name))
-                    && config.tools.get(&call.name).is_some()
+                    && (config.tools.get(&call.name).is_some() || call.name == "read_tool_output")
             });
         if safe_parallel_batch {
             let mut prepared = Vec::new();
@@ -10695,15 +11298,16 @@ async fn run_loop_body(
                     prepared.clear();
                     break;
                 }
-                let tool = config
-                    .tools
-                    .get(&call.name)
-                    .expect("parallel tools are registry-backed");
+                let tool = config.tools.get(&call.name);
+                if tool.is_none() && call.name != "read_tool_output" {
+                    prepared.clear();
+                    break;
+                }
                 prepared.push((index, call_id, call.name.clone(), input, tool));
             }
             if !prepared.is_empty() {
                 let mut journal_pairs = std::collections::HashMap::new();
-                for (index, call_id, name, input, _) in &prepared {
+                for (_, call_id, name, input, _) in &prepared {
                     if let Err(error) = engine
                         .touch_task_progress(
                             &session.id,
@@ -10718,7 +11322,7 @@ async fn run_loop_body(
                     let pair = journal
                         .tool_intent(engine, turn + 1, call_id, name, input)
                         .await?;
-                    journal_pairs.insert(*index, pair);
+                    journal_pairs.insert(call_id.to_string(), pair);
                     emit(
                         engine,
                         &session.id,
@@ -10740,10 +11344,15 @@ async fn run_loop_body(
                         break;
                     };
                     let context = tool_context.clone();
+                    let engine = engine.clone();
+                    let session = session.clone();
                     set.spawn(async move {
-                        let output = match tool.execute(&context, input).await {
-                            Ok(output) => output,
-                            Err(error) => ToolOutput::error(format!("tool error: {error}")),
+                        let output = match tool {
+                            Some(tool) => match tool.execute(&context, input).await {
+                                Ok(output) => output,
+                                Err(error) => ToolOutput::error(format!("tool error: {error}")),
+                            },
+                            None => run_read_tool_output(&engine, &session, input).await,
                         };
                         (index, call_id, name, output)
                     });
@@ -10768,10 +11377,19 @@ async fn run_loop_body(
                             }
                             if let Some((index, call_id, name, input, tool)) = pending.next() {
                                 let context = tool_context.clone();
+                                let engine = engine.clone();
+                                let session = session.clone();
                                 set.spawn(async move {
-                                    let output = match tool.execute(&context, input).await {
-                                        Ok(output) => output,
-                                        Err(error) => ToolOutput::error(format!("tool error: {error}")),
+                                    let output = match tool {
+                                        Some(tool) => match tool.execute(&context, input).await {
+                                            Ok(output) => output,
+                                            Err(error) => {
+                                                ToolOutput::error(format!("tool error: {error}"))
+                                            }
+                                        },
+                                        None => {
+                                            run_read_tool_output(&engine, &session, input).await
+                                        }
                                     };
                                     (index, call_id, name, output)
                                 });
@@ -10780,10 +11398,33 @@ async fn run_loop_body(
                     }
                 }
                 results.sort_by_key(|(index, _, _, _)| *index);
-                for (index, call_id, name, output) in results {
-                    if let Some((journal_step, journal_tool)) = journal_pairs.remove(&index) {
+                let pending = results
+                    .into_iter()
+                    .map(
+                        |(_, call_id, name, output)| crate::tool_output::PendingToolOutput {
+                            tool_call_id: call_id,
+                            tool_name: name,
+                            output,
+                        },
+                    )
+                    .collect::<Vec<_>>();
+                let (mut shaped, _) = shape_tool_output_batch(
+                    engine,
+                    session,
+                    spec,
+                    project,
+                    turn_tool_bytes,
+                    pending,
+                )
+                .await?;
+                for item in &mut shaped {
+                    let call_id = item.tool_call_id.clone();
+                    let name = item.tool_name.clone();
+                    let output = &mut item.output;
+                    output.annotate_shape_metadata();
+                    if let Some((journal_step, journal_tool)) = journal_pairs.remove(&call_id) {
                         journal
-                            .tool_completed(engine, &journal_step, &journal_tool, &output)
+                            .tool_completed(engine, &journal_step, &journal_tool, output)
                             .await?;
                     }
                     emit(
@@ -10797,6 +11438,11 @@ async fn run_loop_body(
                             "output": truncate(&output.content),
                             "is_error": output.is_error,
                             "structured": crate::tools::bounded_structured(output.structured.clone()),
+                            "output_ref": output.output_ref,
+                            "truncated": output.truncated,
+                            "total_bytes": output.total_bytes,
+                            "preview_bytes": output.preview_bytes,
+                            "lines": output.lines,
                         }),
                     )
                     .await?;
@@ -10812,7 +11458,7 @@ async fn run_loop_body(
                             .await?;
                         conversation_ids.push(Some(stored.id));
                     }
-                    conversation.push(ChatMessage::tool(call_id, output.content));
+                    conversation.push(ChatMessage::tool(call_id, output.content.clone()));
                 }
                 emit(
                     engine,
@@ -10906,6 +11552,7 @@ async fn run_loop_body(
                     | "read_artifact"
             );
             let is_memory_tool = matches!(call.name.as_str(), "remember" | "recall");
+            let is_read_tool_output = call.name == "read_tool_output";
             let is_source_tool = matches!(
                 call.name.as_str(),
                 "search_sources" | "read_source" | "list_sources"
@@ -11542,6 +12189,20 @@ async fn run_loop_body(
                     Ok(output) => output,
                     Err(error) => ToolOutput::error(format!("source error: {error}")),
                 }
+            } else if is_read_tool_output {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                    }),
+                )
+                .await?;
+                run_read_tool_output(engine, session, input.clone()).await
             } else if is_memory_tool {
                 emit(
                     engine,
@@ -12010,6 +12671,21 @@ async fn run_loop_body(
                 ))
             };
 
+            let pending = vec![crate::tool_output::PendingToolOutput {
+                tool_call_id: call_id.clone(),
+                tool_name: call.name.clone(),
+                output,
+            }];
+            let (mut shaped, next_turn_bytes) =
+                shape_tool_output_batch(engine, session, spec, project, turn_tool_bytes, pending)
+                    .await?;
+            turn_tool_bytes = next_turn_bytes;
+            let mut output = shaped
+                .pop()
+                .ok_or_else(|| anyhow!("tool-output shaping returned no result"))?
+                .output;
+            output.annotate_shape_metadata();
+
             if let Some((journal_step, journal_tool)) = &journal_pair {
                 journal
                     .tool_completed(engine, journal_step, journal_tool, &output)
@@ -12026,6 +12702,11 @@ async fn run_loop_body(
                     "output": truncate(&output.content),
                     "is_error": output.is_error,
                     "structured": crate::tools::bounded_structured(output.structured.clone()),
+                    "output_ref": output.output_ref,
+                    "truncated": output.truncated,
+                    "total_bytes": output.total_bytes,
+                    "preview_bytes": output.preview_bytes,
+                    "lines": output.lines,
                 }),
             )
             .await?;
@@ -13433,6 +14114,99 @@ async fn run_source_tool(
     }
 }
 
+/// Shape one assistant turn's tool results before journal completion, event
+/// persistence, or conversation insertion. The full body is spilled first;
+/// only the bounded preview enters the transcript and event stream.
+#[allow(clippy::too_many_arguments)]
+async fn shape_tool_output_batch(
+    engine: &Engine,
+    session: &Session,
+    spec: &AgentSpec,
+    project: &Project,
+    prior_turn_bytes: u64,
+    mut pending: Vec<crate::tool_output::PendingToolOutput>,
+) -> Result<(Vec<crate::tool_output::PendingToolOutput>, u64)> {
+    if pending.is_empty() {
+        return Ok((pending, prior_turn_bytes));
+    }
+    let policy = engine
+        .get_tool_output_policy(&project.id)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, project_id = %project.id, "failed to load tool-output policy; using defaults");
+            vp_protocol::types::ToolOutputPolicy::default()
+        });
+    let max_total_bytes_per_turn = policy.max_total_bytes_per_turn;
+    let store = crate::tool_output::ToolOutputStore::new(engine.store().clone());
+    let project_id = project.id.clone();
+    let session_id = session.id.clone();
+    let (pending, report) = tokio::task::spawn_blocking(move || {
+        let report = crate::tool_output::shape_tool_outputs(
+            Some(&store),
+            &policy,
+            &session_id,
+            &project_id,
+            prior_turn_bytes,
+            &mut pending,
+        )?;
+        Ok::<_, anyhow::Error>((pending, report))
+    })
+    .await
+    .context("tool-output shaping task failed")??;
+    for notice in report.notices {
+        let kind = match notice.kind {
+            crate::tool_output::ToolOutputNoticeKind::Spilled => "tool.output_spilled",
+            crate::tool_output::ToolOutputNoticeKind::Truncated => "tool.output_truncated",
+        };
+        emit(
+            engine,
+            &session.id,
+            spec,
+            kind,
+            serde_json::json!({
+                "tool_call_id": notice.tool_call_id,
+                "name": notice.tool_name,
+                "handle": notice.handle,
+                "sha256": notice.sha256,
+                "bytes": notice.total_bytes,
+                "returned_bytes": notice.returned_bytes,
+                "lines": notice.total_lines,
+                "returned_lines": notice.returned_lines,
+                "preview_bytes": notice.preview_bytes,
+                "reason": notice.reason,
+                "error": notice.error,
+            }),
+        )
+        .await?;
+    }
+    let next_turn_bytes = prior_turn_bytes
+        .saturating_add(report.provider_bytes)
+        .min(max_total_bytes_per_turn);
+    Ok((pending, next_turn_bytes))
+}
+
+async fn run_read_tool_output(
+    engine: &Engine,
+    session: &Session,
+    input: serde_json::Value,
+) -> ToolOutput {
+    let params = match crate::tool_output::ReadToolOutputParams::from_input(&input) {
+        Ok(params) => params,
+        Err(error) => return ToolOutput::error(format!("read_tool_output: {error}")),
+    };
+    let store = crate::tool_output::ToolOutputStore::new(engine.store().clone());
+    let session_id = session.id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::tool_output::page_tool_output(&store, &session_id, &params)
+    })
+    .await;
+    match result {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => ToolOutput::error(format!("read_tool_output: {error}")),
+        Err(error) => ToolOutput::error(format!("read_tool_output task failed: {error}")),
+    }
+}
+
 async fn run_memory_tool(
     engine: &Engine,
     session: &Session,
@@ -13842,6 +14616,7 @@ fn is_parallel_safe_tool(name: &str) -> bool {
             | "dependency_graph"
             | "build_context"
             | "affected_tests"
+            | "read_tool_output"
             | "remote_read"
             | "remote_list"
             | "remote_git"
@@ -13922,6 +14697,25 @@ fn recall_tool_schema() -> ToolSchema {
     }
 }
 
+fn read_tool_output_tool_schema() -> ToolSchema {
+    ToolSchema {
+        name: "read_tool_output".to_string(),
+        description: "Page a full tool output that was spilled to the daemon-owned output store. Handles are opaque and only resolve inside this session. Offset is zero-based lines; pattern is a literal case-sensitive substring. The full transcript is retained; this tool returns a bounded window plus a continuation hint.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "handle": {"type": "string", "description": "Handle from an [output truncated] marker or an output_ref field"},
+                "offset": {"type": "integer", "minimum": 0, "description": "Zero-based line offset in the filtered line set"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "Maximum lines to return"},
+                "max_bytes": {"type": "integer", "minimum": 256, "maximum": 65536, "description": "Maximum returned bytes; the daemon hard-caps this value"},
+                "from_end": {"type": "boolean", "description": "Select from the end of the matching lines; output remains chronological"},
+                "pattern": {"type": "string", "maxLength": 500, "description": "Literal case-sensitive substring filter"}
+            },
+            "required": ["handle"]
+        }),
+    }
+}
+
 fn team_status_tool_schema() -> ToolSchema {
     ToolSchema {
         name: "team_status".to_string(),
@@ -13953,6 +14747,7 @@ fn tool_schemas(
     if role == AgentRole::Scout {
         tools.extend(source_tool_schemas());
         tools.push(recall_tool_schema());
+        tools.push(read_tool_output_tool_schema());
         tools.push(team_status_tool_schema());
         return tools;
     }
@@ -14026,6 +14821,7 @@ fn tool_schemas(
         }),
     });
     tools.push(recall_tool_schema());
+    tools.push(read_tool_output_tool_schema());
     if role != AgentRole::Verifier {
         tools.push(ToolSchema {
             name: "remember".to_string(),

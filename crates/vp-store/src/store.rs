@@ -25,13 +25,26 @@ use vp_protocol::types::{
     RunCheckpoint, RunStep, RunToolCall, ScheduledTask, SearchHit, Session, SessionBundle,
     SessionContinuation, SessionRun, SessionRunPolicy, ShellPolicy, Skill, Source, SourceChunk,
     SourceCollection, SourceSearchHit, SourceStats, SteeringMessage, StoredMessage,
-    TaskSchedulerPolicy, TaskStall, TeamPlan, TodoItem, UsageEntry, WorktreeRetentionPolicy,
-    WriteLease, cache_hit_ratio,
+    TaskSchedulerPolicy, TaskStall, TeamPlan, TodoItem, ToolOutputAuditResult, ToolOutputPolicy,
+    ToolOutputToolStat, UsageEntry, WorktreeRetentionPolicy, WriteLease, cache_hit_ratio,
 };
 
 use vp_protocol::remote::ExecutionHost;
 
 use crate::paths;
+
+/// Hard ceiling for a single stored tool output. Tools already bound their own
+/// results; this prevents a pathological producer from writing an unbounded
+/// blob while still allowing large build logs and diffs to be paged.
+pub const MAX_TOOL_OUTPUT_BLOB_BYTES: usize = 32 * 1024 * 1024;
+
+pub fn tool_output_line_count(content: &str) -> u64 {
+    if content.is_empty() {
+        0
+    } else {
+        content.bytes().filter(|byte| *byte == b'\n').count() as u64 + 1
+    }
+}
 
 /// A live or expired runtime-lease projection. The unpredictable lease token
 /// is deliberately absent: it is an internal fencing secret returned only to
@@ -74,6 +87,60 @@ fn map_runtime_lease(row: &rusqlite::Row<'_>) -> rusqlite::Result<RuntimeLease> 
 
 pub(crate) const RUNTIME_LEASE_COLUMNS: &str = "lease_key, owner_id, owner_instance, kind,
     session_id, fencing_token, acquired_at, heartbeat_at, renewed_at, expires_at, released_at";
+
+/// One daemon-owned tool-output handle. The output body is never stored in
+/// SQLite; it lives in the content-addressed `tool-outputs` blob directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredToolOutput {
+    pub entry: vp_protocol::types::ToolOutputEntry,
+    pub preview: String,
+}
+
+/// A pruning pass over the tool-output metadata table. `active_entries` is
+/// reported separately because active sessions can temporarily exceed
+/// `max_entries`; their unexpired handles are never pruned.
+#[derive(Debug, Clone, Default)]
+pub struct ToolOutputPruneRequest {
+    pub project_id: Option<String>,
+    pub session_id: Option<String>,
+    pub older_than_secs: Option<u64>,
+    pub max_entries: Option<u64>,
+    pub dry_run: bool,
+}
+
+/// Bounded status projection for RPC/CLI/Swift. It contains no output bodies.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolOutputStats {
+    pub entries: u64,
+    pub total_bytes: u64,
+    pub preview_bytes: u64,
+    pub active_entries: u64,
+    pub expired_entries: u64,
+    pub oldest_created_at: Option<String>,
+    pub newest_created_at: Option<String>,
+}
+
+fn map_tool_output(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredToolOutput> {
+    let expires_at: Option<String> = row.get(11)?;
+    Ok(StoredToolOutput {
+        entry: vp_protocol::types::ToolOutputEntry {
+            id: row.get(0)?,
+            session_id: row.get(1)?,
+            tool_call_id: row.get(2)?,
+            tool_name: row.get(3)?,
+            sha256: row.get(4)?,
+            bytes: row.get::<_, i64>(5)?.max(0) as u64,
+            lines: row.get::<_, i64>(6)?.max(0) as u64,
+            preview_bytes: row.get::<_, i64>(7)?.max(0) as u64,
+            created_at: row.get(8)?,
+            expires_at,
+        },
+        preview: row.get(9)?,
+    })
+}
+
+const TOOL_OUTPUT_COLUMNS: &str = "id, session_id, tool_call_id, tool_name, sha256, bytes, lines, \
+     length(preview), created_at, preview, project_id, expires_at";
 
 /// A daemon-wide lease over an interactive computer surface (browser or GUI).
 /// It is deliberately separate from the worktree write-scope leases: a
@@ -633,6 +700,8 @@ pub struct ProjectManifestSnapshot {
     pub shell_policy: ShellPolicy,
     pub integration_policy: IntegrationPolicy,
     pub artifact_policy: ArtifactPolicy,
+    #[serde(default)]
+    pub tool_output_policy: ToolOutputPolicy,
     pub mailbox_policy: MailboxPolicy,
     pub worktree_policy: WorktreeRetentionPolicy,
     #[serde(default)]
@@ -1211,6 +1280,31 @@ impl Store {
                 PRIMARY KEY (session_id, request_key)
             );
 
+            -- Full tool output is operational state, not a replay projection
+            -- and not bundle content. The body lives in
+            -- `<data_dir>/tool-outputs/<sha256>.txt`; this table is the
+            -- daemon-owned handle registry.
+            CREATE TABLE IF NOT EXISTS tool_outputs (
+                id           TEXT PRIMARY KEY,
+                project_id   TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                tool_call_id TEXT,
+                tool_name    TEXT NOT NULL,
+                sha256       TEXT NOT NULL,
+                bytes        INTEGER NOT NULL,
+                lines        INTEGER NOT NULL,
+                created_at   TEXT NOT NULL,
+                expires_at   TEXT,
+                preview      TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_tool_outputs_project
+                ON tool_outputs(project_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_tool_outputs_session
+                ON tool_outputs(session_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_tool_outputs_expires
+                ON tool_outputs(expires_at);
+
             CREATE TABLE IF NOT EXISTS usage_ledger (
                 id            TEXT PRIMARY KEY,
                 session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -1583,6 +1677,12 @@ impl Store {
                 max_age_secs INTEGER,
                 max_count    INTEGER,
                 updated_at   TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS project_tool_output_policies (
+                project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                policy     TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS project_budgets (
@@ -2593,6 +2693,7 @@ impl Store {
                 execution_host: self.get_execution_host(&project.id)?,
                 integration_policy: self.get_integration_policy(&project.id)?,
                 artifact_policy: self.get_artifact_policy(&project.id)?,
+                tool_output_policy: self.get_tool_output_policy(&project.id)?,
                 mailbox_policy: self.get_mailbox_policy(&project.id)?,
                 worktree_policy: self.get_worktree_policy(&project.id)?,
                 checkpoint_policy: self.get_checkpoint_policy(&project.id)?,
@@ -6861,6 +6962,668 @@ impl Store {
         Ok(Some(path))
     }
 
+    // ------------------------------------------------------------------
+    // Tool output store
+    //
+    // Full tool outputs are operational state. They are content-addressed,
+    // daemon-owned, and never addressed by a user-supplied path. Metadata rows
+    // are intentionally not part of replay/repair or bundle content.
+    // ------------------------------------------------------------------
+
+    fn tool_output_blob_dir(&self) -> PathBuf {
+        self.data_dir.join("tool-outputs")
+    }
+
+    /// Resolve a validated content hash to the blob path. The only accepted
+    /// input is a 64-character lowercase hex SHA-256; there is no user path
+    /// parameter anywhere in this API.
+    pub fn tool_output_blob_path(&self, sha256: &str) -> Result<PathBuf> {
+        if sha256.len() != 64
+            || !sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(anyhow!("invalid tool-output content hash"));
+        }
+        Ok(self.tool_output_blob_dir().join(format!("{sha256}.txt")))
+    }
+
+    fn write_tool_output_blob(&self, sha256: &str, content: &[u8]) -> Result<PathBuf> {
+        let dir = self.tool_output_blob_dir();
+        if let Ok(metadata) = std::fs::symlink_metadata(&dir)
+            && metadata.file_type().is_symlink()
+        {
+            return Err(anyhow!(
+                "tool-output directory {} is a symlink; refusing to follow",
+                dir.display()
+            ));
+        }
+        paths::ensure_private_dir(&dir)
+            .with_context(|| format!("creating tool-output directory {}", dir.display()))?;
+        let path = self.tool_output_blob_path(sha256)?;
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(anyhow!(
+                        "tool-output blob {} is not a regular file",
+                        path.display()
+                    ));
+                }
+                let existing = std::fs::read(&path).with_context(|| {
+                    format!("reading existing tool-output blob {}", path.display())
+                })?;
+                let existing_sha = format!("{:x}", Sha256::digest(&existing));
+                if existing_sha != sha256 {
+                    return Err(anyhow!(
+                        "tool-output blob {} content does not match its hash",
+                        path.display()
+                    ));
+                }
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspecting tool-output blob {}", path.display()));
+            }
+        }
+        let temp = dir.join(format!(".{sha256}.{}.tmp", Uuid::now_v7()));
+        let result = (|| -> Result<()> {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options
+                .open(&temp)
+                .with_context(|| format!("creating tool-output blob {}", temp.display()))?;
+            file.write_all(content)
+                .with_context(|| format!("writing tool-output blob {}", temp.display()))?;
+            file.sync_all()
+                .with_context(|| format!("syncing tool-output blob {}", temp.display()))?;
+            drop(file);
+            paths::ensure_private_file(&temp)?;
+            std::fs::rename(&temp, &path).with_context(|| {
+                format!(
+                    "renaming tool-output blob {} to {}",
+                    temp.display(),
+                    path.display()
+                )
+            })?;
+            paths::ensure_private_file(&path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        result.map(|()| path)
+    }
+
+    /// Persist one full tool output and its daemon-owned handle. The caller
+    /// supplies a bounded preview; `content` is the exact full text that must
+    /// survive until retention expires.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spill_tool_output(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        tool_call_id: Option<&str>,
+        tool_name: &str,
+        content: &str,
+        preview: &str,
+        retention_secs: u64,
+    ) -> Result<StoredToolOutput> {
+        if content.len() > MAX_TOOL_OUTPUT_BLOB_BYTES {
+            return Err(anyhow!(
+                "tool output is {} bytes; the store limit is {} bytes",
+                content.len(),
+                MAX_TOOL_OUTPUT_BLOB_BYTES
+            ));
+        }
+        let sha256 = format!("{:x}", Sha256::digest(content.as_bytes()));
+        self.write_tool_output_blob(&sha256, content.as_bytes())?;
+        let created_at = now_rfc3339();
+        let created = OffsetDateTime::parse(&created_at, &Rfc3339)
+            .context("parsing tool-output creation timestamp")?;
+        let expires = created + time::Duration::seconds(retention_secs.min(31_536_000) as i64);
+        let expires_at = expires
+            .format(&Rfc3339)
+            .context("formatting tool-output expiry")?;
+        let id = format!("out_{}", Uuid::now_v7());
+        let lines = tool_output_line_count(content);
+        let entry = vp_protocol::types::ToolOutputEntry {
+            id: id.clone(),
+            session_id: session_id.to_string(),
+            tool_call_id: tool_call_id.map(str::to_string),
+            tool_name: tool_name.to_string(),
+            sha256,
+            bytes: content.len() as u64,
+            lines,
+            preview_bytes: preview.len() as u64,
+            created_at: created_at.clone(),
+            expires_at: Some(expires_at.clone()),
+        };
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO tool_outputs
+             (id, project_id, session_id, tool_call_id, tool_name, sha256, bytes, lines,
+              created_at, expires_at, preview)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                id,
+                project_id,
+                session_id,
+                entry.tool_call_id,
+                entry.tool_name,
+                entry.sha256,
+                entry.bytes as i64,
+                entry.lines as i64,
+                created_at,
+                expires_at,
+                preview
+            ],
+        )?;
+        Ok(StoredToolOutput {
+            entry,
+            preview: preview.to_string(),
+        })
+    }
+
+    /// Force one handle's expiry. This is a maintenance/test seam: normal
+    /// runtime code always derives expiry from the policy at spill time.
+    pub fn set_tool_output_expiry(&self, id: &str, expires_at: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE tool_outputs SET expires_at = ?1 WHERE id = ?2",
+            params![expires_at, id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn get_tool_output(&self, id: &str) -> Result<Option<StoredToolOutput>> {
+        if id.len() > 128 || id.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.lock()?;
+        conn.query_row(
+            &format!("SELECT {TOOL_OUTPUT_COLUMNS} FROM tool_outputs WHERE id = ?1"),
+            params![id],
+            map_tool_output,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Read and verify the full body for one handle. The caller must already
+    /// have validated session ownership; this method never treats the handle
+    /// as a path and re-checks the content hash before returning it.
+    pub fn read_tool_output_text(&self, output: &StoredToolOutput) -> Result<String> {
+        let path = self.tool_output_blob_path(&output.entry.sha256)?;
+        let metadata = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("inspecting tool-output blob {}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(anyhow!(
+                "tool-output blob {} is not a regular file",
+                path.display()
+            ));
+        }
+        if metadata.len() != output.entry.bytes {
+            return Err(anyhow!(
+                "tool-output blob {} size does not match metadata",
+                path.display()
+            ));
+        }
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("reading tool-output blob {}", path.display()))?;
+        let actual = format!("{:x}", Sha256::digest(&bytes));
+        if actual != output.entry.sha256 {
+            return Err(anyhow!(
+                "tool-output blob {} content does not match its hash",
+                path.display()
+            ));
+        }
+        String::from_utf8(bytes).context("tool-output blob is not valid UTF-8")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_tool_outputs(
+        &self,
+        project_id: Option<&str>,
+        session_id: Option<&str>,
+        tool_name: Option<&str>,
+        before_created_at: Option<&str>,
+        include_expired: bool,
+        limit: usize,
+    ) -> Result<Vec<StoredToolOutput>> {
+        let now = now_rfc3339();
+        let conn = self.lock()?;
+        let limit = limit.clamp(1, 10_000) as i64;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {TOOL_OUTPUT_COLUMNS} FROM tool_outputs
+             WHERE (?1 IS NULL OR project_id = ?1)
+               AND (?2 IS NULL OR session_id = ?2)
+               AND (?3 IS NULL OR tool_name = ?3)
+               AND (?4 IS NULL OR created_at < ?4)
+               AND (?5 = 1 OR expires_at IS NULL OR expires_at > ?6)
+             ORDER BY created_at DESC, id DESC LIMIT ?7"
+        ))?;
+        let rows = stmt
+            .query_map(
+                params![
+                    project_id,
+                    session_id,
+                    tool_name,
+                    before_created_at,
+                    if include_expired { 1 } else { 0 },
+                    now,
+                    limit
+                ],
+                map_tool_output,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn tool_output_total(
+        &self,
+        project_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<u64> {
+        let conn = self.lock()?;
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM tool_outputs
+             WHERE (?1 IS NULL OR project_id = ?1)
+               AND (?2 IS NULL OR session_id = ?2)",
+            params![project_id, session_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count.max(0) as u64)
+    }
+
+    pub fn tool_output_stats(
+        &self,
+        project_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<ToolOutputStats> {
+        let now = now_rfc3339();
+        let conn = self.lock()?;
+        let mut stats = ToolOutputStats::default();
+        conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(t.bytes), 0), COALESCE(SUM(length(t.preview)), 0),
+                    COALESCE(SUM(CASE WHEN t.expires_at IS NOT NULL AND t.expires_at <= ?3
+                                      THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN s.status IN ('queued', 'running', 'paused', 'waiting_input')
+                                      THEN 1 ELSE 0 END), 0),
+                    MIN(t.created_at), MAX(t.created_at)
+             FROM tool_outputs t JOIN sessions s ON s.id = t.session_id
+             WHERE (?1 IS NULL OR t.project_id = ?1)
+               AND (?2 IS NULL OR t.session_id = ?2)",
+            params![project_id, session_id, now],
+            |row| {
+                stats.entries = row.get::<_, i64>(0)?.max(0) as u64;
+                stats.total_bytes = row.get::<_, i64>(1)?.max(0) as u64;
+                stats.preview_bytes = row.get::<_, i64>(2)?.max(0) as u64;
+                stats.expired_entries = row.get::<_, i64>(3)?.max(0) as u64;
+                stats.active_entries = row.get::<_, i64>(4)?.max(0) as u64;
+                stats.oldest_created_at = row.get(5)?;
+                stats.newest_created_at = row.get(6)?;
+                Ok(())
+            },
+        )?;
+        Ok(stats)
+    }
+
+    pub fn tool_output_tool_stats(
+        &self,
+        project_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<Vec<ToolOutputToolStat>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT tool_name, COUNT(*), COALESCE(SUM(bytes), 0),
+                    COALESCE(SUM(length(preview)), 0)
+             FROM tool_outputs
+             WHERE (?1 IS NULL OR project_id = ?1)
+               AND (?2 IS NULL OR session_id = ?2)
+             GROUP BY tool_name
+             ORDER BY tool_name ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![project_id, session_id], |row| {
+                Ok(ToolOutputToolStat {
+                    tool_name: row.get(0)?,
+                    entries: row.get::<_, i64>(1)?.max(0) as u64,
+                    bytes: row.get::<_, i64>(2)?.max(0) as u64,
+                    preview_bytes: row.get::<_, i64>(3)?.max(0) as u64,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn prune_tool_outputs(
+        &self,
+        request: &ToolOutputPruneRequest,
+    ) -> Result<vp_protocol::types::ToolOutputPruneResult> {
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        struct Candidate {
+            id: String,
+            sha256: String,
+            bytes: u64,
+            created_at: String,
+            expires_at: Option<String>,
+            active: bool,
+        }
+        let mut stmt = tx.prepare(
+            "SELECT t.id, t.sha256, t.bytes, t.created_at, t.expires_at,
+                    CASE WHEN s.status IN ('queued', 'running', 'paused', 'waiting_input')
+                         THEN 1 ELSE 0 END
+             FROM tool_outputs t JOIN sessions s ON s.id = t.session_id
+             WHERE (?1 IS NULL OR t.project_id = ?1)
+               AND (?2 IS NULL OR t.session_id = ?2)
+             ORDER BY t.created_at ASC, t.id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![request.project_id, request.session_id], |row| {
+                Ok(Candidate {
+                    id: row.get(0)?,
+                    sha256: row.get(1)?,
+                    bytes: row.get::<_, i64>(2)?.max(0) as u64,
+                    created_at: row.get(3)?,
+                    expires_at: row.get(4)?,
+                    active: row.get::<_, i64>(5)? != 0,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        let cutoff = request
+            .older_than_secs
+            .map(|seconds| {
+                let now = OffsetDateTime::parse(&now, &Rfc3339)?;
+                let cutoff = now - time::Duration::seconds(seconds.min(31_536_000) as i64);
+                cutoff
+                    .format(&Rfc3339)
+                    .context("formatting tool-output cutoff")
+            })
+            .transpose()?;
+        let mut candidates = std::collections::BTreeSet::new();
+        let mut overflow_candidates = std::collections::BTreeSet::new();
+        let mut expired_removed = 0u64;
+        let protected_active = rows.iter().filter(|row| row.active).count() as u64;
+        for row in &rows {
+            let expired = row
+                .expires_at
+                .as_deref()
+                .is_some_and(|expires| expires <= now.as_str());
+            if expired {
+                candidates.insert(row.id.clone());
+                expired_removed += 1;
+                continue;
+            }
+            if row.active {
+                continue;
+            }
+            if cutoff
+                .as_deref()
+                .is_some_and(|cutoff| row.created_at.as_str() <= cutoff)
+            {
+                candidates.insert(row.id.clone());
+            }
+        }
+        if let Some(max_entries) = request.max_entries {
+            let remaining = rows
+                .iter()
+                .filter(|row| !candidates.contains(&row.id))
+                .collect::<Vec<_>>();
+            if remaining.len() as u64 > max_entries {
+                let mut keep = remaining
+                    .iter()
+                    .map(|row| (row.created_at.clone(), row.id.clone()))
+                    .collect::<Vec<_>>();
+                // Newest-first keeps the cap useful; creation time and id are
+                // deterministic tie-breakers.
+                keep.sort_by(|left, right| right.cmp(left));
+                let keep = keep
+                    .into_iter()
+                    .take(max_entries as usize)
+                    .map(|(_, id)| id)
+                    .collect::<std::collections::BTreeSet<_>>();
+                for row in remaining {
+                    if !keep.contains(&row.id) && !row.active {
+                        candidates.insert(row.id.clone());
+                        overflow_candidates.insert(row.id.clone());
+                    }
+                }
+            }
+        }
+        let removed_rows = rows
+            .iter()
+            .filter(|row| candidates.contains(&row.id))
+            .collect::<Vec<_>>();
+        let overflow_removed = overflow_candidates
+            .iter()
+            .filter(|id| candidates.contains(*id))
+            .count() as u64;
+        let removed_bytes = removed_rows
+            .iter()
+            .fold(0u64, |total, row| total.saturating_add(row.bytes));
+        if !request.dry_run {
+            for row in &removed_rows {
+                tx.execute("DELETE FROM tool_outputs WHERE id = ?1", params![row.id])?;
+            }
+        }
+        let result = vp_protocol::types::ToolOutputPruneResult {
+            project_id: request.project_id.clone(),
+            session_id: request.session_id.clone(),
+            candidates: removed_rows.len() as u64,
+            removed: if request.dry_run {
+                0
+            } else {
+                removed_rows.len() as u64
+            },
+            removed_bytes: if request.dry_run { 0 } else { removed_bytes },
+            expired_removed,
+            overflow_removed,
+            protected_active,
+            dry_run: request.dry_run,
+        };
+        tx.commit()?;
+        if !request.dry_run {
+            let mut checked = std::collections::BTreeSet::new();
+            for row in &removed_rows {
+                if !checked.insert(row.sha256.clone()) {
+                    continue;
+                }
+                let references: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM tool_outputs WHERE sha256 = ?1",
+                    params![row.sha256],
+                    |row| row.get(0),
+                )?;
+                if references == 0
+                    && let Ok(path) = self.tool_output_blob_path(&row.sha256)
+                    && let Ok(metadata) = std::fs::symlink_metadata(&path)
+                    && metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    pub fn get_tool_output_policy(&self, project_id: &str) -> Result<ToolOutputPolicy> {
+        let conn = self.lock()?;
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT policy FROM project_tool_output_policies WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match stored {
+            Some(policy) => {
+                serde_json::from_str(&policy).context("parsing stored tool-output policy")
+            }
+            None => Ok(ToolOutputPolicy::default()),
+        }
+    }
+
+    pub fn set_tool_output_policy(
+        &self,
+        project_id: &str,
+        policy: &ToolOutputPolicy,
+    ) -> Result<()> {
+        let text = serde_json::to_string(policy).context("serializing tool-output policy")?;
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO project_tool_output_policies (project_id, policy, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(project_id) DO UPDATE SET
+                policy = excluded.policy,
+                updated_at = excluded.updated_at",
+            params![project_id, text, now_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Verify the metadata/blob boundary. Metadata is never deleted here;
+    /// optional cleanup removes only unreferenced, hash-shaped blob files.
+    pub fn audit_tool_outputs(
+        &self,
+        project_id: Option<&str>,
+        verify_hashes: bool,
+        clean_orphans: bool,
+    ) -> Result<ToolOutputAuditResult> {
+        let checked_at = now_rfc3339();
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT sha256, bytes FROM tool_outputs
+             WHERE (?1 IS NULL OR project_id = ?1)
+             ORDER BY sha256 ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![project_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        let mut all_hashes = std::collections::BTreeSet::new();
+        {
+            let mut stmt = conn.prepare("SELECT DISTINCT sha256 FROM tool_outputs")?;
+            let hashes = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            for hash in hashes {
+                all_hashes.insert(hash?);
+            }
+        }
+        let mut audit = ToolOutputAuditResult {
+            project_id: project_id.map(str::to_string),
+            rows: rows.len() as u64,
+            checked_at,
+            ..ToolOutputAuditResult::default()
+        };
+        let dir = self.tool_output_blob_dir();
+        let mut referenced = std::collections::BTreeSet::new();
+        for (sha256, bytes) in &rows {
+            referenced.insert(sha256.clone());
+            let Ok(path) = self.tool_output_blob_path(sha256) else {
+                audit.missing_blobs += 1;
+                continue;
+            };
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() || !metadata.is_file() {
+                        audit.unsafe_blob_files += 1;
+                        continue;
+                    }
+                    if metadata.len() != *bytes {
+                        audit.hash_mismatches += 1;
+                        continue;
+                    }
+                    if verify_hashes {
+                        let data = std::fs::read(&path).with_context(|| {
+                            format!("reading tool-output blob {}", path.display())
+                        })?;
+                        let actual = format!("{:x}", Sha256::digest(&data));
+                        if actual != *sha256 {
+                            audit.hash_mismatches += 1;
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    audit.missing_blobs += 1;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("inspecting tool-output blob {}", path.display())
+                    });
+                }
+            }
+        }
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => Some(entries),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading tool-output directory {}", dir.display()));
+            }
+        };
+        if let Some(entries) = entries {
+            for entry in entries {
+                let entry = entry?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let Some(hash) = name.strip_suffix(".txt") else {
+                    continue;
+                };
+                if hash.len() != 64
+                    || !hash
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    audit.unsafe_blob_files += 1;
+                    continue;
+                }
+                let file_type = entry.file_type()?;
+                if file_type.is_symlink() || !file_type.is_file() {
+                    audit.unsafe_blob_files += 1;
+                    continue;
+                }
+                let metadata = entry.metadata()?;
+                audit.blob_files += 1;
+                if !all_hashes.contains(hash) {
+                    audit.orphan_blobs += 1;
+                    audit.orphan_bytes = audit.orphan_bytes.saturating_add(metadata.len());
+                    // A concurrent spill writes the blob just before inserting
+                    // its metadata row. Do not delete a fresh unreferenced file:
+                    // it may be in that narrow window. Old crash leftovers are
+                    // safe to remove.
+                    let old_enough = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age >= std::time::Duration::from_secs(300));
+                    if clean_orphans && old_enough {
+                        let path = entry.path();
+                        std::fs::remove_file(&path).with_context(|| {
+                            format!("removing orphan tool-output blob {}", path.display())
+                        })?;
+                        audit.cleaned_orphans += 1;
+                        audit.cleaned_bytes = audit.cleaned_bytes.saturating_add(metadata.len());
+                    }
+                }
+            }
+        }
+        Ok(audit)
+    }
+
     pub fn get_checkpoint_policy(&self, project_id: &str) -> Result<CheckpointRetentionPolicy> {
         let conn = self.lock()?;
         let stored = conn
@@ -10077,6 +10840,16 @@ impl Store {
             events.push(event?);
         }
         Ok(events)
+    }
+
+    pub fn event_count_by_kind(&self, session_id: &str, kind: &str) -> Result<u64> {
+        let conn = self.lock()?;
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE session_id = ?1 AND type = ?2",
+            params![session_id, kind],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count.max(0) as u64)
     }
 
     pub fn latest_event_by_kind(&self, session_id: &str, kind: &str) -> Result<Option<Event>> {
@@ -15830,6 +16603,14 @@ impl Store {
             return Err(anyhow!("session already exists: {}", bundle.session.id));
         }
 
+        // Tool-output bodies are operational and never part of a bundle. Drop
+        // any stale handle rows for this session id before registering the
+        // imported archive; imported event markers keep their preview text but
+        // cannot resolve a source handle.
+        tx.execute(
+            "DELETE FROM tool_outputs WHERE session_id = ?1",
+            params![bundle.session.id],
+        )?;
         let plan_json = bundle
             .team_plan
             .as_ref()

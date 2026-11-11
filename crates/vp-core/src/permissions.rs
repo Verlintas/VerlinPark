@@ -348,6 +348,7 @@ pub fn assess_tool_call(name: &str, input: &Value, worktree: &Path) -> Permissio
         | "read_image"
         | "read_document"
         | "data_query"
+        | "read_tool_output"
         | "budget_status"
         | "task_detail"
         | "tool_search"

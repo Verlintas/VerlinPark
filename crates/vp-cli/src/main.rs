@@ -1337,6 +1337,82 @@ enum Command {
         #[arg(long = "embedding-clear")]
         embedding_clear: bool,
     },
+    /// Show the project tool-output spill and paging policy.
+    ToolOutputPolicy { project: String },
+    /// Update tool-output spill thresholds and retention.
+    ToolOutputPolicySet {
+        project: String,
+        /// Disable spilling while keeping legacy bounded output.
+        #[arg(long)]
+        disable: bool,
+        /// Re-enable spilling.
+        #[arg(long)]
+        enable: bool,
+        /// Spill results larger than this many bytes.
+        #[arg(long)]
+        spill_threshold: Option<u64>,
+        /// Provider-facing preview body size in bytes.
+        #[arg(long)]
+        preview_bytes: Option<u64>,
+        /// Aggregate preview budget per assistant turn.
+        #[arg(long)]
+        max_turn_bytes: Option<u64>,
+        /// Handle retention in seconds.
+        #[arg(long)]
+        retention_secs: Option<u64>,
+        /// Maximum stored handles per project.
+        #[arg(long)]
+        max_entries: Option<u64>,
+        /// Per-tool spill threshold as TOOL=BYTES (repeatable).
+        #[arg(long = "tool-threshold")]
+        tool_thresholds: Vec<String>,
+    },
+    /// List daemon-owned tool-output handles (metadata only).
+    ToolOutputs {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        tool: Option<String>,
+        #[arg(long)]
+        before: Option<String>,
+        #[arg(long)]
+        include_expired: bool,
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Show tool-output store counts and bytes.
+    ToolOutputStatus {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Prune expired or excess tool-output handles.
+    ToolOutputPrune {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        older_than_secs: Option<u64>,
+        #[arg(long)]
+        max_entries: Option<u64>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Verify tool-output metadata and blob integrity.
+    ToolOutputAudit {
+        #[arg(long)]
+        project: Option<String>,
+        /// Re-hash every selected blob (slow).
+        #[arg(long)]
+        verify_hashes: bool,
+        /// Remove blob files with no metadata row.
+        #[arg(long)]
+        clean_orphans: bool,
+    },
     /// Show the project artifact retention policy.
     ArtifactPolicy { project: String },
     /// Update artifact retention and optional automatic GC.
@@ -4018,6 +4094,14 @@ async fn main() -> Result<()> {
             )
             .await?
         }
+        Command::ToolOutputPolicy { project } => {
+            rpc(
+                &discovery,
+                "tool_output.policy.get",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
         Command::MemoryEmbeddingsRebuild { project } => {
             rpc(
                 &discovery,
@@ -4031,6 +4115,137 @@ async fn main() -> Result<()> {
                 &discovery,
                 "memory.embeddings.test",
                 json!({"project_id": project, "text": text}),
+            )
+            .await?
+        }
+        Command::ToolOutputPolicySet {
+            project,
+            disable,
+            enable,
+            spill_threshold,
+            preview_bytes,
+            max_turn_bytes,
+            retention_secs,
+            max_entries,
+            tool_thresholds,
+        } => {
+            if disable && enable {
+                bail!("--disable and --enable are mutually exclusive");
+            }
+            let current = rpc(
+                &discovery,
+                "tool_output.policy.get",
+                json!({"project_id": project}),
+            )
+            .await?;
+            let mut policy = current.get("policy").cloned().unwrap_or_default();
+            if !policy.is_object() {
+                policy = json!({});
+            }
+            if let Some(object) = policy.as_object_mut() {
+                if disable {
+                    object.insert("enabled".into(), json!(false));
+                }
+                if enable {
+                    object.insert("enabled".into(), json!(true));
+                }
+                if let Some(value) = spill_threshold {
+                    object.insert("spill_threshold_bytes".into(), json!(value));
+                }
+                if let Some(value) = preview_bytes {
+                    object.insert("preview_bytes".into(), json!(value));
+                }
+                if let Some(value) = max_turn_bytes {
+                    object.insert("max_total_bytes_per_turn".into(), json!(value));
+                }
+                if let Some(value) = retention_secs {
+                    object.insert("retention_secs".into(), json!(value));
+                }
+                if let Some(value) = max_entries {
+                    object.insert("max_entries".into(), json!(value));
+                }
+                if !tool_thresholds.is_empty() {
+                    let mut thresholds = object
+                        .get("tool_thresholds")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default();
+                    for entry in parse_tool_thresholds(&tool_thresholds)? {
+                        thresholds.insert(entry.0, json!(entry.1));
+                    }
+                    object.insert("tool_thresholds".into(), Value::Object(thresholds));
+                }
+            }
+            rpc(
+                &discovery,
+                "tool_output.policy.set",
+                json!({"project_id": project, "policy": policy}),
+            )
+            .await?
+        }
+        Command::ToolOutputs {
+            project,
+            session,
+            tool,
+            before,
+            include_expired,
+            limit,
+        } => {
+            rpc(
+                &discovery,
+                "tool_output.list",
+                json!({
+                    "project_id": project,
+                    "session_id": session,
+                    "tool_name": tool,
+                    "before_created_at": before,
+                    "include_expired": include_expired,
+                    "limit": limit,
+                }),
+            )
+            .await?
+        }
+        Command::ToolOutputStatus { project, session } => {
+            rpc(
+                &discovery,
+                "tool_output.status",
+                json!({"project_id": project, "session_id": session}),
+            )
+            .await?
+        }
+        Command::ToolOutputPrune {
+            project,
+            session,
+            older_than_secs,
+            max_entries,
+            dry_run,
+        } => {
+            rpc(
+                &discovery,
+                "tool_output.prune",
+                json!({
+                    "project_id": project,
+                    "session_id": session,
+                    "older_than_secs": older_than_secs,
+                    "max_entries": max_entries,
+                    "dry_run": dry_run,
+                }),
+            )
+            .await?
+        }
+        Command::ToolOutputAudit {
+            project,
+            verify_hashes,
+            clean_orphans,
+        } => {
+            rpc(
+                &discovery,
+                "tool_output.audit",
+                json!({
+                    "project_id": project,
+                    "verify_hashes": verify_hashes,
+                    "clean_orphans": clean_orphans,
+                }),
             )
             .await?
         }
@@ -4294,6 +4509,25 @@ async fn mcp_server_enabled(discovery: &Discovery, server_id: &str) -> Result<bo
         })
         .and_then(|server| server.get("enabled").and_then(Value::as_bool))
         .ok_or_else(|| anyhow::anyhow!("MCP server not found: {server_id}"))
+}
+
+fn parse_tool_thresholds(values: &[String]) -> Result<Vec<(String, u64)>> {
+    let mut thresholds = Vec::new();
+    for value in values {
+        let (tool, bytes) = value
+            .split_once('=')
+            .with_context(|| format!("--tool-threshold must be TOOL=BYTES: {value}"))?;
+        let tool = tool.trim();
+        if tool.is_empty() {
+            bail!("--tool-threshold tool name must not be empty");
+        }
+        let bytes = bytes
+            .trim()
+            .parse::<u64>()
+            .with_context(|| format!("--tool-threshold bytes must be an integer: {value}"))?;
+        thresholds.push((tool.to_string(), bytes));
+    }
+    Ok(thresholds)
 }
 
 fn parse_env_pairs(values: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
@@ -6245,7 +6479,76 @@ fn print_human(value: &Value) {
         );
         return;
     }
+    if value.get("hash_mismatches").is_some() && value.get("orphan_blobs").is_some() {
+        println!(
+            "tool-output audit: {} row(s), {} blob(s), {} missing, {} mismatched, {} unsafe, {} orphan(s) ({} bytes, cleaned {})",
+            value["rows"].as_u64().unwrap_or(0),
+            value["blob_files"].as_u64().unwrap_or(0),
+            value["missing_blobs"].as_u64().unwrap_or(0),
+            value["hash_mismatches"].as_u64().unwrap_or(0),
+            value["unsafe_blob_files"].as_u64().unwrap_or(0),
+            value["orphan_blobs"].as_u64().unwrap_or(0),
+            value["orphan_bytes"].as_u64().unwrap_or(0),
+            value["cleaned_orphans"].as_u64().unwrap_or(0)
+        );
+        return;
+    }
+    if let Some(entries) = value.get("entries").and_then(Value::as_array)
+        && value.get("total").is_some()
+    {
+        if entries.is_empty() {
+            println!("No spilled tool outputs.");
+        } else {
+            for entry in entries {
+                println!(
+                    "{}  {:<12}  {:>8}B  {} lines  {}",
+                    entry["id"].as_str().unwrap_or("?"),
+                    entry["tool_name"].as_str().unwrap_or("?"),
+                    entry["bytes"].as_u64().unwrap_or(0),
+                    entry["lines"].as_u64().unwrap_or(0),
+                    entry["created_at"].as_str().unwrap_or("?")
+                );
+            }
+            println!(
+                "{} of {} handle(s) shown.",
+                entries.len(),
+                value["total"].as_u64().unwrap_or(0)
+            );
+        }
+        return;
+    }
+    if value.get("entries").is_some_and(Value::is_u64)
+        && value
+            .get("policy")
+            .is_some_and(|policy| policy.get("spill_threshold_bytes").is_some())
+    {
+        println!(
+            "tool outputs: {} handle(s), {} bytes stored, {} active, {} expired",
+            value["entries"].as_u64().unwrap_or(0),
+            value["total_bytes"].as_u64().unwrap_or(0),
+            value["active_entries"].as_u64().unwrap_or(0),
+            value["expired_entries"].as_u64().unwrap_or(0)
+        );
+        return;
+    }
     if let Some(policy) = value.get("policy") {
+        if policy.get("spill_threshold_bytes").is_some() {
+            println!(
+                "project {}  tool-output={}  spill>{}  preview={}  turn-budget={}  retention={}s  max-entries={}",
+                value["project_id"].as_str().unwrap_or("?"),
+                if policy["enabled"].as_bool().unwrap_or(true) {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                policy["spill_threshold_bytes"].as_u64().unwrap_or(0),
+                policy["preview_bytes"].as_u64().unwrap_or(0),
+                policy["max_total_bytes_per_turn"].as_u64().unwrap_or(0),
+                policy["retention_secs"].as_u64().unwrap_or(0),
+                policy["max_entries"].as_u64().unwrap_or(0)
+            );
+            return;
+        }
         if policy.get("delete_unread").is_some() {
             println!(
                 "project {}  mailbox-max-age={}  mailbox-max-count={}  delete-unread={}  auto-gc={}",
@@ -6996,6 +7299,60 @@ mod durable_run_cli_tests {
                         assert_eq!(operation_id.as_deref(), Some("op-resume"));
                     }
                     other => panic!("expected run-resume, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn parses_tool_output_threshold_overrides() {
+        let parsed =
+            parse_tool_thresholds(&["shell=131072".to_string(), "grep = 8192".to_string()])
+                .unwrap();
+        assert_eq!(parsed[0], ("shell".to_string(), 131_072));
+        assert_eq!(parsed[1], ("grep".to_string(), 8_192));
+        assert!(parse_tool_thresholds(&["shell".to_string()]).is_err());
+        assert!(parse_tool_thresholds(&["=1024".to_string()]).is_err());
+        assert!(parse_tool_thresholds(&["shell=not-a-number".to_string()]).is_err());
+    }
+
+    #[test]
+    fn tool_output_cli_flags_parse_additively() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "tool-output-policy-set",
+                    "proj-1",
+                    "--spill-threshold",
+                    "32768",
+                    "--preview-bytes",
+                    "8192",
+                    "--tool-threshold",
+                    "shell=131072",
+                    "--max-entries",
+                    "500",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::ToolOutputPolicySet {
+                        project,
+                        spill_threshold,
+                        preview_bytes,
+                        max_entries,
+                        tool_thresholds,
+                        ..
+                    } => {
+                        assert_eq!(project, "proj-1");
+                        assert_eq!(spill_threshold, Some(32_768));
+                        assert_eq!(preview_bytes, Some(8_192));
+                        assert_eq!(max_entries, Some(500));
+                        assert_eq!(tool_thresholds, vec!["shell=131072".to_string()]);
+                    }
+                    other => panic!("expected tool-output-policy-set, got {other:?}"),
                 }
             })
             .unwrap()

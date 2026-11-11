@@ -104,6 +104,16 @@ final class AppModel {
     var integrationMaxTokensText = ""
     var integrationPolicyBusy = false
     var integrationPolicyStatus: String?
+    var toolOutputPolicy = ToolOutputPolicy.default
+    var toolOutputEnabled = true
+    var toolOutputSpillThresholdText = "16384"
+    var toolOutputPreviewBytesText = "4096"
+    var toolOutputMaxTurnBytesText = "65536"
+    var toolOutputRetentionSecsText = "604800"
+    var toolOutputMaxEntriesText = "2000"
+    var toolOutputToolThresholds: [String: Int] = [:]
+    var toolOutputPolicyBusy = false
+    var toolOutputPolicyStatus: String?
     var artifactPolicy = ArtifactPolicy.disabled
     var artifactAutoGc = false
     var artifactMaxBytesText = ""
@@ -377,6 +387,7 @@ final class AppModel {
     var programMilestoneDraftCostBudget = ""
     var programMilestoneDraftDeps: Set<String> = []
     var contextStatus: SessionContextStatus?
+    var toolOutputStatus: ToolOutputStatus?
     var compactBusy = false
     var compactNotice: String?
     var forkBusy = false
@@ -567,6 +578,7 @@ final class AppModel {
             usage: usageLedger,
             context: contextStatus,
             cache: sessionCacheStatus,
+            toolOutputs: toolOutputStatus,
             eventTypes: events.map(\.type),
             latestPrefixHash: latestPromptPrefixHash
         )
@@ -610,6 +622,7 @@ final class AppModel {
     private func resetEfficiencyState() {
         efficiencyRefreshTask?.cancel()
         sessionCacheStatus = nil
+        toolOutputStatus = nil
         efficiencyBusy = false
         efficiencyStatus = nil
     }
@@ -3011,6 +3024,7 @@ final class AppModel {
             usageLedger = nil
             usageStatus = nil
             contextStatus = nil
+            toolOutputStatus = nil
             resetEfficiencyState()
             return
         }
@@ -3037,6 +3051,19 @@ final class AppModel {
             }
             projectUsageStatus = error.localizedDescription
             efficiencyStatus = error.localizedDescription
+        }
+
+        do {
+            let status = try await core.toolOutputStatus(projectID: projectID, sessionID: nil)
+            guard projectID == selectedProjectID, generation == selectionGeneration else {
+                return
+            }
+            toolOutputStatus = status
+        } catch {
+            guard projectID == selectedProjectID, generation == selectionGeneration else {
+                return
+            }
+            toolOutputStatus = nil
         }
 
         guard let sessionID,
@@ -3067,6 +3094,17 @@ final class AppModel {
             contextStatus = status
         } catch {
             // Context status is diagnostic; keep the last successful snapshot.
+        }
+
+        do {
+            let status = try await core.toolOutputStatus(
+                projectID: projectID,
+                sessionID: sessionID
+            )
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            toolOutputStatus = status
+        } catch {
+            // Tool-output status is diagnostic; keep the project-level value.
         }
 
         do {
@@ -3253,6 +3291,123 @@ final class AppModel {
             await loadMailbox()
         } catch {
             mailboxPolicyStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func loadToolOutputPolicy() async {
+        guard let projectID = selectedProjectID else {
+            toolOutputPolicy = .default
+            toolOutputEnabled = true
+            toolOutputSpillThresholdText = "16384"
+            toolOutputPreviewBytesText = "4096"
+            toolOutputMaxTurnBytesText = "65536"
+            toolOutputRetentionSecsText = "604800"
+            toolOutputMaxEntriesText = "2000"
+            toolOutputToolThresholds = [:]
+            toolOutputPolicyStatus = nil
+            return
+        }
+        toolOutputPolicyBusy = true
+        defer { toolOutputPolicyBusy = false }
+        do {
+            let policy = try await core.toolOutputPolicy(projectID: projectID)
+            guard projectID == selectedProjectID else { return }
+            toolOutputPolicy = policy
+            toolOutputEnabled = policy.enabled
+            toolOutputSpillThresholdText = String(policy.spillThresholdBytes)
+            toolOutputPreviewBytesText = String(policy.previewBytes)
+            toolOutputMaxTurnBytesText = String(policy.maxTotalBytesPerTurn)
+            toolOutputRetentionSecsText = String(policy.retentionSecs)
+            toolOutputMaxEntriesText = String(policy.maxEntries)
+            toolOutputToolThresholds = policy.toolThresholds ?? [:]
+            toolOutputPolicyStatus = nil
+        } catch {
+            toolOutputPolicyStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func saveToolOutputPolicy() async {
+        guard let projectID = selectedProjectID else {
+            toolOutputPolicyStatus = "Select a project first."
+            return
+        }
+        func requiredInt(_ title: String, _ text: String) -> Int? {
+            guard let value = Int(text.trimmingCharacters(in: .whitespaces)), value > 0 else {
+                toolOutputPolicyStatus = "\(title) must be a positive integer."
+                return nil
+            }
+            return value
+        }
+        guard let spill = requiredInt("Spill threshold", toolOutputSpillThresholdText),
+              let preview = requiredInt("Preview bytes", toolOutputPreviewBytesText),
+              let maxTurn = requiredInt("Turn budget", toolOutputMaxTurnBytesText),
+              let retention = requiredInt("Retention", toolOutputRetentionSecsText),
+              let maxEntries = requiredInt("Max entries", toolOutputMaxEntriesText)
+        else { return }
+        if preview > spill {
+            toolOutputPolicyStatus = "Preview bytes must not exceed the spill threshold."
+            return
+        }
+        if maxTurn < preview {
+            toolOutputPolicyStatus = "Turn budget must not be smaller than preview bytes."
+            return
+        }
+        toolOutputPolicyBusy = true
+        defer { toolOutputPolicyBusy = false }
+        do {
+            let policy = try await core.setToolOutputPolicy(
+                projectID: projectID,
+                policy: ToolOutputPolicy(
+                    enabled: toolOutputEnabled,
+                    spillThresholdBytes: spill,
+                    previewBytes: preview,
+                    maxTotalBytesPerTurn: maxTurn,
+                    retentionSecs: retention,
+                    maxEntries: maxEntries,
+                    toolThresholds: toolOutputToolThresholds.isEmpty
+                        ? nil
+                        : toolOutputToolThresholds
+                )
+            )
+            guard projectID == selectedProjectID else { return }
+            toolOutputPolicy = policy
+            toolOutputPolicyStatus = policy.enabled
+                ? "Tool-output policy saved"
+                : "Tool-output spilling disabled"
+        } catch {
+            toolOutputPolicyStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func resetToolOutputPolicy() async {
+        toolOutputEnabled = true
+        toolOutputSpillThresholdText = "16384"
+        toolOutputPreviewBytesText = "4096"
+        toolOutputMaxTurnBytesText = "65536"
+        toolOutputRetentionSecsText = "604800"
+        toolOutputMaxEntriesText = "2000"
+        toolOutputToolThresholds = [:]
+        await saveToolOutputPolicy()
+    }
+
+    func auditToolOutputs() async {
+        guard let projectID = selectedProjectID else { return }
+        toolOutputPolicyBusy = true
+        defer { toolOutputPolicyBusy = false }
+        do {
+            let audit = try await core.auditToolOutputs(
+                projectID: projectID,
+                verifyHashes: false,
+                cleanOrphans: true
+            )
+            toolOutputPolicyStatus =
+                "Audit: \(audit.rows) handles, \(audit.missingBlobs) missing, "
+                    + "\(audit.hashMismatches) mismatched, \(audit.cleanedOrphans) orphan(s) cleaned"
+        } catch {
+            toolOutputPolicyStatus = error.localizedDescription
             handle(error)
         }
     }

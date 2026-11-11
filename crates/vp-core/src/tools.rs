@@ -65,44 +65,110 @@ pub struct ToolOutput {
     /// provider still receives `content`; tools must keep that rendering
     /// concise and actionable.
     pub structured: Option<Value>,
+    /// Daemon-owned handle created when the full output was spilled. It is
+    /// never a workspace path and is only resolvable through the store.
+    pub output_ref: Option<String>,
+    /// True when `content` is a bounded preview rather than the full result.
+    pub truncated: bool,
+    /// Exact full result size before provider-facing shaping.
+    pub total_bytes: u64,
+    /// Number of bytes retained in `content` as the preview body.
+    pub preview_bytes: u64,
+    /// Number of logical lines in the full result.
+    pub lines: u64,
+    /// Tools that truncate internally can preserve the pre-truncation text
+    /// here. The shaper consumes it and never exposes it to a provider or
+    /// event.
+    pub full_content: Option<String>,
 }
 
 impl ToolOutput {
     pub fn ok(content: impl Into<String>) -> Self {
-        Self {
-            content: content.into(),
-            is_error: false,
-            structured: None,
-        }
+        Self::new(content, false, None)
     }
 
     pub fn error(content: impl Into<String>) -> Self {
-        Self {
-            content: content.into(),
-            is_error: true,
-            structured: None,
-        }
+        Self::new(content, true, None)
     }
 
     pub fn ok_structured(content: impl Into<String>, structured: Value) -> Self {
-        Self {
-            content: content.into(),
-            is_error: false,
-            structured: Some(structured),
-        }
+        Self::new(content, false, Some(structured))
     }
 
     pub fn error_structured(content: impl Into<String>, structured: Value) -> Self {
+        Self::new(content, true, Some(structured))
+    }
+
+    fn new(content: impl Into<String>, is_error: bool, structured: Option<Value>) -> Self {
+        let content = content.into();
+        let total_bytes = content.len() as u64;
+        let lines = crate::tool_output::line_count(&content);
         Self {
-            content: content.into(),
-            is_error: true,
-            structured: Some(structured),
+            content,
+            is_error,
+            structured,
+            output_ref: None,
+            truncated: false,
+            total_bytes,
+            preview_bytes: total_bytes,
+            lines,
+            full_content: None,
         }
     }
 
     pub fn with_structured(mut self, structured: Value) -> Self {
         self.structured = Some(structured);
         self
+    }
+
+    /// Preserve an unbounded internal result for the shaper while keeping the
+    /// provider-facing constructor bounded by the legacy cap. Tools that
+    /// truncate before returning use this instead of `truncate`.
+    pub fn ok_structured_preserving(full: String, structured: Value, is_error: bool) -> Self {
+        let content = truncate(full.clone());
+        let mut output = if is_error {
+            Self::error_structured(content, structured)
+        } else {
+            Self::ok_structured(content, structured)
+        };
+        if full.len() as u64 > output.total_bytes {
+            output.full_content = Some(full);
+            output.total_bytes = output
+                .full_content
+                .as_ref()
+                .map_or(0, |text| text.len() as u64);
+            output.lines =
+                crate::tool_output::line_count(output.full_content.as_deref().unwrap_or(""));
+        }
+        output
+    }
+
+    /// Merge the structural spill metadata into the event-facing structured
+    /// object. The provider text is untouched.
+    pub fn annotate_shape_metadata(&mut self) {
+        let Some(value) = self.structured.take() else {
+            self.structured = Some(serde_json::json!({
+                "output_ref": self.output_ref,
+                "truncated": self.truncated,
+                "total_bytes": self.total_bytes,
+                "preview_bytes": self.preview_bytes,
+                "lines": self.lines,
+            }));
+            return;
+        };
+        if let serde_json::Value::Object(mut object) = value {
+            object.insert("output_ref".into(), serde_json::json!(self.output_ref));
+            object.insert("truncated".into(), serde_json::json!(self.truncated));
+            object.insert("total_bytes".into(), serde_json::json!(self.total_bytes));
+            object.insert(
+                "preview_bytes".into(),
+                serde_json::json!(self.preview_bytes),
+            );
+            object.insert("lines".into(), serde_json::json!(self.lines));
+            self.structured = Some(serde_json::Value::Object(object));
+        } else {
+            self.structured = Some(value);
+        }
     }
 }
 
@@ -600,8 +666,8 @@ impl AgentTool for FetchUrl {
                         .map(|title| format!(" · {title}"))
                         .unwrap_or_default()
                 );
-                Ok(ToolOutput::ok_structured(
-                    truncate(format!("{header}\n{visible}")),
+                Ok(ToolOutput::ok_structured_preserving(
+                    format!("{header}\n{visible}"),
                     json!({
                         "ok": fetched.status < 400,
                         "status": fetched.status,
@@ -614,6 +680,7 @@ impl AgentTool for FetchUrl {
                         "sha256": hash,
                         "truncated": fetched.truncated,
                     }),
+                    false,
                 ))
             }
             Err(error) => Ok(ToolOutput::error_structured(
@@ -699,8 +766,8 @@ impl AgentTool for ReadFile {
                 offset.saturating_add(returned)
             ));
         }
-        Ok(ToolOutput::ok_structured(
-            truncate(out),
+        Ok(ToolOutput::ok_structured_preserving(
+            out,
             json!({
                 "path": path,
                 "sha256": hash,
@@ -711,6 +778,7 @@ impl AgentTool for ReadFile {
                 "next_offset": truncated.then_some(offset.saturating_add(returned)),
                 "encoding": "utf-8",
             }),
+            false,
         ))
     }
 }
@@ -805,8 +873,8 @@ impl AgentTool for ListDir {
                 next_cursor
             ));
         }
-        Ok(ToolOutput::ok_structured(
-            truncate(rendered),
+        Ok(ToolOutput::ok_structured_preserving(
+            rendered,
             json!({
                 "path": path,
                 "entries": page,
@@ -815,6 +883,7 @@ impl AgentTool for ListDir {
                 "next_cursor": truncated.then_some(next_cursor),
                 "truncated": truncated,
             }),
+            false,
         ))
     }
 }
@@ -988,14 +1057,15 @@ impl AgentTool for Grep {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        Ok(ToolOutput::ok_structured(
-            truncate(rendered),
+        Ok(ToolOutput::ok_structured_preserving(
+            rendered,
             json!({
                 "matches": matches,
                 "match_count": matches.len(),
                 "files_scanned": files_scanned,
                 "truncated": truncated,
             }),
+            false,
         ))
     }
 }
@@ -1110,8 +1180,8 @@ impl AgentTool for EditFile {
             path.display(),
             diff
         );
-        Ok(ToolOutput::ok_structured(
-            truncate(content_text),
+        Ok(ToolOutput::ok_structured_preserving(
+            content_text,
             json!({
                 "path": path,
                 "replacements": matches,
@@ -1121,6 +1191,7 @@ impl AgentTool for EditFile {
                 "diff": diff,
                 "bytes": replaced.len(),
             }),
+            false,
         ))
     }
 }
@@ -1210,8 +1281,8 @@ impl AgentTool for WriteFile {
             path.display(),
             diff
         );
-        Ok(ToolOutput::ok_structured(
-            truncate(content_text),
+        Ok(ToolOutput::ok_structured_preserving(
+            content_text,
             json!({
                 "path": path,
                 "bytes": content.len(),
@@ -1222,6 +1293,7 @@ impl AgentTool for WriteFile {
                 "diff": diff,
                 "line_count": utf8_line_count(content),
             }),
+            false,
         ))
     }
 }
@@ -1534,12 +1606,11 @@ impl AgentTool for Shell {
             "elapsed_ms": captured.duration_ms,
             "warnings": warnings,
         });
-        let text = truncate(text);
-        if captured.exit_code == 0 {
-            Ok(ToolOutput::ok_structured(text, structured))
-        } else {
-            Ok(ToolOutput::error_structured(text, structured))
-        }
+        Ok(ToolOutput::ok_structured_preserving(
+            text,
+            structured,
+            captured.exit_code != 0,
+        ))
     }
 }
 
@@ -1888,6 +1959,10 @@ pub(crate) fn bounded_structured(value: Option<Value>) -> Option<Value> {
         "truncated": true,
         "summary": summary,
         "original_bytes": text.len(),
+        "output_ref": value.get("output_ref"),
+        "total_bytes": value.get("total_bytes"),
+        "preview_bytes": value.get("preview_bytes"),
+        "lines": value.get("lines"),
         "note": "full result is available in the tool text; structured data was capped at 32 KiB",
     }))
 }

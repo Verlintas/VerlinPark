@@ -85,6 +85,156 @@ struct ArtifactPolicy: Codable, Hashable, Sendable {
     }
 }
 
+struct ToolOutputPolicy: Codable, Hashable, Sendable {
+    let enabled: Bool
+    let spillThresholdBytes: Int
+    let previewBytes: Int
+    let maxTotalBytesPerTurn: Int
+    let retentionSecs: Int
+    let maxEntries: Int
+    let toolThresholds: [String: Int]?
+
+    static let `default` = ToolOutputPolicy(
+        enabled: true,
+        spillThresholdBytes: 16384,
+        previewBytes: 4096,
+        maxTotalBytesPerTurn: 65536,
+        retentionSecs: 604_800,
+        maxEntries: 2000,
+        toolThresholds: nil
+    )
+
+    enum CodingKeys: String, CodingKey {
+        case enabled
+        case spillThresholdBytes = "spill_threshold_bytes"
+        case previewBytes = "preview_bytes"
+        case maxTotalBytesPerTurn = "max_total_bytes_per_turn"
+        case retentionSecs = "retention_secs"
+        case maxEntries = "max_entries"
+        case toolThresholds = "tool_thresholds"
+    }
+}
+
+struct ToolOutputAuditResult: Codable, Sendable {
+    let projectId: String?
+    let rows: Int
+    let blobFiles: Int
+    let missingBlobs: Int
+    let hashMismatches: Int
+    let unsafeBlobFiles: Int
+    let orphanBlobs: Int
+    let orphanBytes: Int
+    let cleanedOrphans: Int
+    let cleanedBytes: Int
+    let checkedAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case rows
+        case blobFiles = "blob_files"
+        case missingBlobs = "missing_blobs"
+        case hashMismatches = "hash_mismatches"
+        case unsafeBlobFiles = "unsafe_blob_files"
+        case orphanBlobs = "orphan_blobs"
+        case orphanBytes = "orphan_bytes"
+        case cleanedOrphans = "cleaned_orphans"
+        case cleanedBytes = "cleaned_bytes"
+        case checkedAt = "checked_at"
+    }
+}
+
+struct ToolOutputPolicyResult: Codable, Sendable {
+    let projectId: String
+    let policy: ToolOutputPolicy
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case policy
+    }
+}
+
+struct ToolOutputListResult: Codable, Sendable {
+    let entries: [ToolOutputEntry]
+    let total: Int
+    let truncated: Bool
+    let nextBefore: String?
+
+    enum CodingKeys: String, CodingKey {
+        case entries
+        case total
+        case truncated
+        case nextBefore = "next_before"
+    }
+}
+
+struct ToolOutputEntry: Codable, Identifiable, Sendable {
+    let id: String
+    let sessionId: String
+    let toolCallId: String?
+    let toolName: String
+    let sha256: String
+    let bytes: Int
+    let lines: Int
+    let previewBytes: Int
+    let createdAt: String
+    let expiresAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case sessionId = "session_id"
+        case toolCallId = "tool_call_id"
+        case toolName = "tool_name"
+        case sha256
+        case bytes
+        case lines
+        case previewBytes = "preview_bytes"
+        case createdAt = "created_at"
+        case expiresAt = "expires_at"
+    }
+}
+
+struct ToolOutputToolStat: Codable, Sendable {
+    let toolName: String
+    let entries: Int
+    let bytes: Int
+    let previewBytes: Int
+
+    enum CodingKeys: String, CodingKey {
+        case toolName = "tool_name"
+        case entries
+        case bytes
+        case previewBytes = "preview_bytes"
+    }
+}
+
+struct ToolOutputStatus: Codable, Sendable {
+    let projectId: String?
+    let sessionId: String?
+    let policy: ToolOutputPolicy
+    let entries: Int
+    let totalBytes: Int
+    let previewBytes: Int
+    let activeEntries: Int
+    let expiredEntries: Int
+    let oldestCreatedAt: String?
+    let newestCreatedAt: String?
+    let byTool: [ToolOutputToolStat]?
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case sessionId = "session_id"
+        case policy
+        case entries
+        case totalBytes = "total_bytes"
+        case previewBytes = "preview_bytes"
+        case activeEntries = "active_entries"
+        case expiredEntries = "expired_entries"
+        case oldestCreatedAt = "oldest_created_at"
+        case newestCreatedAt = "newest_created_at"
+        case byTool = "by_tool"
+    }
+}
+
 struct ProjectUsageSession: Codable, Identifiable, Sendable {
     let sessionId: String
     let goal: String
@@ -2191,6 +2341,11 @@ struct ContextCompactionSummary: Codable, Sendable {
     let estimatedTokensBefore: Int
     let estimatedTokensAfter: Int
     let createdAt: String
+    let latencyMs: Int?
+    let backgroundReuse: Bool?
+    let fallbackToSync: Bool?
+    let compactionCount: Int?
+    let structuredState: JSONValue?
 
     enum CodingKeys: String, CodingKey {
         case mode
@@ -2200,6 +2355,11 @@ struct ContextCompactionSummary: Codable, Sendable {
         case estimatedTokensBefore = "estimated_tokens_before"
         case estimatedTokensAfter = "estimated_tokens_after"
         case createdAt = "created_at"
+        case latencyMs = "latency_ms"
+        case backgroundReuse = "background_reuse"
+        case fallbackToSync = "fallback_to_sync"
+        case compactionCount = "compaction_count"
+        case structuredState = "structured_state"
     }
 }
 
@@ -2208,12 +2368,24 @@ struct SessionContextStatus: Codable, Sendable {
     let usage: ContextUsage?
     let lastCompaction: ContextCompactionSummary?
     let lastMeasurement: ContextMeasurement?
+    let compactionCount: Int?
+    let lastCompactionLatencyMs: Int?
+    let lastCompactionTokensBefore: Int?
+    let lastCompactionTokensAfter: Int?
+    let compactionBackgroundReuse: Bool?
+    let compactionFallbackToSync: Bool?
 
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id"
         case usage
         case lastCompaction = "last_compaction"
         case lastMeasurement = "last_measurement"
+        case compactionCount = "compaction_count"
+        case lastCompactionLatencyMs = "last_compaction_latency_ms"
+        case lastCompactionTokensBefore = "last_compaction_tokens_before"
+        case lastCompactionTokensAfter = "last_compaction_tokens_after"
+        case compactionBackgroundReuse = "compaction_background_reuse"
+        case compactionFallbackToSync = "compaction_fallback_to_sync"
     }
 }
 

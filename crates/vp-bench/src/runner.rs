@@ -465,6 +465,8 @@ fn build_agent_config(
         approval_timeout_secs: 30,
         compact_after_tokens: config.compact_after_tokens,
         compact_keep_messages: config.compact_keep_messages,
+        compact_keep_tokens: 15_000,
+        compact_prepare_ratio: 0.6,
         context_window: config.context_window,
     })
 }

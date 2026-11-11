@@ -187,6 +187,44 @@ struct EfficiencyCard: View {
                         .font(VPTheme.mono(8))
                         .foregroundStyle(VPTheme.textTertiary)
                 }
+                HStack(spacing: 10) {
+                    metric(
+                        "Tool spills",
+                        "\(snapshot.toolOutputEntries ?? 0)",
+                        detail: snapshot.toolOutputBytes.map {
+                            "\(EfficiencyMetrics.tokenLabel($0)) stored · \(snapshot.toolOutputActiveEntries ?? 0) active"
+                        } ?? "no store telemetry"
+                    )
+                    if let latency = snapshot.compactionLatencyMs {
+                        metric(
+                            "Last compaction",
+                            "\(latency) ms",
+                            detail: {
+                                let before = EfficiencyMetrics.tokenLabel(snapshot.compactionTokensBefore)
+                                let after = EfficiencyMetrics.tokenLabel(snapshot.compactionTokensAfter)
+                                return "\(before) → \(after) tokens"
+                            }()
+                        )
+                    }
+                    if snapshot.compactionBackgroundReuse == true {
+                        metric("Prepared reuse", "yes", detail: "summary prepared below threshold")
+                    } else if snapshot.compactionFallbackToSync == true {
+                        metric("Fallback", "sync", detail: "prepared summary was stale")
+                    }
+                    Spacer(minLength: 0)
+                }
+                if let enabled = snapshot.toolOutputEnabled,
+                   let spill = snapshot.toolOutputSpillThresholdBytes,
+                   let preview = snapshot.toolOutputPreviewBytes,
+                   let retention = snapshot.toolOutputRetentionSecs,
+                   let maxEntries = snapshot.toolOutputMaxEntries
+                {
+                    Text(
+                        "Tool output policy: \(enabled ? "spill on" : "spill off") · >\(EfficiencyMetrics.tokenLabel(spill)) · preview \(EfficiencyMetrics.tokenLabel(preview)) · retention \(retention / 86400)d · cap \(maxEntries)"
+                    )
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(VPTheme.textTertiary)
+                }
             }
         } else {
             Text("Context usage has not been recorded for this session yet.")

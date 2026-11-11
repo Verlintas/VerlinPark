@@ -757,6 +757,13 @@ private struct ContextPopoverView: View {
                     )
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.secondary)
+                    if let latency = compaction.latencyMs {
+                        Text(
+                            "\(latency) ms · \(compaction.backgroundReuse == true ? "prepared summary reused" : compaction.fallbackToSync == true ? "fallback to sync" : "synchronous")"
+                        )
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    }
                 } else {
                     Text("No compaction yet.")
                         .font(.caption)

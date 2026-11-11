@@ -24,6 +24,19 @@ struct EfficiencySnapshot: Equatable, Sendable {
     let contextHardLimitTokens: Int?
     let contextMessages: Int?
     let compactionCount: Int?
+    let compactionLatencyMs: Int?
+    let compactionTokensBefore: Int?
+    let compactionTokensAfter: Int?
+    let compactionBackgroundReuse: Bool?
+    let compactionFallbackToSync: Bool?
+    let toolOutputEntries: Int?
+    let toolOutputBytes: Int?
+    let toolOutputActiveEntries: Int?
+    let toolOutputEnabled: Bool?
+    let toolOutputSpillThresholdBytes: Int?
+    let toolOutputPreviewBytes: Int?
+    let toolOutputRetentionSecs: Int?
+    let toolOutputMaxEntries: Int?
     let preambleTokensEstimate: Int?
     let promptPrefixHash: String?
     let ratioIsFromDaemon: Bool
@@ -115,10 +128,13 @@ enum EfficiencyMetrics {
         usage: UsageLedgerResult?,
         context: SessionContextStatus?,
         cache: SessionCacheStatus?,
+        toolOutputs: ToolOutputStatus?,
         eventTypes: [String],
         latestPrefixHash: String?
     ) -> EfficiencySnapshot? {
-        guard projectUsage != nil || usage != nil || context != nil || cache != nil else {
+        guard projectUsage != nil || usage != nil || context != nil || cache != nil
+            || toolOutputs != nil
+        else {
             return nil
         }
 
@@ -171,10 +187,28 @@ enum EfficiencyMetrics {
             contextThresholdTokens: contextUsage?.thresholdTokens,
             contextHardLimitTokens: contextUsage?.hardLimitTokens,
             contextMessages: contextUsage?.messages,
-            compactionCount: compactionCount(
+            compactionCount: context?.compactionCount ?? compactionCount(
                 eventTypes: eventTypes,
                 hasLastCompaction: context?.lastCompaction != nil
             ),
+            compactionLatencyMs: context?.lastCompaction?.latencyMs
+                ?? context?.lastCompactionLatencyMs,
+            compactionTokensBefore: context?.lastCompaction?.estimatedTokensBefore
+                ?? context?.lastCompactionTokensBefore,
+            compactionTokensAfter: context?.lastCompaction?.estimatedTokensAfter
+                ?? context?.lastCompactionTokensAfter,
+            compactionBackgroundReuse: context?.lastCompaction?.backgroundReuse
+                ?? context?.compactionBackgroundReuse,
+            compactionFallbackToSync: context?.lastCompaction?.fallbackToSync
+                ?? context?.compactionFallbackToSync,
+            toolOutputEntries: toolOutputs?.entries,
+            toolOutputBytes: toolOutputs?.totalBytes,
+            toolOutputActiveEntries: toolOutputs?.activeEntries,
+            toolOutputEnabled: toolOutputs?.policy.enabled,
+            toolOutputSpillThresholdBytes: toolOutputs?.policy.spillThresholdBytes,
+            toolOutputPreviewBytes: toolOutputs?.policy.previewBytes,
+            toolOutputRetentionSecs: toolOutputs?.policy.retentionSecs,
+            toolOutputMaxEntries: toolOutputs?.policy.maxEntries,
             preambleTokensEstimate: cache?.preambleTokensEstimate
                 ?? contextUsage?.preambleTokensEstimate,
             promptPrefixHash: cache?.promptPrefixHash ?? latestPrefixHash,

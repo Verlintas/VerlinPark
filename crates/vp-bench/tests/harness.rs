@@ -94,7 +94,35 @@ async fn baseline_plan_and_scout_runs_are_solved_and_reported() {
     let dir = tempfile::TempDir::new().unwrap();
     let artifacts = write_artifacts_with_stem(&report, dir.path(), "e2e-report").unwrap();
     let loaded = load_report(&artifacts.json_path).unwrap();
-    assert_eq!(loaded.summary, report.summary);
+    assert_eq!(loaded.summary.scenario_count, report.summary.scenario_count);
+    assert_eq!(loaded.summary.run_count, report.summary.run_count);
+    assert_eq!(loaded.summary.solved_runs, report.summary.solved_runs);
+    assert_eq!(loaded.summary.unsolved_runs, report.summary.unsolved_runs);
+    assert_eq!(loaded.summary.harness_faults, report.summary.harness_faults);
+    assert_eq!(loaded.summary.all_solved, report.summary.all_solved);
+    assert_eq!(loaded.summary.total_tokens, report.summary.total_tokens);
+    assert!((loaded.summary.total_cost_usd - report.summary.total_cost_usd).abs() < 1e-12);
+    assert!(
+        (loaded.summary.cost_per_solved_task_usd.unwrap()
+            - report.summary.cost_per_solved_task_usd.unwrap())
+        .abs()
+            < 1e-12
+    );
+    assert!(
+        (loaded.summary.tokens_per_solved_task.unwrap()
+            - report.summary.tokens_per_solved_task.unwrap())
+        .abs()
+            < 1e-9
+    );
+    assert!(
+        (loaded.summary.cache_hit_ratio.unwrap() - report.summary.cache_hit_ratio.unwrap()).abs()
+            < 1e-12
+    );
+    assert_eq!(
+        loaded.summary.verifier_pass_rate,
+        report.summary.verifier_pass_rate
+    );
+    assert_eq!(loaded.summary.merge_rate, report.summary.merge_rate);
     assert!(
         fs::read_to_string(&artifacts.markdown_path)
             .unwrap()

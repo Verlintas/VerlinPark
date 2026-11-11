@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -2535,6 +2537,238 @@ pub struct ArtifactPolicyResult {
     pub policy: ArtifactPolicy,
 }
 
+/// Project-scoped policy for spilling oversized tool output into the local
+/// content-addressed store and replacing it with a bounded, page-readable
+/// preview.
+///
+/// The policy is deliberately additive: older clients decode defaults, and the
+/// runtime never treats a tool-output handle as a workspace path. Thresholds
+/// are bytes, not characters, so a multi-byte UTF-8 output never gets a
+/// provider-facing preview larger than the configured bound by accident.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolOutputPolicy {
+    #[serde(default = "default_tool_output_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_tool_output_spill_threshold")]
+    pub spill_threshold_bytes: u64,
+    #[serde(default = "default_tool_output_preview_bytes")]
+    pub preview_bytes: u64,
+    #[serde(default = "default_tool_output_max_turn_bytes")]
+    pub max_total_bytes_per_turn: u64,
+    #[serde(default = "default_tool_output_retention_secs")]
+    pub retention_secs: u64,
+    #[serde(default = "default_tool_output_max_entries")]
+    pub max_entries: u64,
+    /// Optional per-tool spill thresholds. Recognized tools are
+    /// `read_file`, `read_files`, `grep`, `shell`, `run_project_task`, `git`,
+    /// `remote_exec`, `code_diagnostics`, and `browser`; unknown names are
+    /// retained but ignored until a matching tool call appears.
+    #[serde(default)]
+    pub tool_thresholds: BTreeMap<String, u64>,
+}
+
+impl Default for ToolOutputPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: default_tool_output_enabled(),
+            spill_threshold_bytes: default_tool_output_spill_threshold(),
+            preview_bytes: default_tool_output_preview_bytes(),
+            max_total_bytes_per_turn: default_tool_output_max_turn_bytes(),
+            retention_secs: default_tool_output_retention_secs(),
+            max_entries: default_tool_output_max_entries(),
+            tool_thresholds: BTreeMap::new(),
+        }
+    }
+}
+
+fn default_tool_output_enabled() -> bool {
+    true
+}
+
+fn default_tool_output_spill_threshold() -> u64 {
+    16 * 1024
+}
+
+fn default_tool_output_preview_bytes() -> u64 {
+    4 * 1024
+}
+
+fn default_tool_output_max_turn_bytes() -> u64 {
+    64 * 1024
+}
+
+fn default_tool_output_retention_secs() -> u64 {
+    7 * 24 * 60 * 60
+}
+
+fn default_tool_output_max_entries() -> u64 {
+    2_000
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolOutputPolicyParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetToolOutputPolicyParams {
+    pub project_id: String,
+    pub policy: ToolOutputPolicy,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolOutputPolicyResult {
+    pub project_id: String,
+    pub policy: ToolOutputPolicy,
+}
+
+/// Metadata for one spilled tool output. It never contains the output body:
+/// callers that need content must go through the daemon-owned
+/// `read_tool_output` tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolOutputEntry {
+    pub id: String,
+    pub session_id: String,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    pub tool_name: String,
+    pub sha256: String,
+    pub bytes: u64,
+    pub lines: u64,
+    pub preview_bytes: u64,
+    pub created_at: String,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolOutputToolStat {
+    pub tool_name: String,
+    pub entries: u64,
+    pub bytes: u64,
+    pub preview_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolOutputStatus {
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub policy: ToolOutputPolicy,
+    pub entries: u64,
+    pub total_bytes: u64,
+    pub preview_bytes: u64,
+    pub active_entries: u64,
+    pub expired_entries: u64,
+    #[serde(default)]
+    pub oldest_created_at: Option<String>,
+    #[serde(default)]
+    pub newest_created_at: Option<String>,
+    /// Per-tool spill counts and bytes, sorted by tool name. Metadata only.
+    #[serde(default)]
+    pub by_tool: Vec<ToolOutputToolStat>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ToolOutputStatusParams {
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ToolOutputListParams {
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    /// Exclusive creation-time cursor for older entries.
+    #[serde(default)]
+    pub before_created_at: Option<String>,
+    /// Include rows whose `expires_at` has passed but which the sweep has not
+    /// removed yet. Defaults to false so operator lists match paging behavior.
+    #[serde(default)]
+    pub include_expired: bool,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolOutputListResult {
+    pub entries: Vec<ToolOutputEntry>,
+    pub total: u64,
+    pub truncated: bool,
+    /// Pass as `before_created_at` to fetch the next page.
+    #[serde(default)]
+    pub next_before: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ToolOutputPruneParams {
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Override the project retention age for this sweep. Values below 60 are
+    /// rejected rather than silently deleting live handles.
+    #[serde(default)]
+    pub older_than_secs: Option<u64>,
+    /// Override the project entry cap for this sweep.
+    #[serde(default)]
+    pub max_entries: Option<u64>,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ToolOutputAuditParams {
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// Re-hash each selected blob. This is O(stored bytes) and is off by
+    /// default for routine operator checks.
+    #[serde(default)]
+    pub verify_hashes: bool,
+    /// Remove content-addressed files with no metadata row. Metadata is never
+    /// removed by an audit.
+    #[serde(default)]
+    pub clean_orphans: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ToolOutputAuditResult {
+    #[serde(default)]
+    pub project_id: Option<String>,
+    pub rows: u64,
+    pub blob_files: u64,
+    pub missing_blobs: u64,
+    pub hash_mismatches: u64,
+    pub unsafe_blob_files: u64,
+    pub orphan_blobs: u64,
+    pub orphan_bytes: u64,
+    pub cleaned_orphans: u64,
+    pub cleaned_bytes: u64,
+    pub checked_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ToolOutputPruneResult {
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub candidates: u64,
+    pub removed: u64,
+    pub removed_bytes: u64,
+    pub expired_removed: u64,
+    pub overflow_removed: u64,
+    pub protected_active: u64,
+    pub dry_run: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MailboxPolicy {
     #[serde(default)]
@@ -3018,6 +3252,31 @@ impl Default for ContextMeasurement {
     }
 }
 
+/// Deterministic task state included in every compaction summary. The model's
+/// free-text summary is advisory; this block is generated from the stored
+/// TeamPlan and is authoritative for recovery.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextStructuredState {
+    #[serde(default)]
+    pub goal: String,
+    #[serde(default)]
+    pub plan_revision: u32,
+    #[serde(default)]
+    pub active_task_id: Option<String>,
+    #[serde(default)]
+    pub active_task_title: Option<String>,
+    #[serde(default)]
+    pub active_task_department: Option<String>,
+    #[serde(default)]
+    pub active_task_acceptance: Vec<String>,
+    #[serde(default)]
+    pub active_task_write_scope: Vec<String>,
+    #[serde(default)]
+    pub recent_completed_task_ids: Vec<String>,
+    #[serde(default)]
+    pub generated_at: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContextCompactionSummary {
     #[serde(default)]
@@ -3032,6 +3291,24 @@ pub struct ContextCompactionSummary {
     pub estimated_tokens_before: u64,
     #[serde(default)]
     pub estimated_tokens_after: u64,
+    /// Wall-clock duration of this compaction, including a prepared-summary
+    /// reuse (which is nearly free) or a synchronous summarizer call.
+    #[serde(default)]
+    pub latency_ms: u64,
+    /// True when this compaction reused a summary prepared below the
+    /// compaction threshold.
+    #[serde(default)]
+    pub background_reuse: bool,
+    /// True when a prepared summary existed but could not be reused, so the
+    /// synchronous path ran instead.
+    #[serde(default)]
+    pub fallback_to_sync: bool,
+    /// Cumulative successful compaction count for the session, including this
+    /// event.
+    #[serde(default)]
+    pub compaction_count: u64,
+    #[serde(default)]
+    pub structured_state: Option<ContextStructuredState>,
     #[serde(default)]
     pub created_at: String,
 }
@@ -3042,6 +3319,15 @@ pub struct SessionContextStatus {
     pub usage: Option<ContextUsage>,
     pub last_compaction: Option<ContextCompactionSummary>,
     pub last_measurement: Option<ContextMeasurement>,
+    /// Latest cumulative compaction count. This mirrors
+    /// `last_compaction.compaction_count` and is surfaced separately so older
+    /// clients can still read the summary object.
+    pub compaction_count: u64,
+    pub last_compaction_latency_ms: u64,
+    pub last_compaction_tokens_before: u64,
+    pub last_compaction_tokens_after: u64,
+    pub compaction_background_reuse: bool,
+    pub compaction_fallback_to_sync: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -7230,6 +7516,225 @@ mod program_wire_tests {
     }
 
     #[test]
+    fn tool_output_policy_decodes_with_safe_defaults() {
+        let policy: ToolOutputPolicy = serde_json::from_str("{}").unwrap();
+        assert!(policy.enabled);
+        assert_eq!(policy.spill_threshold_bytes, 16 * 1024);
+        assert_eq!(policy.preview_bytes, 4 * 1024);
+        assert_eq!(policy.max_total_bytes_per_turn, 64 * 1024);
+        assert_eq!(policy.retention_secs, 7 * 24 * 60 * 60);
+        assert_eq!(policy.max_entries, 2_000);
+        assert!(policy.tool_thresholds.is_empty());
+
+        let encoded = serde_json::to_string(&policy).unwrap();
+        let decoded: ToolOutputPolicy = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, policy);
+    }
+
+    #[test]
+    fn tool_output_policy_keeps_unknown_per_tool_fields() {
+        let policy: ToolOutputPolicy = serde_json::from_value(serde_json::json!({
+            "enabled": false,
+            "spill_threshold_bytes": 8192,
+            "tool_thresholds": {"shell": 131072, "future_tool": 4096}
+        }))
+        .unwrap();
+        assert!(!policy.enabled);
+        assert_eq!(policy.spill_threshold_bytes, 8192);
+        assert_eq!(policy.tool_thresholds.get("shell"), Some(&131_072));
+        assert_eq!(policy.tool_thresholds.get("future_tool"), Some(&4096));
+    }
+
+    #[test]
+    fn legacy_compaction_summary_decodes_without_metrics() {
+        let summary: ContextCompactionSummary = serde_json::from_value(serde_json::json!({
+            "mode": "summary",
+            "summarized_messages": 8,
+            "dropped_messages": 0,
+            "kept_messages": 4,
+            "estimated_tokens_before": 1000,
+            "estimated_tokens_after": 400,
+            "created_at": "2026-11-11T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(summary.mode, "summary");
+        assert_eq!(summary.latency_ms, 0);
+        assert!(!summary.background_reuse);
+        assert!(!summary.fallback_to_sync);
+        assert_eq!(summary.compaction_count, 0);
+        assert!(summary.structured_state.is_none());
+    }
+
+    #[test]
+    fn tool_output_params_default_additively() {
+        let list: ToolOutputListParams = serde_json::from_str("{}").unwrap();
+        assert!(list.project_id.is_none());
+        assert!(list.session_id.is_none());
+        assert!(list.tool_name.is_none());
+        assert!(list.before_created_at.is_none());
+        assert!(!list.include_expired);
+        assert!(list.limit.is_none());
+        let prune: ToolOutputPruneParams = serde_json::from_str("{}").unwrap();
+        assert!(!prune.dry_run);
+        assert!(prune.older_than_secs.is_none());
+        let audit: ToolOutputAuditParams = serde_json::from_str("{}").unwrap();
+        assert!(!audit.verify_hashes);
+        assert!(!audit.clean_orphans);
+        let status: ToolOutputStatusParams = serde_json::from_str("{}").unwrap();
+        assert!(status.project_id.is_none());
+    }
+
+    #[test]
+    fn tool_output_entry_and_status_decode_metadata_only() {
+        let entry: ToolOutputEntry = serde_json::from_value(serde_json::json!({
+            "id": "out_00000000-0000-0000-0000-000000000000",
+            "session_id": "ses-1",
+            "tool_name": "shell",
+            "sha256": "a".repeat(64),
+            "bytes": 1000,
+            "lines": 10,
+            "preview_bytes": 200,
+            "created_at": "2026-11-11T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(entry.bytes, 1000);
+        assert!(entry.tool_call_id.is_none());
+        assert!(entry.expires_at.is_none());
+        let status: ToolOutputStatus = serde_json::from_value(serde_json::json!({
+            "policy": {},
+            "entries": 2,
+            "total_bytes": 4000,
+            "preview_bytes": 800,
+            "active_entries": 1,
+            "expired_entries": 0,
+            "by_tool": [
+                {"tool_name": "shell", "entries": 2, "bytes": 4000, "preview_bytes": 800}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(status.entries, 2);
+        assert_eq!(status.by_tool.len(), 1);
+        assert_eq!(status.by_tool[0].tool_name, "shell");
+        assert_eq!(status.policy, ToolOutputPolicy::default());
+        assert!(status.project_id.is_none());
+    }
+
+    #[test]
+    fn legacy_tool_output_status_decodes_without_by_tool() {
+        let status: ToolOutputStatus = serde_json::from_value(serde_json::json!({
+            "policy": {
+                "enabled": true,
+                "spill_threshold_bytes": 16384,
+                "preview_bytes": 4096,
+                "max_total_bytes_per_turn": 65536,
+                "retention_secs": 604800,
+                "max_entries": 2000
+            },
+            "entries": 0,
+            "total_bytes": 0,
+            "preview_bytes": 0,
+            "active_entries": 0,
+            "expired_entries": 0
+        }))
+        .unwrap();
+        assert!(status.by_tool.is_empty());
+        assert!(status.oldest_created_at.is_none());
+        assert!(status.project_id.is_none());
+    }
+
+    #[test]
+    fn tool_output_status_params_reject_a_non_object_payload() {
+        assert!(
+            serde_json::from_value::<ToolOutputStatusParams>(serde_json::json!("bad")).is_err()
+        );
+        let params: ToolOutputStatusParams =
+            serde_json::from_value(serde_json::json!({"session_id": "ses-1"})).unwrap();
+        assert_eq!(params.session_id.as_deref(), Some("ses-1"));
+        assert!(params.project_id.is_none());
+    }
+
+    #[test]
+    fn tool_output_list_result_reports_a_next_cursor() {
+        let result = ToolOutputListResult {
+            entries: Vec::new(),
+            total: 10,
+            truncated: true,
+            next_before: Some("2026-11-11T00:00:00Z".into()),
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["next_before"], "2026-11-11T00:00:00Z");
+        assert_eq!(value["entries"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn tool_output_prune_and_audit_results_are_stable_json() {
+        let prune = ToolOutputPruneResult {
+            project_id: Some("proj-1".into()),
+            session_id: None,
+            candidates: 3,
+            removed: 2,
+            removed_bytes: 100,
+            expired_removed: 1,
+            overflow_removed: 1,
+            protected_active: 1,
+            dry_run: false,
+        };
+        let value = serde_json::to_value(&prune).unwrap();
+        assert_eq!(value["candidates"], 3);
+        assert_eq!(value["removed"], 2);
+        assert_eq!(value["protected_active"], 1);
+        let audit = ToolOutputAuditResult {
+            rows: 2,
+            orphan_blobs: 1,
+            cleaned_orphans: 1,
+            ..ToolOutputAuditResult::default()
+        };
+        let value = serde_json::to_value(&audit).unwrap();
+        assert_eq!(value["rows"], 2);
+        assert_eq!(value["orphan_blobs"], 1);
+        assert_eq!(value["missing_blobs"], 0);
+    }
+
+    #[test]
+    fn tool_output_policy_full_round_trip_preserves_overrides() {
+        let mut policy = ToolOutputPolicy {
+            enabled: false,
+            spill_threshold_bytes: 2_048,
+            preview_bytes: 512,
+            max_total_bytes_per_turn: 4_096,
+            retention_secs: 600,
+            max_entries: 7,
+            ..ToolOutputPolicy::default()
+        };
+        policy.tool_thresholds.insert("shell".into(), 65_536);
+        policy.tool_thresholds.insert("grep".into(), 1_024);
+        let encoded = serde_json::to_string(&policy).unwrap();
+        let decoded: ToolOutputPolicy = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, policy);
+        assert_eq!(decoded.tool_thresholds.get("shell"), Some(&65_536));
+    }
+
+    #[test]
+    fn tool_output_entry_round_trips_every_metadata_field() {
+        let entry = ToolOutputEntry {
+            id: "out_00000000-0000-0000-0000-000000000000".into(),
+            session_id: "ses-1".into(),
+            tool_call_id: Some("call-1".into()),
+            tool_name: "shell".into(),
+            sha256: "a".repeat(64),
+            bytes: 1234,
+            lines: 12,
+            preview_bytes: 200,
+            created_at: "2026-11-11T00:00:00Z".into(),
+            expires_at: Some("2026-11-18T00:00:00Z".into()),
+        };
+        let encoded = serde_json::to_string(&entry).unwrap();
+        let decoded: ToolOutputEntry = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, entry);
+    }
+
+    #[test]
     fn continuation_status_and_reclaim_wire_shapes_are_token_free() {
         let continuation: SessionContinuation = serde_json::from_value(serde_json::json!({
             "id": "cont-1",
@@ -7487,5 +7992,77 @@ mod program_wire_tests {
         let decoded: MemorySemanticSummary =
             serde_json::from_value(serde_json::to_value(&summary).unwrap()).unwrap();
         assert_eq!(decoded, summary);
+    }
+
+    #[test]
+    fn session_context_status_serializes_compaction_metrics() {
+        let status = SessionContextStatus {
+            session_id: "ses-1".into(),
+            usage: None,
+            last_compaction: None,
+            last_measurement: None,
+            compaction_count: 3,
+            last_compaction_latency_ms: 25,
+            last_compaction_tokens_before: 9_000,
+            last_compaction_tokens_after: 3_000,
+            compaction_background_reuse: true,
+            compaction_fallback_to_sync: false,
+        };
+        let value = serde_json::to_value(&status).unwrap();
+        assert_eq!(value["compaction_count"], 3);
+        assert_eq!(value["last_compaction_latency_ms"], 25);
+        assert_eq!(value["last_compaction_tokens_before"], 9_000);
+        assert_eq!(value["last_compaction_tokens_after"], 3_000);
+        assert_eq!(value["compaction_background_reuse"], true);
+        assert_eq!(value["last_compaction"], Value::Null);
+    }
+
+    #[test]
+    fn modern_compaction_summary_round_trips_metrics() {
+        let summary = ContextCompactionSummary {
+            mode: "summary".into(),
+            summarized_messages: 8,
+            dropped_messages: 1,
+            kept_messages: 4,
+            estimated_tokens_before: 10_000,
+            estimated_tokens_after: 4_000,
+            latency_ms: 42,
+            background_reuse: true,
+            fallback_to_sync: false,
+            compaction_count: 3,
+            structured_state: Some(ContextStructuredState {
+                goal: "ship C1".into(),
+                plan_revision: 2,
+                active_task_id: Some("T1".into()),
+                active_task_title: Some("paging".into()),
+                active_task_department: Some("runtime".into()),
+                active_task_acceptance: vec!["tests".into()],
+                active_task_write_scope: vec!["crates/vp-core".into()],
+                recent_completed_task_ids: vec!["T0".into()],
+                generated_at: "2026-11-11T00:00:00Z".into(),
+            }),
+            created_at: "2026-11-11T00:00:00Z".into(),
+        };
+        let encoded = serde_json::to_string(&summary).unwrap();
+        let decoded: ContextCompactionSummary = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, summary);
+    }
+
+    #[test]
+    fn structured_state_round_trips() {
+        let state = ContextStructuredState {
+            goal: "ship C1".into(),
+            plan_revision: 2,
+            active_task_id: Some("T2".into()),
+            active_task_title: Some("tool output store".into()),
+            active_task_department: Some("runtime".into()),
+            active_task_acceptance: vec!["tests pass".into()],
+            active_task_write_scope: vec!["crates/vp-core".into()],
+            recent_completed_task_ids: vec!["T1".into()],
+            generated_at: "2026-11-11T00:00:00Z".into(),
+        };
+        let encoded = serde_json::to_string(&state).unwrap();
+        let decoded: ContextStructuredState = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, state);
     }
 }

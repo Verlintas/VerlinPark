@@ -185,8 +185,8 @@ impl AgentTool for FindFiles {
                 next_cursor
             ));
         }
-        Ok(ToolOutput::ok_structured(
-            truncate(rendered),
+        Ok(ToolOutput::ok_structured_preserving(
+            rendered,
             json!({
                 "matches": page,
                 "total": total,
@@ -195,6 +195,7 @@ impl AgentTool for FindFiles {
                 "next_cursor": truncated.then_some(next_cursor),
                 "truncated": truncated,
             }),
+            false,
         ))
     }
 }
@@ -457,14 +458,15 @@ impl AgentTool for ReadFiles {
                 }
             }
         }
-        Ok(ToolOutput::ok_structured(
-            truncate(rendered.join("\n\n")),
+        Ok(ToolOutput::ok_structured_preserving(
+            rendered.join("\n\n"),
             json!({
                 "files": results,
                 "total_bytes": total_bytes,
                 "truncated": truncated || total_bytes > MAX_BATCH_READ_BYTES,
                 "max_batch_bytes": MAX_BATCH_READ_BYTES,
             }),
+            false,
         ))
     }
 }

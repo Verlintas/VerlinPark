@@ -73,18 +73,20 @@ use vp_protocol::types::{
     SetIntegrationPolicyParams, SetMailboxPolicyParams, SetMemoryPolicyParams,
     SetProjectBudgetParams, SetSessionPriorityParams, SetSessionRunPolicyParams,
     SetSessionUnlimitedParams, SetShellPolicyParams, SetSourceCollectionParams,
-    SetSourceLabelsParams, SetTaskSchedulerPolicyParams, SetWorktreePolicyParams,
-    ShellPolicyParams, ShellPolicyResult, SkillCreateParams, SkillEnabledParams, SkillIdParams,
-    SkillImportParams, SkillListParams, SkillUpdateParams, SourceActionParams,
-    SourceCollectionsParams, SourceCreateFileParams, SourceCreateNoteParams, SourceCreateUrlParams,
-    SourceGetParams, SourceImportParams, SourceListParams, SourceSearchParams, SubscribeParams,
-    TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult, TaskQueueParams,
-    TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult, TerminalCloseParams,
-    TerminalOpenParams, TerminalReadParams, TerminalResizeParams, TerminalWriteParams,
-    UpdateAcpAgentParams, UpdateCheckParams, UpdateDownloadParams, UpdateMcpServerParams,
-    UpdateModelPresetParams, UpdateSourceMetadataParams, UsageLedgerParams, WorkspaceFileParams,
-    WorkspaceGrepParams, WorkspaceListParams, WorkspaceSearchParams, WorkspaceTreeParams,
-    WorkspaceWriteParams, WorktreePolicyParams,
+    SetSourceLabelsParams, SetTaskSchedulerPolicyParams, SetToolOutputPolicyParams,
+    SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult, SkillCreateParams,
+    SkillEnabledParams, SkillIdParams, SkillImportParams, SkillListParams, SkillUpdateParams,
+    SourceActionParams, SourceCollectionsParams, SourceCreateFileParams, SourceCreateNoteParams,
+    SourceCreateUrlParams, SourceGetParams, SourceImportParams, SourceListParams,
+    SourceSearchParams, SubscribeParams, TaskActionParams, TaskActionResult, TaskDispatchParams,
+    TaskDispatchResult, TaskQueueParams, TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult,
+    TerminalCloseParams, TerminalOpenParams, TerminalReadParams, TerminalResizeParams,
+    TerminalWriteParams, ToolOutputAuditParams, ToolOutputListParams, ToolOutputPolicyParams,
+    ToolOutputPolicyResult, ToolOutputPruneParams, ToolOutputStatusParams, UpdateAcpAgentParams,
+    UpdateCheckParams, UpdateDownloadParams, UpdateMcpServerParams, UpdateModelPresetParams,
+    UpdateSourceMetadataParams, UsageLedgerParams, WorkspaceFileParams, WorkspaceGrepParams,
+    WorkspaceListParams, WorkspaceSearchParams, WorkspaceTreeParams, WorkspaceWriteParams,
+    WorktreePolicyParams,
 };
 use vp_protocol::types::{
     ComputerLeaseInfo, ComputerLeaseListResult, ComputerLeaseReleaseParams,
@@ -189,6 +191,7 @@ async fn main() -> Result<()> {
     state.agent.start_task_scheduler();
     spawn_worktree_sweeper(state.engine.clone());
     spawn_checkpoint_sweeper(state.engine.clone());
+    spawn_tool_output_sweeper(state.engine.clone());
     spawn_memory_sweeper(state.engine.clone());
     spawn_memory_stale_sweeper(state.engine.clone());
     spawn_memory_conflict_scanner(state.engine.clone());
@@ -3021,6 +3024,64 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             },
             Err(response) => response_with_id(id, response),
         },
+        "tool_output.policy.get" => match parse_params::<ToolOutputPolicyParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .get_tool_output_policy(&params.project_id)
+                .await
+            {
+                Ok(policy) => RpcResponse::success(
+                    id,
+                    ToolOutputPolicyResult {
+                        project_id: params.project_id,
+                        policy,
+                    },
+                ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "tool_output.policy.set" => {
+            match parse_params::<SetToolOutputPolicyParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .set_tool_output_policy(&params.project_id, params.policy)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "tool_output.status" => match parse_params::<ToolOutputStatusParams>(request.params) {
+            Ok(params) => match state.engine.tool_output_status(params).await {
+                Ok(status) => RpcResponse::success(id, status),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "tool_output.list" => match parse_params::<ToolOutputListParams>(request.params) {
+            Ok(params) => match state.engine.list_tool_outputs(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "tool_output.prune" => match parse_params::<ToolOutputPruneParams>(request.params) {
+            Ok(params) => match state.engine.prune_tool_outputs(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "tool_output.audit" => match parse_params::<ToolOutputAuditParams>(request.params) {
+            Ok(params) => match state.engine.audit_tool_outputs(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
         "artifact.policy.get" => match parse_params::<ArtifactPolicyParams>(request.params) {
             Ok(params) => match state.engine.get_artifact_policy(&params.project_id).await {
                 Ok(policy) => RpcResponse::success(
@@ -3270,6 +3331,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             | "memory.policy.set"
             | "mailbox.policy.set"
             | "artifact.policy.set"
+            | "tool_output.policy.set"
             | "session.import"
     ) && let Err(error) = state.engine.record_project_manifest().await
     {
@@ -3337,6 +3399,35 @@ fn spawn_checkpoint_sweeper(engine: Engine) {
                 Ok(_) => {}
                 Err(error) => {
                     tracing::warn!(%error, "automatic checkpoint retention failed");
+                }
+            }
+        }
+    });
+}
+
+fn spawn_tool_output_sweeper(engine: Engine) {
+    let seconds = std::env::var("VERLINPARK_TOOL_OUTPUT_SWEEP_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(3600);
+    if seconds == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(seconds));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match engine.sweep_tool_output_retention().await {
+                Ok(removed) if removed > 0 => {
+                    tracing::info!(
+                        removed,
+                        "tool-output retention removed expired or excess handles"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "tool-output retention sweep failed");
                 }
             }
         }

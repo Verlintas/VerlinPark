@@ -9064,3 +9064,1110 @@ fn incomplete_embedding_policy_is_not_considered_configured() {
     assert_eq!(status.dimensions, 1536);
     assert_eq!(status.indexable, 0);
 }
+
+#[test]
+fn tool_output_policy_round_trips_and_defaults() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("tool-output"))
+        .unwrap();
+    assert_eq!(
+        store.get_tool_output_policy(&project.id).unwrap(),
+        ToolOutputPolicy::default()
+    );
+    let mut policy = ToolOutputPolicy {
+        enabled: false,
+        spill_threshold_bytes: 8_192,
+        preview_bytes: 2_048,
+        max_total_bytes_per_turn: 8_192,
+        retention_secs: 3_600,
+        max_entries: 42,
+        ..ToolOutputPolicy::default()
+    };
+    policy.tool_thresholds.insert("shell".into(), 65_536);
+    store.set_tool_output_policy(&project.id, &policy).unwrap();
+    assert_eq!(store.get_tool_output_policy(&project.id).unwrap(), policy);
+}
+
+#[test]
+fn spills_and_pages_content_addressed_tool_output() {
+    let (data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("tool-output"))
+        .unwrap();
+    let session = store.create_session(&project.id, "inspect").unwrap();
+    let content = "line one\nline two";
+    let spilled = store
+        .spill_tool_output(
+            &project.id,
+            &session.id,
+            Some("call_1"),
+            "shell",
+            content,
+            "line one",
+            3_600,
+        )
+        .unwrap();
+    assert_eq!(spilled.entry.bytes, content.len() as u64);
+    assert_eq!(spilled.entry.lines, 2);
+    assert!(spilled.entry.expires_at.is_some());
+    let stored = store
+        .get_tool_output(&spilled.entry.id)
+        .unwrap()
+        .expect("handle");
+    assert_eq!(
+        store.read_tool_output_text(&stored).unwrap(),
+        content.to_string()
+    );
+    let blob = store.tool_output_blob_path(&spilled.entry.sha256).unwrap();
+    assert!(blob.is_file());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&blob).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "blob must be private");
+    }
+    assert!(blob.starts_with(data.path().join("tool-outputs")));
+    let listed = store
+        .list_tool_outputs(Some(&project.id), None, None, None, false, 10)
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].entry.id, spilled.entry.id);
+    let stats = store.tool_output_stats(Some(&project.id), None).unwrap();
+    assert_eq!(stats.entries, 1);
+    assert_eq!(stats.total_bytes, content.len() as u64);
+    assert!(stats.active_entries == 0);
+    let by_tool = store
+        .tool_output_tool_stats(Some(&project.id), None)
+        .unwrap();
+    assert_eq!(by_tool.len(), 1);
+    assert_eq!(by_tool[0].tool_name, "shell");
+    assert_eq!(by_tool[0].entries, 1);
+    assert_eq!(by_tool[0].bytes, content.len() as u64);
+}
+
+#[test]
+fn lists_tool_outputs_with_tool_and_time_filters() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("list"))
+        .unwrap();
+    let session = store.create_session(&project.id, "list").unwrap();
+    let shell = store
+        .spill_tool_output(
+            &project.id,
+            &session.id,
+            None,
+            "shell",
+            "shell body",
+            "",
+            3_600,
+        )
+        .unwrap();
+    let grep = store
+        .spill_tool_output(
+            &project.id,
+            &session.id,
+            None,
+            "grep",
+            "grep body",
+            "",
+            3_600,
+        )
+        .unwrap();
+    let shell_only = store
+        .list_tool_outputs(Some(&project.id), None, Some("shell"), None, false, 10)
+        .unwrap();
+    assert_eq!(shell_only.len(), 1);
+    assert_eq!(shell_only[0].entry.id, shell.entry.id);
+    let newest = store
+        .list_tool_outputs(Some(&project.id), None, None, None, false, 1)
+        .unwrap();
+    assert_eq!(newest.len(), 1);
+    let older = store
+        .list_tool_outputs(
+            Some(&project.id),
+            None,
+            None,
+            Some(newest[0].entry.created_at.as_str()),
+            false,
+            10,
+        )
+        .unwrap();
+    assert_eq!(older.len(), 1);
+    assert_eq!(
+        older[0].entry.id,
+        if newest[0].entry.id == shell.entry.id {
+            grep.entry.id
+        } else {
+            shell.entry.id
+        }
+    );
+}
+
+#[test]
+fn rejects_tool_output_path_and_symlink_escapes() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("tool-output"))
+        .unwrap();
+    let session = store.create_session(&project.id, "inspect").unwrap();
+    assert!(store.tool_output_blob_path("../../etc/passwd").is_err());
+    assert!(store.tool_output_blob_path("not-a-hash").is_err());
+    let content = "escape check";
+    let sha = format!("{:x}", Sha256::digest(content.as_bytes()));
+    let dir = store.data_dir().join("tool-outputs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let outside = store.data_dir().join("outside");
+    std::fs::write(&outside, "untouched").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, dir.join(format!("{sha}.txt"))).unwrap();
+    let error = store
+        .spill_tool_output(&project.id, &session.id, None, "shell", content, "", 3_600)
+        .unwrap_err();
+    assert!(error.to_string().contains("not a regular file"));
+    assert_eq!(std::fs::read_to_string(outside).unwrap(), "untouched");
+}
+
+#[test]
+fn prunes_expired_and_excess_tool_outputs_but_protects_active_sessions() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("tool-output"))
+        .unwrap();
+    let active = store.create_session(&project.id, "active").unwrap();
+    let idle = store.create_session(&project.id, "idle").unwrap();
+    store.update_session_status(&active.id, "running").unwrap();
+    let active_output = store
+        .spill_tool_output(
+            &project.id,
+            &active.id,
+            None,
+            "shell",
+            "active body",
+            "",
+            3_600,
+        )
+        .unwrap();
+    let idle_output = store
+        .spill_tool_output(&project.id, &idle.id, None, "shell", "idle body", "", 3_600)
+        .unwrap();
+    let report = store
+        .prune_tool_outputs(&ToolOutputPruneRequest {
+            project_id: Some(project.id.clone()),
+            session_id: None,
+            older_than_secs: None,
+            max_entries: Some(1),
+            dry_run: false,
+        })
+        .unwrap();
+    assert!(report.protected_active >= 1);
+    assert!(
+        store
+            .get_tool_output(&active_output.entry.id)
+            .unwrap()
+            .is_some(),
+        "active unexpired handles are protected"
+    );
+    assert!(
+        store
+            .get_tool_output(&idle_output.entry.id)
+            .unwrap()
+            .is_some(),
+        "the newest idle handle is kept by the cap"
+    );
+
+    let expired = store
+        .spill_tool_output(
+            &project.id,
+            &active.id,
+            None,
+            "shell",
+            "expired body",
+            "",
+            60,
+        )
+        .unwrap();
+    // Force the expiry into the past without changing the content.
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE tool_outputs SET expires_at = '2000-01-01T00:00:00Z' WHERE id = ?1",
+            params![expired.entry.id],
+        )
+        .unwrap();
+    }
+    let dry = store
+        .prune_tool_outputs(&ToolOutputPruneRequest {
+            project_id: Some(project.id.clone()),
+            session_id: None,
+            older_than_secs: Some(60),
+            max_entries: None,
+            dry_run: true,
+        })
+        .unwrap();
+    assert!(dry.dry_run);
+    assert!(dry.removed == 0);
+    assert!(dry.candidates >= 1);
+    let report = store
+        .prune_tool_outputs(&ToolOutputPruneRequest {
+            project_id: Some(project.id),
+            session_id: None,
+            older_than_secs: Some(60),
+            max_entries: None,
+            dry_run: false,
+        })
+        .unwrap();
+    assert!(report.expired_removed >= 1);
+    assert!(
+        store.get_tool_output(&expired.entry.id).unwrap().is_none(),
+        "expired active-session handles may be removed"
+    );
+    assert!(
+        store
+            .get_tool_output(&active_output.entry.id)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn audits_missing_orphan_and_mismatched_tool_output_blobs() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("audit"))
+        .unwrap();
+    let session = store.create_session(&project.id, "audit").unwrap();
+    let kept = store
+        .spill_tool_output(
+            &project.id,
+            &session.id,
+            None,
+            "shell",
+            "kept body",
+            "",
+            3_600,
+        )
+        .unwrap();
+    let missing = store
+        .spill_tool_output(
+            &project.id,
+            &session.id,
+            None,
+            "shell",
+            "missing body",
+            "",
+            3_600,
+        )
+        .unwrap();
+    let corrupted = store
+        .spill_tool_output(
+            &project.id,
+            &session.id,
+            None,
+            "shell",
+            "corrupt body",
+            "",
+            3_600,
+        )
+        .unwrap();
+    let dir = store.data_dir().join("tool-outputs");
+    std::fs::remove_file(store.tool_output_blob_path(&missing.entry.sha256).unwrap()).unwrap();
+    let corrupt_path = store
+        .tool_output_blob_path(&corrupted.entry.sha256)
+        .unwrap();
+    std::fs::write(&corrupt_path, "same length").unwrap();
+    let orphan_content = "orphan body";
+    let orphan_sha = format!("{:x}", Sha256::digest(orphan_content.as_bytes()));
+    std::fs::write(dir.join(format!("{orphan_sha}.txt")), orphan_content).unwrap();
+
+    let audit = store
+        .audit_tool_outputs(Some(&project.id), true, false)
+        .unwrap();
+    assert_eq!(audit.rows, 3);
+    assert_eq!(audit.blob_files, 3);
+    assert_eq!(audit.missing_blobs, 1);
+    assert_eq!(audit.hash_mismatches, 1);
+    assert_eq!(audit.orphan_blobs, 1);
+    assert_eq!(audit.cleaned_orphans, 0);
+    assert!(
+        store
+            .tool_output_blob_path(&kept.entry.sha256)
+            .unwrap()
+            .is_file()
+    );
+
+    // Orphan cleanup has a five-minute grace window so a concurrent spill
+    // cannot have its just-written blob removed before the row insert.
+    let orphan_path = dir.join(format!("{orphan_sha}.txt"));
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3_600);
+    let times = std::fs::FileTimes::new().set_modified(old);
+    std::fs::File::open(&orphan_path)
+        .unwrap()
+        .set_times(times)
+        .unwrap();
+    let cleaned = store
+        .audit_tool_outputs(Some(&project.id), false, true)
+        .unwrap();
+    assert_eq!(cleaned.cleaned_orphans, 1);
+    assert!(!dir.join(format!("{orphan_sha}.txt")).exists());
+    assert!(store.get_tool_output(&missing.entry.id).unwrap().is_some());
+}
+
+#[test]
+fn identical_tool_output_bodies_share_one_blob_until_the_last_reference_goes() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("dedup"))
+        .unwrap();
+    let first = store.create_session(&project.id, "first").unwrap();
+    let second = store.create_session(&project.id, "second").unwrap();
+    let content = "identical shared body";
+    let one = store
+        .spill_tool_output(&project.id, &first.id, None, "shell", content, "", 3_600)
+        .unwrap();
+    let two = store
+        .spill_tool_output(&project.id, &second.id, None, "grep", content, "", 3_600)
+        .unwrap();
+    assert_eq!(one.entry.sha256, two.entry.sha256);
+    let blob = store.tool_output_blob_path(&one.entry.sha256).unwrap();
+    assert!(blob.is_file());
+    store.update_session_status(&first.id, "idle").unwrap();
+    store.update_session_status(&second.id, "idle").unwrap();
+    // Delete one metadata row directly, then prune through the public API.
+    let report = store
+        .prune_tool_outputs(&ToolOutputPruneRequest {
+            project_id: Some(project.id.clone()),
+            session_id: Some(first.id.clone()),
+            older_than_secs: Some(0),
+            max_entries: None,
+            dry_run: false,
+        })
+        .unwrap();
+    assert_eq!(report.removed, 1);
+    assert!(blob.is_file(), "the second reference keeps the blob");
+    let report = store
+        .prune_tool_outputs(&ToolOutputPruneRequest {
+            project_id: Some(project.id),
+            session_id: Some(second.id),
+            older_than_secs: Some(0),
+            max_entries: None,
+            dry_run: false,
+        })
+        .unwrap();
+    assert_eq!(report.removed, 1);
+    assert!(!blob.exists(), "last reference removes the blob");
+}
+
+#[test]
+fn tool_output_stats_and_lists_distinguish_expired_handles() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("stats"))
+        .unwrap();
+    let session = store.create_session(&project.id, "stats").unwrap();
+    let live = store
+        .spill_tool_output(&project.id, &session.id, None, "shell", "live", "", 3_600)
+        .unwrap();
+    let expired = store
+        .spill_tool_output(&project.id, &session.id, None, "grep", "expired", "", 60)
+        .unwrap();
+    store
+        .set_tool_output_expiry(&expired.entry.id, "2000-01-01T00:00:00Z")
+        .unwrap();
+    let stats = store
+        .tool_output_stats(Some(&project.id), Some(&session.id))
+        .unwrap();
+    assert_eq!(stats.entries, 2);
+    assert_eq!(stats.expired_entries, 1);
+    let visible = store
+        .list_tool_outputs(Some(&project.id), None, None, None, false, 10)
+        .unwrap();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].entry.id, live.entry.id);
+    let all = store
+        .list_tool_outputs(Some(&project.id), None, None, None, true, 10)
+        .unwrap();
+    assert_eq!(all.len(), 2);
+    let dry = store
+        .prune_tool_outputs(&ToolOutputPruneRequest {
+            project_id: Some(project.id.clone()),
+            session_id: None,
+            older_than_secs: None,
+            max_entries: None,
+            dry_run: true,
+        })
+        .unwrap();
+    assert_eq!(dry.expired_removed, 1);
+    assert_eq!(dry.removed, 0);
+    assert!(store.get_tool_output(&expired.entry.id).unwrap().is_some());
+}
+
+#[test]
+fn tool_output_audit_flags_symlinked_blob_files() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("symlink-audit"))
+        .unwrap();
+    let content = "symlink audit body";
+    let sha = format!("{:x}", Sha256::digest(content.as_bytes()));
+    let dir = store.data_dir().join("tool-outputs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let outside = store.data_dir().join("outside-audit");
+    std::fs::write(&outside, content).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, dir.join(format!("{sha}.txt"))).unwrap();
+    let audit = store
+        .audit_tool_outputs(Some(&project.id), true, false)
+        .unwrap();
+    assert_eq!(audit.unsafe_blob_files, 1);
+    assert_eq!(audit.orphan_blobs, 0);
+    assert_eq!(std::fs::read_to_string(outside).unwrap(), content);
+    // A symlinked blob is never deleted by clean_orphans.
+    let audit = store
+        .audit_tool_outputs(Some(&project.id), false, true)
+        .unwrap();
+    assert_eq!(audit.cleaned_orphans, 0);
+    assert!(dir.join(format!("{sha}.txt")).exists());
+}
+
+#[test]
+fn project_manifest_round_trips_the_tool_output_policy() {
+    let (data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("manifest"))
+        .unwrap();
+    let policy = ToolOutputPolicy {
+        enabled: true,
+        spill_threshold_bytes: 32_768,
+        preview_bytes: 8_192,
+        max_total_bytes_per_turn: 131_072,
+        retention_secs: 86_400,
+        max_entries: 99,
+        ..ToolOutputPolicy::default()
+    };
+    store.set_tool_output_policy(&project.id, &policy).unwrap();
+    store.record_project_manifest().unwrap();
+    let snapshots = read_project_manifest(data.path()).unwrap();
+    let snapshot = snapshots
+        .iter()
+        .find(|snapshot| snapshot.project.id == project.id)
+        .expect("manifest snapshot");
+    assert_eq!(snapshot.tool_output_policy, policy);
+}
+
+#[test]
+fn tool_output_prune_dry_run_preserves_rows_and_blobs() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("dry-run"))
+        .unwrap();
+    let session = store.create_session(&project.id, "dry").unwrap();
+    let spill = store
+        .spill_tool_output(&project.id, &session.id, None, "shell", "body", "", 3_600)
+        .unwrap();
+    let blob = store.tool_output_blob_path(&spill.entry.sha256).unwrap();
+    let report = store
+        .prune_tool_outputs(&ToolOutputPruneRequest {
+            project_id: Some(project.id.clone()),
+            session_id: None,
+            older_than_secs: Some(0),
+            max_entries: None,
+            dry_run: true,
+        })
+        .unwrap();
+    assert_eq!(report.candidates, 1);
+    assert_eq!(report.removed, 0);
+    assert!(store.get_tool_output(&spill.entry.id).unwrap().is_some());
+    assert!(blob.is_file());
+}
+
+#[test]
+fn tool_output_audit_project_filter_ignores_other_projects() {
+    let (_data, store, repo) = test_store();
+    let first = store
+        .add_project(repo.path().to_str().unwrap(), Some("first"))
+        .unwrap();
+    let other_repo = TempDir::new().unwrap();
+    let second = store
+        .add_project(other_repo.path().to_str().unwrap(), Some("second"))
+        .unwrap();
+    let first_session = store.create_session(&first.id, "one").unwrap();
+    let second_session = store.create_session(&second.id, "two").unwrap();
+    store
+        .spill_tool_output(
+            &first.id,
+            &first_session.id,
+            None,
+            "shell",
+            "one",
+            "",
+            3_600,
+        )
+        .unwrap();
+    let broken = store
+        .spill_tool_output(
+            &second.id,
+            &second_session.id,
+            None,
+            "shell",
+            "two",
+            "",
+            3_600,
+        )
+        .unwrap();
+    std::fs::remove_file(store.tool_output_blob_path(&broken.entry.sha256).unwrap()).unwrap();
+    let audit = store
+        .audit_tool_outputs(Some(&first.id), true, false)
+        .unwrap();
+    assert_eq!(audit.rows, 1);
+    assert_eq!(audit.missing_blobs, 0);
+    let all = store.audit_tool_outputs(None, true, false).unwrap();
+    assert_eq!(all.rows, 2);
+    assert_eq!(all.missing_blobs, 1);
+}
+
+#[test]
+fn deleting_a_session_cascades_tool_output_rows_and_leaves_a_gc_orphan() {
+    let (data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("cascade"))
+        .unwrap();
+    let session = store.create_session(&project.id, "cascade").unwrap();
+    let spill = store
+        .spill_tool_output(
+            &project.id,
+            &session.id,
+            None,
+            "shell",
+            "cascade",
+            "",
+            3_600,
+        )
+        .unwrap();
+    let blob = store.tool_output_blob_path(&spill.entry.sha256).unwrap();
+    let conn = rusqlite::Connection::open(data.path().join("verlinpark.db")).unwrap();
+    conn.execute("DELETE FROM sessions WHERE id = ?1", params![session.id])
+        .unwrap();
+    drop(conn);
+    assert!(store.get_tool_output(&spill.entry.id).unwrap().is_none());
+    assert!(blob.is_file(), "blob cleanup is explicit, not cascaded");
+    let audit = store
+        .audit_tool_outputs(Some(&project.id), false, true)
+        .unwrap();
+    assert_eq!(audit.orphan_blobs, 1);
+    assert_eq!(audit.cleaned_orphans, 0, "fresh blobs have a grace window");
+}
+
+#[test]
+fn tool_output_policy_survives_reopening_the_database() {
+    let (data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("reopen"))
+        .unwrap();
+    let policy = ToolOutputPolicy {
+        enabled: false,
+        spill_threshold_bytes: 4_096,
+        preview_bytes: 1_024,
+        max_total_bytes_per_turn: 4_096,
+        retention_secs: 600,
+        max_entries: 12,
+        ..ToolOutputPolicy::default()
+    };
+    store.set_tool_output_policy(&project.id, &policy).unwrap();
+    drop(store);
+    let reopened = Store::open(data.path()).unwrap();
+    assert_eq!(
+        reopened.get_tool_output_policy(&project.id).unwrap(),
+        policy
+    );
+}
+
+#[test]
+fn prune_max_entries_keeps_newest_rows_and_deletes_old_blobs() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("cap"))
+        .unwrap();
+    let session = store.create_session(&project.id, "cap").unwrap();
+    let mut spills = Vec::new();
+    for index in 0..4 {
+        spills.push(
+            store
+                .spill_tool_output(
+                    &project.id,
+                    &session.id,
+                    None,
+                    "shell",
+                    &format!("body {index}"),
+                    "",
+                    3_600,
+                )
+                .unwrap(),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let report = store
+        .prune_tool_outputs(&ToolOutputPruneRequest {
+            project_id: Some(project.id.clone()),
+            session_id: None,
+            older_than_secs: None,
+            max_entries: Some(2),
+            dry_run: false,
+        })
+        .unwrap();
+    assert_eq!(report.overflow_removed, 2);
+    assert_eq!(report.removed, 2);
+    let remaining = store
+        .list_tool_outputs(Some(&project.id), None, None, None, true, 10)
+        .unwrap();
+    assert_eq!(remaining.len(), 2);
+    assert!(
+        store
+            .get_tool_output(&spills[0].entry.id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get_tool_output(&spills[1].entry.id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get_tool_output(&spills[2].entry.id)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .get_tool_output(&spills[3].entry.id)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn tool_output_stats_are_scoped_by_session() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("scope"))
+        .unwrap();
+    let first = store.create_session(&project.id, "first").unwrap();
+    let second = store.create_session(&project.id, "second").unwrap();
+    store
+        .spill_tool_output(&project.id, &first.id, None, "shell", "one", "", 3_600)
+        .unwrap();
+    store
+        .spill_tool_output(&project.id, &second.id, None, "grep", "two", "", 3_600)
+        .unwrap();
+    let project_stats = store.tool_output_stats(Some(&project.id), None).unwrap();
+    assert_eq!(project_stats.entries, 2);
+    let first_stats = store
+        .tool_output_stats(Some(&project.id), Some(&first.id))
+        .unwrap();
+    assert_eq!(first_stats.entries, 1);
+    assert_eq!(first_stats.total_bytes, 3);
+    let first_tools = store
+        .tool_output_tool_stats(Some(&project.id), Some(&first.id))
+        .unwrap();
+    assert_eq!(first_tools.len(), 1);
+    assert_eq!(first_tools[0].tool_name, "shell");
+}
+
+#[test]
+fn tool_output_audit_without_hash_verification_still_checks_size() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("hash"))
+        .unwrap();
+    let session = store.create_session(&project.id, "hash").unwrap();
+    let spill = store
+        .spill_tool_output(&project.id, &session.id, None, "shell", "abc", "", 3_600)
+        .unwrap();
+    std::fs::write(
+        store.tool_output_blob_path(&spill.entry.sha256).unwrap(),
+        "longer than abc",
+    )
+    .unwrap();
+    let audit = store
+        .audit_tool_outputs(Some(&project.id), false, false)
+        .unwrap();
+    assert_eq!(audit.hash_mismatches, 1);
+}
+
+#[test]
+fn tool_output_tool_stats_are_sorted_by_name() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("sort"))
+        .unwrap();
+    let session = store.create_session(&project.id, "sort").unwrap();
+    for tool in ["shell", "grep", "read_file", "shell"] {
+        store
+            .spill_tool_output(
+                &project.id,
+                &session.id,
+                None,
+                tool,
+                &format!("{tool} body"),
+                "",
+                3_600,
+            )
+            .unwrap();
+    }
+    let stats = store
+        .tool_output_tool_stats(Some(&project.id), None)
+        .unwrap();
+    let names = stats
+        .iter()
+        .map(|stat| stat.tool_name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["grep", "read_file", "shell"]);
+    let shell = stats.iter().find(|stat| stat.tool_name == "shell").unwrap();
+    assert_eq!(shell.entries, 2);
+}
+
+#[test]
+fn orphan_audit_counts_bytes_and_never_deletes_referenced_blobs() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("orphan-bytes"))
+        .unwrap();
+    let session = store.create_session(&project.id, "orphan").unwrap();
+    let kept = store
+        .spill_tool_output(&project.id, &session.id, None, "shell", "keep", "", 3_600)
+        .unwrap();
+    let dir = store.data_dir().join("tool-outputs");
+    let orphan = "orphan bytes";
+    let orphan_sha = format!("{:x}", Sha256::digest(orphan.as_bytes()));
+    std::fs::write(dir.join(format!("{orphan_sha}.txt")), orphan).unwrap();
+    let audit = store
+        .audit_tool_outputs(Some(&project.id), false, false)
+        .unwrap();
+    assert_eq!(audit.orphan_blobs, 1);
+    assert_eq!(audit.orphan_bytes, orphan.len() as u64);
+    assert!(
+        store
+            .tool_output_blob_path(&kept.entry.sha256)
+            .unwrap()
+            .is_file()
+    );
+}
+
+#[test]
+fn prune_age_cutoff_keeps_new_rows_and_respects_session_filter() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("cutoff"))
+        .unwrap();
+    let first = store.create_session(&project.id, "first").unwrap();
+    let second = store.create_session(&project.id, "second").unwrap();
+    store
+        .spill_tool_output(&project.id, &first.id, None, "shell", "one", "", 3_600)
+        .unwrap();
+    store
+        .spill_tool_output(&project.id, &second.id, None, "shell", "two", "", 3_600)
+        .unwrap();
+    let fresh = store
+        .prune_tool_outputs(&ToolOutputPruneRequest {
+            project_id: Some(project.id.clone()),
+            session_id: None,
+            older_than_secs: Some(60),
+            max_entries: None,
+            dry_run: false,
+        })
+        .unwrap();
+    assert_eq!(fresh.removed, 0);
+    let filtered = store
+        .prune_tool_outputs(&ToolOutputPruneRequest {
+            project_id: Some(project.id.clone()),
+            session_id: Some(first.id),
+            older_than_secs: Some(0),
+            max_entries: None,
+            dry_run: false,
+        })
+        .unwrap();
+    assert_eq!(filtered.removed, 1);
+    let stats = store.tool_output_stats(Some(&project.id), None).unwrap();
+    assert_eq!(stats.entries, 1);
+    assert_eq!(
+        store
+            .tool_output_stats(Some(&project.id), Some(&second.id))
+            .unwrap()
+            .entries,
+        1
+    );
+}
+
+#[test]
+fn tool_output_stats_are_zero_safe_on_an_empty_project() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("empty"))
+        .unwrap();
+    let stats = store.tool_output_stats(Some(&project.id), None).unwrap();
+    assert_eq!(stats.entries, 0);
+    assert_eq!(stats.total_bytes, 0);
+    assert_eq!(stats.active_entries, 0);
+    assert!(stats.oldest_created_at.is_none());
+    let audit = store
+        .audit_tool_outputs(Some(&project.id), true, false)
+        .unwrap();
+    assert_eq!(audit.rows, 0);
+    assert_eq!(audit.blob_files, 0);
+    assert_eq!(audit.orphan_blobs, 0);
+}
+
+#[test]
+fn tool_output_list_limit_is_clamped_and_ordered_newest_first() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("order"))
+        .unwrap();
+    let session = store.create_session(&project.id, "order").unwrap();
+    let mut ids = Vec::new();
+    for index in 0..3 {
+        ids.push(
+            store
+                .spill_tool_output(
+                    &project.id,
+                    &session.id,
+                    None,
+                    "shell",
+                    &format!("body {index}"),
+                    "",
+                    3_600,
+                )
+                .unwrap()
+                .entry
+                .id,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let rows = store
+        .list_tool_outputs(Some(&project.id), None, None, None, true, 0)
+        .unwrap();
+    assert_eq!(rows.len(), 1, "limit zero clamps to one");
+    assert_eq!(rows[0].entry.id, ids[2]);
+    let rows = store
+        .list_tool_outputs(Some(&project.id), None, None, None, true, 10)
+        .unwrap();
+    assert_eq!(rows[0].entry.id, ids[2]);
+    assert_eq!(rows[2].entry.id, ids[0]);
+}
+
+#[test]
+fn tool_output_read_verifies_blob_size_and_hash() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("verify"))
+        .unwrap();
+    let session = store.create_session(&project.id, "verify").unwrap();
+    let spill = store
+        .spill_tool_output(
+            &project.id,
+            &session.id,
+            None,
+            "shell",
+            "verify me",
+            "",
+            3_600,
+        )
+        .unwrap();
+    let stored = store.get_tool_output(&spill.entry.id).unwrap().unwrap();
+    let path = store.tool_output_blob_path(&spill.entry.sha256).unwrap();
+    std::fs::write(&path, "short").unwrap();
+    let error = store.read_tool_output_text(&stored).unwrap_err();
+    assert!(error.to_string().contains("size"));
+    std::fs::write(&path, "different").unwrap();
+    let error = store.read_tool_output_text(&stored).unwrap_err();
+    assert!(error.to_string().contains("hash"));
+    std::fs::write(&path, "VERIFY ME").unwrap();
+    let error = store.read_tool_output_text(&stored).unwrap_err();
+    assert!(error.to_string().contains("hash"));
+}
+
+#[test]
+fn audit_ignores_temp_files_and_counts_only_hash_shaped_txt_blobs() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("temp"))
+        .unwrap();
+    let session = store.create_session(&project.id, "temp").unwrap();
+    store
+        .spill_tool_output(&project.id, &session.id, None, "shell", "kept", "", 3_600)
+        .unwrap();
+    let dir = store.data_dir().join("tool-outputs");
+    std::fs::write(dir.join(".not-a-hash.tmp"), "temp").unwrap();
+    std::fs::write(dir.join("README"), "notes").unwrap();
+    let audit = store
+        .audit_tool_outputs(Some(&project.id), false, false)
+        .unwrap();
+    assert_eq!(audit.blob_files, 1);
+    assert_eq!(audit.orphan_blobs, 0);
+    assert_eq!(audit.unsafe_blob_files, 0);
+}
+
+#[test]
+fn tool_output_stats_and_audit_handle_shared_bodies_correctly() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("shared-stats"))
+        .unwrap();
+    let first = store.create_session(&project.id, "first").unwrap();
+    let second = store.create_session(&project.id, "second").unwrap();
+    let content = "shared stats body";
+    let one = store
+        .spill_tool_output(&project.id, &first.id, None, "shell", content, "", 3_600)
+        .unwrap();
+    let two = store
+        .spill_tool_output(&project.id, &second.id, None, "grep", content, "", 3_600)
+        .unwrap();
+    assert_eq!(one.entry.sha256, two.entry.sha256);
+    let stats = store.tool_output_stats(Some(&project.id), None).unwrap();
+    assert_eq!(stats.entries, 2);
+    assert_eq!(stats.total_bytes, (content.len() * 2) as u64);
+    let audit = store
+        .audit_tool_outputs(Some(&project.id), true, false)
+        .unwrap();
+    assert_eq!(audit.rows, 2);
+    assert_eq!(audit.blob_files, 1);
+    assert_eq!(audit.missing_blobs, 0);
+    assert_eq!(audit.hash_mismatches, 0);
+}
+
+#[test]
+fn protection_count_reports_active_rows_even_when_the_cap_is_exceeded() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("protect"))
+        .unwrap();
+    let active = store.create_session(&project.id, "active").unwrap();
+    let idle = store.create_session(&project.id, "idle").unwrap();
+    let idle_older = store.create_session(&project.id, "idle-older").unwrap();
+    store
+        .update_session_status(&active.id, "waiting_input")
+        .unwrap();
+    for index in 0..2 {
+        store
+            .spill_tool_output(
+                &project.id,
+                &active.id,
+                None,
+                "shell",
+                &format!("active {index}"),
+                "",
+                3_600,
+            )
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    store
+        .spill_tool_output(&project.id, &idle.id, None, "grep", "idle", "", 3_600)
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    store
+        .spill_tool_output(
+            &project.id,
+            &idle_older.id,
+            None,
+            "grep",
+            "idle older",
+            "",
+            3_600,
+        )
+        .unwrap();
+    let report = store
+        .prune_tool_outputs(&ToolOutputPruneRequest {
+            project_id: Some(project.id.clone()),
+            session_id: None,
+            older_than_secs: None,
+            max_entries: Some(1),
+            dry_run: false,
+        })
+        .unwrap();
+    assert_eq!(report.protected_active, 2);
+    assert_eq!(report.overflow_removed, 1);
+    assert_eq!(
+        store
+            .tool_output_stats(Some(&project.id), None)
+            .unwrap()
+            .entries,
+        3,
+        "active rows can exceed the cap; only the oldest idle row is pruned"
+    );
+}
+
+#[test]
+fn audit_missing_blob_is_not_mistaken_for_an_orphan() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("missing-audit"))
+        .unwrap();
+    let session = store.create_session(&project.id, "missing").unwrap();
+    let spill = store
+        .spill_tool_output(
+            &project.id,
+            &session.id,
+            None,
+            "shell",
+            "missing",
+            "",
+            3_600,
+        )
+        .unwrap();
+    std::fs::remove_file(store.tool_output_blob_path(&spill.entry.sha256).unwrap()).unwrap();
+    let audit = store
+        .audit_tool_outputs(Some(&project.id), true, false)
+        .unwrap();
+    assert_eq!(audit.rows, 1);
+    assert_eq!(audit.missing_blobs, 1);
+    assert_eq!(audit.orphan_blobs, 0);
+    assert_eq!(audit.blob_files, 0);
+}
+
+#[test]
+fn tool_output_tool_stats_report_preview_bytes() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("preview-stats"))
+        .unwrap();
+    let session = store.create_session(&project.id, "preview").unwrap();
+    store
+        .spill_tool_output(
+            &project.id,
+            &session.id,
+            None,
+            "shell",
+            "full body that is longer",
+            "preview",
+            3_600,
+        )
+        .unwrap();
+    let stats = store
+        .tool_output_tool_stats(Some(&project.id), Some(&session.id))
+        .unwrap();
+    assert_eq!(stats.len(), 1);
+    assert_eq!(stats[0].tool_name, "shell");
+    assert_eq!(stats[0].preview_bytes, "preview".len() as u64);
+    assert_eq!(stats[0].bytes, "full body that is longer".len() as u64);
+}
+
+#[test]
+fn tool_output_blob_path_is_hash_only_and_case_sensitive() {
+    let (_data, store, _repo) = test_store();
+    assert!(store.tool_output_blob_path(&"a".repeat(64)).is_ok());
+    assert!(store.tool_output_blob_path(&"A".repeat(64)).is_err());
+    assert!(
+        store
+            .tool_output_blob_path("a".repeat(63).as_str())
+            .is_err()
+    );
+    assert!(
+        store
+            .tool_output_blob_path(&format!("{}x", "a".repeat(63)))
+            .is_err()
+    );
+}

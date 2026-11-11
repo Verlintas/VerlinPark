@@ -13,7 +13,7 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::tools::{AgentTool, ToolContext, ToolOutput, truncate};
+use crate::tools::{AgentTool, ToolContext, ToolOutput};
 
 const MAX_GIT_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PATCH_CHARS: usize = 60_000;
@@ -155,8 +155,8 @@ fn git_status(context: &ToolContext) -> Result<ToolOutput> {
             String::new()
         }
     );
-    Ok(ToolOutput::ok_structured(
-        truncate(format!("{summary}\n{rendered}")),
+    Ok(ToolOutput::ok_structured_preserving(
+        format!("{summary}\n{rendered}"),
         json!({
             "action": "status",
             "branch": branch,
@@ -169,6 +169,7 @@ fn git_status(context: &ToolContext) -> Result<ToolOutput> {
             "truncated": status.truncated || entries.len() >= MAX_STATUS_ENTRIES,
             "worktree": context.root.to_string_lossy().to_string(),
         }),
+        false,
     ))
 }
 
@@ -309,8 +310,8 @@ fn git_diff(context: &ToolContext, input: &Value, paths: &[String]) -> Result<To
         patch_text.len(),
         if patch.truncated { " (capped)" } else { "" }
     );
-    Ok(ToolOutput::ok_structured(
-        truncate(format!("{summary}\n{patch_text}")),
+    Ok(ToolOutput::ok_structured_preserving(
+        format!("{summary}\n{patch_text}"),
         json!({
             "action": "diff",
             "scope": scope,
@@ -319,6 +320,7 @@ fn git_diff(context: &ToolContext, input: &Value, paths: &[String]) -> Result<To
             "stat_only": stat_only,
             "truncated": patch.truncated || patch.stdout.len() > MAX_PATCH_CHARS,
         }),
+        false,
     ))
 }
 
@@ -382,13 +384,14 @@ fn git_log(context: &ToolContext, input: &Value, paths: &[String]) -> Result<Too
         })
         .collect::<Vec<_>>()
         .join("\n");
-    Ok(ToolOutput::ok_structured(
-        truncate(rendered),
+    Ok(ToolOutput::ok_structured_preserving(
+        rendered,
         json!({
             "action": "log",
             "commits": commits,
             "truncated": output.truncated,
         }),
+        false,
     ))
 }
 
@@ -423,8 +426,8 @@ fn git_show(context: &ToolContext, input: &Value, paths: &[String]) -> Result<To
     }
     let patch = run_git(&context.root, &patch_args)?;
     let patch_text = truncate_chars(&patch.stdout, MAX_PATCH_CHARS);
-    Ok(ToolOutput::ok_structured(
-        truncate(format!("{}\n{patch_text}", stat.stdout.trim_end())),
+    Ok(ToolOutput::ok_structured_preserving(
+        format!("{}\n{patch_text}", stat.stdout.trim_end()),
         json!({
             "action": "show",
             "commit": commit,
@@ -432,6 +435,7 @@ fn git_show(context: &ToolContext, input: &Value, paths: &[String]) -> Result<To
             "patch": patch_text,
             "truncated": stat.truncated || patch.truncated,
         }),
+        false,
     ))
 }
 
@@ -518,14 +522,15 @@ fn git_blame(context: &ToolContext, input: &Value) -> Result<ToolOutput> {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    Ok(ToolOutput::ok_structured(
-        truncate(rendered),
+    Ok(ToolOutput::ok_structured_preserving(
+        rendered,
         json!({
             "action": "blame",
             "path": path,
             "lines": entries,
             "truncated": output.truncated,
         }),
+        false,
     ))
 }
 
@@ -550,14 +555,15 @@ fn git_files(context: &ToolContext, input: &Value) -> Result<ToolOutput> {
         .take(MAX_FILES)
         .map(str::to_string)
         .collect::<Vec<_>>();
-    Ok(ToolOutput::ok_structured(
-        truncate(files.join("\n")),
+    Ok(ToolOutput::ok_structured_preserving(
+        files.join("\n"),
         json!({
             "action": "files",
             "commit": commit,
             "files": files,
             "truncated": output.truncated || files.len() >= MAX_FILES,
         }),
+        false,
     ))
 }
 

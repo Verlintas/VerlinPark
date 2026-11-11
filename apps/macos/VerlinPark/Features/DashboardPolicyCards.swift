@@ -520,6 +520,97 @@ struct IntegrationPolicyCard: View {
     }
 }
 
+struct ToolOutputPolicyCard: View {
+    @Environment(AppModel.self) private var model
+    let project: Project
+
+    var body: some View {
+        @Bindable var model = model
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Tool-output policy")
+                    Text(project.name)
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.toolOutputPolicyBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Toggle("Spill oversized results", isOn: $model.toolOutputEnabled)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+            }
+
+            Text(
+                "Full results are stored under the daemon data directory and replaced with a bounded preview. Handles are opaque and resolve only inside the originating session. Active sessions are protected from prune."
+            )
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+
+            HStack(spacing: 10) {
+                policyField("Spill > bytes", text: $model.toolOutputSpillThresholdText)
+                policyField("Preview bytes", text: $model.toolOutputPreviewBytesText)
+                policyField("Turn budget", text: $model.toolOutputMaxTurnBytesText)
+                policyField("Retention secs", text: $model.toolOutputRetentionSecsText)
+                policyField("Max entries", text: $model.toolOutputMaxEntriesText)
+                Spacer(minLength: 0)
+            }
+
+            HStack(spacing: 10) {
+                Spacer()
+                Button("Audit now") {
+                    Task { await model.auditToolOutputs() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.toolOutputPolicyBusy)
+                Button("Reset") {
+                    Task { await model.resetToolOutputPolicy() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.toolOutputPolicyBusy)
+                Button("Save policy") {
+                    Task { await model.saveToolOutputPolicy() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.toolOutputPolicyBusy)
+            }
+
+            if let status = model.toolOutputPolicyStatus {
+                Text(status)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 0)
+        .task(id: project.id) {
+            await model.loadToolOutputPolicy()
+        }
+    }
+
+    private func policyField(_ title: String, text: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.tertiary)
+            TextField("required", text: text)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 9, design: .monospaced))
+                .frame(width: 82)
+        }
+    }
+}
+
 struct ArtifactPolicyCard: View {
     @Environment(AppModel.self) private var model
     let project: Project

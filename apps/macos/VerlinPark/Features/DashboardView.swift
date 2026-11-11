@@ -433,6 +433,7 @@ struct DashboardView: View {
                 MemoryCard(project: project)
                 MemoryHealthCard(project: project)
                 MemoryPolicyCard(project: project)
+                ToolOutputPolicyCard(project: project)
                 ArtifactPolicyCard(project: project)
                 MailboxPolicyCard(project: project)
                 WorktreeCleanupCard(project: project)

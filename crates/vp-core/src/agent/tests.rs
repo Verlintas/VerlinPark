@@ -133,6 +133,8 @@ fn test_service_with_provider_cap(
         approval_timeout_secs: 600,
         compact_after_tokens: 0,
         compact_keep_messages: 8,
+        compact_keep_tokens: 1_000_000,
+        compact_prepare_ratio: 0.6,
         context_window: 0,
     };
     let service = AgentService::configured(engine.clone(), config);
@@ -7358,6 +7360,1290 @@ async fn compacts_long_conversations_and_resumes_from_the_summary() {
     assert!(replay.consistent, "compaction replay drifted: {replay:?}");
 }
 
+#[test]
+fn estimate_message_tokens_includes_tool_call_payloads() {
+    let dry = ChatMessage::user("hello");
+    let with_calls = ChatMessage::assistant_tool_calls(
+        "hello",
+        vec![vp_providers::ToolCall {
+            id: "call-1".into(),
+            name: "shell".into(),
+            arguments: "{\"command\":\"echo hi\"}".into(),
+        }],
+    );
+    assert!(estimate_message_tokens(&with_calls) > estimate_message_tokens(&dry));
+}
+
+#[test]
+fn keep_tokens_trims_to_a_deterministic_message_boundary() {
+    let mut conversation = Vec::new();
+    for index in 0..12 {
+        conversation.push(if index % 2 == 0 {
+            ChatMessage::user("x".repeat(400))
+        } else {
+            ChatMessage {
+                role: "assistant".into(),
+                content: "y".repeat(400),
+                tool_calls: None,
+                tool_call_id: None,
+            }
+        });
+    }
+    let count_only = safe_context_cut_with_tokens(&conversation, 8, 0, 0).unwrap();
+    let token_limited = safe_context_cut_with_tokens(&conversation, 8, 250, 0).unwrap();
+    assert!(token_limited >= count_only);
+    assert!(matches!(
+        conversation[token_limited].role.as_str(),
+        "user" | "assistant"
+    ));
+    // The retained tail satisfies the token budget unless a single message is
+    // already larger than the budget.
+    let retained = estimate_messages_tokens(&conversation[token_limited..]);
+    assert!(retained <= 500, "retained tail was {retained} tokens");
+}
+
+#[test]
+fn structured_state_is_deterministic_and_refreshable() {
+    let state = ContextStructuredState {
+        goal: "ship C1".into(),
+        plan_revision: 3,
+        active_task_id: Some("T2".into()),
+        active_task_title: Some("paging".into()),
+        active_task_department: Some("runtime".into()),
+        active_task_acceptance: vec!["tests pass".into(), "no path escape".into()],
+        active_task_write_scope: vec!["crates/vp-core".into()],
+        recent_completed_task_ids: vec!["T1".into()],
+        generated_at: "2026-11-11T00:00:00Z".into(),
+    };
+    let first = render_structured_state(&state);
+    let second = render_structured_state(&state);
+    assert_eq!(first, second);
+    assert!(first.contains("Goal: ship C1"));
+    assert!(first.contains("Plan revision: 3"));
+    assert!(first.contains("Active task: T2 - paging"));
+    assert!(first.contains("tests pass"));
+    assert!(first.contains("crates/vp-core"));
+    let refreshed = refresh_structured_state(
+        &format!("Earlier conversation summary\n{first}\nmodel summary text"),
+        &render_structured_state(&ContextStructuredState {
+            plan_revision: 4,
+            ..state
+        }),
+    );
+    assert_eq!(refreshed.matches(STRUCTURED_STATE_START).count(), 1);
+    assert!(refreshed.contains("Plan revision: 4"));
+    assert!(refreshed.contains("model summary text"));
+}
+
+#[tokio::test]
+async fn prepared_summary_cache_invalidates_on_every_key_component() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, _project) = test_service(&dir);
+    let config = service.config.read().unwrap().as_ref().unwrap().clone();
+    let spec = AgentSpec {
+        id: "leader".into(),
+        role: AgentRole::Leader,
+        name: "Leader".into(),
+        depth: 0,
+        parent_name: None,
+        title: None,
+        task_id: None,
+        department: None,
+        profile: AgentProfile::Generic,
+        allow_delegation: true,
+        auto_approve: false,
+        worktree: PathBuf::from("."),
+        branch: "test".into(),
+        session_worktree: PathBuf::from("."),
+        session_branch: "test".into(),
+        write_scope: Vec::new(),
+        base_commit: String::new(),
+    };
+    let conversation = vec![
+        ChatMessage::user("one"),
+        ChatMessage {
+            role: "assistant".into(),
+            content: "two".into(),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+        ChatMessage::user("three"),
+    ];
+    let key = prepared_summary_key(&config, &spec, "prefix-a", 2, &conversation, 3);
+    let prepared = PreparedSummary {
+        key: key.clone(),
+        summary: "summary".into(),
+        input_tokens: 10,
+        output_tokens: 5,
+        estimated_usage: false,
+    };
+    let mut runtime = CompactionRuntime {
+        prepared: Some(prepared.clone()),
+        failed_prepare_keys: HashSet::new(),
+    };
+    let (reused, was_present) = runtime.take_reusable(&config, &spec, "prefix-a", 2, &conversation);
+    assert!(reused.is_some());
+    assert!(was_present);
+
+    let mut wrong_prefix = CompactionRuntime {
+        prepared: Some(prepared.clone()),
+        failed_prepare_keys: HashSet::new(),
+    };
+    assert!(
+        wrong_prefix
+            .take_reusable(&config, &spec, "prefix-b", 2, &conversation)
+            .0
+            .is_none()
+    );
+    let mut wrong_plan = CompactionRuntime {
+        prepared: Some(prepared.clone()),
+        failed_prepare_keys: HashSet::new(),
+    };
+    assert!(
+        wrong_plan
+            .take_reusable(&config, &spec, "prefix-a", 3, &conversation)
+            .0
+            .is_none()
+    );
+    let mut mutated = conversation.clone();
+    mutated[0].content = "one changed".into();
+    let mut wrong_cursor = CompactionRuntime {
+        prepared: Some(prepared),
+        failed_prepare_keys: HashSet::new(),
+    };
+    assert!(
+        wrong_cursor
+            .take_reusable(&config, &spec, "prefix-a", 2, &mutated)
+            .0
+            .is_none()
+    );
+    let _ = engine;
+}
+
+#[tokio::test]
+async fn structured_state_honors_an_explicit_task_id() {
+    let dir = TempDir::new().unwrap();
+    let (engine, _service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "explicit task".into(), None)
+        .await
+        .unwrap();
+    let plan = TeamPlan {
+        goal: "two tasks".into(),
+        departments: vec![PlanDepartment {
+            name: "impl".into(),
+            manager_title: "Implementation".into(),
+            profile: "coding".into(),
+            objective: "build".into(),
+            token_budget: None,
+            cost_budget_usd: None,
+        }],
+        tasks: vec![
+            PlanTask {
+                id: "T1".into(),
+                department: "impl".into(),
+                title: "First".into(),
+                kind: "coding".into(),
+                priority: 0,
+                profile: None,
+                deps: Vec::new(),
+                write_scope: vec!["src/one".into()],
+                acceptance: vec!["one done".into()],
+                token_budget: None,
+                cost_budget_usd: None,
+            },
+            PlanTask {
+                id: "T2".into(),
+                department: "impl".into(),
+                title: "Second".into(),
+                kind: "coding".into(),
+                priority: 0,
+                profile: None,
+                deps: vec!["T1".into()],
+                write_scope: vec!["src/two".into()],
+                acceptance: vec!["two done".into()],
+                token_budget: None,
+                cost_budget_usd: None,
+            },
+        ],
+    };
+    engine.set_team_plan(&session.id, &plan).await.unwrap();
+    let spec = AgentSpec {
+        id: "worker".into(),
+        role: AgentRole::Worker,
+        name: "Worker".into(),
+        depth: 1,
+        parent_name: Some("Leader".into()),
+        title: Some("Implementation".into()),
+        task_id: Some("T2".into()),
+        department: Some("impl".into()),
+        profile: AgentProfile::Coding,
+        allow_delegation: false,
+        auto_approve: false,
+        worktree: PathBuf::from("."),
+        branch: "test".into(),
+        session_worktree: PathBuf::from("."),
+        session_branch: "test".into(),
+        write_scope: vec!["src/two".into()],
+        base_commit: String::new(),
+    };
+    let state = load_compaction_structured_state(&engine, &session, &spec).await;
+    assert_eq!(state.goal, "two tasks");
+    assert_eq!(state.plan_revision, 1);
+    assert_eq!(state.active_task_id.as_deref(), Some("T2"));
+    assert_eq!(state.active_task_title.as_deref(), Some("Second"));
+    assert_eq!(state.active_task_department.as_deref(), Some("impl"));
+    assert_eq!(state.active_task_acceptance, vec!["two done".to_string()]);
+    assert_eq!(state.active_task_write_scope, vec!["src/two".to_string()]);
+    let rendered = render_structured_state(&state);
+    assert!(rendered.contains("Active task: T2 - Second"));
+    assert!(rendered.contains("src/two"));
+}
+
+#[tokio::test]
+async fn structured_state_without_a_plan_uses_the_session_goal() {
+    let dir = TempDir::new().unwrap();
+    let (engine, _service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "session-only goal".into(), None)
+        .await
+        .unwrap();
+    let spec = AgentSpec {
+        id: "leader".into(),
+        role: AgentRole::Leader,
+        name: "Leader".into(),
+        depth: 0,
+        parent_name: None,
+        title: None,
+        task_id: None,
+        department: None,
+        profile: AgentProfile::Generic,
+        allow_delegation: true,
+        auto_approve: false,
+        worktree: PathBuf::from("."),
+        branch: "test".into(),
+        session_worktree: PathBuf::from("."),
+        session_branch: "test".into(),
+        write_scope: Vec::new(),
+        base_commit: String::new(),
+    };
+    let state = load_compaction_structured_state(&engine, &session, &spec).await;
+    assert_eq!(state.goal, "session-only goal");
+    assert_eq!(state.plan_revision, 0);
+    assert!(state.active_task_id.is_none());
+    assert!(state.active_task_acceptance.is_empty());
+}
+
+#[tokio::test]
+async fn agent_shaping_uses_the_project_tool_output_policy() {
+    let dir = TempDir::new().unwrap();
+    let (engine, _service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id.clone(), "policy shaping".into(), None)
+        .await
+        .unwrap();
+    let spec = AgentSpec {
+        id: "leader".into(),
+        role: AgentRole::Leader,
+        name: "Leader".into(),
+        depth: 0,
+        parent_name: None,
+        title: None,
+        task_id: None,
+        department: None,
+        profile: AgentProfile::Generic,
+        allow_delegation: true,
+        auto_approve: false,
+        worktree: PathBuf::from("."),
+        branch: "test".into(),
+        session_worktree: PathBuf::from("."),
+        session_branch: "test".into(),
+        write_scope: Vec::new(),
+        base_commit: String::new(),
+    };
+    let mut policy = vp_protocol::types::ToolOutputPolicy {
+        spill_threshold_bytes: 100_000,
+        preview_bytes: 4096,
+        max_total_bytes_per_turn: 500_000,
+        ..vp_protocol::types::ToolOutputPolicy::default()
+    };
+    engine
+        .set_tool_output_policy(&project.id, policy.clone())
+        .await
+        .unwrap();
+    let pending = || crate::tool_output::PendingToolOutput {
+        tool_call_id: "call_policy".into(),
+        tool_name: "shell".into(),
+        output: ToolOutput::ok("p".repeat(10_000)),
+    };
+    let (shaped, _) =
+        shape_tool_output_batch(&engine, &session, &spec, &project, 0, vec![pending()])
+            .await
+            .unwrap();
+    assert!(shaped[0].output.output_ref.is_none());
+    policy.spill_threshold_bytes = 512;
+    policy.preview_bytes = 256;
+    policy.max_total_bytes_per_turn = 500_000;
+    engine
+        .set_tool_output_policy(&project.id, policy)
+        .await
+        .unwrap();
+    let (shaped, _) =
+        shape_tool_output_batch(&engine, &session, &spec, &project, 0, vec![pending()])
+            .await
+            .unwrap();
+    assert!(shaped[0].output.output_ref.is_some());
+}
+
+#[tokio::test]
+async fn read_tool_output_is_advertised_to_every_read_only_role() {
+    let dir = TempDir::new().unwrap();
+    let (_engine, service, _project) = test_service(&dir);
+    let config = service.config.read().unwrap().as_ref().unwrap().clone();
+    assert!(is_parallel_safe_tool("read_tool_output"));
+    for (role, profile) in [
+        (AgentRole::Leader, AgentProfile::Generic),
+        (AgentRole::Manager, AgentProfile::Coding),
+        (AgentRole::Verifier, AgentProfile::Verification),
+        (AgentRole::Scout, AgentProfile::Research),
+        (AgentRole::Worker, AgentProfile::Coding),
+        (AgentRole::Labour, AgentProfile::Generic),
+    ] {
+        assert!(
+            role.allows_tool(profile, "read_tool_output"),
+            "{role:?} must allow read_tool_output"
+        );
+        let schemas = tool_schemas(&config, role, profile, role == AgentRole::Leader);
+        assert!(
+            schemas
+                .iter()
+                .any(|schema| schema.name == "read_tool_output"),
+            "{role:?} schema must include read_tool_output"
+        );
+    }
+}
+
+#[tokio::test]
+async fn spills_large_tool_results_and_pages_them_with_read_tool_output() {
+    let dir = TempDir::new().unwrap();
+    let (engine, _service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id.clone(), "tool output".into(), None)
+        .await
+        .unwrap();
+    let spec = AgentSpec {
+        id: "leader".into(),
+        role: AgentRole::Leader,
+        name: "Leader".into(),
+        depth: 0,
+        parent_name: None,
+        title: None,
+        task_id: None,
+        department: None,
+        profile: AgentProfile::Generic,
+        allow_delegation: true,
+        auto_approve: false,
+        worktree: PathBuf::from("."),
+        branch: "test".into(),
+        session_worktree: PathBuf::from("."),
+        session_branch: "test".into(),
+        write_scope: Vec::new(),
+        base_commit: String::new(),
+    };
+    let content = (0..1_000)
+        .map(|index| format!("line {index:04} value {}", "x".repeat(20)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let pending = vec![crate::tool_output::PendingToolOutput {
+        tool_call_id: "call_shell".into(),
+        tool_name: "shell".into(),
+        output: ToolOutput::ok(content.clone()),
+    }];
+    let (shaped, provider_bytes) =
+        shape_tool_output_batch(&engine, &session, &spec, &project, 0, pending)
+            .await
+            .unwrap();
+    let output = &shaped[0].output;
+    let handle = output.output_ref.clone().expect("spilled handle");
+    assert!(output.truncated);
+    assert!(output.total_bytes >= content.len() as u64);
+    assert!(output.content.len() < 5_000);
+    assert!(output.content.contains("read_tool_output handle="));
+    assert!(provider_bytes <= 64 * 1024);
+    let events = engine
+        .list_events(session.id.clone(), 0, 100)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "tool.output_spilled"
+            && event.payload["handle"].as_str() == Some(handle.as_str())
+            && event.payload.get("content").is_none()
+    }));
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "tool.output_truncated")
+    );
+    let page = run_read_tool_output(
+        &engine,
+        &session,
+        serde_json::json!({
+            "handle": handle,
+            "offset": 500,
+            "limit": 5,
+        }),
+    )
+    .await;
+    assert!(!page.is_error);
+    assert!(page.content.contains("line 0500"));
+    assert!(page.content.contains("line 0504"));
+    assert!(page.content.contains("read_tool_output"));
+    let foreign = engine
+        .create_session(project.id, "foreign".into(), None)
+        .await
+        .unwrap();
+    let denied =
+        run_read_tool_output(&engine, &foreign, serde_json::json!({"handle": handle})).await;
+    assert!(denied.is_error);
+    assert!(denied.content.contains("unknown tool output handle"));
+}
+
+#[test]
+fn token_aware_cut_keeps_one_oversized_message() {
+    let conversation = vec![
+        ChatMessage::user("x".repeat(4_000)),
+        ChatMessage {
+            role: "assistant".into(),
+            content: "y".repeat(4_000),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+        ChatMessage::user("small tail"),
+    ];
+    let cut = safe_context_cut_with_tokens(&conversation, 8, 10, 0);
+    assert_eq!(cut, None, "there is no safe cut that leaves a usable tail");
+    let conversation = vec![
+        ChatMessage::user("x".repeat(4_000)),
+        ChatMessage {
+            role: "assistant".into(),
+            content: "y".repeat(4_000),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+        ChatMessage::user("tail"),
+        ChatMessage {
+            role: "assistant".into(),
+            content: "last".into(),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+    ];
+    let cut = safe_context_cut_with_tokens(&conversation, 2, 5, 0).unwrap();
+    assert_eq!(cut, 2);
+    assert_eq!(conversation[cut].role, "user");
+}
+
+#[test]
+fn zero_keep_tokens_falls_back_to_message_count() {
+    let conversation = (0..10)
+        .map(|index| {
+            if index % 2 == 0 {
+                ChatMessage::user(format!("message {index}"))
+            } else {
+                ChatMessage {
+                    role: "assistant".into(),
+                    content: format!("message {index}"),
+                    tool_calls: None,
+                    tool_call_id: None,
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    let with_zero = safe_context_cut_with_tokens(&conversation, 4, 0, 0).unwrap();
+    let with_tokens = safe_context_cut_with_tokens(&conversation, 4, 1_000_000, 0).unwrap();
+    assert_eq!(with_zero, with_tokens);
+    assert!(with_zero >= 6);
+}
+
+#[tokio::test]
+async fn prepare_failure_is_distinct_from_compaction_failure() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(ScriptedStreamProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![Err(ProviderError::Stream(
+            "prepare unavailable".into(),
+        ))]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "prepare failure".into(), None)
+        .await
+        .unwrap();
+    let mut config = service.config.read().unwrap().as_ref().unwrap().clone();
+    config.compact_after_tokens = 1_000;
+    config.compact_keep_messages = 2;
+    config.compact_keep_tokens = 100_000;
+    config.compact_prepare_ratio = 0.6;
+    config.context_window = 100_000;
+    let spec = AgentSpec {
+        id: "leader".into(),
+        role: AgentRole::Leader,
+        name: "Leader".into(),
+        depth: 0,
+        parent_name: None,
+        title: None,
+        task_id: None,
+        department: None,
+        profile: AgentProfile::Generic,
+        allow_delegation: true,
+        auto_approve: false,
+        worktree: PathBuf::from("."),
+        branch: "test".into(),
+        session_worktree: PathBuf::from("."),
+        session_branch: "test".into(),
+        write_scope: Vec::new(),
+        base_commit: String::new(),
+    };
+    let budget = SessionBudget::new(
+        None,
+        0,
+        AgentCaps {
+            managers: 1,
+            workers: 1,
+            labour: 1,
+        },
+    );
+    let control = RunControl::new();
+    let mut conversation = Vec::new();
+    let mut conversation_ids = Vec::new();
+    for index in 0..7 {
+        let message = engine
+            .append_message(
+                &session.id,
+                if index % 2 == 0 { "user" } else { "assistant" },
+                &"x".repeat(400),
+                serde_json::json!([]),
+                None,
+            )
+            .await
+            .unwrap();
+        conversation.push(ChatMessage {
+            role: message.role,
+            content: message.content,
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        conversation_ids.push(Some(message.id));
+    }
+    let mut runtime = CompactionRuntime::default();
+    let changed = compact_context_if_needed(
+        &engine,
+        &config,
+        &session,
+        &spec,
+        &budget,
+        &control,
+        &mut conversation,
+        &mut conversation_ids,
+        1_000,
+        100_000,
+        0,
+        1.0,
+        false,
+        "stable-prefix",
+        0.6,
+        &mut runtime,
+        ContextStrategy::Summarize,
+    )
+    .await
+    .unwrap();
+    assert!(!changed);
+    assert!(runtime.prepared.is_none());
+    let events = engine.list_events(session.id, 0, 100).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "context.compaction_prepare_failed")
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "context.compact_failed")
+    );
+}
+
+#[tokio::test]
+async fn compaction_metrics_event_omits_summary_text() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("metrics summary".into()),
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    set_compaction(&service, 0, 3);
+    let session = engine
+        .create_session(project.id, "metrics".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    for index in 0..12 {
+        engine
+            .append_message(
+                &session.id,
+                if index % 2 == 0 { "user" } else { "assistant" },
+                &format!("message {index}: metrics event content"),
+                serde_json::json!([]),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let result = service.compact_now(&session.id).await.unwrap();
+    assert!(result.compacted);
+    let events = engine.list_events(session.id, 0, 200).await.unwrap();
+    let metrics = events
+        .iter()
+        .find(|event| event.kind == "context.compaction")
+        .expect("context.compaction");
+    assert!(metrics.payload.get("summary").is_none());
+    assert_eq!(metrics.payload["mode"], "summary");
+    assert!(metrics.payload["latency_ms"].as_u64().is_some());
+    assert!(metrics.payload["estimated_tokens_before"].as_u64().unwrap() > 0);
+    assert!(metrics.payload["estimated_tokens_after"].as_u64().unwrap() > 0);
+    assert_eq!(metrics.payload["compaction_count"], 1);
+    assert_eq!(metrics.payload["background_reuse"], false);
+}
+
+#[tokio::test]
+async fn prepared_summary_is_invalidated_by_a_real_plan_revision() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::TextDelta("prepared revision one".into()),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("synchronous revision two".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "plan invalidation".into(), None)
+        .await
+        .unwrap();
+    engine
+        .set_team_plan(&session.id, &continuation_test_plan())
+        .await
+        .unwrap();
+    let mut config = service.config.read().unwrap().as_ref().unwrap().clone();
+    config.compact_after_tokens = 1_000;
+    config.compact_keep_messages = 2;
+    config.compact_keep_tokens = 100_000;
+    config.compact_prepare_ratio = 0.6;
+    config.context_window = 100_000;
+    let spec = AgentSpec {
+        id: "leader".into(),
+        role: AgentRole::Leader,
+        name: "Leader".into(),
+        depth: 0,
+        parent_name: None,
+        title: None,
+        task_id: None,
+        department: None,
+        profile: AgentProfile::Generic,
+        allow_delegation: true,
+        auto_approve: false,
+        worktree: PathBuf::from("."),
+        branch: "test".into(),
+        session_worktree: PathBuf::from("."),
+        session_branch: "test".into(),
+        write_scope: Vec::new(),
+        base_commit: String::new(),
+    };
+    let budget = SessionBudget::new(
+        None,
+        0,
+        AgentCaps {
+            managers: 1,
+            workers: 1,
+            labour: 1,
+        },
+    );
+    let control = RunControl::new();
+    let mut conversation = Vec::new();
+    let mut conversation_ids = Vec::new();
+    for index in 0..7 {
+        let message = engine
+            .append_message(
+                &session.id,
+                if index % 2 == 0 { "user" } else { "assistant" },
+                &"x".repeat(400),
+                serde_json::json!([]),
+                None,
+            )
+            .await
+            .unwrap();
+        conversation.push(ChatMessage {
+            role: message.role,
+            content: message.content,
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        conversation_ids.push(Some(message.id));
+    }
+    let mut runtime = CompactionRuntime::default();
+    compact_context_if_needed(
+        &engine,
+        &config,
+        &session,
+        &spec,
+        &budget,
+        &control,
+        &mut conversation,
+        &mut conversation_ids,
+        1_000,
+        100_000,
+        0,
+        1.0,
+        false,
+        "stable-prefix",
+        0.6,
+        &mut runtime,
+        ContextStrategy::Summarize,
+    )
+    .await
+    .unwrap();
+    assert!(runtime.prepared.is_some());
+    let mut revised = continuation_test_plan();
+    revised.goal = "revised plan".into();
+    engine.set_team_plan(&session.id, &revised).await.unwrap();
+    for index in 7..12 {
+        let message = engine
+            .append_message(
+                &session.id,
+                if index % 2 == 0 { "user" } else { "assistant" },
+                &"y".repeat(400),
+                serde_json::json!([]),
+                None,
+            )
+            .await
+            .unwrap();
+        conversation.push(ChatMessage {
+            role: message.role,
+            content: message.content,
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        conversation_ids.push(Some(message.id));
+    }
+    let changed = compact_context_if_needed(
+        &engine,
+        &config,
+        &session,
+        &spec,
+        &budget,
+        &control,
+        &mut conversation,
+        &mut conversation_ids,
+        1_000,
+        100_000,
+        0,
+        1.0,
+        false,
+        "stable-prefix",
+        0.6,
+        &mut runtime,
+        ContextStrategy::Summarize,
+    )
+    .await
+    .unwrap();
+    assert!(changed);
+    let events = engine
+        .list_events(session.id.clone(), 0, 100)
+        .await
+        .unwrap();
+    let compaction = events
+        .iter()
+        .find(|event| event.kind == "context.compacted")
+        .expect("context.compacted");
+    assert_eq!(compaction.payload["background_reuse"], false);
+    assert_eq!(compaction.payload["fallback_to_sync"], true);
+    assert_eq!(compaction.payload["structured_state"]["plan_revision"], 2);
+    assert!(
+        compaction.payload["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("synchronous revision two")
+                && summary.contains("Goal: revised plan"))
+    );
+    let summarized = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.system.as_deref() == Some(COMPACTION_SYSTEM_PROMPT))
+        .count();
+    assert_eq!(summarized, 2);
+}
+
+#[tokio::test]
+async fn compaction_fallback_preserves_the_authoritative_plan_state() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(ScriptedStreamProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![Err(ProviderError::Stream(
+            "summary unavailable".into(),
+        ))]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "trim context".into(), None)
+        .await
+        .unwrap();
+    engine
+        .set_team_plan(&session.id, &continuation_test_plan())
+        .await
+        .unwrap();
+    let mut config = service.config.read().unwrap().as_ref().unwrap().clone();
+    config.compact_keep_messages = 2;
+    config.compact_keep_tokens = 100_000;
+    let spec = AgentSpec {
+        id: "leader".into(),
+        role: AgentRole::Leader,
+        name: "Leader".into(),
+        depth: 0,
+        parent_name: None,
+        title: None,
+        task_id: None,
+        department: None,
+        profile: AgentProfile::Generic,
+        allow_delegation: true,
+        auto_approve: false,
+        worktree: PathBuf::from("."),
+        branch: "test".into(),
+        session_worktree: PathBuf::from("."),
+        session_branch: "test".into(),
+        write_scope: Vec::new(),
+        base_commit: String::new(),
+    };
+    let budget = SessionBudget::new(
+        None,
+        0,
+        AgentCaps {
+            managers: 1,
+            workers: 1,
+            labour: 1,
+        },
+    );
+    let control = RunControl::new();
+    let mut conversation = Vec::new();
+    let mut conversation_ids = Vec::new();
+    for index in 0..10 {
+        let message = engine
+            .append_message(
+                &session.id,
+                if index % 2 == 0 { "user" } else { "assistant" },
+                "this message contains enough text to make the context exceed the tiny hard limit",
+                serde_json::json!([]),
+                None,
+            )
+            .await
+            .unwrap();
+        conversation.push(ChatMessage {
+            role: message.role,
+            content: message.content,
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        conversation_ids.push(Some(message.id));
+    }
+    let changed = compact_context_if_needed(
+        &engine,
+        &config,
+        &session,
+        &spec,
+        &budget,
+        &control,
+        &mut conversation,
+        &mut conversation_ids,
+        10,
+        200,
+        0,
+        1.0,
+        true,
+        "test-prefix",
+        0.6,
+        &mut CompactionRuntime::default(),
+        ContextStrategy::Summarize,
+    )
+    .await
+    .unwrap();
+    assert!(changed);
+    assert!(
+        conversation[0].content.contains(STRUCTURED_STATE_START),
+        "structured state must survive the trim fallback: {}",
+        conversation[0].content
+    );
+    assert!(
+        conversation[0]
+            .content
+            .contains("Goal: deferred continuation")
+    );
+    assert!(conversation[0].content.contains("T1"));
+    assert!(conversation[0].content.contains("src/one"));
+    let events = engine
+        .list_events(session.id.clone(), 0, 100)
+        .await
+        .unwrap();
+    let compaction = events
+        .iter()
+        .find(|event| event.kind == "context.compacted")
+        .expect("context.compacted");
+    assert_eq!(compaction.payload["mode"], "trim");
+    assert!(compaction.payload["structured_state"]["active_task_id"] == "T1");
+    assert!(compaction.payload["latency_ms"].as_u64().is_some());
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "context.compaction")
+    );
+}
+
+#[tokio::test]
+async fn prepared_summary_is_reused_once_at_the_threshold() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("prepared summary text".into()),
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "prepare context".into(), None)
+        .await
+        .unwrap();
+    let mut config = service.config.read().unwrap().as_ref().unwrap().clone();
+    config.compact_after_tokens = 1_000;
+    config.compact_keep_messages = 2;
+    config.compact_keep_tokens = 100_000;
+    config.compact_prepare_ratio = 0.6;
+    config.context_window = 100_000;
+    let spec = AgentSpec {
+        id: "leader".into(),
+        role: AgentRole::Leader,
+        name: "Leader".into(),
+        depth: 0,
+        parent_name: None,
+        title: None,
+        task_id: None,
+        department: None,
+        profile: AgentProfile::Generic,
+        allow_delegation: true,
+        auto_approve: false,
+        worktree: PathBuf::from("."),
+        branch: "test".into(),
+        session_worktree: PathBuf::from("."),
+        session_branch: "test".into(),
+        write_scope: Vec::new(),
+        base_commit: String::new(),
+    };
+    let budget = SessionBudget::new(
+        None,
+        0,
+        AgentCaps {
+            managers: 1,
+            workers: 1,
+            labour: 1,
+        },
+    );
+    let control = RunControl::new();
+    let mut conversation = Vec::new();
+    let mut conversation_ids = Vec::new();
+    for index in 0..7 {
+        let message = engine
+            .append_message(
+                &session.id,
+                if index % 2 == 0 { "user" } else { "assistant" },
+                &"x".repeat(400),
+                serde_json::json!([]),
+                None,
+            )
+            .await
+            .unwrap();
+        conversation.push(ChatMessage {
+            role: message.role,
+            content: message.content,
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        conversation_ids.push(Some(message.id));
+    }
+    let mut runtime = CompactionRuntime::default();
+    let changed = compact_context_if_needed(
+        &engine,
+        &config,
+        &session,
+        &spec,
+        &budget,
+        &control,
+        &mut conversation,
+        &mut conversation_ids,
+        1_000,
+        100_000,
+        0,
+        1.0,
+        false,
+        "stable-prefix",
+        0.6,
+        &mut runtime,
+        ContextStrategy::Summarize,
+    )
+    .await
+    .unwrap();
+    assert!(!changed, "preparation must not swap the summary");
+    assert!(runtime.prepared.is_some());
+    for index in 7..12 {
+        let message = engine
+            .append_message(
+                &session.id,
+                if index % 2 == 0 { "user" } else { "assistant" },
+                &"y".repeat(400),
+                serde_json::json!([]),
+                None,
+            )
+            .await
+            .unwrap();
+        conversation.push(ChatMessage {
+            role: message.role,
+            content: message.content,
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        conversation_ids.push(Some(message.id));
+    }
+    let changed = compact_context_if_needed(
+        &engine,
+        &config,
+        &session,
+        &spec,
+        &budget,
+        &control,
+        &mut conversation,
+        &mut conversation_ids,
+        1_000,
+        100_000,
+        0,
+        1.0,
+        false,
+        "stable-prefix",
+        0.6,
+        &mut runtime,
+        ContextStrategy::Summarize,
+    )
+    .await
+    .unwrap();
+    assert!(changed);
+    assert!(runtime.prepared.is_none());
+    assert!(
+        conversation
+            .iter()
+            .any(|message| message.content.starts_with('y')),
+        "messages appended after the prepared cut must remain in the tail"
+    );
+    let summarized = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.system.as_deref() == Some(COMPACTION_SYSTEM_PROMPT))
+        .count();
+    assert_eq!(summarized, 1, "prepared summary must avoid a second call");
+    let events = engine
+        .list_events(session.id.clone(), 0, 100)
+        .await
+        .unwrap();
+    let compaction = events
+        .iter()
+        .find(|event| event.kind == "context.compacted")
+        .expect("context.compacted");
+    assert_eq!(compaction.payload["background_reuse"], true);
+    assert_eq!(compaction.payload["compaction_count"], 1);
+    assert!(
+        compaction.payload["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("prepared summary text")
+                && summary.contains(STRUCTURED_STATE_START))
+    );
+}
+
+#[tokio::test]
+async fn prepared_summary_is_invalidated_by_model_and_plan_changes() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::TextDelta("prepared summary text".into()),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("synchronous summary text".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "invalidate context".into(), None)
+        .await
+        .unwrap();
+    let mut config = service.config.read().unwrap().as_ref().unwrap().clone();
+    config.compact_after_tokens = 1_000;
+    config.compact_keep_messages = 2;
+    config.compact_keep_tokens = 100_000;
+    config.compact_prepare_ratio = 0.6;
+    config.context_window = 100_000;
+    let spec = AgentSpec {
+        id: "leader".into(),
+        role: AgentRole::Leader,
+        name: "Leader".into(),
+        depth: 0,
+        parent_name: None,
+        title: None,
+        task_id: None,
+        department: None,
+        profile: AgentProfile::Generic,
+        allow_delegation: true,
+        auto_approve: false,
+        worktree: PathBuf::from("."),
+        branch: "test".into(),
+        session_worktree: PathBuf::from("."),
+        session_branch: "test".into(),
+        write_scope: Vec::new(),
+        base_commit: String::new(),
+    };
+    let budget = SessionBudget::new(
+        None,
+        0,
+        AgentCaps {
+            managers: 1,
+            workers: 1,
+            labour: 1,
+        },
+    );
+    let control = RunControl::new();
+    let mut conversation = Vec::new();
+    let mut conversation_ids = Vec::new();
+    for index in 0..7 {
+        let message = engine
+            .append_message(
+                &session.id,
+                if index % 2 == 0 { "user" } else { "assistant" },
+                &"x".repeat(400),
+                serde_json::json!([]),
+                None,
+            )
+            .await
+            .unwrap();
+        conversation.push(ChatMessage {
+            role: message.role,
+            content: message.content,
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        conversation_ids.push(Some(message.id));
+    }
+    let mut runtime = CompactionRuntime::default();
+    compact_context_if_needed(
+        &engine,
+        &config,
+        &session,
+        &spec,
+        &budget,
+        &control,
+        &mut conversation,
+        &mut conversation_ids,
+        1_000,
+        100_000,
+        0,
+        1.0,
+        false,
+        "stable-prefix",
+        0.6,
+        &mut runtime,
+        ContextStrategy::Summarize,
+    )
+    .await
+    .unwrap();
+    assert!(runtime.prepared.is_some());
+    config.model = "different-model".into();
+    for index in 7..12 {
+        let message = engine
+            .append_message(
+                &session.id,
+                if index % 2 == 0 { "user" } else { "assistant" },
+                &"y".repeat(400),
+                serde_json::json!([]),
+                None,
+            )
+            .await
+            .unwrap();
+        conversation.push(ChatMessage {
+            role: message.role,
+            content: message.content,
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        conversation_ids.push(Some(message.id));
+    }
+    let changed = compact_context_if_needed(
+        &engine,
+        &config,
+        &session,
+        &spec,
+        &budget,
+        &control,
+        &mut conversation,
+        &mut conversation_ids,
+        1_000,
+        100_000,
+        0,
+        1.0,
+        false,
+        "stable-prefix",
+        0.6,
+        &mut runtime,
+        ContextStrategy::Summarize,
+    )
+    .await
+    .unwrap();
+    assert!(changed);
+    let events = engine
+        .list_events(session.id.clone(), 0, 100)
+        .await
+        .unwrap();
+    let compaction = events
+        .iter()
+        .find(|event| event.kind == "context.compacted")
+        .expect("context.compacted");
+    assert_eq!(compaction.payload["background_reuse"], false);
+    assert_eq!(compaction.payload["fallback_to_sync"], true);
+    assert!(
+        compaction.payload["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("synchronous summary text"))
+    );
+}
+
 #[tokio::test]
 async fn manually_compacts_an_idle_session_without_starting_a_prompt() {
     let dir = TempDir::new().unwrap();
@@ -7378,6 +8664,10 @@ async fn manually_compacts_an_idle_session_without_starting_a_prompt() {
         .unwrap();
     engine
         .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    engine
+        .set_team_plan(&session.id, &continuation_test_plan())
         .await
         .unwrap();
     for index in 0..12 {
@@ -7401,6 +8691,10 @@ async fn manually_compacts_an_idle_session_without_starting_a_prompt() {
     assert_eq!(compaction.mode, "summary");
     assert!(compaction.summarized_messages > 0);
     assert!(compaction.estimated_tokens_after < compaction.estimated_tokens_before);
+    let structured = compaction.structured_state.expect("structured state");
+    assert_eq!(structured.active_task_id.as_deref(), Some("T1"));
+    assert_eq!(structured.goal, "deferred continuation");
+    assert_eq!(structured.plan_revision, 1);
 
     // Manual compaction must not start a prompt or change the session status.
     let sessions = engine.list_sessions(Some(project.id)).await.unwrap();
@@ -7421,11 +8715,97 @@ async fn manually_compacts_an_idle_session_without_starting_a_prompt() {
             .content
             .starts_with("Earlier conversation summary")
     );
+    assert!(loaded.messages[0].content.contains(STRUCTURED_STATE_START));
+    assert!(
+        loaded.messages[0]
+            .content
+            .contains("Goal: deferred continuation")
+    );
+    assert!(loaded.messages[0].content.contains("T1"));
     let status = engine.session_context_status(&session.id).await.unwrap();
+    assert_eq!(status.compaction_count, 1);
+    assert!(status.last_compaction_latency_ms < 60_000);
+    assert_eq!(
+        status.last_compaction_tokens_before,
+        compaction.estimated_tokens_before
+    );
+    assert_eq!(
+        status.last_compaction_tokens_after,
+        compaction.estimated_tokens_after
+    );
     let usage = status.usage.expect("post-compaction usage");
     let summary = status.last_compaction.expect("last compaction");
     assert_eq!(usage.estimated_tokens, summary.estimated_tokens_after);
     assert!(usage.estimated_tokens < summary.estimated_tokens_before);
+}
+
+#[tokio::test]
+async fn manual_compaction_count_and_latency_are_cumulative() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::TextDelta("first summary".into()),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("second summary".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    set_compaction(&service, 0, 3);
+    let session = engine
+        .create_session(project.id, "count context".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    for index in 0..14 {
+        engine
+            .append_message(
+                &session.id,
+                if index % 2 == 0 { "user" } else { "assistant" },
+                &format!("message {index}: cumulative compaction metrics"),
+                serde_json::json!([]),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let first = service.compact_now(&session.id).await.unwrap();
+    assert_eq!(first.compaction.as_ref().unwrap().compaction_count, 1);
+    // Add tail messages so the second pass has work even after the first
+    // summary was inserted.
+    for index in 14..22 {
+        engine
+            .append_message(
+                &session.id,
+                if index % 2 == 0 { "user" } else { "assistant" },
+                &format!("message {index}: second compaction window"),
+                serde_json::json!([]),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let second = service.compact_now(&session.id).await.unwrap();
+    assert!(second.compacted);
+    assert_eq!(second.compaction.as_ref().unwrap().compaction_count, 2);
+    assert!(!second.compaction.as_ref().unwrap().background_reuse);
+    let status = engine.session_context_status(&session.id).await.unwrap();
+    assert_eq!(status.compaction_count, 2);
+    let compactions = engine
+        .list_events(session.id, 0, 300)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "context.compacted")
+        .count();
+    assert_eq!(compactions, 2);
 }
 
 #[tokio::test]
@@ -7714,6 +9094,9 @@ async fn trims_older_messages_when_summarization_fails() {
         0,
         1.0,
         false,
+        "test-prefix",
+        0.6,
+        &mut super::CompactionRuntime::default(),
         super::ContextStrategy::Summarize,
     )
     .await
@@ -7815,6 +9198,9 @@ async fn compaction_counts_system_and_tool_tokens() {
         40,
         1.0,
         false,
+        "test-prefix",
+        0.6,
+        &mut super::CompactionRuntime::default(),
         super::ContextStrategy::Summarize,
     )
     .await
@@ -7914,6 +9300,9 @@ async fn compaction_applies_context_calibration() {
         40,
         2.0,
         false,
+        "test-prefix",
+        0.6,
+        &mut super::CompactionRuntime::default(),
         super::ContextStrategy::Trim,
     )
     .await
@@ -12816,6 +14205,8 @@ fn configured_service_for_test(
         approval_timeout_secs: 600,
         compact_after_tokens: 0,
         compact_keep_messages: 8,
+        compact_keep_tokens: 15_000,
+        compact_prepare_ratio: 0.6,
         context_window: 0,
     };
     AgentService::configured(engine, config)

@@ -65,11 +65,13 @@ use vp_protocol::types::{
     SourceReindexResult, SourceSearchResult, SourceStats, SteeringMessage, StoredMessage,
     TaskQueueResult, TaskSchedulerPolicy, TaskSchedulerPolicyResult, TaskStall, TeamPlan,
     TerminalCloseResult, TerminalOpenResult, TerminalReadResult, TerminalResizeResult,
-    TerminalWriteResult, TodoItem, UpdateModelPresetParams, UpdateSourceMetadataParams,
-    UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult, UsageTotals, WorkspaceFileResult,
-    WorkspaceGrepResult, WorkspaceListResult, WorkspaceSearchResult, WorkspaceTreeResult,
-    WorkspaceWriteResult, WorktreeCleanupEntry, WorktreeCleanupResult, WorktreePolicyResult,
-    WorktreeRetentionPolicy, WriteLease,
+    TerminalWriteResult, TodoItem, ToolOutputAuditParams, ToolOutputAuditResult,
+    ToolOutputListParams, ToolOutputListResult, ToolOutputPolicy, ToolOutputPolicyResult,
+    ToolOutputPruneParams, ToolOutputPruneResult, ToolOutputStatus, ToolOutputStatusParams,
+    UpdateModelPresetParams, UpdateSourceMetadataParams, UsageBucket, UsageCsvResult, UsageEntry,
+    UsageLedgerResult, UsageTotals, WorkspaceFileResult, WorkspaceGrepResult, WorkspaceListResult,
+    WorkspaceSearchResult, WorkspaceTreeResult, WorkspaceWriteResult, WorktreeCleanupEntry,
+    WorktreeCleanupResult, WorktreePolicyResult, WorktreeRetentionPolicy, WriteLease,
 };
 use vp_store::Store;
 use vp_store::store::{
@@ -106,6 +108,7 @@ pub mod skills;
 pub mod sources;
 pub mod terminal;
 pub mod textdiff;
+pub mod tool_output;
 pub mod tooling;
 pub mod update;
 pub mod workspace;
@@ -1264,6 +1267,158 @@ impl Engine {
         tokio::task::spawn_blocking(move || store.set_task_scheduler_policy(&id, &stored))
             .await??;
         Ok(TaskSchedulerPolicyResult { project_id, policy })
+    }
+
+    pub async fn get_tool_output_policy(&self, project_id: &str) -> Result<ToolOutputPolicy> {
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        tokio::task::spawn_blocking({
+            let store = store.clone();
+            let id = project_id.clone();
+            move || store.get_project(&id)
+        })
+        .await??
+        .ok_or_else(|| anyhow::anyhow!("project not found: {project_id}"))?;
+        tokio::task::spawn_blocking(move || store.get_tool_output_policy(&project_id)).await?
+    }
+
+    pub async fn set_tool_output_policy(
+        &self,
+        project_id: &str,
+        policy: ToolOutputPolicy,
+    ) -> Result<ToolOutputPolicyResult> {
+        crate::tool_output::validate_tool_output_policy(&policy)?;
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        tokio::task::spawn_blocking({
+            let store = store.clone();
+            let id = project_id.clone();
+            move || store.get_project(&id)
+        })
+        .await??
+        .ok_or_else(|| anyhow::anyhow!("project not found: {project_id}"))?;
+        let stored = policy.clone();
+        let id = project_id.clone();
+        tokio::task::spawn_blocking(move || store.set_tool_output_policy(&id, &stored)).await??;
+        Ok(ToolOutputPolicyResult { project_id, policy })
+    }
+
+    pub async fn tool_output_status(
+        &self,
+        params: ToolOutputStatusParams,
+    ) -> Result<ToolOutputStatus> {
+        let project_id = params.project_id.clone();
+        let session_id = params.session_id.clone();
+        let store = self.store.clone();
+        let project_for_policy = project_id.clone();
+        let session_for_policy = session_id.clone();
+        let policy = tokio::task::spawn_blocking(move || match project_for_policy {
+            Some(project_id) => store.get_tool_output_policy(&project_id),
+            None => match session_for_policy {
+                Some(session_id) => match store.get_session(&session_id)? {
+                    Some(session) => store.get_tool_output_policy(&session.project_id),
+                    None => Ok(ToolOutputPolicy::default()),
+                },
+                None => Ok(ToolOutputPolicy::default()),
+            },
+        })
+        .await??;
+        let output_store = crate::tool_output::ToolOutputStore::new(self.store.clone());
+        tokio::task::spawn_blocking(move || {
+            output_store.status(project_id.as_deref(), session_id.as_deref(), policy)
+        })
+        .await?
+    }
+
+    pub async fn list_tool_outputs(
+        &self,
+        params: ToolOutputListParams,
+    ) -> Result<ToolOutputListResult> {
+        let output_store = crate::tool_output::ToolOutputStore::new(self.store.clone());
+        tokio::task::spawn_blocking(move || {
+            let limit = params.limit.unwrap_or(100) as usize;
+            output_store.list(
+                params.project_id.as_deref(),
+                params.session_id.as_deref(),
+                params.tool_name.as_deref(),
+                params.before_created_at.as_deref(),
+                params.include_expired,
+                limit,
+            )
+        })
+        .await?
+    }
+
+    pub async fn prune_tool_outputs(
+        &self,
+        params: ToolOutputPruneParams,
+    ) -> Result<ToolOutputPruneResult> {
+        let output_store = crate::tool_output::ToolOutputStore::new(self.store.clone());
+        tokio::task::spawn_blocking(move || {
+            let policy_project = match params.project_id.as_deref() {
+                Some(project_id) => Some(project_id.to_string()),
+                None => match params.session_id.as_deref() {
+                    Some(session_id) => output_store.session_project_id(session_id)?,
+                    None => None,
+                },
+            };
+            let policy = match policy_project.as_deref() {
+                Some(project_id) => output_store.policy(project_id)?,
+                None => ToolOutputPolicy::default(),
+            };
+            let older_than_secs = Some(params.older_than_secs.unwrap_or(policy.retention_secs));
+            output_store.prune(&vp_store::store::ToolOutputPruneRequest {
+                project_id: params.project_id,
+                session_id: params.session_id,
+                older_than_secs,
+                max_entries: params.max_entries.or(Some(policy.max_entries)),
+                dry_run: params.dry_run,
+            })
+        })
+        .await?
+    }
+
+    pub async fn audit_tool_outputs(
+        &self,
+        params: ToolOutputAuditParams,
+    ) -> Result<ToolOutputAuditResult> {
+        let output_store = crate::tool_output::ToolOutputStore::new(self.store.clone());
+        tokio::task::spawn_blocking(move || {
+            output_store.audit(
+                params.project_id.as_deref(),
+                params.verify_hashes,
+                params.clean_orphans,
+            )
+        })
+        .await?
+    }
+
+    /// Daemon retention sweep. It runs per project so each project policy can
+    /// protect active sessions and enforce its own entry cap.
+    pub async fn sweep_tool_output_retention(&self) -> Result<u64> {
+        let projects = self.list_projects().await?;
+        let mut removed = 0u64;
+        for project in projects {
+            let output_store = crate::tool_output::ToolOutputStore::new(self.store.clone());
+            let project_id = project.id.clone();
+            let report = tokio::task::spawn_blocking(move || {
+                let policy = output_store.policy(&project_id)?;
+                output_store.prune(&vp_store::store::ToolOutputPruneRequest {
+                    project_id: Some(project_id),
+                    session_id: None,
+                    older_than_secs: Some(policy.retention_secs),
+                    max_entries: Some(policy.max_entries),
+                    dry_run: false,
+                })
+            })
+            .await??;
+            removed = removed.saturating_add(report.removed);
+        }
+        // Clean crash-left orphan blobs after metadata pruning. This never
+        // removes a referenced body and never touches metadata.
+        let output_store = crate::tool_output::ToolOutputStore::new(self.store.clone());
+        tokio::task::spawn_blocking(move || output_store.audit(None, false, true)).await??;
+        Ok(removed)
     }
 
     pub async fn list_intake_tasks(
@@ -9899,6 +10054,13 @@ impl Engine {
         tokio::task::spawn_blocking(move || store.latest_event_by_kind(&session_id, &kind)).await?
     }
 
+    pub async fn count_events_of_kind(&self, session_id: &str, kind: &str) -> Result<u64> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let kind = kind.to_string();
+        tokio::task::spawn_blocking(move || store.event_count_by_kind(&session_id, &kind)).await?
+    }
+
     pub async fn session_context_status(&self, session_id: &str) -> Result<SessionContextStatus> {
         let usage_event = self
             .latest_event_of_kind(session_id, "context.usage")
@@ -9933,11 +10095,39 @@ impl Engine {
                     measurement
                 })
         });
+        let compaction_count = last_compaction
+            .as_ref()
+            .map(|summary| summary.compaction_count)
+            .unwrap_or(0);
+        let last_compaction_latency_ms = last_compaction
+            .as_ref()
+            .map(|summary| summary.latency_ms)
+            .unwrap_or(0);
+        let last_compaction_tokens_before = last_compaction
+            .as_ref()
+            .map(|summary| summary.estimated_tokens_before)
+            .unwrap_or(0);
+        let last_compaction_tokens_after = last_compaction
+            .as_ref()
+            .map(|summary| summary.estimated_tokens_after)
+            .unwrap_or(0);
+        let compaction_background_reuse = last_compaction
+            .as_ref()
+            .is_some_and(|summary| summary.background_reuse);
+        let compaction_fallback_to_sync = last_compaction
+            .as_ref()
+            .is_some_and(|summary| summary.fallback_to_sync);
         Ok(SessionContextStatus {
             session_id: session_id.to_string(),
             usage,
             last_compaction,
             last_measurement,
+            compaction_count,
+            last_compaction_latency_ms,
+            last_compaction_tokens_before,
+            last_compaction_tokens_after,
+            compaction_background_reuse,
+            compaction_fallback_to_sync,
         })
     }
 

@@ -84,6 +84,14 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
             store.set_execution_host(&snapshot.project.id, &snapshot.execution_host)?;
             store.set_integration_policy(&snapshot.project.id, &snapshot.integration_policy)?;
             store.set_artifact_policy(&snapshot.project.id, &snapshot.artifact_policy)?;
+            crate::tool_output::validate_tool_output_policy(&snapshot.tool_output_policy)
+                .with_context(|| {
+                    format!(
+                        "tool-output policy for project {} is invalid",
+                        snapshot.project.id
+                    )
+                })?;
+            store.set_tool_output_policy(&snapshot.project.id, &snapshot.tool_output_policy)?;
             store.set_mailbox_policy(&snapshot.project.id, &snapshot.mailbox_policy)?;
             store.set_worktree_policy(&snapshot.project.id, &snapshot.worktree_policy)?;
             store.set_checkpoint_policy(&snapshot.project.id, &snapshot.checkpoint_policy)?;

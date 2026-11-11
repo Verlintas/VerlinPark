@@ -836,6 +836,70 @@ actor CoreClient {
         .decode(SessionCacheStatus.self)
     }
 
+    func toolOutputPolicy(projectID: String) async throws -> ToolOutputPolicy {
+        let params: [String: JSONValue] = ["project_id": .string(projectID)]
+        return try await request(method: "tool_output.policy.get", params: params)
+            .decode(ToolOutputPolicyResult.self)
+            .policy
+    }
+
+    func toolOutputStatus(
+        projectID: String?,
+        sessionID: String?
+    ) async throws -> ToolOutputStatus {
+        var params: [String: JSONValue] = [:]
+        if let projectID {
+            params["project_id"] = .string(projectID)
+        }
+        if let sessionID {
+            params["session_id"] = .string(sessionID)
+        }
+        return try await request(method: "tool_output.status", params: params)
+            .decode(ToolOutputStatus.self)
+    }
+
+    func setToolOutputPolicy(
+        projectID: String,
+        policy: ToolOutputPolicy
+    ) async throws -> ToolOutputPolicy {
+        var value: [String: JSONValue] = [
+            "enabled": .bool(policy.enabled),
+            "spill_threshold_bytes": .number(Double(policy.spillThresholdBytes)),
+            "preview_bytes": .number(Double(policy.previewBytes)),
+            "max_total_bytes_per_turn": .number(Double(policy.maxTotalBytesPerTurn)),
+            "retention_secs": .number(Double(policy.retentionSecs)),
+            "max_entries": .number(Double(policy.maxEntries)),
+        ]
+        if let thresholds = policy.toolThresholds, !thresholds.isEmpty {
+            value["tool_thresholds"] = .object(
+                thresholds.mapValues { .number(Double($0)) }
+            )
+        }
+        let params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "policy": .object(value),
+        ]
+        return try await request(method: "tool_output.policy.set", params: params)
+            .decode(ToolOutputPolicyResult.self)
+            .policy
+    }
+
+    func auditToolOutputs(
+        projectID: String?,
+        verifyHashes: Bool,
+        cleanOrphans: Bool
+    ) async throws -> ToolOutputAuditResult {
+        var params: [String: JSONValue] = [
+            "verify_hashes": .bool(verifyHashes),
+            "clean_orphans": .bool(cleanOrphans),
+        ]
+        if let projectID {
+            params["project_id"] = .string(projectID)
+        }
+        return try await request(method: "tool_output.audit", params: params)
+            .decode(ToolOutputAuditResult.self)
+    }
+
     func resumePlan(sessionID: String) async throws -> Bool {
         let params: [String: JSONValue] = ["session_id": .string(sessionID)]
         return try await request(method: "session.plan_resume", params: params)
