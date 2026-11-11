@@ -7914,6 +7914,8 @@ async fn run_integration_command(
         read_jail: policy.read_jail,
         git_branch: session.branch.clone(),
         remote: None,
+        session_id: None,
+        process_supervisor: None,
     };
     let (exit, text) =
         crate::tools::run_sandboxed_login_shell(&context, &command, Duration::from_secs(300))
@@ -11925,6 +11927,8 @@ async fn run_loop_body(
         read_jail: shell_policy.read_jail,
         git_branch: Some(spec.branch.clone()),
         remote: engine.remote_access(&project.id).await?.map(Arc::new),
+        session_id: Some(session.id.clone()),
+        process_supervisor: Some(Arc::clone(engine.process_supervisor())),
     };
     let sections = build_prompt_sections(engine, project, session, spec, objective, true).await;
     let system = sections.render();

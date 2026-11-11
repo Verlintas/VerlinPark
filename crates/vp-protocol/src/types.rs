@@ -743,6 +743,13 @@ pub struct DaemonMetrics {
     pub memories: Vec<MetricCount>,
     pub memory_conflicts: Vec<MetricCount>,
     pub runtime_leases: Vec<MetricCount>,
+    /// Durable supervised processes by state (`starting`, `running`,
+    /// `exited`, `stopped`, `lost`, `unknown`).
+    #[serde(default)]
+    pub supervised_processes: Vec<MetricCount>,
+    /// Retained bytes across daemon-owned supervised-process logs.
+    #[serde(default)]
+    pub supervised_process_output_bytes: u64,
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub cache_read_tokens: u64,
@@ -1947,6 +1954,287 @@ pub struct ConsoleCloseResult {
     pub closed: bool,
     #[serde(default)]
     pub exit_code: Option<i32>,
+}
+
+/// A durable process supervised by the daemon.
+///
+/// Lifecycle transitions are event-backed (`process.starting`,
+/// `process.started`, `process.adopted`, `process.exited`, `process.lost`,
+/// `process.unknown`, `process.stopped`, `process.pruned`). Heartbeat,
+/// last-access, and output byte/line counters are operational observation state
+/// and are not replay content; the columns are updated without an event so a
+/// chatty build cannot flood the event log. Output bodies never enter events.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SupervisedProcess {
+    pub id: String,
+    pub session_id: String,
+    #[serde(default)]
+    pub name: String,
+    pub command: String,
+    /// Canonical argv stored for inspection. The actual shell is
+    /// `/bin/sh -c <command>` under the Seatbelt sandbox.
+    #[serde(default)]
+    pub argv: Vec<String>,
+    /// Absolute working directory inside the session worktree.
+    pub cwd: String,
+    /// Canonical worktree root the process belongs to.
+    pub worktree: String,
+    /// SHA-256 over the effective allowlisted environment (names and values).
+    pub env_hash: String,
+    /// SHA-256 over the immutable spawn description. The same value is placed
+    /// in the child environment and re-read for restart adoption.
+    pub command_hash: String,
+    /// `starting`, `running`, `exited`, `stopped`, `lost`, or `unknown`.
+    pub state: String,
+    #[serde(default)]
+    pub pid: Option<i64>,
+    #[serde(default)]
+    pub pgid: Option<i64>,
+    /// Per-spawn random nonce placed in the child environment.
+    pub nonce: String,
+    pub started_at: String,
+    /// `ps -o lstart=` observation captured at spawn. Reattachment requires an
+    /// exact match, which rejects PID reuse.
+    #[serde(default)]
+    pub process_started_at: Option<String>,
+    pub heartbeat_at: String,
+    #[serde(default)]
+    pub finished_at: Option<String>,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub signal: Option<i32>,
+    /// Daemon-owned append-only log file. Output bodies are operational state.
+    #[serde(default)]
+    pub output_path: String,
+    #[serde(default)]
+    pub output_bytes: u64,
+    #[serde(default)]
+    pub output_lines: u64,
+    #[serde(default)]
+    pub total_output_bytes: u64,
+    #[serde(default)]
+    pub output_rotations: u64,
+    /// Hard cap for retained output bytes.
+    #[serde(default = "default_process_output_bytes")]
+    pub max_output_bytes: u64,
+    /// Hard cap for retained output lines.
+    #[serde(default = "default_process_output_lines")]
+    pub max_output_lines: u64,
+    /// `instance_id:pid` of the daemon incarnation that currently supervises
+    /// the row. A restart with matching evidence adopts the row and updates it.
+    #[serde(default)]
+    pub owner_instance: String,
+    #[serde(default)]
+    pub retention_deadline: Option<String>,
+    #[serde(default = "default_process_idle_ttl")]
+    pub idle_ttl_secs: u64,
+    #[serde(default)]
+    pub last_access_at: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+fn default_process_idle_ttl() -> u64 {
+    3_600
+}
+
+fn default_process_output_bytes() -> u64 {
+    1_048_576
+}
+
+fn default_process_output_lines() -> u64 {
+    20_000
+}
+
+/// Project-scoped durable-process policy. Defaults preserve the historical
+/// per-session cap and one-hour idle TTL; a project can opt out of idle stops
+/// or tighten caps without changing agent tool schemas.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProcessPolicy {
+    /// Stop live processes idle beyond their per-process TTL. Default true.
+    #[serde(default = "default_process_idle_sweep")]
+    pub idle_sweep_enabled: bool,
+    /// Active supervised processes per session.
+    #[serde(default = "default_process_max")]
+    pub max_processes: u32,
+    /// Upper bound applied to a process's requested idle TTL.
+    #[serde(default = "default_process_policy_idle_ttl")]
+    pub idle_ttl_secs: u64,
+    /// Per-process retained log byte cap.
+    #[serde(default = "default_process_output_bytes")]
+    pub max_output_bytes: u64,
+    /// Per-process retained log line cap.
+    #[serde(default = "default_process_output_lines")]
+    pub max_output_lines: u64,
+}
+
+fn default_process_idle_sweep() -> bool {
+    true
+}
+
+fn default_process_max() -> u32 {
+    8
+}
+
+fn default_process_policy_idle_ttl() -> u64 {
+    3_600
+}
+
+impl Default for ProcessPolicy {
+    fn default() -> Self {
+        Self {
+            idle_sweep_enabled: true,
+            max_processes: default_process_max(),
+            idle_ttl_secs: default_process_policy_idle_ttl(),
+            max_output_bytes: default_process_output_bytes(),
+            max_output_lines: default_process_output_lines(),
+        }
+    }
+}
+
+impl ProcessPolicy {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=32).contains(&self.max_processes) {
+            return Err("max_processes must be 1..32".to_string());
+        }
+        if !(60..=86_400).contains(&self.idle_ttl_secs) {
+            return Err("idle_ttl_secs must be 60..86400".to_string());
+        }
+        if !(4_096..=16 * 1024 * 1024).contains(&self.max_output_bytes) {
+            return Err("max_output_bytes must be 4096..16777216".to_string());
+        }
+        if !(100..=1_000_000).contains(&self.max_output_lines) {
+            return Err("max_output_lines must be 100..1000000".to_string());
+        }
+        Ok(())
+    }
+
+    /// Clamp a process request to this project's limits. A caller may always
+    /// ask for a shorter TTL or smaller log; it cannot widen the policy.
+    pub fn clamp(
+        &self,
+        idle_ttl_secs: u64,
+        max_output_bytes: u64,
+        max_output_lines: u64,
+    ) -> (u64, u64, u64) {
+        (
+            idle_ttl_secs.min(self.idle_ttl_secs),
+            max_output_bytes.min(self.max_output_bytes),
+            max_output_lines.min(self.max_output_lines),
+        )
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProcessPolicyParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetProcessPolicyParams {
+    pub project_id: String,
+    pub policy: ProcessPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProcessPolicyResult {
+    pub project_id: String,
+    pub policy: ProcessPolicy,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProcessListParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub include_finished: Option<bool>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProcessListResult {
+    pub session_id: String,
+    pub processes: Vec<SupervisedProcess>,
+    #[serde(default)]
+    pub active: u32,
+    #[serde(default)]
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProcessLogsParams {
+    pub session_id: String,
+    pub process_id: String,
+    /// Zero-based byte offset. Ignored when `from_end` is set.
+    #[serde(default)]
+    pub offset: Option<u64>,
+    #[serde(default)]
+    pub max_bytes: Option<u32>,
+    #[serde(default)]
+    pub max_lines: Option<u32>,
+    /// Return the newest retained bytes instead of a forward page.
+    #[serde(default)]
+    pub from_end: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProcessLogsResult {
+    pub session_id: String,
+    pub process_id: String,
+    pub state: String,
+    pub content: String,
+    #[serde(default)]
+    pub offset: u64,
+    #[serde(default)]
+    pub next_offset: u64,
+    #[serde(default)]
+    pub total_bytes: u64,
+    #[serde(default)]
+    pub eof: bool,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub rotated: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProcessStopParams {
+    pub session_id: String,
+    pub process_id: String,
+    /// `TERM` (default), `KILL`, `INT`, or `HUP`.
+    #[serde(default)]
+    pub signal: Option<String>,
+    #[serde(default)]
+    pub grace_secs: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProcessStopResult {
+    pub process: SupervisedProcess,
+    #[serde(default)]
+    pub forced: bool,
+    #[serde(default)]
+    pub waited_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProcessSupervisorStatus {
+    pub instance: String,
+    #[serde(default)]
+    pub running: u32,
+    #[serde(default)]
+    pub starting: u32,
+    #[serde(default)]
+    pub unknown: u32,
+    #[serde(default)]
+    pub exited: u32,
+    #[serde(default)]
+    pub stopped: u32,
+    #[serde(default)]
+    pub lost: u32,
+    #[serde(default)]
+    pub output_bytes: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -6131,6 +6419,11 @@ pub struct SessionBundle {
     /// Durable active-context boundaries. Older bundles decode as empty.
     #[serde(default)]
     pub context_checkpoints: Vec<ContextCheckpoint>,
+    /// Event-backed durable supervised-process lifecycle rows. Output bodies
+    /// are operational state and are not part of the archive; imported rows are
+    /// metadata-only and can never be reattached or read as local files.
+    #[serde(default)]
+    pub supervised_processes: Vec<SupervisedProcess>,
 }
 
 /// Project policy for automatic crash resume. Manual `session.run.resume`
@@ -6440,6 +6733,10 @@ pub struct SessionReplayReport {
     /// Event-backed durable context checkpoint projection.
     #[serde(default)]
     pub context_checkpoints_match: bool,
+    /// Event-backed durable supervised-process lifecycle projection. Operational
+    /// heartbeat/output telemetry is deliberately excluded from the comparison.
+    #[serde(default)]
+    pub processes_match: bool,
     pub consistent: bool,
     #[serde(default)]
     pub repaired: bool,
@@ -8989,6 +9286,11 @@ mod tests {
                 key: "session".to_string(),
                 count: 1,
             }],
+            supervised_processes: vec![MetricCount {
+                key: "running".to_string(),
+                count: 1,
+            }],
+            supervised_process_output_bytes: 512,
             tokens_in: 1000,
             tokens_out: 250,
             cache_read_tokens: 400,
@@ -9375,6 +9677,8 @@ mod tests {
             memories: Vec::new(),
             memory_conflicts: Vec::new(),
             runtime_leases: Vec::new(),
+            supervised_processes: Vec::new(),
+            supervised_process_output_bytes: 0,
             tokens_in: 10,
             tokens_out: 2,
             cache_read_tokens: 4,
@@ -10976,6 +11280,7 @@ mod context_checkpoint_bundle_tests {
                 automatic: true,
                 created_at: "2026-11-11T00:00:00Z".into(),
             }],
+            supervised_processes: Vec::new(),
         };
         let encoded = serde_json::to_string(&bundle).unwrap();
         let decoded: SessionBundle = serde_json::from_str(&encoded).unwrap();
@@ -11455,5 +11760,222 @@ mod context_checkpoint_bundle_tests {
         assert!(status.recent_jobs.is_empty());
         assert_eq!(status.integrity, SourceEmbeddingIntegrity::default());
         assert!(status.semantic_unavailable.is_none());
+    }
+}
+
+#[cfg(test)]
+mod process_supervisor_protocol_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn row() -> SupervisedProcess {
+        SupervisedProcess {
+            id: "psup_1".to_string(),
+            session_id: "ses_1".to_string(),
+            name: "server".to_string(),
+            command: "cargo run".to_string(),
+            argv: vec!["/bin/sh".into(), "-c".into(), "cargo run".into()],
+            cwd: "/tmp/work".to_string(),
+            worktree: "/tmp/work".to_string(),
+            env_hash: "env".to_string(),
+            command_hash: "command".to_string(),
+            state: "running".to_string(),
+            pid: Some(42),
+            pgid: Some(42),
+            nonce: "nonce".to_string(),
+            started_at: "2026-11-11T00:00:00Z".to_string(),
+            process_started_at: Some("Wed Nov 11 00:00:00 2026".to_string()),
+            heartbeat_at: "2026-11-11T00:00:01Z".to_string(),
+            finished_at: None,
+            exit_code: None,
+            signal: None,
+            output_path: "/data/processes/ses_1/psup_1/output.log".to_string(),
+            output_bytes: 12,
+            output_lines: 2,
+            total_output_bytes: 44,
+            output_rotations: 1,
+            max_output_bytes: 1_048_576,
+            max_output_lines: 20_000,
+            owner_instance: "instance:9".to_string(),
+            retention_deadline: None,
+            idle_ttl_secs: 3_600,
+            last_access_at: "2026-11-11T00:00:01Z".to_string(),
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn supervised_process_round_trips_and_tolerates_old_fields() {
+        let value = serde_json::to_value(row()).unwrap();
+        let decoded: SupervisedProcess = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(decoded, row());
+        let mut minimal = value.clone();
+        let object = minimal.as_object_mut().unwrap();
+        for key in [
+            "argv",
+            "pid",
+            "pgid",
+            "process_started_at",
+            "output_bytes",
+            "output_lines",
+            "total_output_bytes",
+            "output_rotations",
+            "max_output_bytes",
+            "max_output_lines",
+            "owner_instance",
+            "retention_deadline",
+            "idle_ttl_secs",
+            "last_access_at",
+        ] {
+            object.remove(key);
+        }
+        let decoded: SupervisedProcess = serde_json::from_value(minimal).unwrap();
+        assert!(decoded.argv.is_empty());
+        assert_eq!(decoded.pid, None);
+        assert_eq!(decoded.idle_ttl_secs, 3_600);
+        assert_eq!(decoded.max_output_bytes, 1_048_576);
+        assert_eq!(decoded.max_output_lines, 20_000);
+    }
+
+    #[test]
+    fn process_params_are_forward_compatible() {
+        let list: ProcessListParams = serde_json::from_value(json!({
+            "session_id": "ses_1"
+        }))
+        .unwrap();
+        assert!(list.include_finished.is_none());
+        assert!(list.limit.is_none());
+        let logs: ProcessLogsParams = serde_json::from_value(json!({
+            "session_id": "ses_1",
+            "process_id": "psup_1"
+        }))
+        .unwrap();
+        assert!(!logs.from_end);
+        assert!(logs.offset.is_none());
+        let stop: ProcessStopParams = serde_json::from_value(json!({
+            "session_id": "ses_1",
+            "process_id": "psup_1"
+        }))
+        .unwrap();
+        assert!(stop.signal.is_none());
+        assert!(stop.grace_secs.is_none());
+    }
+
+    #[test]
+    fn logs_result_round_trips() {
+        let result = ProcessLogsResult {
+            session_id: "ses_1".to_string(),
+            process_id: "psup_1".to_string(),
+            state: "running".to_string(),
+            content: "hello\n".to_string(),
+            offset: 0,
+            next_offset: 6,
+            total_bytes: 6,
+            eof: true,
+            truncated: false,
+            rotated: true,
+        };
+        let decoded: ProcessLogsResult =
+            serde_json::from_value(serde_json::to_value(&result).unwrap()).unwrap();
+        assert_eq!(decoded, result);
+    }
+
+    #[test]
+    fn process_metrics_decode_with_defaults() {
+        let metrics: DaemonMetrics = serde_json::from_value(json!({
+            "version": "0.1",
+            "protocol": 1,
+            "uptime_secs": 5,
+            "projects": 1,
+            "sessions": [],
+            "plan_tasks": [],
+            "merge_queue": [],
+            "intake": [],
+            "continuations": [],
+            "recoveries": [],
+            "memories": [],
+            "memory_conflicts": [],
+            "runtime_leases": [],
+            "tokens_in": 0,
+            "tokens_out": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "cost_spent_usd": 0.0
+        }))
+        .unwrap();
+        assert!(metrics.supervised_processes.is_empty());
+        assert_eq!(metrics.supervised_process_output_bytes, 0);
+    }
+}
+
+#[cfg(test)]
+mod process_policy_protocol_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn process_policy_defaults_preserve_historical_limits() {
+        let policy: ProcessPolicy = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(policy, ProcessPolicy::default());
+        assert!(policy.idle_sweep_enabled);
+        assert_eq!(policy.max_processes, 8);
+        assert_eq!(policy.idle_ttl_secs, 3_600);
+        assert_eq!(policy.max_output_bytes, 1_048_576);
+        assert_eq!(policy.max_output_lines, 20_000);
+    }
+
+    #[test]
+    fn process_policy_validation_bounds_and_clamps() {
+        assert!(ProcessPolicy::default().validate().is_ok());
+        let too_many = ProcessPolicy {
+            max_processes: 33,
+            ..ProcessPolicy::default()
+        };
+        assert!(too_many.validate().is_err());
+        let short_idle = ProcessPolicy {
+            idle_ttl_secs: 59,
+            ..ProcessPolicy::default()
+        };
+        assert!(short_idle.validate().is_err());
+        let small_log = ProcessPolicy {
+            max_output_bytes: 1_024,
+            ..ProcessPolicy::default()
+        };
+        assert!(small_log.validate().is_err());
+        let policy = ProcessPolicy {
+            idle_ttl_secs: 900,
+            max_output_bytes: 65_536,
+            max_output_lines: 2_000,
+            ..ProcessPolicy::default()
+        };
+        assert_eq!(
+            policy.clamp(86_400, 4_194_304, 50_000),
+            (900, 65_536, 2_000)
+        );
+        assert_eq!(policy.clamp(60, 4_096, 100), (60, 4_096, 100));
+    }
+
+    #[test]
+    fn process_policy_result_round_trips() {
+        let result = ProcessPolicyResult {
+            project_id: "prj-1".to_string(),
+            policy: ProcessPolicy {
+                idle_sweep_enabled: false,
+                max_processes: 2,
+                idle_ttl_secs: 600,
+                max_output_bytes: 8_192,
+                max_output_lines: 500,
+            },
+        };
+        let decoded: ProcessPolicyResult =
+            serde_json::from_value(serde_json::to_value(&result).unwrap()).unwrap();
+        assert_eq!(decoded, result);
+        let set: SetProcessPolicyParams = serde_json::from_value(json!({
+            "project_id": "prj-1",
+            "policy": {"max_processes": 4}
+        }))
+        .unwrap();
+        assert_eq!(set.policy.max_processes, 4);
+        assert!(set.policy.idle_sweep_enabled);
     }
 }

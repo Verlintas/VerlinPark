@@ -54,6 +54,8 @@ fn context(root: &Path) -> ToolContext {
         secret_roots: Vec::new(),
         network_allowed: false,
         remote: None,
+        session_id: None,
+        process_supervisor: None,
     }
 }
 
@@ -133,16 +135,18 @@ async fn registry_failures_use_the_public_stable_contract() {
     );
 
     let process = registry.get("process").unwrap();
-    let error = process
+    let output = process
         .execute(
             &context,
             json!({"action": "read", "process_id": "proc-missing"}),
         )
         .await
-        .expect_err("unknown process");
-    assert_eq!(
-        failure_from_anyhow("process", &error).code,
-        ToolErrorCode::PROCESS_NOT_FOUND
+        .expect("process tool returns a typed failure without a session supervisor");
+    assert_eq!(code_of(&output), "PROCESS_FAILED");
+    assert!(output.content.starts_with("error[PROCESS_FAILED]"));
+    assert!(
+        failure_from_anyhow("process", &anyhow::anyhow!("unknown process")).code
+            == ToolErrorCode::PROCESS_NOT_FOUND
     );
 
     let remote = registry.get("remote_read").unwrap();

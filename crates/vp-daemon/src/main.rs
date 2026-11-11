@@ -56,7 +56,8 @@ use vp_protocol::types::{
     MemoryHealthParams, MemoryListParams, MemoryPolicyParams, MemoryPruneParams,
     MemorySearchParams, MemoryStatsParams, MemorySweepParams, MemoryUpdateParams,
     MemoryVerifyParams, MergeQueueListParams, MergeQueueListResult, OpenPullRequestParams,
-    PingResult, ProjectBudgetParams, ProjectForkForestParams, ProjectListResult,
+    PingResult, ProcessListParams, ProcessLogsParams, ProcessPolicyParams, ProcessPolicyResult,
+    ProcessStopParams, ProjectBudgetParams, ProjectForkForestParams, ProjectListResult,
     ProjectUsageParams, PromptParams, PromptResult, QuestionListParams, RehydrateSessionParams,
     ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams,
     ResolveMergeResult, RetryMergeParams, RetryMergeResult, SchedulerStatusParams, SearchParams,
@@ -76,7 +77,7 @@ use vp_protocol::types::{
     SessionSteeringCancelParams, SessionSteeringParams, SessionTodosParams, SessionTodosResult,
     SessionTranscriptParams, SetArtifactPolicyParams, SetCachePolicyParams,
     SetCheckpointPolicyParams, SetContextCheckpointPolicyParams, SetIntegrationPolicyParams,
-    SetMailboxPolicyParams, SetMemoryPolicyParams, SetProjectBudgetParams,
+    SetMailboxPolicyParams, SetMemoryPolicyParams, SetProcessPolicyParams, SetProjectBudgetParams,
     SetSessionPriorityParams, SetSessionRunPolicyParams, SetSessionUnlimitedParams,
     SetShellPolicyParams, SetSourceCollectionParams, SetSourceEmbeddingPolicyParams,
     SetSourceLabelsParams, SetTaskSchedulerPolicyParams, SetToolOutputPolicyParams,
@@ -173,6 +174,24 @@ async fn main() -> Result<()> {
     if let Err(error) = engine.retire_legacy_gui_leases().await {
         tracing::warn!(%error, "failed to retire legacy GUI leases");
     }
+    match engine.reconcile_supervised_processes().await {
+        Ok(report)
+            if report.adopted > 0
+                || report.lost > 0
+                || report.unknown > 0
+                || report.skipped_imported > 0 =>
+        {
+            tracing::info!(
+                adopted = report.adopted,
+                lost = report.lost,
+                unknown = report.unknown,
+                skipped_imported = report.skipped_imported,
+                "reconciled durable supervised processes"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "failed to reconcile supervised processes"),
+    }
     if let Err(error) = engine.record_project_manifest().await {
         tracing::warn!(%error, "failed to write project manifest");
     }
@@ -214,6 +233,7 @@ async fn main() -> Result<()> {
     spawn_gui_grace_sweeper(state.engine.clone());
     spawn_task_stall_sweeper(state.engine.clone());
     spawn_stall_recovery_reconciler(state.agent.clone());
+    spawn_process_sweeper(state.engine.clone());
     spawn_orchestration_controller(state.engine.clone());
 
     let listener = TcpListener::bind(("127.0.0.1", args.port.unwrap_or(0))).await?;
@@ -301,6 +321,8 @@ async fn collect_daemon_metrics(state: &AppState) -> Result<DaemonMetrics> {
         memories: snapshot.memories,
         memory_conflicts: snapshot.memory_conflicts,
         runtime_leases: snapshot.runtime_leases,
+        supervised_processes: snapshot.supervised_processes,
+        supervised_process_output_bytes: snapshot.supervised_process_output_bytes,
         tokens_in: snapshot.tokens_in,
         tokens_out: snapshot.tokens_out,
         cache_read_tokens: snapshot.cache_read_tokens,
@@ -1773,6 +1795,81 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "console.close" => match parse_params::<ConsoleCloseParams>(request.params) {
             Ok(params) => match state.engine.console_close(&params.console_id).await {
                 Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.processes" => match parse_params::<ProcessListParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .session_processes(&params.session_id, params.include_finished, params.limit)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.process.logs" => match parse_params::<ProcessLogsParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .session_process_logs(
+                    &params.session_id,
+                    &params.process_id,
+                    params.offset,
+                    params.max_bytes,
+                    params.max_lines,
+                    params.from_end,
+                )
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.process.stop" => match parse_params::<ProcessStopParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .session_process_stop(
+                    &params.session_id,
+                    &params.process_id,
+                    params.signal,
+                    params.grace_secs,
+                )
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "process.policy.get" => match parse_params::<ProcessPolicyParams>(request.params) {
+            Ok(params) => match state.engine.get_process_policy(&params.project_id).await {
+                Ok(policy) => RpcResponse::success(
+                    id,
+                    ProcessPolicyResult {
+                        project_id: params.project_id,
+                        policy,
+                    },
+                ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "process.policy.set" => match parse_params::<SetProcessPolicyParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .set_process_policy(&params.project_id, params.policy)
+                .await
+            {
+                Ok(policy) => RpcResponse::success(
+                    id,
+                    ProcessPolicyResult {
+                        project_id: params.project_id,
+                        policy,
+                    },
+                ),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),
@@ -3690,6 +3787,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             | "memory.policy.set"
             | "source.embedding.policy.set"
             | "source.embedding.reindex"
+            | "process.policy.set"
             | "mailbox.policy.set"
             | "artifact.policy.set"
             | "tool_output.policy.set"
@@ -3712,6 +3810,46 @@ fn response_with_id(id: Option<Value>, error: RpcError) -> RpcResponse {
 
 fn internal_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
     RpcResponse::error(id, RpcError::new(codes::INTERNAL_ERROR, error.to_string()))
+}
+
+fn spawn_process_sweeper(engine: Engine) {
+    let seconds = std::env::var("VERLINPARK_PROCESS_SWEEP_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(60);
+    if seconds == 0 {
+        return;
+    }
+    let idle_enabled = std::env::var("VERLINPARK_PROCESS_IDLE_SWEEP_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value > 0)
+        .unwrap_or(true);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(seconds));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match engine.sweep_supervised_processes(idle_enabled).await {
+                Ok(report)
+                    if report.idle_stopped > 0
+                        || report.pruned > 0
+                        || report.lost > 0
+                        || report.unknown > 0 =>
+                {
+                    tracing::info!(
+                        idle_stopped = report.idle_stopped,
+                        lost = report.lost,
+                        unknown = report.unknown,
+                        pruned = report.pruned,
+                        "supervised-process sweep"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "supervised-process sweep failed"),
+            }
+        }
+    });
 }
 
 fn spawn_worktree_sweeper(engine: Engine) {
@@ -4271,5 +4409,224 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod process_rpc_tests {
+    use super::*;
+    use serde_json::json;
+    use std::path::Path;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use vp_core::process_supervisor::{ProcessSupervisor, StartSpec};
+    use vp_core::tools::ToolContext;
+    use vp_protocol::rpc::RpcRequest;
+
+    fn context(
+        worktree: &Path,
+        data: &Path,
+        _store: &Store,
+        session: &str,
+        supervisor: Arc<ProcessSupervisor>,
+    ) -> ToolContext {
+        ToolContext {
+            root: worktree.to_path_buf(),
+            project_root: worktree.to_path_buf(),
+            sandbox_root: data.join("sandbox").join(session),
+            secret_roots: Vec::new(),
+            network_allowed: true,
+            home: worktree.join("home"),
+            restrict_home: false,
+            read_jail: false,
+            git_branch: None,
+            remote: None,
+            session_id: Some(session.to_string()),
+            process_supervisor: Some(supervisor),
+        }
+    }
+
+    async fn call(state: &AppState, method: &str, params: Value) -> Value {
+        let response = dispatch(state, RpcRequest::new(json!(1), method, params)).await;
+        assert!(
+            response.error.is_none(),
+            "{} failed: {:?}",
+            method,
+            response.error
+        );
+        response.result.unwrap_or(Value::Null)
+    }
+
+    #[tokio::test]
+    async fn process_rpcs_and_metrics_cover_the_durable_surface() {
+        let worktree = TempDir::new().unwrap();
+        std::fs::create_dir_all(worktree.path().join("home")).unwrap();
+        let data = TempDir::new().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        let project = store
+            .add_project(worktree.path().to_str().unwrap(), None)
+            .unwrap();
+        let session = store
+            .create_session(&project.id, "process rpc test")
+            .unwrap();
+        let engine = Engine::new(store.clone());
+        let supervisor = Arc::clone(engine.process_supervisor());
+        let context = context(
+            worktree.path(),
+            data.path(),
+            &store,
+            &session.id,
+            supervisor.clone(),
+        );
+        let row = supervisor
+            .start(
+                &session.id,
+                &context,
+                &StartSpec {
+                    command: "printf 'rpc-ready\\n'; sleep 20".to_string(),
+                    ..StartSpec::default()
+                },
+            )
+            .await
+            .unwrap();
+        let state = AppState {
+            engine: engine.clone(),
+            agent: AgentService::from_env(engine),
+            token: Arc::new("test-token".to_string()),
+            data_dir: data.path().to_path_buf(),
+            started_at: now_rfc3339(),
+            started: Instant::now(),
+            pid: std::process::id(),
+        };
+
+        let list = call(
+            &state,
+            "session.processes",
+            json!({"session_id": session.id, "include_finished": false, "limit": 10}),
+        )
+        .await;
+        assert_eq!(list["session_id"], session.id);
+        assert_eq!(list["active"], 1);
+        assert_eq!(list["processes"][0]["id"], row.id);
+
+        let logs = call(
+            &state,
+            "session.process.logs",
+            json!({
+                "session_id": session.id,
+                "process_id": row.id,
+                "from_end": true,
+                "max_bytes": 1024,
+            }),
+        )
+        .await;
+        assert_eq!(logs["process_id"], row.id);
+        assert_eq!(logs["state"], "running");
+        let content = logs["content"].as_str().unwrap_or_default();
+        // The shell may not have flushed the first line yet on a loaded CI box;
+        // poll briefly rather than asserting on a scheduling race.
+        if !content.contains("rpc-ready") {
+            for _ in 0..50 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let logs = call(
+                    &state,
+                    "session.process.logs",
+                    json!({
+                        "session_id": session.id,
+                        "process_id": row.id,
+                        "from_end": true,
+                        "max_bytes": 1024,
+                    }),
+                )
+                .await;
+                if logs["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("rpc-ready")
+                {
+                    break;
+                }
+            }
+        }
+
+        let metrics = call(&state, "daemon.metrics", json!({})).await;
+        let process_counts = metrics["metrics"]["supervised_processes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            process_counts
+                .iter()
+                .any(|entry| entry["key"] == "running" && entry["count"].as_u64() == Some(1)),
+            "metrics={metrics}"
+        );
+        assert!(
+            metrics["metrics"]["supervised_process_output_bytes"]
+                .as_u64()
+                .is_some()
+        );
+        assert!(
+            metrics["prometheus"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("verlinpark_supervised_processes{state=\"running\"} 1")
+        );
+
+        let policy = call(
+            &state,
+            "process.policy.get",
+            json!({"project_id": project.id}),
+        )
+        .await;
+        assert_eq!(policy["policy"]["max_processes"], 8);
+        let updated = call(
+            &state,
+            "process.policy.set",
+            json!({
+                "project_id": project.id,
+                "policy": {
+                    "idle_sweep_enabled": false,
+                    "max_processes": 2,
+                    "idle_ttl_secs": 600,
+                    "max_output_bytes": 65536,
+                    "max_output_lines": 2000
+                }
+            }),
+        )
+        .await;
+        assert_eq!(updated["policy"]["max_processes"], 2);
+        assert_eq!(updated["policy"]["idle_sweep_enabled"], false);
+        let reread = call(
+            &state,
+            "process.policy.get",
+            json!({"project_id": project.id}),
+        )
+        .await;
+        assert_eq!(reread["policy"]["idle_ttl_secs"], 600);
+
+        let stopped = call(
+            &state,
+            "session.process.stop",
+            json!({
+                "session_id": session.id,
+                "process_id": row.id,
+                "signal": "TERM",
+                "grace_secs": 2,
+            }),
+        )
+        .await;
+        assert_eq!(stopped["process"]["state"], "stopped");
+        assert_eq!(stopped["forced"], false);
+
+        let missing = dispatch(
+            &state,
+            RpcRequest::new(
+                json!(2),
+                "session.process.logs",
+                json!({"session_id": session.id, "process_id": "psup_missing"}),
+            ),
+        )
+        .await;
+        assert!(missing.error.is_some());
     }
 }

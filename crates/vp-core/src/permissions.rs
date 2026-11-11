@@ -216,14 +216,23 @@ pub fn assess_tool_call_with_gui(
             }
         }
         "process" => {
-            if input.get("action").and_then(Value::as_str) == Some("start") {
+            let action = input
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("status");
+            if action == "start" {
                 let command = input
                     .get("command")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 assess_shell_command(command, worktree)
+            } else if matches!(action, "stop" | "signal" | "write") {
+                PermissionAssessment::new(
+                    RiskLevel::WorkspaceWrite,
+                    "process control sends signals or changes process state",
+                )
             } else {
-                PermissionAssessment::new(RiskLevel::ReadOnly, "process control")
+                PermissionAssessment::new(RiskLevel::ReadOnly, "process inspection")
             }
         }
         "task_control" => PermissionAssessment::new(

@@ -48,6 +48,7 @@ private struct ProjectStageView: View {
     @State private var showingContext = false
     @State private var showingToolActivity = false
     @State private var showingGui = false
+    @State private var showingProcesses = false
     @State private var showingFork = false
     @State private var showingSteer = false
     @State private var showingDefer = false
@@ -75,6 +76,13 @@ private struct ProjectStageView: View {
         .task(id: model.selectedProjectID) {
             if model.selectedProjectID != nil {
                 await model.loadSkills(silent: true)
+            }
+        }
+        .task(id: model.selectedSessionID) {
+            await model.refreshProcessSummary()
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(5))
+                await model.refreshProcessSummary()
             }
         }
         .sheet(isPresented: $showingToolActivity) {
@@ -213,6 +221,24 @@ private struct ProjectStageView: View {
                         .help(
                             "Per-tool latency, stable error codes, retryability, output bytes, and truncation"
                         )
+                        if model.activeProcessCount > 0 {
+                            Button {
+                                showingProcesses.toggle()
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "gearshape.2")
+                                        .font(.system(size: 8, weight: .semibold))
+                                    Text("\(model.activeProcessCount) proc")
+                                }
+                                .foregroundStyle(VPTheme.info)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Durable supervised processes for this session")
+                            .popover(isPresented: $showingProcesses, arrowEdge: .bottom) {
+                                StageProcessPopover()
+                                    .environment(model)
+                            }
+                        }
                         if model.hasLongTaskAttention {
                             longTaskAttentionPill
                         }
@@ -704,6 +730,63 @@ private struct ProjectStageView: View {
                     draft = ""
                 }
             }
+        }
+    }
+}
+
+private struct StageProcessPopover: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Supervised processes")
+                    .font(.system(size: 11, weight: .semibold))
+                Spacer()
+                Text("\(model.processSummary.count) active")
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(VPTheme.textTertiary)
+            }
+            if model.processSummary.isEmpty {
+                Text("No durable processes are running for this session.")
+                    .font(VPTheme.mono(8.5))
+                    .foregroundStyle(VPTheme.textTertiary)
+                    .frame(maxWidth: 260, alignment: .leading)
+            } else {
+                ForEach(model.processSummary) { process in
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(process.state == "running" ? VPTheme.success : VPTheme.warning)
+                            .frame(width: 5, height: 5)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(process.name)
+                                .font(VPTheme.mono(8.5, weight: .medium))
+                                .lineLimit(1)
+                            Text(
+                                [
+                                    process.state,
+                                    process.pid.map { "pid \($0)" },
+                                    "\(process.outputBytes) bytes",
+                                ].compactMap(\.self).joined(separator: " · ")
+                            )
+                            .font(VPTheme.mono(7))
+                            .foregroundStyle(VPTheme.textTertiary)
+                        }
+                        Spacer()
+                        Button("Stop") {
+                            Task { await model.stopSupervisedProcess(process.id) }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                        .disabled(model.processStopBusy)
+                    }
+                }
+            }
+        }
+        .padding(12)
+        .frame(minWidth: 280)
+        .task {
+            await model.refreshProcessSummary()
         }
     }
 }

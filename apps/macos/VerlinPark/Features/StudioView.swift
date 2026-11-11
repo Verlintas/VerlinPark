@@ -300,6 +300,8 @@ struct PreviewPanelView: View {
                         cost
                     case .console:
                         ConsolePanel()
+                    case .processes:
+                        ProcessPanel()
                     case .terminal:
                         TerminalPanel()
                     case .trace:
@@ -342,6 +344,9 @@ struct PreviewPanelView: View {
             }
             if mode == .history {
                 await model.loadGitHistory()
+            }
+            if mode == .processes {
+                await model.loadProcesses()
             }
         }
         .alert("Commit worktree", isPresented: $showingCommit) {
@@ -468,6 +473,8 @@ struct PreviewPanelView: View {
                             await model.loadUsage()
                         case .console:
                             await model.pollConsole()
+                        case .processes:
+                            await model.loadProcesses()
                         case .terminal:
                             await model.pollTerminal()
                         default:
@@ -484,6 +491,7 @@ struct PreviewPanelView: View {
                         mode == .queue ? "Refresh queue" : mode == .mailbox ? "Refresh mailbox" :
                         mode == .cost ? "Refresh usage" :
                         mode == .console ? "Refresh console" :
+                        mode == .processes ? "Refresh processes" :
                         mode == .terminal ? "Refresh terminal" : "Refresh diff"
                 )
                 .disabled(model.diffLoading)
@@ -1236,6 +1244,7 @@ private enum PreviewMode: String, CaseIterable, Identifiable {
     case mailbox
     case cost
     case console
+    case processes
     case terminal
     case trace
 
@@ -1255,6 +1264,7 @@ private enum PreviewMode: String, CaseIterable, Identifiable {
         case .mailbox: L10n.t("Mailbox")
         case .cost: L10n.t("Cost")
         case .console: L10n.t("Console")
+        case .processes: L10n.t("Processes")
         case .terminal: L10n.t("Terminal")
         case .trace: L10n.t("Trace")
         }
@@ -1272,6 +1282,7 @@ private enum PreviewMode: String, CaseIterable, Identifiable {
         case .mailbox: "tray"
         case .cost: "dollarsign.circle"
         case .console: "terminal"
+        case .processes: "gearshape.2"
         case .terminal: "apple.terminal"
         case .trace: "list.bullet.rectangle"
         }
@@ -1279,7 +1290,7 @@ private enum PreviewMode: String, CaseIterable, Identifiable {
 
     static let primary: [PreviewMode] = [.showcase, .changes, .files, .sources, .plan]
     static let secondary: [PreviewMode] = [
-        .history, .queue, .mailbox, .cost, .console, .terminal, .trace,
+        .history, .queue, .mailbox, .cost, .console, .processes, .terminal, .trace,
     ]
 }
 
@@ -2348,6 +2359,195 @@ private struct WorkspaceBrowserRow: View {
                 .foregroundStyle(VPTheme.textTertiary)
         }
         .padding(.vertical, 4)
+    }
+}
+
+private struct ProcessPanel: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                VPStatusDot(
+                    color: activeCount > 0 ? VPTheme.success : .secondary,
+                    pulsing: activeCount > 0,
+                    size: 7
+                )
+                Text("\(model.supervisedProcesses.count) processes · \(activeCount) active")
+                    .font(VPTheme.mono(9))
+                    .foregroundStyle(VPTheme.textSecondary)
+                Spacer()
+                if model.processesBusy || model.processStopBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Refresh") {
+                    Task { await model.loadProcesses() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+            .padding(10)
+            VPGradientRule().frame(height: 1)
+            if let error = model.processesError {
+                Text(error)
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(VPTheme.warning)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+            }
+            if model.supervisedProcesses.isEmpty {
+                StudioEmptyView(
+                    icon: "gearshape.2",
+                    title: "No supervised processes",
+                    detail: "Agents can start durable processes with the process tool; they survive a daemon restart when their identity can be verified."
+                )
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(model.supervisedProcesses) { process in
+                            processRow(process)
+                            VPHairline()
+                        }
+                    }
+                }
+            }
+            if let selected = selectedProcess {
+                VPGradientRule().frame(height: 1)
+                logPane(selected)
+            }
+        }
+        .task(id: model.selectedSessionID) {
+            await model.loadProcesses()
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(2))
+                await model.loadProcesses()
+            }
+        }
+    }
+
+    private var activeCount: Int {
+        model.supervisedProcesses.filter {
+            $0.state == "running" || $0.state == "starting" || $0.state == "unknown"
+        }.count
+    }
+
+    private var selectedProcess: SupervisedProcess? {
+        guard let id = model.selectedProcessID else { return nil }
+        return model.supervisedProcesses.first { $0.id == id }
+    }
+
+    private func processRow(_ process: SupervisedProcess) -> some View {
+        let selected = process.id == model.selectedProcessID
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 7) {
+                Circle()
+                    .fill(stateColor(process.state))
+                    .frame(width: 6, height: 6)
+                Text(process.name)
+                    .font(.system(size: 11, weight: .medium))
+                    .lineLimit(1)
+                Text(process.state)
+                    .font(VPTheme.mono(7.5))
+                    .foregroundStyle(stateColor(process.state))
+                Spacer()
+                if let pid = process.pid {
+                    Text("pid \(pid)")
+                        .font(VPTheme.mono(7.5))
+                        .foregroundStyle(VPTheme.textTertiary)
+                }
+                Text(elapsed(process.startedAt))
+                    .font(VPTheme.mono(7.5))
+                    .foregroundStyle(VPTheme.textTertiary)
+                if let exit = process.exitCode {
+                    Text("exit \(exit)")
+                        .font(VPTheme.mono(7.5))
+                        .foregroundStyle(exit == 0 ? VPTheme.success : VPTheme.danger)
+                }
+                if isActive(process.state) {
+                    Button("Stop") {
+                        Task { await model.stopSupervisedProcess(process.id) }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                    .disabled(model.processStopBusy)
+                }
+            }
+            Text(process.command)
+                .font(VPTheme.mono(8))
+                .foregroundStyle(VPTheme.textSecondary)
+                .lineLimit(1)
+            if let detail = process.detail, !detail.isEmpty {
+                Text(detail)
+                    .font(VPTheme.mono(7))
+                    .foregroundStyle(VPTheme.textTertiary)
+                    .lineLimit(2)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(selected ? VPTheme.accent.opacity(0.10) : .clear)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            model.selectedProcessID = process.id
+            Task { await model.loadProcessLogs(processID: process.id) }
+        }
+    }
+
+    private func logPane(_ process: SupervisedProcess) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 7) {
+                Text(process.id)
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(VPTheme.textTertiary)
+                Spacer()
+                Text("\(process.outputBytes) retained / \(process.totalOutputBytes) total")
+                    .font(VPTheme.mono(7))
+                    .foregroundStyle(VPTheme.textTertiary)
+            }
+            .padding(.horizontal, 10)
+            .padding(.top, 7)
+            ScrollView {
+                Text(model.processLogs.isEmpty ? "(no retained output)" : model.processLogs)
+                    .font(VPTheme.mono(8.5))
+                    .foregroundStyle(model.processLogs.isEmpty ? VPTheme.textTertiary : VPTheme.textSecondary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(10)
+            }
+            .frame(minHeight: 120, maxHeight: 240)
+        }
+    }
+
+    private func isActive(_ state: String) -> Bool {
+        state == "running" || state == "starting" || state == "unknown"
+    }
+
+    private func stateColor(_ state: String) -> Color {
+        switch state {
+        case "running": VPTheme.success
+        case "starting": VPTheme.info
+        case "unknown": VPTheme.warning
+        case "lost": VPTheme.danger
+        case "stopped": VPTheme.textTertiary
+        case "exited": VPTheme.textSecondary
+        default: VPTheme.textSecondary
+        }
+    }
+
+    private func elapsed(_ startedAt: String) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let date = formatter.date(from: startedAt) ?? ISO8601DateFormatter().date(from: startedAt)
+        guard let date else { return startedAt }
+        let seconds = max(0, Int(Date().timeIntervalSince(date)))
+        if seconds < 60 {
+            return "\(seconds)s"
+        }
+        if seconds < 3600 {
+            return "\(seconds / 60)m \(seconds % 60)s"
+        }
+        return "\(seconds / 3600)h \((seconds % 3600) / 60)m"
     }
 }
 

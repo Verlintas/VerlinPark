@@ -11643,6 +11643,25 @@ fn context_checkpoint_projection_can_be_replaced_from_replay() {
 }
 
 #[test]
+fn context_checkpoint_listing_orders_by_instant_not_string() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("context ordering"))
+        .unwrap();
+    let session = store.create_session(&project.id, "ordering").unwrap();
+    let mut earlier = context_checkpoint_row(&session, &project.id, "ctx-earlier", None);
+    earlier.created_at = "2026-11-12T00:00:00.099Z".into();
+    let mut later = context_checkpoint_row(&session, &project.id, "ctx-later", None);
+    later.created_at = "2026-11-12T00:00:00.1Z".into();
+    store
+        .replace_context_checkpoints(&session.id, &[earlier, later])
+        .unwrap();
+    let rows = store.list_context_checkpoints(&session.id, 10).unwrap();
+    let ids = rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>();
+    assert_eq!(ids, vec!["ctx-earlier", "ctx-later"]);
+}
+
+#[test]
 fn context_checkpoint_rows_reject_oversized_and_mismatched_payloads() {
     let (_data, store, repo) = test_store();
     let project = store
@@ -11754,6 +11773,7 @@ fn context_checkpoint_bundle_validation_checks_session_and_project() {
         run_steps: Vec::new(),
         run_checkpoints: Vec::new(),
         context_checkpoints: vec![checkpoint.clone()],
+        supervised_processes: Vec::new(),
     };
     validate_session_bundle(&bundle).unwrap();
     bundle.context_checkpoints[0].project_id = "other-project".into();
@@ -12007,6 +12027,7 @@ fn importing_a_projection_only_bundle_synthesizes_checkpoint_events() {
         run_steps: Vec::new(),
         run_checkpoints: Vec::new(),
         context_checkpoints: vec![checkpoint.clone()],
+        supervised_processes: Vec::new(),
     };
     let imported = Store::open(data.path().join("imported")).unwrap();
     imported.import_session_bundle(&bundle).unwrap();
@@ -13061,4 +13082,362 @@ fn source_embedding_usage_and_ready_counts_are_model_scoped() {
         1,
         "limit clamps to at least one"
     );
+}
+
+fn supervised_row(session: &str, root: &std::path::Path, id: &str) -> SupervisedProcess {
+    SupervisedProcess {
+        id: id.to_string(),
+        session_id: session.to_string(),
+        name: "test".to_string(),
+        command: "sleep 1".to_string(),
+        argv: vec!["/bin/sh".into(), "-c".into(), "sleep 1".into()],
+        cwd: root.to_string_lossy().to_string(),
+        worktree: root.to_string_lossy().to_string(),
+        env_hash: "env".to_string(),
+        command_hash: "command".to_string(),
+        state: "starting".to_string(),
+        pid: None,
+        pgid: None,
+        nonce: "nonce".to_string(),
+        started_at: now_rfc3339(),
+        process_started_at: None,
+        heartbeat_at: now_rfc3339(),
+        finished_at: None,
+        exit_code: None,
+        signal: None,
+        output_path: String::new(),
+        output_bytes: 0,
+        output_lines: 0,
+        total_output_bytes: 0,
+        output_rotations: 0,
+        max_output_bytes: 1_048_576,
+        max_output_lines: 20_000,
+        owner_instance: "instance:1".to_string(),
+        retention_deadline: None,
+        idle_ttl_secs: 3_600,
+        last_access_at: now_rfc3339(),
+        detail: None,
+    }
+}
+
+#[test]
+fn supervised_processes_round_trip_with_lifecycle_events() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("processes"))
+        .unwrap();
+    let session = store.create_session(&project.id, "supervise").unwrap();
+    let mut row = supervised_row(&session.id, repo.path(), "psup_store");
+    let event = store
+        .insert_supervised_process_with_event(&session.id, &row, "process.starting")
+        .unwrap();
+    assert_eq!(event.kind, "process.starting");
+    assert_eq!(
+        store
+            .count_active_supervised_processes(&session.id)
+            .unwrap(),
+        1
+    );
+    let stored = store
+        .get_supervised_process(&session.id, "psup_store")
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, "starting");
+    assert_eq!(stored.max_output_bytes, 1_048_576);
+
+    row.state = "running".to_string();
+    row.pid = Some(4242);
+    row.pgid = Some(4242);
+    row.process_started_at = Some("Wed Nov 11 00:00:00 2026".to_string());
+    let event = store
+        .update_supervised_process_with_event(&row, "process.started")
+        .unwrap();
+    assert_eq!(event.kind, "process.started");
+    let stored = store
+        .get_supervised_process(&session.id, "psup_store")
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, "running");
+    assert_eq!(stored.pid, Some(4242));
+
+    row.output_bytes = 512;
+    row.output_lines = 4;
+    row.total_output_bytes = 700;
+    store.record_supervised_process_telemetry(&row).unwrap();
+    let stored = store
+        .get_supervised_process(&session.id, "psup_store")
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.output_bytes, 512);
+    assert_eq!(stored.total_output_bytes, 700);
+
+    let list = store
+        .list_supervised_processes(&session.id, true, 10)
+        .unwrap();
+    assert_eq!(list.len(), 1);
+    let live = store
+        .list_supervised_processes(&session.id, false, 10)
+        .unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(store.supervised_process_output_bytes().unwrap(), 512);
+    let counts = store.supervised_process_counts().unwrap();
+    assert!(
+        counts
+            .iter()
+            .any(|entry| entry.key == "running" && entry.count == 1)
+    );
+}
+
+#[test]
+fn supervised_process_replacement_and_pruning_are_bounded() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("processes"))
+        .unwrap();
+    let session = store.create_session(&project.id, "supervise").unwrap();
+    let mut row = supervised_row(&session.id, repo.path(), "psup_prune");
+    store
+        .insert_supervised_process_with_event(&session.id, &row, "process.starting")
+        .unwrap();
+    let error = store
+        .prune_supervised_process_with_event(&session.id, "psup_prune", "retention")
+        .unwrap_err();
+    assert!(error.to_string().contains("refusing to prune"));
+    row.state = "stopped".to_string();
+    row.pid = Some(10);
+    row.pgid = Some(10);
+    row.signal = Some(15);
+    store
+        .update_supervised_process_with_event(&row, "process.stopped")
+        .unwrap();
+    let pruned = store
+        .prune_supervised_process_with_event(&session.id, "psup_prune", "retention")
+        .unwrap()
+        .unwrap();
+    assert_eq!(pruned.kind, "process.pruned");
+    assert!(
+        store
+            .get_supervised_process(&session.id, "psup_prune")
+            .unwrap()
+            .is_none()
+    );
+
+    let replacement = vec![{
+        let mut next = supervised_row(&session.id, repo.path(), "psup_replacement");
+        next.state = "unknown".to_string();
+        next
+    }];
+    store
+        .replace_supervised_processes(&session.id, &replacement)
+        .unwrap();
+    let rows = store
+        .list_supervised_processes(&session.id, true, 10)
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, "psup_replacement");
+    assert_eq!(
+        store
+            .count_active_supervised_processes(&session.id)
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn supervised_process_rows_validate_caps() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("processes"))
+        .unwrap();
+    let session = store.create_session(&project.id, "supervise").unwrap();
+    let mut row = supervised_row(&session.id, repo.path(), "psup_bad");
+    row.max_output_bytes = 1;
+    let error = store
+        .insert_supervised_process_with_event(&session.id, &row, "process.starting")
+        .unwrap_err();
+    assert!(error.to_string().contains("max_output_bytes"));
+    row.max_output_bytes = 4_096;
+    row.state = "bogus".to_string();
+    let error = store
+        .insert_supervised_process_with_event(&session.id, &row, "process.starting")
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("invalid supervised process state")
+    );
+}
+
+#[test]
+fn bundle_import_preserves_supervised_process_lifecycle_rows() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("bundle"))
+        .unwrap();
+    let session = store.create_session(&project.id, "bundle process").unwrap();
+    let mut row = supervised_row(&session.id, repo.path(), "psup_bundle");
+    row.state = "stopped".to_string();
+    row.pid = Some(77);
+    row.pgid = Some(77);
+    row.signal = Some(15);
+    row.exit_code = Some(0);
+    row.output_path = "/tmp/archive-output.log".to_string();
+    row.finished_at = Some(now_rfc3339());
+    row.retention_deadline = Some("2099-01-01T00:00:00Z".to_string());
+    let event = Event {
+        session_id: session.id.clone(),
+        seq: 1,
+        kind: "process.stopped".to_string(),
+        payload: serde_json::to_value(&row).unwrap(),
+        created_at: now_rfc3339(),
+    };
+    let bundle = SessionBundle {
+        version: 1,
+        exported_at: now_rfc3339(),
+        project: project.clone(),
+        session: session.clone(),
+        events: vec![event],
+        agents: Vec::new(),
+        messages: Vec::new(),
+        team_plan: None,
+        todos: Vec::new(),
+        approvals: Vec::new(),
+        merge_queue: Vec::new(),
+        agent_messages: Vec::new(),
+        artifacts: Vec::new(),
+        usage: Vec::new(),
+        memories: Vec::new(),
+        memory_conflicts: Vec::new(),
+        questions: Vec::new(),
+        tasks: Vec::new(),
+        steering: Vec::new(),
+        continuations: Vec::new(),
+        recoveries: Vec::new(),
+        programs: Vec::new(),
+        program_milestones: Vec::new(),
+        program_events: Vec::new(),
+        session_runs: Vec::new(),
+        run_steps: Vec::new(),
+        run_checkpoints: Vec::new(),
+        context_checkpoints: Vec::new(),
+        supervised_processes: vec![row.clone()],
+    };
+    validate_session_bundle(&bundle).unwrap();
+    let data = TempDir::new().unwrap();
+    let imported = Store::open(data.path()).unwrap();
+    imported.import_session_bundle(&bundle).unwrap();
+    let imported_session = imported.get_session(&session.id).unwrap().unwrap();
+    assert_eq!(imported_session.status, "imported");
+    let rows = imported
+        .list_supervised_processes(&session.id, true, 10)
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, "psup_bundle");
+    assert_eq!(rows[0].state, "stopped");
+    assert_eq!(rows[0].exit_code, Some(0));
+    // Imported rows keep their archived path; the daemon refuses to read a
+    // path outside its own managed root. The store never rewrites it.
+    assert_eq!(rows[0].output_path, "/tmp/archive-output.log");
+}
+
+#[test]
+fn supervised_process_bundle_validation_rejects_wrong_session() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("bundle"))
+        .unwrap();
+    let session = store.create_session(&project.id, "bundle process").unwrap();
+    let other = store.create_session(&project.id, "other").unwrap();
+    let row = supervised_row(&other.id, repo.path(), "psup_wrong");
+    let bundle = SessionBundle {
+        version: 1,
+        exported_at: now_rfc3339(),
+        project,
+        session,
+        events: Vec::new(),
+        agents: Vec::new(),
+        messages: Vec::new(),
+        team_plan: None,
+        todos: Vec::new(),
+        approvals: Vec::new(),
+        merge_queue: Vec::new(),
+        agent_messages: Vec::new(),
+        artifacts: Vec::new(),
+        usage: Vec::new(),
+        memories: Vec::new(),
+        memory_conflicts: Vec::new(),
+        questions: Vec::new(),
+        tasks: Vec::new(),
+        steering: Vec::new(),
+        continuations: Vec::new(),
+        recoveries: Vec::new(),
+        programs: Vec::new(),
+        program_milestones: Vec::new(),
+        program_events: Vec::new(),
+        session_runs: Vec::new(),
+        run_steps: Vec::new(),
+        run_checkpoints: Vec::new(),
+        context_checkpoints: Vec::new(),
+        supervised_processes: vec![row],
+    };
+    let error = validate_session_bundle(&bundle).unwrap_err();
+    assert!(error.to_string().contains("belongs to session"), "{error}");
+}
+
+#[test]
+fn process_policy_round_trips_and_validates() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("process policy"))
+        .unwrap();
+    let default = store.get_process_policy(&project.id).unwrap();
+    assert_eq!(default, ProcessPolicy::default());
+    assert!(default.idle_sweep_enabled);
+    assert_eq!(default.max_processes, 8);
+    assert_eq!(default.idle_ttl_secs, 3_600);
+
+    let policy = ProcessPolicy {
+        idle_sweep_enabled: false,
+        max_processes: 3,
+        idle_ttl_secs: 900,
+        max_output_bytes: 65_536,
+        max_output_lines: 2_000,
+    };
+    store.set_process_policy(&project.id, &policy).unwrap();
+    assert_eq!(store.get_process_policy(&project.id).unwrap(), policy);
+    store.record_project_manifest().unwrap();
+    let snapshot = crate::read_project_manifest(store.data_dir()).unwrap();
+    let project_snapshot = snapshot
+        .into_iter()
+        .find(|snapshot| snapshot.project.id == project.id)
+        .unwrap();
+    assert_eq!(project_snapshot.process_policy, policy);
+
+    let invalid = ProcessPolicy {
+        max_processes: 0,
+        ..ProcessPolicy::default()
+    };
+    assert!(store.set_process_policy(&project.id, &invalid).is_err());
+    assert_eq!(store.get_process_policy(&project.id).unwrap(), policy);
+}
+
+#[test]
+fn process_policy_manifest_defaults_for_older_projects() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("legacy"))
+        .unwrap();
+    let encoded = serde_json::to_value({
+        store.record_project_manifest().unwrap();
+        crate::read_project_manifest(store.data_dir())
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| snapshot.project.id == project.id)
+            .unwrap()
+    })
+    .unwrap();
+    let mut value = encoded;
+    value.as_object_mut().unwrap().remove("process_policy");
+    let decoded: ProjectManifestSnapshot = serde_json::from_value(value).unwrap();
+    assert_eq!(decoded.process_policy, ProcessPolicy::default());
 }

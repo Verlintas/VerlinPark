@@ -221,6 +221,13 @@ final class AppModel {
     var consoleInput = ""
     var consoleBusy = false
     var consoleError: String?
+    var supervisedProcesses: [SupervisedProcess] = []
+    var processSummary: [SupervisedProcess] = []
+    var selectedProcessID: String?
+    var processLogs = ""
+    var processesBusy = false
+    var processesError: String?
+    var processStopBusy = false
     var memoryPolicyEnabled = false
     var memoryPolicyMaxItems = "1000"
     var memoryPolicyMaxAgeDays = "180"
@@ -2959,6 +2966,102 @@ final class AppModel {
 
     func clearConsole() {
         consoleOutput = ""
+    }
+
+    func loadProcesses() async {
+        guard let sessionID = selectedSessionID
+        else {
+            supervisedProcesses = []
+            selectedProcessID = nil
+            processLogs = ""
+            return
+        }
+        processesBusy = true
+        defer { processesBusy = false }
+        do {
+            let result = try await core.listProcesses(sessionID: sessionID)
+            supervisedProcesses = result.processes
+            if let selectedProcessID,
+               !result.processes.contains(where: { $0.id == selectedProcessID })
+            {
+                self.selectedProcessID = nil
+                processLogs = ""
+            }
+            if selectedProcessID == nil {
+                selectedProcessID = result.processes.first?.id
+            }
+            processesError = nil
+            if let selectedProcessID {
+                await loadProcessLogs(processID: selectedProcessID)
+            }
+        } catch {
+            processesError = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func loadProcessLogs(processID: String) async {
+        guard let sessionID = selectedSessionID else { return }
+        do {
+            let result = try await core.processLogs(
+                sessionID: sessionID,
+                processID: processID,
+                maxBytes: 65536,
+                fromEnd: true
+            )
+            var text = result.content
+            if result.rotated {
+                text = "[older output was dropped by bounded rotation]\n" + text
+            }
+            if text.count > 200_000 {
+                text = String(text.suffix(160_000))
+            }
+            processLogs = text
+        } catch {
+            processesError = error.localizedDescription
+        }
+    }
+
+    func refreshProcessSummary() async {
+        guard let sessionID = selectedSessionID else {
+            processSummary = []
+            return
+        }
+        do {
+            let result = try await core.listProcesses(
+                sessionID: sessionID,
+                includeFinished: false,
+                limit: 8
+            )
+            processSummary = result.processes
+        } catch {
+            // A transient summary failure must not replace the Stage with an
+            // error banner; the Preview card owns detailed diagnostics.
+            processSummary = []
+        }
+    }
+
+    var activeProcessCount: Int {
+        processSummary.count
+    }
+
+    func stopSupervisedProcess(_ processID: String) async {
+        guard let sessionID = selectedSessionID else { return }
+        processStopBusy = true
+        defer { processStopBusy = false }
+        do {
+            let result = try await core.stopProcess(sessionID: sessionID, processID: processID)
+            if let index = supervisedProcesses.firstIndex(where: { $0.id == processID }) {
+                supervisedProcesses[index] = result.process
+            }
+            if result.process.state != "running", result.process.state != "starting" {
+                processSummary.removeAll { $0.id == processID }
+            }
+            processesError = nil
+            await loadProcessLogs(processID: processID)
+        } catch {
+            processesError = error.localizedDescription
+        }
     }
 
     func loadMemories() async {

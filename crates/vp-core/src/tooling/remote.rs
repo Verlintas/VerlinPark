@@ -857,6 +857,8 @@ mod tests {
             read_jail: false,
             git_branch: None,
             remote: None,
+            session_id: None,
+            process_supervisor: None,
         };
         let error = access(&context, &json!({"path": "a"})).unwrap_err();
         assert!(error.to_string().contains("no ssh execution host"));

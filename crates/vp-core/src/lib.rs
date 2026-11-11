@@ -40,18 +40,20 @@ use vp_protocol::types::{
     OrchestrationOverviewResult, OrchestrationOverviewTotals, OrchestrationPolicy,
     OrchestrationPreviewAction, OrchestrationPreviewResult, OrchestrationRecoveriesResult,
     OrchestrationRecovery, OrchestrationSessionSummary, OrchestrationSnapshot,
-    PlanRevisionDetailResult, PlanRevisionInfo, Program, ProgramActionParams, ProgramCreateParams,
-    ProgramDeleteParams, ProgramListResult, ProgramMilestone, ProgramMilestoneActionParams,
-    ProgramMilestoneCreateParams, ProgramMilestoneListResult, ProgramMilestoneUpdateParams,
-    ProgramPolicy, ProgramReplayReport, ProgramStatus, ProgramStatusParams, ProgramStatusResult,
-    ProgramTickParams, ProgramTickResult, ProgramUpdateParams, Project, ProjectBudget,
-    ProjectBudgetResult, ProjectUsageResult, PullRequestResult, Question, QuestionListResult,
-    ReviseTeamPlanResult, ScheduledTask, SearchResult, Session, SessionBundle, SessionCacheStatus,
-    SessionCheckpoint, SessionCheckpointDeleteResult, SessionCheckpointDiffResult,
-    SessionCheckpointListResult, SessionCheckpointPruneResult, SessionCheckpointRestoreResult,
-    SessionCheckpointStatsResult, SessionCitationAuditResult, SessionCitationsResult,
-    SessionCommit, SessionCompareFile, SessionCompareResult, SessionContextStatus,
-    SessionContinuation, SessionContinuationCancelResult, SessionContinuationClaimInfo,
+    PlanRevisionDetailResult, PlanRevisionInfo, ProcessListResult, ProcessLogsResult,
+    ProcessPolicy, ProcessStopResult, ProcessSupervisorStatus, Program, ProgramActionParams,
+    ProgramCreateParams, ProgramDeleteParams, ProgramListResult, ProgramMilestone,
+    ProgramMilestoneActionParams, ProgramMilestoneCreateParams, ProgramMilestoneListResult,
+    ProgramMilestoneUpdateParams, ProgramPolicy, ProgramReplayReport, ProgramStatus,
+    ProgramStatusParams, ProgramStatusResult, ProgramTickParams, ProgramTickResult,
+    ProgramUpdateParams, Project, ProjectBudget, ProjectBudgetResult, ProjectUsageResult,
+    PullRequestResult, Question, QuestionListResult, ReviseTeamPlanResult, ScheduledTask,
+    SearchResult, Session, SessionBundle, SessionCacheStatus, SessionCheckpoint,
+    SessionCheckpointDeleteResult, SessionCheckpointDiffResult, SessionCheckpointListResult,
+    SessionCheckpointPruneResult, SessionCheckpointRestoreResult, SessionCheckpointStatsResult,
+    SessionCitationAuditResult, SessionCitationsResult, SessionCommit, SessionCompareFile,
+    SessionCompareResult, SessionContextStatus, SessionContinuation,
+    SessionContinuationCancelResult, SessionContinuationClaimInfo,
     SessionContinuationReclaimResult, SessionContinuationStatusResult, SessionContinuationsResult,
     SessionDeferResult, SessionDiff, SessionForkResult, SessionForkTreeNode, SessionForkTreeResult,
     SessionImportResult, SessionLandResult, SessionLineageEntry, SessionLineageResult,
@@ -106,6 +108,7 @@ pub mod memory_index;
 mod operation;
 pub mod orchestration;
 pub mod permissions;
+pub mod process_supervisor;
 pub mod program;
 pub mod prompt_cache;
 pub mod rebuild;
@@ -151,6 +154,7 @@ struct ReplayData {
     run_steps: Vec<vp_protocol::types::RunStep>,
     run_checkpoints: Vec<vp_protocol::types::RunCheckpoint>,
     context_checkpoints: Vec<vp_protocol::types::ContextCheckpoint>,
+    processes: Vec<vp_protocol::types::SupervisedProcess>,
     events: Vec<Event>,
 }
 
@@ -178,6 +182,7 @@ pub struct Engine {
     computers: Arc<computer::ComputerManager>,
     gui: Arc<gui::GuiCoordinator>,
     scheduler: Arc<scheduler::TaskScheduler>,
+    process_supervisor: Arc<process_supervisor::ProcessSupervisor>,
     runtime_id: String,
     continuation_claims: Arc<Mutex<HashMap<String, SessionContinuationClaim>>>,
 }
@@ -739,6 +744,7 @@ impl Engine {
         let runtime_id = store.owner_id_for_nonce(&Uuid::now_v7().to_string());
         Self {
             scheduler: Arc::new(scheduler::TaskScheduler::new(store.clone())),
+            process_supervisor: Arc::new(process_supervisor::ProcessSupervisor::new(store.clone())),
             store,
             events,
             approval_waiters: Arc::new(Mutex::new(HashMap::new())),
@@ -1485,6 +1491,39 @@ impl Engine {
         .await??
         .ok_or_else(|| anyhow::anyhow!("project not found: {project_id}"))?;
         tokio::task::spawn_blocking(move || store.get_shell_policy(&project_id)).await?
+    }
+
+    pub async fn get_process_policy(&self, project_id: &str) -> Result<ProcessPolicy> {
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            if store.get_project(&project_id)?.is_none() {
+                return Err(anyhow::anyhow!("project not found: {project_id}"));
+            }
+            store.get_process_policy(&project_id)
+        })
+        .await?
+    }
+
+    pub async fn set_process_policy(
+        &self,
+        project_id: &str,
+        policy: ProcessPolicy,
+    ) -> Result<ProcessPolicy> {
+        policy
+            .validate()
+            .map_err(|error| anyhow::anyhow!("invalid process policy: {error}"))?;
+        let store = self.store.clone();
+        let project_id_for_store = project_id.to_string();
+        let policy_for_store = policy.clone();
+        tokio::task::spawn_blocking(move || {
+            if store.get_project(&project_id_for_store)?.is_none() {
+                return Err(anyhow::anyhow!("project not found: {project_id_for_store}"));
+            }
+            store.set_process_policy(&project_id_for_store, &policy_for_store)
+        })
+        .await??;
+        Ok(policy)
     }
 
     /// Read-only language-server availability for a project checkout. This
@@ -8405,6 +8444,8 @@ impl Engine {
             .worktree
             .clone()
             .ok_or_else(|| anyhow::anyhow!("session has no worktree"))?;
+        self.stop_session_processes(&session.id, "session discard")
+            .await;
         let worktree = PathBuf::from(worktree);
         let git_lock = self.git_lock.clone();
         tokio::task::spawn_blocking(move || {
@@ -12091,6 +12132,7 @@ impl Engine {
             let run_steps = store.list_session_run_steps(&id)?;
             let run_checkpoints = store.list_session_run_checkpoints(&id)?;
             let context_checkpoints = store.list_context_checkpoints(&id, 10_000)?;
+            let processes = store.list_supervised_processes(&id, true, 500)?;
             let events = store.list_all_events(&id)?;
             Ok(ReplayData {
                 session,
@@ -12116,6 +12158,7 @@ impl Engine {
                 run_steps,
                 run_checkpoints,
                 context_checkpoints,
+                processes,
                 events,
             })
         })
@@ -12926,6 +12969,18 @@ impl Engine {
             ));
         }
 
+        let expected_processes = crate::process_supervisor::processes_from_events(&data.events);
+        let processes_match = expected_processes.as_ref().is_some_and(|expected| {
+            crate::process_supervisor::processes_match(&data.processes, expected)
+        });
+        if !processes_match {
+            mismatches.push(format!(
+                "supervised processes: projection={}, replay={}",
+                data.processes.len(),
+                expected_processes.as_ref().map(Vec::len).unwrap_or(0)
+            ));
+        }
+
         let expected_artifacts = Self::expected_artifacts(data);
         let projected_artifacts = data
             .artifacts
@@ -13206,7 +13261,8 @@ impl Engine {
             && runs_match
             && run_steps_match
             && run_checkpoints_match
-            && context_checkpoints_match;
+            && context_checkpoints_match
+            && processes_match;
         Ok(SessionReplayReport {
             session_id: data.session.id.clone(),
             event_count: data.events.len(),
@@ -13234,6 +13290,7 @@ impl Engine {
             run_steps_match,
             run_checkpoints_match,
             context_checkpoints_match,
+            processes_match,
             consistent,
             repaired,
             rebuilt: false,
@@ -13509,6 +13566,7 @@ impl Engine {
             .and_then(|value| i32::try_from(value).ok());
         let journal = crate::run_journal::projections_from_events(&data.events);
         let context_checkpoints = crate::context::checkpoints_from_events(&data.events);
+        let processes = crate::process_supervisor::processes_from_events(&data.events);
         Ok(SessionRepair {
             status,
             priority,
@@ -13536,6 +13594,7 @@ impl Engine {
             run_steps: journal.as_ref().map(|value| value.1.clone()),
             run_checkpoints: journal.as_ref().map(|value| value.2.clone()),
             context_checkpoints,
+            supervised_processes: processes,
             artifact_warnings,
         })
     }
@@ -13885,6 +13944,7 @@ impl Engine {
             run_steps: data.run_steps,
             run_checkpoints: data.run_checkpoints,
             context_checkpoints: data.context_checkpoints,
+            supervised_processes: data.processes,
         })
     }
 
@@ -15222,6 +15282,8 @@ impl Engine {
             read_jail: policy.read_jail,
             git_branch: session.branch.clone(),
             remote: None,
+            session_id: None,
+            process_supervisor: None,
         };
         self.consoles.open(&session.id, context).await
     }
@@ -15249,6 +15311,112 @@ impl Engine {
 
     pub async fn console_close(&self, console_id: &str) -> Result<ConsoleCloseResult> {
         self.consoles.close(console_id).await
+    }
+
+    pub fn process_supervisor(&self) -> &Arc<process_supervisor::ProcessSupervisor> {
+        &self.process_supervisor
+    }
+
+    /// Reconcile durable supervised processes after a daemon restart. Adoption
+    /// requires full PID/start-time/nonce/command-hash evidence.
+    pub async fn reconcile_supervised_processes(
+        &self,
+    ) -> Result<process_supervisor::ReconcileReport> {
+        self.process_supervisor.reconcile().await
+    }
+
+    /// Idle-stop and retention-sweep durable processes. The daemon controls the
+    /// cadence and can disable idle stops with
+    /// `VERLINPARK_PROCESS_IDLE_SWEEP_SECS=0`.
+    pub async fn sweep_supervised_processes(
+        &self,
+        idle_enabled: bool,
+    ) -> Result<process_supervisor::SweepReport> {
+        self.process_supervisor.sweep(idle_enabled).await
+    }
+
+    pub async fn stop_session_processes(&self, session_id: &str, reason: &str) -> usize {
+        self.process_supervisor
+            .stop_session(session_id, reason)
+            .await
+    }
+
+    pub fn process_supervisor_status(&self) -> Result<ProcessSupervisorStatus> {
+        self.process_supervisor.status()
+    }
+
+    pub async fn session_processes(
+        &self,
+        session_id: &str,
+        include_finished: Option<bool>,
+        limit: Option<u32>,
+    ) -> Result<ProcessListResult> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            if store.get_session(&id)?.is_none() {
+                return Err(anyhow::anyhow!("session not found: {id}"));
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        let rows = self.process_supervisor.list(
+            session_id,
+            include_finished.unwrap_or(true),
+            limit.unwrap_or(50).clamp(1, 200),
+        )?;
+        Ok(ProcessListResult {
+            session_id: session_id.to_string(),
+            active: self.process_supervisor.active_count(session_id)?,
+            processes: rows,
+            limit: self
+                .process_supervisor
+                .policy_for_session(session_id)
+                .max_processes,
+        })
+    }
+
+    pub async fn session_process_logs(
+        &self,
+        session_id: &str,
+        process_id: &str,
+        offset: Option<u64>,
+        max_bytes: Option<u32>,
+        max_lines: Option<u32>,
+        from_end: bool,
+    ) -> Result<ProcessLogsResult> {
+        let supervisor = Arc::clone(&self.process_supervisor);
+        let session_id = session_id.to_string();
+        let process_id = process_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            supervisor.read_logs(
+                &session_id,
+                &process_id,
+                offset,
+                max_bytes,
+                max_lines,
+                from_end,
+            )
+        })
+        .await?
+    }
+
+    pub async fn session_process_stop(
+        &self,
+        session_id: &str,
+        process_id: &str,
+        signal: Option<String>,
+        grace_secs: Option<u32>,
+    ) -> Result<ProcessStopResult> {
+        self.process_supervisor
+            .stop(
+                session_id,
+                process_id,
+                signal.as_deref(),
+                grace_secs.map(u64::from),
+                "stopped by operator",
+            )
+            .await
     }
 
     pub async fn workspace_tree(&self, session_id: &str) -> Result<WorkspaceTreeResult> {
@@ -15424,6 +15592,8 @@ impl Engine {
             read_jail: policy.read_jail,
             git_branch: session.branch.clone(),
             remote: None,
+            session_id: None,
+            process_supervisor: None,
         };
         self.terminals.open(&session.id, context, cols, rows).await
     }
@@ -15685,7 +15855,8 @@ impl Engine {
                 });
                 continue;
             }
-            crate::tooling::process::stop_worktree_processes(&path);
+            self.stop_session_processes(&session.id, "worktree cleanup")
+                .await;
             crate::tooling::lsp::stop_lsp_servers(&path);
             self.stop_session_browsers(&session.id).await;
             self.stop_session_computers(&session.id).await;

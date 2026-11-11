@@ -1,200 +1,23 @@
-//! Long-lived sandboxed processes for dev servers, watchers, and interactive
-//! tools. Processes are scoped to one agent worktree, capped, and swept by an
-//! idle TTL. They intentionally do not survive a daemon restart in v1.
+//! Durable process tool for long-lived sandboxed children.
+//!
+//! The tool is a thin protocol layer over [`crate::process_supervisor`]. The
+//! daemon owns the row, log file, lifecycle events, restart reconciliation, and
+//! idle sweep; a provider turn only starts, inspects, waits for, or stops one.
+//! No command is ever restarted automatically.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
-
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::{Value, json};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::process::ChildStdin;
-use tokio::sync::Mutex as AsyncMutex;
-use uuid::Uuid;
 
-use crate::tools::{
-    AgentTool, ToolContext, ToolOutput, safe_existing_path, sandboxed_command, truncate,
+use crate::process_supervisor::{
+    MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES, MIN_OUTPUT_BYTES, MIN_OUTPUT_LINES, StartSpec,
 };
-
-const MAX_PROCESSES_PER_WORKTREE: usize = 8;
-const MAX_STREAM_BYTES: usize = 2 * 1024 * 1024;
-const DEFAULT_IDLE_TTL_SECS: u64 = 3_600;
-const COMPLETED_RETENTION_SECS: u64 = 600;
-const READ_MAX_BYTES: usize = 1024 * 1024;
+use crate::tooling::errors::ToolErrorCode;
+use crate::tools::{AgentTool, ToolContext, ToolOutput, truncate};
 
 pub struct ProcessTool;
 pub struct WaitFor;
-
-#[derive(Debug, Default)]
-struct StreamBuffer {
-    bytes: Vec<u8>,
-    base: u64,
-    total: u64,
-    truncated: bool,
-}
-
-impl StreamBuffer {
-    fn push(&mut self, bytes: &[u8]) {
-        self.total = self.total.saturating_add(bytes.len() as u64);
-        self.bytes.extend_from_slice(bytes);
-        if self.bytes.len() > MAX_STREAM_BYTES {
-            let excess = self.bytes.len() - MAX_STREAM_BYTES;
-            self.bytes.drain(..excess);
-            self.base = self.base.saturating_add(excess as u64);
-            self.truncated = true;
-        }
-    }
-
-    fn read_from(&self, cursor: u64, max_bytes: usize) -> (String, u64, bool, bool) {
-        let skipped = cursor < self.base;
-        let start = if skipped {
-            0
-        } else {
-            (cursor - self.base) as usize
-        };
-        if start >= self.bytes.len() {
-            return (String::new(), self.total, skipped, false);
-        }
-        let end = (start + max_bytes).min(self.bytes.len());
-        let text = String::from_utf8_lossy(&self.bytes[start..end]).to_string();
-        let next = self.base.saturating_add(end as u64);
-        let more = end < self.bytes.len();
-        (text, next, skipped, more)
-    }
-
-    fn tail(&self, max_bytes: usize) -> String {
-        let start = self.bytes.len().saturating_sub(max_bytes);
-        String::from_utf8_lossy(&self.bytes[start..]).to_string()
-    }
-}
-
-#[derive(Debug, Default)]
-struct ProcessOutput {
-    stdout: StreamBuffer,
-    stderr: StreamBuffer,
-}
-
-struct ProcessState {
-    id: String,
-    name: String,
-    command: String,
-    root: PathBuf,
-    pid: Option<i32>,
-    stdin: Option<ChildStdin>,
-    output: Arc<Mutex<ProcessOutput>>,
-    done: bool,
-    exit_code: Option<i32>,
-    started: Instant,
-    last_access: Instant,
-    idle_ttl: Duration,
-    stdout_cursor: u64,
-    stderr_cursor: u64,
-}
-
-type SharedProcess = Arc<AsyncMutex<ProcessState>>;
-
-static PROCESSES: OnceLock<Mutex<HashMap<String, SharedProcess>>> = OnceLock::new();
-
-fn registry() -> &'static Mutex<HashMap<String, SharedProcess>> {
-    PROCESSES.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Kill every tracked process whose worktree is about to be removed.
-pub(crate) fn stop_worktree_processes(root: &Path) {
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let Ok(mut processes) = registry().lock() else {
-        return;
-    };
-    processes.retain(|_, process| {
-        let Ok(guard) = process.try_lock() else {
-            return true;
-        };
-        if guard.root == root {
-            kill_group(guard.pid, libc::SIGKILL);
-            false
-        } else {
-            true
-        }
-    });
-}
-
-fn process_root(context: &ToolContext) -> PathBuf {
-    context
-        .root
-        .canonicalize()
-        .unwrap_or_else(|_| context.root.clone())
-}
-
-fn ensure_sweeper() {
-    static STARTED: OnceLock<()> = OnceLock::new();
-    STARTED.get_or_init(|| {
-        tokio::spawn(async {
-            loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                reap_all();
-            }
-        });
-    });
-}
-
-fn reap_all() {
-    let Ok(mut processes) = registry().lock() else {
-        return;
-    };
-    let now = Instant::now();
-    processes.retain(|_, process| {
-        let Ok(guard) = process.try_lock() else {
-            return true;
-        };
-        if !guard.done && now.duration_since(guard.last_access) > guard.idle_ttl {
-            kill_group(guard.pid, libc::SIGKILL);
-            return false;
-        }
-        if guard.done
-            && now.duration_since(guard.started) > Duration::from_secs(COMPLETED_RETENTION_SECS)
-        {
-            return false;
-        }
-        true
-    });
-}
-
-fn count_for_root(root: &Path) -> usize {
-    let Ok(processes) = registry().lock() else {
-        return 0;
-    };
-    processes
-        .values()
-        .filter(|process| {
-            process
-                .try_lock()
-                .map(|guard| guard.root == root && !guard.done)
-                .unwrap_or(true)
-        })
-        .count()
-}
-
-async fn get_process(context: &ToolContext, id: &str) -> Result<SharedProcess> {
-    let root = process_root(context);
-    let process = registry()
-        .lock()
-        .ok()
-        .and_then(|processes| processes.get(id).cloned())
-        .ok_or_else(|| anyhow!("unknown process id: {id}"))?;
-    let matches = {
-        let guard = process.lock().await;
-        guard.root == root
-    };
-    if !matches {
-        bail!("process does not belong to this worktree");
-    }
-    Ok(process)
-}
 
 #[async_trait]
 impl AgentTool for ProcessTool {
@@ -203,26 +26,32 @@ impl AgentTool for ProcessTool {
     }
 
     fn description(&self) -> &'static str {
-        "Start, inspect, read, write, signal, wait for, or stop a long-lived sandboxed process such as a dev server or watcher."
+        "Start, inspect, read logs from, wait for, or stop a durable sandboxed process. Processes survive a daemon restart when their identity can be verified, and are never restarted automatically."
     }
 
     fn schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["start", "list", "status", "read", "write", "signal", "wait", "stop"]},
-                "command": {"type": "string", "description": "Shell command for action=start"},
+                "action": {"type": "string", "enum": ["start", "list", "status", "logs", "read", "wait", "stop", "signal", "write"]},
+                "command": {"type": "string", "description": "Shell command for action=start; max 16 KiB"},
                 "name": {"type": "string", "description": "Human label; default is the first command word"},
                 "cwd": {"type": "string", "description": "Worktree-relative working directory"},
-                "env": {"type": "object", "description": "Explicit environment variables; max 32 keys"},
-                "process_id": {"type": "string", "description": "Required for status/read/write/signal/wait/stop"},
-                "input": {"type": "string", "description": "stdin text for action=write"},
-                "newline": {"type": "boolean", "description": "Append newline to stdin; default true"},
-                "signal": {"type": "string", "enum": ["TERM", "KILL", "INT", "HUP"], "description": "Default TERM"},
+                "env": {"type": "object", "description": "Explicit environment variables; max 32 keys, VERLINPARK_* reserved"},
+                "process_id": {"type": "string", "description": "Required for status/logs/read/wait/stop/signal/write"},
+                "offset": {"type": "integer", "minimum": 0, "description": "Byte offset for action=logs"},
+                "from_end": {"type": "boolean", "description": "Read the newest retained bytes for action=logs"},
+                "max_bytes": {"type": "integer", "minimum": 1, "maximum": 1048576, "description": "Log page byte cap; default 65536"},
+                "max_lines": {"type": "integer", "minimum": 1, "maximum": 20000, "description": "Log page line cap; default 20000"},
+                "max_output_bytes": {"type": "integer", "minimum": 4096, "maximum": 4194304, "description": "Retained log byte cap; default 1 MiB"},
+                "max_output_lines": {"type": "integer", "minimum": 100, "maximum": 50000, "description": "Retained log line cap; default 20000"},
                 "pattern": {"type": "string", "description": "Regex pattern for action=wait"},
-                "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 3600, "description": "Wait or idle TTL; default 30 for wait, 3600 for start"},
-                "max_bytes": {"type": "integer", "minimum": 1, "maximum": 1048576, "description": "Default 65536"},
-                "reset": {"type": "boolean", "description": "Read from the beginning of the retained buffer"}
+                "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 3600, "description": "Wait deadline; default 30. For start it is the idle TTL; default 3600"},
+                "signal": {"type": "string", "enum": ["TERM", "KILL", "INT", "HUP"], "description": "Default TERM"},
+                "grace_secs": {"type": "integer", "minimum": 1, "maximum": 30, "description": "TERM-to-KILL grace for action=stop; default 5"},
+                "include_finished": {"type": "boolean", "description": "Include exited/stopped/lost rows in action=list; default true"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200, "description": "List cap; default 50"},
+                "reset": {"type": "boolean", "description": "Legacy alias for from_end=false with offset=0"}
             },
             "required": ["action"]
         })
@@ -233,463 +62,336 @@ impl AgentTool for ProcessTool {
             .get("action")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("action is required"))?;
-        ensure_sweeper();
-        let root = process_root(context);
-        reap_all();
+        let (session_id, supervisor) = match (
+            context.session_id.as_deref(),
+            context.process_supervisor.as_ref(),
+        ) {
+            (Some(session_id), Some(supervisor)) => (session_id, supervisor),
+            _ => {
+                return Ok(ToolOutput::error_coded(
+                    "process",
+                    ToolErrorCode::PROCESS_FAILED,
+                    "durable process supervision is unavailable in this context",
+                ));
+            }
+        };
         match action {
-            "start" => start_process(context, &input, &root).await,
-            "list" => list_processes(&root).await,
-            "status" => status_process(context, &input).await,
-            "read" => read_process(context, &input).await,
-            "write" => write_process(context, &input).await,
-            "signal" => signal_process(context, &input).await,
-            "wait" => wait_process(context, &input).await,
-            "stop" => stop_process(context, &input).await,
-            _ => Ok(ToolOutput::error_structured(
+            "start" => start_process(context, session_id, supervisor, &input).await,
+            "list" => list_processes(session_id, supervisor, &input),
+            "status" => status_process(session_id, supervisor, &input),
+            "logs" => logs_process(session_id, supervisor, &input),
+            "read" => legacy_read_process(session_id, supervisor, &input),
+            "wait" => wait_process(session_id, supervisor, &input).await,
+            "stop" => stop_process(session_id, supervisor, &input).await,
+            "signal" => signal_process(session_id, supervisor, &input),
+            "write" => Ok(ToolOutput::error_coded(
+                "process",
+                ToolErrorCode::PROCESS_IO_FAILED,
+                "durable processes run with detached stdin; use files, arguments, or a network protocol instead",
+            )),
+            _ => Ok(ToolOutput::error_coded(
+                "process",
+                ToolErrorCode::INVALID_ARGUMENT,
                 format!("unsupported process action: {action}"),
-                json!({"code": "INVALID_ARGUMENT", "action": action}),
             )),
         }
     }
 }
 
-async fn start_process(context: &ToolContext, input: &Value, root: &Path) -> Result<ToolOutput> {
+async fn start_process(
+    context: &ToolContext,
+    session_id: &str,
+    supervisor: &std::sync::Arc<crate::process_supervisor::ProcessSupervisor>,
+    input: &Value,
+) -> Result<ToolOutput> {
     let command = input
         .get("command")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|command| !command.is_empty())
-        .ok_or_else(|| anyhow!("command is required for action=start"))?;
-    if command.len() > 16_384 {
-        return Ok(ToolOutput::error_structured(
-            "command exceeds the 16 KiB limit",
-            json!({"code": "INVALID_ARGUMENT"}),
-        ));
-    }
-    if count_for_root(root) >= MAX_PROCESSES_PER_WORKTREE {
-        return Ok(ToolOutput::error_structured(
-            format!(
-                "process limit is {MAX_PROCESSES_PER_WORKTREE} per worktree; stop an existing process first"
-            ),
-            json!({"code": "PROCESS_LIMIT", "limit": MAX_PROCESSES_PER_WORKTREE}),
-        ));
-    }
+        .ok_or_else(|| anyhow!("command is required for action=start"))?
+        .to_string();
     let name = input
         .get("name")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            command
-                .split_whitespace()
-                .next()
-                .unwrap_or("process")
-                .to_string()
-        });
-    let idle_ttl = input
-        .get("timeout_secs")
-        .and_then(Value::as_u64)
-        .unwrap_or(DEFAULT_IDLE_TTL_SECS)
-        .clamp(1, 86_400);
-    let cwd = if let Some(relative) = input.get("cwd").and_then(Value::as_str) {
-        let path = safe_existing_path(root, relative)?;
-        if !path.is_dir() {
-            return Ok(ToolOutput::error_structured(
-                "cwd must be a directory",
-                json!({"code": "INVALID_ARGUMENT", "cwd": relative}),
-            ));
-        }
-        Some(path)
-    } else {
-        None
-    };
-    let mut process = sandboxed_command(context).await?;
-    process
-        .arg("/bin/sh")
-        .arg("-c")
-        .arg(command)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(cwd) = &cwd {
-        process.current_dir(cwd);
-    }
-    if let Some(env) = input.get("env").and_then(Value::as_object) {
-        if env.len() > 32 {
-            return Ok(ToolOutput::error_structured(
+        .map(str::to_string);
+    let cwd = input.get("cwd").and_then(Value::as_str).map(str::to_string);
+    let mut env = std::collections::BTreeMap::new();
+    if let Some(values) = input.get("env").and_then(Value::as_object) {
+        if values.len() > 32 {
+            return Ok(ToolOutput::error_coded(
+                "process",
+                ToolErrorCode::INVALID_ARGUMENT,
                 "env accepts at most 32 entries",
-                json!({"code": "INVALID_ARGUMENT", "entries": env.len()}),
             ));
         }
-        for (key, value) in env {
-            if !valid_env_key(key) {
-                return Ok(ToolOutput::error_structured(
-                    format!("invalid environment variable name: {key}"),
-                    json!({"code": "INVALID_ARGUMENT", "key": key}),
-                ));
-            }
+        for (key, value) in values {
             let Some(value) = value.as_str() else {
-                return Ok(ToolOutput::error_structured(
+                return Ok(ToolOutput::error_coded(
+                    "process",
+                    ToolErrorCode::INVALID_ARGUMENT,
                     format!("environment variable {key} must be a string"),
-                    json!({"code": "INVALID_ARGUMENT", "key": key}),
                 ));
             };
-            if value.len() > 4_096 || value.contains('\0') {
-                return Ok(ToolOutput::error_structured(
-                    format!("environment variable {key} is too large or contains NUL"),
-                    json!({"code": "INVALID_ARGUMENT", "key": key}),
-                ));
-            }
-            process.env(key, value);
+            env.insert(key.clone(), value.to_string());
         }
     }
-    let mut child = process.spawn().context("spawning sandboxed process")?;
-    let pid = child.id().and_then(|pid| i32::try_from(pid).ok());
-    let stdin = child.stdin.take();
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("process stdout pipe is unavailable"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow!("process stderr pipe is unavailable"))?;
-    let output = Arc::new(Mutex::new(ProcessOutput::default()));
-    tokio::spawn(pump_stream(stdout, output.clone(), true));
-    tokio::spawn(pump_stream(stderr, output.clone(), false));
-    let id = format!("proc_{}", &Uuid::now_v7().simple().to_string()[..12]);
-    let state = Arc::new(AsyncMutex::new(ProcessState {
-        id: id.clone(),
+    let idle_ttl_secs = input
+        .get("timeout_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(3_600)
+        .clamp(1, 86_400);
+    let max_output_bytes = input
+        .get("max_output_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(1_048_576)
+        .clamp(MIN_OUTPUT_BYTES, MAX_OUTPUT_BYTES);
+    let max_output_lines = input
+        .get("max_output_lines")
+        .and_then(Value::as_u64)
+        .unwrap_or(20_000)
+        .clamp(MIN_OUTPUT_LINES, MAX_OUTPUT_LINES);
+    let spec = StartSpec {
+        command: command.clone(),
         name: name.clone(),
-        command: command.to_string(),
-        root: root.to_path_buf(),
-        pid,
-        stdin,
-        output: output.clone(),
-        done: false,
-        exit_code: None,
-        started: Instant::now(),
-        last_access: Instant::now(),
-        idle_ttl: Duration::from_secs(idle_ttl),
-        stdout_cursor: 0,
-        stderr_cursor: 0,
-    }));
-    let wait_state = state.clone();
-    tokio::spawn(async move {
-        let status = child.wait().await;
-        let mut guard = wait_state.lock().await;
-        guard.done = true;
-        guard.exit_code = status.ok().and_then(|status| status.code());
-        guard.pid = None;
-        guard.stdin = None;
-    });
-    if let Ok(mut processes) = registry().lock() {
-        processes.insert(id.clone(), state);
-    }
-    Ok(ToolOutput::ok_structured(
-        format!(
-            "started {} ({}){}",
-            id,
-            name,
-            cwd.map(|cwd| format!(" in {}", cwd.display()))
-                .unwrap_or_default()
-        ),
-        json!({
-            "process_id": id,
-            "name": name,
-            "command": command,
-            "pid": pid,
-            "status": "running",
-            "idle_ttl_secs": idle_ttl,
-            "next_actions": [format!("process action=wait process_id={id} pattern=<ready>")],
-        }),
-    ))
-}
-
-fn valid_env_key(key: &str) -> bool {
-    !key.is_empty()
-        && key.len() <= 128
-        && key
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-        && key
-            .chars()
-            .next()
-            .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
-}
-
-async fn pump_stream<R>(mut reader: R, output: Arc<Mutex<ProcessOutput>>, stdout: bool)
-where
-    R: AsyncRead + Unpin,
-{
-    let mut buffer = [0u8; 8192];
-    loop {
-        match reader.read(&mut buffer).await {
-            Ok(0) | Err(_) => break,
-            Ok(read) => {
-                if let Ok(mut output) = output.lock() {
-                    if stdout {
-                        output.stdout.push(&buffer[..read]);
-                    } else {
-                        output.stderr.push(&buffer[..read]);
-                    }
-                }
+        cwd,
+        env,
+        idle_ttl_secs,
+        max_output_bytes,
+        max_output_lines,
+    };
+    match supervisor.start(session_id, context, &spec).await {
+        Ok(row) => Ok(ToolOutput::ok_structured(
+            format!(
+                "started {} ({}) · running · pid {}",
+                row.id,
+                row.name,
+                row.pid.unwrap_or(0)
+            ),
+            json!({
+                "process_id": row.id,
+                "name": row.name,
+                "command": row.command,
+                "pid": row.pid,
+                "status": row.state,
+                "state": row.state,
+                "started_at": row.started_at,
+                "idle_ttl_secs": row.idle_ttl_secs,
+                "max_output_bytes": row.max_output_bytes,
+                "max_output_lines": row.max_output_lines,
+                "process": row,
+                "next_actions": [
+                    format!("process action=logs process_id={}", row.id),
+                    format!("process action=wait process_id={} pattern=<ready>", row.id),
+                ],
+            }),
+        )),
+        Err(error) => {
+            let message = error.to_string();
+            if message.contains("process limit") {
+                Ok(ToolOutput::error_coded(
+                    "process",
+                    ToolErrorCode::PROCESS_LIMIT,
+                    message,
+                ))
+            } else {
+                Ok(ToolOutput::error_coded(
+                    "process",
+                    ToolErrorCode::PROCESS_SPAWN_FAILED,
+                    message,
+                ))
             }
         }
     }
 }
 
-async fn list_processes(root: &Path) -> Result<ToolOutput> {
-    let processes = registry()
-        .lock()
-        .map(|processes| processes.values().cloned().collect::<Vec<SharedProcess>>())
-        .unwrap_or_default();
-    let mut entries = Vec::new();
-    for process in processes {
-        let guard = process.lock().await;
-        if guard.root != root {
-            continue;
-        }
-        entries.push(json!({
-            "process_id": guard.id,
-            "name": guard.name,
-            "command": guard.command,
-            "pid": guard.pid,
-            "done": guard.done,
-            "exit_code": guard.exit_code,
-            "duration_ms": guard.started.elapsed().as_millis() as u64,
-        }));
-    }
-    entries.sort_by(|left, right| {
-        left["process_id"]
-            .as_str()
-            .cmp(&right["process_id"].as_str())
-    });
-    let rendered = entries
+fn list_processes(
+    session_id: &str,
+    supervisor: &crate::process_supervisor::ProcessSupervisor,
+    input: &Value,
+) -> Result<ToolOutput> {
+    let include_finished = input
+        .get("include_finished")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let limit = input
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(50)
+        .clamp(1, 200) as u32;
+    let rows = supervisor.list(session_id, include_finished, limit)?;
+    let active = supervisor.active_count(session_id)?;
+    let rendered = rows
         .iter()
-        .map(|entry| {
+        .map(|row| {
             format!(
-                "{} {} · {} · {}",
-                entry["process_id"].as_str().unwrap_or("?"),
-                entry["name"].as_str().unwrap_or("?"),
-                if entry["done"].as_bool().unwrap_or(false) {
-                    format!("exited {}", entry["exit_code"].as_i64().unwrap_or(-1))
-                } else {
-                    "running".to_string()
-                },
-                entry["command"].as_str().unwrap_or("")
+                "{} {} · {} · pid {} · {} bytes{}",
+                row.id,
+                row.name,
+                row.state,
+                row.pid.unwrap_or(0),
+                row.output_bytes,
+                row.exit_code
+                    .map(|code| format!(" · exit {code}"))
+                    .unwrap_or_default()
             )
         })
         .collect::<Vec<_>>()
         .join("\n");
     Ok(ToolOutput::ok_structured(
-        truncate(rendered),
+        truncate(if rendered.is_empty() {
+            "(no supervised processes)".to_string()
+        } else {
+            rendered
+        }),
         json!({
-            "processes": entries,
-            "count": entries.len(),
-            "limit": MAX_PROCESSES_PER_WORKTREE,
+            "processes": rows,
+            "count": rows.len(),
+            "active": active,
+            "limit": supervisor.policy_for_session(session_id).max_processes,
+            "include_finished": include_finished,
         }),
     ))
 }
 
-async fn status_process(context: &ToolContext, input: &Value) -> Result<ToolOutput> {
+fn status_process(
+    session_id: &str,
+    supervisor: &crate::process_supervisor::ProcessSupervisor,
+    input: &Value,
+) -> Result<ToolOutput> {
     let id = process_id(input)?;
-    let process = get_process(context, id).await?;
-    let mut guard = process.lock().await;
-    guard.last_access = Instant::now();
-    let output_bytes = guard
-        .output
-        .lock()
-        .map(|output| {
-            (
-                output.stdout.total,
-                output.stderr.total,
-                output.stdout.truncated || output.stderr.truncated,
-            )
-        })
-        .unwrap_or((0, 0, false));
+    let mut row = supervisor.get(session_id, id)?;
+    supervisor.touch(&mut row);
+    let text = format!(
+        "{} {} · {}{}{}",
+        row.id,
+        row.name,
+        row.state,
+        row.pid
+            .map(|pid| format!(" · pid {pid}"))
+            .unwrap_or_default(),
+        row.exit_code
+            .map(|code| format!(" · exit {code}"))
+            .unwrap_or_default()
+    );
     Ok(ToolOutput::ok_structured(
-        format!(
-            "{} {} · {}{}ms",
-            guard.id,
-            guard.name,
-            if guard.done {
-                format!("exited {} · ", guard.exit_code.unwrap_or(-1))
-            } else {
-                "running · ".to_string()
-            },
-            guard.started.elapsed().as_millis()
-        ),
+        text,
         json!({
-            "process_id": guard.id,
-            "name": guard.name,
-            "command": guard.command,
-            "pid": guard.pid,
-            "done": guard.done,
-            "exit_code": guard.exit_code,
-            "duration_ms": guard.started.elapsed().as_millis() as u64,
-            "stdout_bytes": output_bytes.0,
-            "stderr_bytes": output_bytes.1,
-            "output_truncated": output_bytes.2,
-            "stdout_cursor": guard.stdout_cursor,
-            "stderr_cursor": guard.stderr_cursor,
+            "process_id": row.id,
+            "process": row,
         }),
     ))
 }
 
-async fn read_process(context: &ToolContext, input: &Value) -> Result<ToolOutput> {
+fn logs_process(
+    session_id: &str,
+    supervisor: &crate::process_supervisor::ProcessSupervisor,
+    input: &Value,
+) -> Result<ToolOutput> {
     let id = process_id(input)?;
-    let max_bytes = input
-        .get("max_bytes")
-        .and_then(Value::as_u64)
-        .unwrap_or(65_536)
-        .clamp(1, READ_MAX_BYTES as u64) as usize;
-    let reset = input.get("reset").and_then(Value::as_bool).unwrap_or(false);
-    let process = get_process(context, id).await?;
-    let mut guard = process.lock().await;
-    guard.last_access = Instant::now();
-    if reset {
-        guard.stdout_cursor = 0;
-        guard.stderr_cursor = 0;
-    }
-    let stdout_cursor = guard.stdout_cursor;
-    let stderr_cursor = guard.stderr_cursor;
-    let (stdout, next_stdout, skipped_stdout, more_stdout) = guard
-        .output
-        .lock()
-        .map(|output| output.stdout.read_from(stdout_cursor, max_bytes))
-        .unwrap_or_default();
-    let (stderr, next_stderr, skipped_stderr, more_stderr) = guard
-        .output
-        .lock()
-        .map(|output| output.stderr.read_from(stderr_cursor, max_bytes))
-        .unwrap_or_default();
-    guard.stdout_cursor = next_stdout;
-    guard.stderr_cursor = next_stderr;
+    let offset = input.get("offset").and_then(Value::as_u64);
+    let max_bytes = input.get("max_bytes").and_then(Value::as_u64);
+    let max_lines = input.get("max_lines").and_then(Value::as_u64);
+    let from_end = input
+        .get("from_end")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let result = supervisor.read_logs(
+        session_id,
+        id,
+        offset,
+        max_bytes.map(|value| value.min(u32::MAX as u64) as u32),
+        max_lines.map(|value| value.min(u32::MAX as u64) as u32),
+        from_end,
+    )?;
     let mut text = String::new();
-    if skipped_stdout || skipped_stderr {
-        text.push_str("[older output was dropped from the ring buffer]\n");
+    if result.rotated {
+        text.push_str("[older output was dropped by bounded rotation]\n");
     }
-    if !stdout.is_empty() {
-        text.push_str("[stdout]\n");
-        text.push_str(&stdout);
-        if !stdout.ends_with('\n') {
-            text.push('\n');
-        }
-    }
-    if !stderr.is_empty() {
-        text.push_str("[stderr]\n");
-        text.push_str(&stderr);
-        if !stderr.ends_with('\n') {
+    if !result.content.is_empty() {
+        text.push_str(&result.content);
+        if !text.ends_with('\n') {
             text.push('\n');
         }
     }
     if text.is_empty() {
-        text.push_str("(no new output)");
+        text.push_str("(no output)");
     }
-    let output = guard.output.clone();
-    let tail = output
-        .lock()
-        .map(|output| format!("{}{}", output.stdout.tail(2_000), output.stderr.tail(2_000)))
-        .unwrap_or_default();
     Ok(ToolOutput::ok_structured(
         truncate(text),
         json!({
-            "process_id": guard.id,
-            "done": guard.done,
-            "exit_code": guard.exit_code,
-            "stdout": stdout,
-            "stderr": stderr,
-            "stdout_cursor": guard.stdout_cursor,
-            "stderr_cursor": guard.stderr_cursor,
-            "more_stdout": more_stdout,
-            "more_stderr": more_stderr,
-            "skipped": skipped_stdout || skipped_stderr,
-            "tail": tail,
+            "process_id": result.process_id,
+            "state": result.state,
+            "content": result.content,
+            "offset": result.offset,
+            "next_offset": result.next_offset,
+            "total_bytes": result.total_bytes,
+            "eof": result.eof,
+            "truncated": result.truncated,
+            "rotated": result.rotated,
+            "text": result.content,
+            "stdout": result.content,
         }),
     ))
 }
 
-async fn write_process(context: &ToolContext, input: &Value) -> Result<ToolOutput> {
+fn legacy_read_process(
+    session_id: &str,
+    supervisor: &crate::process_supervisor::ProcessSupervisor,
+    input: &Value,
+) -> Result<ToolOutput> {
     let id = process_id(input)?;
-    let text = input
-        .get("input")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("input is required for action=write"))?;
-    let newline = input
-        .get("newline")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let process = get_process(context, id).await?;
-    let mut guard = process.lock().await;
-    guard.last_access = Instant::now();
-    let Some(stdin) = guard.stdin.as_mut() else {
-        return Ok(ToolOutput::error_structured(
-            "process stdin is closed",
-            json!({"code": "PROCESS_EXITED", "process_id": guard.id, "exit_code": guard.exit_code}),
-        ));
+    let reset = input.get("reset").and_then(Value::as_bool).unwrap_or(false);
+    let offset = if reset {
+        Some(0)
+    } else {
+        input.get("offset").and_then(Value::as_u64)
     };
-    let mut payload = text.as_bytes().to_vec();
-    if newline {
-        payload.push(b'\n');
-    }
-    stdin.write_all(&payload).await?;
-    stdin.flush().await?;
+    let max_bytes = input
+        .get("max_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(65_536)
+        .min(u32::MAX as u64) as u32;
+    let from_end = !reset && offset.is_none();
+    let result = supervisor.read_logs(session_id, id, offset, Some(max_bytes), None, from_end)?;
+    let text = if result.content.is_empty() {
+        "(no new output)".to_string()
+    } else {
+        result.content.clone()
+    };
     Ok(ToolOutput::ok_structured(
-        format!("wrote {} byte(s) to {}", payload.len(), guard.id),
+        truncate(format!(
+            "{}{}",
+            if result.rotated {
+                "[older output was dropped by bounded rotation]\n"
+            } else {
+                ""
+            },
+            text
+        )),
         json!({
-            "process_id": guard.id,
-            "bytes": payload.len(),
+            "process_id": result.process_id,
+            "state": result.state,
+            "done": result.state != "running" && result.state != "starting",
+            "content": result.content,
+            "stdout": result.content,
+            "offset": result.offset,
+            "next_offset": result.next_offset,
+            "total_bytes": result.total_bytes,
+            "eof": result.eof,
+            "truncated": result.truncated,
+            "tail": result.content,
         }),
     ))
 }
 
-async fn signal_process(context: &ToolContext, input: &Value) -> Result<ToolOutput> {
-    let id = process_id(input)?;
-    let signal = match input
-        .get("signal")
-        .and_then(Value::as_str)
-        .unwrap_or("TERM")
-        .to_ascii_uppercase()
-        .as_str()
-    {
-        "TERM" => libc::SIGTERM,
-        "KILL" => libc::SIGKILL,
-        "INT" => libc::SIGINT,
-        "HUP" => libc::SIGHUP,
-        other => {
-            return Ok(ToolOutput::error_structured(
-                format!("unsupported signal: {other}"),
-                json!({"code": "INVALID_ARGUMENT", "signal": other}),
-            ));
-        }
-    };
-    let process = get_process(context, id).await?;
-    let mut guard = process.lock().await;
-    guard.last_access = Instant::now();
-    if guard.done {
-        return Ok(ToolOutput::ok_structured(
-            format!(
-                "{} already exited {}",
-                guard.id,
-                guard.exit_code.unwrap_or(-1)
-            ),
-            json!({"process_id": guard.id, "done": true, "exit_code": guard.exit_code}),
-        ));
-    }
-    let sent = kill_group(guard.pid, signal);
-    Ok(ToolOutput::ok_structured(
-        format!("sent signal {} to {}", signal, guard.id),
-        json!({
-            "process_id": guard.id,
-            "signal": signal,
-            "sent": sent,
-        }),
-    ))
-}
-
-async fn wait_process(context: &ToolContext, input: &Value) -> Result<ToolOutput> {
+async fn wait_process(
+    session_id: &str,
+    supervisor: &crate::process_supervisor::ProcessSupervisor,
+    input: &Value,
+) -> Result<ToolOutput> {
     let id = process_id(input)?;
     let timeout_secs = input
         .get("timeout_secs")
@@ -703,112 +405,126 @@ async fn wait_process(context: &ToolContext, input: &Value) -> Result<ToolOutput
             Regex::new(pattern).map_err(|error| anyhow!("invalid wait pattern: {error}"))
         })
         .transpose()?;
-    let process = get_process(context, id).await?;
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    let started = Instant::now();
-    loop {
-        {
-            let mut guard = process.lock().await;
-            guard.last_access = Instant::now();
-            let matched = pattern.as_ref().and_then(|pattern| {
-                guard.output.lock().ok().and_then(|output| {
-                    let tail = format!(
-                        "{}\n{}",
-                        output.stdout.tail(256 * 1024),
-                        output.stderr.tail(256 * 1024)
-                    );
-                    pattern.is_match(&tail).then_some(tail)
-                })
-            });
-            if let Some(tail) = matched {
-                return Ok(ToolOutput::ok_structured(
-                    format!("pattern matched after {}ms", started.elapsed().as_millis()),
-                    json!({
-                        "process_id": guard.id,
-                        "matched": true,
-                        "elapsed_ms": started.elapsed().as_millis() as u64,
-                        "evidence": tail.chars().take(4_000).collect::<String>(),
-                    }),
-                ));
-            }
-            if guard.done {
-                let tail = guard
-                    .output
-                    .lock()
-                    .map(|output| {
-                        format!("{}{}", output.stdout.tail(2_000), output.stderr.tail(2_000))
-                    })
-                    .unwrap_or_default();
-                return Ok(ToolOutput::error_structured(
-                    format!(
-                        "{} exited {} before the condition matched",
-                        guard.id,
-                        guard.exit_code.unwrap_or(-1)
-                    ),
-                    json!({
-                        "code": "PROCESS_EXITED",
-                        "process_id": guard.id,
-                        "exit_code": guard.exit_code,
-                        "tail": tail,
-                    }),
-                ));
-            }
-        }
-        if Instant::now() >= deadline {
-            return Ok(ToolOutput::error_structured(
-                format!("wait timed out after {timeout_secs}s"),
-                json!({
-                    "code": "WAIT_TIMEOUT",
-                    "process_id": id,
-                    "timeout_secs": timeout_secs,
-                }),
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    let outcome = supervisor
+        .wait(session_id, id, timeout_secs, pattern.as_ref())
+        .await?;
+    if outcome.matched {
+        return Ok(ToolOutput::ok_structured(
+            format!("pattern matched after {}ms", outcome.elapsed_ms),
+            json!({
+                "process_id": outcome.process.id,
+                "matched": true,
+                "elapsed_ms": outcome.elapsed_ms,
+                "evidence": outcome.evidence,
+                "process": outcome.process,
+            }),
+        ));
+    }
+    if outcome.timed_out {
+        return Ok(ToolOutput::error_coded(
+            "process",
+            ToolErrorCode::WAIT_TIMEOUT,
+            format!("wait timed out after {timeout_secs}s"),
+        )
+        .with_structured(json!({
+            "process_id": outcome.process.id,
+            "timeout_secs": timeout_secs,
+            "state": outcome.process.state,
+        })));
+    }
+    if outcome.process.state == "exited" || outcome.process.state == "stopped" {
+        return Ok(ToolOutput::error_coded(
+            "process",
+            ToolErrorCode::PROCESS_EXITED,
+            format!(
+                "{} {} {} before the condition matched",
+                outcome.process.id,
+                outcome.process.state,
+                outcome
+                    .process
+                    .exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "without an exit code".to_string())
+            ),
+        )
+        .with_structured(json!({
+            "process_id": outcome.process.id,
+            "exit_code": outcome.process.exit_code,
+            "state": outcome.process.state,
+            "tail": outcome.evidence,
+        })));
+    }
+    Ok(ToolOutput::error_coded(
+        "process",
+        ToolErrorCode::PROCESS_LOST,
+        format!(
+            "{} entered state {} before the condition matched",
+            outcome.process.id, outcome.process.state
+        ),
+    )
+    .with_structured(json!({
+        "process_id": outcome.process.id,
+        "state": outcome.process.state,
+        "tail": outcome.evidence,
+    })))
+}
+
+async fn stop_process(
+    session_id: &str,
+    supervisor: &crate::process_supervisor::ProcessSupervisor,
+    input: &Value,
+) -> Result<ToolOutput> {
+    let id = process_id(input)?;
+    let signal = input.get("signal").and_then(Value::as_str);
+    let grace_secs = input.get("grace_secs").and_then(Value::as_u64);
+    match supervisor
+        .stop(session_id, id, signal, grace_secs, "stopped by operator")
+        .await
+    {
+        Ok(result) => Ok(ToolOutput::ok_structured(
+            format!(
+                "{} stopped{} after {}ms",
+                result.process.id,
+                if result.forced { " (forced)" } else { "" },
+                result.waited_ms
+            ),
+            json!({
+                "process_id": result.process.id,
+                "done": true,
+                "state": result.process.state,
+                "exit_code": result.process.exit_code,
+                "signal": result.process.signal,
+                "forced": result.forced,
+                "waited_ms": result.waited_ms,
+                "process": result.process,
+            }),
+        )),
+        Err(error) => Ok(ToolOutput::error_coded(
+            "process",
+            ToolErrorCode::PROCESS_STOP_TIMEOUT,
+            error.to_string(),
+        )),
     }
 }
 
-async fn stop_process(context: &ToolContext, input: &Value) -> Result<ToolOutput> {
+fn signal_process(
+    session_id: &str,
+    supervisor: &crate::process_supervisor::ProcessSupervisor,
+    input: &Value,
+) -> Result<ToolOutput> {
     let id = process_id(input)?;
-    let process = get_process(context, id).await?;
-    let pid = {
-        let mut guard = process.lock().await;
-        guard.last_access = Instant::now();
-        if guard.done {
-            return Ok(ToolOutput::ok_structured(
-                format!(
-                    "{} already exited {}",
-                    guard.id,
-                    guard.exit_code.unwrap_or(-1)
-                ),
-                json!({"process_id": guard.id, "done": true, "exit_code": guard.exit_code}),
-            ));
-        }
-        guard.pid
-    };
-    let sent = kill_group(pid, libc::SIGTERM);
-    for _ in 0..20 {
-        {
-            let guard = process.lock().await;
-            if guard.done {
-                return Ok(ToolOutput::ok_structured(
-                    format!(
-                        "{} stopped with exit {}",
-                        guard.id,
-                        guard.exit_code.unwrap_or(-1)
-                    ),
-                    json!({"process_id": guard.id, "done": true, "exit_code": guard.exit_code, "sent": sent}),
-                ));
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    kill_group(pid, libc::SIGKILL);
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let guard = process.lock().await;
+    let signal = input
+        .get("signal")
+        .and_then(Value::as_str)
+        .unwrap_or("TERM");
+    let sent = supervisor.signal(session_id, id, signal)?;
     Ok(ToolOutput::ok_structured(
-        format!("{} killed", guard.id),
-        json!({"process_id": guard.id, "done": guard.done, "exit_code": guard.exit_code, "sent": sent, "forced": true}),
+        format!("sent signal {signal} to {id}"),
+        json!({
+            "process_id": id,
+            "signal": signal,
+            "sent": sent,
+        }),
     ))
 }
 
@@ -821,21 +537,6 @@ fn process_id(input: &Value) -> Result<&str> {
         .ok_or_else(|| anyhow!("process_id is required"))
 }
 
-fn kill_group(pid: Option<i32>, signal: i32) -> bool {
-    let Some(pid) = pid else {
-        return false;
-    };
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(-pid, signal) == 0
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = signal;
-        false
-    }
-}
-
 #[async_trait]
 impl AgentTool for WaitFor {
     fn name(&self) -> &'static str {
@@ -843,7 +544,7 @@ impl AgentTool for WaitFor {
     }
 
     fn description(&self) -> &'static str {
-        "Wait deterministically for a local TCP port, a localhost URL, or a process log pattern. No sleep guessing."
+        "Wait deterministically for a local TCP port, a localhost URL, or a durable process log pattern. No sleep guessing."
     }
 
     fn schema(&self) -> Value {
@@ -852,7 +553,7 @@ impl AgentTool for WaitFor {
             "properties": {
                 "port": {"type": "integer", "minimum": 1, "maximum": 65535, "description": "Local TCP port"},
                 "url": {"type": "string", "description": "Localhost http(s) URL"},
-                "process_id": {"type": "string", "description": "Process to inspect for a log pattern"},
+                "process_id": {"type": "string", "description": "Durable process to inspect for a log pattern"},
                 "pattern": {"type": "string", "description": "Regex pattern when process_id is used"},
                 "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 3600, "description": "Default 30"},
                 "interval_ms": {"type": "integer", "minimum": 50, "maximum": 5000, "description": "Default 200"}
@@ -879,13 +580,26 @@ impl AgentTool for WaitFor {
         let process_id = input.get("process_id").and_then(Value::as_str);
         let pattern = input.get("pattern").and_then(Value::as_str);
         if port.is_none() && url.is_none() && process_id.is_none() {
-            return Ok(ToolOutput::error_structured(
+            return Ok(ToolOutput::error_coded(
+                "wait_for",
+                ToolErrorCode::INVALID_ARGUMENT,
                 "wait_for requires port, url, or process_id with pattern",
-                json!({"code": "INVALID_ARGUMENT"}),
             ));
         }
-        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-        let started = Instant::now();
+        if process_id.is_some() && pattern.is_none() {
+            return Ok(ToolOutput::error_coded(
+                "wait_for",
+                ToolErrorCode::INVALID_ARGUMENT,
+                "process_id requires a regex pattern",
+            ));
+        }
+        let compiled = pattern
+            .map(|pattern| {
+                Regex::new(pattern).map_err(|error| anyhow!("invalid wait pattern: {error}"))
+            })
+            .transpose()?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        let started = std::time::Instant::now();
         let mut last_error = String::new();
         loop {
             if let Some(port) = port {
@@ -906,14 +620,15 @@ impl AgentTool for WaitFor {
             }
             if let Some(url) = url {
                 if !is_local_url(url) {
-                    return Ok(ToolOutput::error_structured(
+                    return Ok(ToolOutput::error_coded(
+                        "wait_for",
+                        ToolErrorCode::NETWORK_DENIED,
                         "wait_for url must be localhost, 127.0.0.1, or [::1]",
-                        json!({"code": "NETWORK_DENIED", "url": url}),
                     ));
                 }
                 match reqwest::Client::builder()
                     .redirect(reqwest::redirect::Policy::none())
-                    .timeout(Duration::from_secs(2))
+                    .timeout(std::time::Duration::from_secs(2))
                     .build()
                 {
                     Ok(client) => match client.get(url).send().await {
@@ -935,20 +650,31 @@ impl AgentTool for WaitFor {
                     Err(error) => last_error = error.to_string(),
                 }
             }
-            if let (Some(process_id), Some(pattern)) = (process_id, pattern) {
-                let regex = Regex::new(pattern)
-                    .map_err(|error| anyhow!("invalid wait pattern: {error}"))?;
-                let process = get_process(context, process_id).await?;
-                let guard = process.lock().await;
-                let matched = guard.output.lock().ok().and_then(|output| {
-                    let tail = format!(
-                        "{}\n{}",
-                        output.stdout.tail(256 * 1024),
-                        output.stderr.tail(256 * 1024)
-                    );
-                    regex.is_match(&tail).then_some(tail)
-                });
-                if let Some(tail) = matched {
+            if let (Some(process_id), Some(pattern)) = (process_id, compiled.as_ref()) {
+                let (session_id, supervisor) = match (
+                    context.session_id.as_deref(),
+                    context.process_supervisor.as_ref(),
+                ) {
+                    (Some(session_id), Some(supervisor)) => (session_id, supervisor),
+                    _ => {
+                        return Ok(ToolOutput::error_coded(
+                            "wait_for",
+                            ToolErrorCode::PROCESS_FAILED,
+                            "durable process supervision is unavailable in this context",
+                        ));
+                    }
+                };
+                let mut row = supervisor.get(session_id, process_id)?;
+                let logs = supervisor.read_logs(
+                    session_id,
+                    process_id,
+                    None,
+                    Some(256 * 1024),
+                    None,
+                    true,
+                )?;
+                if pattern.is_match(&logs.content) {
+                    supervisor.touch(&mut row);
                     return Ok(ToolOutput::ok_structured(
                         format!(
                             "process pattern matched after {}ms",
@@ -959,36 +685,37 @@ impl AgentTool for WaitFor {
                             "kind": "process_pattern",
                             "process_id": process_id,
                             "elapsed_ms": started.elapsed().as_millis() as u64,
-                            "evidence": tail.chars().take(4_000).collect::<String>(),
+                            "evidence": logs.content.chars().take(4_000).collect::<String>(),
                         }),
                     ));
                 }
-                if guard.done {
-                    return Ok(ToolOutput::error_structured(
-                        format!(
-                            "{} exited {} before the pattern matched",
-                            guard.id,
-                            guard.exit_code.unwrap_or(-1)
-                        ),
-                        json!({
-                            "code": "PROCESS_EXITED",
-                            "process_id": guard.id,
-                            "exit_code": guard.exit_code,
-                        }),
-                    ));
+                if matches!(row.state.as_str(), "exited" | "stopped" | "lost") {
+                    return Ok(ToolOutput::error_coded(
+                        "wait_for",
+                        ToolErrorCode::PROCESS_EXITED,
+                        format!("{} {} before the pattern matched", row.id, row.state),
+                    )
+                    .with_structured(json!({
+                        "process_id": row.id,
+                        "state": row.state,
+                        "exit_code": row.exit_code,
+                        "tail": logs.content.chars().take(2_000).collect::<String>(),
+                    })));
                 }
+                supervisor.touch(&mut row);
             }
-            if Instant::now() >= deadline {
-                return Ok(ToolOutput::error_structured(
+            if std::time::Instant::now() >= deadline {
+                return Ok(ToolOutput::error_coded(
+                    "wait_for",
+                    ToolErrorCode::WAIT_TIMEOUT,
                     format!("wait_for timed out after {timeout_secs}s"),
-                    json!({
-                        "code": "WAIT_TIMEOUT",
-                        "timeout_secs": timeout_secs,
-                        "last_error": last_error,
-                    }),
-                ));
+                )
+                .with_structured(json!({
+                    "timeout_secs": timeout_secs,
+                    "last_error": last_error,
+                })));
             }
-            tokio::time::sleep(Duration::from_millis(interval)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(interval)).await;
         }
     }
 }
@@ -1012,14 +739,17 @@ fn is_local_url(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use crate::process_supervisor::ProcessSupervisor;
+    use std::path::Path;
+    use std::sync::Arc;
     use tempfile::TempDir;
+    use vp_store::Store;
 
-    fn context(root: &Path) -> ToolContext {
+    fn context_for(root: &Path, data_dir: &Path, store: &Store, session_id: &str) -> ToolContext {
         ToolContext {
             root: root.to_path_buf(),
             project_root: root.to_path_buf(),
-            sandbox_root: root.join(".sandbox"),
+            sandbox_root: data_dir.join("sandbox").join(session_id),
             secret_roots: Vec::new(),
             network_allowed: true,
             home: root.join("home"),
@@ -1027,13 +757,28 @@ mod tests {
             read_jail: false,
             git_branch: None,
             remote: None,
+            session_id: Some(session_id.to_string()),
+            process_supervisor: Some(Arc::new(ProcessSupervisor::new(store.clone()))),
         }
+    }
+
+    fn store_with_session(root: &Path) -> (TempDir, Store, String) {
+        let data = TempDir::new().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        let project = store
+            .add_project(root.to_string_lossy().as_ref(), None)
+            .unwrap();
+        let session = store
+            .create_session(&project.id, "durable process tool test")
+            .unwrap();
+        (data, store, session.id)
     }
 
     #[tokio::test]
     async fn starts_reads_and_stops_a_process() {
         let dir = TempDir::new().unwrap();
-        let context = context(dir.path());
+        let (data, store, session_id) = store_with_session(dir.path());
+        let context = context_for(dir.path(), data.path(), &store, &session_id);
         let started = ProcessTool
             .execute(
                 &context,
@@ -1055,7 +800,7 @@ mod tests {
             .unwrap();
         assert!(!waited.is_error, "{}", waited.content);
         let read = ProcessTool
-            .execute(&context, json!({"action": "read", "process_id": id}))
+            .execute(&context, json!({"action": "logs", "process_id": id}))
             .await
             .unwrap();
         assert!(!read.is_error, "{}", read.content);
@@ -1070,14 +815,15 @@ mod tests {
     #[tokio::test]
     async fn rejects_cwd_escape_and_unknown_processes() {
         let dir = TempDir::new().unwrap();
-        let context = context(dir.path());
+        let (data, store, session_id) = store_with_session(dir.path());
+        let context = context_for(dir.path(), data.path(), &store, &session_id);
         let escape = ProcessTool
             .execute(
                 &context,
                 json!({"action": "start", "command": "true", "cwd": "../"}),
             )
             .await;
-        assert!(escape.is_err());
+        assert!(escape.is_err() || escape.unwrap().is_error);
         let unknown = ProcessTool
             .execute(
                 &context,

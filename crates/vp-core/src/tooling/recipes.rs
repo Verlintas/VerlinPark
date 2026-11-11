@@ -343,14 +343,14 @@ pub const RECIPES: &[ToolRecipe] = &[
         ],
         tools: &["process", "wait_for", "shell", "local_http"],
         steps: &[
-            "Start the process with a bounded command and capture its process_id.",
-            "Read available output with process action=read; do not busy-loop on shell.",
+            "Start the process with a bounded command and capture its durable process_id.",
+            "Read available output with process action=logs; do not busy-loop on shell.",
             "Wait for a condition such as a port, file, or output line with wait_for and a bounded timeout.",
             "Probe the server with local_http or a matching client before claiming it is ready.",
-            "Stop the process when finished; idle processes are still owned by the run.",
+            "Stop the process explicitly when finished; idle processes are swept only under policy and are never restarted automatically.",
         ],
         example: "process {\"action\":\"start\",\"command\":\"cargo run --bin server\"} then wait_for {\"process_id\":\"proc-1\",\"condition\":\"port\",\"port\":8080,\"timeout_secs\":30}",
-        caveats: "Processes do not survive a daemon restart. A timeout is not proof the process failed; inspect output and exit status.",
+        caveats: "Processes are durable only when the daemon can verify the full PID/start-time/nonce/command-hash identity after a restart; a process is never restarted automatically, and an unverified pid is marked unknown or lost rather than adopted.",
     },
     ToolRecipe {
         slug: "patch_recovery",

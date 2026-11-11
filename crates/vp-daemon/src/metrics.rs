@@ -97,6 +97,26 @@ pub fn render_prometheus(metrics: &DaemonMetrics) -> String {
         "kind",
         &metrics.runtime_leases,
     );
+    render_group(
+        &mut out,
+        "verlinpark_supervised_processes",
+        "Durable supervised processes by state.",
+        "state",
+        &metrics.supervised_processes,
+    );
+    let _ = writeln!(
+        out,
+        "# HELP verlinpark_supervised_process_output_bytes Retained bytes across supervised-process logs."
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE verlinpark_supervised_process_output_bytes gauge"
+    );
+    let _ = writeln!(
+        out,
+        "verlinpark_supervised_process_output_bytes {}",
+        metrics.supervised_process_output_bytes
+    );
     let _ = writeln!(
         out,
         "# HELP verlinpark_tokens_total Provider tokens by direction."
@@ -232,6 +252,8 @@ mod tests {
             memories: vec![count("active", 5)],
             memory_conflicts: vec![count("open", 1)],
             runtime_leases: vec![count("session", 2)],
+            supervised_processes: vec![count("running", 1), count("lost", 1)],
+            supervised_process_output_bytes: 512,
             tokens_in: 1000,
             tokens_out: 250,
             cache_read_tokens: 400,
@@ -261,6 +283,8 @@ mod tests {
             "verlinpark_memories",
             "verlinpark_memory_conflicts",
             "verlinpark_runtime_leases",
+            "verlinpark_supervised_processes",
+            "verlinpark_supervised_process_output_bytes",
             "verlinpark_tokens_total",
             "verlinpark_cache_tokens_total",
             "verlinpark_cache_hit_ratio",
@@ -284,6 +308,9 @@ mod tests {
         assert!(rendered.contains("verlinpark_sessions{status=\"draft\"} 1\n"));
         assert!(rendered.contains("verlinpark_sessions{status=\"running\"} 2\n"));
         assert!(rendered.contains("verlinpark_runtime_leases{kind=\"session\"} 2\n"));
+        assert!(rendered.contains("verlinpark_supervised_processes{state=\"running\"} 1\n"));
+        assert!(rendered.contains("verlinpark_supervised_processes{state=\"lost\"} 1\n"));
+        assert!(rendered.contains("verlinpark_supervised_process_output_bytes 512\n"));
         assert!(rendered.contains("verlinpark_tokens_total{direction=\"in\"} 1000\n"));
         assert!(rendered.contains("verlinpark_tokens_total{direction=\"out\"} 250\n"));
         assert!(rendered.contains("verlinpark_cache_tokens_total{direction=\"read\"} 400\n"));

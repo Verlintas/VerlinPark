@@ -374,6 +374,8 @@ mod tests {
             read_jail: false,
             git_branch: None,
             remote: None,
+            session_id: None,
+            process_supervisor: None,
         }
     }
 

@@ -363,6 +363,9 @@ tool_error_codes! {
     PROCESS_LIMIT => "PROCESS_LIMIT", false, "process", "Stop an idle process before starting another; the per-worktree cap is deliberate.";
     PROCESS_NOT_FOUND => "PROCESS_NOT_FOUND", false, "process", "List running processes and use a live process_id.";
     PROCESS_FAILED => "PROCESS_FAILED", false, "process", "Inspect the process output and exit state; do not retry unchanged.";
+    PROCESS_LOST => "PROCESS_LOST", false, "process", "The process is gone and its exit status may be unknown after a daemon restart; inspect its logs and start a new process explicitly.";
+    PROCESS_UNKNOWN => "PROCESS_UNKNOWN", true, "process", "Full PID/start-time/nonce evidence is unavailable; re-check status before acting and never signal an unverified pid.";
+    PROCESS_STOP_TIMEOUT => "PROCESS_STOP_TIMEOUT", false, "process", "The process did not stop within the bounded grace period; inspect whether SIGKILL was delivered and do not assume it exited.";
     WAIT_TIMEOUT => "WAIT_TIMEOUT", true, "process", "Read available output and wait again with a longer timeout if the process is still running.";
     PROCESS_SPAWN_FAILED => "PROCESS_SPAWN_FAILED", false, "process", "Check the command path and policy; do not retry the same spawn.";
     PROCESS_IO_FAILED => "PROCESS_IO_FAILED", false, "process", "Check whether the process exited and reopen its output before retrying.";

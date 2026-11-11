@@ -55,6 +55,13 @@ pub struct ToolContext {
     /// project has a local execution host; remote tools fail instead of
     /// falling back to local paths.
     pub remote: Option<Arc<crate::remote::RemoteToolAccess>>,
+    /// The session this tool call belongs to. Durable process supervision is
+    /// session-scoped; tools that do not run inside a session leave this unset.
+    pub session_id: Option<String>,
+    /// Daemon-owned durable process supervisor. `None` only in contexts that
+    /// cannot create durable processes (for example a one-shot integration
+    /// command or an isolated tool unit test).
+    pub process_supervisor: Option<Arc<crate::process_supervisor::ProcessSupervisor>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2314,6 +2321,8 @@ mod tests {
                 secret_roots: Vec::new(),
                 network_allowed: true,
                 remote: None,
+                session_id: None,
+                process_supervisor: None,
             },
         )
     }
@@ -2557,6 +2566,8 @@ mod tests {
             secret_roots: Vec::new(),
             network_allowed: true,
             remote: None,
+            session_id: None,
+            process_supervisor: None,
         };
         let inside = Shell
             .execute(&context, json!({"command": "echo inside > inside.txt"}))
@@ -2608,6 +2619,8 @@ mod tests {
             read_jail: false,
             git_branch: None,
             remote: None,
+            session_id: None,
+            process_supervisor: None,
         };
         let visible = Shell
             .execute(&context, json!({"command": "cat visible.txt"}))
@@ -2645,6 +2658,8 @@ mod tests {
             read_jail: true,
             git_branch: None,
             remote: None,
+            session_id: None,
+            process_supervisor: None,
         };
         let visible = Shell
             .execute(&context, json!({"command": "cat visible.txt"}))
@@ -2684,6 +2699,8 @@ mod tests {
             secret_roots: Vec::new(),
             network_allowed: false,
             remote: None,
+            session_id: None,
+            process_supervisor: None,
         };
         let output = Shell
             .execute(
@@ -2712,6 +2729,8 @@ mod tests {
             secret_roots: Vec::new(),
             network_allowed: true,
             remote: None,
+            session_id: None,
+            process_supervisor: None,
         };
         let started = std::time::Instant::now();
         let result = Shell
@@ -2794,6 +2813,8 @@ mod tests {
             secret_roots: Vec::new(),
             network_allowed: true,
             remote: None,
+            session_id: None,
+            process_supervisor: None,
         };
         let output = Shell
             .execute(
@@ -2884,6 +2905,8 @@ mod tests {
             secret_roots: Vec::new(),
             network_allowed: true,
             remote: None,
+            session_id: None,
+            process_supervisor: None,
         };
         let output = Shell
             .execute(
@@ -2979,12 +3002,12 @@ mod tests {
         let error = crate::tooling::process::ProcessTool
             .execute(
                 &context,
-                json!({"action": "read", "process_id": "proc-missing"}),
+                json!({"action": "status", "process_id": "proc-missing"}),
             )
             .await
-            .expect_err("unknown process");
-        let failure = failure_from_anyhow("process", &error);
-        assert_eq!(failure.code, ToolErrorCode::PROCESS_NOT_FOUND);
+            .expect("process tool returns a typed failure without a session supervisor");
+        let failure = error.failure.expect("typed process failure");
+        assert_eq!(failure.code, ToolErrorCode::PROCESS_FAILED);
 
         let remote = crate::tooling::remote::RemoteRead
             .execute(&context, json!({"path": "README.md"}))

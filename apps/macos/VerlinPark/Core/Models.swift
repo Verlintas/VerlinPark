@@ -5332,6 +5332,126 @@ struct WorkspaceWriteResult: Codable, Sendable {
     let sha256: String
 }
 
+struct SupervisedProcess: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let sessionId: String
+    let name: String
+    let command: String
+    let argv: [String]
+    let cwd: String
+    let worktree: String
+    let envHash: String
+    let commandHash: String
+    let state: String
+    let pid: Int?
+    let pgid: Int?
+    let nonce: String
+    let startedAt: String
+    let processStartedAt: String?
+    let heartbeatAt: String
+    let finishedAt: String?
+    let exitCode: Int?
+    let signal: Int?
+    let outputPath: String
+    let outputBytes: UInt64
+    let outputLines: UInt64
+    let totalOutputBytes: UInt64
+    let outputRotations: UInt64
+    let maxOutputBytes: UInt64
+    let maxOutputLines: UInt64
+    let ownerInstance: String
+    let retentionDeadline: String?
+    let idleTtlSecs: UInt64
+    let lastAccessAt: String
+    let detail: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case sessionId = "session_id"
+        case name
+        case command
+        case argv
+        case cwd
+        case worktree
+        case envHash = "env_hash"
+        case commandHash = "command_hash"
+        case state
+        case pid
+        case pgid
+        case nonce
+        case startedAt = "started_at"
+        case processStartedAt = "process_started_at"
+        case heartbeatAt = "heartbeat_at"
+        case finishedAt = "finished_at"
+        case exitCode = "exit_code"
+        case signal
+        case outputPath = "output_path"
+        case outputBytes = "output_bytes"
+        case outputLines = "output_lines"
+        case totalOutputBytes = "total_output_bytes"
+        case outputRotations = "output_rotations"
+        case maxOutputBytes = "max_output_bytes"
+        case maxOutputLines = "max_output_lines"
+        case ownerInstance = "owner_instance"
+        case retentionDeadline = "retention_deadline"
+        case idleTtlSecs = "idle_ttl_secs"
+        case lastAccessAt = "last_access_at"
+        case detail
+    }
+}
+
+struct ProcessListResult: Codable, Sendable {
+    let sessionId: String
+    let processes: [SupervisedProcess]
+    let active: UInt32
+    let limit: UInt32
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case processes
+        case active
+        case limit
+    }
+}
+
+struct ProcessLogsResult: Codable, Sendable {
+    let sessionId: String
+    let processId: String
+    let state: String
+    let content: String
+    let offset: UInt64
+    let nextOffset: UInt64
+    let totalBytes: UInt64
+    let eof: Bool
+    let truncated: Bool
+    let rotated: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case processId = "process_id"
+        case state
+        case content
+        case offset
+        case nextOffset = "next_offset"
+        case totalBytes = "total_bytes"
+        case eof
+        case truncated
+        case rotated
+    }
+}
+
+struct ProcessStopResult: Codable, Sendable {
+    let process: SupervisedProcess
+    let forced: Bool
+    let waitedMs: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case process
+        case forced
+        case waitedMs = "waited_ms"
+    }
+}
+
 struct ConsoleOpenResult: Codable, Sendable {
     let consoleId: String
     let worktree: String

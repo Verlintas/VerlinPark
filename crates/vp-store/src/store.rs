@@ -21,13 +21,14 @@ use vp_protocol::types::{
     MemoryEmbeddingUsage, MemoryEmbeddingsStatusResult, MemoryEvidence, MemoryHealthResult,
     MemoryItem, MemoryPolicy, MemoryStatCount, MergeQueueEntry, MetricCount, ModelPreset,
     OrchestrationDecision, OrchestrationNote, OrchestrationPolicy, OrchestrationRecovery,
-    PlanTaskProgress, Program, ProgramEvent, ProgramMilestone, ProgramMilestoneStatus,
-    ProgramPolicy, ProgramStatus, ProgramUsage, Project, ProjectBudget, ProjectUsageSession,
-    Question, RunBudgetSnapshot, RunCheckpoint, RunStep, RunToolCall, ScheduledTask, SearchHit,
-    Session, SessionBundle, SessionContinuation, SessionRun, SessionRunPolicy, ShellPolicy, Skill,
-    Source, SourceChunk, SourceCollection, SourceEmbeddingIntegrity, SourceEmbeddingJobStatus,
-    SourceEmbeddingPolicy, SourceEmbeddingStatusResult, SourceEmbeddingUsage, SourceSearchHit,
-    SourceStats, SteeringMessage, StoredMessage, TaskSchedulerPolicy, TaskStall, TeamPlan,
+    PlanTaskProgress, ProcessPolicy, Program, ProgramEvent, ProgramMilestone,
+    ProgramMilestoneStatus, ProgramPolicy, ProgramStatus, ProgramUsage, Project, ProjectBudget,
+    ProjectUsageSession, Question, RunBudgetSnapshot, RunCheckpoint, RunStep, RunToolCall,
+    ScheduledTask, SearchHit, Session, SessionBundle, SessionContinuation, SessionRun,
+    SessionRunPolicy, ShellPolicy, Skill, Source, SourceChunk, SourceCollection,
+    SourceEmbeddingIntegrity, SourceEmbeddingJobStatus, SourceEmbeddingPolicy,
+    SourceEmbeddingStatusResult, SourceEmbeddingUsage, SourceSearchHit, SourceStats,
+    SteeringMessage, StoredMessage, SupervisedProcess, TaskSchedulerPolicy, TaskStall, TeamPlan,
     TodoItem, ToolOutputAuditResult, ToolOutputPolicy, ToolOutputToolStat, UsageEntry,
     WorktreeRetentionPolicy, WriteLease, cache_hit_ratio,
 };
@@ -617,6 +618,9 @@ pub struct SessionRepair {
     /// Event-backed durable context checkpoint rows. `None` leaves the
     /// projection untouched.
     pub context_checkpoints: Option<Vec<ContextCheckpoint>>,
+    /// Event-backed supervised-process lifecycle rows. `None` leaves the
+    /// projection untouched; operational telemetry is not reconstructed.
+    pub supervised_processes: Option<Vec<SupervisedProcess>>,
     pub artifact_warnings: Vec<String>,
 }
 
@@ -841,6 +845,10 @@ pub struct ProjectManifestSnapshot {
     /// decode as the bounded default (sweep disabled).
     #[serde(default)]
     pub context_checkpoint_policy: ContextCheckpointPolicy,
+    /// Project-scoped durable-process caps and idle sweep. Older manifests
+    /// decode as the historical 8-process/1-hour defaults.
+    #[serde(default)]
+    pub process_policy: ProcessPolicy,
     pub budget: ProjectBudget,
     #[serde(default)]
     pub task_scheduler_policy: TaskSchedulerPolicy,
@@ -922,6 +930,8 @@ pub struct DaemonMetricsSnapshot {
     pub memories: Vec<MetricCount>,
     pub memory_conflicts: Vec<MetricCount>,
     pub runtime_leases: Vec<MetricCount>,
+    pub supervised_processes: Vec<MetricCount>,
+    pub supervised_process_output_bytes: u64,
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub cache_read_tokens: u64,
@@ -1177,6 +1187,21 @@ fn validate_session_bundle(bundle: &SessionBundle) -> Result<()> {
         }
         validate_context_checkpoint_row(checkpoint)?;
     }
+    let mut supervised_ids = std::collections::HashSet::new();
+    for process in &bundle.supervised_processes {
+        ensure_bundle_session(
+            "supervised process",
+            &process.session_id,
+            &bundle.session.id,
+        )?;
+        if !supervised_ids.insert(process.id.clone()) {
+            return Err(anyhow!(
+                "bundle supervised process {} is duplicated",
+                process.id
+            ));
+        }
+        validate_supervised_process_row(process)?;
+    }
     Ok(())
 }
 
@@ -1241,6 +1266,16 @@ impl Store {
                 restrict_home   INTEGER NOT NULL DEFAULT 0,
                 read_jail       INTEGER NOT NULL DEFAULT 0,
                 updated_at      TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS project_process_policies (
+                project_id          TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                idle_sweep_enabled  INTEGER NOT NULL DEFAULT 1,
+                max_processes       INTEGER NOT NULL DEFAULT 8,
+                idle_ttl_secs       INTEGER NOT NULL DEFAULT 3600,
+                max_output_bytes    INTEGER NOT NULL DEFAULT 1048576,
+                max_output_lines    INTEGER NOT NULL DEFAULT 20000,
+                updated_at          TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS project_cache_policies (
@@ -2306,6 +2341,50 @@ impl Store {
                 max_age_days     INTEGER NOT NULL DEFAULT 30
             );
 
+            -- Durable supervised processes. Lifecycle transitions are mirrored
+            -- to process.* events; heartbeat, last-access, and output counters
+            -- are operational observation state updated without events.
+            CREATE TABLE IF NOT EXISTS supervised_processes (
+                id                  TEXT PRIMARY KEY,
+                session_id          TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                name                TEXT NOT NULL DEFAULT '',
+                command             TEXT NOT NULL,
+                argv                TEXT NOT NULL DEFAULT '[]',
+                cwd                 TEXT NOT NULL DEFAULT '',
+                worktree            TEXT NOT NULL,
+                env_hash            TEXT NOT NULL DEFAULT '',
+                command_hash        TEXT NOT NULL DEFAULT '',
+                state               TEXT NOT NULL,
+                pid                 INTEGER,
+                pgid                INTEGER,
+                nonce               TEXT NOT NULL DEFAULT '',
+                started_at          TEXT NOT NULL,
+                process_started_at  TEXT,
+                heartbeat_at        TEXT NOT NULL,
+                finished_at         TEXT,
+                exit_code           INTEGER,
+                signal              INTEGER,
+                output_path         TEXT NOT NULL DEFAULT '',
+                output_bytes        INTEGER NOT NULL DEFAULT 0,
+                output_lines        INTEGER NOT NULL DEFAULT 0,
+                total_output_bytes  INTEGER NOT NULL DEFAULT 0,
+                output_rotations    INTEGER NOT NULL DEFAULT 0,
+                max_output_bytes    INTEGER NOT NULL DEFAULT 1048576,
+                max_output_lines    INTEGER NOT NULL DEFAULT 20000,
+                owner_instance      TEXT NOT NULL DEFAULT '',
+                retention_deadline  TEXT,
+                idle_ttl_secs       INTEGER NOT NULL DEFAULT 3600,
+                last_access_at      TEXT NOT NULL,
+                detail              TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_supervised_processes_session
+                ON supervised_processes(session_id, started_at);
+            CREATE INDEX IF NOT EXISTS idx_supervised_processes_state
+                ON supervised_processes(state, heartbeat_at);
+            CREATE INDEX IF NOT EXISTS idx_supervised_processes_retention
+                ON supervised_processes(retention_deadline);
+
             CREATE TABLE IF NOT EXISTS session_continuations (
                 id              TEXT PRIMARY KEY,
                 session_id      TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -3061,6 +3140,7 @@ impl Store {
                 worktree_policy: self.get_worktree_policy(&project.id)?,
                 checkpoint_policy: self.get_checkpoint_policy(&project.id)?,
                 context_checkpoint_policy: self.get_context_checkpoint_policy(&project.id)?,
+                process_policy: self.get_process_policy(&project.id)?,
                 budget: self.get_project_budget(&project.id)?,
                 task_scheduler_policy: self.get_task_scheduler_policy(&project.id)?,
                 session_run_policy: self.get_session_run_policy(&project.id)?,
@@ -3184,6 +3264,66 @@ impl Store {
                 read_deny,
                 if policy.restrict_home { 1 } else { 0 },
                 if policy.read_jail { 1 } else { 0 },
+                now_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_process_policy(&self, project_id: &str) -> Result<ProcessPolicy> {
+        let conn = self.lock()?;
+        let stored = conn
+            .query_row(
+                "SELECT idle_sweep_enabled, max_processes, idle_ttl_secs,
+                        max_output_bytes, max_output_lines
+                 FROM project_process_policies WHERE project_id = ?1",
+                params![project_id],
+                |row| {
+                    Ok(ProcessPolicy {
+                        idle_sweep_enabled: row.get::<_, i64>(0)? != 0,
+                        max_processes: row.get::<_, i64>(1)?.max(1) as u32,
+                        idle_ttl_secs: row.get::<_, i64>(2)?.max(1) as u64,
+                        max_output_bytes: row.get::<_, i64>(3)?.max(1) as u64,
+                        max_output_lines: row.get::<_, i64>(4)?.max(1) as u64,
+                    })
+                },
+            )
+            .optional()?;
+        stored.map_or_else(
+            || Ok(ProcessPolicy::default()),
+            |policy| {
+                policy
+                    .validate()
+                    .map_err(|error| anyhow!("stored process policy is invalid: {error}"))?;
+                Ok(policy)
+            },
+        )
+    }
+
+    pub fn set_process_policy(&self, project_id: &str, policy: &ProcessPolicy) -> Result<()> {
+        policy
+            .validate()
+            .map_err(|error| anyhow!("invalid process policy: {error}"))?;
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO project_process_policies
+             (project_id, idle_sweep_enabled, max_processes, idle_ttl_secs,
+              max_output_bytes, max_output_lines, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(project_id) DO UPDATE SET
+                idle_sweep_enabled = excluded.idle_sweep_enabled,
+                max_processes = excluded.max_processes,
+                idle_ttl_secs = excluded.idle_ttl_secs,
+                max_output_bytes = excluded.max_output_bytes,
+                max_output_lines = excluded.max_output_lines,
+                updated_at = excluded.updated_at",
+            params![
+                project_id,
+                if policy.idle_sweep_enabled { 1 } else { 0 },
+                i64::from(policy.max_processes),
+                policy.idle_ttl_secs as i64,
+                policy.max_output_bytes as i64,
+                policy.max_output_lines as i64,
                 now_rfc3339()
             ],
         )?;
@@ -9310,7 +9450,7 @@ impl Store {
                     automatic, created_at
              FROM context_checkpoints
              WHERE session_id = ?1
-             ORDER BY created_at DESC, id DESC
+             ORDER BY julianday(created_at) DESC, id DESC
              LIMIT ?2",
         )?;
         let rows = statement.query_map(
@@ -9429,6 +9569,293 @@ impl Store {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         replace_context_checkpoints_tx(&tx, session_id, checkpoints)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Insert a `process.starting` row and its event in one transaction.
+    /// The event is written before the projection so a crash cannot leave a
+    /// process row with no lifecycle audit trail.
+    pub fn insert_supervised_process_with_event(
+        &self,
+        session_id: &str,
+        process: &SupervisedProcess,
+        event_kind: &str,
+    ) -> Result<Event> {
+        if process.session_id != session_id {
+            return Err(anyhow!(
+                "supervised process belongs to a different session: {}",
+                process.session_id
+            ));
+        }
+        if !matches!(event_kind, "process.starting" | "process.started") {
+            return Err(anyhow!(
+                "invalid supervised-process insert event: {event_kind}"
+            ));
+        }
+        validate_supervised_process_row(process)?;
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let event = insert_event_tx(&tx, session_id, event_kind, serde_json::to_value(process)?)?;
+        insert_supervised_process_tx(&tx, process)?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(event)
+    }
+
+    /// Update every durable field of a supervised process and append its
+    /// lifecycle event in one transaction.
+    pub fn update_supervised_process_with_event(
+        &self,
+        process: &SupervisedProcess,
+        event_kind: &str,
+    ) -> Result<Event> {
+        validate_supervised_process_row(process)?;
+        if !matches!(
+            event_kind,
+            "process.started"
+                | "process.adopted"
+                | "process.exited"
+                | "process.lost"
+                | "process.unknown"
+                | "process.stopped"
+        ) {
+            return Err(anyhow!(
+                "invalid supervised-process transition event: {event_kind}"
+            ));
+        }
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let event = insert_event_tx(
+            &tx,
+            &process.session_id,
+            event_kind,
+            serde_json::to_value(process)?,
+        )?;
+        update_supervised_process_tx(&tx, process)?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(event)
+    }
+
+    /// Persist heartbeat/last-access/output telemetry without an event. These
+    /// fields are observation state; lifecycle transitions remain event-backed.
+    pub fn record_supervised_process_telemetry(&self, process: &SupervisedProcess) -> Result<()> {
+        if process.session_id.is_empty() || process.id.is_empty() {
+            return Err(anyhow!("supervised process id and session are required"));
+        }
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE supervised_processes
+             SET heartbeat_at = ?2, last_access_at = ?3, output_bytes = ?4,
+                 output_lines = ?5, total_output_bytes = ?6, output_rotations = ?7
+             WHERE session_id = ?8 AND id = ?1",
+            params![
+                process.id,
+                process.heartbeat_at,
+                process.last_access_at,
+                process.output_bytes as i64,
+                process.output_lines as i64,
+                process.total_output_bytes as i64,
+                process.output_rotations as i64,
+                process.session_id,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!("supervised process not found: {}", process.id));
+        }
+        Ok(())
+    }
+
+    /// Mark a row terminal and delete it as part of retention. The
+    /// `process.pruned` event carries only the id/reason; output bodies are
+    /// operational state and are never part of replay content.
+    pub fn prune_supervised_process_with_event(
+        &self,
+        session_id: &str,
+        process_id: &str,
+        reason: &str,
+    ) -> Result<Option<Event>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let state: Option<String> = tx
+            .query_row(
+                "SELECT state FROM supervised_processes WHERE session_id = ?1 AND id = ?2",
+                params![session_id, process_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(state) = state else {
+            return Ok(None);
+        };
+        if matches!(state.as_str(), "starting" | "running" | "unknown") {
+            return Err(anyhow!(
+                "refusing to prune a live supervised process: {process_id} ({state})"
+            ));
+        }
+        let event = insert_event_tx(
+            &tx,
+            session_id,
+            "process.pruned",
+            serde_json::json!({
+                "process_id": process_id,
+                "reason": reason,
+                "state": state,
+            }),
+        )?;
+        tx.execute(
+            "DELETE FROM supervised_processes WHERE session_id = ?1 AND id = ?2",
+            params![session_id, process_id],
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some(event))
+    }
+
+    pub fn get_supervised_process(
+        &self,
+        session_id: &str,
+        process_id: &str,
+    ) -> Result<Option<SupervisedProcess>> {
+        let conn = self.lock()?;
+        Ok(conn
+            .query_row(
+                "SELECT id, session_id, name, command, argv, cwd, worktree,
+                        env_hash, command_hash, state, pid, pgid, nonce,
+                        started_at, process_started_at, heartbeat_at, finished_at,
+                        exit_code, signal, output_path, output_bytes, output_lines,
+                        total_output_bytes, output_rotations, max_output_bytes,
+                        max_output_lines, owner_instance,
+                        retention_deadline, idle_ttl_secs, last_access_at, detail
+                 FROM supervised_processes
+                 WHERE session_id = ?1 AND id = ?2",
+                params![session_id, process_id],
+                map_supervised_process,
+            )
+            .optional()?)
+    }
+
+    pub fn list_supervised_processes(
+        &self,
+        session_id: &str,
+        include_finished: bool,
+        limit: u32,
+    ) -> Result<Vec<SupervisedProcess>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT id, session_id, name, command, argv, cwd, worktree,
+                    env_hash, command_hash, state, pid, pgid, nonce,
+                    started_at, process_started_at, heartbeat_at, finished_at,
+                    exit_code, signal, output_path, output_bytes, output_lines,
+                    total_output_bytes, output_rotations, max_output_bytes,
+                    max_output_lines, owner_instance,
+                    retention_deadline, idle_ttl_secs, last_access_at, detail
+             FROM supervised_processes
+             WHERE session_id = ?1
+               AND (?2 = 1 OR state IN ('starting', 'running', 'unknown'))
+             ORDER BY started_at DESC, id DESC
+             LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![
+                session_id,
+                if include_finished { 1 } else { 0 },
+                i64::from(limit.clamp(1, 500))
+            ],
+            map_supervised_process,
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Unfinished rows examined by startup reconciliation.
+    pub fn list_unfinished_supervised_processes(&self) -> Result<Vec<SupervisedProcess>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT id, session_id, name, command, argv, cwd, worktree,
+                    env_hash, command_hash, state, pid, pgid, nonce,
+                    started_at, process_started_at, heartbeat_at, finished_at,
+                    exit_code, signal, output_path, output_bytes, output_lines,
+                    total_output_bytes, output_rotations, max_output_bytes,
+                    max_output_lines, owner_instance,
+                    retention_deadline, idle_ttl_secs, last_access_at, detail
+             FROM supervised_processes
+             WHERE state IN ('starting', 'running', 'unknown')
+             ORDER BY started_at, id",
+        )?;
+        let rows = statement.query_map([], map_supervised_process)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Running/starting/unknown rows for the idle sweep.
+    pub fn list_live_supervised_processes(&self) -> Result<Vec<SupervisedProcess>> {
+        self.list_unfinished_supervised_processes()
+    }
+
+    /// Terminal rows whose retention deadline has passed.
+    pub fn list_expired_supervised_processes(&self, now: &str) -> Result<Vec<SupervisedProcess>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT id, session_id, name, command, argv, cwd, worktree,
+                    env_hash, command_hash, state, pid, pgid, nonce,
+                    started_at, process_started_at, heartbeat_at, finished_at,
+                    exit_code, signal, output_path, output_bytes, output_lines,
+                    total_output_bytes, output_rotations, max_output_bytes,
+                    max_output_lines, owner_instance,
+                    retention_deadline, idle_ttl_secs, last_access_at, detail
+             FROM supervised_processes
+             WHERE state IN ('exited', 'stopped', 'lost')
+               AND retention_deadline IS NOT NULL
+               AND retention_deadline <= ?1
+             ORDER BY retention_deadline, id",
+        )?;
+        let rows = statement.query_map(params![now], map_supervised_process)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn count_active_supervised_processes(&self, session_id: &str) -> Result<u32> {
+        let conn = self.lock()?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM supervised_processes
+             WHERE session_id = ?1 AND state IN ('starting', 'running', 'unknown')",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as u32)
+    }
+
+    pub fn supervised_process_counts(&self) -> Result<Vec<MetricCount>> {
+        let conn = self.lock()?;
+        bounded_metric_counts(&conn, "supervised_processes", "state")
+    }
+
+    pub fn supervised_process_output_bytes(&self) -> Result<u64> {
+        let conn = self.lock()?;
+        let total: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(output_bytes), 0) FROM supervised_processes",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(total.max(0) as u64)
+    }
+
+    /// Replace the event-backed supervised-process projection during
+    /// replay/repair/bundle import. Operational heartbeat/output telemetry is
+    /// rebuilt from the event snapshot; it is observation state, not durable
+    /// lifecycle state.
+    pub fn replace_supervised_processes(
+        &self,
+        session_id: &str,
+        processes: &[SupervisedProcess],
+    ) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        replace_supervised_processes_tx(&tx, session_id, processes)?;
         tx.commit()?;
         Ok(())
     }
@@ -13272,7 +13699,7 @@ impl Store {
                 let mut statement = conn.prepare(
                     "SELECT payload FROM events
                      WHERE type = 'gui.action'
-                     ORDER BY created_at DESC LIMIT ?1",
+                     ORDER BY julianday(created_at) DESC, rowid DESC LIMIT ?1",
                 )?;
                 let rows = statement.query_map(params![limit], |row| row.get::<_, String>(0))?;
                 for payload in rows {
@@ -13699,6 +14126,14 @@ impl Store {
             memories: bounded_metric_counts(&conn, "memories", "status")?,
             memory_conflicts: bounded_metric_counts(&conn, "memory_conflicts", "status")?,
             runtime_leases: bounded_metric_counts(&conn, "runtime_leases", "kind")?,
+            supervised_processes: bounded_metric_counts(&conn, "supervised_processes", "state")?,
+            supervised_process_output_bytes: conn
+                .query_row(
+                    "SELECT COALESCE(SUM(output_bytes), 0) FROM supervised_processes",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?
+                .max(0) as u64,
             tokens_in,
             tokens_out,
             cache_read_tokens,
@@ -19180,6 +19615,9 @@ impl Store {
         if let Some(context_checkpoints) = &repair.context_checkpoints {
             replace_context_checkpoints_tx(&tx, session_id, context_checkpoints)?;
         }
+        if let Some(processes) = &repair.supervised_processes {
+            replace_supervised_processes_tx(&tx, session_id, processes)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -19703,6 +20141,7 @@ impl Store {
             &bundle.run_checkpoints,
         )?;
         replace_context_checkpoints_tx(&tx, &bundle.session.id, &bundle.context_checkpoints)?;
+        replace_supervised_processes_tx(&tx, &bundle.session.id, &bundle.supervised_processes)?;
         let has_context_checkpoint_events = bundle.events.iter().any(|event| {
             matches!(
                 event.kind.as_str(),
@@ -20880,6 +21319,222 @@ fn map_context_checkpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContextCh
         automatic: row.get::<_, i64>(17)? != 0,
         created_at: row.get(18)?,
     })
+}
+
+fn validate_supervised_process_row(process: &SupervisedProcess) -> Result<()> {
+    if process.id.trim().is_empty() || process.id.len() > 128 {
+        return Err(anyhow!("supervised process id is empty or too long"));
+    }
+    if process.session_id.trim().is_empty() {
+        return Err(anyhow!("supervised process session id is empty"));
+    }
+    if process.command.len() > 16_384 {
+        return Err(anyhow!(
+            "supervised process command exceeds the 16 KiB limit"
+        ));
+    }
+    if process.argv.len() > 64 {
+        return Err(anyhow!("supervised process argv exceeds 64 entries"));
+    }
+    if let Some(pid) = process.pid
+        && (pid <= 0 || pid > i32::MAX as i64)
+    {
+        return Err(anyhow!("supervised process pid is out of range"));
+    }
+    if let Some(pgid) = process.pgid
+        && (pgid <= 0 || pgid > i32::MAX as i64)
+    {
+        return Err(anyhow!("supervised process pgid is out of range"));
+    }
+    if !matches!(
+        process.state.as_str(),
+        "starting" | "running" | "exited" | "stopped" | "lost" | "unknown"
+    ) {
+        return Err(anyhow!(
+            "invalid supervised process state: {}",
+            process.state
+        ));
+    }
+    if process.output_path.len() > 4_096 || process.cwd.len() > 4_096 {
+        return Err(anyhow!("supervised process path is too long"));
+    }
+    if process.idle_ttl_secs == 0 || process.idle_ttl_secs > 86_400 {
+        return Err(anyhow!(
+            "supervised process idle TTL must be 1..86400 seconds"
+        ));
+    }
+    if process.max_output_bytes < 4_096 || process.max_output_bytes > 16 * 1024 * 1024 {
+        return Err(anyhow!(
+            "supervised process max_output_bytes must be 4096..16777216"
+        ));
+    }
+    if process.max_output_lines < 100 || process.max_output_lines > 1_000_000 {
+        return Err(anyhow!(
+            "supervised process max_output_lines must be 100..1000000"
+        ));
+    }
+    Ok(())
+}
+
+fn map_supervised_process(row: &rusqlite::Row<'_>) -> rusqlite::Result<SupervisedProcess> {
+    let argv: String = row.get(4)?;
+    Ok(SupervisedProcess {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        name: row.get(2)?,
+        command: row.get(3)?,
+        argv: serde_json::from_str(&argv).unwrap_or_default(),
+        cwd: row.get(5)?,
+        worktree: row.get(6)?,
+        env_hash: row.get(7)?,
+        command_hash: row.get(8)?,
+        state: row.get(9)?,
+        pid: row.get(10)?,
+        pgid: row.get(11)?,
+        nonce: row.get(12)?,
+        started_at: row.get(13)?,
+        process_started_at: row.get(14)?,
+        heartbeat_at: row.get(15)?,
+        finished_at: row.get(16)?,
+        exit_code: row.get::<_, Option<i64>>(17)?.map(|value| value as i32),
+        signal: row.get::<_, Option<i64>>(18)?.map(|value| value as i32),
+        output_path: row.get(19)?,
+        output_bytes: row.get::<_, i64>(20)?.max(0) as u64,
+        output_lines: row.get::<_, i64>(21)?.max(0) as u64,
+        total_output_bytes: row.get::<_, i64>(22)?.max(0) as u64,
+        output_rotations: row.get::<_, i64>(23)?.max(0) as u64,
+        max_output_bytes: row.get::<_, i64>(24)?.max(1) as u64,
+        max_output_lines: row.get::<_, i64>(25)?.max(1) as u64,
+        owner_instance: row.get(26)?,
+        retention_deadline: row.get(27)?,
+        idle_ttl_secs: row.get::<_, i64>(28)?.max(1) as u64,
+        last_access_at: row.get(29)?,
+        detail: row.get(30)?,
+    })
+}
+
+fn insert_supervised_process_tx(tx: &Transaction<'_>, process: &SupervisedProcess) -> Result<()> {
+    tx.execute(
+        "INSERT INTO supervised_processes
+         (id, session_id, name, command, argv, cwd, worktree, env_hash,
+          command_hash, state, pid, pgid, nonce, started_at, process_started_at,
+          heartbeat_at, finished_at, exit_code, signal, output_path, output_bytes,
+          output_lines, total_output_bytes, output_rotations, max_output_bytes,
+          max_output_lines, owner_instance,
+          retention_deadline, idle_ttl_secs, last_access_at, detail)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                 ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26,
+                 ?27, ?28, ?29, ?30, ?31)",
+        params![
+            process.id,
+            process.session_id,
+            process.name,
+            process.command,
+            serde_json::to_string(&process.argv)?,
+            process.cwd,
+            process.worktree,
+            process.env_hash,
+            process.command_hash,
+            process.state,
+            process.pid,
+            process.pgid,
+            process.nonce,
+            process.started_at,
+            process.process_started_at,
+            process.heartbeat_at,
+            process.finished_at,
+            process.exit_code.map(i64::from),
+            process.signal.map(i64::from),
+            process.output_path,
+            process.output_bytes as i64,
+            process.output_lines as i64,
+            process.total_output_bytes as i64,
+            process.output_rotations as i64,
+            process.max_output_bytes as i64,
+            process.max_output_lines as i64,
+            process.owner_instance,
+            process.retention_deadline,
+            process.idle_ttl_secs as i64,
+            process.last_access_at,
+            process.detail,
+        ],
+    )?;
+    Ok(())
+}
+
+fn update_supervised_process_tx(tx: &Transaction<'_>, process: &SupervisedProcess) -> Result<()> {
+    let changed = tx.execute(
+        "UPDATE supervised_processes SET
+            name = ?2, command = ?3, argv = ?4, cwd = ?5, worktree = ?6,
+            env_hash = ?7, command_hash = ?8, state = ?9, pid = ?10, pgid = ?11,
+            nonce = ?12, started_at = ?13, process_started_at = ?14,
+            heartbeat_at = ?15, finished_at = ?16, exit_code = ?17, signal = ?18,
+            output_path = ?19, output_bytes = ?20, output_lines = ?21,
+            total_output_bytes = ?22, output_rotations = ?23,
+            max_output_bytes = ?24, max_output_lines = ?25, owner_instance = ?26,
+            retention_deadline = ?27, idle_ttl_secs = ?28, last_access_at = ?29,
+            detail = ?30
+         WHERE id = ?1 AND session_id = ?31",
+        params![
+            process.id,
+            process.name,
+            process.command,
+            serde_json::to_string(&process.argv)?,
+            process.cwd,
+            process.worktree,
+            process.env_hash,
+            process.command_hash,
+            process.state,
+            process.pid,
+            process.pgid,
+            process.nonce,
+            process.started_at,
+            process.process_started_at,
+            process.heartbeat_at,
+            process.finished_at,
+            process.exit_code.map(i64::from),
+            process.signal.map(i64::from),
+            process.output_path,
+            process.output_bytes as i64,
+            process.output_lines as i64,
+            process.total_output_bytes as i64,
+            process.output_rotations as i64,
+            process.max_output_bytes as i64,
+            process.max_output_lines as i64,
+            process.owner_instance,
+            process.retention_deadline,
+            process.idle_ttl_secs as i64,
+            process.last_access_at,
+            process.detail,
+            process.session_id,
+        ],
+    )?;
+    if changed == 0 {
+        return Err(anyhow!("supervised process not found: {}", process.id));
+    }
+    Ok(())
+}
+
+fn replace_supervised_processes_tx(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    processes: &[SupervisedProcess],
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM supervised_processes WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    for process in processes {
+        if process.session_id != session_id {
+            return Err(anyhow!(
+                "supervised process {} belongs to a different session",
+                process.id
+            ));
+        }
+        validate_supervised_process_row(process)?;
+        insert_supervised_process_tx(tx, process)?;
+    }
+    Ok(())
 }
 
 fn insert_context_checkpoint_tx(

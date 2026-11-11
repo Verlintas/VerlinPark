@@ -1273,6 +1273,61 @@ enum Command {
     },
     /// Run one command in the session console under the shell sandbox.
     Console { session: String, command: String },
+    /// Show the project-scoped durable-process policy.
+    ProcessPolicy { project: String },
+    /// Update the project-scoped durable-process policy. Unspecified fields keep
+    /// their current values.
+    ProcessPolicySet {
+        project: String,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        idle_sweep_enabled: Option<bool>,
+        #[arg(long)]
+        max_processes: Option<u32>,
+        #[arg(long)]
+        idle_ttl_secs: Option<u64>,
+        #[arg(long)]
+        max_output_bytes: Option<u64>,
+        #[arg(long)]
+        max_output_lines: Option<u64>,
+    },
+    /// List durable supervised processes for a session.
+    Processes {
+        session: String,
+        /// Include exited/stopped/lost rows (default true).
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        include_finished: Option<bool>,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
+    /// Page a durable supervised process log by byte offset.
+    ProcessLogs {
+        session: String,
+        process: String,
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
+        #[arg(long, default_value_t = 65536)]
+        max_bytes: u32,
+        #[arg(long)]
+        max_lines: Option<u32>,
+        /// Read the newest retained bytes instead of a forward page.
+        #[arg(long)]
+        from_end: bool,
+        /// Poll for new output until the process reaches a terminal state.
+        #[arg(long)]
+        follow: bool,
+        /// Follow deadline in seconds; default 300.
+        #[arg(long, default_value_t = 300)]
+        timeout_secs: u64,
+    },
+    /// Stop a durable supervised process (SIGTERM, bounded wait, SIGKILL).
+    ProcessStop {
+        session: String,
+        process: String,
+        #[arg(long, default_value = "TERM")]
+        signal: String,
+        #[arg(long, default_value_t = 5)]
+        grace_secs: u32,
+    },
     /// List files in a session worktree.
     Files { session: String },
     /// Show one session worktree file.
@@ -4201,6 +4256,148 @@ async fn main() -> Result<()> {
             )
             .await?
         }
+        Command::ProcessPolicy { project } => {
+            rpc(
+                &discovery,
+                "process.policy.get",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::ProcessPolicySet {
+            project,
+            idle_sweep_enabled,
+            max_processes,
+            idle_ttl_secs,
+            max_output_bytes,
+            max_output_lines,
+        } => {
+            let current = rpc(
+                &discovery,
+                "process.policy.get",
+                json!({"project_id": project}),
+            )
+            .await?;
+            let mut policy = current["policy"].clone();
+            if let Some(enabled) = idle_sweep_enabled {
+                policy["idle_sweep_enabled"] = json!(enabled);
+            }
+            if let Some(value) = max_processes {
+                policy["max_processes"] = json!(value);
+            }
+            if let Some(value) = idle_ttl_secs {
+                policy["idle_ttl_secs"] = json!(value);
+            }
+            if let Some(value) = max_output_bytes {
+                policy["max_output_bytes"] = json!(value);
+            }
+            if let Some(value) = max_output_lines {
+                policy["max_output_lines"] = json!(value);
+            }
+            rpc(
+                &discovery,
+                "process.policy.set",
+                json!({"project_id": project, "policy": policy}),
+            )
+            .await?
+        }
+        Command::Processes {
+            session,
+            include_finished,
+            limit,
+        } => {
+            rpc(
+                &discovery,
+                "session.processes",
+                json!({
+                    "session_id": session,
+                    "include_finished": include_finished,
+                    "limit": limit,
+                }),
+            )
+            .await?
+        }
+        Command::ProcessLogs {
+            session,
+            process,
+            offset,
+            max_bytes,
+            max_lines,
+            from_end,
+            follow,
+            timeout_secs,
+        } => {
+            if follow {
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs.max(1));
+                let mut cursor = offset;
+                loop {
+                    let result = rpc(
+                        &discovery,
+                        "session.process.logs",
+                        json!({
+                            "session_id": session,
+                            "process_id": process,
+                            "offset": cursor,
+                            "max_bytes": max_bytes,
+                            "max_lines": max_lines,
+                            "from_end": false,
+                        }),
+                    )
+                    .await?;
+                    if let Some(content) = result["content"].as_str()
+                        && !content.is_empty()
+                    {
+                        print!("{content}");
+                        let _ = std::io::stdout().flush();
+                    }
+                    cursor = result["next_offset"].as_u64().unwrap_or(cursor);
+                    let state = result["state"].as_str().unwrap_or("running");
+                    let eof = result["eof"].as_bool().unwrap_or(false);
+                    if eof && matches!(state, "exited" | "stopped" | "lost") {
+                        break;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        eprintln!("process log follow timed out after {timeout_secs}s");
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                }
+                json!({"process_streamed": true})
+            } else {
+                rpc(
+                    &discovery,
+                    "session.process.logs",
+                    json!({
+                        "session_id": session,
+                        "process_id": process,
+                        "offset": offset,
+                        "max_bytes": max_bytes,
+                        "max_lines": max_lines,
+                        "from_end": from_end,
+                    }),
+                )
+                .await?
+            }
+        }
+        Command::ProcessStop {
+            session,
+            process,
+            signal,
+            grace_secs,
+        } => {
+            rpc(
+                &discovery,
+                "session.process.stop",
+                json!({
+                    "session_id": session,
+                    "process_id": process,
+                    "signal": signal,
+                    "grace_secs": grace_secs,
+                }),
+            )
+            .await?
+        }
         Command::Console { session, command } => {
             let opened = rpc(&discovery, "console.open", json!({"session_id": session})).await?;
             let console_id = opened["console_id"]
@@ -6399,7 +6596,110 @@ fn lsp_status_lines(value: &Value) -> Option<Vec<String>> {
     Some(lines)
 }
 
+fn process_console_lines(value: &Value) -> Option<Vec<String>> {
+    if let Some(policy) = value
+        .get("policy")
+        .filter(|policy| policy.get("max_processes").is_some())
+    {
+        let project = value["project_id"].as_str().unwrap_or("?");
+        return Some(vec![
+            format!("project {project} process policy"),
+            format!(
+                "  idle sweep {} · max {} · idle TTL {}s",
+                if policy["idle_sweep_enabled"].as_bool().unwrap_or(false) {
+                    "on"
+                } else {
+                    "off"
+                },
+                policy["max_processes"].as_u64().unwrap_or(0),
+                policy["idle_ttl_secs"].as_u64().unwrap_or(0),
+            ),
+            format!(
+                "  retained log {} bytes / {} lines",
+                policy["max_output_bytes"].as_u64().unwrap_or(0),
+                policy["max_output_lines"].as_u64().unwrap_or(0),
+            ),
+        ]);
+    }
+    if let Some(processes) = value.get("processes").and_then(Value::as_array)
+        && value.get("active").is_some()
+    {
+        if processes.is_empty() {
+            return Some(vec!["No supervised processes.".to_string()]);
+        }
+        let mut lines = Vec::new();
+        for process in processes {
+            let id = process["id"].as_str().unwrap_or("?");
+            let state = process["state"].as_str().unwrap_or("?");
+            let name = process["name"].as_str().unwrap_or("");
+            let pid = process["pid"].as_i64().unwrap_or(0);
+            let elapsed = process["started_at"].as_str().unwrap_or("");
+            let exit = process["exit_code"]
+                .as_i64()
+                .map(|code| format!("  exit {code}"))
+                .unwrap_or_default();
+            lines.push(format!(
+                "{id}  {state:<8}  pid {pid:<7}  {name}{exit}  started {elapsed}  {} bytes",
+                process["output_bytes"].as_u64().unwrap_or(0)
+            ));
+            if let Some(detail) = process["detail"].as_str() {
+                lines.push(format!("  {detail}"));
+            }
+        }
+        return Some(lines);
+    }
+    if let Some(process_id) = value.get("process_id").and_then(Value::as_str)
+        && let Some(content) = value.get("content").and_then(Value::as_str)
+        && value.get("next_offset").is_some()
+    {
+        let mut lines = vec![format!(
+            "{process_id}  {}  bytes {}/{}  offset {} -> {}{}",
+            value["state"].as_str().unwrap_or("?"),
+            value["content"].as_str().map(str::len).unwrap_or(0),
+            value["total_bytes"].as_u64().unwrap_or(0),
+            value["offset"].as_u64().unwrap_or(0),
+            value["next_offset"].as_u64().unwrap_or(0),
+            if value["truncated"].as_bool().unwrap_or(false) {
+                "  (truncated)"
+            } else {
+                ""
+            }
+        )];
+        if !content.is_empty() {
+            lines.push(content.to_string());
+        }
+        return Some(lines);
+    }
+    if let Some(process) = value.get("process")
+        && value.get("forced").is_some()
+    {
+        return Some(vec![format!(
+            "{}  {}  exit {}{}  waited {}ms{}",
+            process["id"].as_str().unwrap_or("?"),
+            process["state"].as_str().unwrap_or("?"),
+            process["exit_code"].as_i64().unwrap_or(-1),
+            process["signal"]
+                .as_i64()
+                .map(|signal| format!("  signal {signal}"))
+                .unwrap_or_default(),
+            value["waited_ms"].as_u64().unwrap_or(0),
+            if value["forced"].as_bool().unwrap_or(false) {
+                "  (forced)"
+            } else {
+                ""
+            }
+        )]);
+    }
+    None
+}
+
 fn print_human(value: &Value) {
+    if let Some(lines) = process_console_lines(value) {
+        for line in lines {
+            println!("{line}");
+        }
+        return;
+    }
     if let Some(lines) = lsp_status_lines(value) {
         for line in lines {
             println!("{line}");
@@ -10642,5 +10942,221 @@ mod source_embedding_cli_tests {
         assert_eq!(value["semantic_unavailable"], "no_indexed_vectors");
         assert_eq!(value["recent_jobs"][0]["chunks_done"], 8);
         assert_eq!(value["endpoint_env_present"], false);
+    }
+}
+
+#[cfg(test)]
+mod process_command_tests {
+    use super::*;
+
+    #[test]
+    fn clap_parses_process_commands() {
+        // The CLI command enum is very large; parse on a thread with a
+        // generous stack so this test is not sensitive to the default 2 MiB
+        // libtest thread size.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from(["vp", "processes", "ses-1"]).unwrap();
+                match cli.command {
+                    Command::Processes {
+                        session,
+                        include_finished,
+                        limit,
+                    } => {
+                        assert_eq!(session, "ses-1");
+                        assert!(include_finished.is_none());
+                        assert_eq!(limit, 50);
+                    }
+                    other => panic!("expected processes, got {other:?}"),
+                }
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "process-logs",
+                    "ses-1",
+                    "psup_1",
+                    "--offset",
+                    "1024",
+                    "--max-bytes",
+                    "2048",
+                    "--max-lines",
+                    "40",
+                    "--from-end",
+                    "--follow",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::ProcessLogs {
+                        session,
+                        process,
+                        offset,
+                        max_bytes,
+                        max_lines,
+                        from_end,
+                        follow,
+                        timeout_secs,
+                    } => {
+                        assert_eq!(session, "ses-1");
+                        assert_eq!(process, "psup_1");
+                        assert_eq!(offset, 1024);
+                        assert_eq!(max_bytes, 2048);
+                        assert_eq!(max_lines, Some(40));
+                        assert!(from_end);
+                        assert!(follow);
+                        assert_eq!(timeout_secs, 300);
+                    }
+                    other => panic!("expected process-logs, got {other:?}"),
+                }
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "process-stop",
+                    "ses-1",
+                    "psup_1",
+                    "--signal",
+                    "KILL",
+                    "--grace-secs",
+                    "2",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::ProcessStop {
+                        session,
+                        process,
+                        signal,
+                        grace_secs,
+                    } => {
+                        assert_eq!(session, "ses-1");
+                        assert_eq!(process, "psup_1");
+                        assert_eq!(signal, "KILL");
+                        assert_eq!(grace_secs, 2);
+                    }
+                    other => panic!("expected process-stop, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn clap_parses_process_policy_commands() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from(["vp", "process-policy", "prj-1"]).unwrap();
+                match cli.command {
+                    Command::ProcessPolicy { project } => assert_eq!(project, "prj-1"),
+                    other => panic!("expected process-policy, got {other:?}"),
+                }
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "process-policy-set",
+                    "prj-1",
+                    "--idle-sweep-enabled",
+                    "false",
+                    "--max-processes",
+                    "4",
+                    "--idle-ttl-secs",
+                    "900",
+                    "--max-output-bytes",
+                    "65536",
+                    "--max-output-lines",
+                    "2000",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::ProcessPolicySet {
+                        project,
+                        idle_sweep_enabled,
+                        max_processes,
+                        idle_ttl_secs,
+                        max_output_bytes,
+                        max_output_lines,
+                    } => {
+                        assert_eq!(project, "prj-1");
+                        assert_eq!(idle_sweep_enabled, Some(false));
+                        assert_eq!(max_processes, Some(4));
+                        assert_eq!(idle_ttl_secs, Some(900));
+                        assert_eq!(max_output_bytes, Some(65536));
+                        assert_eq!(max_output_lines, Some(2000));
+                    }
+                    other => panic!("expected process-policy-set, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn process_policy_human_rendering_is_bounded() {
+        let value = json!({
+            "project_id": "prj-1",
+            "policy": {
+                "idle_sweep_enabled": true,
+                "max_processes": 8,
+                "idle_ttl_secs": 3600,
+                "max_output_bytes": 1048576,
+                "max_output_lines": 20000
+            }
+        });
+        let lines = process_console_lines(&value).unwrap();
+        assert!(lines[0].contains("prj-1"));
+        assert!(lines[1].contains("idle sweep on"));
+        assert!(lines[2].contains("1048576 bytes"));
+    }
+
+    #[test]
+    fn human_process_list_and_logs_are_bounded() {
+        let list = json!({
+            "session_id": "ses-1",
+            "processes": [{
+                "id": "psup_1",
+                "state": "running",
+                "name": "server",
+                "pid": 42,
+                "started_at": "2026-11-11T00:00:00Z",
+                "output_bytes": 128,
+                "exit_code": null,
+                "detail": null
+            }],
+            "active": 1,
+            "limit": 8
+        });
+        let lines = process_console_lines(&list).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("psup_1"));
+        assert!(lines[0].contains("running"));
+        assert!(lines[0].contains("pid 42"));
+
+        let logs = json!({
+            "session_id": "ses-1",
+            "process_id": "psup_1",
+            "state": "running",
+            "content": "hello\n",
+            "offset": 0,
+            "next_offset": 6,
+            "total_bytes": 6,
+            "eof": true,
+            "truncated": false,
+            "rotated": false
+        });
+        let lines = process_console_lines(&logs).unwrap();
+        assert!(lines[0].contains("psup_1"));
+        assert!(lines.iter().any(|line| line == "hello\n"));
+
+        let stop = json!({
+            "process": {
+                "id": "psup_1",
+                "state": "stopped",
+                "exit_code": 0,
+                "signal": 15
+            },
+            "forced": false,
+            "waited_ms": 12
+        });
+        let lines = process_console_lines(&stop).unwrap();
+        assert!(lines[0].contains("stopped"));
+        assert!(lines[0].contains("signal 15"));
     }
 }

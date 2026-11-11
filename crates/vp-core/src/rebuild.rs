@@ -101,6 +101,7 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
                 &snapshot.project.id,
                 &snapshot.context_checkpoint_policy,
             )?;
+            store.set_process_policy(&snapshot.project.id, &snapshot.process_policy)?;
             store.set_project_budget(&snapshot.project.id, &snapshot.budget)?;
             store
                 .set_task_scheduler_policy(&snapshot.project.id, &snapshot.task_scheduler_policy)?;

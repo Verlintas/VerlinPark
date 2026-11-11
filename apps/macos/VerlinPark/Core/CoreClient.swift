@@ -2650,6 +2650,62 @@ actor CoreClient {
         .decode(ConsoleCloseResult.self)
     }
 
+    func listProcesses(
+        sessionID: String,
+        includeFinished: Bool = true,
+        limit: UInt32 = 50
+    ) async throws -> ProcessListResult {
+        try await request(
+            method: "session.processes",
+            params: [
+                "session_id": .string(sessionID),
+                "include_finished": .bool(includeFinished),
+                "limit": .number(Double(limit)),
+            ]
+        )
+        .decode(ProcessListResult.self)
+    }
+
+    func processLogs(
+        sessionID: String,
+        processID: String,
+        offset: UInt64 = 0,
+        maxBytes: UInt32 = 65536,
+        maxLines: UInt32? = nil,
+        fromEnd: Bool = false
+    ) async throws -> ProcessLogsResult {
+        var params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "process_id": .string(processID),
+            "offset": .number(Double(offset)),
+            "max_bytes": .number(Double(maxBytes)),
+            "from_end": .bool(fromEnd),
+        ]
+        if let maxLines {
+            params["max_lines"] = .number(Double(maxLines))
+        }
+        return try await request(method: "session.process.logs", params: params)
+            .decode(ProcessLogsResult.self)
+    }
+
+    func stopProcess(
+        sessionID: String,
+        processID: String,
+        signal: String = "TERM",
+        graceSecs: UInt32 = 5
+    ) async throws -> ProcessStopResult {
+        try await request(
+            method: "session.process.stop",
+            params: [
+                "session_id": .string(sessionID),
+                "process_id": .string(processID),
+                "signal": .string(signal),
+                "grace_secs": .number(Double(graceSecs)),
+            ]
+        )
+        .decode(ProcessStopResult.self)
+    }
+
     func listQuestions(sessionID: String) async throws -> [Question] {
         let params: [String: JSONValue] = ["session_id": .string(sessionID)]
         return try await request(method: "question.list", params: params)
