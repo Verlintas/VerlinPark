@@ -6,6 +6,7 @@ use std::process::Command;
 use tempfile::TempDir;
 use vp_providers::{EventStream, ProviderError};
 use vp_store::Store;
+use vp_store::store::Claim;
 
 fn prices(input: f64, output: f64) -> RolePrices {
     RolePrices {
@@ -3928,7 +3929,7 @@ async fn steering_is_delivered_at_the_next_turn_boundary() {
         .await
         .unwrap();
     let steering = engine
-        .steer_session(&session.id, "inspect the tests first", None, None)
+        .steer_session(&session.id, "inspect the tests first", None, None, None)
         .await
         .unwrap()
         .steering;
@@ -3987,7 +3988,7 @@ async fn steering_left_pending_when_a_run_ends_is_cancelled() {
         .await
         .unwrap();
     let steering = engine
-        .steer_session(&session.id, "too late", None, None)
+        .steer_session(&session.id, "too late", None, None, None)
         .await
         .unwrap()
         .steering;
@@ -8879,6 +8880,7 @@ async fn deferred_continuation_waits_for_active_session_and_delivers_once() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap()
@@ -9005,6 +9007,7 @@ async fn recurring_continuation_delivers_first_run_and_leaves_child_pending() {
             None,
             Some(60),
             Some(3),
+            None,
         )
         .await
         .unwrap()
@@ -9123,6 +9126,7 @@ async fn recurring_continuation_start_failure_does_not_schedule_child() {
             Some(1),
             Some(60),
             Some(3),
+            None,
         )
         .await
         .unwrap()
@@ -9200,6 +9204,7 @@ async fn deferred_continuation_start_failures_back_off_and_respect_attempt_cap()
             Some(1),
             None,
             None,
+            None,
         )
         .await
         .unwrap()
@@ -9213,6 +9218,7 @@ async fn deferred_continuation_start_failures_back_off_and_respect_attempt_cap()
             None,
             None,
             Some(3),
+            None,
             None,
             None,
         )
@@ -9311,6 +9317,7 @@ async fn deferred_continuations_cancel_for_landed_and_imported_sessions() {
                 None,
                 Some(60),
                 Some(3),
+                None,
             )
             .await
             .unwrap()
@@ -9378,6 +9385,7 @@ async fn deferred_continuation_deadline_fallback_wakes_without_watched_tasks() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap()
@@ -9435,6 +9443,7 @@ async fn deferred_continuation_claim_has_one_winner_and_recovery_fails_closed() 
             &session.id,
             "claim once",
             vec!["T1".into()],
+            None,
             None,
             None,
             None,
@@ -10500,4 +10509,210 @@ async fn unrelated_verification_does_not_outrank_a_same_task_result() {
         unrelated_position.is_none_or(|position| position > 0),
         "unrelated verification outranked the same-task result"
     );
+}
+
+fn recording_service(
+    dir: &TempDir,
+) -> (
+    Engine,
+    AgentService,
+    vp_protocol::types::Project,
+    Arc<Mutex<Vec<ChatRequest>>>,
+) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::new()),
+    });
+    let provider_trait: Arc<dyn Provider> = provider;
+    let (engine, service, project) = test_service_with_provider(dir, provider_trait);
+    (engine, service, project, requests)
+}
+
+#[tokio::test]
+async fn prompt_operation_replays_without_a_second_run() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project, requests) = recording_service(&dir);
+    let session = engine
+        .create_session(project.id, "prompt operation".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+
+    service
+        .start_with_operation(&session.id, "repeatable instructions", Some("op-prompt-1"))
+        .await
+        .unwrap();
+    let finished = wait_until_idle(&engine, &session).await;
+    assert_eq!(finished.status, "idle");
+    assert_eq!(requests.lock().unwrap().len(), 1);
+
+    service
+        .start_with_operation(&session.id, "repeatable instructions", Some("op-prompt-1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "replay must not call the provider again"
+    );
+    let messages = engine.list_messages(&session.id).await.unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| {
+                message.role == "user" && message.content == "repeatable instructions"
+            })
+            .count(),
+        1,
+        "replay must not append a second user message"
+    );
+    let events = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "agent.queued")
+            .count(),
+        1,
+        "replay must not enqueue a second run"
+    );
+
+    let conflict = service
+        .start_with_operation(&session.id, "different instructions", Some("op-prompt-1"))
+        .await
+        .unwrap_err();
+    assert!(conflict.to_string().contains("different method or payload"));
+    assert_eq!(requests.lock().unwrap().len(), 1);
+
+    service
+        .start_with_operation(&session.id, "repeatable instructions", Some("op-prompt-2"))
+        .await
+        .unwrap();
+    let finished = wait_until_idle(&engine, &session).await;
+    assert_eq!(finished.status, "idle");
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        2,
+        "a new operation id must start a new run"
+    );
+}
+
+#[tokio::test]
+async fn prompt_operation_in_progress_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project, requests) = recording_service(&dir);
+    let session = engine
+        .create_session(project.id, "pending operation".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let payload = serde_json::json!({
+        "session_id": session.id,
+        "content": "one run",
+    });
+    let fingerprint = crate::operation::fingerprint("session.prompt", &payload).unwrap();
+    assert_eq!(
+        engine
+            .store()
+            .claim_session_operation(
+                &session.id,
+                "op-in-progress",
+                "session.prompt",
+                &fingerprint
+            )
+            .unwrap(),
+        Claim::New
+    );
+
+    let error = service
+        .start_with_operation(&session.id, "one run", Some("op-in-progress"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("already in progress"));
+    assert_eq!(requests.lock().unwrap().len(), 0);
+    assert!(engine.list_messages(&session.id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn prompt_operation_unknown_after_recovery_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project, requests) = recording_service(&dir);
+    let session = engine
+        .create_session(project.id, "crash window".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let payload = serde_json::json!({
+        "session_id": session.id,
+        "content": "maybe started",
+    });
+    let fingerprint = crate::operation::fingerprint("session.prompt", &payload).unwrap();
+    let store = engine.store().clone();
+    assert_eq!(
+        store
+            .claim_session_operation(&session.id, "op-unknown", "session.prompt", &fingerprint)
+            .unwrap(),
+        Claim::New
+    );
+
+    engine.recover_interrupted_sessions().await.unwrap();
+    assert_eq!(
+        store
+            .claim_session_operation(&session.id, "op-unknown", "session.prompt", &fingerprint)
+            .unwrap(),
+        Claim::Unknown
+    );
+    let error = service
+        .start_with_operation(&session.id, "maybe started", Some("op-unknown"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("unknown outcome"));
+    assert_eq!(requests.lock().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn prompt_operation_failed_can_be_retried_with_the_same_id() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project, requests) = recording_service(&dir);
+    let session = engine
+        .create_session(project.id, "failed operation".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let config = service.config.write().unwrap().take();
+    let error = service
+        .start_with_operation(&session.id, "retry me", Some("op-retry"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("provider is not configured"));
+    *service.config.write().unwrap() = config;
+
+    service
+        .start_with_operation(&session.id, "retry me", Some("op-retry"))
+        .await
+        .unwrap();
+    let finished = wait_until_idle(&engine, &session).await;
+    assert_eq!(finished.status, "idle");
+    assert_eq!(requests.lock().unwrap().len(), 1);
+
+    service
+        .start_with_operation(&session.id, "retry me", Some("op-retry"))
+        .await
+        .unwrap();
+    assert_eq!(requests.lock().unwrap().len(), 1);
 }

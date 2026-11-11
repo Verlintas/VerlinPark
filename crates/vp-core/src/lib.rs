@@ -80,6 +80,7 @@ mod dashboard;
 pub mod history;
 pub mod mcp;
 pub mod memory;
+mod operation;
 pub mod orchestration;
 pub mod permissions;
 pub mod rebuild;
@@ -4787,8 +4788,55 @@ impl Engine {
 
     /// Create an operator steering request for one running agent/run. When
     /// `agent_id` is omitted the session Leader is targeted; there is no
-    /// implicit broadcast to Workers.
+    /// implicit broadcast to Workers. An optional operation id replays the
+    /// first steering row instead of creating a duplicate.
     pub async fn steer_session(
+        &self,
+        session_id: &str,
+        body: &str,
+        agent_id: Option<&str>,
+        task_id: Option<&str>,
+        operation_id: Option<&str>,
+    ) -> Result<SessionSteerResult> {
+        let payload = serde_json::json!({
+            "session_id": session_id,
+            "body": body,
+            "agent_id": agent_id,
+            "task_id": task_id,
+        });
+        let receipt = match crate::operation::begin(
+            self.store(),
+            session_id,
+            operation_id,
+            "session.steer",
+            &payload,
+        )
+        .await?
+        {
+            crate::operation::OperationStart::Replay(result) => {
+                return crate::operation::replay(&result);
+            }
+            crate::operation::OperationStart::Proceed(receipt) => receipt,
+        };
+        let result = self
+            .steer_session_inner(session_id, body, agent_id, task_id)
+            .await;
+        match &result {
+            Ok(value) => {
+                if let Err(error) = crate::operation::complete(&receipt, value).await {
+                    return Err(error.context(
+                        "steering was created but the session operation receipt could not be completed",
+                    ));
+                }
+            }
+            Err(error) => {
+                crate::operation::fail(&receipt, &format!("{error:#}")).await;
+            }
+        }
+        result
+    }
+
+    async fn steer_session_inner(
         &self,
         session_id: &str,
         body: &str,
@@ -4903,6 +4951,73 @@ impl Engine {
     /// write scopes.
     #[allow(clippy::too_many_arguments)]
     pub async fn defer_session(
+        &self,
+        session_id: &str,
+        body: &str,
+        watch_task_ids: Vec<String>,
+        watch_mode: Option<&str>,
+        deadline_at: Option<&str>,
+        after_secs: Option<u64>,
+        max_attempts: Option<u32>,
+        every_secs: Option<u64>,
+        max_runs: Option<u32>,
+        operation_id: Option<&str>,
+    ) -> Result<SessionDeferResult> {
+        let payload = serde_json::json!({
+            "session_id": session_id,
+            "body": body,
+            "watch_task_ids": &watch_task_ids,
+            "watch_mode": watch_mode,
+            "deadline_at": deadline_at,
+            "after_secs": after_secs,
+            "max_attempts": max_attempts,
+            "every_secs": every_secs,
+            "max_runs": max_runs,
+        });
+        let receipt = match crate::operation::begin(
+            self.store(),
+            session_id,
+            operation_id,
+            "session.defer",
+            &payload,
+        )
+        .await?
+        {
+            crate::operation::OperationStart::Replay(result) => {
+                return crate::operation::replay(&result);
+            }
+            crate::operation::OperationStart::Proceed(receipt) => receipt,
+        };
+        let result = self
+            .defer_session_inner(
+                session_id,
+                body,
+                watch_task_ids,
+                watch_mode,
+                deadline_at,
+                after_secs,
+                max_attempts,
+                every_secs,
+                max_runs,
+            )
+            .await;
+        match &result {
+            Ok(value) => {
+                if let Err(error) = crate::operation::complete(&receipt, value).await {
+                    return Err(error.context(
+                        "continuation was created but the session operation receipt could not be completed",
+                    ));
+                }
+            }
+            Err(error) => {
+                crate::operation::fail(&receipt, &format!("{error:#}")).await;
+            }
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn defer_session_inner(
         &self,
         session_id: &str,
         body: &str,
@@ -5707,6 +5822,20 @@ impl Engine {
             tokio::task::spawn_blocking(move || store.recover_state()).await??;
         for event in events {
             let _ = self.events.send(event);
+        }
+        // An operation receipt that is still `pending` belongs to the previous
+        // daemon process. Its side effect may or may not have landed, so it is
+        // failed closed as `unknown` instead of being replayed.
+        let operation_store = self.store.clone();
+        let unknown_operations = tokio::task::spawn_blocking(move || {
+            operation_store.mark_pending_session_operations_unknown()
+        })
+        .await??;
+        if unknown_operations > 0 {
+            tracing::warn!(
+                operations = unknown_operations,
+                "marked pending session operations unknown after daemon recovery"
+            );
         }
         // A crash may land after `git merge` but before the queue status is
         // finalized. If the session worktree is clean, reset it to the

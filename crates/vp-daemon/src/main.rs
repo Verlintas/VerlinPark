@@ -1641,6 +1641,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                     &params.body,
                     params.agent_id.as_deref(),
                     params.task_id.as_deref(),
+                    params.operation_id.as_deref(),
                 )
                 .await
             {
@@ -1682,6 +1683,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                     params.max_attempts,
                     params.every_secs,
                     params.max_runs,
+                    params.operation_id.as_deref(),
                 )
                 .await
             {
@@ -2748,7 +2750,15 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             Err(response) => response_with_id(id, response),
         },
         "session.prompt" => match parse_params::<PromptParams>(request.params) {
-            Ok(params) => match state.agent.start(&params.session_id, &params.content).await {
+            Ok(params) => match state
+                .agent
+                .start_with_operation(
+                    &params.session_id,
+                    &params.content,
+                    params.operation_id.as_deref(),
+                )
+                .await
+            {
                 Ok(()) => RpcResponse::success(id, PromptResult { accepted: true }),
                 Err(error) => internal_error(id, error),
             },

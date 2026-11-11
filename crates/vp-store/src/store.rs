@@ -93,6 +93,27 @@ pub enum ComputerLeaseAttempt {
     },
 }
 
+/// Result of claiming an idempotent session operation. `pending` rows from a
+/// previous daemon process are promoted to `unknown` during startup recovery
+/// and never silently replayed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Claim {
+    /// No row existed, or a failed row with the same fingerprint was reset to
+    /// `pending` for a safe retry.
+    New,
+    /// The operation already completed with the same method and payload.
+    /// The stored JSON result should be returned without repeating side
+    /// effects.
+    Replay(String),
+    /// Another caller already holds the same operation in `pending`.
+    InProgress,
+    /// The operation id exists with a different method or payload.
+    Conflict,
+    /// The previous daemon stopped while the operation was in flight. The
+    /// side effects may or may not have landed.
+    Unknown,
+}
+
 /// Input for creating a standalone intake task. Kept in the store layer so
 /// the engine and tests construct the same shape without a 15-argument call.
 #[derive(Debug, Clone)]
@@ -1301,6 +1322,22 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_steering_messages_session
                 ON steering_messages(session_id, agent_id, status, created_at);
+
+            CREATE TABLE IF NOT EXISTS session_operations (
+                session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                operation_id TEXT NOT NULL,
+                method       TEXT NOT NULL,
+                fingerprint  TEXT NOT NULL,
+                status       TEXT NOT NULL,
+                result_json  TEXT,
+                error        TEXT,
+                created_at   TEXT NOT NULL,
+                updated_at   TEXT NOT NULL,
+                PRIMARY KEY (session_id, operation_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_session_operations_status
+                ON session_operations(status, updated_at);
 
             CREATE TABLE IF NOT EXISTS session_continuations (
                 id              TEXT PRIMARY KEY,
@@ -7946,6 +7983,159 @@ impl Store {
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Atomically claim an operation receipt for one session. The comparison
+    /// and insert/update happen in one immediate transaction so two callers
+    /// cannot both start the same operation.
+    pub fn claim_session_operation(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+        method: &str,
+        fingerprint: &str,
+    ) -> Result<Claim> {
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let existing = tx
+            .query_row(
+                "SELECT method, fingerprint, status, result_json
+                 FROM session_operations
+                 WHERE session_id = ?1 AND operation_id = ?2",
+                params![session_id, operation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((existing_method, existing_fingerprint, status, result_json)) = existing else {
+            tx.execute(
+                "INSERT INTO session_operations
+                 (session_id, operation_id, method, fingerprint, status, result_json, error,
+                  created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 'pending', NULL, NULL, ?5, ?5)",
+                params![session_id, operation_id, method, fingerprint, now],
+            )?;
+            tx.commit()?;
+            return Ok(Claim::New);
+        };
+        if existing_method != method || existing_fingerprint != fingerprint {
+            return Ok(Claim::Conflict);
+        }
+        match status.as_str() {
+            "completed" => {
+                let result = result_json.ok_or_else(|| {
+                    anyhow!(
+                        "session operation {operation_id} is completed but has no stored result"
+                    )
+                })?;
+                Ok(Claim::Replay(result))
+            }
+            "pending" => Ok(Claim::InProgress),
+            "unknown" => Ok(Claim::Unknown),
+            "failed" => {
+                tx.execute(
+                    "UPDATE session_operations
+                     SET status = 'pending', result_json = NULL, error = NULL, updated_at = ?3
+                     WHERE session_id = ?1 AND operation_id = ?2 AND status = 'failed'",
+                    params![session_id, operation_id, now],
+                )?;
+                tx.commit()?;
+                Ok(Claim::New)
+            }
+            other => Err(anyhow!(
+                "session operation {operation_id} has invalid status {other}"
+            )),
+        }
+    }
+
+    pub fn complete_session_operation(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+        result_json: &str,
+    ) -> Result<()> {
+        let now = now_rfc3339();
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE session_operations
+             SET status = 'completed', result_json = ?3, error = NULL, updated_at = ?4
+             WHERE session_id = ?1 AND operation_id = ?2 AND status = 'pending'",
+            params![session_id, operation_id, result_json, now],
+        )?;
+        if changed > 0 {
+            return Ok(());
+        }
+        let status = conn
+            .query_row(
+                "SELECT status FROM session_operations
+                 WHERE session_id = ?1 AND operation_id = ?2",
+                params![session_id, operation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match status {
+            Some(status) => Err(anyhow!(
+                "session operation {operation_id} is {status}; cannot mark it completed"
+            )),
+            None => Err(anyhow!("session operation {operation_id} was not found")),
+        }
+    }
+
+    pub fn fail_session_operation(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+        error: &str,
+    ) -> Result<()> {
+        let now = now_rfc3339();
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE session_operations
+             SET status = 'failed', result_json = NULL, error = ?3, updated_at = ?4
+             WHERE session_id = ?1 AND operation_id = ?2 AND status = 'pending'",
+            params![session_id, operation_id, error, now],
+        )?;
+        if changed > 0 {
+            return Ok(());
+        }
+        let status = conn
+            .query_row(
+                "SELECT status FROM session_operations
+                 WHERE session_id = ?1 AND operation_id = ?2",
+                params![session_id, operation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match status {
+            Some(status) => Err(anyhow!(
+                "session operation {operation_id} is {status}; cannot mark it failed"
+            )),
+            None => Err(anyhow!("session operation {operation_id} was not found")),
+        }
+    }
+
+    /// Startup recovery: a `pending` row means the previous daemon stopped
+    /// while the operation was in flight. Its side effects may or may not
+    /// have landed, so fail closed until an operator inspects the session.
+    pub fn mark_pending_session_operations_unknown(&self) -> Result<usize> {
+        let now = now_rfc3339();
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE session_operations
+             SET status = 'unknown',
+                 error = 'daemon restarted while the operation was pending; outcome unknown',
+                 updated_at = ?1
+             WHERE status = 'pending'",
+            params![now],
+        )?;
+        Ok(changed)
     }
 
     /// Persist an operator steering request and its creation event in one

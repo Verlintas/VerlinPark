@@ -716,6 +716,9 @@ enum Command {
         /// Require the target agent to be running this plan task.
         #[arg(long)]
         task: Option<String>,
+        /// Idempotency key; retrying with the same key replays the first result.
+        #[arg(long)]
+        operation_id: Option<String>,
     },
     /// List persisted steering messages for a session.
     Steering {
@@ -750,6 +753,9 @@ enum Command {
         /// Maximum delivered runs in the recurrence series (2..=100, default 10).
         #[arg(long)]
         max_runs: Option<u32>,
+        /// Idempotency key; retrying with the same key replays the first result.
+        #[arg(long)]
+        operation_id: Option<String>,
     },
     /// List deferred continuations for a session.
     Continuations {
@@ -842,7 +848,13 @@ enum Command {
         limit: u32,
     },
     /// Send a follow-up prompt to the session Leader.
-    Prompt { session: String, content: String },
+    Prompt {
+        session: String,
+        content: String,
+        /// Idempotency key; retrying with the same key replays the first result.
+        #[arg(long)]
+        operation_id: Option<String>,
+    },
     /// Ask the running Leader to stop.
     Cancel { session: String },
     /// Pause the running Leader between turns/tools.
@@ -2397,6 +2409,7 @@ async fn main() -> Result<()> {
             text,
             agent,
             task,
+            operation_id,
         } => {
             rpc(
                 &discovery,
@@ -2406,6 +2419,7 @@ async fn main() -> Result<()> {
                     "body": text,
                     "agent_id": agent,
                     "task_id": task,
+                    "operation_id": operation_id,
                 }),
             )
             .await?
@@ -2434,6 +2448,7 @@ async fn main() -> Result<()> {
             at,
             every_secs,
             max_runs,
+            operation_id,
         } => {
             rpc(
                 &discovery,
@@ -2447,6 +2462,7 @@ async fn main() -> Result<()> {
                     "deadline_at": at,
                     "every_secs": every_secs,
                     "max_runs": max_runs,
+                    "operation_id": operation_id,
                 }),
             )
             .await?
@@ -2742,11 +2758,15 @@ async fn main() -> Result<()> {
             )
             .await?
         }
-        Command::Prompt { session, content } => {
+        Command::Prompt {
+            session,
+            content,
+            operation_id,
+        } => {
             rpc(
                 &discovery,
                 "session.prompt",
-                json!({"session_id": session, "content": content}),
+                json!({"session_id": session, "content": content, "operation_id": operation_id}),
             )
             .await?
         }
@@ -5782,6 +5802,66 @@ fn print_human(value: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_operation_id_flags_parse() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "prompt",
+                    "ses-1",
+                    "continue",
+                    "--operation-id",
+                    "op-prompt",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::Prompt { operation_id, .. } => {
+                        assert_eq!(operation_id.as_deref(), Some("op-prompt"))
+                    }
+                    other => panic!("expected prompt command, got {other:?}"),
+                }
+
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "defer",
+                    "ses-1",
+                    "follow up",
+                    "--after-secs",
+                    "60",
+                    "--operation-id",
+                    "op-defer",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::Defer { operation_id, .. } => {
+                        assert_eq!(operation_id.as_deref(), Some("op-defer"))
+                    }
+                    other => panic!("expected defer command, got {other:?}"),
+                }
+
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "steer",
+                    "ses-1",
+                    "inspect tests",
+                    "--operation-id",
+                    "op-steer",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::Steer { operation_id, .. } => {
+                        assert_eq!(operation_id.as_deref(), Some("op-steer"))
+                    }
+                    other => panic!("expected steer command, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 
     #[test]
     fn metrics_command_parses_prometheus_flag() {

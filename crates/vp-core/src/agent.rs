@@ -4104,6 +4104,63 @@ impl AgentService {
     }
 
     pub async fn start(&self, session_id: &str, prompt: &str) -> Result<()> {
+        self.start_with_operation(session_id, prompt, None).await
+    }
+
+    /// Start a Leader run with an optional idempotency key. A completed
+    /// receipt with the same method and payload is replayed as accepted;
+    /// pending, conflicting, or crash-unknown receipts never start a second
+    /// run.
+    pub async fn start_with_operation(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        operation_id: Option<&str>,
+    ) -> Result<()> {
+        let payload = json!({
+            "session_id": session_id,
+            "content": prompt,
+        });
+        let receipt = match crate::operation::begin(
+            self.engine.store(),
+            session_id,
+            operation_id,
+            "session.prompt",
+            &payload,
+        )
+        .await?
+        {
+            crate::operation::OperationStart::Replay(_) => return Ok(()),
+            crate::operation::OperationStart::Proceed(receipt) => receipt,
+        };
+        let result = self.start_inner(session_id, prompt).await;
+        match &result {
+            Ok(()) => {
+                if let Some(receipt) = &receipt
+                    && let Err(error) = receipt.complete(&json!({"accepted": true})).await
+                {
+                    return Err(error.context(
+                        "run started but the session operation receipt could not be completed",
+                    ));
+                }
+            }
+            Err(error) => {
+                if let Some(receipt) = &receipt
+                    && let Err(receipt_error) = receipt.fail(&format!("{error:#}")).await
+                {
+                    tracing::warn!(
+                        %receipt_error,
+                        session_id,
+                        operation_id = ?operation_id,
+                        "failed to record a failed session operation"
+                    );
+                }
+            }
+        }
+        result
+    }
+
+    async fn start_inner(&self, session_id: &str, prompt: &str) -> Result<()> {
         let config = self
             .config
             .read()

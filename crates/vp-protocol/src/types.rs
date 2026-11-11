@@ -3279,6 +3279,11 @@ pub struct SessionMergeForkResult {
 pub struct PromptParams {
     pub session_id: String,
     pub content: String,
+    /// Optional caller-supplied idempotency key. Repeating the same id with
+    /// the same payload replays the first accepted result instead of starting
+    /// a second run.
+    #[serde(default)]
+    pub operation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3982,6 +3987,10 @@ pub struct SessionSteerParams {
     pub agent_id: Option<String>,
     #[serde(default)]
     pub task_id: Option<String>,
+    /// Optional caller-supplied idempotency key. Repeating the same id with
+    /// the same payload replays the first steering result.
+    #[serde(default)]
+    pub operation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -4123,6 +4132,11 @@ pub struct SessionDeferParams {
     /// continuations omit it or pass 1.
     #[serde(default)]
     pub max_runs: Option<u32>,
+    /// Optional caller-supplied idempotency key. Repeating the same id with
+    /// the same payload replays the first continuation instead of creating a
+    /// duplicate.
+    #[serde(default)]
+    pub operation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -4868,6 +4882,53 @@ pub struct OrchestrationSnapshotResult {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn session_operation_ids_decode_as_optional() {
+        let legacy_prompt: PromptParams = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "content": "continue"
+        }))
+        .unwrap();
+        assert!(legacy_prompt.operation_id.is_none());
+        let prompt: PromptParams = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "content": "continue",
+            "operation_id": "op-1"
+        }))
+        .unwrap();
+        assert_eq!(prompt.operation_id.as_deref(), Some("op-1"));
+
+        let legacy_steer: SessionSteerParams = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "body": "look at tests"
+        }))
+        .unwrap();
+        assert!(legacy_steer.operation_id.is_none());
+        let steer: SessionSteerParams = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "body": "look at tests",
+            "operation_id": "op-2"
+        }))
+        .unwrap();
+        assert_eq!(steer.operation_id.as_deref(), Some("op-2"));
+
+        let legacy_defer: SessionDeferParams = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "body": "follow up",
+            "watch_task_ids": ["T1"]
+        }))
+        .unwrap();
+        assert!(legacy_defer.operation_id.is_none());
+        let defer: SessionDeferParams = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "body": "follow up",
+            "watch_task_ids": ["T1"],
+            "operation_id": "op-3"
+        }))
+        .unwrap();
+        assert_eq!(defer.operation_id.as_deref(), Some("op-3"));
+    }
 
     #[test]
     fn session_continuation_decodes_legacy_rows_as_one_shot() {

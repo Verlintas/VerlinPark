@@ -4668,7 +4668,7 @@ async fn steering_targets_a_running_leader_orders_and_replays() {
         .unwrap();
 
     let error = engine
-        .steer_session(&session.id, "too early", None, None)
+        .steer_session(&session.id, "too early", None, None, None)
         .await
         .unwrap_err();
     assert!(error.to_string().contains("no running Leader"));
@@ -4678,12 +4678,18 @@ async fn steering_targets_a_running_leader_orders_and_replays() {
         .unwrap();
 
     let first = engine
-        .steer_session(&session.id, "first instruction", None, None)
+        .steer_session(&session.id, "first instruction", None, None, None)
         .await
         .unwrap()
         .steering;
     let second = engine
-        .steer_session(&session.id, "second instruction", Some(&leader_id), None)
+        .steer_session(
+            &session.id,
+            "second instruction",
+            Some(&leader_id),
+            None,
+            None,
+        )
         .await
         .unwrap()
         .steering;
@@ -4800,18 +4806,24 @@ async fn steering_rejects_wrong_targets_scopes_tasks_and_cleans_up_runs() {
         .unwrap();
 
     let error = engine
-        .steer_session(&other.id, "wrong session", Some(&leader_id), None)
+        .steer_session(&other.id, "wrong session", Some(&leader_id), None, None)
         .await
         .unwrap_err();
     assert!(error.to_string().contains("not in this session"));
     let error = engine
-        .steer_session(&session.id, "wrong task", Some(&worker.id), Some("T2"))
+        .steer_session(
+            &session.id,
+            "wrong task",
+            Some(&worker.id),
+            Some("T2"),
+            None,
+        )
         .await
         .unwrap_err();
     assert!(error.to_string().contains("not working on task T2"));
 
     let cancelled = engine
-        .steer_session(&session.id, "cancel me", None, None)
+        .steer_session(&session.id, "cancel me", None, None, None)
         .await
         .unwrap()
         .steering;
@@ -4826,7 +4838,7 @@ async fn steering_rejects_wrong_targets_scopes_tasks_and_cleans_up_runs() {
     );
 
     let scoped = engine
-        .steer_session(&session.id, "task only", Some(&worker.id), Some("T1"))
+        .steer_session(&session.id, "task only", Some(&worker.id), Some("T1"), None)
         .await
         .unwrap()
         .steering;
@@ -4846,7 +4858,7 @@ async fn steering_rejects_wrong_targets_scopes_tasks_and_cleans_up_runs() {
     assert!(delivered[0].message.is_none());
 
     let pending = engine
-        .steer_session(&session.id, "run is ending", None, None)
+        .steer_session(&session.id, "run is ending", None, None, None)
         .await
         .unwrap()
         .steering;
@@ -7605,6 +7617,7 @@ async fn deferred_continuations_validate_creation_and_replay_repair_bundle() {
                 None,
                 None,
                 None,
+                None,
                 None
             )
             .await
@@ -7616,6 +7629,7 @@ async fn deferred_continuations_validate_creation_and_replay_repair_bundle() {
                 &session.id,
                 &"x".repeat(4_001),
                 vec!["T1".into()],
+                None,
                 None,
                 None,
                 None,
@@ -7637,6 +7651,7 @@ async fn deferred_continuations_validate_creation_and_replay_repair_bundle() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -7652,6 +7667,7 @@ async fn deferred_continuations_validate_creation_and_replay_repair_bundle() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -7662,6 +7678,7 @@ async fn deferred_continuations_validate_creation_and_replay_repair_bundle() {
             "later",
             vec!["T1".into()],
             Some("most"),
+            None,
             None,
             None,
             None,
@@ -7685,6 +7702,7 @@ async fn deferred_continuations_validate_creation_and_replay_repair_bundle() {
                 None,
                 None,
                 None,
+                None,
                 None
             )
             .await
@@ -7699,6 +7717,7 @@ async fn deferred_continuations_validate_creation_and_replay_repair_bundle() {
                 None,
                 None,
                 Some(31 * 24 * 60 * 60),
+                None,
                 None,
                 None,
                 None
@@ -7720,6 +7739,7 @@ async fn deferred_continuations_validate_creation_and_replay_repair_bundle() {
                 Some(5),
                 None,
                 None,
+                None,
                 None
             )
             .await
@@ -7735,6 +7755,7 @@ async fn deferred_continuations_validate_creation_and_replay_repair_bundle() {
             Some(&tomorrow),
             None,
             Some(9),
+            None,
             None,
             None,
         )
@@ -7762,6 +7783,7 @@ async fn deferred_continuations_validate_creation_and_replay_repair_bundle() {
             &session.id,
             "use the T2 result",
             vec!["T2".into()],
+            None,
             None,
             None,
             None,
@@ -7928,6 +7950,7 @@ async fn deferred_continuations_can_be_cancelled_once() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap()
@@ -7988,6 +8011,7 @@ async fn recurring_continuation_delivery_schedules_child_waits_for_interval_and_
                 None,
                 Some(59),
                 None,
+                None,
             )
             .await
             .is_err()
@@ -8003,6 +8027,7 @@ async fn recurring_continuation_delivery_schedules_child_waits_for_interval_and_
                 Some(60),
                 None,
                 Some(crate::continuation::MAX_RECURRENCE_SECS + 1),
+                None,
                 None,
             )
             .await
@@ -8020,6 +8045,7 @@ async fn recurring_continuation_delivery_schedules_child_waits_for_interval_and_
                 None,
                 Some(60),
                 Some(1),
+                None,
             )
             .await
             .is_err()
@@ -8036,6 +8062,7 @@ async fn recurring_continuation_delivery_schedules_child_waits_for_interval_and_
                 None,
                 Some(60),
                 Some(101),
+                None,
             )
             .await
             .is_err()
@@ -8052,6 +8079,7 @@ async fn recurring_continuation_delivery_schedules_child_waits_for_interval_and_
                 None,
                 None,
                 Some(2),
+                None,
             )
             .await
             .is_err()
@@ -8068,6 +8096,7 @@ async fn recurring_continuation_delivery_schedules_child_waits_for_interval_and_
             None,
             Some(60),
             Some(2),
+            None,
         )
         .await
         .unwrap()
@@ -8272,6 +8301,7 @@ async fn cancelling_one_recurring_row_leaves_the_other_rows_untouched() {
             None,
             Some(60),
             Some(3),
+            None,
         )
         .await
         .unwrap()
@@ -8358,6 +8388,7 @@ async fn recurring_continuation_bundle_repair_and_db_rebuild_fold_scheduled_chil
                 None,
                 Some(120),
                 Some(4),
+                None,
             )
             .await
             .unwrap()
@@ -8501,6 +8532,7 @@ async fn recurring_continuation_crash_before_delivery_fails_closed_without_child
             None,
             Some(60),
             Some(3),
+            None,
         )
         .await
         .unwrap()
@@ -9132,5 +9164,219 @@ async fn memory_conflicts_scan_broadcast_resolve_health_and_bundle() {
             .unwrap()
             .len(),
         1
+    );
+}
+
+#[tokio::test]
+async fn deferred_continuation_operation_replays_and_retries_after_failure() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("defer operation".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "defer operation".into(), None)
+        .await
+        .unwrap();
+    let error = engine
+        .defer_session(
+            &session.id,
+            "follow up once",
+            vec!["T1".into()],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("op-defer-1"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("session has no stored TeamPlan to watch")
+    );
+    assert!(
+        engine
+            .session_continuations(&session.id, None, Some(10))
+            .await
+            .unwrap()
+            .continuations
+            .is_empty()
+    );
+
+    engine
+        .set_team_plan(&session.id, &orchestration_test_plan())
+        .await
+        .unwrap();
+    let first = engine
+        .defer_session(
+            &session.id,
+            "follow up once",
+            vec!["T1".into()],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("op-defer-1"),
+        )
+        .await
+        .unwrap()
+        .continuation;
+    let replay = engine
+        .defer_session(
+            &session.id,
+            "follow up once",
+            vec!["T1".into()],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("op-defer-1"),
+        )
+        .await
+        .unwrap()
+        .continuation;
+    assert_eq!(first.id, replay.id);
+    let conflict = engine
+        .defer_session(
+            &session.id,
+            "different follow up",
+            vec!["T1".into()],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("op-defer-1"),
+        )
+        .await
+        .unwrap_err();
+    assert!(conflict.to_string().contains("different method or payload"));
+
+    let listed = engine
+        .session_continuations(&session.id, None, Some(10))
+        .await
+        .unwrap();
+    assert_eq!(listed.continuations.len(), 1);
+    let events = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "session.continuation.created")
+            .count(),
+        1,
+        "replay must not create a duplicate continuation event"
+    );
+}
+
+#[tokio::test]
+async fn steering_operation_replays_and_retries_after_failure() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("steer operation".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "steer operation".into(), None)
+        .await
+        .unwrap();
+    let leader_id = engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    engine
+        .update_agent_status(&leader_id, "idle")
+        .await
+        .unwrap();
+    let error = engine
+        .steer_session(
+            &session.id,
+            "inspect the tests first",
+            None,
+            None,
+            Some("op-steer-1"),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("no running Leader"));
+
+    engine
+        .update_agent_status(&leader_id, "running")
+        .await
+        .unwrap();
+    let first = engine
+        .steer_session(
+            &session.id,
+            "inspect the tests first",
+            None,
+            None,
+            Some("op-steer-1"),
+        )
+        .await
+        .unwrap()
+        .steering;
+    let replay = engine
+        .steer_session(
+            &session.id,
+            "inspect the tests first",
+            None,
+            None,
+            Some("op-steer-1"),
+        )
+        .await
+        .unwrap()
+        .steering;
+    assert_eq!(first.id, replay.id);
+    let conflict = engine
+        .steer_session(
+            &session.id,
+            "change the tests",
+            None,
+            None,
+            Some("op-steer-1"),
+        )
+        .await
+        .unwrap_err();
+    assert!(conflict.to_string().contains("different method or payload"));
+
+    let listed = engine
+        .session_steering(&session.id, None, Some(10))
+        .await
+        .unwrap();
+    assert_eq!(listed.steering.len(), 1);
+    let events = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "steering.created")
+            .count(),
+        1,
+        "replay must not create a duplicate steering event"
     );
 }

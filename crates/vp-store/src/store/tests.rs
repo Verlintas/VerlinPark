@@ -4551,3 +4551,127 @@ fn daemon_metrics_snapshot_counts_statuses_and_usage_totals() {
     assert_eq!(snapshot.cache_write_tokens, 10);
     assert!((snapshot.cost_spent_usd - 0.75).abs() < 1e-9);
 }
+
+#[test]
+fn session_operation_claims_replay_conflict_and_report_in_progress() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("operations"))
+        .unwrap();
+    let session = store
+        .create_session(&project.id, "idempotent prompt")
+        .unwrap();
+
+    assert_eq!(
+        store
+            .claim_session_operation(&session.id, "op-1", "session.prompt", "fingerprint-a")
+            .unwrap(),
+        Claim::New
+    );
+    assert_eq!(
+        store
+            .claim_session_operation(&session.id, "op-1", "session.prompt", "fingerprint-a")
+            .unwrap(),
+        Claim::InProgress
+    );
+    assert_eq!(
+        store
+            .claim_session_operation(&session.id, "op-1", "session.prompt", "fingerprint-b")
+            .unwrap(),
+        Claim::Conflict
+    );
+    assert_eq!(
+        store
+            .claim_session_operation(&session.id, "op-1", "session.steer", "fingerprint-a")
+            .unwrap(),
+        Claim::Conflict
+    );
+
+    let result = serde_json::json!({"accepted": true}).to_string();
+    store
+        .complete_session_operation(&session.id, "op-1", &result)
+        .unwrap();
+    assert_eq!(
+        store
+            .claim_session_operation(&session.id, "op-1", "session.prompt", "fingerprint-a")
+            .unwrap(),
+        Claim::Replay(result.clone())
+    );
+    assert_eq!(
+        store
+            .claim_session_operation(&session.id, "op-1", "session.prompt", "fingerprint-b")
+            .unwrap(),
+        Claim::Conflict
+    );
+
+    // The same operation id in another session is a separate receipt.
+    let other = store.create_session(&project.id, "other session").unwrap();
+    assert_eq!(
+        store
+            .claim_session_operation(&other.id, "op-1", "session.prompt", "fingerprint-a")
+            .unwrap(),
+        Claim::New
+    );
+}
+
+#[test]
+fn session_operation_failed_rows_can_be_retried() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("operations"))
+        .unwrap();
+    let session = store.create_session(&project.id, "retry").unwrap();
+    assert_eq!(
+        store
+            .claim_session_operation(&session.id, "op-2", "session.defer", "same")
+            .unwrap(),
+        Claim::New
+    );
+    store
+        .fail_session_operation(&session.id, "op-2", "session was landed")
+        .unwrap();
+    assert_eq!(
+        store
+            .claim_session_operation(&session.id, "op-2", "session.defer", "same")
+            .unwrap(),
+        Claim::New
+    );
+    assert_eq!(
+        store
+            .claim_session_operation(&session.id, "op-2", "session.defer", "different")
+            .unwrap(),
+        Claim::Conflict
+    );
+    store
+        .complete_session_operation(&session.id, "op-2", "{\"deferred\":true}")
+        .unwrap();
+    assert_eq!(
+        store
+            .claim_session_operation(&session.id, "op-2", "session.defer", "same")
+            .unwrap(),
+        Claim::Replay("{\"deferred\":true}".to_string())
+    );
+}
+
+#[test]
+fn startup_marks_pending_session_operations_unknown() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("operations"))
+        .unwrap();
+    let session = store.create_session(&project.id, "crash window").unwrap();
+    assert_eq!(
+        store
+            .claim_session_operation(&session.id, "op-3", "session.prompt", "same")
+            .unwrap(),
+        Claim::New
+    );
+    assert_eq!(store.mark_pending_session_operations_unknown().unwrap(), 1);
+    assert_eq!(
+        store
+            .claim_session_operation(&session.id, "op-3", "session.prompt", "same")
+            .unwrap(),
+        Claim::Unknown
+    );
+    assert_eq!(store.mark_pending_session_operations_unknown().unwrap(), 0);
+}
