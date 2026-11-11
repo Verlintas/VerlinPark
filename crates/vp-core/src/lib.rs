@@ -25,25 +25,26 @@ use vp_protocol::types::{
     IntakeCreateParams, IntakeListResult, IntakeTask, IntakeUpdateParams, IntegrationPolicy,
     MailboxGcResult, MailboxPolicy, McpCallResult, McpGetPromptResult, McpProbeResult,
     McpPromptListResult, McpReadResourceResult, McpResourceListResult, McpServer, McpServerConfig,
-    McpServerListResult, McpToolListResult, MemoryBriefResult, MemoryDeleteResult, MemoryEvidence,
-    MemoryItem, MemoryListResult, MemoryMatch, MemoryPolicy, MemoryPolicyResult, MemoryPruneResult,
-    MemorySearchParams, MemorySearchResult, MemoryStatsResult, MemorySweepResult,
-    MemoryUpdateResult, MemoryVerificationCheck, MemoryVerifyResult, MergeQueueEntry,
-    MessageCitation, ModelPreset, ModelPresetListResult, OrchestrationDecision, OrchestrationNote,
-    OrchestrationOverviewResult, OrchestrationOverviewTotals, OrchestrationPolicy,
-    OrchestrationPreviewAction, OrchestrationPreviewResult, OrchestrationRecoveriesResult,
-    OrchestrationRecovery, OrchestrationSessionSummary, OrchestrationSnapshot,
-    PlanRevisionDetailResult, PlanRevisionInfo, Project, ProjectBudget, ProjectBudgetResult,
-    ProjectUsageResult, PullRequestResult, Question, QuestionListResult, ReviseTeamPlanResult,
-    ScheduledTask, SearchResult, Session, SessionBundle, SessionCheckpoint,
-    SessionCheckpointDeleteResult, SessionCheckpointDiffResult, SessionCheckpointListResult,
-    SessionCheckpointPruneResult, SessionCheckpointRestoreResult, SessionCheckpointStatsResult,
-    SessionCitationAuditResult, SessionCitationsResult, SessionCommit, SessionCompareFile,
-    SessionCompareResult, SessionContextStatus, SessionContinuation,
-    SessionContinuationCancelResult, SessionContinuationsResult, SessionDeferResult, SessionDiff,
-    SessionForkResult, SessionForkTreeNode, SessionForkTreeResult, SessionImportResult,
-    SessionLandResult, SessionLineageEntry, SessionLineageResult, SessionLogStatus,
-    SessionPriorityResult, SessionRehydrateResult, SessionReplayReport,
+    McpServerListResult, McpToolListResult, MemoryBriefResult, MemoryConflict,
+    MemoryConflictResolveResult, MemoryConflictScanResult, MemoryConflictsResult,
+    MemoryDeleteResult, MemoryEvidence, MemoryHealthResult, MemoryItem, MemoryListResult,
+    MemoryMatch, MemoryPolicy, MemoryPolicyResult, MemoryPruneResult, MemorySearchParams,
+    MemorySearchResult, MemoryStatsResult, MemorySweepResult, MemoryUpdateResult,
+    MemoryVerificationCheck, MemoryVerifyResult, MergeQueueEntry, MessageCitation, ModelPreset,
+    ModelPresetListResult, OrchestrationDecision, OrchestrationNote, OrchestrationOverviewResult,
+    OrchestrationOverviewTotals, OrchestrationPolicy, OrchestrationPreviewAction,
+    OrchestrationPreviewResult, OrchestrationRecoveriesResult, OrchestrationRecovery,
+    OrchestrationSessionSummary, OrchestrationSnapshot, PlanRevisionDetailResult, PlanRevisionInfo,
+    Project, ProjectBudget, ProjectBudgetResult, ProjectUsageResult, PullRequestResult, Question,
+    QuestionListResult, ReviseTeamPlanResult, ScheduledTask, SearchResult, Session, SessionBundle,
+    SessionCheckpoint, SessionCheckpointDeleteResult, SessionCheckpointDiffResult,
+    SessionCheckpointListResult, SessionCheckpointPruneResult, SessionCheckpointRestoreResult,
+    SessionCheckpointStatsResult, SessionCitationAuditResult, SessionCitationsResult,
+    SessionCommit, SessionCompareFile, SessionCompareResult, SessionContextStatus,
+    SessionContinuation, SessionContinuationCancelResult, SessionContinuationsResult,
+    SessionDeferResult, SessionDiff, SessionForkResult, SessionForkTreeNode, SessionForkTreeResult,
+    SessionImportResult, SessionLandResult, SessionLineageEntry, SessionLineageResult,
+    SessionLogStatus, SessionPriorityResult, SessionRehydrateResult, SessionReplayReport,
     SessionSkillActivationsResult, SessionStallsResult, SessionSteerResult,
     SessionSteeringCancelResult, SessionSteeringListResult, SessionTranscriptResult,
     SessionUnlimitedResult, ShellPolicy, Skill, SkillActivation, SkillCreateParams,
@@ -107,6 +108,7 @@ struct ReplayData {
     artifacts: Vec<Artifact>,
     usage: Vec<UsageEntry>,
     memories: Vec<MemoryItem>,
+    memory_conflicts: Vec<MemoryConflict>,
     questions: Vec<Question>,
     tasks: Vec<ScheduledTask>,
     steering: Vec<SteeringMessage>,
@@ -7541,6 +7543,147 @@ impl Engine {
         })
     }
 
+    pub async fn memory_conflicts(
+        &self,
+        project_id: &str,
+        status: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<MemoryConflictsResult> {
+        if let Some(status) = status
+            && !matches!(status, "open" | "resolved")
+        {
+            anyhow::bail!("memory conflict status must be open or resolved");
+        }
+        self.ensure_project_exists(project_id).await?;
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let status = status.map(str::to_string);
+        let conflicts = tokio::task::spawn_blocking(move || {
+            store.list_memory_conflicts(&project, status.as_deref(), limit)
+        })
+        .await??;
+        Ok(MemoryConflictsResult {
+            project_id: project_id.to_string(),
+            conflicts,
+        })
+    }
+
+    /// Deterministic detection pass. Never auto-resolves and never changes a
+    /// memory lifecycle status.
+    pub async fn memory_conflict_scan(&self, project_id: &str) -> Result<MemoryConflictScanResult> {
+        self.ensure_project_exists(project_id).await?;
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let scan =
+            tokio::task::spawn_blocking(move || store.scan_memory_conflicts(&project)).await??;
+        for event in &scan.events {
+            let _ = self.events.send(event.clone());
+        }
+        Ok(MemoryConflictScanResult {
+            project_id: project_id.to_string(),
+            detected: u32::try_from(scan.new.len()).unwrap_or(u32::MAX),
+            open: u32::try_from(scan.open.len()).unwrap_or(u32::MAX),
+            conflicts: scan.open,
+        })
+    }
+
+    pub async fn memory_conflict_resolve(
+        &self,
+        id: &str,
+        action: &str,
+        note: Option<&str>,
+    ) -> Result<MemoryConflictResolveResult> {
+        if !matches!(action, "keep_a" | "keep_b" | "keep_both" | "archive_both") {
+            anyhow::bail!(
+                "memory conflict action must be keep_a, keep_b, keep_both, or archive_both"
+            );
+        }
+        let store = self.store.clone();
+        let conflict_id = id.to_string();
+        let conflict = tokio::task::spawn_blocking(move || store.get_memory_conflict(&conflict_id))
+            .await??
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "memory conflict {id} not found: memory no longer exists or the conflict was removed with a deleted memory"
+                )
+            })?;
+        let project_id = conflict.project_id.clone();
+        let store = self.store.clone();
+        let conflict_id = id.to_string();
+        let action = action.to_string();
+        let note = note
+            .map(str::trim)
+            .filter(|note| !note.is_empty())
+            .map(str::to_string);
+        let resolution = tokio::task::spawn_blocking(move || {
+            store.resolve_memory_conflict(&project_id, &conflict_id, &action, note.as_deref())
+        })
+        .await??;
+        for event in &resolution.events {
+            let _ = self.events.send(event.clone());
+        }
+        Ok(MemoryConflictResolveResult {
+            conflict: resolution.conflict,
+            memories: resolution.memories,
+        })
+    }
+
+    pub async fn memory_health(&self, project_id: &str) -> Result<MemoryHealthResult> {
+        self.ensure_project_exists(project_id).await?;
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        tokio::task::spawn_blocking(move || store.memory_health(&project)).await?
+    }
+
+    async fn ensure_project_exists(&self, project_id: &str) -> Result<()> {
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let exists = tokio::task::spawn_blocking(move || store.get_project(&project))
+            .await??
+            .is_some();
+        if !exists {
+            anyhow::bail!("project not found: {project_id}");
+        }
+        Ok(())
+    }
+
+    /// Daemon tick: detect conflicts for every project. Detection only; it
+    /// never resolves a conflict or changes a memory status.
+    pub async fn scan_all_memory_conflicts(&self) -> Result<(usize, usize, usize)> {
+        let projects = self.list_projects().await?;
+        let mut projects_scanned = 0usize;
+        let mut detected = 0usize;
+        let mut open = 0usize;
+        for project in projects {
+            match self.memory_conflict_scan(&project.id).await {
+                Ok(result) => {
+                    projects_scanned += 1;
+                    detected += result.detected as usize;
+                    open += result.open as usize;
+                    if result.detected > 0 {
+                        tracing::info!(
+                            project_id = %project.id,
+                            detected = result.detected,
+                            open = result.open,
+                            "memory conflict scan detected new same-scope conflicts"
+                        );
+                    } else {
+                        tracing::debug!(
+                            project_id = %project.id,
+                            detected = result.detected,
+                            open = result.open,
+                            "memory conflict scan complete"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, project_id = %project.id, "memory conflict scan failed");
+                }
+            }
+        }
+        Ok((projects_scanned, detected, open))
+    }
+
     /// Daemon tick: sweep only projects whose policy opted into `sweep_stale`.
     pub async fn sweep_memory_staleness(&self) -> Result<(usize, usize)> {
         let store = self.store.clone();
@@ -7992,6 +8135,7 @@ impl Engine {
             let artifacts = store.list_artifacts(&id)?;
             let usage = store.list_usage_entries(&id)?;
             let memories = store.list_session_memories(&id)?;
+            let memory_conflicts = store.list_session_memory_conflicts(&id)?;
             let questions = store.list_session_questions(&id)?;
             let tasks = store.list_plan_tasks(None, Some(&id))?;
             let steering = store.list_steering(&id, None, Some(2_000))?;
@@ -8012,6 +8156,7 @@ impl Engine {
                 artifacts,
                 usage,
                 memories,
+                memory_conflicts,
                 questions,
                 tasks,
                 steering,
@@ -8884,6 +9029,28 @@ impl Engine {
             ));
         }
 
+        let replay_conflicts = replay_memory_conflicts(&data.events)
+            .into_iter()
+            .filter_map(|conflict| {
+                Some((conflict.id.clone(), serde_json::to_value(conflict).ok()?))
+            })
+            .collect::<HashMap<_, _>>();
+        let projected_conflicts = data
+            .memory_conflicts
+            .iter()
+            .filter_map(|conflict| {
+                Some((conflict.id.clone(), serde_json::to_value(conflict).ok()?))
+            })
+            .collect::<HashMap<_, _>>();
+        let memory_conflicts_match = replay_conflicts == projected_conflicts;
+        if !memory_conflicts_match {
+            mismatches.push(format!(
+                "memory conflicts: projection={}, replay={}",
+                projected_conflicts.len(),
+                replay_conflicts.len()
+            ));
+        }
+
         let expected_approvals = Self::expected_approvals(data);
         let expected_approval_values = expected_approvals
             .iter()
@@ -9019,6 +9186,7 @@ impl Engine {
             && artifacts_matches
             && approvals_matches
             && memories_matches
+            && memory_conflicts_match
             && questions_matches
             && task_queue_matches
             && plan_matches
@@ -9046,6 +9214,7 @@ impl Engine {
             approvals_matches,
             ledger_matches,
             memories_matches,
+            memory_conflicts_match,
             questions_matches,
             task_queue_matches,
             notes_match,
@@ -9343,6 +9512,7 @@ impl Engine {
             artifacts,
             approvals: Some(Self::expected_approvals(data)),
             memories,
+            memory_conflicts: Some(replay_memory_conflicts(&data.events)),
             questions,
             tasks: Self::expected_tasks(data),
             steering: Some(replay_steering(&data.events)),
@@ -9632,6 +9802,7 @@ impl Engine {
             artifacts,
             usage,
             memories: data.memories,
+            memory_conflicts: data.memory_conflicts,
             questions: data.questions,
             tasks: data.tasks,
             steering: data.steering,
@@ -11853,6 +12024,43 @@ async fn ensure_session_not_active(store: &Store, session_id: &str, action: &str
 /// Prefer the latest total so both `record_agent_usage` and the legacy
 /// `record_cost` path replay identically; fall back to summing older usage
 /// events that predate `agent.cost`.
+/// Fold conflict lifecycle events last-write-wins by conflict id. A deleted
+/// memory also tombstones conflicts that reference it, matching the projection
+/// delete in `Store::delete_memories_with_events`.
+fn replay_memory_conflicts(events: &[Event]) -> Vec<MemoryConflict> {
+    let mut conflicts: HashMap<String, MemoryConflict> = HashMap::new();
+    for event in events {
+        match event.kind.as_str() {
+            "memory.conflict.detected" | "memory.conflict.resolved" => {
+                if let Ok(conflict) =
+                    serde_json::from_value::<MemoryConflict>(event.payload.clone())
+                {
+                    conflicts.insert(conflict.id.clone(), conflict);
+                }
+            }
+            "memory.deleted" => {
+                if let Ok(memory) = serde_json::from_value::<MemoryItem>(event.payload.clone()) {
+                    conflicts.retain(|_, conflict| {
+                        conflict.memory_a_id != memory.id && conflict.memory_b_id != memory.id
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut conflicts = conflicts.into_values().collect::<Vec<_>>();
+    conflicts.sort_by(|left, right| {
+        left.scope_kind
+            .cmp(&right.scope_kind)
+            .then_with(|| left.scope_value.cmp(&right.scope_value))
+            .then_with(|| left.memory_a_id.cmp(&right.memory_a_id))
+            .then_with(|| left.memory_b_id.cmp(&right.memory_b_id))
+            .then_with(|| right.detected_at.cmp(&left.detected_at))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    conflicts
+}
+
 fn replay_session_unlimited(events: &[Event]) -> bool {
     events
         .iter()

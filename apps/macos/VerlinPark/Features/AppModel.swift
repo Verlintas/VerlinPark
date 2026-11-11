@@ -198,6 +198,10 @@ final class AppModel {
     var memoryIncludeStale = false
     var memoryStats: MemoryStatsResult?
     var memoryStatsStatus: String?
+    var memoryConflicts: [MemoryConflict] = []
+    var memoryHealth: MemoryHealthResult?
+    var memoryConflictBusy = false
+    var memoryConflictStatus: String?
     var memoryActionBusyID: String?
     var memorySweepBusy = false
     var projectTokenBudgetText = ""
@@ -2491,6 +2495,8 @@ final class AppModel {
             memoryStatus = error.localizedDescription
         }
         await loadMemoryStats()
+        await loadMemoryHealth()
+        await loadMemoryConflicts()
     }
 
     func loadMemoryStats() async {
@@ -2505,6 +2511,84 @@ final class AppModel {
             memoryStatsStatus = nil
         } catch {
             memoryStatsStatus = error.localizedDescription
+        }
+    }
+
+    func loadMemoryHealth() async {
+        guard let projectID = selectedProjectID else {
+            memoryHealth = nil
+            return
+        }
+        do {
+            let health = try await core.memoryHealth(projectID: projectID)
+            guard projectID == selectedProjectID else { return }
+            memoryHealth = health
+        } catch {
+            memoryConflictStatus = error.localizedDescription
+        }
+    }
+
+    func loadMemoryConflicts() async {
+        guard let projectID = selectedProjectID else {
+            memoryConflicts = []
+            return
+        }
+        do {
+            let conflicts = try await core.memoryConflicts(
+                projectID: projectID,
+                status: nil,
+                limit: 100
+            )
+            guard projectID == selectedProjectID else { return }
+            memoryConflicts = conflicts
+        } catch {
+            memoryConflictStatus = error.localizedDescription
+        }
+    }
+
+    func scanMemoryConflicts() async {
+        guard let projectID = selectedProjectID else {
+            memoryConflictStatus = "Select a project before scanning."
+            return
+        }
+        memoryConflictBusy = true
+        defer { memoryConflictBusy = false }
+        do {
+            let result = try await core.scanMemoryConflicts(projectID: projectID)
+            guard projectID == selectedProjectID else { return }
+            if result.detected > 0 {
+                memoryConflictStatus =
+                    "Detected \(result.detected) new conflict(s); \(result.open) open total."
+            } else {
+                memoryConflictStatus =
+                    "No new same-scope conflicts. \(result.open) open total."
+            }
+            await loadMemoryHealth()
+            await loadMemoryConflicts()
+        } catch {
+            memoryConflictStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func resolveMemoryConflict(
+        _ conflict: MemoryConflict,
+        action: MemoryConflictResolution
+    ) async {
+        memoryConflictBusy = true
+        defer { memoryConflictBusy = false }
+        do {
+            let result = try await core.resolveMemoryConflict(
+                id: conflict.id,
+                action: action,
+                note: nil
+            )
+            memoryConflictStatus =
+                "Conflict resolved with \(action.title.lowercased()): \(result.conflict.status)."
+            await loadMemories()
+        } catch {
+            memoryConflictStatus = error.localizedDescription
+            handle(error)
         }
     }
 
@@ -6159,7 +6243,15 @@ final class AppModel {
             Task { await self.loadMailbox() }
         }
 
-        if event.type == "memory.created" {
+        if event.type.hasPrefix("memory.conflict.") {
+            Task {
+                await self.loadMemoryHealth()
+                await self.loadMemoryConflicts()
+            }
+        } else if event.type.hasPrefix("memory.") {
+            // Create, delete, prune, verify, stale, supersede, and pin all
+            // change the memory projection or health counters. Reloading the
+            // list also refreshes stats, health, and conflicts.
             Task { await self.loadMemories() }
         }
 

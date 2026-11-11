@@ -1521,6 +1521,113 @@ pub struct MemoryStatsResult {
     pub by_kind: Vec<MemoryStatCount>,
 }
 
+fn default_memory_conflict_status() -> String {
+    "open".to_string()
+}
+
+/// A deterministic, explainable review row for two active memories that cover
+/// the same path or task evidence but have different bodies. Detection never
+/// mutates memory; an explicit operator resolution does.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryConflict {
+    pub id: String,
+    pub project_id: String,
+    /// Session that owns the detection event (memory A's session).
+    pub session_id: String,
+    pub memory_a_id: String,
+    pub memory_b_id: String,
+    pub memory_a_title: String,
+    pub memory_b_title: String,
+    pub memory_a_kind: String,
+    pub memory_b_kind: String,
+    pub memory_a_excerpt: String,
+    pub memory_b_excerpt: String,
+    /// `path` or `task`.
+    pub scope_kind: String,
+    pub scope_value: String,
+    pub reason: String,
+    /// `open` or `resolved`.
+    #[serde(default = "default_memory_conflict_status")]
+    pub status: String,
+    pub detected_at: String,
+    #[serde(default)]
+    pub resolved_at: Option<String>,
+    /// `keep_a`, `keep_b`, `keep_both`, or `archive_both`.
+    #[serde(default)]
+    pub resolution: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryConflictsParams {
+    pub project_id: String,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryConflictsResult {
+    pub project_id: String,
+    pub conflicts: Vec<MemoryConflict>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryConflictScanParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryConflictScanResult {
+    pub project_id: String,
+    /// Number of conflicts inserted by this scan.
+    pub detected: u32,
+    /// Number of open conflicts after the scan.
+    pub open: u32,
+    pub conflicts: Vec<MemoryConflict>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryConflictResolveParams {
+    pub id: String,
+    /// `keep_a`, `keep_b`, `keep_both`, or `archive_both`.
+    pub action: String,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryConflictResolveResult {
+    pub conflict: MemoryConflict,
+    pub memories: Vec<MemoryItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryHealthParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryHealthResult {
+    pub project_id: String,
+    pub total: u32,
+    pub active: u32,
+    pub stale: u32,
+    pub superseded: u32,
+    pub archived: u32,
+    pub pinned: u32,
+    /// Active rows with at least one evidence entry.
+    pub evidence_covered: u32,
+    /// Rows with a recorded `last_verified_at`.
+    pub verified: u32,
+    /// Active, non-pinned rows whose `verify_after` is in the past.
+    pub verification_due: u32,
+    pub open_conflicts: u32,
+    pub by_kind: Vec<MemoryStatCount>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct MemoryCreateParams {
     pub session_id: String,
@@ -3537,6 +3644,9 @@ pub struct SessionBundle {
     pub usage: Vec<UsageEntry>,
     #[serde(default)]
     pub memories: Vec<MemoryItem>,
+    /// Deterministic memory conflicts owned by this session's event stream.
+    #[serde(default)]
+    pub memory_conflicts: Vec<MemoryConflict>,
     #[serde(default)]
     pub questions: Vec<Question>,
     /// Persistent task-DAG rows. Older bundles decode as an empty queue.
@@ -3575,6 +3685,8 @@ pub struct SessionReplayReport {
     pub ledger_matches: bool,
     #[serde(default)]
     pub memories_matches: bool,
+    #[serde(default)]
+    pub memory_conflicts_match: bool,
     #[serde(default)]
     pub questions_matches: bool,
     #[serde(default)]
@@ -4787,6 +4899,102 @@ mod tests {
             serde_json::from_value(json!({"project_id": "prj-1"})).unwrap();
         assert!(params.status.is_none());
         assert!(!params.include_stale);
+    }
+
+    #[test]
+    fn memory_conflict_and_health_round_trip_with_defaults() {
+        let conflict: MemoryConflict = serde_json::from_value(json!({
+            "id": "conflict-1",
+            "project_id": "prj-1",
+            "session_id": "ses-1",
+            "memory_a_id": "mem-a",
+            "memory_b_id": "mem-b",
+            "memory_a_title": "Tabs",
+            "memory_b_title": "Spaces",
+            "memory_a_kind": "decision",
+            "memory_b_kind": "fact",
+            "memory_a_excerpt": "Use tabs.",
+            "memory_b_excerpt": "Use spaces.",
+            "scope_kind": "path",
+            "scope_value": "src/lib.rs",
+            "reason": "Both active memories cite path src/lib.rs and have different bodies.",
+            "detected_at": "2026-11-11T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(conflict.status, "open");
+        assert!(conflict.resolved_at.is_none());
+        assert!(conflict.resolution.is_none());
+        assert!(conflict.note.is_none());
+        let encoded = serde_json::to_value(&conflict).unwrap();
+        let decoded: MemoryConflict = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, conflict);
+
+        let health = MemoryHealthResult {
+            project_id: "prj-1".to_string(),
+            total: 10,
+            active: 6,
+            stale: 2,
+            superseded: 1,
+            archived: 1,
+            pinned: 2,
+            evidence_covered: 4,
+            verified: 3,
+            verification_due: 1,
+            open_conflicts: 2,
+            by_kind: vec![MemoryStatCount {
+                key: "fact".to_string(),
+                count: 4,
+            }],
+        };
+        let encoded = serde_json::to_value(&health).unwrap();
+        let decoded: MemoryHealthResult = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, health);
+
+        let params: MemoryConflictsParams =
+            serde_json::from_value(json!({"project_id": "prj-1"})).unwrap();
+        assert!(params.status.is_none());
+        assert!(params.limit.is_none());
+        let resolve: MemoryConflictResolveParams =
+            serde_json::from_value(json!({"id": "c1", "action": "keep_a"})).unwrap();
+        assert!(resolve.note.is_none());
+
+        // Older bundles have no memory_conflicts field.
+        let bundle_json = json!({
+            "version": 1,
+            "exported_at": "2026-11-11T00:00:00Z",
+            "project": {
+                "id": "prj-1",
+                "name": "Demo",
+                "root": "/tmp/demo",
+                "default_branch": "main",
+                "created_at": "2026-11-11T00:00:00Z"
+            },
+            "session": {
+                "id": "ses-1",
+                "project_id": "prj-1",
+                "goal": "demo",
+                "status": "imported",
+                "priority": 0,
+                "worktree": null,
+                "branch": null,
+                "token_budget": null,
+                "cost_budget_usd": null,
+                "time_budget_secs": null,
+                "unlimited": false,
+                "cost_spent_usd": 0.0,
+                "base_commit": null,
+                "tokens_in": 0,
+                "tokens_out": 0,
+                "created_at": "2026-11-11T00:00:00Z"
+            },
+            "events": [],
+            "agents": [],
+            "messages": [],
+            "todos": [],
+            "merge_queue": []
+        });
+        let bundle: SessionBundle = serde_json::from_value(bundle_json).unwrap();
+        assert!(bundle.memory_conflicts.is_empty());
     }
 
     #[test]

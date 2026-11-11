@@ -3565,3 +3565,578 @@ fn memory_list_hides_stale_by_default_and_stats_count_lifecycle() {
     assert!(!future.id.is_empty());
     assert!(pinned.pinned);
 }
+
+fn create_conflict_memory(
+    store: &Store,
+    project_id: &str,
+    session_id: &str,
+    kind: &str,
+    title: &str,
+    body: &str,
+    evidence: Vec<MemoryEvidence>,
+) -> MemoryItem {
+    store
+        .create_memory_with_metadata_event(NewMemory {
+            session_id,
+            project_id,
+            agent_id: "agent-1",
+            agent_name: "Leader",
+            kind,
+            title,
+            body,
+            tags: &[],
+            source: "operator",
+            evidence: &evidence,
+            pinned: false,
+            verify_after: None,
+            dedupe: false,
+            auto_supersede: false,
+        })
+        .unwrap()
+        .memory
+}
+
+#[test]
+fn detects_shared_path_conflicts_for_distinct_bodies_only() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("memory conflicts"))
+        .unwrap();
+    let session = store.create_session(&project.id, "conflicts").unwrap();
+    let path = || vec![memory_evidence("path", "src/lib.rs")];
+    let first = create_conflict_memory(
+        &store,
+        &project.id,
+        &session.id,
+        "decision",
+        "Use tabs",
+        "Indent with tabs.",
+        path(),
+    );
+    let second = create_conflict_memory(
+        &store,
+        &project.id,
+        &session.id,
+        "convention",
+        "Use spaces",
+        "Indent with four spaces.",
+        path(),
+    );
+    // Same normalized body is not a conflict even with shared scope.
+    let same = create_conflict_memory(
+        &store,
+        &project.id,
+        &session.id,
+        "fact",
+        "Tabs again",
+        "  INDENT   WITH TABS. ",
+        vec![memory_evidence("path", "src/same.rs")],
+    );
+    let same_copy = create_conflict_memory(
+        &store,
+        &project.id,
+        &session.id,
+        "fact",
+        "Tabs same body",
+        "Indent with tabs.",
+        vec![memory_evidence("path", "src/same.rs")],
+    );
+
+    let scan = store.scan_memory_conflicts(&project.id).unwrap();
+    assert_eq!(scan.new.len(), 1);
+    assert_eq!(scan.open.len(), 1);
+    assert_eq!(scan.events.len(), 1);
+    let conflict = &scan.new[0];
+    assert_eq!(conflict.scope_kind, "path");
+    assert_eq!(conflict.scope_value, "src/lib.rs");
+    assert_eq!(conflict.status, "open");
+    assert_eq!(conflict.session_id, session.id);
+    assert_eq!(conflict.memory_a_id, first.id);
+    assert_eq!(conflict.memory_b_id, second.id);
+    assert_eq!(conflict.memory_a_title, "Use tabs");
+    assert_eq!(conflict.memory_b_title, "Use spaces");
+    assert_eq!(conflict.memory_a_kind, "decision");
+    assert_eq!(conflict.memory_b_kind, "convention");
+    assert!(conflict.reason.contains("src/lib.rs"));
+    assert!(conflict.memory_a_excerpt.contains("tabs"));
+    assert_eq!(conflict.id.len(), 32);
+    assert!(
+        conflict
+            .id
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    );
+    assert_eq!(
+        conflict.id,
+        memory_conflict_id(&project.id, "path", "src/lib.rs", &first, &second)
+    );
+    assert!(!conflict.memory_a_id.is_empty());
+    assert!(same.id != same_copy.id);
+
+    // Duplicate scans never duplicate rows or events.
+    let again = store.scan_memory_conflicts(&project.id).unwrap();
+    assert!(again.new.is_empty());
+    assert!(again.events.is_empty());
+    assert_eq!(again.open.len(), 1);
+    let all = store
+        .list_memory_conflicts(&project.id, None, None)
+        .unwrap();
+    assert_eq!(all.len(), 1);
+    let events = store.list_all_events(&session.id).unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "memory.conflict.detected")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn ignores_inactive_memories_and_detects_shared_task_conflicts() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("memory conflicts"))
+        .unwrap();
+    let session = store.create_session(&project.id, "conflicts").unwrap();
+    let task = || vec![memory_evidence("task", "T9")];
+    let stale = create_conflict_memory(
+        &store,
+        &project.id,
+        &session.id,
+        "decision",
+        "Stale decision",
+        "Old answer.",
+        task(),
+    );
+    let superseded = create_conflict_memory(
+        &store,
+        &project.id,
+        &session.id,
+        "convention",
+        "Superseded convention",
+        "Older answer.",
+        task(),
+    );
+    let archived = create_conflict_memory(
+        &store,
+        &project.id,
+        &session.id,
+        "fact",
+        "Archived fact",
+        "Archived answer.",
+        task(),
+    );
+    store
+        .update_memory_with_event(&stale.id, Some("stale"), None, None)
+        .unwrap();
+    store
+        .update_memory_with_event(&superseded.id, Some("superseded"), None, None)
+        .unwrap();
+    store
+        .update_memory_with_event(&archived.id, Some("archived"), None, None)
+        .unwrap();
+    let _ = create_conflict_memory(
+        &store,
+        &project.id,
+        &session.id,
+        "decision",
+        "Decision on task",
+        "Decisions do not join task conflicts.",
+        task(),
+    );
+
+    let verification = create_conflict_memory(
+        &store,
+        &project.id,
+        &session.id,
+        "verification",
+        "Verification passed",
+        "The verifier approved the change.",
+        task(),
+    );
+    let result = create_conflict_memory(
+        &store,
+        &project.id,
+        &session.id,
+        "task_result",
+        "Task result differs",
+        "The worker reported a different outcome.",
+        task(),
+    );
+    let scan = store.scan_memory_conflicts(&project.id).unwrap();
+    assert_eq!(scan.new.len(), 1);
+    let conflict = &scan.new[0];
+    assert_eq!(conflict.scope_kind, "task");
+    assert_eq!(conflict.scope_value, "T9");
+    assert_eq!(conflict.memory_a_id, verification.id);
+    assert_eq!(conflict.memory_b_id, result.id);
+    assert!(conflict.reason.contains("task T9"));
+    assert!(conflict.memory_a_excerpt.contains("verifier"));
+}
+
+#[test]
+fn memory_conflict_ids_and_ordering_are_deterministic() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("memory conflicts"))
+        .unwrap();
+    let session = store.create_session(&project.id, "conflicts").unwrap();
+    for (title, body, reference) in [
+        ("Zeta", "Zeta body.", "z/path.rs"),
+        ("Omega", "Omega body.", "z/path.rs"),
+        ("Alpha", "Alpha body.", "a/path.rs"),
+        ("Beta", "Beta body.", "a/path.rs"),
+    ] {
+        create_conflict_memory(
+            &store,
+            &project.id,
+            &session.id,
+            "fact",
+            title,
+            body,
+            vec![memory_evidence("path", reference)],
+        );
+    }
+    let scan = store.scan_memory_conflicts(&project.id).unwrap();
+    assert_eq!(scan.new.len(), 2);
+    assert_eq!(scan.new[0].scope_value, "a/path.rs");
+    assert_eq!(scan.new[1].scope_value, "z/path.rs");
+    let first_ids = scan
+        .new
+        .iter()
+        .map(|conflict| conflict.id.clone())
+        .collect::<Vec<_>>();
+    let again = store.scan_memory_conflicts(&project.id).unwrap();
+    assert!(again.new.is_empty());
+    let all = store
+        .list_memory_conflicts(&project.id, Some("open"), None)
+        .unwrap();
+    assert_eq!(
+        all.iter()
+            .map(|conflict| conflict.id.clone())
+            .collect::<Vec<_>>(),
+        first_ids
+    );
+    // Content participates in the id: changing either body creates a new
+    // review row instead of silently reopening the resolved one.
+    let mut changed = store.get_memory(&scan.new[0].memory_b_id).unwrap().unwrap();
+    changed.body = "A materially different body.".to_string();
+    let changed_id = memory_conflict_id(
+        &project.id,
+        "path",
+        "a/path.rs",
+        &store.get_memory(&scan.new[0].memory_a_id).unwrap().unwrap(),
+        &changed,
+    );
+    assert_ne!(changed_id, scan.new[0].id);
+}
+
+#[test]
+fn resolves_memory_conflicts_with_explicit_actions_atomically() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("memory conflicts"))
+        .unwrap();
+    let other_repo = TempDir::new().unwrap();
+    let other_project = store
+        .add_project(other_repo.path().to_str().unwrap(), Some("other"))
+        .unwrap();
+    let session = store.create_session(&project.id, "conflicts").unwrap();
+    let pair = |reference: &str, left: &str, right: &str| {
+        let evidence = vec![memory_evidence("path", reference)];
+        let a = create_conflict_memory(
+            &store,
+            &project.id,
+            &session.id,
+            "fact",
+            &format!("{reference} A"),
+            left,
+            evidence.clone(),
+        );
+        let b = create_conflict_memory(
+            &store,
+            &project.id,
+            &session.id,
+            "fact",
+            &format!("{reference} B"),
+            right,
+            evidence,
+        );
+        (a, b)
+    };
+    pair("src/keep-a.rs", "Keep A answer.", "Lose B answer.");
+    pair("src/keep-b.rs", "Lose A answer.", "Keep B answer.");
+    pair("src/both.rs", "Both A answer.", "Both B answer.");
+    pair("src/archive.rs", "Archive A answer.", "Archive B answer.");
+    let scan = store.scan_memory_conflicts(&project.id).unwrap();
+    assert_eq!(scan.new.len(), 4);
+    let find = |scope: &str| {
+        scan.new
+            .iter()
+            .find(|conflict| conflict.scope_value == scope)
+            .unwrap()
+            .clone()
+    };
+
+    let keep_a = find("src/keep-a.rs");
+    let resolution = store
+        .resolve_memory_conflict(&project.id, &keep_a.id, "keep_a", Some("A wins"))
+        .unwrap();
+    assert_eq!(resolution.conflict.status, "resolved");
+    assert_eq!(resolution.conflict.resolution.as_deref(), Some("keep_a"));
+    assert_eq!(resolution.conflict.note.as_deref(), Some("A wins"));
+    assert!(resolution.conflict.resolved_at.is_some());
+    assert_eq!(resolution.memories.len(), 2);
+    assert_eq!(
+        store
+            .get_memory(&keep_a.memory_a_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        "active"
+    );
+    let superseded = store.get_memory(&keep_a.memory_b_id).unwrap().unwrap();
+    assert_eq!(superseded.status, "superseded");
+    assert_eq!(
+        superseded.superseded_by.as_deref(),
+        Some(keep_a.memory_a_id.as_str())
+    );
+    assert!(
+        resolution
+            .events
+            .iter()
+            .any(|event| event.kind == "memory.superseded")
+    );
+    assert!(
+        resolution
+            .events
+            .iter()
+            .any(|event| event.kind == "memory.conflict.resolved")
+    );
+
+    let keep_b = find("src/keep-b.rs");
+    let resolution = store
+        .resolve_memory_conflict(&project.id, &keep_b.id, "keep_b", None)
+        .unwrap();
+    assert_eq!(
+        store
+            .get_memory(&keep_b.memory_a_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        "superseded"
+    );
+    assert_eq!(
+        store
+            .get_memory(&keep_b.memory_b_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        "active"
+    );
+    assert_eq!(resolution.conflict.resolution.as_deref(), Some("keep_b"));
+
+    let both = find("src/both.rs");
+    let resolution = store
+        .resolve_memory_conflict(&project.id, &both.id, "keep_both", None)
+        .unwrap();
+    assert_eq!(
+        store.get_memory(&both.memory_a_id).unwrap().unwrap().status,
+        "active"
+    );
+    assert_eq!(
+        store.get_memory(&both.memory_b_id).unwrap().unwrap().status,
+        "active"
+    );
+    assert!(
+        !resolution
+            .events
+            .iter()
+            .any(|event| event.kind == "memory.superseded")
+    );
+    assert_eq!(resolution.events.len(), 1);
+
+    let archive = find("src/archive.rs");
+    let resolution = store
+        .resolve_memory_conflict(&project.id, &archive.id, "archive_both", None)
+        .unwrap();
+    assert_eq!(
+        store
+            .get_memory(&archive.memory_a_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        "archived"
+    );
+    assert_eq!(
+        store
+            .get_memory(&archive.memory_b_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        "archived"
+    );
+    assert_eq!(
+        resolution
+            .events
+            .iter()
+            .filter(|event| event.kind == "memory.updated")
+            .count(),
+        2
+    );
+
+    // Resolving twice fails; cross-project ids fail; invalid actions fail.
+    assert!(
+        store
+            .resolve_memory_conflict(&project.id, &keep_a.id, "keep_a", None)
+            .is_err()
+    );
+    assert!(
+        store
+            .resolve_memory_conflict(&other_project.id, &keep_b.id, "keep_a", None)
+            .is_err()
+    );
+    assert!(
+        store
+            .resolve_memory_conflict(&project.id, &both.id, "invented", None)
+            .is_err()
+    );
+
+    // A deleted memory tombstones its conflicts; resolution cannot resurrect it.
+    let deleted = find("src/both.rs");
+    store
+        .delete_memories_with_events(std::slice::from_ref(&deleted.memory_a_id))
+        .unwrap();
+    let error = store
+        .resolve_memory_conflict(&project.id, &deleted.id, "keep_b", None)
+        .unwrap_err();
+    assert!(error.to_string().contains("no longer exists"));
+    assert!(
+        store
+            .list_memory_conflicts(&project.id, Some("resolved"), None)
+            .unwrap()
+            .iter()
+            .all(|conflict| conflict.id != deleted.id)
+    );
+}
+
+#[test]
+fn memory_health_counts_lifecycle_evidence_and_verification_due() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("memory health"))
+        .unwrap();
+    let session = store.create_session(&project.id, "health").unwrap();
+    let active = create_conflict_memory(
+        &store,
+        &project.id,
+        &session.id,
+        "fact",
+        "Active evidenced",
+        "Active body.",
+        vec![memory_evidence("path", "src/health.rs")],
+    );
+    let due = create_conflict_memory(
+        &store,
+        &project.id,
+        &session.id,
+        "fact",
+        "Active due",
+        "Due body.",
+        vec![memory_evidence("path", "src/due.rs")],
+    );
+    let pinned = create_conflict_memory(
+        &store,
+        &project.id,
+        &session.id,
+        "decision",
+        "Pinned due",
+        "Pinned body.",
+        Vec::new(),
+    );
+    let stale = create_conflict_memory(
+        &store,
+        &project.id,
+        &session.id,
+        "convention",
+        "Stale row",
+        "Stale body.",
+        Vec::new(),
+    );
+    let superseded = create_conflict_memory(
+        &store,
+        &project.id,
+        &session.id,
+        "task_result",
+        "Superseded row",
+        "Superseded body.",
+        Vec::new(),
+    );
+    let archived = create_conflict_memory(
+        &store,
+        &project.id,
+        &session.id,
+        "verification",
+        "Archived row",
+        "Archived body.",
+        Vec::new(),
+    );
+    // Expired TTLs and explicit verifies use the normal event-backed paths.
+    store
+        .mark_memory_verified_with_event(
+            &due.id,
+            "2026-01-01T00:00:00Z",
+            Some("2026-02-01T00:00:00Z"),
+        )
+        .unwrap();
+    store
+        .mark_memory_verified_with_event(
+            &pinned.id,
+            "2026-01-01T00:00:00Z",
+            Some("2026-02-01T00:00:00Z"),
+        )
+        .unwrap();
+    store
+        .update_memory_with_event(&pinned.id, None, Some(true), None)
+        .unwrap();
+    store
+        .mark_memory_stale_with_event(&stale.id, "verification expired")
+        .unwrap();
+    store
+        .update_memory_with_event(&superseded.id, Some("superseded"), None, None)
+        .unwrap();
+    store
+        .update_memory_with_event(&archived.id, Some("archived"), None, None)
+        .unwrap();
+    create_conflict_memory(
+        &store,
+        &project.id,
+        &session.id,
+        "fact",
+        "Another active same scope",
+        "Different body.",
+        vec![memory_evidence("path", "src/health.rs")],
+    );
+    let scan = store.scan_memory_conflicts(&project.id).unwrap();
+    assert_eq!(scan.open.len(), 1);
+
+    let health = store.memory_health(&project.id).unwrap();
+    assert_eq!(health.total, 7);
+    assert_eq!(health.active, 4);
+    assert_eq!(health.stale, 1);
+    assert_eq!(health.superseded, 1);
+    assert_eq!(health.archived, 1);
+    assert_eq!(health.pinned, 1);
+    assert_eq!(health.evidence_covered, 3);
+    assert_eq!(health.verified, 2);
+    assert_eq!(health.verification_due, 1);
+    assert_eq!(health.open_conflicts, 1);
+    assert!(
+        health
+            .by_kind
+            .iter()
+            .any(|count| count.key == "fact" && count.count == 3)
+    );
+    assert!(!active.id.is_empty());
+}

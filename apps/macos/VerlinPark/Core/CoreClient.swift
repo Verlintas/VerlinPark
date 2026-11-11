@@ -2151,6 +2151,51 @@ actor CoreClient {
         .decode(MemoryStatsResult.self)
     }
 
+    func memoryConflicts(
+        projectID: String,
+        status: String?,
+        limit: Int
+    ) async throws -> [MemoryConflict] {
+        let params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "status": status.map(JSONValue.string) ?? .null,
+            "limit": .number(Double(limit)),
+        ]
+        return try await request(method: "memory.conflicts", params: params)
+            .decode(MemoryConflictsResult.self)
+            .conflicts
+    }
+
+    func scanMemoryConflicts(projectID: String) async throws -> MemoryConflictScanResult {
+        try await request(
+            method: "memory.conflict.scan",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(MemoryConflictScanResult.self)
+    }
+
+    func resolveMemoryConflict(
+        id: String,
+        action: MemoryConflictResolution,
+        note: String?
+    ) async throws -> MemoryConflictResolveResult {
+        let params: [String: JSONValue] = [
+            "id": .string(id),
+            "action": .string(action.rawValue),
+            "note": note.map(JSONValue.string) ?? .null,
+        ]
+        return try await request(method: "memory.conflict.resolve", params: params)
+            .decode(MemoryConflictResolveResult.self)
+    }
+
+    func memoryHealth(projectID: String) async throws -> MemoryHealthResult {
+        try await request(
+            method: "memory.health",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(MemoryHealthResult.self)
+    }
+
     func createMemory(
         sessionID: String,
         kind: String,

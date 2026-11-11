@@ -8138,3 +8138,150 @@ async fn memory_projection_folds_lifecycle_events_repairs_and_bundles() {
     let repaired_memories = engine.store().list_session_memories(&session.id).unwrap();
     assert_eq!(repaired_memories.len(), 2);
 }
+
+#[tokio::test]
+async fn memory_conflicts_scan_broadcast_resolve_health_and_bundle() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("memory conflicts".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "conflicts".into(), None)
+        .await
+        .unwrap();
+    let path_evidence = vec![MemoryEvidence {
+        kind: "path".to_string(),
+        reference: "README.md".to_string(),
+        note: None,
+    }];
+    let first = engine
+        .create_memory_with_metadata(
+            &session.id,
+            "agent-1",
+            "Leader",
+            "decision",
+            "README says hello",
+            "The README is a greeting.",
+            Vec::new(),
+            "operator",
+            path_evidence.clone(),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+    let second = engine
+        .create_memory_with_metadata(
+            &session.id,
+            "agent-1",
+            "Leader",
+            "convention",
+            "README says goodbye",
+            "The README is a farewell.",
+            Vec::new(),
+            "operator",
+            path_evidence,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mut receiver = engine.subscribe();
+    while receiver.try_recv().is_ok() {}
+    let scan = engine.memory_conflict_scan(&project.id).await.unwrap();
+    assert_eq!(scan.detected, 1);
+    assert_eq!(scan.open, 1);
+    assert_eq!(scan.conflicts.len(), 1);
+    let conflict_id = scan.conflicts[0].id.clone();
+    let event = receiver.recv().await.unwrap();
+    assert_eq!(event.kind, "memory.conflict.detected");
+    assert_eq!(event.payload["id"], conflict_id.clone());
+    assert_eq!(event.payload["memory_a_id"], first.id.clone());
+    assert_eq!(event.payload["memory_b_id"], second.id.clone());
+
+    // Daemon tick shape: every project is scanned, already-known ids are not
+    // recreated, and the open count is reported without resolving anything.
+    let (projects, detected, open) = engine.scan_all_memory_conflicts().await.unwrap();
+    assert_eq!(projects, 1);
+    assert_eq!(detected, 0);
+    assert_eq!(open, 1);
+
+    let listed = engine
+        .memory_conflicts(&project.id, Some("open"), Some(10))
+        .await
+        .unwrap();
+    assert_eq!(listed.conflicts.len(), 1);
+    let health = engine.memory_health(&project.id).await.unwrap();
+    assert_eq!(health.active, 2);
+    assert_eq!(health.open_conflicts, 1);
+    assert_eq!(health.evidence_covered, 2);
+
+    let resolution = engine
+        .memory_conflict_resolve(&conflict_id, "keep_a", Some("greeting wins"))
+        .await
+        .unwrap();
+    assert_eq!(resolution.conflict.status, "resolved");
+    assert_eq!(
+        resolution
+            .memories
+            .iter()
+            .find(|memory| memory.id == second.id)
+            .unwrap()
+            .status,
+        "superseded"
+    );
+    let event = receiver.recv().await.unwrap();
+    assert_eq!(event.kind, "memory.superseded");
+    let event = receiver.recv().await.unwrap();
+    assert_eq!(event.kind, "memory.conflict.resolved");
+    assert!(
+        engine
+            .memory_conflict_resolve(&conflict_id, "keep_a", None)
+            .await
+            .is_err()
+    );
+    assert!(
+        engine
+            .memory_conflict_resolve(&conflict_id, "invalid", None)
+            .await
+            .is_err()
+    );
+
+    let replay = engine.replay_session(&session.id).await.unwrap();
+    assert!(replay.memory_conflicts_match, "{:?}", replay.mismatches);
+    assert!(replay.consistent, "{:?}", replay.mismatches);
+    let bundle = engine.export_session(&session.id).await.unwrap();
+    assert_eq!(bundle.memory_conflicts.len(), 1);
+    assert_eq!(bundle.memory_conflicts[0].status, "resolved");
+
+    let imported_dir = TempDir::new().unwrap();
+    let imported = Store::open(imported_dir.path()).unwrap();
+    imported.import_session_bundle(&bundle).unwrap();
+    let imported_conflicts = imported.list_session_memory_conflicts(&session.id).unwrap();
+    assert_eq!(imported_conflicts, bundle.memory_conflicts);
+
+    engine
+        .store()
+        .replace_session_memory_conflicts(&session.id, &[])
+        .unwrap();
+    let drifted = engine.replay_session(&session.id).await.unwrap();
+    assert!(!drifted.memory_conflicts_match);
+    let repaired = engine.repair_session(&session.id).await.unwrap();
+    assert!(repaired.consistent);
+    assert_eq!(
+        engine
+            .store()
+            .list_session_memory_conflicts(&session.id)
+            .unwrap()
+            .len(),
+        1
+    );
+}

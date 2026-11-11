@@ -970,6 +970,27 @@ enum Command {
     },
     /// Show memory counts by status, source, and kind.
     MemoryStats { project: String },
+    /// List deterministic same-scope memory conflicts.
+    MemoryConflicts {
+        project: String,
+        /// Filter by exact status (open or resolved).
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+    /// Detect new same-scope memory conflicts. Never changes memory.
+    MemoryConflictScan { project: String },
+    /// Resolve one memory conflict explicitly.
+    MemoryConflictResolve {
+        id: String,
+        #[arg(long, value_parser = ["keep-a", "keep-b", "keep-both", "archive-both"])]
+        action: String,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Show memory health metrics for a project.
+    MemoryHealth { project: String },
     /// Add a project memory tied to a session.
     Remember {
         session: String,
@@ -3070,6 +3091,38 @@ async fn main() -> Result<()> {
         Command::MemoryStats { project } => {
             rpc(&discovery, "memory.stats", json!({"project_id": project})).await?
         }
+        Command::MemoryConflicts {
+            project,
+            status,
+            limit,
+        } => {
+            rpc(
+                &discovery,
+                "memory.conflicts",
+                json!({"project_id": project, "status": status, "limit": limit}),
+            )
+            .await?
+        }
+        Command::MemoryConflictScan { project } => {
+            rpc(
+                &discovery,
+                "memory.conflict.scan",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::MemoryConflictResolve { id, action, note } => {
+            let action = action.replace('-', "_");
+            rpc(
+                &discovery,
+                "memory.conflict.resolve",
+                json!({"id": id, "action": action, "note": note}),
+            )
+            .await?
+        }
+        Command::MemoryHealth { project } => {
+            rpc(&discovery, "memory.health", json!({"project_id": project})).await?
+        }
         Command::MemoryPrune {
             project,
             days,
@@ -4772,6 +4825,102 @@ fn print_human(value: &Value) {
             memory["last_verified_at"].as_str().unwrap_or("never"),
             memory["stale_reason"].as_str().unwrap_or("none")
         );
+        return;
+    }
+    if let Some(conflicts) = value.get("conflicts").and_then(Value::as_array) {
+        if let Some(detected) = value.get("detected").and_then(Value::as_u64) {
+            println!(
+                "memory conflict scan: detected={} open={}",
+                detected,
+                value["open"].as_u64().unwrap_or(0)
+            );
+        }
+        if conflicts.is_empty() {
+            println!("no memory conflicts");
+        }
+        for conflict in conflicts {
+            println!(
+                "[{}·{}] {} · {} · {}",
+                conflict["memory_a_kind"].as_str().unwrap_or("?"),
+                conflict["memory_b_kind"].as_str().unwrap_or("?"),
+                conflict["memory_a_title"].as_str().unwrap_or("?"),
+                conflict["memory_b_title"].as_str().unwrap_or("?"),
+                conflict["status"].as_str().unwrap_or("open")
+            );
+            println!(
+                "  {} {} · id {}",
+                conflict["scope_kind"].as_str().unwrap_or("?"),
+                conflict["scope_value"].as_str().unwrap_or("?"),
+                conflict["id"].as_str().unwrap_or("?")
+            );
+            println!("  {}", conflict["reason"].as_str().unwrap_or(""));
+            for side in ["a", "b"] {
+                let key = format!("memory_{side}_excerpt");
+                if let Some(excerpt) = conflict[&key].as_str()
+                    && !excerpt.is_empty()
+                {
+                    println!("  {}: {}", side.to_uppercase(), excerpt);
+                }
+            }
+        }
+        return;
+    }
+    if let Some(conflict) = value.get("conflict") {
+        println!(
+            "memory conflict {} resolved={} action={} at={}",
+            conflict["id"].as_str().unwrap_or("?"),
+            conflict["status"].as_str().unwrap_or("?"),
+            conflict["resolution"].as_str().unwrap_or("?"),
+            conflict["resolved_at"].as_str().unwrap_or("?")
+        );
+        if let Some(note) = conflict["note"].as_str() {
+            println!("  note: {note}");
+        }
+        if let Some(memories) = value.get("memories").and_then(Value::as_array) {
+            for memory in memories {
+                println!(
+                    "  [{}·{}] {} · {} · {}",
+                    memory["kind"].as_str().unwrap_or("?"),
+                    memory["source"].as_str().unwrap_or("agent"),
+                    memory["title"].as_str().unwrap_or("?"),
+                    memory["status"].as_str().unwrap_or("active"),
+                    memory["id"].as_str().unwrap_or("?")
+                );
+            }
+        }
+        return;
+    }
+    if value.get("verification_due").is_some() && value.get("evidence_covered").is_some() {
+        println!(
+            "memory health: total={} active={} stale={} superseded={} archived={} pinned={}",
+            value["total"].as_u64().unwrap_or(0),
+            value["active"].as_u64().unwrap_or(0),
+            value["stale"].as_u64().unwrap_or(0),
+            value["superseded"].as_u64().unwrap_or(0),
+            value["archived"].as_u64().unwrap_or(0),
+            value["pinned"].as_u64().unwrap_or(0)
+        );
+        println!(
+            "  evidence_covered={} verified={} verification_due={} open_conflicts={}",
+            value["evidence_covered"].as_u64().unwrap_or(0),
+            value["verified"].as_u64().unwrap_or(0),
+            value["verification_due"].as_u64().unwrap_or(0),
+            value["open_conflicts"].as_u64().unwrap_or(0)
+        );
+        if let Some(kinds) = value.get("by_kind").and_then(Value::as_array) {
+            let counts = kinds
+                .iter()
+                .map(|count| {
+                    format!(
+                        "{}={}",
+                        count["key"].as_str().unwrap_or("?"),
+                        count["count"].as_u64().unwrap_or(0)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!("  by_kind: {counts}");
+        }
         return;
     }
     if value.get("by_status").and_then(Value::as_array).is_some() && value.get("total").is_some() {

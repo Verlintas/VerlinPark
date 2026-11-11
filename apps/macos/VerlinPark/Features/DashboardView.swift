@@ -429,6 +429,7 @@ struct DashboardView: View {
         case .storage:
             if let project = model.selectedProject {
                 MemoryCard(project: project)
+                MemoryHealthCard(project: project)
                 MemoryPolicyCard(project: project)
                 ArtifactPolicyCard(project: project)
                 MailboxPolicyCard(project: project)

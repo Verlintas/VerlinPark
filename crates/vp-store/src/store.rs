@@ -13,13 +13,14 @@ use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
     AcpAgent, AgentMessage, AgentRecord, Approval, ApprovalGrant, Artifact, ArtifactPolicy,
     ArtifactVersion, CheckpointRetentionPolicy, ContinuationOutcome, Event, IntakeTask,
-    IntegrationPolicy, MailboxPolicy, McpServer, McpServerConfig, McpTransport, MemoryEvidence,
-    MemoryItem, MemoryPolicy, MemoryStatCount, MergeQueueEntry, ModelPreset, OrchestrationDecision,
-    OrchestrationNote, OrchestrationPolicy, OrchestrationRecovery, PlanTaskProgress, Project,
-    ProjectBudget, ProjectUsageSession, Question, ScheduledTask, SearchHit, Session, SessionBundle,
-    SessionContinuation, ShellPolicy, Skill, Source, SourceChunk, SourceCollection,
-    SourceSearchHit, SourceStats, SteeringMessage, StoredMessage, TaskSchedulerPolicy, TaskStall,
-    TeamPlan, TodoItem, UsageEntry, WorktreeRetentionPolicy, WriteLease,
+    IntegrationPolicy, MailboxPolicy, McpServer, McpServerConfig, McpTransport, MemoryConflict,
+    MemoryEvidence, MemoryHealthResult, MemoryItem, MemoryPolicy, MemoryStatCount, MergeQueueEntry,
+    ModelPreset, OrchestrationDecision, OrchestrationNote, OrchestrationPolicy,
+    OrchestrationRecovery, PlanTaskProgress, Project, ProjectBudget, ProjectUsageSession, Question,
+    ScheduledTask, SearchHit, Session, SessionBundle, SessionContinuation, ShellPolicy, Skill,
+    Source, SourceChunk, SourceCollection, SourceSearchHit, SourceStats, SteeringMessage,
+    StoredMessage, TaskSchedulerPolicy, TaskStall, TeamPlan, TodoItem, UsageEntry,
+    WorktreeRetentionPolicy, WriteLease,
 };
 
 use crate::paths;
@@ -258,6 +259,7 @@ pub struct SessionRepair {
     pub artifacts: Option<Vec<Artifact>>,
     pub approvals: Option<Vec<Approval>>,
     pub memories: Option<Vec<MemoryItem>>,
+    pub memory_conflicts: Option<Vec<MemoryConflict>>,
     pub questions: Option<Vec<Question>>,
     pub tasks: Option<Vec<ScheduledTask>>,
     pub steering: Option<Vec<SteeringMessage>>,
@@ -313,6 +315,33 @@ pub struct MemoryStatsSnapshot {
     pub by_status: Vec<MemoryStatCount>,
     pub by_source: Vec<MemoryStatCount>,
     pub by_kind: Vec<MemoryStatCount>,
+}
+
+/// One active memory that cites a `path` or `task` evidence reference. Rows
+/// are grouped by `(scope_kind, scope_value)` before pairing.
+#[derive(Debug, Clone)]
+struct ConflictCandidate {
+    memory: MemoryItem,
+    scope_kind: &'static str,
+    scope_value: String,
+}
+
+/// Result of a detection pass. `new` is empty when every current conflict id
+/// already exists, including resolved rows.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryConflictScan {
+    pub new: Vec<MemoryConflict>,
+    pub open: Vec<MemoryConflict>,
+    pub events: Vec<Event>,
+}
+
+/// Result of an explicit operator resolution.
+#[derive(Debug, Clone)]
+pub struct MemoryConflictResolution {
+    pub conflict: MemoryConflict,
+    /// The two memories in A/B order after any lifecycle mutation.
+    pub memories: Vec<MemoryItem>,
+    pub events: Vec<Event>,
 }
 
 /// A steering row delivered at a turn boundary, plus the optional persisted
@@ -458,6 +487,15 @@ fn validate_session_bundle(bundle: &SessionBundle) -> Result<()> {
             return Err(anyhow!(
                 "bundle memory {} belongs to a different project",
                 memory.id
+            ));
+        }
+    }
+    for conflict in &bundle.memory_conflicts {
+        ensure_bundle_session("memory conflict", &conflict.session_id, &bundle.session.id)?;
+        if conflict.project_id != bundle.project.id {
+            return Err(anyhow!(
+                "bundle memory conflict {} belongs to a different project",
+                conflict.id
             ));
         }
     }
@@ -803,6 +841,31 @@ impl Store {
                 used_at    TEXT NOT NULL,
                 PRIMARY KEY(memory_id, session_id)
             );
+
+            CREATE TABLE IF NOT EXISTS memory_conflicts (
+                id               TEXT PRIMARY KEY,
+                project_id       TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                session_id       TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                memory_a_id      TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                memory_b_id      TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                memory_a_title   TEXT NOT NULL,
+                memory_b_title   TEXT NOT NULL,
+                memory_a_kind    TEXT NOT NULL,
+                memory_b_kind    TEXT NOT NULL,
+                memory_a_excerpt TEXT NOT NULL,
+                memory_b_excerpt TEXT NOT NULL,
+                scope_kind       TEXT NOT NULL,
+                scope_value      TEXT NOT NULL,
+                reason           TEXT NOT NULL,
+                status           TEXT NOT NULL DEFAULT 'open',
+                detected_at      TEXT NOT NULL,
+                resolved_at      TEXT,
+                resolution       TEXT,
+                note             TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memory_conflicts_project_status
+                ON memory_conflicts(project_id, status, detected_at);
 
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
                 title,
@@ -1487,7 +1550,30 @@ impl Store {
                  session_id TEXT NOT NULL,
                  used_at    TEXT NOT NULL,
                  PRIMARY KEY(memory_id, session_id)
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS memory_conflicts (
+                 id               TEXT PRIMARY KEY,
+                 project_id       TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                 session_id       TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                 memory_a_id      TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                 memory_b_id      TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                 memory_a_title   TEXT NOT NULL,
+                 memory_b_title   TEXT NOT NULL,
+                 memory_a_kind    TEXT NOT NULL,
+                 memory_b_kind    TEXT NOT NULL,
+                 memory_a_excerpt TEXT NOT NULL,
+                 memory_b_excerpt TEXT NOT NULL,
+                 scope_kind       TEXT NOT NULL,
+                 scope_value      TEXT NOT NULL,
+                 reason           TEXT NOT NULL,
+                 status           TEXT NOT NULL DEFAULT 'open',
+                 detected_at      TEXT NOT NULL,
+                 resolved_at      TEXT,
+                 resolution       TEXT,
+                 note             TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_memory_conflicts_project_status
+                 ON memory_conflicts(project_id, status, detected_at);",
         )?;
         ensure_column(
             &conn,
@@ -5189,6 +5275,18 @@ impl Store {
         Ok(())
     }
 
+    pub fn replace_session_memory_conflicts(
+        &self,
+        session_id: &str,
+        conflicts: &[MemoryConflict],
+    ) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        replace_session_memory_conflicts_tx(&tx, session_id, conflicts)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn delete_memories_with_events(&self, ids: &[String]) -> Result<Vec<(MemoryItem, Event)>> {
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -5200,6 +5298,13 @@ impl Store {
             let Some(memory) = get_memory_tx(&tx, id)? else {
                 continue;
             };
+            // A conflict cannot be resolved once either side is gone. The
+            // `memory.deleted` event removes the memory from replay, and this
+            // tombstone keeps the conflict projection consistent too.
+            tx.execute(
+                "DELETE FROM memory_conflicts WHERE memory_a_id = ?1 OR memory_b_id = ?1",
+                params![id],
+            )?;
             tx.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
             let event = insert_event_tx(
                 &tx,
@@ -5407,6 +5512,307 @@ impl Store {
             by_source: memory_count_group(&conn, project_id, "source")?,
             by_kind: memory_count_group(&conn, project_id, "kind")?,
         })
+    }
+
+    /// List deterministic memory conflicts. `status` filters exactly (`open` or
+    /// `resolved`); without a limit the newest 500 are returned.
+    pub fn list_memory_conflicts(
+        &self,
+        project_id: &str,
+        status: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<Vec<MemoryConflict>> {
+        let conn = self.lock()?;
+        list_memory_conflicts_conn(&conn, project_id, status, limit)
+    }
+
+    pub fn get_memory_conflict(&self, id: &str) -> Result<Option<MemoryConflict>> {
+        let conn = self.lock()?;
+        get_memory_conflict_tx(&conn, id)
+    }
+
+    pub fn list_session_memory_conflicts(&self, session_id: &str) -> Result<Vec<MemoryConflict>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MEMORY_CONFLICT_COLUMNS}
+             FROM memory_conflicts WHERE session_id = ?1
+             ORDER BY scope_kind ASC, scope_value ASC, memory_a_id ASC, memory_b_id ASC,
+                      detected_at DESC, id ASC"
+        ))?;
+        let rows = stmt.query_map(params![session_id], map_memory_conflict_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Detect deterministic scope conflicts. New rows are inserted as `open`
+    /// with one `memory.conflict.detected` event in the same transaction. An
+    /// existing id (including a resolved row) is never recreated. Detection
+    /// never mutates either memory.
+    pub fn scan_memory_conflicts(&self, project_id: &str) -> Result<MemoryConflictScan> {
+        let detected_at = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let memories = active_memories_with_evidence_tx(&tx, project_id, MAX_CONFLICT_MEMORIES)?;
+        let candidates = detect_memory_conflicts(project_id, &memories, &detected_at);
+        let mut scan = MemoryConflictScan::default();
+        for conflict in candidates {
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO memory_conflicts
+                 (id, project_id, session_id, memory_a_id, memory_b_id, memory_a_title,
+                  memory_b_title, memory_a_kind, memory_b_kind, memory_a_excerpt,
+                  memory_b_excerpt, scope_kind, scope_value, reason, status, detected_at,
+                  resolved_at, resolution, note)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                         ?16, ?17, ?18, ?19)",
+                params![
+                    &conflict.id,
+                    &conflict.project_id,
+                    &conflict.session_id,
+                    &conflict.memory_a_id,
+                    &conflict.memory_b_id,
+                    &conflict.memory_a_title,
+                    &conflict.memory_b_title,
+                    &conflict.memory_a_kind,
+                    &conflict.memory_b_kind,
+                    &conflict.memory_a_excerpt,
+                    &conflict.memory_b_excerpt,
+                    &conflict.scope_kind,
+                    &conflict.scope_value,
+                    &conflict.reason,
+                    &conflict.status,
+                    &conflict.detected_at,
+                    &conflict.resolved_at,
+                    &conflict.resolution,
+                    &conflict.note,
+                ],
+            )?;
+            if inserted == 0 {
+                continue;
+            }
+            let event = insert_event_tx(
+                &tx,
+                &conflict.session_id,
+                "memory.conflict.detected",
+                serde_json::to_value(&conflict)?,
+            )?;
+            scan.new.push(conflict);
+            scan.events.push(event);
+        }
+        scan.open = list_memory_conflicts_conn(&tx, project_id, Some("open"), None)?;
+        tx.commit()?;
+        drop(conn);
+        for event in &scan.events {
+            if let Err(error) = self.append_event_mirror(event) {
+                tracing::warn!(%error, "failed to append event mirror");
+            }
+        }
+        Ok(scan)
+    }
+
+    /// Resolve one conflict explicitly. The memory mutation, the conflict row,
+    /// and every event commit atomically. `keep_both` changes no memory.
+    pub fn resolve_memory_conflict(
+        &self,
+        project_id: &str,
+        id: &str,
+        action: &str,
+        note: Option<&str>,
+    ) -> Result<MemoryConflictResolution> {
+        if !matches!(action, "keep_a" | "keep_b" | "keep_both" | "archive_both") {
+            return Err(anyhow!(
+                "memory conflict action must be keep_a, keep_b, keep_both, or archive_both"
+            ));
+        }
+        let note = note
+            .map(str::trim)
+            .filter(|note| !note.is_empty())
+            .map(str::to_string);
+        if note
+            .as_deref()
+            .is_some_and(|note| note.chars().count() > 2_000)
+        {
+            return Err(anyhow!(
+                "memory conflict note is limited to 2000 characters"
+            ));
+        }
+        let resolved_at = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let Some(mut conflict) = get_memory_conflict_tx(&tx, id)? else {
+            return Err(anyhow!(
+                "memory conflict {id} not found: memory no longer exists or the conflict was removed with a deleted memory"
+            ));
+        };
+        if conflict.project_id != project_id {
+            return Err(anyhow!(
+                "memory conflict {id} belongs to project {}, not {project_id}",
+                conflict.project_id
+            ));
+        }
+        if conflict.status == "resolved" {
+            return Err(anyhow!("memory conflict {id} is already resolved"));
+        }
+        let Some(mut memory_a) = get_memory_tx(&tx, &conflict.memory_a_id)? else {
+            return Err(anyhow!(
+                "memory conflict {id} references memory {} which no longer exists",
+                conflict.memory_a_id
+            ));
+        };
+        let Some(mut memory_b) = get_memory_tx(&tx, &conflict.memory_b_id)? else {
+            return Err(anyhow!(
+                "memory conflict {id} references memory {} which no longer exists",
+                conflict.memory_b_id
+            ));
+        };
+        if memory_a.project_id != project_id || memory_b.project_id != project_id {
+            return Err(anyhow!(
+                "memory conflict {id} references memories from a different project"
+            ));
+        }
+
+        let mut events = Vec::new();
+        match action {
+            "keep_a" => {
+                memory_b.status = "superseded".to_string();
+                memory_b.superseded_by = Some(memory_a.id.clone());
+                update_memory_projection_tx(&tx, &memory_b)?;
+                events.push(insert_event_tx(
+                    &tx,
+                    &memory_b.session_id,
+                    "memory.superseded",
+                    serde_json::to_value(&memory_b)?,
+                )?);
+            }
+            "keep_b" => {
+                memory_a.status = "superseded".to_string();
+                memory_a.superseded_by = Some(memory_b.id.clone());
+                update_memory_projection_tx(&tx, &memory_a)?;
+                events.push(insert_event_tx(
+                    &tx,
+                    &memory_a.session_id,
+                    "memory.superseded",
+                    serde_json::to_value(&memory_a)?,
+                )?);
+            }
+            "archive_both" => {
+                for memory in [&mut memory_a, &mut memory_b] {
+                    memory.status = "archived".to_string();
+                    update_memory_projection_tx(&tx, memory)?;
+                    events.push(insert_event_tx(
+                        &tx,
+                        &memory.session_id,
+                        "memory.updated",
+                        serde_json::to_value(&*memory)?,
+                    )?);
+                }
+            }
+            "keep_both" => {}
+            _ => unreachable!("validated above"),
+        }
+
+        conflict.status = "resolved".to_string();
+        conflict.resolved_at = Some(resolved_at);
+        conflict.resolution = Some(action.to_string());
+        conflict.note = note;
+        update_memory_conflict_tx(&tx, &conflict)?;
+        events.push(insert_event_tx(
+            &tx,
+            &conflict.session_id,
+            "memory.conflict.resolved",
+            serde_json::to_value(&conflict)?,
+        )?);
+
+        tx.commit()?;
+        drop(conn);
+        for event in &events {
+            if let Err(error) = self.append_event_mirror(event) {
+                tracing::warn!(%error, "failed to append event mirror");
+            }
+        }
+        Ok(MemoryConflictResolution {
+            conflict,
+            memories: vec![memory_a, memory_b],
+            events,
+        })
+    }
+
+    /// Operator-facing health snapshot. `verification_due` counts active,
+    /// non-pinned rows whose explicit TTL has elapsed.
+    pub fn memory_health(&self, project_id: &str) -> Result<MemoryHealthResult> {
+        let now = time::OffsetDateTime::now_utc();
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT kind, status, evidence, pinned, last_verified_at, verify_after
+             FROM memories WHERE project_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)? != 0,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+        let mut health = MemoryHealthResult {
+            project_id: project_id.to_string(),
+            total: 0,
+            active: 0,
+            stale: 0,
+            superseded: 0,
+            archived: 0,
+            pinned: 0,
+            evidence_covered: 0,
+            verified: 0,
+            verification_due: 0,
+            open_conflicts: 0,
+            by_kind: Vec::new(),
+        };
+        let mut kinds: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+        for row in rows {
+            let (kind, status, evidence, pinned, last_verified_at, verify_after) = row?;
+            health.total += 1;
+            match status.as_str() {
+                "active" => health.active += 1,
+                "stale" => health.stale += 1,
+                "superseded" => health.superseded += 1,
+                "archived" => health.archived += 1,
+                _ => {}
+            }
+            if pinned {
+                health.pinned += 1;
+            }
+            if status == "active"
+                && !serde_json::from_str::<Vec<MemoryEvidence>>(&evidence)
+                    .unwrap_or_default()
+                    .is_empty()
+            {
+                health.evidence_covered += 1;
+            }
+            if last_verified_at.is_some() {
+                health.verified += 1;
+            }
+            if status == "active"
+                && !pinned
+                && verify_after.as_deref().is_some_and(|verify_after| {
+                    parse_rfc3339(verify_after).is_some_and(|verify_after| verify_after < now)
+                })
+            {
+                health.verification_due += 1;
+            }
+            *kinds.entry(kind).or_insert(0) += 1;
+        }
+        health.by_kind = kinds
+            .into_iter()
+            .map(|(key, count)| MemoryStatCount { key, count })
+            .collect();
+        let open_conflicts = conn.query_row(
+            "SELECT COUNT(*) FROM memory_conflicts WHERE project_id = ?1 AND status = 'open'",
+            params![project_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        health.open_conflicts = u32::try_from(open_conflicts).unwrap_or(u32::MAX);
+        Ok(health)
     }
 
     pub fn plan_task_exists(&self, project_id: &str, task_id: &str) -> Result<bool> {
@@ -11075,6 +11481,9 @@ impl Store {
         if let Some(memories) = &repair.memories {
             replace_session_memories_tx(&tx, session_id, memories)?;
         }
+        if let Some(conflicts) = &repair.memory_conflicts {
+            replace_session_memory_conflicts_tx(&tx, session_id, conflicts)?;
+        }
         if let Some(questions) = &repair.questions {
             tx.execute(
                 "DELETE FROM questions WHERE session_id = ?1",
@@ -11467,6 +11876,9 @@ impl Store {
         }
         for memory in &bundle.memories {
             insert_memory_tx(&tx, memory)?;
+        }
+        for conflict in &bundle.memory_conflicts {
+            upsert_memory_conflict_tx(&tx, conflict)?;
         }
         for question in &bundle.questions {
             tx.execute(
@@ -12709,6 +13121,348 @@ fn get_memory_tx(conn: &Connection, id: &str) -> Result<Option<MemoryItem>> {
     )
     .optional()
     .map_err(Into::into)
+}
+
+const MEMORY_CONFLICT_COLUMNS: &str = "id, project_id, session_id, memory_a_id, memory_b_id,
+    memory_a_title, memory_b_title, memory_a_kind, memory_b_kind, memory_a_excerpt,
+    memory_b_excerpt, scope_kind, scope_value, reason, status, detected_at, resolved_at,
+    resolution, note";
+const MAX_CONFLICT_MEMORIES: usize = 5_000;
+const MAX_CONFLICT_PAIRS_PER_GROUP: usize = 50;
+const MAX_CONFLICT_PAIRS_TOTAL: usize = 500;
+const MEMORY_CONFLICT_EXCERPT_CHARS: usize = 600;
+
+fn map_memory_conflict_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryConflict> {
+    Ok(MemoryConflict {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        session_id: row.get(2)?,
+        memory_a_id: row.get(3)?,
+        memory_b_id: row.get(4)?,
+        memory_a_title: row.get(5)?,
+        memory_b_title: row.get(6)?,
+        memory_a_kind: row.get(7)?,
+        memory_b_kind: row.get(8)?,
+        memory_a_excerpt: row.get(9)?,
+        memory_b_excerpt: row.get(10)?,
+        scope_kind: row.get(11)?,
+        scope_value: row.get(12)?,
+        reason: row.get(13)?,
+        status: row.get(14)?,
+        detected_at: row.get(15)?,
+        resolved_at: row.get(16)?,
+        resolution: row.get(17)?,
+        note: row.get(18)?,
+    })
+}
+
+fn get_memory_conflict_tx(conn: &Connection, id: &str) -> Result<Option<MemoryConflict>> {
+    conn.query_row(
+        &format!("SELECT {MEMORY_CONFLICT_COLUMNS} FROM memory_conflicts WHERE id = ?1"),
+        params![id],
+        map_memory_conflict_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn list_memory_conflicts_conn(
+    conn: &Connection,
+    project_id: &str,
+    status: Option<&str>,
+    limit: Option<u32>,
+) -> Result<Vec<MemoryConflict>> {
+    let limit = i64::from(limit.unwrap_or(500).clamp(1, 1_000));
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {MEMORY_CONFLICT_COLUMNS}
+         FROM memory_conflicts
+         WHERE project_id = ?1 AND (?2 IS NULL OR status = ?2)
+         ORDER BY scope_kind ASC, scope_value ASC, memory_a_id ASC, memory_b_id ASC,
+                  detected_at DESC, id ASC
+         LIMIT ?3"
+    ))?;
+    let rows = stmt.query_map(params![project_id, status, limit], map_memory_conflict_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn update_memory_conflict_tx(tx: &Transaction<'_>, conflict: &MemoryConflict) -> Result<()> {
+    tx.execute(
+        "UPDATE memory_conflicts SET
+             memory_a_title = ?2,
+             memory_b_title = ?3,
+             memory_a_kind = ?4,
+             memory_b_kind = ?5,
+             memory_a_excerpt = ?6,
+             memory_b_excerpt = ?7,
+             scope_kind = ?8,
+             scope_value = ?9,
+             reason = ?10,
+             status = ?11,
+             detected_at = ?12,
+             resolved_at = ?13,
+             resolution = ?14,
+             note = ?15
+         WHERE id = ?1",
+        params![
+            &conflict.id,
+            &conflict.memory_a_title,
+            &conflict.memory_b_title,
+            &conflict.memory_a_kind,
+            &conflict.memory_b_kind,
+            &conflict.memory_a_excerpt,
+            &conflict.memory_b_excerpt,
+            &conflict.scope_kind,
+            &conflict.scope_value,
+            &conflict.reason,
+            &conflict.status,
+            &conflict.detected_at,
+            &conflict.resolved_at,
+            &conflict.resolution,
+            &conflict.note,
+        ],
+    )?;
+    Ok(())
+}
+
+fn upsert_memory_conflict_tx(tx: &Transaction<'_>, conflict: &MemoryConflict) -> Result<()> {
+    tx.execute(
+        "INSERT INTO memory_conflicts
+         (id, project_id, session_id, memory_a_id, memory_b_id, memory_a_title, memory_b_title,
+          memory_a_kind, memory_b_kind, memory_a_excerpt, memory_b_excerpt, scope_kind,
+          scope_value, reason, status, detected_at, resolved_at, resolution, note)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                 ?17, ?18, ?19)
+         ON CONFLICT(id) DO UPDATE SET
+             memory_a_title = excluded.memory_a_title,
+             memory_b_title = excluded.memory_b_title,
+             memory_a_kind = excluded.memory_a_kind,
+             memory_b_kind = excluded.memory_b_kind,
+             memory_a_excerpt = excluded.memory_a_excerpt,
+             memory_b_excerpt = excluded.memory_b_excerpt,
+             scope_kind = excluded.scope_kind,
+             scope_value = excluded.scope_value,
+             reason = excluded.reason,
+             status = excluded.status,
+             detected_at = excluded.detected_at,
+             resolved_at = excluded.resolved_at,
+             resolution = excluded.resolution,
+             note = excluded.note",
+        params![
+            &conflict.id,
+            &conflict.project_id,
+            &conflict.session_id,
+            &conflict.memory_a_id,
+            &conflict.memory_b_id,
+            &conflict.memory_a_title,
+            &conflict.memory_b_title,
+            &conflict.memory_a_kind,
+            &conflict.memory_b_kind,
+            &conflict.memory_a_excerpt,
+            &conflict.memory_b_excerpt,
+            &conflict.scope_kind,
+            &conflict.scope_value,
+            &conflict.reason,
+            &conflict.status,
+            &conflict.detected_at,
+            &conflict.resolved_at,
+            &conflict.resolution,
+            &conflict.note,
+        ],
+    )?;
+    Ok(())
+}
+
+fn replace_session_memory_conflicts_tx(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    conflicts: &[MemoryConflict],
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM memory_conflicts WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    for conflict in conflicts {
+        upsert_memory_conflict_tx(tx, conflict)?;
+    }
+    Ok(())
+}
+
+fn active_memories_with_evidence_tx(
+    conn: &Connection,
+    project_id: &str,
+    limit: usize,
+) -> Result<Vec<MemoryItem>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, session_id, project_id, agent_id, agent_name, kind, title, body,
+                tags, created_at, status, source, evidence, supersedes, superseded_by,
+                pinned, use_count, last_used_at, last_verified_at, verify_after, stale_reason
+         FROM memories
+         WHERE project_id = ?1 AND status = 'active'
+         ORDER BY id ASC
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![project_id, limit as i64], map_memory_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn detect_memory_conflicts(
+    project_id: &str,
+    memories: &[MemoryItem],
+    detected_at: &str,
+) -> Vec<MemoryConflict> {
+    let mut groups: std::collections::BTreeMap<(String, String), Vec<ConflictCandidate>> =
+        std::collections::BTreeMap::new();
+    for memory in memories {
+        let mut seen_scopes = std::collections::BTreeSet::new();
+        for evidence in &memory.evidence {
+            let scope_kind = match evidence.kind.as_str() {
+                "path" if matches!(memory.kind.as_str(), "decision" | "convention" | "fact") => {
+                    "path"
+                }
+                "task" if matches!(memory.kind.as_str(), "verification" | "task_result") => "task",
+                _ => continue,
+            };
+            let scope_value = evidence.reference.trim();
+            if scope_value.is_empty()
+                || !seen_scopes.insert((scope_kind.to_string(), scope_value.to_string()))
+            {
+                continue;
+            }
+            groups
+                .entry((scope_kind.to_string(), scope_value.to_string()))
+                .or_default()
+                .push(ConflictCandidate {
+                    memory: memory.clone(),
+                    scope_kind,
+                    scope_value: scope_value.to_string(),
+                });
+        }
+    }
+
+    let mut conflicts = Vec::new();
+    let mut total_pairs = 0usize;
+    for ((scope_kind, scope_value), mut group) in groups {
+        group.sort_by(|left, right| left.memory.id.cmp(&right.memory.id));
+        let mut group_pairs = 0usize;
+        'group: for left in 0..group.len() {
+            for right in (left + 1)..group.len() {
+                if total_pairs >= MAX_CONFLICT_PAIRS_TOTAL
+                    || group_pairs >= MAX_CONFLICT_PAIRS_PER_GROUP
+                {
+                    break 'group;
+                }
+                let memory_a = &group[left].memory;
+                let memory_b = &group[right].memory;
+                if normalize_memory_body(&memory_a.body) == normalize_memory_body(&memory_b.body) {
+                    continue;
+                }
+                let reason = format!(
+                    "Both active memories cite {scope_kind} {scope_value} and have different bodies."
+                );
+                conflicts.push(MemoryConflict {
+                    id: memory_conflict_id(
+                        project_id,
+                        &scope_kind,
+                        &scope_value,
+                        memory_a,
+                        memory_b,
+                    ),
+                    project_id: project_id.to_string(),
+                    session_id: memory_a.session_id.clone(),
+                    memory_a_id: memory_a.id.clone(),
+                    memory_b_id: memory_b.id.clone(),
+                    memory_a_title: memory_a.title.clone(),
+                    memory_b_title: memory_b.title.clone(),
+                    memory_a_kind: memory_a.kind.clone(),
+                    memory_b_kind: memory_b.kind.clone(),
+                    memory_a_excerpt: bounded_excerpt(
+                        &memory_a.body,
+                        MEMORY_CONFLICT_EXCERPT_CHARS,
+                    ),
+                    memory_b_excerpt: bounded_excerpt(
+                        &memory_b.body,
+                        MEMORY_CONFLICT_EXCERPT_CHARS,
+                    ),
+                    scope_kind: group[left].scope_kind.to_string(),
+                    scope_value: group[left].scope_value.clone(),
+                    reason,
+                    status: "open".to_string(),
+                    detected_at: detected_at.to_string(),
+                    resolved_at: None,
+                    resolution: None,
+                    note: None,
+                });
+                total_pairs += 1;
+                group_pairs += 1;
+            }
+        }
+    }
+    conflicts.sort_by(|left, right| {
+        left.scope_kind
+            .cmp(&right.scope_kind)
+            .then_with(|| left.scope_value.cmp(&right.scope_value))
+            .then_with(|| left.memory_a_id.cmp(&right.memory_a_id))
+            .then_with(|| left.memory_b_id.cmp(&right.memory_b_id))
+    });
+    conflicts
+}
+
+fn memory_conflict_id(
+    project_id: &str,
+    scope_kind: &str,
+    scope_value: &str,
+    memory_a: &MemoryItem,
+    memory_b: &MemoryItem,
+) -> String {
+    let (first, second) = if memory_a.id <= memory_b.id {
+        (memory_a, memory_b)
+    } else {
+        (memory_b, memory_a)
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(project_id.as_bytes());
+    hasher.update(b"|");
+    hasher.update(scope_kind.as_bytes());
+    hasher.update(b"|");
+    hasher.update(scope_value.as_bytes());
+    hasher.update(b"|");
+    hasher.update(first.id.as_bytes());
+    hasher.update(b"|");
+    hasher.update(second.id.as_bytes());
+    hasher.update(b"|");
+    hasher.update(memory_body_hash(&first.body).as_bytes());
+    hasher.update(b"|");
+    hasher.update(memory_body_hash(&second.body).as_bytes());
+    format!("{:x}", hasher.finalize())
+        .chars()
+        .take(32)
+        .collect()
+}
+
+fn memory_body_hash(body: &str) -> String {
+    let normalized = normalize_memory_body(body);
+    format!("{:x}", Sha256::digest(normalized.as_bytes()))
+}
+
+fn normalize_memory_body(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn bounded_excerpt(value: &str, max_chars: usize) -> String {
+    let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max_chars {
+        return collapsed;
+    }
+    let mut excerpt = collapsed
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    excerpt.push('…');
+    excerpt
 }
 
 fn normalize_memory_key(value: &str) -> String {

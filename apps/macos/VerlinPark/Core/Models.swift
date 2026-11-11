@@ -564,6 +564,157 @@ struct MemoryStatsResult: Codable, Sendable {
     }
 }
 
+struct MemoryConflict: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let projectId: String
+    let sessionId: String
+    let memoryAId: String
+    let memoryBId: String
+    let memoryATitle: String
+    let memoryBTitle: String
+    let memoryAKind: String
+    let memoryBKind: String
+    let memoryAExcerpt: String
+    let memoryBExcerpt: String
+    let scopeKind: String
+    let scopeValue: String
+    let reason: String
+    let status: String
+    let detectedAt: String
+    let resolvedAt: String?
+    let resolution: String?
+    let note: String?
+
+    var isOpen: Bool {
+        status == "open"
+    }
+
+    var scopeLabel: String {
+        "\(scopeKind) \(scopeValue)"
+    }
+
+    var initial: String {
+        String(id.prefix(8))
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case projectId = "project_id"
+        case sessionId = "session_id"
+        case memoryAId = "memory_a_id"
+        case memoryBId = "memory_b_id"
+        case memoryATitle = "memory_a_title"
+        case memoryBTitle = "memory_b_title"
+        case memoryAKind = "memory_a_kind"
+        case memoryBKind = "memory_b_kind"
+        case memoryAExcerpt = "memory_a_excerpt"
+        case memoryBExcerpt = "memory_b_excerpt"
+        case scopeKind = "scope_kind"
+        case scopeValue = "scope_value"
+        case reason
+        case status
+        case detectedAt = "detected_at"
+        case resolvedAt = "resolved_at"
+        case resolution
+        case note
+    }
+}
+
+struct MemoryConflictsResult: Codable, Sendable {
+    let projectId: String
+    let conflicts: [MemoryConflict]
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case conflicts
+    }
+}
+
+struct MemoryConflictScanResult: Codable, Sendable {
+    let projectId: String
+    let detected: Int
+    let open: Int
+    let conflicts: [MemoryConflict]
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case detected
+        case open
+        case conflicts
+    }
+}
+
+struct MemoryConflictResolveResult: Codable, Sendable {
+    let conflict: MemoryConflict
+    let memories: [MemoryItem]
+}
+
+struct MemoryHealthResult: Codable, Sendable {
+    let projectId: String
+    let total: Int
+    let active: Int
+    let stale: Int
+    let superseded: Int
+    let archived: Int
+    let pinned: Int
+    let evidenceCovered: Int
+    let verified: Int
+    let verificationDue: Int
+    let openConflicts: Int
+    let byKind: [MemoryStatCount]
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case total
+        case active
+        case stale
+        case superseded
+        case archived
+        case pinned
+        case evidenceCovered = "evidence_covered"
+        case verified
+        case verificationDue = "verification_due"
+        case openConflicts = "open_conflicts"
+        case byKind = "by_kind"
+    }
+}
+
+/// Explicit operator resolution actions. Detection never applies one of these;
+/// the user must choose. Keeping the RPC spelling here prevents accidental
+/// drift between the UI and the daemon's validated action strings.
+enum MemoryConflictResolution: String, CaseIterable, Identifiable, Sendable {
+    case keepA = "keep_a"
+    case keepB = "keep_b"
+    case keepBoth = "keep_both"
+    case archiveBoth = "archive_both"
+
+    var id: String {
+        rawValue
+    }
+
+    var title: String {
+        switch self {
+        case .keepA: "Keep A"
+        case .keepB: "Keep B"
+        case .keepBoth: "Keep Both"
+        case .archiveBoth: "Archive Both"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .keepA: "Supersede B and keep A active."
+        case .keepB: "Supersede A and keep B active."
+        case .keepBoth: "Resolve the review row without changing either memory."
+        case .archiveBoth: "Archive both memories. They stop appearing as active claims."
+        }
+    }
+
+    var isDestructive: Bool {
+        self != .keepBoth
+    }
+}
+
 struct MemorySweepResult: Codable, Sendable {
     let projectId: String
     let candidates: Int

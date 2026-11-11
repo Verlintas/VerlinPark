@@ -159,6 +159,170 @@ final class MemoryConsoleTests: XCTestCase {
         XCTAssertFalse(sweep.dryRun)
     }
 
+    func testMemoryConflictDecodesScopeAndExcerpts() throws {
+        let conflict = try JSONDecoder().decode(
+            MemoryConflict.self,
+            from: Data(
+                """
+                {
+                  "id": "conflict-1234567890",
+                  "project_id": "project-1",
+                  "session_id": "session-1",
+                  "memory_a_id": "memory-a",
+                  "memory_b_id": "memory-b",
+                  "memory_a_title": "Parser uses tabs",
+                  "memory_b_title": "Parser uses spaces",
+                  "memory_a_kind": "convention",
+                  "memory_b_kind": "decision",
+                  "memory_a_excerpt": "Indent parser files with tabs.",
+                  "memory_b_excerpt": "Indent parser files with four spaces.",
+                  "scope_kind": "path",
+                  "scope_value": "src/parser.rs",
+                  "reason": "Both active memories cite path src/parser.rs and have different bodies.",
+                  "status": "open",
+                  "detected_at": "2026-11-11T03:00:00Z",
+                  "resolved_at": null,
+                  "resolution": null,
+                  "note": null
+                }
+                """.utf8
+            )
+        )
+        XCTAssertEqual(conflict.scopeLabel, "path src/parser.rs")
+        XCTAssertEqual(conflict.initial, "conflict")
+        XCTAssertTrue(conflict.isOpen)
+        XCTAssertEqual(conflict.memoryAKind, "convention")
+        XCTAssertEqual(conflict.memoryBExcerpt, "Indent parser files with four spaces.")
+        XCTAssertEqual(conflict.reason.contains("different bodies"), true)
+    }
+
+    func testMemoryHealthAndConflictScanDecode() throws {
+        let health = try JSONDecoder().decode(
+            MemoryHealthResult.self,
+            from: Data(
+                """
+                {
+                  "project_id": "project-1",
+                  "total": 9,
+                  "active": 5,
+                  "stale": 2,
+                  "superseded": 1,
+                  "archived": 1,
+                  "pinned": 2,
+                  "evidence_covered": 4,
+                  "verified": 3,
+                  "verification_due": 2,
+                  "open_conflicts": 1,
+                  "by_kind": [{"key": "fact", "count": 4}]
+                }
+                """.utf8
+            )
+        )
+        XCTAssertEqual(health.active, 5)
+        XCTAssertEqual(health.evidenceCovered, 4)
+        XCTAssertEqual(health.verificationDue, 2)
+        XCTAssertEqual(health.openConflicts, 1)
+        XCTAssertEqual(health.byKind.first?.count, 4)
+
+        let scan = try JSONDecoder().decode(
+            MemoryConflictScanResult.self,
+            from: Data(
+                """
+                {
+                  "project_id": "project-1",
+                  "detected": 2,
+                  "open": 3,
+                  "conflicts": []
+                }
+                """.utf8
+            )
+        )
+        XCTAssertEqual(scan.detected, 2)
+        XCTAssertEqual(scan.open, 3)
+        XCTAssertTrue(scan.conflicts.isEmpty)
+    }
+
+    func testMemoryConflictResolveResultDecodesUpdatedMemories() throws {
+        let result = try JSONDecoder().decode(
+            MemoryConflictResolveResult.self,
+            from: Data(
+                """
+                {
+                  "conflict": {
+                    "id": "conflict-1",
+                    "project_id": "project-1",
+                    "session_id": "session-1",
+                    "memory_a_id": "memory-a",
+                    "memory_b_id": "memory-b",
+                    "memory_a_title": "Keep A",
+                    "memory_b_title": "Lose B",
+                    "memory_a_kind": "fact",
+                    "memory_b_kind": "fact",
+                    "memory_a_excerpt": "A body",
+                    "memory_b_excerpt": "B body",
+                    "scope_kind": "task",
+                    "scope_value": "T3",
+                    "reason": "Both active memories cite task T3 and have different bodies.",
+                    "status": "resolved",
+                    "detected_at": "2026-11-11T03:00:00Z",
+                    "resolved_at": "2026-11-11T04:00:00Z",
+                    "resolution": "keep_a",
+                    "note": "A matches the merged commit."
+                  },
+                  "memories": [
+                    {
+                      "id": "memory-a",
+                      "session_id": "session-1",
+                      "project_id": "project-1",
+                      "agent_id": "agent-1",
+                      "agent_name": "Leader",
+                      "kind": "fact",
+                      "title": "Keep A",
+                      "body": "A body",
+                      "tags": [],
+                      "created_at": "2026-11-11T01:00:00Z",
+                      "status": "active"
+                    },
+                    {
+                      "id": "memory-b",
+                      "session_id": "session-1",
+                      "project_id": "project-1",
+                      "agent_id": "agent-1",
+                      "agent_name": "Leader",
+                      "kind": "fact",
+                      "title": "Lose B",
+                      "body": "B body",
+                      "tags": [],
+                      "created_at": "2026-11-11T01:00:00Z",
+                      "status": "superseded",
+                      "superseded_by": "memory-a"
+                    }
+                  ]
+                }
+                """.utf8
+            )
+        )
+        XCTAssertEqual(result.conflict.status, "resolved")
+        XCTAssertEqual(result.conflict.resolution, "keep_a")
+        XCTAssertFalse(result.conflict.isOpen)
+        XCTAssertEqual(result.memories.count, 2)
+        XCTAssertEqual(result.memories[1].displayStatus, "superseded")
+        XCTAssertEqual(result.memories[1].supersededBy, "memory-a")
+    }
+
+    func testMemoryConflictResolutionMapsToRPCStringsAndHelpers() {
+        XCTAssertEqual(MemoryConflictResolution.keepA.rawValue, "keep_a")
+        XCTAssertEqual(MemoryConflictResolution.keepB.rawValue, "keep_b")
+        XCTAssertEqual(MemoryConflictResolution.keepBoth.rawValue, "keep_both")
+        XCTAssertEqual(MemoryConflictResolution.archiveBoth.rawValue, "archive_both")
+        XCTAssertEqual(MemoryConflictResolution.keepA.title, "Keep A")
+        XCTAssertTrue(MemoryConflictResolution.keepA.detail.contains("Supersede B"))
+        XCTAssertTrue(MemoryConflictResolution.keepBoth.detail.contains("without changing"))
+        XCTAssertFalse(MemoryConflictResolution.keepBoth.isDestructive)
+        XCTAssertTrue(MemoryConflictResolution.archiveBoth.isDestructive)
+        XCTAssertTrue(MemoryConflictResolution.archiveBoth.detail.contains("Archive both"))
+    }
+
     func testVerificationCheckDecodesUncheckedEvidence() throws {
         let result = try JSONDecoder().decode(
             MemoryVerifyResult.self,

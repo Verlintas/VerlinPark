@@ -301,9 +301,12 @@ struct MemoryCard: View {
                         Task { await model.loadMemories() }
                     }
                 if let stats = model.memoryStats {
-                    Text(statsSummary(stats))
-                        .font(.system(size: 8, design: .monospaced))
-                        .foregroundStyle(.tertiary)
+                    Text(
+                        statsSummary(stats)
+                            + (model.memoryHealth.map { " · \($0.openConflicts) conflicts" } ?? "")
+                    )
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
                 } else if let status = model.memoryStatsStatus {
                     Text(status)
                         .font(.system(size: 8, design: .monospaced))
@@ -398,6 +401,244 @@ struct MemoryCard: View {
             Text(
                 "Only unpinned memories created more than 30 days ago are removed. Recent and pinned memories are kept."
             )
+        }
+    }
+}
+
+struct MemoryHealthCard: View {
+    @Environment(AppModel.self) private var model
+    let project: Project
+    @State private var pendingConflict: MemoryConflict?
+    @State private var pendingAction: MemoryConflictResolution = .keepA
+
+    private var openConflicts: [MemoryConflict] {
+        model.memoryConflicts.filter(\.isOpen)
+    }
+
+    private func metric(
+        _ title: LocalizedStringKey,
+        _ value: Int,
+        color: Color = .secondary
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.system(size: 7.5, design: .monospaced))
+                .foregroundStyle(.tertiary)
+            Text("\(value)")
+                .font(.system(size: 15, weight: .semibold, design: .rounded))
+                .foregroundStyle(color)
+        }
+        .frame(minWidth: 64, alignment: .leading)
+    }
+
+    private func requestResolution(
+        _ conflict: MemoryConflict,
+        action: MemoryConflictResolution
+    ) {
+        if action.isDestructive {
+            pendingConflict = conflict
+            pendingAction = action
+        } else {
+            Task { await model.resolveMemoryConflict(conflict, action: action) }
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Memory health")
+                    Text(project.name)
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.memoryConflictBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Refresh") {
+                    Task {
+                        await model.loadMemoryHealth()
+                        await model.loadMemoryConflicts()
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.memoryConflictBusy)
+                Button("Scan") {
+                    Task { await model.scanMemoryConflicts() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.memoryConflictBusy)
+                .help("Detect same-path or same-task active claims with different bodies")
+            }
+            Text(
+                "Potential conflicts are deterministic review signals, not semantic fact-checking. Detection never changes memory; only an explicit resolution does."
+            )
+            .font(.system(size: 9, design: .monospaced))
+            .foregroundStyle(.secondary)
+
+            if let health = model.memoryHealth {
+                HStack(alignment: .top, spacing: 14) {
+                    metric("active", health.active, color: VPTheme.success)
+                    metric("stale", health.stale, color: VPTheme.warning)
+                    metric("pinned", health.pinned, color: VPTheme.accent)
+                    metric("evidence", health.evidenceCovered)
+                    metric("due", health.verificationDue, color: VPTheme.warning)
+                    metric(
+                        "conflicts",
+                        health.openConflicts,
+                        color: health.openConflicts > 0 ? VPTheme.warning : .secondary
+                    )
+                    Spacer()
+                }
+                HStack(spacing: 10) {
+                    Text(verbatim: "\(health.total) total · \(health.verified) verified")
+                    if health.superseded > 0 {
+                        Text(verbatim: "\(health.superseded) superseded")
+                    }
+                    if health.archived > 0 {
+                        Text(verbatim: "\(health.archived) archived")
+                    }
+                    if !health.byKind.isEmpty {
+                        Text(
+                            verbatim: health.byKind
+                                .map { "\($0.key) \($0.count)" }
+                                .joined(separator: " · ")
+                        )
+                        .lineLimit(1)
+                    }
+                }
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.tertiary)
+            } else if let status = model.memoryConflictStatus {
+                Text(status)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+
+            if model.memoryConflicts.isEmpty {
+                Text(
+                    model.memoryConflictStatus
+                        ?? "No memory conflicts. Scan to detect same-scope active claims with different bodies."
+                )
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundStyle(.secondary)
+            } else {
+                ForEach(model.memoryConflicts) { conflict in
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack(spacing: 6) {
+                            Text(conflict.scopeKind.uppercased())
+                                .font(.system(size: 8, weight: .medium, design: .monospaced))
+                                .foregroundStyle(.cyan)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(.cyan.opacity(0.1), in: Capsule())
+                            Text(conflict.scopeValue)
+                                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                            Spacer()
+                            Text(conflict.status.uppercased())
+                                .font(.system(size: 7.5, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(conflict.isOpen ? VPTheme.warning : VPTheme.success)
+                            Text(conflict.initial)
+                                .font(.system(size: 7.5, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                        }
+                        HStack(alignment: .top, spacing: 10) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(
+                                    verbatim: "\(conflict.memoryAKind) · \(conflict.memoryATitle)"
+                                )
+                                .font(.system(size: 8.5, weight: .medium))
+                                Text(conflict.memoryAExcerpt)
+                                    .font(.system(size: 8, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(3)
+                            }
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(
+                                    verbatim: "\(conflict.memoryBKind) · \(conflict.memoryBTitle)"
+                                )
+                                .font(.system(size: 8.5, weight: .medium))
+                                Text(conflict.memoryBExcerpt)
+                                    .font(.system(size: 8, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(3)
+                            }
+                        }
+                        Text(conflict.reason)
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(VPTheme.accentDeep)
+                        if conflict.isOpen {
+                            HStack(spacing: 6) {
+                                ForEach(MemoryConflictResolution.allCases) { action in
+                                    Button(LocalizedStringKey(action.title)) {
+                                        requestResolution(conflict, action: action)
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.mini)
+                                    .disabled(model.memoryConflictBusy)
+                                    .help(action.detail)
+                                }
+                            }
+                        } else if let resolution = conflict.resolution {
+                            Text(
+                                verbatim: "resolved with \(resolution)"
+                                    + (conflict.note.map { " · \($0)" } ?? "")
+                            )
+                            .font(.system(size: 7.5, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                        }
+                    }
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 8))
+                }
+                if openConflicts.isEmpty, model.memoryConflicts.count > 0 {
+                    Text("No open conflicts remain. Resolved rows stay visible as history.")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            if let status = model.memoryConflictStatus, !model.memoryConflicts.isEmpty {
+                Text(status)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 1)
+        .confirmationDialog(
+            LocalizedStringKey(pendingAction.title),
+            isPresented: Binding(
+                get: { pendingConflict != nil },
+                set: {
+                    if !$0 {
+                        pendingConflict = nil
+                    }
+                }
+            ),
+            titleVisibility: .visible
+        ) {
+            if let conflict = pendingConflict {
+                Button(LocalizedStringKey(pendingAction.title), role: .destructive) {
+                    Task {
+                        await model.resolveMemoryConflict(conflict, action: pendingAction)
+                        pendingConflict = nil
+                    }
+                }
+            }
+            Button("Cancel", role: .cancel) {
+                pendingConflict = nil
+            }
+        } message: {
+            Text(pendingAction.detail)
         }
     }
 }

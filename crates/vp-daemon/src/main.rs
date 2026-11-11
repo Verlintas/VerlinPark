@@ -41,18 +41,19 @@ use vp_protocol::types::{
     ListEventsParams, ListSessionsParams, MailboxGcParams, MailboxListParams, MailboxListResult,
     MailboxPolicyParams, MailboxPolicyResult, MarkMessageReadParams, McpCallParams,
     McpGetPromptParams, McpProbeParams, McpReadResourceParams, McpServerIdParams,
-    MemoryBriefParams, MemoryCreateParams, MemoryCreateResult, MemoryDeleteParams,
-    MemoryListParams, MemoryPolicyParams, MemoryPruneParams, MemorySearchParams, MemoryStatsParams,
-    MemorySweepParams, MemoryUpdateParams, MemoryVerifyParams, MergeQueueListParams,
-    MergeQueueListResult, OpenPullRequestParams, PingResult, ProjectBudgetParams,
-    ProjectForkForestParams, ProjectListResult, ProjectUsageParams, PromptParams, PromptResult,
-    QuestionListParams, RehydrateSessionParams, ReplaySessionParams, ResolveApprovalParams,
-    ResolveApprovalResult, ResolveMergeParams, ResolveMergeResult, RetryMergeParams,
-    RetryMergeResult, SchedulerStatusParams, SearchParams, ServerInfo,
-    SessionCheckpointDeleteParams, SessionCheckpointDiffParams, SessionCheckpointListParams,
-    SessionCheckpointParams, SessionCheckpointPruneParams, SessionCheckpointRestoreParams,
-    SessionCheckpointStatsParams, SessionCitationAuditParams, SessionCitationsParams,
-    SessionCompactParams, SessionCompareParams, SessionContextParams,
+    MemoryBriefParams, MemoryConflictResolveParams, MemoryConflictScanParams,
+    MemoryConflictsParams, MemoryCreateParams, MemoryCreateResult, MemoryDeleteParams,
+    MemoryHealthParams, MemoryListParams, MemoryPolicyParams, MemoryPruneParams,
+    MemorySearchParams, MemoryStatsParams, MemorySweepParams, MemoryUpdateParams,
+    MemoryVerifyParams, MergeQueueListParams, MergeQueueListResult, OpenPullRequestParams,
+    PingResult, ProjectBudgetParams, ProjectForkForestParams, ProjectListResult,
+    ProjectUsageParams, PromptParams, PromptResult, QuestionListParams, RehydrateSessionParams,
+    ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams,
+    ResolveMergeResult, RetryMergeParams, RetryMergeResult, SchedulerStatusParams, SearchParams,
+    ServerInfo, SessionCheckpointDeleteParams, SessionCheckpointDiffParams,
+    SessionCheckpointListParams, SessionCheckpointParams, SessionCheckpointPruneParams,
+    SessionCheckpointRestoreParams, SessionCheckpointStatsParams, SessionCitationAuditParams,
+    SessionCitationsParams, SessionCompactParams, SessionCompareParams, SessionContextParams,
     SessionContinuationCancelParams, SessionContinuationsParams, SessionDeferParams,
     SessionDiffParams, SessionExportParams, SessionForkParams, SessionForkTreeParams,
     SessionImportParams, SessionLineageParams, SessionListResult, SessionLogParams,
@@ -167,6 +168,7 @@ async fn main() -> Result<()> {
     spawn_checkpoint_sweeper(state.engine.clone());
     spawn_memory_sweeper(state.engine.clone());
     spawn_memory_stale_sweeper(state.engine.clone());
+    spawn_memory_conflict_scanner(state.engine.clone());
     spawn_terminal_sweeper(state.engine.clone());
     spawn_browser_sweeper(state.engine.clone());
     spawn_task_stall_sweeper(state.engine.clone());
@@ -2358,6 +2360,44 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             },
             Err(response) => response_with_id(id, response),
         },
+        "memory.conflicts" => match parse_params::<MemoryConflictsParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .memory_conflicts(&params.project_id, params.status.as_deref(), params.limit)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "memory.conflict.scan" => match parse_params::<MemoryConflictScanParams>(request.params) {
+            Ok(params) => match state.engine.memory_conflict_scan(&params.project_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "memory.conflict.resolve" => {
+            match parse_params::<MemoryConflictResolveParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .memory_conflict_resolve(&params.id, &params.action, params.note.as_deref())
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "memory.health" => match parse_params::<MemoryHealthParams>(request.params) {
+            Ok(params) => match state.engine.memory_health(&params.project_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
         "memory.create" => match parse_params::<MemoryCreateParams>(request.params) {
             Ok(params) => match state
                 .engine
@@ -3010,6 +3050,39 @@ fn spawn_memory_stale_sweeper(engine: Engine) {
                 Ok(_) => {}
                 Err(error) => {
                     tracing::warn!(%error, "automatic memory staleness sweep failed");
+                }
+            }
+        }
+    });
+}
+
+/// Deterministic same-scope conflict detection. This tick never resolves a
+/// conflict and never mutates memory status; operator resolution stays explicit.
+fn spawn_memory_conflict_scanner(engine: Engine) {
+    let seconds = std::env::var("VERLINPARK_MEMORY_CONFLICT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(3600);
+    if seconds == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(seconds));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match engine.scan_all_memory_conflicts().await {
+                Ok((projects, detected, open)) if detected > 0 => {
+                    tracing::info!(
+                        projects,
+                        detected,
+                        open,
+                        "automatic memory conflict scan detected new conflicts"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "automatic memory conflict scan failed");
                 }
             }
         }
