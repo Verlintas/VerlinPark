@@ -355,6 +355,34 @@ pub struct DeliveredSteering {
 
 pub type PendingTaskSessionRow = (String, String, i32, usize, String, i32, u64);
 
+/// Input for creating the first row of a deferred continuation. The store
+/// generates the row id and uses it as the series id when none is supplied.
+#[derive(Debug, Clone)]
+pub struct NewSessionContinuation {
+    pub session_id: String,
+    pub project_id: String,
+    pub body: String,
+    pub watch_task_ids: Vec<String>,
+    pub watch_mode: String,
+    pub deadline_at: Option<String>,
+    pub max_attempts: u32,
+    pub series_id: Option<String>,
+    pub parent_continuation_id: Option<String>,
+    pub recurrence_every_secs: Option<u64>,
+    pub recurrence_max_runs: u32,
+    pub run_count: u32,
+}
+
+/// Result of committing one successful continuation delivery. `scheduled` is
+/// the next pending run when the series still has budget, and both events are
+/// emitted in the same transaction as the projection change.
+#[derive(Debug, Clone)]
+pub struct ContinuationDelivery {
+    pub delivered: SessionContinuation,
+    pub scheduled: Option<SessionContinuation>,
+    pub events: Vec<Event>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectManifestSnapshot {
     pub version: u32,
@@ -1292,7 +1320,12 @@ impl Store {
                 created_at      TEXT NOT NULL,
                 ready_at        TEXT,
                 delivered_at    TEXT,
-                updated_at      TEXT NOT NULL
+                updated_at      TEXT NOT NULL,
+                series_id       TEXT NOT NULL DEFAULT '',
+                parent_continuation_id TEXT,
+                recurrence_every_secs INTEGER,
+                recurrence_max_runs INTEGER NOT NULL DEFAULT 1,
+                run_count       INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE INDEX IF NOT EXISTS idx_session_continuations_status
@@ -1489,6 +1522,36 @@ impl Store {
             "INTEGER NOT NULL DEFAULT 1",
         )?;
         ensure_column(&conn, "intake_tasks", "deps", "TEXT NOT NULL DEFAULT '[]'")?;
+        ensure_column(
+            &conn,
+            "session_continuations",
+            "series_id",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &conn,
+            "session_continuations",
+            "parent_continuation_id",
+            "TEXT",
+        )?;
+        ensure_column(
+            &conn,
+            "session_continuations",
+            "recurrence_every_secs",
+            "INTEGER",
+        )?;
+        ensure_column(
+            &conn,
+            "session_continuations",
+            "recurrence_max_runs",
+            "INTEGER NOT NULL DEFAULT 1",
+        )?;
+        ensure_column(
+            &conn,
+            "session_continuations",
+            "run_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         ensure_column(&conn, "sources", "collection", "TEXT")?;
         ensure_column(
             &conn,
@@ -8178,31 +8241,27 @@ impl Store {
     }
 
     /// Persist a deferred continuation and its creation event atomically. The
-    /// engine validates body, watch ids, task states, and the deadline before
-    /// calling this.
-    #[allow(clippy::too_many_arguments)]
+    /// engine validates body, watch ids, task states, recurrence, and the
+    /// deadline before calling this. The first row of a series owns the series
+    /// id; a child row is only created by a successful delivery.
     pub fn create_session_continuation_with_event(
         &self,
-        session_id: &str,
-        project_id: &str,
-        body: &str,
-        watch_task_ids: &[String],
-        watch_mode: &str,
-        deadline_at: Option<&str>,
-        max_attempts: u32,
+        new: &NewSessionContinuation,
     ) -> Result<(SessionContinuation, Event)> {
         let now = now_rfc3339();
+        let id = Uuid::now_v7().to_string();
+        let series_id = new.series_id.clone().unwrap_or_else(|| id.clone());
         let continuation = SessionContinuation {
-            id: Uuid::now_v7().to_string(),
-            session_id: session_id.to_string(),
-            project_id: project_id.to_string(),
-            body: body.to_string(),
-            watch_task_ids: watch_task_ids.to_vec(),
-            watch_mode: watch_mode.to_string(),
-            deadline_at: deadline_at.map(str::to_string),
+            id,
+            session_id: new.session_id.clone(),
+            project_id: new.project_id.clone(),
+            body: new.body.clone(),
+            watch_task_ids: new.watch_task_ids.clone(),
+            watch_mode: new.watch_mode.clone(),
+            deadline_at: new.deadline_at.clone(),
             status: "pending".to_string(),
             attempts: 0,
-            max_attempts: max_attempts.max(1),
+            max_attempts: new.max_attempts.max(1),
             wake_reason: None,
             outcomes: Vec::new(),
             last_error: None,
@@ -8211,44 +8270,32 @@ impl Store {
             ready_at: None,
             delivered_at: None,
             updated_at: now,
+            series_id,
+            parent_continuation_id: new.parent_continuation_id.clone(),
+            recurrence_every_secs: new.recurrence_every_secs,
+            recurrence_max_runs: new.recurrence_max_runs.max(1),
+            run_count: new.run_count,
         };
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         let actual_project: String = tx
             .query_row(
                 "SELECT project_id FROM sessions WHERE id = ?1",
-                params![session_id],
+                params![continuation.session_id],
                 |row| row.get(0),
             )
             .optional()?
-            .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
-        if actual_project != project_id {
-            return Err(anyhow!("session {session_id} belongs to {actual_project}"));
+            .ok_or_else(|| anyhow!("session not found: {}", continuation.session_id))?;
+        if actual_project != continuation.project_id {
+            return Err(anyhow!(
+                "session {} belongs to {actual_project}",
+                continuation.session_id
+            ));
         }
-        tx.execute(
-            "INSERT INTO session_continuations
-             (id, session_id, project_id, body, watch_task_ids, watch_mode, deadline_at,
-              status, attempts, max_attempts, wake_reason, outcomes, last_error,
-              next_attempt_at, created_at, ready_at, delivered_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, '[]', NULL,
-                     NULL, ?11, NULL, NULL, ?11)",
-            params![
-                continuation.id,
-                continuation.session_id,
-                continuation.project_id,
-                continuation.body,
-                serde_json::to_string(&continuation.watch_task_ids)?,
-                continuation.watch_mode,
-                continuation.deadline_at,
-                continuation.status,
-                i64::from(continuation.attempts),
-                i64::from(continuation.max_attempts),
-                continuation.created_at
-            ],
-        )?;
+        insert_session_continuation_tx(&tx, &continuation)?;
         let event = insert_event_tx(
             &tx,
-            session_id,
+            &continuation.session_id,
             "session.continuation.created",
             serde_json::to_value(&continuation)?,
         )?;
@@ -8267,15 +8314,13 @@ impl Store {
     ) -> Result<Vec<SessionContinuation>> {
         let conn = self.lock()?;
         let limit = limit.unwrap_or(500).clamp(1, 2_000) as i64;
-        let mut stmt = conn.prepare(
-            "SELECT id, session_id, project_id, body, watch_task_ids, watch_mode,
-                    deadline_at, status, attempts, max_attempts, wake_reason, outcomes,
-                    last_error, next_attempt_at, created_at, ready_at, delivered_at, updated_at
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {SESSION_CONTINUATION_COLUMNS}
              FROM session_continuations
              WHERE session_id = ?1 AND (?2 IS NULL OR status = ?2)
              ORDER BY created_at ASC, id ASC
-             LIMIT ?3",
-        )?;
+             LIMIT ?3"
+        ))?;
         let rows = stmt.query_map(params![session_id, status, limit], map_session_continuation)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
@@ -8284,14 +8329,12 @@ impl Store {
     /// The scheduler tick evaluates this snapshot; it never sees terminal rows.
     pub fn list_open_session_continuations(&self) -> Result<Vec<SessionContinuation>> {
         let conn = self.lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, session_id, project_id, body, watch_task_ids, watch_mode,
-                    deadline_at, status, attempts, max_attempts, wake_reason, outcomes,
-                    last_error, next_attempt_at, created_at, ready_at, delivered_at, updated_at
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {SESSION_CONTINUATION_COLUMNS}
              FROM session_continuations
              WHERE status IN ('pending', 'ready')
-             ORDER BY created_at ASC, id ASC",
-        )?;
+             ORDER BY created_at ASC, id ASC"
+        ))?;
         let rows = stmt.query_map([], map_session_continuation)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
@@ -8365,35 +8408,58 @@ impl Store {
         Ok(Some((continuation, event)))
     }
 
+    /// Atomically mark a claimed row delivered, increment its run count, and
+    /// schedule the next run when the series still has budget. Projection,
+    /// delivery event, and child event commit together. If inserting the child
+    /// fails the transaction rolls back, so the claimed row remains
+    /// `delivering`; daemon recovery then fails it closed and no duplicate
+    /// child can exist.
     pub fn mark_session_continuation_delivered_with_event(
         &self,
         id: &str,
-    ) -> Result<Option<(SessionContinuation, Event)>> {
+    ) -> Result<Option<ContinuationDelivery>> {
         let now = now_rfc3339();
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         let changed = tx.execute(
             "UPDATE session_continuations
-             SET status = 'delivered', delivered_at = ?1, next_attempt_at = NULL, updated_at = ?1
+             SET status = 'delivered', run_count = run_count + 1, delivered_at = ?1,
+                 next_attempt_at = NULL, updated_at = ?1
              WHERE id = ?2 AND status = 'delivering'",
             params![now, id],
         )?;
         if changed == 0 {
             return Ok(None);
         }
-        let continuation = query_session_continuation_tx(&tx, id)?
+        let delivered = query_session_continuation_tx(&tx, id)?
             .ok_or_else(|| anyhow!("continuation disappeared during delivery: {id}"))?;
-        let event = insert_event_tx(
+        let mut events = vec![insert_event_tx(
             &tx,
-            &continuation.session_id,
+            &delivered.session_id,
             "session.continuation.delivered",
-            serde_json::to_value(&continuation)?,
-        )?;
-        tx.commit()?;
-        if let Err(error) = self.append_event_mirror(&event) {
-            tracing::warn!(%error, "failed to append event mirror");
+            serde_json::to_value(&delivered)?,
+        )?];
+        let scheduled = next_recurring_continuation(&delivered, &now)?;
+        if let Some(child) = &scheduled {
+            insert_session_continuation_tx(&tx, child)?;
+            events.push(insert_event_tx(
+                &tx,
+                &child.session_id,
+                "session.continuation.scheduled",
+                serde_json::to_value(child)?,
+            )?);
         }
-        Ok(Some((continuation, event)))
+        tx.commit()?;
+        for event in &events {
+            if let Err(error) = self.append_event_mirror(event) {
+                tracing::warn!(%error, "failed to append event mirror");
+            }
+        }
+        Ok(Some(ContinuationDelivery {
+            delivered,
+            scheduled,
+            events,
+        }))
     }
 
     /// Record a failed start attempt without exhausting the cap. The row stays
@@ -12781,7 +12847,8 @@ fn map_steering(row: &rusqlite::Row<'_>) -> rusqlite::Result<SteeringMessage> {
 
 const SESSION_CONTINUATION_COLUMNS: &str = "id, session_id, project_id, body, watch_task_ids,
     watch_mode, deadline_at, status, attempts, max_attempts, wake_reason, outcomes,
-    last_error, next_attempt_at, created_at, ready_at, delivered_at, updated_at";
+    last_error, next_attempt_at, created_at, ready_at, delivered_at, updated_at,
+    series_id, parent_continuation_id, recurrence_every_secs, recurrence_max_runs, run_count";
 
 fn map_session_continuation(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionContinuation> {
     let watch_task_ids = row.get::<_, String>(4)?;
@@ -12805,7 +12872,64 @@ fn map_session_continuation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session
         ready_at: row.get(15)?,
         delivered_at: row.get(16)?,
         updated_at: row.get(17)?,
+        series_id: row.get(18)?,
+        parent_continuation_id: row.get(19)?,
+        recurrence_every_secs: row
+            .get::<_, Option<i64>>(20)?
+            .map(|value| value.max(0) as u64),
+        recurrence_max_runs: row.get::<_, i64>(21)?.max(1) as u32,
+        run_count: row.get::<_, i64>(22)?.max(0) as u32,
     })
+}
+
+fn next_recurring_continuation(
+    delivered: &SessionContinuation,
+    delivered_at: &str,
+) -> Result<Option<SessionContinuation>> {
+    let Some(every_secs) = delivered.recurrence_every_secs else {
+        return Ok(None);
+    };
+    if delivered.run_count >= delivered.recurrence_max_runs.max(1) {
+        return Ok(None);
+    }
+    let delivered_at =
+        time::OffsetDateTime::parse(delivered_at, &time::format_description::well_known::Rfc3339)
+            .map_err(|error| anyhow!("parsing delivery time: {error}"))?;
+    let seconds =
+        i64::try_from(every_secs).map_err(|_| anyhow!("recurrence interval is too large"))?;
+    let deadline = (delivered_at + time::Duration::seconds(seconds))
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(|error| anyhow!("formatting recurrence deadline: {error}"))?;
+    let series_id = if delivered.series_id.is_empty() {
+        delivered.id.clone()
+    } else {
+        delivered.series_id.clone()
+    };
+    Ok(Some(SessionContinuation {
+        id: Uuid::now_v7().to_string(),
+        session_id: delivered.session_id.clone(),
+        project_id: delivered.project_id.clone(),
+        body: delivered.body.clone(),
+        watch_task_ids: Vec::new(),
+        watch_mode: "all".to_string(),
+        deadline_at: Some(deadline),
+        status: "pending".to_string(),
+        attempts: 0,
+        max_attempts: delivered.max_attempts.max(1),
+        wake_reason: None,
+        outcomes: Vec::new(),
+        last_error: None,
+        next_attempt_at: None,
+        created_at: delivered.updated_at.clone(),
+        ready_at: None,
+        delivered_at: None,
+        updated_at: delivered.updated_at.clone(),
+        series_id,
+        parent_continuation_id: Some(delivered.id.clone()),
+        recurrence_every_secs: Some(every_secs),
+        recurrence_max_runs: delivered.recurrence_max_runs.max(1),
+        run_count: delivered.run_count,
+    }))
 }
 
 fn query_session_continuation_tx(
@@ -12831,9 +12955,11 @@ fn insert_session_continuation_tx(
         "INSERT INTO session_continuations
          (id, session_id, project_id, body, watch_task_ids, watch_mode, deadline_at,
           status, attempts, max_attempts, wake_reason, outcomes, last_error,
-          next_attempt_at, created_at, ready_at, delivered_at, updated_at)
+          next_attempt_at, created_at, ready_at, delivered_at, updated_at,
+          series_id, parent_continuation_id, recurrence_every_secs, recurrence_max_runs,
+          run_count)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                 ?14, ?15, ?16, ?17, ?18)",
+                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
         params![
             continuation.id,
             continuation.session_id,
@@ -12852,7 +12978,14 @@ fn insert_session_continuation_tx(
             continuation.created_at,
             continuation.ready_at,
             continuation.delivered_at,
-            continuation.updated_at
+            continuation.updated_at,
+            continuation.series_id,
+            continuation.parent_continuation_id,
+            continuation
+                .recurrence_every_secs
+                .map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
+            i64::from(continuation.recurrence_max_runs),
+            i64::from(continuation.run_count)
         ],
     )?;
     Ok(())

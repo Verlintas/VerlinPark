@@ -7596,7 +7596,17 @@ async fn deferred_continuations_validate_creation_and_replay_repair_bundle() {
 
     assert!(
         engine
-            .defer_session(&session.id, "   ", Vec::new(), None, None, None, None)
+            .defer_session(
+                &session.id,
+                "   ",
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None
+            )
             .await
             .is_err()
     );
@@ -7609,13 +7619,25 @@ async fn deferred_continuations_validate_creation_and_replay_repair_bundle() {
                 None,
                 None,
                 None,
+                None,
+                None,
                 None
             )
             .await
             .is_err()
     );
     let no_trigger = engine
-        .defer_session(&session.id, "later", Vec::new(), None, None, None, None)
+        .defer_session(
+            &session.id,
+            "later",
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap_err();
     assert!(no_trigger.to_string().contains("watch task or a deadline"));
@@ -7625,6 +7647,8 @@ async fn deferred_continuations_validate_creation_and_replay_repair_bundle() {
             "later",
             vec!["T9".into()],
             Some("all"),
+            None,
+            None,
             None,
             None,
             None,
@@ -7638,6 +7662,8 @@ async fn deferred_continuations_validate_creation_and_replay_repair_bundle() {
             "later",
             vec!["T1".into()],
             Some("most"),
+            None,
+            None,
             None,
             None,
             None,
@@ -7657,6 +7683,8 @@ async fn deferred_continuations_validate_creation_and_replay_repair_bundle() {
                 None,
                 Some(&past),
                 None,
+                None,
+                None,
                 None
             )
             .await
@@ -7671,6 +7699,8 @@ async fn deferred_continuations_validate_creation_and_replay_repair_bundle() {
                 None,
                 None,
                 Some(31 * 24 * 60 * 60),
+                None,
+                None,
                 None
             )
             .await
@@ -7688,6 +7718,8 @@ async fn deferred_continuations_validate_creation_and_replay_repair_bundle() {
                 None,
                 Some(&tomorrow),
                 Some(5),
+                None,
+                None,
                 None
             )
             .await
@@ -7703,6 +7735,8 @@ async fn deferred_continuations_validate_creation_and_replay_repair_bundle() {
             Some(&tomorrow),
             None,
             Some(9),
+            None,
+            None,
         )
         .await
         .unwrap()
@@ -7728,6 +7762,8 @@ async fn deferred_continuations_validate_creation_and_replay_repair_bundle() {
             &session.id,
             "use the T2 result",
             vec!["T2".into()],
+            None,
+            None,
             None,
             None,
             None,
@@ -7890,6 +7926,8 @@ async fn deferred_continuations_can_be_cancelled_once() {
             None,
             Some(60),
             None,
+            None,
+            None,
         )
         .await
         .unwrap()
@@ -7909,6 +7947,605 @@ async fn deferred_continuations_can_be_cancelled_once() {
             .cancel_session_continuation(&continuation.id)
             .await
             .is_err()
+    );
+    let replay = engine.replay_session(&session.id).await.unwrap();
+    assert!(replay.continuations_match, "{:?}", replay.mismatches);
+    assert!(replay.consistent, "{:?}", replay.mismatches);
+}
+
+#[tokio::test]
+async fn recurring_continuation_delivery_schedules_child_waits_for_interval_and_stops_at_max_runs()
+{
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("recurring continuation".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "recurring".into(), None)
+        .await
+        .unwrap();
+    engine
+        .set_team_plan(&session.id, &orchestration_test_plan())
+        .await
+        .unwrap();
+
+    assert!(
+        engine
+            .defer_session(
+                &session.id,
+                "too fast",
+                Vec::new(),
+                None,
+                None,
+                Some(60),
+                None,
+                Some(59),
+                None,
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        engine
+            .defer_session(
+                &session.id,
+                "too long",
+                Vec::new(),
+                None,
+                None,
+                Some(60),
+                None,
+                Some(crate::continuation::MAX_RECURRENCE_SECS + 1),
+                None,
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        engine
+            .defer_session(
+                &session.id,
+                "one run",
+                Vec::new(),
+                None,
+                None,
+                Some(60),
+                None,
+                Some(60),
+                Some(1),
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        engine
+            .defer_session(
+                &session.id,
+                "too many runs",
+                Vec::new(),
+                None,
+                None,
+                Some(60),
+                None,
+                Some(60),
+                Some(101),
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        engine
+            .defer_session(
+                &session.id,
+                "no interval",
+                Vec::new(),
+                None,
+                None,
+                Some(60),
+                None,
+                None,
+                Some(2),
+            )
+            .await
+            .is_err()
+    );
+
+    let created = engine
+        .defer_session(
+            &session.id,
+            "check the build",
+            vec!["T1".into()],
+            None,
+            None,
+            None,
+            None,
+            Some(60),
+            Some(2),
+        )
+        .await
+        .unwrap()
+        .continuation;
+    assert_eq!(created.status, "pending");
+    assert_eq!(created.series_id, created.id);
+    assert!(created.parent_continuation_id.is_none());
+    assert_eq!(created.recurrence_every_secs, Some(60));
+    assert_eq!(created.recurrence_max_runs, 2);
+    assert_eq!(created.run_count, 0);
+
+    engine.skip_plan_task(&session.id, "T1").await.unwrap();
+    engine
+        .mark_session_continuation_ready(&created.id, "watch", &[])
+        .await
+        .unwrap()
+        .unwrap();
+    engine
+        .claim_session_continuation(&created.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let delivered = engine
+        .mark_session_continuation_delivered(&created.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivered.status, "delivered");
+    assert_eq!(delivered.run_count, 1);
+    assert_eq!(delivered.recurrence_max_runs, 2);
+    assert!(delivered.delivered_at.is_some());
+
+    let rows = engine
+        .session_continuations(&session.id, None, Some(10))
+        .await
+        .unwrap()
+        .continuations;
+    assert_eq!(rows.len(), 2, "exactly one child was created");
+    let child = rows
+        .iter()
+        .find(|row| row.parent_continuation_id.as_deref() == Some(created.id.as_str()))
+        .expect("child continuation exists");
+    assert_eq!(child.status, "pending");
+    assert_eq!(child.watch_mode, "all");
+    assert!(child.watch_task_ids.is_empty());
+    assert_eq!(child.series_id, created.series_id);
+    assert_eq!(child.run_count, 1);
+    assert_eq!(child.recurrence_every_secs, Some(60));
+    assert_eq!(child.recurrence_max_runs, 2);
+    assert_eq!(child.body, created.body);
+    let child_deadline = time::OffsetDateTime::parse(
+        child.deadline_at.as_deref().unwrap(),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    let now = time::OffsetDateTime::now_utc();
+    assert!(child_deadline > now + time::Duration::seconds(50));
+    assert!(child_deadline <= now + time::Duration::seconds(70));
+
+    // The original watch task is terminal, but the child has no watch ids, so
+    // it can only wake on its own future deadline.
+    let tasks = engine
+        .task_queue(None, Some(session.id.clone()))
+        .await
+        .unwrap()
+        .tasks;
+    assert!(
+        crate::continuation::evaluate_wake(
+            &child.watch_task_ids,
+            &child.watch_mode,
+            child.deadline_at.as_deref(),
+            &tasks,
+            now,
+        )
+        .is_none()
+    );
+
+    let events = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    let scheduled = events
+        .iter()
+        .filter(|event| event.kind == "session.continuation.scheduled")
+        .collect::<Vec<_>>();
+    assert_eq!(scheduled.len(), 1);
+    let payload = scheduled[0].payload.clone();
+    let scheduled_child: SessionContinuation = serde_json::from_value(payload).unwrap();
+    assert_eq!(scheduled_child, *child);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "session.continuation.delivered")
+            .count(),
+        1
+    );
+    let delivered_event = events
+        .iter()
+        .find(|event| event.kind == "session.continuation.delivered")
+        .unwrap();
+    let delivered_payload: SessionContinuation =
+        serde_json::from_value(delivered_event.payload.clone()).unwrap();
+    assert_eq!(delivered_payload.run_count, 1);
+    assert_eq!(delivered_payload.series_id, created.series_id);
+
+    // Repeated delivery of the same row is idempotent: no duplicate child and
+    // no duplicate events.
+    assert!(
+        engine
+            .mark_session_continuation_delivered(&created.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let rows = engine
+        .session_continuations(&session.id, None, Some(10))
+        .await
+        .unwrap()
+        .continuations;
+    assert_eq!(rows.len(), 2);
+    let events = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "session.continuation.scheduled")
+            .count(),
+        1
+    );
+
+    let replay = engine.replay_session(&session.id).await.unwrap();
+    assert!(replay.continuations_match, "{:?}", replay.mismatches);
+    assert!(replay.consistent, "{:?}", replay.mismatches);
+
+    // The second delivered run reaches max_runs and must not schedule a third.
+    engine
+        .mark_session_continuation_ready(&child.id, "deadline", &[])
+        .await
+        .unwrap()
+        .unwrap();
+    engine
+        .claim_session_continuation(&child.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let second = engine
+        .mark_session_continuation_delivered(&child.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.status, "delivered");
+    assert_eq!(second.run_count, 2);
+    let rows = engine
+        .session_continuations(&session.id, None, Some(10))
+        .await
+        .unwrap()
+        .continuations;
+    assert_eq!(rows.len(), 2, "max_runs stops the chain");
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "session.continuation.scheduled")
+            .count(),
+        1
+    );
+    let replay = engine.replay_session(&session.id).await.unwrap();
+    assert!(replay.continuations_match, "{:?}", replay.mismatches);
+    assert!(replay.consistent, "{:?}", replay.mismatches);
+}
+
+#[tokio::test]
+async fn cancelling_one_recurring_row_leaves_the_other_rows_untouched() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("recurring cancel".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "recurring cancel".into(), None)
+        .await
+        .unwrap();
+    let created = engine
+        .defer_session(
+            &session.id,
+            "cancel one run",
+            Vec::new(),
+            None,
+            None,
+            Some(60),
+            None,
+            Some(60),
+            Some(3),
+        )
+        .await
+        .unwrap()
+        .continuation;
+    engine
+        .mark_session_continuation_ready(&created.id, "deadline", &[])
+        .await
+        .unwrap()
+        .unwrap();
+    engine
+        .claim_session_continuation(&created.id)
+        .await
+        .unwrap()
+        .unwrap();
+    engine
+        .mark_session_continuation_delivered(&created.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let rows = engine
+        .session_continuations(&session.id, None, Some(10))
+        .await
+        .unwrap()
+        .continuations;
+    let child = rows
+        .iter()
+        .find(|row| row.id != created.id)
+        .unwrap()
+        .clone();
+    let cancelled = engine.cancel_session_continuation(&child.id).await.unwrap();
+    assert!(cancelled.cancelled);
+    assert_eq!(cancelled.continuation.status, "cancelled");
+
+    let rows = engine
+        .session_continuations(&session.id, None, Some(10))
+        .await
+        .unwrap()
+        .continuations;
+    assert_eq!(rows.len(), 2);
+    let parent = rows.iter().find(|row| row.id == created.id).unwrap();
+    assert_eq!(parent.status, "delivered");
+    assert_eq!(parent.run_count, 1);
+    let child = rows.iter().find(|row| row.id == child.id).unwrap();
+    assert_eq!(child.status, "cancelled");
+    assert_eq!(child.run_count, 1);
+    assert!(
+        engine
+            .store()
+            .list_open_session_continuations()
+            .unwrap()
+            .is_empty()
+    );
+    let replay = engine.replay_session(&session.id).await.unwrap();
+    assert!(replay.continuations_match, "{:?}", replay.mismatches);
+    assert!(replay.consistent, "{:?}", replay.mismatches);
+}
+
+#[tokio::test]
+async fn recurring_continuation_bundle_repair_and_db_rebuild_fold_scheduled_children() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    {
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("recurring rebuild".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id, "recurring rebuild".into(), None)
+            .await
+            .unwrap();
+        let created = engine
+            .defer_session(
+                &session.id,
+                "recurring rebuild body",
+                Vec::new(),
+                None,
+                None,
+                Some(60),
+                None,
+                Some(120),
+                Some(4),
+            )
+            .await
+            .unwrap()
+            .continuation;
+        engine
+            .mark_session_continuation_ready(&created.id, "deadline", &[])
+            .await
+            .unwrap()
+            .unwrap();
+        engine
+            .claim_session_continuation(&created.id)
+            .await
+            .unwrap()
+            .unwrap();
+        engine
+            .mark_session_continuation_delivered(&created.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let rows = engine
+            .session_continuations(&session.id, None, Some(10))
+            .await
+            .unwrap()
+            .continuations;
+        assert_eq!(rows.len(), 2);
+        let child = rows
+            .iter()
+            .find(|row| row.id != created.id)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            child.parent_continuation_id.as_deref(),
+            Some(created.id.as_str())
+        );
+
+        let replay = engine.replay_session(&session.id).await.unwrap();
+        assert!(replay.continuations_match, "{:?}", replay.mismatches);
+
+        // Drop the projection and prove repair rebuilds both rows from events.
+        engine
+            .store()
+            .replace_session_continuations(&session.id, &[])
+            .unwrap();
+        let drifted = engine.replay_session(&session.id).await.unwrap();
+        assert!(!drifted.continuations_match);
+        let repaired = engine.repair_session(&session.id).await.unwrap();
+        assert!(repaired.continuations_match, "{:?}", repaired.mismatches);
+        assert!(repaired.consistent, "{:?}", repaired.mismatches);
+        let rebuilt = engine.rebuild_session(&session.id).await.unwrap();
+        assert!(rebuilt.continuations_match, "{:?}", rebuilt.mismatches);
+
+        let bundle = engine.export_session(&session.id).await.unwrap();
+        assert_eq!(bundle.continuations.len(), 2);
+        let bundled_child = bundle
+            .continuations
+            .iter()
+            .find(|row| row.id == child.id)
+            .unwrap();
+        assert_eq!(bundled_child.run_count, 1);
+        assert_eq!(bundled_child.recurrence_every_secs, Some(120));
+        assert_eq!(bundled_child.recurrence_max_runs, 4);
+        assert_eq!(bundled_child.series_id, created.series_id);
+
+        let import_data = TempDir::new().unwrap();
+        let imported_engine = Engine::new(Store::open(import_data.path()).unwrap());
+        imported_engine.import_session(bundle).await.unwrap();
+        let imported = imported_engine
+            .session_continuations(&session.id, None, Some(10))
+            .await
+            .unwrap()
+            .continuations;
+        assert_eq!(imported.len(), 2);
+        let imported_child = imported.iter().find(|row| row.id == child.id).unwrap();
+        assert_eq!(
+            imported_child.parent_continuation_id.as_deref(),
+            Some(created.id.as_str())
+        );
+        assert_eq!(imported_child.run_count, 1);
+        assert_eq!(imported_child.series_id, created.series_id);
+
+        engine.record_project_manifest().await.unwrap();
+    }
+
+    let report = crate::rebuild::rebuild_database(data.path(), false)
+        .await
+        .unwrap();
+    assert_eq!(report.projects, 1);
+    assert_eq!(report.sessions, 1);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    let store = Store::open(data.path()).unwrap();
+    let sessions = store.list_sessions(None).unwrap();
+    assert_eq!(sessions.len(), 1);
+    let rows = store
+        .list_session_continuations(&sessions[0].id, None, Some(10))
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let delivered = rows.iter().find(|row| row.status == "delivered").unwrap();
+    assert_eq!(delivered.run_count, 1);
+    assert_eq!(delivered.recurrence_every_secs, Some(120));
+    assert_eq!(delivered.recurrence_max_runs, 4);
+    assert_eq!(delivered.series_id, delivered.id);
+    let child = rows.iter().find(|row| row.status == "pending").unwrap();
+    assert_eq!(
+        child.parent_continuation_id.as_deref(),
+        Some(delivered.id.as_str())
+    );
+    assert_eq!(child.run_count, 1);
+    assert_eq!(child.series_id, delivered.series_id);
+    assert!(child.watch_task_ids.is_empty());
+}
+
+#[tokio::test]
+async fn recurring_continuation_crash_before_delivery_fails_closed_without_child() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("recurring crash".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "crash".into(), None)
+        .await
+        .unwrap();
+    engine
+        .set_team_plan(&session.id, &orchestration_test_plan())
+        .await
+        .unwrap();
+    let created = engine
+        .defer_session(
+            &session.id,
+            "crash before delivery",
+            vec!["T1".into()],
+            None,
+            None,
+            None,
+            None,
+            Some(60),
+            Some(3),
+        )
+        .await
+        .unwrap()
+        .continuation;
+    engine.skip_plan_task(&session.id, "T1").await.unwrap();
+    engine
+        .mark_session_continuation_ready(&created.id, "watch", &[])
+        .await
+        .unwrap()
+        .unwrap();
+    engine
+        .claim_session_continuation(&created.id)
+        .await
+        .unwrap()
+        .unwrap();
+    engine.recover_interrupted_sessions().await.unwrap();
+
+    let rows = engine
+        .session_continuations(&session.id, None, Some(10))
+        .await
+        .unwrap()
+        .continuations;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "failed");
+    assert_eq!(rows[0].run_count, 0);
+    assert!(
+        rows[0]
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("daemon restarted while delivering")
+    );
+    let events = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "session.continuation.delivered")
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "session.continuation.scheduled")
     );
     let replay = engine.replay_session(&session.id).await.unwrap();
     assert!(replay.continuations_match, "{:?}", replay.mismatches);

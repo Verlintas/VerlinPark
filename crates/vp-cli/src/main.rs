@@ -743,6 +743,13 @@ enum Command {
         /// Absolute RFC3339 deadline.
         #[arg(long)]
         at: Option<String>,
+        /// Repeat every N seconds after a successful delivery (60..=2592000).
+        /// The first wake still needs a watch task or deadline.
+        #[arg(long)]
+        every_secs: Option<u64>,
+        /// Maximum delivered runs in the recurrence series (2..=100, default 10).
+        #[arg(long)]
+        max_runs: Option<u32>,
     },
     /// List deferred continuations for a session.
     Continuations {
@@ -2425,6 +2432,8 @@ async fn main() -> Result<()> {
             watch_mode,
             after_secs,
             at,
+            every_secs,
+            max_runs,
         } => {
             rpc(
                 &discovery,
@@ -2436,6 +2445,8 @@ async fn main() -> Result<()> {
                     "watch_mode": watch_mode,
                     "after_secs": after_secs,
                     "deadline_at": at,
+                    "every_secs": every_secs,
+                    "max_runs": max_runs,
                 }),
             )
             .await?
@@ -3549,6 +3560,57 @@ fn read_json_input(file: Option<&std::path::Path>) -> Result<String> {
 }
 
 fn print_human(value: &Value) {
+    if value.as_object().is_some_and(|object| {
+        object.len() == 2
+            && object.contains_key("session_id")
+            && object.contains_key("continuations")
+    }) && let Some(continuations) = value.get("continuations").and_then(Value::as_array)
+    {
+        if continuations.is_empty() {
+            println!("No continuations.");
+            return;
+        }
+        for continuation in continuations {
+            let id = continuation["id"].as_str().unwrap_or("?");
+            let series = continuation["series_id"]
+                .as_str()
+                .filter(|series| !series.is_empty())
+                .unwrap_or(id);
+            let run_count = continuation["run_count"].as_u64().unwrap_or(0);
+            let max_runs = continuation["recurrence_max_runs"].as_u64().unwrap_or(1);
+            let mut header = format!(
+                "{id}  {}  run {run_count}/{max_runs}  series {series}",
+                continuation["status"].as_str().unwrap_or("?")
+            );
+            if let Some(every_secs) = continuation["recurrence_every_secs"].as_u64() {
+                header.push_str(&format!("  every {every_secs}s"));
+            }
+            println!("{header}");
+            if let Some(deadline) = continuation["deadline_at"].as_str() {
+                println!("  deadline {deadline}");
+            }
+            let watch = continuation["watch_task_ids"]
+                .as_array()
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            if !watch.is_empty() {
+                println!(
+                    "  watch {}: {watch}",
+                    continuation["watch_mode"].as_str().unwrap_or("all")
+                );
+            }
+            if let Some(error) = continuation["last_error"].as_str() {
+                println!("  {error}");
+            }
+            println!("  {}", continuation["body"].as_str().unwrap_or(""));
+        }
+        return;
+    }
     if let Some(session_id) = value.get("session_id").and_then(Value::as_str)
         && value.get("goal").is_none()
         && let Some(unlimited) = value.get("unlimited").and_then(Value::as_bool)

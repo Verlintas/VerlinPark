@@ -3776,12 +3776,16 @@ impl AgentService {
                 continue;
             };
             let reason = continuation.wake_reason.as_deref().unwrap_or("watch");
-            let prompt = crate::continuation::render_prompt(
-                &continuation.id,
-                &continuation.body,
+            let prompt = crate::continuation::render_prompt(&crate::continuation::PromptContext {
+                id: &continuation.id,
+                series_id: &continuation.series_id,
+                run_count: continuation.run_count,
+                recurrence_every_secs: continuation.recurrence_every_secs,
+                recurrence_max_runs: continuation.recurrence_max_runs,
+                body: &continuation.body,
                 reason,
-                &continuation.outcomes,
-            );
+                outcomes: &continuation.outcomes,
+            });
             match self.start(&continuation.session_id, &prompt).await {
                 Ok(()) => {
                     self.engine

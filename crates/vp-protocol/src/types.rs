@@ -4061,6 +4061,25 @@ pub struct SessionContinuation {
     pub delivered_at: Option<String>,
     #[serde(default)]
     pub updated_at: String,
+    /// Stable id shared by every run in a recurrence series. Empty means the
+    /// row predates recurrence and behaves as a one-shot whose series is its
+    /// own id.
+    #[serde(default)]
+    pub series_id: String,
+    /// Previous run in the series, if this row was created by a delivery.
+    #[serde(default)]
+    pub parent_continuation_id: Option<String>,
+    /// Interval between delivered runs. Absent means one-shot.
+    #[serde(default)]
+    pub recurrence_every_secs: Option<u64>,
+    /// Maximum number of delivered runs in the series, including the first.
+    /// Old rows default to one delivered run.
+    #[serde(default = "default_continuation_recurrence_max_runs")]
+    pub recurrence_max_runs: u32,
+    /// Delivered runs already completed before this row. A pending child starts
+    /// at the count of its parent, and delivery increments it.
+    #[serde(default)]
+    pub run_count: u32,
 }
 
 fn default_continuation_watch_mode() -> String {
@@ -4069,6 +4088,10 @@ fn default_continuation_watch_mode() -> String {
 
 fn default_continuation_max_attempts() -> u32 {
     3
+}
+
+fn default_continuation_recurrence_max_runs() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -4090,6 +4113,16 @@ pub struct SessionDeferParams {
     /// Small bounded start-attempt cap. Defaults to 3.
     #[serde(default)]
     pub max_attempts: Option<u32>,
+    /// Repeat the continuation every N seconds after a successful delivery.
+    /// Range 60..=2_592_000 (30 days). The first wake still requires a watched
+    /// task or a deadline.
+    #[serde(default)]
+    pub every_secs: Option<u64>,
+    /// Maximum delivered runs in the recurrence series, including the first.
+    /// Defaults to 10 when `every_secs` is set and must be 2..=100. One-shot
+    /// continuations omit it or pass 1.
+    #[serde(default)]
+    pub max_runs: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -4835,6 +4868,96 @@ pub struct OrchestrationSnapshotResult {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn session_continuation_decodes_legacy_rows_as_one_shot() {
+        let legacy: SessionContinuation = serde_json::from_value(json!({
+            "id": "cont-1",
+            "session_id": "ses-1",
+            "project_id": "prj-1",
+            "body": "follow up",
+            "watch_task_ids": ["T1"],
+            "watch_mode": "all",
+            "deadline_at": null,
+            "status": "delivered",
+            "attempts": 0,
+            "max_attempts": 3,
+            "wake_reason": "watch",
+            "outcomes": [],
+            "last_error": null,
+            "next_attempt_at": null,
+            "created_at": "2026-11-11T00:00:00Z",
+            "ready_at": "2026-11-11T00:01:00Z",
+            "delivered_at": "2026-11-11T00:02:00Z",
+            "updated_at": "2026-11-11T00:02:00Z"
+        }))
+        .unwrap();
+        assert!(legacy.series_id.is_empty());
+        assert!(legacy.parent_continuation_id.is_none());
+        assert!(legacy.recurrence_every_secs.is_none());
+        assert_eq!(legacy.recurrence_max_runs, 1);
+        assert_eq!(legacy.run_count, 0);
+
+        let recurring: SessionContinuation = serde_json::from_value(json!({
+            "id": "cont-2",
+            "session_id": "ses-1",
+            "project_id": "prj-1",
+            "body": "follow up",
+            "watch_task_ids": [],
+            "watch_mode": "all",
+            "deadline_at": "2026-11-11T01:00:00Z",
+            "status": "pending",
+            "attempts": 0,
+            "max_attempts": 3,
+            "wake_reason": null,
+            "outcomes": [],
+            "last_error": null,
+            "next_attempt_at": null,
+            "created_at": "2026-11-11T00:00:00Z",
+            "ready_at": null,
+            "delivered_at": null,
+            "updated_at": "2026-11-11T00:00:00Z",
+            "series_id": "cont-1",
+            "parent_continuation_id": "cont-1",
+            "recurrence_every_secs": 3600,
+            "recurrence_max_runs": 10,
+            "run_count": 1
+        }))
+        .unwrap();
+        assert_eq!(recurring.series_id, "cont-1");
+        assert_eq!(recurring.parent_continuation_id.as_deref(), Some("cont-1"));
+        assert_eq!(recurring.recurrence_every_secs, Some(3600));
+        assert_eq!(recurring.recurrence_max_runs, 10);
+        assert_eq!(recurring.run_count, 1);
+        let encoded = serde_json::to_value(&recurring).unwrap();
+        let decoded: SessionContinuation = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, recurring);
+    }
+
+    #[test]
+    fn session_defer_params_decode_legacy_and_recurrence_fields() {
+        let legacy: SessionDeferParams = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "body": "follow up",
+            "watch_task_ids": ["T1"]
+        }))
+        .unwrap();
+        assert!(legacy.after_secs.is_none());
+        assert!(legacy.max_attempts.is_none());
+        assert!(legacy.every_secs.is_none());
+        assert!(legacy.max_runs.is_none());
+
+        let recurring: SessionDeferParams = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "body": "follow up",
+            "watch_task_ids": ["T1"],
+            "every_secs": 3600,
+            "max_runs": 24
+        }))
+        .unwrap();
+        assert_eq!(recurring.every_secs, Some(3600));
+        assert_eq!(recurring.max_runs, Some(24));
+    }
 
     #[test]
     fn memory_items_decode_legacy_defaults_and_round_trip_provenance() {

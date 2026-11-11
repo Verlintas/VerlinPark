@@ -14,12 +14,80 @@ pub const MAX_WATCH_TASKS: usize = 100;
 pub const MAX_DEADLINE_SECS: i64 = 30 * 24 * 60 * 60;
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 pub const MAX_CONTEXT_NOTE_CHARS: usize = 2_000;
+/// Minimum interval between delivered runs in a recurrence series.
+pub const MIN_RECURRENCE_SECS: u64 = 60;
+/// Maximum interval between delivered runs in a recurrence series (30 days).
+pub const MAX_RECURRENCE_SECS: u64 = MAX_DEADLINE_SECS as u64;
+/// Default number of delivered runs when a series does not set `max_runs`.
+pub const DEFAULT_RECURRENCE_MAX_RUNS: u32 = 10;
+/// Hard cap on the number of delivered runs in one series.
+pub const MAX_RECURRENCE_RUNS: u32 = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakeEvaluation {
     /// `watch` or `deadline`.
     pub reason: String,
     pub outcomes: Vec<ContinuationOutcome>,
+}
+
+/// Normalized recurrence settings for a newly deferred continuation. A
+/// one-shot row keeps `every_secs = None` and `max_runs = 1`, which is also
+/// how rows created before recurrence decode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecurrenceSpec {
+    pub every_secs: Option<u64>,
+    pub max_runs: u32,
+}
+
+/// Validate the recurrence pair. The first wake is still an ordinary watch or
+/// deadline; `every_secs` only controls how the next run is created after a
+/// successful delivery.
+pub fn normalize_recurrence(
+    every_secs: Option<u64>,
+    max_runs: Option<u32>,
+) -> Result<RecurrenceSpec> {
+    match every_secs {
+        Some(every_secs) => {
+            if !(MIN_RECURRENCE_SECS..=MAX_RECURRENCE_SECS).contains(&every_secs) {
+                return Err(anyhow!(
+                    "recurrence interval must be {MIN_RECURRENCE_SECS}..={MAX_RECURRENCE_SECS} seconds (30 days)"
+                ));
+            }
+            let max_runs = max_runs.unwrap_or(DEFAULT_RECURRENCE_MAX_RUNS);
+            if !(2..=MAX_RECURRENCE_RUNS).contains(&max_runs) {
+                return Err(anyhow!(
+                    "recurrence max_runs must be 2..={MAX_RECURRENCE_RUNS} when every_secs is set"
+                ));
+            }
+            Ok(RecurrenceSpec {
+                every_secs: Some(every_secs),
+                max_runs,
+            })
+        }
+        None => {
+            if let Some(max_runs) = max_runs
+                && max_runs != 1
+            {
+                return Err(anyhow!(
+                    "max_runs requires every_secs; one-shot continuations use max_runs 1"
+                ));
+            }
+            Ok(RecurrenceSpec {
+                every_secs: None,
+                max_runs: 1,
+            })
+        }
+    }
+}
+
+/// A recurrence series is identified by its first row. Legacy rows have an
+/// empty `series_id` and are treated as a one-row series with their own id.
+pub fn series_id_for(continuation_id: &str, series_id: &str) -> String {
+    if series_id.is_empty() {
+        continuation_id.to_string()
+    } else {
+        series_id.to_string()
+    }
 }
 
 /// A watched task is settled once it reaches any terminal plan-task status.
@@ -162,24 +230,43 @@ pub fn snapshot_outcomes(
         .collect()
 }
 
-/// Render the operator prompt. The prefix is a bounded context note; the
+/// Inputs for the operator prompt. The prefix is a bounded context note; the
 /// deferred body follows as ordinary user content. Nothing here is injected
 /// into a system prompt.
-pub fn render_prompt(
-    id: &str,
-    body: &str,
-    reason: &str,
-    outcomes: &[ContinuationOutcome],
-) -> String {
+pub struct PromptContext<'a> {
+    pub id: &'a str,
+    pub series_id: &'a str,
+    pub run_count: u32,
+    pub recurrence_every_secs: Option<u64>,
+    pub recurrence_max_runs: u32,
+    pub body: &'a str,
+    pub reason: &'a str,
+    pub outcomes: &'a [ContinuationOutcome],
+}
+
+/// Render the operator prompt. The recurrence label is bounded like the rest
+/// of the context note; the number of children is bounded separately by
+/// `recurrence_max_runs`.
+pub fn render_prompt(context: &PromptContext<'_>) -> String {
     let mut note = format!(
         "[Deferred continuation #{}]\nDeferred reason: {}\n",
-        id, reason
+        context.id, context.reason
     );
-    if outcomes.is_empty() {
+    if let Some(every_secs) = context.recurrence_every_secs {
+        let series = series_id_for(context.id, context.series_id);
+        note.push_str(&format!(
+            "Recurring series: {} · run {}/{} · every {}s\n",
+            truncate_chars(&series, 80),
+            context.run_count.saturating_add(1),
+            context.recurrence_max_runs.max(1),
+            every_secs
+        ));
+    }
+    if context.outcomes.is_empty() {
         note.push_str("Watched tasks: none\n");
     } else {
         note.push_str("Watched tasks:\n");
-        for outcome in outcomes {
+        for outcome in context.outcomes {
             let title = truncate_chars(&outcome.title, 120);
             if title.is_empty() {
                 note.push_str(&format!("- {}: {}\n", outcome.task_id, outcome.status));
@@ -193,7 +280,7 @@ pub fn render_prompt(
     }
     note = truncate_chars(&note, MAX_CONTEXT_NOTE_CHARS);
     note.push_str("\nOperator prompt:\n");
-    note.push_str(body);
+    note.push_str(context.body);
     note
 }
 
@@ -207,4 +294,69 @@ fn truncate_chars(value: &str, limit: usize) -> String {
         .collect::<String>();
     truncated.push('…');
     truncated
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recurrence_defaults_bounds_and_one_shot_compatibility() {
+        assert_eq!(
+            normalize_recurrence(None, None).unwrap(),
+            RecurrenceSpec {
+                every_secs: None,
+                max_runs: 1
+            }
+        );
+        assert_eq!(
+            normalize_recurrence(None, Some(1)).unwrap(),
+            RecurrenceSpec {
+                every_secs: None,
+                max_runs: 1
+            }
+        );
+        assert!(normalize_recurrence(None, Some(2)).is_err());
+        assert!(normalize_recurrence(Some(59), None).is_err());
+        assert!(normalize_recurrence(Some(MAX_RECURRENCE_SECS + 1), None).is_err());
+        assert_eq!(
+            normalize_recurrence(Some(60), None).unwrap(),
+            RecurrenceSpec {
+                every_secs: Some(60),
+                max_runs: DEFAULT_RECURRENCE_MAX_RUNS
+            }
+        );
+        assert_eq!(
+            normalize_recurrence(Some(MAX_RECURRENCE_SECS), Some(2))
+                .unwrap()
+                .max_runs,
+            2
+        );
+        assert!(normalize_recurrence(Some(60), Some(1)).is_err());
+        assert!(normalize_recurrence(Some(60), Some(101)).is_err());
+        assert_eq!(
+            normalize_recurrence(Some(60), Some(100)).unwrap().max_runs,
+            100
+        );
+    }
+
+    #[test]
+    fn recurrence_prompt_label_is_bounded_and_marks_series_run() {
+        let body = "x".repeat(MAX_BODY_CHARS);
+        let prompt = render_prompt(&PromptContext {
+            id: "cont-2",
+            series_id: "cont-1",
+            run_count: 2,
+            recurrence_every_secs: Some(3_600),
+            recurrence_max_runs: 10,
+            body: &body,
+            reason: "deadline",
+            outcomes: &[],
+        });
+        assert!(prompt.starts_with("[Deferred continuation #cont-2]"));
+        assert!(prompt.contains("Recurring series: cont-1 · run 3/10 · every 3600s"));
+        assert!(prompt.ends_with(&body));
+        let note = prompt.split("\nOperator prompt:\n").next().unwrap();
+        assert!(note.chars().count() <= MAX_CONTEXT_NOTE_CHARS);
+    }
 }

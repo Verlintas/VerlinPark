@@ -63,8 +63,8 @@ use vp_protocol::types::{
 };
 use vp_store::Store;
 use vp_store::store::{
-    DeliveredSteering, MemoryCandidate, NewIntakeTask, NewMemory, SessionRepair, SourceSearchQuery,
-    SourceSnapshot,
+    DeliveredSteering, MemoryCandidate, NewIntakeTask, NewMemory, NewSessionContinuation,
+    SessionRepair, SourceSearchQuery, SourceSnapshot,
 };
 
 use crate::budget::BudgetRegistry;
@@ -4911,9 +4911,12 @@ impl Engine {
         deadline_at: Option<&str>,
         after_secs: Option<u64>,
         max_attempts: Option<u32>,
+        every_secs: Option<u64>,
+        max_runs: Option<u32>,
     ) -> Result<SessionDeferResult> {
         let body = crate::continuation::validate_body(body)?;
         let watch_mode = crate::continuation::normalize_watch_mode(watch_mode)?;
+        let recurrence = crate::continuation::normalize_recurrence(every_secs, max_runs)?;
         let store = self.store.clone();
         let id = session_id.to_string();
         let session = tokio::task::spawn_blocking(move || store.get_session(&id))
@@ -4993,15 +4996,20 @@ impl Engine {
         let project_id = session.project_id.clone();
         let max_attempts = crate::continuation::normalize_max_attempts(max_attempts);
         let (continuation, event) = tokio::task::spawn_blocking(move || {
-            store.create_session_continuation_with_event(
-                &session_id,
-                &project_id,
-                &body,
-                &watch_task_ids,
-                &watch_mode,
-                deadline_at.as_deref(),
+            store.create_session_continuation_with_event(&NewSessionContinuation {
+                session_id,
+                project_id,
+                body,
+                watch_task_ids,
+                watch_mode,
+                deadline_at,
                 max_attempts,
-            )
+                series_id: None,
+                parent_continuation_id: None,
+                recurrence_every_secs: recurrence.every_secs,
+                recurrence_max_runs: recurrence.max_runs,
+                run_count: 0,
+            })
         })
         .await??;
         let _ = self.events.send(event);
@@ -5109,11 +5117,13 @@ impl Engine {
             store.mark_session_continuation_delivered_with_event(&id)
         })
         .await??;
-        let Some((continuation, event)) = result else {
+        let Some(delivery) = result else {
             return Ok(None);
         };
-        let _ = self.events.send(event);
-        Ok(Some(continuation))
+        for event in delivery.events {
+            let _ = self.events.send(event);
+        }
+        Ok(Some(delivery.delivered))
     }
 
     pub async fn retry_session_continuation(
@@ -12152,6 +12162,7 @@ fn replay_continuations(events: &[Event]) -> Vec<SessionContinuation> {
                 | "session.continuation.delivering"
                 | "session.continuation.retrying"
                 | "session.continuation.delivered"
+                | "session.continuation.scheduled"
                 | "session.continuation.cancelled"
                 | "session.continuation.failed"
         ) {

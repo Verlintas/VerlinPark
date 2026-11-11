@@ -1680,6 +1680,8 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                     params.deadline_at.as_deref(),
                     params.after_secs,
                     params.max_attempts,
+                    params.every_secs,
+                    params.max_runs,
                 )
                 .await
             {

@@ -1102,6 +1102,55 @@ fn migrates_legacy_sessions_table_with_worktree_columns() {
 }
 
 #[test]
+fn migrates_legacy_continuation_rows_as_one_shot() {
+    let data = TempDir::new().unwrap();
+    {
+        let conn = Connection::open(data.path().join("verlinpark.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_continuations (
+                    id              TEXT PRIMARY KEY,
+                    session_id      TEXT NOT NULL,
+                    project_id      TEXT NOT NULL,
+                    body            TEXT NOT NULL,
+                    watch_task_ids  TEXT NOT NULL DEFAULT '[]',
+                    watch_mode      TEXT NOT NULL DEFAULT 'all',
+                    deadline_at     TEXT,
+                    status          TEXT NOT NULL,
+                    attempts        INTEGER NOT NULL DEFAULT 0,
+                    max_attempts    INTEGER NOT NULL DEFAULT 3,
+                    wake_reason     TEXT,
+                    outcomes        TEXT NOT NULL DEFAULT '[]',
+                    last_error      TEXT,
+                    next_attempt_at TEXT,
+                    created_at      TEXT NOT NULL,
+                    ready_at        TEXT,
+                    delivered_at    TEXT,
+                    updated_at      TEXT NOT NULL
+                );
+                INSERT INTO session_continuations
+                    (id, session_id, project_id, body, watch_task_ids, watch_mode, status,
+                     created_at, updated_at)
+                VALUES ('legacy-cont', 'legacy-session', 'legacy-project', 'legacy body', '[]',
+                        'all', 'pending', '2026-11-11T00:00:00Z', '2026-11-11T00:00:00Z');",
+        )
+        .unwrap();
+    }
+    let store = Store::open(data.path()).unwrap();
+    let rows = store
+        .list_session_continuations("legacy-session", None, Some(10))
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.id, "legacy-cont");
+    assert!(row.series_id.is_empty());
+    assert!(row.parent_continuation_id.is_none());
+    assert!(row.recurrence_every_secs.is_none());
+    assert_eq!(row.recurrence_max_runs, 1);
+    assert_eq!(row.run_count, 0);
+    assert_eq!(row.status, "pending");
+}
+
+#[test]
 fn migrates_legacy_agents_without_losing_rows() {
     let data = TempDir::new().unwrap();
     let db_path = data.path().join("verlinpark.db");
