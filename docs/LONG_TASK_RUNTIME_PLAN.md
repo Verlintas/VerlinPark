@@ -1,12 +1,23 @@
 # Long-Task Runtime Plan — durable, remote, programmatic, native
 
-> **Status:** active implementation plan.
+> **Status:** implemented (2026-11-11); this file remains the design record.
 > **Created:** 2026-11-11
 > **Goal:** make VerlinPark survive process death, remote workspaces, and
 > multi-milestone programs, and add native macOS computer control.
 > **Budget:** one large round, target +30,000 net lines of production code and
 > tests. No filler; each module must be complete enough to operate, fail closed,
 > and be replayed/audited.
+>
+> **Result:** R1–R4 landed as seven commits on `main` (`5208270`, `191ec56`,
+> `6298fc0`, `315ecf7`, `0d75274`, `7e4a7ba`, `a504e10`), with `git diff --stat
+> c615f72..HEAD --` showing **42,176 insertions / 1,715 deletions** before the
+> documentation close-out. Rust coverage is **932 passing tests** (636 core,
+> 98 store, 73 remote, 32 remote-agent stdio, 31 protocol, 18 provider, 14
+> jail-contract, 12 wire-contract, 6 remote-agent unit, 4 CLI, 4 daemon, 4
+> remote-host) with 5 ignored; Swift is **170 app tests plus 116
+> computer-helper tests**. All gates remain intact. The implementation and its
+> limitations are described in ADR-0155–0158 and `PROGRESS.md`; the modules are
+> not stubs, but the explicit limits below still apply.
 
 ---
 
@@ -236,6 +247,21 @@ dispatch, Swift packaging, tests, ADR-0158.
 
 Integration order: **R1 → R2 → R3 → R4**. Resolve additive protocol/daemon
 conflicts in that order; never rewrite another module's tables or events.
+
+## 4.1 Implementation record (2026-11-11)
+
+| Workstream | Landed code | Operator surface | Limits that remain |
+|---|---|---|---|
+| R1 durable runs | `vp-core/src/run_journal.rs`, `session_runs` / `run_steps` / `run_tool_calls` / `run_checkpoints`, project `SessionRunPolicy` | `session.runs`, `session.run.detail/resume/cancel`, `session.run.policy.*`, `vp runs` / `run-*` | Top-level Leader runs only for ad-hoc resume; no provider-call exactly-once or mid-stream resume; task-scoped runs use plan retry; imported archives not resumable |
+| R2 remote | `vp-remote`, `vp-remote-agent`, `ExecutionHost`, six explicit tools | `host.*`, `remote.status`, `remote.worktree_list`, `remote.ledger`, `vp host-*` / `remote-*` | Helper must be pre-installed; SSH/user trust is the boundary; no remote daemon/port, cross-host scheduler, or automatic merge of remote worktrees; remote exec is not Seatbelt-confined |
+| R3 programs | `vp-core/src/program.rs`, `programs` / `program_milestones` / `program_milestone_sessions`, deterministic controller | `program.*`, `program.tick`, `vp program-*`, Manage Dash Programs card | No LLM program planner, no cross-project program, no distributed fencing; program budget is not a global pre-flight reservation, but milestone budgets are cumulative across retries |
+| R4 computer | Packaged `VerlinParkComputerHelper`, `vp-core/src/computer.rs`, `computer` tool, ComputerLease | `computer.status`, agent `computer`, helper README/manual smoke | Not sandboxed; manual Accessibility/Screen Recording TCC grants; AX trees/refs vary by app; screenshots are artifacts; no menu-bar walker, AppleScript, clipboard, URL opener, or shell path |
+
+The four modules are additive and preserve the existing gates. The
+`execution_host`, program ledger, and run-journal projections are covered by
+replay/repair/bundle/`db-rebuild` to the extent explicitly described in the
+ADRs; operational tool outcomes and `plan_task_progress` remain operational
+state, not replayable state.
 
 ## 5. Acceptance
 

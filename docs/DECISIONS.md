@@ -164,6 +164,10 @@
 | [0152](adr/0152-read-only-scout-agent.md) | Read-only Scout agent for fresh-context exploration with no worktree or merge | Accepted | Runtime/Agent |
 | [0153](adr/0153-cache-and-preamble-telemetry.md) | Derived cache hit ratio, session cache status, and heuristic preamble telemetry | Accepted | Runtime/Observability |
 | [0154](adr/0154-efficiency-dashboard.md) | macOS Efficiency card and Stage cache-hit surface | Accepted | macOS |
+| [0155](adr/0155-durable-run-journal.md) | Durable provider/tool journal, crash resume preflight, duplicate-write hard block, unknown-outcome reporting | Accepted | Runtime/Store/Protocol |
+| [0156](adr/0156-remote-workspaces.md) | Explicit SSH/stdio remote workspaces with path jail, atomic writes, bounded exec, and remote worktrees | Accepted | Runtime/Protocol/Security |
+| [0157](adr/0157-project-programs-and-milestones.md) | Project-scoped programs, deterministic milestone controller, dependency/budget/retry policy, Manage Dash ledger | Accepted | Runtime/Store/macOS |
+| [0158](adr/0158-native-macos-computer-control.md) | Accessibility/CGEvent/ScreenCaptureKit helper and risk-classified `computer` tool under ComputerLease | Accepted | Runtime/macOS |
 
 ---
 

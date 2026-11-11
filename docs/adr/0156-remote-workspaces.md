@@ -76,7 +76,10 @@ Auth tokens never enter SQLite or the project manifest. `ExecutionHost`
 stores `token_env`, the name of a daemon environment variable, and optionally
 `token_file`, the remote file the helper reads. The daemon must have the token
 in its environment to authenticate; the remote helper may read the same token
-from a `0600` file. Token values are never logged.
+from a `0600` file. Because OpenSSH does not forward arbitrary environment
+variables, a helper launched with only `--token-env` falls back to
+`~/.verlinpark/remote-token` (mode `0600`) when the named variable is absent;
+an explicit `--token-file` is authoritative. Token values are never logged.
 
 ### 3. Every path is resolved through a canonical root jail
 

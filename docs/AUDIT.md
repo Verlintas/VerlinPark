@@ -452,7 +452,7 @@ Swift 对应拆成 `CollabView`、`PlanBoardView`、`PreviewView`、`OrgPresetSh
 
 ### P2-12：测试覆盖缺口
 
-已有 618 个 Rust 测试 + 163 个 Swift 测试，覆盖 Leader loop、provider probe/retry/idle timeout/stream retry before output/partial usage settlement/context compaction/model-aware context limits/rolling trim/active-request accounting/context usage status/provider-usage calibration/manual context compaction/session checkpoint-fork/checkpoint-retention/checkpoint-policy-sweep/fork-lineage-compare/fork-merge-back/recursive-fork-tree/project-fork-forest-audit/checkpoint-diff-restore/checkpoint-stats/verified-update-download/model-preset-catalog/dashboard-snapshot/motion-interaction-system/UTF-8-safe truncation、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、session/task/department/project 预算、恢复、pause/resume、queued session 恢复、shell 沙箱/policy/home read jail、process group 清理、agent-assisted conflict resolution、opt-in auto-resolve policy、priority-aware aging global session admission、persistent task-DAG queue/global write leases/project-level auto-resume policy/per-task dispatch、cross-session scope locks、priority-aware aging task+session global Worker/Labour capacity/budget-gated plan auto-expansion、per-role models/USD/time budgets、per-call usage ledger 与 replay/repair、mailbox retention、project memory（delete/prune/FTS/replay/retention policy）、mid-run questions、MCP stdio/HTTP/SSE（Streamable HTTP + legacy SSE、session/protocol headers、same-origin/secret-header policy、probe/persistent/pagination/resources/prompts/dynamic tools）、ACP stdio（initialize/session/new/prompt/permission/update/timeout/probe/Worker integration）、sandboxed console、PTY terminal、workspace files/edit、Git history、artifact replay/repair、content-addressed blobs 与 GC、approval replay/repair、event mirror restore、search FTS5-prefix/filter/rebuild、transcript、plan batch abort、plan resume、usage CSV、project usage、worktree retention、diff parser、OpenAI+Anthropic HTTP adapter E2E、db rebuild、dynamic Collab tree/task ownership/coordination tools、orchestration controller/retry gates/dependency policy/preview/overview、persisted coordination/decision projections/targeted mailbox delivery、revision detail/restore/task edit、runtime session/integration leases、crash-safe pre-merge recovery、role-aware context compaction、evidence-backed task_result memory/lifecycle/verify/supersede、path-scoped approval grants/quiet routine tools、Preview Showcase/recursive file tabs、preset-first setup wizard、Collab live strip/Ops tabs、essential Manage Dash、long-task operator console、memory conflict review/health、verifier/integration capture、lease expiry timestamp comparison、daemon Prometheus metrics、recurring continuations、Gitea/Forgejo PR、rich artifact preview、backup/restore、cache hit-ratio/preamble telemetry、read-only Scout、idempotent operation receipts、efficiency dashboard。仍缺：
+已有 932 个 Rust 测试 + 286 个 Swift 测试（170 app + 116 computer helper），覆盖 Leader loop、provider probe/retry/idle timeout/stream retry before output/partial usage settlement/context compaction/model-aware context limits/rolling trim/active-request accounting/context usage status/provider-usage calibration/manual context compaction/session checkpoint-fork/checkpoint-retention/checkpoint-policy-sweep/fork-lineage-compare/fork-merge-back/recursive-fork-tree/project-fork-forest-audit/checkpoint-diff-restore/checkpoint-stats/verified-update-download/model-preset-catalog/dashboard-snapshot/motion-interaction-system/UTF-8-safe truncation、delegation、task worktree、parallel scope、Verifier、TeamPlan、roundtable、session/task/department/project 预算、恢复、pause/resume、queued session 恢复、shell 沙箱/policy/home read jail、process group 清理、agent-assisted conflict resolution、opt-in auto-resolve policy、priority-aware aging global session admission、persistent task-DAG queue/global write leases/project-level auto-resume policy/per-task dispatch、cross-session scope locks、priority-aware aging task+session global Worker/Labour capacity/budget-gated plan auto-expansion、per-role models/USD/time budgets、per-call usage ledger 与 replay/repair、mailbox retention、project memory（delete/prune/FTS/replay/retention policy）、mid-run questions、MCP stdio/HTTP/SSE（Streamable HTTP + legacy SSE、session/protocol headers、same-origin/secret-header policy、probe/persistent/pagination/resources/prompts/dynamic tools）、ACP stdio（initialize/session/new/prompt/permission/update/timeout/probe/Worker integration）、sandboxed console、PTY terminal、workspace files/edit、Git history、artifact replay/repair、content-addressed blobs 与 GC、approval replay/repair、event mirror restore、search FTS5-prefix/filter/rebuild、transcript、plan batch abort、plan resume、usage CSV、project usage、worktree retention、diff parser、OpenAI+Anthropic HTTP adapter E2E、db rebuild、dynamic Collab tree/task ownership/coordination tools、orchestration controller/retry gates/dependency policy/preview/overview、persisted coordination/decision projections/targeted mailbox delivery、revision detail/restore/task edit、runtime session/integration leases、crash-safe pre-merge recovery、role-aware context compaction、evidence-backed task_result memory/lifecycle/verify/supersede、path-scoped approval grants/quiet routine tools、Preview Showcase/recursive file tabs、preset-first setup wizard、Collab live strip/Ops tabs、essential Manage Dash、long-task operator console、memory conflict review/health、verifier/integration capture、lease expiry timestamp comparison、daemon Prometheus metrics、recurring continuations、Gitea/Forgejo PR、rich artifact preview、backup/restore、cache hit-ratio/preamble telemetry、read-only Scout、idempotent operation receipts、efficiency dashboard、durable run journal/resume preflight/duplicate-write gate/unknown tools、remote SSH/stdio transport/path jail/atomic write/exec/ledger、programs/milestones/dependencies/retries/cumulative budgets、native computer protocol/action bounds/risk/lease。仍缺：
 
 - 并发预算超调上界与预算 abort 的 sibling 结算（当前只测取消 abort）
 - 其他 forge PR adapter / 默认自动冲突解决策略 / 真正的 post-merge 集成分支
@@ -580,9 +580,10 @@ just test                  # Rust + xcodebuild test (40 Swift tests)
 - `git` 工具只读；stage/commit/branch 仍由 runtime/merge queue 拥有。
 - Manager 仍是 code read-only；Verifier 仍不能写代码；approval、write scope、
   capacity、budget、Verifier gate 均未放宽。
-- 当前测试：Rust 618（core 490 + 1 browser ignored / protocol 14 / store 89 /
-  providers 18 / cli 3 / daemon 4；另有 3 个 live ignored），Swift 163。
-  此前本文记录的 358/104 是历史基线。
+- 当前测试：Rust 932（core 636 + 2 ignored / protocol 31 / store 98 /
+  remote 73 + jail 14 + wire 12 + host 4 / remote-agent 6 + stdio 32 /
+  providers 18 / cli 4 / daemon 4；另有 3 个 live ignored），Swift 286
+  （170 app + 116 computer helper）。此前本文记录的 358/104、618/163 是历史基线。
 - 新增 optional LSP、provider search、PDF/image/office-document/data reader、
   runtime budget/task/tool/artifact 工具，以及 sandboxed WKWebView browser +
   ComputerLease；LSP 不自动安装，search 需要显式 provider 配置，PDF 页边界
@@ -695,9 +696,39 @@ just test                  # Rust + xcodebuild test (40 Swift tests)
   cache-hit pill、Collab Scout 节点。限制：不推断 provider 价格，不声称
   cost per solved task；compaction count 受已加载事件窗口限制。
 
-仍未解决：native macOS computer、fair/distributed ComputerLease、
-same-agent identity recovery、cross-process continuation、
-embedding/semantic memory recall、不同 scope 的语义冲突检测、Bitbucket PR、
-artifact archive extraction/media transcoding、encrypted/signed/incremental
-backup，以及本文既有的分布式 scheduler/fencing、完整 shell read/network
-confinement、默认自动冲突解决等。
+- Durable run journal 已交付：`session_runs`/`run_steps`/`run_tool_calls`/
+  `run_checkpoints`、intent/outcome 事件、`SessionRunPolicy`、
+  `session.run.*` RPC、daemon 重启 `interrupted`、manual/opt-in auto resume、
+  completed write fingerprint 硬阻断、unknown outcome 报告。限制：只恢复
+  顶层 Leader run；provider call 不是 exactly-once，partial stream 不
+  mid-stream resume；task-scoped run 走 plan retry；imported archive 不可
+  resume；time budget 只按 attempt 检查。
+- Remote workspaces 已交付：`vp-remote`/`vp-remote-agent`、stdio/SSH NDJSON
+  JSON-RPC、canonical path jail/symlink 拒绝、atomic expected-SHA write、
+  bounded exec + process-group cancel、structured Git/worktree、operation
+  ledger、显式 `remote_*` 工具、`ExecutionHost`/`host.*`/manifest。限制：
+  helper 需预装；SSH 主机/用户是信任边界；remote exec 不是 Seatbelt
+  sandbox，`network=deny`/不可强制读限制直接拒绝；没有 remote daemon、
+  cross-host scheduler 或远程 merge queue；remote worktree 不自动合入。
+- Project programs 已交付：`programs`/`program_milestones`/
+  `program_milestone_sessions`、确定性 controller、deps/priority/aging/
+  retry/backoff/max-parallel、program + cumulative milestone budgets、
+  pause/resume/cancel、`program.*` RPC、manifest/bundle/`db-rebuild`、
+  Manage Dash Programs 卡。限制：没有 LLM program planner、跨项目 program、
+  distributed scheduler/fencing；program budget 不是全局 preflight
+  reservation；claim 后崩溃会消耗一次 attempt。
+- Native computer control 已交付：打包 Accessibility/CGEvent/
+  ScreenCaptureKit helper、bounded AX snapshot + secure-field redaction、
+  click/type/key/scroll/drag/wait、screenshot artifact、ComputerLease、
+  risk mapping、approval gate、packaging/manual smoke。限制：helper 不是
+  sandbox，运行在登录用户 TCC/CGEvent 权限下；AX tree/ref 因 app 和 snapshot
+  而异；GUI/TCC 不做 CI 覆盖；没有 menu-bar walker、AppleScript、clipboard、
+  URL opener 或 shell 路径。
+
+仍未解决：fair/distributed ComputerLease、same-agent identity recovery、
+cross-process continuation、provider-call exactly-once 与 mid-stream resume、
+remote daemon/跨主机 scheduler、distributed program/merge fencing、native GUI
+sandboxing、embedding/semantic memory recall、不同 scope 的语义冲突检测、
+Bitbucket PR、artifact archive extraction/media transcoding、
+encrypted/signed/incremental backup，以及本文既有的分布式 scheduler/fencing、
+完整 shell read/network confinement、默认自动冲突解决等。

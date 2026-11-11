@@ -17,7 +17,7 @@
 | **Reference** | [RESEARCH.md](RESEARCH.md) | 2026-10 的竞品/技术调研；历史背景，不是当前状态 |
 | **Reference** | [AGENT_ORCHESTRATION_AND_CACHE_RESEARCH.md](AGENT_ORCHESTRATION_AND_CACHE_RESEARCH.md) | Prompt/KV cache 命中率、Codex/Claude Code/OpenHands/Aider/Magentic-One 等架构对比与 VerlinPark 改进建议 |
 | **Current** | [EFFICIENCY_PLAYBOOK.md](EFFICIENCY_PLAYBOOK.md) | OpenCode + Orca 效率研究的本地基线、E1–E8 实现清单、验收与并行边界；防止上下文压缩丢失计划 |
-| **Current** | [LONG_TASK_RUNTIME_PLAN.md](LONG_TASK_RUNTIME_PLAN.md) | R1–R4 长任务 runtime 计划：durable run journal、remote workspace、program/milestone、native computer；本轮 30k 行验收 |
+| **Current** | [LONG_TASK_RUNTIME_PLAN.md](LONG_TASK_RUNTIME_PLAN.md) | R1–R4 长任务 runtime 计划与实现记录：durable run journal、remote workspace、program/milestone、native computer；已完成 +42k 行验收 |
 | **Reference** | [PRIDE_FLAGS.md](PRIDE_FLAGS.md) | Pride flag 资产来源与许可 |
 | **Reference** | [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) | FlagKit 等第三方资产许可 |
 | **Contributing** | [../CONTRIBUTING.md](../CONTRIBUTING.md) | 构建、测试、提交约定 |
@@ -55,6 +55,7 @@
 | 知识 / 产物 | [0129](adr/0129-project-knowledge-sources-and-citations.md)（知识源/引用）、[0130](adr/0130-project-skill-packs.md)（skill packs）、[0131](adr/0131-artifact-versions-and-idempotent-publication.md)（artifact 版本/幂等）、[0132](adr/0132-bounded-text-diff-and-citation-audit.md)（bounded diff/citation audit）、[0142](adr/0142-evidence-backed-memory.md)（evidence-backed memory v2）、[0144](adr/0144-memory-conflicts-and-health.md)（conflict review/health）、[0145](adr/0145-verifier-and-integration-knowledge-capture.md)（verdict/integration capture）、[0148](adr/0148-gitea-forgejo-pull-requests.md)（Gitea/Forgejo PR）、[0149](adr/0149-rich-artifact-preview.md)（rich artifact preview） |
 | 运维 / 备份 | [0146](adr/0146-daemon-metrics.md)（Prometheus metrics）、[0150](adr/0150-data-directory-backup-restore.md)（backup/restore） |
 | 效率 / 长任务 | [0151](adr/0151-idempotent-session-operations.md)（operation receipts）、[0152](adr/0152-read-only-scout-agent.md)（read-only Scout）、[0153](adr/0153-cache-and-preamble-telemetry.md)（cache telemetry）、[0154](adr/0154-efficiency-dashboard.md)（efficiency dashboard） |
+| 长任务 runtime | [0155](adr/0155-durable-run-journal.md)（durable run journal）、[0156](adr/0156-remote-workspaces.md)（remote workspaces）、[0157](adr/0157-project-programs-and-milestones.md)（programs/milestones）、[0158](adr/0158-native-macos-computer-control.md)（native computer control） |
 | 长任务控制 | [0138](adr/0138-cache-usage-and-stable-prefix.md)（cache/prompt prefix）、[0139](adr/0139-steering-and-progress-ledger.md)（steering/progress）、[0140](adr/0140-stall-recovery.md)（stall recovery）、[0141](adr/0141-deferred-session-continuations.md)（continuations）、[0143](adr/0143-long-task-operator-console.md)（macOS console）、[0147](adr/0147-recurring-session-continuations.md)（recurring continuations） |
 | 安全 / 权限 | [0035](adr/0035-shell-write-sandbox.md)（shell 写入沙箱）、[0036](adr/0036-project-shell-policy.md)（项目级 shell policy） |
 | 成本 / 容量 | [0003](adr/0003-manual-model-budget.md)、[0018](adr/0018-budget-cancel.md)、[0026](adr/0026-org-cap-right-sizing.md)、[0039](adr/0039-global-session-cap-scope-locks.md)（global admission/scope locks）、[0040](adr/0040-per-role-models-usd-time-budgets.md)（per-role models/USD/time）、[0133](adr/0133-unlimited-session-budget-mode.md)（unlimited budget mode） |

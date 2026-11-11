@@ -155,18 +155,22 @@ success.
 
 Budget rules:
 
-- A program's aggregate spend is the sum of the linked sessions' reported
-  tokens and USD cost. Program caps gate new dispatch.
-- A milestone session is created with the smaller of its milestone budget and
-  the remaining program budget. If the program has an aggregate cap but the
-  milestone declares none, the remaining program budget becomes the session
-  cap.
+- A program's aggregate spend is the sum of every linked session across every
+  attempt; the append-only `program_milestone_sessions` dispatch ledger is never
+  cleared by a retry and is rebuilt from program events on import/`db-rebuild`.
+  Program caps gate new dispatch.
+- A milestone session is created with the smaller of its **remaining**
+  milestone budget (the declared or inherited cap minus prior attempts' spend)
+  and the remaining program budget. A retry receives only the remainder, so a
+  milestone cap is cumulative rather than per attempt. If the program has an
+  aggregate cap but the milestone declares none, the remaining program budget
+  becomes the session cap.
 - Existing session and plan-task budgets still win. The program controller
   cannot widen them.
 - When a program budget is exhausted, pending/ready/retryable milestones are
   blocked. The program fails once no running/verifying milestone remains. When
-  a milestone budget is exhausted, that milestone is blocked and is not
-  retried, even if automatic attempts remain.
+  a milestone budget is exhausted across its attempts, that milestone is
+  blocked and is not retried, even if automatic attempts remain.
 
 ### Pause, resume, cancel, delete
 

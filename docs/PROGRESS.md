@@ -1,10 +1,127 @@
 # VerlinPark 进度
 
 > 最后更新：2026-11-11
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
+
+---
+
+## 2026-11-11 Long-task runtime R1-R4: durable journal, remote, programs, native computer
+
+这一轮把长任务 runtime 的四个结构缺口做成可操作、可恢复、可审计的模块；全部
+保持 deterministic Rust 调度、事件先行、不绕过 approval / Seatbelt /
+write scope / Verifier / merge queue / capacity / budget gate。计划与验收记录
+见 [LONG_TASK_RUNTIME_PLAN.md](LONG_TASK_RUNTIME_PLAN.md)，决策见 ADR-0155–0158。
+
+### R1 durable run journal / crash resume
+
+- 新表：`session_runs`、`run_steps`、`run_tool_calls`、`run_checkpoints`；
+  项目级 `SessionRunPolicy { auto_resume(default false), max_attempts(1..=3),
+  max_age_hours(1..=168) }`。
+- 事件：`session.run.started/checkpointed/step_intent/step_completed/
+  tool_intent/tool_completed/interrupted/resumed/failed/completed/
+  cancel_requested`；run 状态/attempt/lineage/budget/worktree/plan revision
+  由事件重建，tool outcome 明确是 operational audit state。
+- provider 请求前写 checkpoint 与 `model_request` intent；工具执行前写
+  `tool_intent`（tool + canonical fingerprint），完成后写 `tool_completed`。
+  崩溃窗口按“已完成 / 未提交 / 未知”分类，不假装 exactly-once。
+- daemon 启动把 running run 标 `interrupted`，仅在项目 policy opt-in 时
+  auto-resume；manual `session.run.resume` 始终存在。
+- resume 前置条件：session idle/failed/cancelled、run interrupted/failed、
+  attempt/age 未超、provider/model 匹配、budget 未耗尽、plan revision 未变、
+  worktree HEAD 等于记录值或是其干净的 descendant；不 reset 用户改动。
+- resume 从事件重建消息，注入 bounded journal note；已完成的
+  `write_file`/`edit_file`/`apply_patch`/`file_manage` 按 name + fingerprint
+  硬阻断并返回 journaled result（consume-once，失败/中断释放 claim）；
+  read-only 工具可重跑；shell/process/local_http/browser 的未知结果如实
+  标 unknown 并提示先验证。
+- RPC：`session.runs`、`session.run.detail/resume/cancel`、
+  `session.run.policy.get/set`；CLI `vp runs` / `run-*`。
+- 边界：没有 provider-call exactly-once、没有 mid-stream resume；task-scoped
+  Worker run 走 plan-task retry；imported/rehydrated archive 不可 resume；
+  wall-clock budget 只按 attempt 检查，token/USD 才做 preflight。
+
+### R2 remote workspaces over SSH/stdio
+
+- 新 crate `vp-remote`：bounded NDJSON JSON-RPC 2.0，`StdioTransport` /
+  `SshTransport`，显式 argv（无本地 shell），握手校验 protocol version、
+  root、auth token；超时、取消、frame 上限、进程组清理。
+- 新 helper `vp-remote-agent`：只依赖 POSIX + Git，不开监听端口；token
+  来自 `--token-file`（0600）或 `--token-env`，在 SSH 场景下若远端没有该
+  环境变量会回退到 `~/.verlinpark/remote-token`（0600）。
+- 操作：`stat`、`list_dir`、`read_file`（offset/limit/UTF-8/base64）、
+  `write_file`（expected SHA + 临时文件 + fsync + rename）、`mkdir`、
+  `remove`、`rename`、`exec`（cwd jail、env allowlist、timeout、output cap、
+  cancel）、`git_status/diff/log/rev_parse/worktree_add/list/remove`、
+  `ledger_stats`、`cancel`、`shutdown`。
+- canonical root path jail：拒绝绝对路径、`..`、控制字符、Git metadata、
+  symlink escape；写目标拒绝 symlink，原子 rename；operation ledger 支持
+  operation id 幂等/冲突/审计。
+- 项目 `ExecutionHost`（SQLite + manifest）选择 `local` / `ssh`；新增显式
+  `remote_read/write/list/exec/git/worktree` 工具，本地工具绝不静默改路由。
+  远程写/exec 仍走 approval broker；`network=deny` 或无法强制的读限制直接
+  拒绝 remote exec（远端不是 Seatbelt 沙箱）。
+- RPC：`host.list/add/update/remove/probe`、`remote.status`、
+  `remote.worktree_list`、`remote.ledger`；helper 打包进 app/release。
+- 边界：helper 需预装；SSH 主机/用户是信任基础设施；没有 remote daemon、
+  跨主机 scheduler、远程 merge queue；远程 worktree 不会自动进入本地
+  merge queue。
+
+### R3 project programs / milestones
+
+- 新表：`programs`、`program_milestones`；追加式
+  `program_milestone_sessions` 记录每次派发，重试不清除历史，program /
+  milestone 预算因此跨 attempt 累计，retry 只获得剩余额度。
+- 确定性 controller：按 priority、aging、dependencies、max_parallel 选
+  ready milestone；先 atomic claim 再创建普通 session + one-task TeamPlan；
+  completion 需要 session idle、T1 completed、integration evidence clean、
+  acceptance 非空；失败按 exponential backoff 重试，耗尽后 blocked；依赖
+  失败按 block/cancel/retry policy 处理；pause/resume/cancel 协作式。
+- 事件：`program.created/updated/paused/resumed/completed/failed/deleted`、
+  `program.milestone.created/updated/started/verified/completed/failed/
+  blocked/retried/skipped/cancelled`；program ledger 进入 manifest /
+  bundle / `db-rebuild`。
+- RPC：`program.list/create/update/pause/resume/cancel/delete/status`、
+  `program.milestone.*`、`program.tick`、`program.replay`；CLI
+  `vp programs` / `program-*`；Manage Dash Programs 卡（里程碑、依赖、
+  attempts、预算、pause/resume/cancel/retry/skip、详情和事件）。
+- 边界：没有 LLM program planner，没有跨项目 program，没有 distributed
+  scheduler/fencing；program budget 不是全局 pre-flight reservation。
+
+### R4 native macOS computer control
+
+- 新打包 helper `VerlinParkComputerHelper`（Accessibility + CGEvent +
+  ScreenCaptureKit），JSON-lines 协议、1 MiB 请求 / 2 MiB 响应上限、父进程
+  watchdog、scratch HOME、进程组清理。
+- 动作：`permissions`、`apps`、`windows`、`focus`、bounded `snapshot`
+  （稳定 `ax-…` ref、secure field 脱敏）、`screenshot`（window/screen PNG
+  到 daemon artifact）、`click`（ref 或 normalized point）、`type`、`key`、
+  `scroll`、`drag`、`wait`。
+- Rust `vp-core/src/computer.rs` 持有 helper 生命周期、frame/超时/空闲
+  sweep、`ComputerLease` 串行化、daemon 侧二次参数校验；Agent 工具
+  `computer` 只给 Leader 和 coding Worker/Labour。
+- 风险映射：read/permissions/apps/windows/snapshot/wait/screenshot →
+  External；focus/click/type/key/scroll/drag → HostState；cmd+q、
+  cmd+shift+delete 等 → Destructive；approval modes 仍然生效。
+- 边界：不是 sandbox；helper 以登录用户 TCC/CGEvent 权限运行；AX tree
+  因 app 而异，ref 只在 snapshot 生命周期内有效；GUI/TCC 只做手工 smoke，
+  不做 CI GUI 覆盖；没有 menu-bar walker、AppleScript、clipboard、URL
+  opener 或 shell 路径。
+
+### 验证与集成
+
+- 合并顺序：R3 (`5208270`) → R2 (`191ec56`) → R3 review fixes
+  (`6298fc0`, `315ecf7`) → R4 (`0d75274`) → R1 (`a504e10`)；R2 token
+  修复 `7e4a7ba`。
+- `git diff --stat c615f72..HEAD`：**42,176 insertions / 1,715 deletions**。
+- Rust：932 passed，5 ignored（2 core + 3 live）；Swift：170 app +
+  116 computer-helper passed；`cargo fmt --check`、`cargo clippy -D warnings`
+  通过，`just lint` / `just test` / `just bundle` 在收尾时重跑。
+- 仍然不要声称：provider-call exactly-once、mid-stream resume、remote
+  daemon/cross-host scheduler、distributed program/merge fencing、native GUI
+  sandboxing、precise preemption beyond the documented boundaries。
 
 ---
 

@@ -1,8 +1,8 @@
 # VerlinPark Agent Tooling Roadmap
 
-> **Status:** Wave A/B/C, optional LSP, provider search, document/data readers, office documents, sandboxed WKWebView browser + ComputerLease, and runtime introspection implemented on 2026-11-10; native macOS computer control remains deferred.<br>
-> **Date:** 2026-11-10<br>
-> **Code baseline:** 2026-11-10 tooling + office + browser wave; see ADR-0134/0136/0137.<br>
+> **Status:** Wave A/B/C, optional LSP, provider search, document/data readers, office documents, sandboxed WKWebView browser + ComputerLease, runtime introspection, native macOS computer control, and explicit SSH/stdio remote workspaces implemented on 2026-11-11; see ADR-0134/0136/0137/0155–0158.<br>
+> **Date:** 2026-11-11<br>
+> **Code baseline:** 2026-11-11 tooling + long-task runtime wave; see ADR-0134/0136/0137/0155–0158.<br>
 > **Implementation budget:** ~10,000–30,000 code lines, target core ~24k, hard planning cap 30k<br>
 > **Purpose:** Preserve the complete missing-tool inventory and design intent across
 > context compression. This file is the source of truth for the tooling work; update
@@ -57,10 +57,22 @@ approval-gated `evaluate`, viewport screenshots, and a daemon-wide
 network-isolated, the browser requires a GUI session, and the lease is
 single-daemon, fail-fast, and not a distributed fencing token.
 
-Still open: native macOS computer control. The headless Chrome/CDP spike failed
-because Chrome's network service was unreliable under the nested Seatbelt
-profile; the shipped WKWebView helper resolves that specific failure without
-weakening the worktree write boundary.
+Implemented native computer control: a packaged Accessibility/CGEvent/
+ScreenCaptureKit helper, bounded AX snapshots with secure-field redaction,
+input actions, artifact screenshots, and a risk-classified `computer` tool under
+the same daemon-wide `ComputerLease`. See ADR-0158. The helper is not a
+sandbox: it runs with the logged-in user's TCC/CGEvent authority, requires
+manual Accessibility and Screen Recording grants, AX trees/refs vary by app, and
+GUI/TCC behavior is manual-smoke tested rather than CI-covered.
+
+Implemented remote workspaces: the `vp-remote` crate and `vp-remote-agent`
+helper provide bounded NDJSON JSON-RPC over stdio or SSH, a canonical-root path
+jail, atomic expected-SHA writes, bounded exec with process-group cancellation,
+structured Git/worktree operations, and an idempotency ledger. Projects opt in
+through `ExecutionHost`; the six explicit `remote_*` tools never silently reroute
+local tools, and remote write/exec remain approval-classified. See ADR-0156.
+Remote exec is not Seatbelt-confined, the helper must be installed, and there is
+no remote daemon, cross-host scheduler, or automatic remote-worktree merge.
 
 ---
 
@@ -246,8 +258,8 @@ core implementation crosses 24k, drop optional items in this order: `C-05`
 LSP, `T-04` task control, `D-01` data query, then optional parsers/edge cases.
 If it crosses 30k before the core is usable, stop and re-plan rather than
 shipping half-tools. Browser and office documents were promoted after the core
-was green; native macOS computer control remains outside the core cap and starts
-only after explicit promotion.
+was green; native macOS computer control and remote workspaces also shipped in
+the 2026-11-11 long-task runtime round, beyond the original core cap.
 
 ---
 
@@ -840,24 +852,34 @@ snapshot rather than native AX; synthetic input; viewport-only screenshots;
 no page-script network isolation; logged-in GUI session required;
 single-daemon fail-fast lease with no queue or fairness policy.
 
-**LOC:** 3,000–5,000. Shipped; native `computer` remains a separate stretch item.
+**LOC:** 3,000–5,000. Shipped; native `computer` also shipped separately in the 2026-11-11 round (ADR-0158).
 
 ---
 
 ### U-02 — `computer`
 
-**Actions:** `apps`, `snapshot`, `click`, `type`, `key`, `scroll`, `screenshot`,
-`wait_for`, `activate`.
+**Actions (shipped):** `permissions`, `apps`, `windows`, `focus`, `snapshot`,
+`click`, `type`, `key`, `scroll`, `drag`, `wait`, `screenshot`.
 
 **Behavior:**
 
-- macOS Accessibility tree with role/title/value/frame; stable element IDs.
-- Screenshots/artifacts; OCR text fallback.
-- ComputerLease serializes GUI/browser access.
+- macOS Accessibility tree with role/title/value/frame; stable snapshot-scoped
+  `ax-…` refs; secure/password fields are redacted.
+- Screenshots are bounded PNG artifacts under daemon scratch, never unbounded
+  inline model data.
+- `ComputerLease` serializes native GUI and browser access on this daemon.
 - Never type secrets into arbitrary apps without approval.
-- Deny dangerous system UI actions by policy; host-state classification.
+- Destructive key combinations (cmd+q, cmd+shift+delete, …) are classified
+  Destructive; focus/input is HostState; read-only inspection is External.
+- The helper is launched by the daemon, uses a scratch HOME, and has bounded
+  protocol frames, request timeouts, idle shutdown, and process-group cleanup.
 
-**LOC:** 2,500–4,000. Stretch.
+**Boundaries:** not sandboxed; requires logged-in GUI session and manual TCC
+grants; AX trees vary by application; no menu-bar walker, AppleScript, clipboard,
+URL opener, or shell path. See ADR-0158 and
+`apps/macos/VerlinParkComputerHelper/README.md`.
+
+**LOC:** 2,500–4,000 planned; shipped in the 2026-11-11 long-task runtime round.
 
 ---
 
@@ -986,13 +1008,13 @@ Exit criteria:
 - Research can discover a source, read it with citations, and report evidence.
 - Images/PDFs produce bounded text/metadata instead of forcing shell guessing.
 
-### Wave D — "UI/computer" (stretch, 5.5–9k)
+### Wave D — "UI/computer" (shipped)
 
 The browser slice shipped with a WKWebView helper and `ComputerLease`; native
-`computer` control remains deferred. Start it only after A–C and only if the LOC
-budget remains under 30k, with a capability spike and a stable schema; do not
-ship a half-working GUI tool. Keep `browser` and `computer` on the same lease
-surface.
+`computer` control and remote SSH workspaces shipped in the 2026-11-11 long-task
+runtime round (ADR-0156/0158). Both remain bounded by the documented trust
+model: browser page JavaScript is not network-isolated, and native GUI control
+is not sandboxed. Keep `browser` and `computer` on the same lease surface.
 
 ### Hard stop rules
 
@@ -1050,7 +1072,8 @@ Statuses: `[ ]` not started, `[~]` in progress, `[x]` done, `[–]` deferred.
 [x] D-01 data_query
 
 [x] U-01 browser (WKWebView helper + ComputerLease; see ADR-0137)
-[–] U-02 computer (native macOS; deferred)
+[x] U-02 computer (native macOS AX/CGEvent/ScreenCaptureKit; ADR-0158)
+[x] remote_read/write/list/exec/git/worktree (SSH/stdio; ADR-0156)
 [x] M-03 read_document
 ```
 
@@ -1067,7 +1090,10 @@ Statuses: `[ ]` not started, `[~]` in progress, `[x]` done, `[–]` deferred.
 | `local_http` | yes | no | yes | yes | yes (localhost) | yes | no |
 | `web_search`, `read_url` | yes | research only | research only | research/coding | yes | research only | no |
 | `browser` | yes | no | no | coding/frontend | no | no | no |
-| `computer` (not implemented) | yes | no | no | coding | no | no | no |
+| `computer` | yes | no | no | coding | no | no | no |
+| `remote_read`/`remote_list`/`remote_git` | yes | yes | yes | yes | yes | yes | yes |
+| `remote_write`/`remote_worktree` | yes | no | no | coding | no | no | no |
+| `remote_exec` | yes | no | yes (test/build) | coding | no | no | no |
 | `read_pdf`, `read_image` | yes | yes | yes | yes | yes | yes | yes |
 | `budget_status`, `task_detail` | yes | yes | yes | own/session | own/session | own/session | own/session |
 | `task_control` | yes | own plan only | no | no | no | no | no |
