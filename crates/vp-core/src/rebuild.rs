@@ -122,6 +122,7 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
                 &snapshot.source_embedding_policy,
             )?;
             store.set_orchestration_policy(&snapshot.project.id, &snapshot.orchestration_policy)?;
+            store.set_critical_path_policy(&snapshot.project.id, &snapshot.critical_path_policy)?;
             store.restore_approval_grants(&snapshot.project.id, &snapshot.approval_grants)?;
             for skill in &snapshot.skills {
                 store.insert_skill(skill)?;

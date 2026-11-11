@@ -7,9 +7,14 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::watch;
 use vp_protocol::types::{
-    IntakeTask, PlanTask, ScheduledTask, Session, TaskQueueResult, TeamPlan, WriteLease,
+    GovernorDeferralInfo, IntakeTask, PlanTask, ScheduledTask, Session, TaskQueueResult, TeamPlan,
+    WriteLease,
 };
 use vp_store::Store;
+
+use crate::budget_governor::{
+    GovernorAdmission, GovernorBudgetView, GovernorCandidate, MAX_PREVIEW_DECISIONS, evaluate,
+};
 
 /// Persistent task-DAG queue. Task definitions come from the submitted
 /// TeamPlan; live status, attempt counts, enqueue time, and write scopes are
@@ -39,6 +44,16 @@ pub struct PendingSession {
     pub enqueued_at: String,
     pub effective_priority: i64,
     pub cooldown_secs: u64,
+}
+
+/// Result of governed ready-task selection. When the policy is disabled (the
+/// default), `governor` is `None`, `deferred` is empty, and `ready` keeps the
+/// existing priority/aging order exactly.
+#[derive(Debug, Clone)]
+pub struct ReadyTaskSelection {
+    pub ready: Vec<PlanTask>,
+    pub deferred: Vec<GovernorDeferralInfo>,
+    pub governor: Option<GovernorAdmission>,
 }
 
 impl TaskScheduler {
@@ -116,6 +131,10 @@ impl TaskScheduler {
     /// priority first; aging adds one point per interval so low-priority ready
     /// work cannot starve behind a permanently high-priority sibling. Ties use
     /// enqueue time then task id.
+    ///
+    /// When the project's critical-path policy is enabled, this applies the
+    /// budget governor: critical-path tasks are admitted first under pressure,
+    /// and non-critical tasks over the protected reserve remain queued.
     pub async fn ready_tasks(
         &self,
         session: &Session,
@@ -123,15 +142,39 @@ impl TaskScheduler {
         plan: &TeamPlan,
         limit: usize,
     ) -> Result<Vec<PlanTask>> {
+        Ok(self
+            .ready_tasks_governed(session, plan_seq, plan, limit, None)
+            .await?
+            .ready)
+    }
+
+    /// Governed variant used by the plan runner. `budget` should carry the
+    /// live session limit/spend and in-flight reservation total; `None` falls
+    /// back to the session projection (spend only, no in-flight reservations).
+    pub async fn ready_tasks_governed(
+        &self,
+        session: &Session,
+        plan_seq: u64,
+        plan: &TeamPlan,
+        limit: usize,
+        budget: Option<GovernorBudgetView>,
+    ) -> Result<ReadyTaskSelection> {
         let store = self.store.clone();
         let session_id = session.id.clone();
         let project_id = session.project_id.clone();
         let priority = session.priority;
         let aging = self.aging;
         let plan = plan.clone();
+        let session_budget = GovernorBudgetView::new(
+            session.token_budget,
+            session.tokens_in.saturating_add(session.tokens_out),
+            0,
+        );
+        let unlimited = session.unlimited;
         tokio::task::spawn_blocking(move || {
             let rows = store.list_plan_tasks(None, Some(&session_id))?;
-            let policy = store.get_orchestration_policy(&project_id)?;
+            let orchestration_policy = store.get_orchestration_policy(&project_id)?;
+            let critical_policy = store.get_critical_path_policy(&project_id)?;
             let rows = rows
                 .into_iter()
                 .filter(|row| row.plan_seq == plan_seq)
@@ -167,7 +210,7 @@ impl TaskScheduler {
                     let retry_boost = if row.attempts > 0
                         && matches!(row.status.as_str(), "failed" | "pending")
                     {
-                        i64::from(policy.retry_priority_boost)
+                        i64::from(orchestration_policy.retry_priority_boost)
                     } else {
                         0
                     };
@@ -190,11 +233,54 @@ impl TaskScheduler {
                 .iter()
                 .map(|task| (task.id.clone(), task.clone()))
                 .collect::<HashMap<_, _>>();
-            Ok(ready
-                .into_iter()
+            let fallback = ready
+                .iter()
                 .filter_map(|(_, row)| definitions.get(&row.task_id).cloned())
                 .take(limit.max(1))
-                .collect())
+                .collect::<Vec<_>>();
+            if unlimited || !critical_policy.enabled {
+                return Ok(ReadyTaskSelection {
+                    ready: fallback,
+                    deferred: Vec::new(),
+                    governor: None,
+                });
+            }
+            let budget = budget.unwrap_or(session_budget);
+            let plan_revision = store.plan_revision_count(&session_id)?;
+            let candidates = ready
+                .iter()
+                .filter_map(|(effective_priority, row)| {
+                    definitions.get(&row.task_id).map(|task| GovernorCandidate {
+                        task,
+                        effective_priority: *effective_priority,
+                        enqueued_at: row.enqueued_at.as_str(),
+                    })
+                })
+                .take(MAX_PREVIEW_DECISIONS)
+                .collect::<Vec<_>>();
+            let admission = evaluate(crate::budget_governor::GovernorEvaluation {
+                session_id: &session_id,
+                project_id: &project_id,
+                plan_revision,
+                plan: &plan,
+                statuses: &statuses,
+                policy: &critical_policy,
+                candidates: &candidates,
+                budget,
+                remaining_override: None,
+            })?;
+            let selected = admission
+                .admitted
+                .iter()
+                .filter_map(|task_id| definitions.get(task_id).cloned())
+                .take(limit.max(1))
+                .collect::<Vec<_>>();
+            let deferred = admission.deferral_infos();
+            Ok(ReadyTaskSelection {
+                ready: selected,
+                deferred,
+                governor: Some(admission),
+            })
         })
         .await?
     }
@@ -744,6 +830,120 @@ mod tests {
             .unwrap();
         assert_eq!(picked.session_id, second.id);
         assert_eq!(picked.task_priority, 50);
+    }
+
+    #[tokio::test]
+    async fn critical_path_policy_default_is_disabled_and_preserves_existing_order() {
+        let (_dir, store, _project, _session) = store();
+        let project = store.list_projects().unwrap().remove(0);
+        let session = store
+            .create_session_with_limits(&project.id, "governed", Some(10_000), None, None)
+            .unwrap();
+        store
+            .append_event(&session.id, "team_plan.submitted", serde_json::json!({}))
+            .unwrap();
+        let scheduler = TaskScheduler::new_with_aging(store.clone(), Duration::ZERO);
+        let plan = plan(vec![task("critical", 0, vec![]), task("side", 100, vec![])]);
+        let (seq, _) = scheduler.sync_plan(&session, &plan).await.unwrap();
+        let selection = scheduler
+            .ready_tasks_governed(&session, seq, &plan, 10, None)
+            .await
+            .unwrap();
+        assert!(selection.governor.is_none());
+        assert!(selection.deferred.is_empty());
+        assert_eq!(
+            selection
+                .ready
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["side", "critical"]
+        );
+    }
+
+    #[tokio::test]
+    async fn governor_defers_non_critical_work_over_the_reserve() {
+        let (_dir, store, _project, _session) = store();
+        let project = store.list_projects().unwrap().remove(0);
+        let session = store
+            .create_session_with_limits(&project.id, "governed", Some(10_000), None, None)
+            .unwrap();
+        store
+            .append_event(&session.id, "team_plan.submitted", serde_json::json!({}))
+            .unwrap();
+        store
+            .set_critical_path_policy(
+                &project.id,
+                &vp_protocol::types::CriticalPathPolicy {
+                    enabled: true,
+                    reserve_ratio: 0.25,
+                    throttle_at_ratio: 0.0,
+                    critical_boost: 25,
+                    min_task_budget: 100,
+                },
+            )
+            .unwrap();
+        let scheduler = TaskScheduler::new_with_aging(store.clone(), Duration::ZERO);
+        let mut critical = task("critical", 0, vec![]);
+        critical.token_budget = Some(8_000);
+        let mut side = task("side", 100, vec![]);
+        side.token_budget = Some(8_000);
+        let plan = plan(vec![critical, side]);
+        let (seq, _) = scheduler.sync_plan(&session, &plan).await.unwrap();
+        let selection = scheduler
+            .ready_tasks_governed(&session, seq, &plan, 10, None)
+            .await
+            .unwrap();
+        let governor = selection.governor.as_ref().unwrap();
+        assert!(governor.reserve.protected_tokens >= 10_000);
+        assert_eq!(selection.ready.len(), 1);
+        assert_eq!(selection.ready[0].id, "critical");
+        assert_eq!(selection.deferred.len(), 1);
+        assert_eq!(selection.deferred[0].task_id, "side");
+        assert_eq!(selection.deferred[0].reason, "reserve");
+        assert_eq!(selection.deferred[0].code, "BUDGET_RESERVED");
+    }
+
+    #[tokio::test]
+    async fn governor_admits_critical_work_first_under_pressure() {
+        let (_dir, store, _project, _session) = store();
+        let project = store.list_projects().unwrap().remove(0);
+        let session = store
+            .create_session_with_limits(&project.id, "governed", Some(10_000), None, None)
+            .unwrap();
+        store
+            .append_event(&session.id, "team_plan.submitted", serde_json::json!({}))
+            .unwrap();
+        store
+            .set_critical_path_policy(
+                &project.id,
+                &vp_protocol::types::CriticalPathPolicy {
+                    enabled: true,
+                    reserve_ratio: 0.5,
+                    throttle_at_ratio: 0.0,
+                    critical_boost: 0,
+                    min_task_budget: 100,
+                },
+            )
+            .unwrap();
+        let scheduler = TaskScheduler::new_with_aging(store.clone(), Duration::ZERO);
+        let mut critical = task("critical", -50, vec![]);
+        critical.token_budget = Some(9_000);
+        let mut side = task("side", 100, vec![]);
+        side.token_budget = Some(9_000);
+        let plan = plan(vec![side, critical]);
+        let (seq, _) = scheduler.sync_plan(&session, &plan).await.unwrap();
+        let selection = scheduler
+            .ready_tasks_governed(&session, seq, &plan, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(selection.ready[0].id, "critical");
+        assert_eq!(
+            selection.governor.as_ref().unwrap().decisions[0]
+                .reason
+                .as_str(),
+            "critical_admit"
+        );
     }
 
     #[tokio::test]

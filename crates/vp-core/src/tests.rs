@@ -12369,3 +12369,411 @@ async fn db_rebuild_restores_source_embedding_policy_and_queues_generations() {
     assert_eq!(status.pending_jobs, 1, "restore queues a derived job");
     assert_eq!(status.indexable_chunks, 1);
 }
+
+mod budget_governor_engine_tests {
+    use super::*;
+    use vp_protocol::types::{CriticalPathPolicy, PlanDepartment, PlanTask, TeamPlan};
+
+    fn plan_task(id: &str, priority: i32, deps: &[&str], budget: u64) -> PlanTask {
+        PlanTask {
+            id: id.to_string(),
+            department: "impl".to_string(),
+            title: id.to_string(),
+            kind: "coding".to_string(),
+            priority,
+            profile: None,
+            deps: deps.iter().map(|dep| (*dep).to_string()).collect(),
+            write_scope: vec![id.to_string()],
+            acceptance: vec!["done".to_string()],
+            token_budget: Some(budget),
+            cost_budget_usd: None,
+        }
+    }
+
+    fn plan(tasks: Vec<PlanTask>) -> TeamPlan {
+        TeamPlan {
+            goal: "governor".to_string(),
+            departments: vec![PlanDepartment {
+                name: "impl".to_string(),
+                manager_title: "Implementation".to_string(),
+                profile: "coding".to_string(),
+                objective: "build".to_string(),
+                token_budget: None,
+                cost_budget_usd: None,
+            }],
+            tasks,
+        }
+    }
+
+    async fn fixture() -> (TempDir, TempDir, Engine, Project, Session) {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("governor".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id.clone(), "govern the plan".into(), Some(10_000))
+            .await
+            .unwrap();
+        (data, repo, engine, project, session)
+    }
+
+    fn enabled_policy() -> CriticalPathPolicy {
+        CriticalPathPolicy {
+            enabled: true,
+            reserve_ratio: 0.25,
+            throttle_at_ratio: 0.0,
+            critical_boost: 25,
+            min_task_budget: 100,
+        }
+    }
+
+    #[tokio::test]
+    async fn governor_status_preview_and_run_context_are_deterministic() {
+        let (_data, _repo, engine, project, session) = fixture().await;
+        let plan = plan(vec![
+            plan_task("critical", 0, &[], 6_000),
+            plan_task("side", 100, &[], 6_000),
+        ]);
+        engine.set_team_plan(&session.id, &plan).await.unwrap();
+        engine
+            .set_critical_path_policy(&project.id, &enabled_policy())
+            .await
+            .unwrap();
+
+        let status = engine
+            .budget_governor_status(&session.id, 10)
+            .await
+            .unwrap();
+        assert!(status.enabled);
+        assert!(status.plan_present);
+        assert_eq!(status.plan_revision, 1);
+        let path = status.critical_path.as_ref().unwrap();
+        assert_eq!(path.task_ids, vec!["critical".to_string()]);
+        assert_eq!(path.weight_tokens, 6_000);
+        assert_eq!(status.reserve.protected_tokens, 8_500);
+        assert_eq!(status.reserve.state, "active");
+        assert_eq!(status.admitted, vec!["critical".to_string()]);
+        assert_eq!(status.deferred.len(), 1);
+        assert_eq!(status.deferred[0].task_id, "side");
+        assert_eq!(status.deferred[0].reason, "reserve");
+        assert_eq!(status.deferred[0].code, "BUDGET_RESERVED");
+
+        let preview = engine
+            .preview_budget_governor(&session.id, Some(10_000), 10)
+            .await
+            .unwrap();
+        assert_eq!(preview.inputs_hash, status.inputs_hash);
+        assert_eq!(preview.decisions, status.decisions);
+
+        let expanded = engine
+            .preview_budget_governor(&session.id, Some(20_000), 10)
+            .await
+            .unwrap();
+        assert_ne!(expanded.inputs_hash, status.inputs_hash);
+        assert!(expanded.admitted.contains(&"side".to_string()));
+        assert!(expanded.deferred.is_empty());
+
+        let side = engine
+            .governor_run_context(&session.id, Some("side"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!side.critical);
+        assert_eq!(side.path_task_ids, vec!["critical".to_string()]);
+        let gate = side.gate(Some(10_000), Some(10_000)).unwrap();
+        assert!(!gate.critical);
+        assert_eq!(gate.protected_tokens, 8_500);
+        let critical = engine
+            .governor_run_context(&session.id, Some("critical"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(critical.critical);
+        let leader = engine
+            .governor_run_context(&session.id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(leader.task_id.is_none());
+        assert!(leader.gate(Some(10_000), Some(10_000)).is_none());
+    }
+
+    #[tokio::test]
+    async fn governor_admission_event_is_persisted_and_bounded() {
+        let (_data, _repo, engine, project, session) = fixture().await;
+        let plan = plan(vec![
+            plan_task("critical", 0, &[], 6_000),
+            plan_task("side", 0, &[], 6_000),
+        ]);
+        engine.set_team_plan(&session.id, &plan).await.unwrap();
+        engine
+            .set_critical_path_policy(&project.id, &enabled_policy())
+            .await
+            .unwrap();
+        let seq = engine
+            .store()
+            .latest_event_seq(&session.id, "team_plan.submitted")
+            .unwrap();
+        let selection = engine
+            .scheduler()
+            .ready_tasks_governed(
+                &session,
+                seq,
+                &plan,
+                10,
+                Some(crate::budget_governor::GovernorBudgetView::new(
+                    Some(10_000),
+                    0,
+                    0,
+                )),
+            )
+            .await
+            .unwrap();
+        let admission = selection.governor.as_ref().unwrap();
+        engine
+            .record_budget_governor_admission(&session.id, admission)
+            .await
+            .unwrap();
+        let decisions = engine.governor_decisions(&session.id, 10).await.unwrap();
+        assert_eq!(decisions.len(), 1);
+        let decision = &decisions[0];
+        assert_eq!(decision.action, "admission");
+        assert_eq!(decision.session_id, session.id);
+        assert_eq!(decision.plan_revision, 1);
+        assert_eq!(decision.path, vec!["critical".to_string()]);
+        assert_eq!(decision.admitted, vec!["critical".to_string()]);
+        assert_eq!(decision.deferred.len(), 1);
+        assert_eq!(decision.deferred[0].task_id, "side");
+        assert!(decision.detail.contains("protected"));
+        assert_eq!(decision.inputs_hash, admission.inputs_hash);
+    }
+
+    #[tokio::test]
+    async fn disabled_policy_status_is_a_no_op_and_keeps_the_path_visible() {
+        let (_data, _repo, engine, _project, session) = fixture().await;
+        let plan = plan(vec![
+            plan_task("critical", 0, &[], 6_000),
+            plan_task("side", 0, &[], 6_000),
+        ]);
+        engine.set_team_plan(&session.id, &plan).await.unwrap();
+        let status = engine
+            .budget_governor_status(&session.id, 10)
+            .await
+            .unwrap();
+        assert!(!status.enabled);
+        assert_eq!(status.reserve.state, "disabled");
+        assert!(status.deferred.is_empty());
+        assert_eq!(status.admitted.len(), 2);
+        assert_eq!(status.critical_path.as_ref().unwrap().weight_tokens, 6_000);
+        assert_eq!(
+            status
+                .decisions
+                .iter()
+                .map(|decision| decision.reason.as_str())
+                .collect::<Vec<_>>(),
+            vec!["disabled", "disabled"]
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_plan_returns_a_typed_status_error() {
+        let (_data, _repo, engine, project, session) = fixture().await;
+        let plan = plan(vec![
+            plan_task("a", 0, &["b"], 1_000),
+            plan_task("b", 0, &["a"], 1_000),
+        ]);
+        engine.set_team_plan(&session.id, &plan).await.unwrap();
+        engine
+            .set_critical_path_policy(&project.id, &enabled_policy())
+            .await
+            .unwrap();
+        let status = engine
+            .budget_governor_status(&session.id, 10)
+            .await
+            .unwrap();
+        let error = status.error.as_ref().unwrap();
+        assert_eq!(error.code, "BUDGET_PATH_CYCLE");
+        assert!(!error.retryable);
+        assert!(status.decisions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn preview_and_disabled_policy_write_no_governor_events() {
+        let (_data, _repo, engine, project, session) = fixture().await;
+        let plan = plan(vec![
+            plan_task("critical", 0, &[], 6_000),
+            plan_task("side", 0, &[], 6_000),
+        ]);
+        engine.set_team_plan(&session.id, &plan).await.unwrap();
+        engine
+            .set_critical_path_policy(&project.id, &enabled_policy())
+            .await
+            .unwrap();
+
+        let first = engine
+            .preview_budget_governor(&session.id, Some(4_000), 10)
+            .await
+            .unwrap();
+        let second = engine
+            .preview_budget_governor(&session.id, Some(4_000), 10)
+            .await
+            .unwrap();
+        assert_eq!(first.inputs_hash, second.inputs_hash);
+        assert_eq!(first.decisions, second.decisions);
+        assert!(
+            engine
+                .governor_decisions(&session.id, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        engine
+            .set_critical_path_policy(&project.id, &CriticalPathPolicy::default())
+            .await
+            .unwrap();
+        let status = engine
+            .budget_governor_status(&session.id, 10)
+            .await
+            .unwrap();
+        assert!(!status.enabled);
+        assert_eq!(status.reserve.state, "disabled");
+        assert!(
+            engine
+                .governor_decisions(&session.id, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_revision_change_moves_the_governor_identity() {
+        let (_data, _repo, engine, project, session) = fixture().await;
+        engine
+            .set_critical_path_policy(&project.id, &enabled_policy())
+            .await
+            .unwrap();
+        let first_plan = plan(vec![plan_task("a", 0, &[], 5_000)]);
+        engine
+            .set_team_plan(&session.id, &first_plan)
+            .await
+            .unwrap();
+        let first = engine
+            .budget_governor_status(&session.id, 10)
+            .await
+            .unwrap();
+        assert_eq!(first.plan_revision, 1);
+        assert_eq!(
+            first.critical_path.as_ref().unwrap().task_ids,
+            vec!["a".to_string()]
+        );
+
+        let second_plan = plan(vec![
+            plan_task("a", 0, &[], 5_000),
+            plan_task("b", 0, &["a"], 9_000),
+        ]);
+        engine
+            .set_team_plan(&session.id, &second_plan)
+            .await
+            .unwrap();
+        let second = engine
+            .budget_governor_status(&session.id, 10)
+            .await
+            .unwrap();
+        assert_eq!(second.plan_revision, 2);
+        assert_eq!(
+            second.critical_path.as_ref().unwrap().task_ids,
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_ne!(first.inputs_hash, second.inputs_hash);
+    }
+
+    #[tokio::test]
+    async fn governor_run_context_is_absent_when_the_policy_is_disabled() {
+        let (_data, _repo, engine, project, session) = fixture().await;
+        let plan = plan(vec![plan_task("a", 0, &[], 5_000)]);
+        engine.set_team_plan(&session.id, &plan).await.unwrap();
+        assert!(
+            engine
+                .governor_run_context(&session.id, Some("a"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        engine
+            .set_critical_path_policy(&project.id, &enabled_policy())
+            .await
+            .unwrap();
+        let context = engine
+            .governor_run_context(&session.id, Some("a"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(context.enabled);
+        assert!(context.critical);
+        assert_eq!(context.path_weight_tokens, 5_000);
+    }
+
+    #[tokio::test]
+    async fn governor_status_without_a_plan_is_empty_but_keeps_the_policy() {
+        let (_data, _repo, engine, project, session) = fixture().await;
+        engine
+            .set_critical_path_policy(&project.id, &enabled_policy())
+            .await
+            .unwrap();
+        let status = engine
+            .budget_governor_status(&session.id, 10)
+            .await
+            .unwrap();
+        assert!(status.enabled);
+        assert!(!status.plan_present);
+        assert!(status.critical_path.is_none());
+        assert!(status.decisions.is_empty());
+        assert!(status.admitted.is_empty());
+        assert!(status.deferred.is_empty());
+        assert_eq!(status.reserve.state, "complete");
+        assert_eq!(status.reserve.protected_tokens, 0);
+        assert_eq!(status.policy, enabled_policy());
+    }
+
+    #[tokio::test]
+    async fn critical_path_policy_set_validates_and_persists() {
+        let (_data, _repo, engine, project, _session) = fixture().await;
+        let invalid = CriticalPathPolicy {
+            reserve_ratio: 2.0,
+            ..CriticalPathPolicy::default()
+        };
+        assert!(
+            engine
+                .set_critical_path_policy(&project.id, &invalid)
+                .await
+                .is_err()
+        );
+        let policy = CriticalPathPolicy {
+            enabled: true,
+            reserve_ratio: 0.4,
+            throttle_at_ratio: 0.2,
+            critical_boost: 10,
+            min_task_budget: 2_000,
+        };
+        let stored = engine
+            .set_critical_path_policy(&project.id, &policy)
+            .await
+            .unwrap();
+        assert_eq!(stored, policy);
+        assert_eq!(
+            engine.critical_path_policy(&project.id).await.unwrap(),
+            policy
+        );
+        let manifest = vp_store::read_project_manifest(engine.store().data_dir()).unwrap();
+        assert_eq!(manifest[0].critical_path_policy, policy);
+    }
+}

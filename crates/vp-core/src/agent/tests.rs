@@ -18140,3 +18140,46 @@ fn session_budget_legacy_expansion_yields_to_managed_scaling() {
     assert_eq!(budget.worker_cap(), 4);
     assert_eq!(slots.targets().0, 4);
 }
+
+#[test]
+fn governor_rejection_is_task_scoped_and_non_abortive() {
+    let rejection = Rejection {
+        scope: "department",
+        id: "impl".to_string(),
+        reason: crate::budget::BudgetReason::Reserved,
+        limit_tokens: Some(10_000),
+        spent_tokens: 2_000,
+        reserved_tokens: 100,
+        limit_cost: None,
+        spent_cost: 0.0,
+        reserved_cost: 0.0,
+        protected_tokens: 6_975,
+    };
+    let stop = BudgetStop::from_governor_rejection(rejection, Some("T1"));
+    assert_eq!(stop.scope, "task");
+    assert_eq!(stop.id.as_deref(), Some("T1"));
+    assert_eq!(stop.code, "BUDGET_RESERVED");
+    assert!(!stop.is_abortive());
+    assert!(stop.summary().contains("critical-path budget reserve"));
+    assert_eq!(stop.payload()["protected_tokens"], 6_975);
+}
+
+#[test]
+fn governor_throttle_stop_is_task_scoped_and_retryable() {
+    let rejection = Rejection {
+        scope: "task",
+        id: "T2".to_string(),
+        reason: crate::budget::BudgetReason::Throttled,
+        limit_tokens: Some(10_000),
+        spent_tokens: 8_000,
+        reserved_tokens: 0,
+        limit_cost: None,
+        spent_cost: 0.0,
+        reserved_cost: 0.0,
+        protected_tokens: 1_500,
+    };
+    let stop = BudgetStop::from_governor_rejection(rejection, Some("T2"));
+    assert_eq!(stop.code, "BUDGET_THROTTLED");
+    assert!(!stop.is_abortive());
+    assert!(stop.summary().contains("budget governor throttle"));
+}

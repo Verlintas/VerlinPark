@@ -35,7 +35,11 @@ use vp_store::Store;
 use crate::Engine;
 use crate::RuntimeLeaseGuard;
 use crate::acp;
-use crate::budget::{BudgetReason, Rejection, ScopeRequest, Spend};
+use crate::budget::{BudgetReason, GovernorGate, Rejection, ScopeRequest, Spend};
+use crate::budget_governor::{
+    DECISION_EVENT_KIND, GovernorBudgetView, GovernorDenial, GovernorReason, GovernorRunContext,
+    denial_payload,
+};
 use crate::permissions::{
     ApprovalDecision, RiskLevel, assess_acp_permission, assess_remote_acp_delegation, decide,
 };
@@ -1540,6 +1544,13 @@ impl SessionBudget {
         self.state.lock().map(|state| state.spent).unwrap_or(0)
     }
 
+    fn reserved_tokens(&self) -> u64 {
+        self.state
+            .lock()
+            .map(|state| state.reserved_tokens)
+            .unwrap_or(0)
+    }
+
     fn exhausted(&self) -> bool {
         self.exceeded_reason().is_some()
     }
@@ -1829,6 +1840,7 @@ enum LoopOutcome {
 struct BudgetStop {
     scope: String,
     reason: String,
+    code: String,
     id: Option<String>,
     limit_tokens: Option<u64>,
     spent_tokens: u64,
@@ -1836,6 +1848,7 @@ struct BudgetStop {
     spent_cost: f64,
     reserved_tokens: u64,
     reserved_cost: f64,
+    protected_tokens: u64,
     elapsed_secs: Option<u64>,
 }
 
@@ -1844,6 +1857,7 @@ impl BudgetStop {
         Self {
             scope: "session".to_string(),
             reason: budget.exceeded_reason().unwrap_or("tokens").to_string(),
+            code: "BUDGET_EXHAUSTED".to_string(),
             id: None,
             limit_tokens: budget.limit,
             spent_tokens: budget.spent(),
@@ -1851,6 +1865,7 @@ impl BudgetStop {
             spent_cost: budget.cost_spent(),
             reserved_tokens: 0,
             reserved_cost: budget.reserved_cost(),
+            protected_tokens: 0,
             elapsed_secs: Some(budget.elapsed_secs()),
         }
     }
@@ -1858,11 +1873,8 @@ impl BudgetStop {
     fn from_rejection(rejection: Rejection) -> Self {
         Self {
             scope: rejection.scope.to_string(),
-            reason: match rejection.reason {
-                BudgetReason::Tokens => "tokens",
-                BudgetReason::Cost => "cost",
-            }
-            .to_string(),
+            reason: rejection.reason.as_str().to_string(),
+            code: rejection.reason.code().to_string(),
             id: Some(rejection.id),
             limit_tokens: rejection.limit_tokens,
             spent_tokens: rejection.spent_tokens,
@@ -1870,13 +1882,55 @@ impl BudgetStop {
             spent_cost: rejection.spent_cost,
             reserved_tokens: rejection.reserved_tokens,
             reserved_cost: rejection.reserved_cost,
+            protected_tokens: rejection.protected_tokens,
             elapsed_secs: None,
+        }
+    }
+
+    /// A governor deferral is a task-scoped stop even when the reservation
+    /// request touched a department/project pool: it must not abort the whole
+    /// session, and the task stays retryable.
+    fn from_governor_rejection(rejection: Rejection, task_id: Option<&str>) -> Self {
+        let mut stop = Self::from_rejection(rejection);
+        if matches!(stop.reason.as_str(), "reserved" | "throttled")
+            && let Some(task_id) = task_id
+        {
+            stop.scope = "task".to_string();
+            stop.id = Some(task_id.to_string());
+        }
+        stop
+    }
+
+    fn governor(
+        reason: BudgetReason,
+        task_id: Option<&str>,
+        budget: &SessionBudget,
+        protected_tokens: u64,
+    ) -> Self {
+        let (scope, id) = match task_id {
+            Some(task) => ("task", Some(task.to_string())),
+            None => ("session", None),
+        };
+        Self {
+            scope: scope.to_string(),
+            reason: reason.as_str().to_string(),
+            code: reason.code().to_string(),
+            id,
+            limit_tokens: budget.limit,
+            spent_tokens: budget.spent(),
+            limit_cost: budget.cost_limit,
+            spent_cost: budget.cost_spent(),
+            reserved_tokens: budget.reserved_tokens(),
+            reserved_cost: budget.reserved_cost(),
+            protected_tokens,
+            elapsed_secs: Some(budget.elapsed_secs()),
         }
     }
 
     fn session_tokens(budget: &SessionBudget) -> Self {
         Self {
             reason: "tokens".to_string(),
+            code: "BUDGET_EXHAUSTED".to_string(),
             ..Self::session(budget)
         }
     }
@@ -1884,6 +1938,7 @@ impl BudgetStop {
     fn session_cost(budget: &SessionBudget) -> Self {
         Self {
             reason: "cost".to_string(),
+            code: "BUDGET_EXHAUSTED".to_string(),
             ..Self::session(budget)
         }
     }
@@ -1896,6 +1951,7 @@ impl BudgetStop {
         serde_json::json!({
             "scope": self.scope,
             "reason": self.reason,
+            "code": self.code,
             "id": self.id,
             "limit": self.limit_tokens,
             "spent": self.spent_tokens,
@@ -1903,6 +1959,7 @@ impl BudgetStop {
             "cost_spent_usd": self.spent_cost,
             "reserved_tokens": self.reserved_tokens,
             "reserved_cost_usd": self.reserved_cost,
+            "protected_tokens": self.protected_tokens,
             "elapsed_secs": self.elapsed_secs,
         })
     }
@@ -1913,7 +1970,15 @@ impl BudgetStop {
             (kind, Some(id)) => format!("{kind} {id}"),
             (kind, None) => kind.to_string(),
         };
-        format!("{scope} {} budget exhausted", self.reason)
+        match self.reason.as_str() {
+            "reserved" => {
+                format!("{scope} deferred by the critical-path budget reserve")
+            }
+            "throttled" => {
+                format!("{scope} deferred by the budget governor throttle")
+            }
+            reason => format!("{scope} {reason} budget exhausted"),
+        }
     }
 }
 
@@ -10088,6 +10153,7 @@ impl PlanBudgetScope {
         BudgetStop {
             scope: scope.to_string(),
             reason: reason.to_string(),
+            code: "BUDGET_EXHAUSTED".to_string(),
             id: Some(id.to_string()),
             limit_tokens,
             spent_tokens: spent.0,
@@ -10095,6 +10161,7 @@ impl PlanBudgetScope {
             spent_cost: spent.1,
             reserved_tokens: 0,
             reserved_cost: 0.0,
+            protected_tokens: 0,
             elapsed_secs: None,
         }
     }
@@ -10285,6 +10352,86 @@ async fn emit_scope_budget_stop(
         spec,
         "agent.budget_exceeded",
         stop.payload(),
+    )
+    .await
+}
+
+struct GovernorDeferralEvent<'a> {
+    engine: &'a Engine,
+    session: &'a Session,
+    spec: &'a AgentSpec,
+    context: Option<&'a GovernorRunContext>,
+    gate: Option<&'a GovernorGate>,
+    reason: BudgetReason,
+    requested_tokens: u64,
+    remaining_tokens: Option<u64>,
+    limit_tokens: Option<u64>,
+    spent_tokens: u64,
+    reserved_tokens: u64,
+}
+
+/// Persist the provider-call deferral that the budget governor rejected. This
+/// is the bridge between the in-flight reservation registry and the event-backed
+/// decision history; the task itself remains retryable/queued.
+async fn emit_governor_deferral(input: GovernorDeferralEvent<'_>) -> Result<()> {
+    let reason = match input.reason {
+        BudgetReason::Throttled => GovernorReason::Throttle,
+        _ => GovernorReason::Reserve,
+    };
+    let now = vp_protocol::now_rfc3339();
+    let decision_id = format!("gov-{}", uuid::Uuid::now_v7());
+    let path = input
+        .context
+        .map(|context| context.path_task_ids.as_slice())
+        .unwrap_or(&[]);
+    let protected = input.gate.map(|gate| gate.protected_tokens).unwrap_or(0);
+    let detail = format!(
+        "non-critical request for {} tokens deferred by {}; remaining {} · protected {}",
+        input.requested_tokens,
+        reason.as_str(),
+        input
+            .remaining_tokens
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unbounded".to_string()),
+        protected
+    );
+    let payload = denial_payload(GovernorDenial {
+        session_id: &input.session.id,
+        decision_id: &decision_id,
+        plan_revision: input
+            .context
+            .map(|context| context.plan_revision)
+            .unwrap_or(0),
+        task_id: input.spec.task_id.as_deref().unwrap_or("unknown"),
+        task_critical: input
+            .context
+            .map(|context| context.critical)
+            .unwrap_or(false),
+        reason,
+        requested_tokens: input.requested_tokens,
+        limit_tokens: input.limit_tokens,
+        spent_tokens: input.spent_tokens,
+        reserved_tokens: input.reserved_tokens,
+        remaining_tokens: input.remaining_tokens,
+        protected_tokens: protected,
+        path,
+        path_weight_tokens: input
+            .context
+            .map(|context| context.path_weight_tokens)
+            .unwrap_or(0),
+        inputs_hash: input
+            .context
+            .map(|context| context.inputs_hash.as_str())
+            .unwrap_or(""),
+        detail,
+        created_at: &now,
+    });
+    emit(
+        input.engine,
+        &input.session.id,
+        input.spec,
+        DECISION_EVENT_KIND,
+        payload,
     )
     .await
 }
@@ -12274,6 +12421,13 @@ async fn run_loop_body(
         Some(&project_budget.budget),
         &project.id,
     );
+    // Static critical-path context for this run. It is intentionally computed
+    // once at run start; a plan revision or completion is picked up by the next
+    // run or scheduler tick. A disabled policy returns `None` without touching
+    // task admission or provider budgeting.
+    let governor_context = engine
+        .governor_run_context(&session.id, spec.task_id.as_deref())
+        .await?;
     let mut warned_project = false;
     // Bounded in-run prepared-summary cache. It is discarded at run end and
     // never starts a second agent run.
@@ -12461,7 +12615,7 @@ async fn run_loop_body(
             .await?;
             warned_project = true;
         }
-        let desired_output = if !budget.is_unlimited() && budget.limit.is_some() {
+        let mut desired_output = if !budget.is_unlimited() && budget.limit.is_some() {
             let remaining = budget.available_tokens().unwrap_or(0);
             if remaining <= input_estimate.saturating_add(MIN_OUTPUT_TOKENS) {
                 return Ok(LoopOutcome::BudgetExceeded(BudgetStop::session_tokens(
@@ -12472,6 +12626,53 @@ async fn run_loop_body(
         } else {
             configured_output
         };
+        // Governor gate for this provider call. It carries `critical` and the
+        // task id with the normal scope requests. A non-critical request is
+        // clamped to the free headroom, or deferred with a typed reason, but
+        // never above the session/project/department hard budget.
+        let governor_budget = if budget.limit.is_some() {
+            (budget.available_tokens(), budget.limit)
+        } else if let Some(limit) = plan_budget.project_tokens {
+            (Some(limit.saturating_sub(project_spent.0)), Some(limit))
+        } else {
+            (None, None)
+        };
+        let governor_gate = governor_context
+            .as_ref()
+            .and_then(|context| context.gate(governor_budget.0, governor_budget.1));
+        if !plan_budget.active()
+            && !budget.is_unlimited()
+            && let Some(gate) = governor_gate.as_ref()
+        {
+            match gate.available_output(input_estimate, MIN_OUTPUT_TOKENS) {
+                Ok(Some(cap)) => desired_output = desired_output.min(cap),
+                Ok(None) => {}
+                Err(reason) => {
+                    emit_governor_deferral(GovernorDeferralEvent {
+                        engine,
+                        session,
+                        spec,
+                        context: governor_context.as_ref(),
+                        gate: Some(gate),
+                        reason,
+                        requested_tokens: input_estimate.saturating_add(desired_output),
+                        remaining_tokens: gate.remaining_tokens,
+                        limit_tokens: governor_budget.1,
+                        spent_tokens: budget.spent(),
+                        reserved_tokens: engine.budget_registry().reserved_for_session(&session.id),
+                    })
+                    .await?;
+                    let stop = BudgetStop::governor(
+                        reason,
+                        spec.task_id.as_deref(),
+                        budget,
+                        gate.protected_tokens,
+                    );
+                    emit_scope_budget_stop(engine, &session.id, spec, &stop).await?;
+                    return Ok(LoopOutcome::BudgetExceeded(stop));
+                }
+            }
+        }
         let scope_lease = if plan_budget.active() && !budget.is_unlimited() {
             let requests = plan_budget.requests(
                 &session.id,
@@ -12481,15 +12682,36 @@ async fn run_loop_body(
                 input_price,
                 output_price,
             );
-            match engine.budget_registry().grant(
+            match engine.budget_registry().grant_governed(
                 &requests,
+                governor_gate.as_ref(),
                 input_estimate,
                 desired_output,
                 MIN_OUTPUT_TOKENS,
             ) {
                 Ok(lease) => Some(lease),
                 Err(rejection) => {
-                    let stop = BudgetStop::from_rejection(rejection);
+                    if matches!(
+                        rejection.reason,
+                        BudgetReason::Reserved | BudgetReason::Throttled
+                    ) {
+                        emit_governor_deferral(GovernorDeferralEvent {
+                            engine,
+                            session,
+                            spec,
+                            context: governor_context.as_ref(),
+                            gate: governor_gate.as_ref(),
+                            reason: rejection.reason,
+                            requested_tokens: input_estimate.saturating_add(desired_output),
+                            remaining_tokens: governor_budget.0,
+                            limit_tokens: governor_budget.1,
+                            spent_tokens: budget.spent(),
+                            reserved_tokens: rejection.reserved_tokens,
+                        })
+                        .await?;
+                    }
+                    let stop =
+                        BudgetStop::from_governor_rejection(rejection, spec.task_id.as_deref());
                     emit_scope_budget_stop(engine, &session.id, spec, &stop).await?;
                     return Ok(LoopOutcome::BudgetExceeded(stop));
                 }
@@ -19321,6 +19543,7 @@ async fn execute_team_plan(
     let limited = max_tasks.is_some();
     let limit = max_tasks.unwrap_or(usize::MAX).max(1);
     let mut executed = 0usize;
+    let mut deferred_by_governor = false;
     let original_worker_cap = budget.worker_cap();
     let _worker_cap_guard = config.auto_expand_workers.then(|| WorkerCapGuard {
         budget,
@@ -19435,11 +19658,47 @@ async fn execute_team_plan(
             }
             return Ok(PlanRunResult::BudgetExceeded(BudgetStop::session(budget)));
         }
-        let ready = engine
+        let governor_budget = GovernorBudgetView::new(
+            budget.limit,
+            budget.spent(),
+            engine.budget_registry().reserved_for_session(&session.id),
+        );
+        let selection = engine
             .scheduler()
-            .ready_tasks(session, plan_seq, plan, plan.tasks.len())
+            .ready_tasks_governed(
+                session,
+                plan_seq,
+                plan,
+                plan.tasks.len(),
+                Some(governor_budget),
+            )
             .await?;
+        if let Some(admission) = selection.governor.as_ref() {
+            engine
+                .record_budget_governor_admission(&session.id, admission)
+                .await?;
+        }
+        let ready = selection.ready;
         if ready.is_empty() {
+            if !selection.deferred.is_empty() {
+                // Governor deferrals are not dependency failures: leave the
+                // tasks queued/retryable and end this batch without blocking
+                // them. The next scheduler tick or explicit resume recomputes
+                // the reserve from the then-current budget.
+                reports.push(format!(
+                    "Budget governor deferred {} ready task(s): {}",
+                    selection.deferred.len(),
+                    selection
+                        .deferred
+                        .iter()
+                        .take(5)
+                        .map(|deferral| format!("{} ({})", deferral.task_id, deferral.reason))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                deferred_by_governor = true;
+                break;
+            }
             for task in &remaining {
                 statuses.insert(task.id.clone(), "blocked".to_string());
                 let unmet = task
@@ -20050,6 +20309,14 @@ async fn execute_team_plan(
 
     if limited {
         if executed == 0 {
+            if deferred_by_governor {
+                return Ok(PlanRunResult::Done(
+                    reports
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| "No ready task was dispatched.".to_string()),
+                ));
+            }
             return Ok(PlanRunResult::Done(
                 "No ready task was dispatched.".to_string(),
             ));

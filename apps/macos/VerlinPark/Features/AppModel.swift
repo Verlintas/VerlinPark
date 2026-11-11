@@ -89,6 +89,8 @@ final class AppModel {
     var usageLedger: UsageLedgerResult?
     var usageStatus: String?
     var sessionCacheStatus: SessionCacheStatus?
+    var governorStatus: GovernorSessionStatus?
+    var governorStatusMessage: String?
     var efficiencyBusy = false
     var efficiencyStatus: String?
     var shellPolicy = ShellPolicy.allow
@@ -703,6 +705,8 @@ final class AppModel {
         efficiencyRefreshTask?.cancel()
         toolActivityRefreshTask?.cancel()
         sessionCacheStatus = nil
+        governorStatus = nil
+        governorStatusMessage = nil
         toolOutputStatus = nil
         toolActivity = nil
         toolActivityStatus = nil
@@ -3425,6 +3429,8 @@ final class AppModel {
             usageStatus = nil
             contextStatus = nil
             sessionCacheStatus = nil
+            governorStatus = nil
+            governorStatusMessage = nil
             toolActivity = nil
             toolActivityStatus = nil
             return
@@ -3473,6 +3479,19 @@ final class AppModel {
                 efficiencyStatus =
                     "session.cache is unavailable; cache values are derived from session.usage."
             }
+        }
+
+        do {
+            let governor = try await core.budgetGovernor(sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            governorStatus = governor
+            governorStatusMessage = nil
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            governorStatus = nil
+            // The RPC is newer than some daemons. A missing governor is a
+            // diagnostic, not a reason to fail the efficiency surface.
+            governorStatusMessage = "session.budget.governor is unavailable: \(error.localizedDescription)"
         }
 
         await loadToolActivity()

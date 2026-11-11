@@ -50,6 +50,7 @@ struct EfficiencySnapshot: Equatable, Sendable {
     let toolOutputMaxEntries: Int?
     let preambleTokensEstimate: Int?
     let promptPrefixHash: String?
+    let governor: GovernorSessionStatus?
     let ratioIsFromDaemon: Bool
 
     var contextUsageFraction: Double? {
@@ -155,11 +156,12 @@ enum EfficiencyMetrics {
         context: SessionContextStatus?,
         cache: SessionCacheStatus?,
         toolOutputs: ToolOutputStatus?,
+        governor: GovernorSessionStatus? = nil,
         eventTypes: [String],
         latestPrefixHash: String?
     ) -> EfficiencySnapshot? {
         guard projectUsage != nil || usage != nil || context != nil || cache != nil
-            || toolOutputs != nil
+            || toolOutputs != nil || governor != nil
         else {
             return nil
         }
@@ -249,6 +251,7 @@ enum EfficiencyMetrics {
             preambleTokensEstimate: cache?.preambleTokensEstimate
                 ?? contextUsage?.preambleTokensEstimate,
             promptPrefixHash: cache?.promptPrefixHash ?? latestPrefixHash,
+            governor: governor,
             ratioIsFromDaemon: ratioIsFromDaemon
         )
     }

@@ -13566,3 +13566,89 @@ fn scaling_decisions_are_idempotent_and_rebuildable() {
         decisions
     );
 }
+
+#[test]
+fn critical_path_policy_round_trips_and_normalizes() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("governor"))
+        .unwrap();
+    assert_eq!(
+        store.get_critical_path_policy(&project.id).unwrap(),
+        CriticalPathPolicy::default()
+    );
+    assert!(!store.has_critical_path_policy(&project.id).unwrap());
+    let stored = CriticalPathPolicy {
+        enabled: true,
+        reserve_ratio: 3.0,
+        throttle_at_ratio: -1.0,
+        critical_boost: 500,
+        min_task_budget: u64::MAX,
+    };
+    store
+        .set_critical_path_policy(&project.id, &stored)
+        .unwrap();
+    assert!(store.has_critical_path_policy(&project.id).unwrap());
+    let loaded = store.get_critical_path_policy(&project.id).unwrap();
+    assert!(loaded.enabled);
+    assert_eq!(loaded.reserve_ratio, 1.0);
+    assert_eq!(loaded.throttle_at_ratio, 0.0);
+    assert_eq!(
+        loaded.critical_boost,
+        CriticalPathPolicy::MAX_CRITICAL_BOOST
+    );
+    assert_eq!(
+        loaded.min_task_budget,
+        CriticalPathPolicy::MAX_MIN_TASK_BUDGET
+    );
+}
+
+#[test]
+fn critical_path_policy_survives_project_manifest_rebuild() {
+    let (data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("governor manifest"))
+        .unwrap();
+    let policy = CriticalPathPolicy {
+        enabled: true,
+        reserve_ratio: 0.4,
+        throttle_at_ratio: 0.2,
+        critical_boost: 10,
+        min_task_budget: 2_000,
+    };
+    store
+        .set_critical_path_policy(&project.id, &policy)
+        .unwrap();
+    store.record_project_manifest().unwrap();
+    drop(store);
+    let reopened = Store::open(data.path()).unwrap();
+    assert_eq!(
+        reopened.get_critical_path_policy(&project.id).unwrap(),
+        policy
+    );
+    let snapshots = read_project_manifest(data.path()).unwrap();
+    let snapshot = snapshots
+        .iter()
+        .find(|snapshot| snapshot.project.id == project.id)
+        .unwrap();
+    assert_eq!(snapshot.critical_path_policy, policy);
+}
+
+#[test]
+fn legacy_manifest_without_critical_path_policy_decodes_disabled() {
+    let (data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("legacy governor"))
+        .unwrap();
+    store.record_project_manifest().unwrap();
+    let raw = std::fs::read_to_string(data.path().join("projects.jsonl")).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("critical_path_policy");
+    let snapshot: ProjectManifestSnapshot = serde_json::from_value(value).unwrap();
+    assert_eq!(snapshot.critical_path_policy, CriticalPathPolicy::default());
+    assert!(!snapshot.critical_path_policy.enabled);
+    assert_eq!(snapshot.project.id, project.id);
+}

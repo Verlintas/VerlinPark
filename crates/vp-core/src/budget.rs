@@ -27,6 +27,77 @@ pub struct ScopeRequest {
 pub enum BudgetReason {
     Tokens,
     Cost,
+    /// A non-critical request would consume the critical-path reserve pool.
+    Reserved,
+    /// The session is inside the governor's throttle zone.
+    Throttled,
+}
+
+impl BudgetReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tokens => "tokens",
+            Self::Cost => "cost",
+            Self::Reserved => "reserved",
+            Self::Throttled => "throttled",
+        }
+    }
+
+    /// Stable Q3 error-contract code carried into the agent budget stop.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Tokens | Self::Cost => "BUDGET_EXHAUSTED",
+            Self::Reserved => "BUDGET_RESERVED",
+            Self::Throttled => "BUDGET_THROTTLED",
+        }
+    }
+}
+
+/// Read-only reservation gate derived from the budget governor. The gate
+/// accompanies the normal scope requests for one provider call; it can only
+/// lower the granted output or reject a non-critical request, never widen a
+/// hard budget.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GovernorGate {
+    pub enabled: bool,
+    pub task_id: Option<String>,
+    pub critical: bool,
+    pub remaining_tokens: Option<u64>,
+    pub protected_tokens: u64,
+    pub throttled: bool,
+    pub min_task_budget: u64,
+    pub policy_fingerprint: String,
+}
+
+impl GovernorGate {
+    /// Maximum output tokens this non-critical request may use without
+    /// breaching the protected pool. `Ok(None)` means the gate does not apply
+    /// (disabled, critical, or unbounded); `Err` is a typed deferral reason.
+    pub fn available_output(
+        &self,
+        input_estimate: u64,
+        min_output: u64,
+    ) -> Result<Option<u64>, BudgetReason> {
+        if !self.enabled || self.critical {
+            return Ok(None);
+        }
+        let Some(remaining) = self.remaining_tokens else {
+            return Ok(None);
+        };
+        if self.throttled {
+            return Err(BudgetReason::Throttled);
+        }
+        if remaining < self.min_task_budget {
+            return Err(BudgetReason::Reserved);
+        }
+        let available = remaining
+            .saturating_sub(self.protected_tokens)
+            .saturating_sub(input_estimate);
+        if available < min_output {
+            return Err(BudgetReason::Reserved);
+        }
+        Ok(Some(available))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +111,8 @@ pub struct Rejection {
     pub limit_cost: Option<f64>,
     pub spent_cost: f64,
     pub reserved_cost: f64,
+    /// Critical-path tokens held back from non-critical work at rejection time.
+    pub protected_tokens: u64,
 }
 
 #[derive(Debug, Default)]
@@ -66,6 +139,7 @@ pub struct BudgetRegistry {
 
 /// Releases the reservations for one provider call when dropped, including
 /// cancellation and provider errors.
+#[derive(Debug)]
 pub struct BudgetLease {
     registry: Arc<BudgetRegistry>,
     keys: Vec<(String, u64, f64)>,
@@ -105,6 +179,20 @@ impl BudgetRegistry {
         desired_output: u64,
         min_output: u64,
     ) -> Result<BudgetLease, Rejection> {
+        self.grant_governed(requests, None, input_estimate, desired_output, min_output)
+    }
+
+    /// Grant a budget subject to an optional critical-path gate. The governor
+    /// can only reject or reduce a non-critical request below the normal hard
+    /// budget; a critical request is never blocked by the reserve pool.
+    pub fn grant_governed(
+        self: &Arc<Self>,
+        requests: &[ScopeRequest],
+        governor: Option<&GovernorGate>,
+        input_estimate: u64,
+        desired_output: u64,
+        min_output: u64,
+    ) -> Result<BudgetLease, Rejection> {
         if requests.is_empty() {
             return Ok(BudgetLease {
                 registry: self.clone(),
@@ -125,6 +213,7 @@ impl BudgetRegistry {
                     limit_cost: None,
                     spent_cost: 0.0,
                     reserved_cost: 0.0,
+                    protected_tokens: 0,
                 });
             }
         };
@@ -140,6 +229,21 @@ impl BudgetRegistry {
             pool.observed_tokens = pool.observed_tokens.max(request.observed.tokens);
             pool.observed_cost = pool.observed_cost.max(request.observed.cost_usd);
             keys.push((key, request));
+        }
+
+        let mut governor_cap: Option<u64> = None;
+        if let Some(gate) = governor {
+            match gate.available_output(input_estimate, min_output) {
+                Ok(cap) => governor_cap = cap,
+                Err(reason) => {
+                    return Err(first_governor_rejection(
+                        &pools,
+                        &keys,
+                        reason,
+                        gate.protected_tokens,
+                    ));
+                }
+            }
         }
 
         let mut granted = desired_output;
@@ -187,6 +291,9 @@ impl BudgetRegistry {
                     }
                 }
             }
+        }
+        if let Some(cap) = governor_cap {
+            granted = granted.min(cap);
         }
 
         if granted < min_output {
@@ -256,6 +363,63 @@ impl BudgetRegistry {
             pools.remove(&key);
         }
     }
+
+    /// Tokens currently reserved by in-flight provider calls for one session.
+    /// Project pools are shared across sessions and are intentionally excluded.
+    pub fn reserved_for_session(&self, session_id: &str) -> u64 {
+        let prefix = format!("session:{session_id}:");
+        self.inner
+            .lock()
+            .map(|pools| {
+                pools
+                    .iter()
+                    .filter(|(key, _)| key.starts_with(&prefix))
+                    .map(|(_, pool)| pool.reserved_tokens)
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Tokens currently reserved by in-flight provider calls against a project.
+    pub fn reserved_for_project(&self, project_id: &str) -> u64 {
+        let key = format!("project:{project_id}");
+        self.inner
+            .lock()
+            .map(|pools| {
+                pools
+                    .get(&key)
+                    .map(|pool| pool.reserved_tokens)
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+    }
+}
+
+fn first_governor_rejection(
+    pools: &HashMap<String, Pool>,
+    keys: &[(String, &ScopeRequest)],
+    reason: BudgetReason,
+    protected_tokens: u64,
+) -> Rejection {
+    if let Some((key, request)) = keys.first()
+        && let Some(pool) = pools.get(key)
+    {
+        let mut rejection = rejection(pool, request, reason);
+        rejection.protected_tokens = protected_tokens;
+        return rejection;
+    }
+    Rejection {
+        scope: "governor",
+        id: "critical-path".to_string(),
+        reason,
+        limit_tokens: None,
+        spent_tokens: 0,
+        reserved_tokens: 0,
+        limit_cost: None,
+        spent_cost: 0.0,
+        reserved_cost: 0.0,
+        protected_tokens,
+    }
 }
 
 fn rejection(pool: &Pool, request: &ScopeRequest, reason: BudgetReason) -> Rejection {
@@ -269,6 +433,7 @@ fn rejection(pool: &Pool, request: &ScopeRequest, reason: BudgetReason) -> Rejec
         limit_cost: pool.limit_cost,
         spent_cost: pool.observed_cost,
         reserved_cost: pool.reserved_cost,
+        protected_tokens: 0,
     }
 }
 
@@ -395,5 +560,146 @@ mod tests {
             cost_usd: 0.0,
         };
         assert!(registry.grant(&[newer], 10, 50, 10).is_err());
+    }
+
+    fn gate(remaining: u64, protected: u64) -> GovernorGate {
+        GovernorGate {
+            enabled: true,
+            task_id: Some("T2".to_string()),
+            critical: false,
+            remaining_tokens: Some(remaining),
+            protected_tokens: protected,
+            throttled: false,
+            min_task_budget: 50,
+            policy_fingerprint: "hash".to_string(),
+        }
+    }
+
+    #[test]
+    fn governor_gate_clamps_non_critical_output_to_free_headroom() {
+        let registry = Arc::new(BudgetRegistry::new());
+        let lease = registry
+            .grant_governed(
+                &[request("task", "T2", 10_000)],
+                Some(&gate(1_000, 800)),
+                100,
+                500,
+                10,
+            )
+            .unwrap();
+        // 1,000 - 800 protected - 100 input leaves 100 output.
+        assert_eq!(lease.granted_output_tokens(), 100);
+    }
+
+    #[test]
+    fn governor_gate_rejects_when_reserve_leaves_no_minimum_output() {
+        let registry = Arc::new(BudgetRegistry::new());
+        let rejection = registry
+            .grant_governed(
+                &[request("task", "T2", 10_000)],
+                Some(&gate(1_000, 980)),
+                100,
+                500,
+                64,
+            )
+            .unwrap_err();
+        assert_eq!(rejection.reason, BudgetReason::Reserved);
+        assert_eq!(rejection.reason.code(), "BUDGET_RESERVED");
+        assert_eq!(rejection.protected_tokens, 980);
+    }
+
+    #[test]
+    fn governor_gate_rejects_inside_the_throttle_zone() {
+        let registry = Arc::new(BudgetRegistry::new());
+        let mut throttle = gate(1_000, 500);
+        throttle.throttled = true;
+        let rejection = registry
+            .grant_governed(
+                &[request("task", "T2", 10_000)],
+                Some(&throttle),
+                10,
+                100,
+                10,
+            )
+            .unwrap_err();
+        assert_eq!(rejection.reason, BudgetReason::Throttled);
+        assert_eq!(rejection.reason.code(), "BUDGET_THROTTLED");
+    }
+
+    #[test]
+    fn governor_gate_never_blocks_a_critical_request() {
+        let registry = Arc::new(BudgetRegistry::new());
+        let mut critical = gate(1_000, 999);
+        critical.critical = true;
+        let lease = registry
+            .grant_governed(
+                &[request("task", "T2", 1_000)],
+                Some(&critical),
+                100,
+                500,
+                10,
+            )
+            .unwrap();
+        // 1,000 - 100 input leaves 900 output; the reserve does not apply.
+        assert_eq!(lease.granted_output_tokens(), 500);
+    }
+
+    #[test]
+    fn governor_gate_rejects_below_min_task_budget() {
+        let registry = Arc::new(BudgetRegistry::new());
+        let rejection = registry
+            .grant_governed(
+                &[request("task", "T2", 10_000)],
+                Some(&gate(40, 0)),
+                10,
+                100,
+                10,
+            )
+            .unwrap_err();
+        assert_eq!(rejection.reason, BudgetReason::Reserved);
+    }
+
+    #[test]
+    fn disabled_governor_gate_preserves_normal_grant_behavior() {
+        let registry = Arc::new(BudgetRegistry::new());
+        let mut disabled = gate(100, 100);
+        disabled.enabled = false;
+        let lease = registry
+            .grant_governed(
+                &[request("task", "T2", 10_000)],
+                Some(&disabled),
+                10,
+                500,
+                10,
+            )
+            .unwrap();
+        assert_eq!(lease.granted_output_tokens(), 500);
+    }
+
+    #[test]
+    fn reserved_for_session_counts_only_session_pools() {
+        let registry = Arc::new(BudgetRegistry::new());
+        let mut task = request("task", "T1", 1_000);
+        task.pool_key = "session:session-1:task:T1".to_string();
+        let mut department = request("department", "impl", 1_000);
+        department.pool_key = "session:session-1:department:impl".to_string();
+        let project = ScopeRequest {
+            pool_key: "project:p1".to_string(),
+            scope: "project",
+            id: "p1".to_string(),
+            limit_tokens: Some(1_000),
+            limit_cost: None,
+            observed: Spend::default(),
+            input_price_per_m: 0.0,
+            output_price_per_m: 0.0,
+        };
+        let lease = registry
+            .grant(&[task, department, project], 10, 100, 10)
+            .unwrap();
+        assert_eq!(registry.reserved_for_session("session-1"), 220);
+        assert_eq!(registry.reserved_for_project("p1"), 110);
+        drop(lease);
+        assert_eq!(registry.reserved_for_session("session-1"), 0);
+        assert_eq!(registry.reserved_for_project("p1"), 0);
     }
 }

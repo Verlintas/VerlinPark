@@ -568,6 +568,49 @@ enum Command {
         #[arg(long)]
         cost_budget_usd: Option<f64>,
     },
+    /// Show the critical-path budget governor for a session.
+    Governor {
+        session: String,
+        /// Number of recent decision events to include (1–100).
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    /// Show the deterministic critical path and governor preview for a session.
+    CriticalPath {
+        session: String,
+        /// Deterministic preview override for remaining tokens.
+        #[arg(long)]
+        remaining_tokens: Option<u64>,
+    },
+    /// Preview governor admission without writing a decision event.
+    GovernorPreview {
+        session: String,
+        /// Deterministic preview override for remaining tokens.
+        #[arg(long)]
+        remaining_tokens: Option<u64>,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    /// Show the project's critical-path budget governor policy.
+    GovernorPolicy { project: String },
+    /// Update the project's critical-path budget governor policy.
+    GovernorPolicySet {
+        project: String,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        enabled: Option<bool>,
+        /// Fraction of remaining session budget held for the critical path (0.0–1.0).
+        #[arg(long)]
+        reserve_ratio: Option<f64>,
+        /// Remaining-budget fraction that starts the non-critical throttle (0.0–1.0).
+        #[arg(long)]
+        throttle_at_ratio: Option<f64>,
+        /// Priority boost for critical tasks under pressure (0–100).
+        #[arg(long)]
+        critical_boost: Option<i32>,
+        /// Hard floor below which no task is admitted.
+        #[arg(long)]
+        min_task_budget: Option<u64>,
+    },
     /// Remove old terminal session worktrees while keeping branches by default.
     CleanupWorktrees {
         project: String,
@@ -3160,6 +3203,90 @@ async fn main() -> Result<()> {
                         "cost_budget_usd": cost_budget_usd,
                     }
                 }),
+            )
+            .await?
+        }
+        Command::Governor { session, limit } => {
+            rpc(
+                &discovery,
+                "session.budget.governor",
+                json!({"session_id": session, "limit": limit}),
+            )
+            .await?
+        }
+        Command::CriticalPath {
+            session,
+            remaining_tokens,
+        } => {
+            rpc(
+                &discovery,
+                "governor.preview",
+                json!({
+                    "session_id": session,
+                    "remaining_tokens": remaining_tokens,
+                    "limit": 1,
+                }),
+            )
+            .await?
+        }
+        Command::GovernorPreview {
+            session,
+            remaining_tokens,
+            limit,
+        } => {
+            rpc(
+                &discovery,
+                "governor.preview",
+                json!({
+                    "session_id": session,
+                    "remaining_tokens": remaining_tokens,
+                    "limit": limit,
+                }),
+            )
+            .await?
+        }
+        Command::GovernorPolicy { project } => {
+            rpc(
+                &discovery,
+                "critical_path.policy.get",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::GovernorPolicySet {
+            project,
+            enabled,
+            reserve_ratio,
+            throttle_at_ratio,
+            critical_boost,
+            min_task_budget,
+        } => {
+            let current = rpc(
+                &discovery,
+                "critical_path.policy.get",
+                json!({"project_id": project}),
+            )
+            .await?;
+            let mut policy = current.get("policy").cloned().unwrap_or_else(|| json!({}));
+            if let Some(value) = enabled {
+                policy["enabled"] = json!(value);
+            }
+            if let Some(value) = reserve_ratio {
+                policy["reserve_ratio"] = json!(value);
+            }
+            if let Some(value) = throttle_at_ratio {
+                policy["throttle_at_ratio"] = json!(value);
+            }
+            if let Some(value) = critical_boost {
+                policy["critical_boost"] = json!(value);
+            }
+            if let Some(value) = min_task_budget {
+                policy["min_task_budget"] = json!(value);
+            }
+            rpc(
+                &discovery,
+                "critical_path.policy.set",
+                json!({"project_id": project, "policy": policy}),
             )
             .await?
         }
@@ -6705,6 +6832,144 @@ fn context_checkpoint_lines(value: &Value) -> Option<Vec<String>> {
     None
 }
 
+/// Human rendering for `vp governor`, `vp critical-path`, and the project
+/// policy commands. It reads only the real RPC payload; missing fields stay
+/// absent instead of being invented.
+fn governor_lines(value: &Value) -> Option<Vec<String>> {
+    if let Some(policy) = value.get("policy")
+        && value.get("session_id").is_none()
+        && policy.get("reserve_ratio").is_some()
+    {
+        let enabled = policy["enabled"].as_bool().unwrap_or(false);
+        let ratio = policy["reserve_ratio"].as_f64().unwrap_or(0.0) * 100.0;
+        let throttle = policy["throttle_at_ratio"].as_f64().unwrap_or(0.0) * 100.0;
+        return Some(vec![format!(
+            "Critical-path governor: {} · reserve {:.0}% · throttle {:.0}% · boost {} · min {} tokens",
+            if enabled { "enabled" } else { "disabled" },
+            ratio.max(0.0),
+            throttle.max(0.0),
+            policy["critical_boost"].as_i64().unwrap_or(0),
+            policy["min_task_budget"].as_u64().unwrap_or(0)
+        )]);
+    }
+    let session = value.get("session_id")?.as_str()?;
+    let reserve = value.get("reserve")?;
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "Governor {}{} · session {session} · plan r{} · {}{}",
+        if value["enabled"].as_bool().unwrap_or(false) {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        reserve["state"]
+            .as_str()
+            .map(|state| format!(" ({state})"))
+            .unwrap_or_default(),
+        value["plan_revision"].as_u64().unwrap_or(0),
+        value["session_status"].as_str().unwrap_or("unknown"),
+        if value["unlimited"].as_bool().unwrap_or(false) {
+            " · unlimited"
+        } else {
+            ""
+        }
+    ));
+    if let Some(path) = value
+        .get("critical_path")
+        .filter(|path| path["task_ids"].is_array())
+    {
+        let tasks = path["task_ids"]
+            .as_array()
+            .map(|tasks| {
+                tasks
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" -> ")
+            })
+            .unwrap_or_default();
+        if tasks.is_empty() {
+            lines.push(format!(
+                "Path: complete · weight {} tokens",
+                path["weight_tokens"].as_u64().unwrap_or(0)
+            ));
+        } else {
+            lines.push(format!(
+                "Path (weight {} tokens): {tasks}",
+                path["weight_tokens"].as_u64().unwrap_or(0)
+            ));
+        }
+    }
+    lines.push(format!(
+        "Reserve: protected {} of remaining {} · ratio {:.0}% · throttle {:.0}%{}",
+        reserve["protected_tokens"].as_u64().unwrap_or(0),
+        reserve["remaining_tokens"]
+            .as_u64()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unbounded".to_string()),
+        reserve["reserve_ratio"].as_f64().unwrap_or(0.0) * 100.0,
+        reserve["throttle_at_ratio"].as_f64().unwrap_or(0.0) * 100.0,
+        if reserve["throttled"].as_bool().unwrap_or(false) {
+            " · throttled"
+        } else {
+            ""
+        }
+    ));
+    if let Some(admitted) = value["admitted"]
+        .as_array()
+        .filter(|items| !items.is_empty())
+    {
+        lines.push(format!(
+            "Admit: {}",
+            admitted
+                .iter()
+                .filter_map(Value::as_str)
+                .take(8)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(deferred) = value["deferred"]
+        .as_array()
+        .filter(|items| !items.is_empty())
+    {
+        for deferral in deferred.iter().take(5) {
+            lines.push(format!(
+                "Defer: {} ({}, {})",
+                deferral["task_id"].as_str().unwrap_or("?"),
+                deferral["reason"].as_str().unwrap_or("?"),
+                deferral["code"].as_str().unwrap_or("-")
+            ));
+        }
+        if deferred.len() > 5 {
+            lines.push(format!("  +{} more deferred tasks", deferred.len() - 5));
+        }
+    }
+    if let Some(error) = value.get("error").filter(|error| error["code"].is_string()) {
+        lines.push(format!(
+            "Error: {} · {}",
+            error["code"].as_str().unwrap_or("?"),
+            error["message"].as_str().unwrap_or("")
+        ));
+        if let Some(hint) = error["hint"].as_str() {
+            lines.push(format!("  hint: {hint}"));
+        }
+    }
+    if let Some(last) = value["last_decisions"]
+        .as_array()
+        .and_then(|decisions| decisions.last())
+    {
+        lines.push(format!(
+            "Last decision: {} {} at {} · {}",
+            last["action"].as_str().unwrap_or("?"),
+            last["reason"].as_str().unwrap_or("?"),
+            last["created_at"].as_str().unwrap_or("?"),
+            last["detail"].as_str().unwrap_or("")
+        ));
+    }
+    Some(lines)
+}
+
 fn lsp_status_lines(value: &Value) -> Option<Vec<String>> {
     let languages = value.get("languages")?.as_array()?;
     value.get("supported_languages")?;
@@ -7147,6 +7412,12 @@ fn scaling_lines(value: &Value) -> Option<Vec<String>> {
 
 fn print_human(value: &Value) {
     if let Some(lines) = process_console_lines(value) {
+        for line in lines {
+            println!("{line}");
+        }
+        return;
+    }
+    if let Some(lines) = governor_lines(value) {
         for line in lines {
             println!("{line}");
         }
@@ -11738,5 +12009,200 @@ mod scaling_cli_tests {
         assert!(scaling_lines(&json!({"session_id": "ses-1"})).is_none());
         assert!(scaling_lines(&json!({"projects": []})).is_none());
         assert!(scaling_lines(&json!({"policy": {"max_workers": 4}})).is_none());
+    }
+}
+
+#[cfg(test)]
+mod governor_cli_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        let args = args
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .collect::<Vec<_>>();
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(args).unwrap())
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    #[test]
+    fn governor_commands_and_flags_parse() {
+        let cli = parse(&["vp", "governor", "session-1", "--limit", "7"]);
+        match cli.command {
+            Command::Governor { session, limit } => {
+                assert_eq!(session, "session-1");
+                assert_eq!(limit, 7);
+            }
+            other => panic!("expected governor, got {other:?}"),
+        }
+
+        let cli = parse(&[
+            "vp",
+            "critical-path",
+            "session-1",
+            "--remaining-tokens",
+            "1234",
+        ]);
+        match cli.command {
+            Command::CriticalPath {
+                session,
+                remaining_tokens,
+            } => {
+                assert_eq!(session, "session-1");
+                assert_eq!(remaining_tokens, Some(1_234));
+            }
+            other => panic!("expected critical-path, got {other:?}"),
+        }
+
+        let cli = parse(&[
+            "vp",
+            "governor-preview",
+            "session-1",
+            "--remaining-tokens",
+            "99",
+            "--limit",
+            "3",
+        ]);
+        match cli.command {
+            Command::GovernorPreview {
+                session,
+                remaining_tokens,
+                limit,
+            } => {
+                assert_eq!(session, "session-1");
+                assert_eq!(remaining_tokens, Some(99));
+                assert_eq!(limit, 3);
+            }
+            other => panic!("expected governor-preview, got {other:?}"),
+        }
+
+        let cli = parse(&["vp", "governor-policy", "project-1"]);
+        match cli.command {
+            Command::GovernorPolicy { project } => assert_eq!(project, "project-1"),
+            other => panic!("expected governor-policy, got {other:?}"),
+        }
+
+        let cli = parse(&[
+            "vp",
+            "governor-policy-set",
+            "project-1",
+            "--enabled",
+            "--reserve-ratio",
+            "0.4",
+            "--throttle-at-ratio",
+            "0.2",
+            "--critical-boost",
+            "10",
+            "--min-task-budget",
+            "2000",
+        ]);
+        match cli.command {
+            Command::GovernorPolicySet {
+                project,
+                enabled,
+                reserve_ratio,
+                throttle_at_ratio,
+                critical_boost,
+                min_task_budget,
+            } => {
+                assert_eq!(project, "project-1");
+                assert_eq!(enabled, Some(true));
+                assert_eq!(reserve_ratio, Some(0.4));
+                assert_eq!(throttle_at_ratio, Some(0.2));
+                assert_eq!(critical_boost, Some(10));
+                assert_eq!(min_task_budget, Some(2_000));
+            }
+            other => panic!("expected governor-policy-set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn governor_human_renderer_explains_the_reserve() {
+        let value = json!({
+            "session_id": "session-1",
+            "session_status": "idle",
+            "plan_revision": 2,
+            "enabled": true,
+            "unlimited": false,
+            "policy": {"enabled": true, "reserve_ratio": 0.25},
+            "critical_path": {"task_ids": ["a", "b"], "weight_tokens": 5000},
+            "reserve": {
+                "state": "active",
+                "protected_tokens": 7500,
+                "remaining_tokens": 10000,
+                "reserve_ratio": 0.25,
+                "throttle_at_ratio": 0.35,
+                "throttled": false
+            },
+            "admitted": ["a"],
+            "deferred": [{
+                "task_id": "side",
+                "reason": "reserve",
+                "code": "BUDGET_RESERVED"
+            }],
+            "last_decisions": [],
+            "generated_at": "2026-11-11T00:00:00Z"
+        });
+        let lines = governor_lines(&value).unwrap().join("\n");
+        assert!(lines.contains("session session-1"));
+        assert!(lines.contains("a -> b"));
+        assert!(lines.contains("protected 7500 of remaining 10000"));
+        assert!(lines.contains("Defer: side (reserve, BUDGET_RESERVED)"));
+    }
+
+    #[test]
+    fn governor_renderer_surfaces_typed_errors_and_deferrals() {
+        let value = json!({
+            "session_id": "session-1",
+            "session_status": "idle",
+            "plan_revision": 1,
+            "enabled": true,
+            "unlimited": false,
+            "policy": {"enabled": true},
+            "critical_path": {"task_ids": [], "weight_tokens": 0},
+            "reserve": {
+                "state": "complete",
+                "protected_tokens": 0,
+                "remaining_tokens": 5000,
+                "reserve_ratio": 0.25,
+                "throttle_at_ratio": 0.35,
+                "throttled": false
+            },
+            "admitted": [],
+            "deferred": [],
+            "last_decisions": [],
+            "error": {
+                "code": "BUDGET_PATH_CYCLE",
+                "message": "plan dependency cycle",
+                "hint": "remove the cycle"
+            },
+            "generated_at": "2026-11-11T00:00:00Z"
+        });
+        let lines = governor_lines(&value).unwrap().join("\n");
+        assert!(lines.contains("Path: complete"));
+        assert!(lines.contains("BUDGET_PATH_CYCLE"));
+        assert!(lines.contains("hint: remove the cycle"));
+    }
+
+    #[test]
+    fn governor_policy_renderer_is_compact() {
+        let value = json!({
+            "project_id": "p1",
+            "policy": {
+                "enabled": true,
+                "reserve_ratio": 0.5,
+                "throttle_at_ratio": 0.2,
+                "critical_boost": 10,
+                "min_task_budget": 2000
+            }
+        });
+        let lines = governor_lines(&value).unwrap().join("\n");
+        assert!(lines.contains("enabled"));
+        assert!(lines.contains("reserve 50%"));
+        assert!(lines.contains("throttle 20%"));
     }
 }

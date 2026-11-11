@@ -20,6 +20,7 @@ struct EfficiencyCard: View {
                 recentCacheRows(snapshot)
                 tokenRow(snapshot)
                 costRow(snapshot)
+                governorRow(snapshot)
                 contextRow(snapshot)
                 if model.selectedSession != nil {
                     Divider()
@@ -344,6 +345,109 @@ struct EfficiencyCard: View {
         }
     }
 
+    /// Critical-path reserve, admitted/deferred work, and the last persisted
+    /// governor decision. Everything is read-only daemon state.
+    @ViewBuilder
+    private func governorRow(_ snapshot: EfficiencySnapshot) -> some View {
+        if let governor = snapshot.governor {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    Text("CRITICAL PATH BUDGET")
+                        .font(VPTheme.mono(8, weight: .semibold))
+                        .foregroundStyle(VPTheme.textTertiary)
+                    Text(governor.enabled ? "GOVERNOR ON" : "GOVERNOR OFF")
+                        .font(VPTheme.mono(8, weight: .semibold))
+                        .foregroundStyle(governor.enabled ? VPTheme.accent : VPTheme.textTertiary)
+                    if governor.unlimited {
+                        Text("UNLIMITED")
+                            .font(VPTheme.mono(8, weight: .semibold))
+                            .foregroundStyle(VPTheme.textTertiary)
+                    }
+                    if let error = governor.error {
+                        Text(error.code)
+                            .font(VPTheme.mono(8, weight: .semibold))
+                            .foregroundStyle(VPTheme.warning)
+                    }
+                    Spacer(minLength: 0)
+                    if let path = governor.criticalPath {
+                        Text(
+                            "path \(EfficiencyMetrics.tokenLabel(path.weightTokens)) · r\(path.planRevision)"
+                        )
+                        .font(VPTheme.mono(8))
+                        .foregroundStyle(VPTheme.textTertiary)
+                    }
+                }
+                HStack(spacing: 10) {
+                    metric(
+                        "Path",
+                        GovernorMetrics.pathLabel(governor.criticalPath?.taskIDs ?? []),
+                        detail: governor.criticalPath.map {
+                            "\($0.taskCount) tasks · \($0.edgeCount) edges"
+                        } ?? "no plan"
+                    )
+                    metric(
+                        "Protected",
+                        EfficiencyMetrics.tokenLabel(governor.reserve.protectedTokens),
+                        detail: GovernorMetrics.percent(governor.reserve.reserveRatio) + " reserve"
+                    )
+                    metric(
+                        "Remaining",
+                        EfficiencyMetrics.tokenLabel(governor.reserve.remainingTokens),
+                        detail: governor.reserve.state
+                    )
+                    metric(
+                        "Deferred",
+                        "\(governor.deferred.count)",
+                        detail: governor.reserve.throttled ? "throttle zone" : "reserve pool"
+                    )
+                }
+                if !governor.deferred.isEmpty {
+                    ForEach(Array(governor.deferred.prefix(3).enumerated()), id: \.offset) { _, deferral in
+                        HStack(spacing: 8) {
+                            Text(deferral.taskID)
+                                .font(VPTheme.mono(8, weight: .semibold))
+                                .foregroundStyle(VPTheme.textSecondary)
+                                .frame(width: 90, alignment: .leading)
+                            Text(deferral.reason)
+                                .font(VPTheme.mono(8))
+                                .foregroundStyle(VPTheme.warning)
+                            Text(deferral.code)
+                                .font(VPTheme.mono(7))
+                                .foregroundStyle(VPTheme.textTertiary)
+                            Spacer(minLength: 0)
+                            Text("weight \(EfficiencyMetrics.tokenLabel(deferral.weightTokens))")
+                                .font(VPTheme.mono(7))
+                                .foregroundStyle(VPTheme.textTertiary)
+                        }
+                    }
+                    if governor.deferred.count > 3 {
+                        Text("+\(governor.deferred.count - 3) more deferred tasks")
+                            .font(VPTheme.mono(7))
+                            .foregroundStyle(VPTheme.textTertiary)
+                    }
+                }
+                if let decision = governor.lastDecisions.last {
+                    Text("Last decision \(decision.action) \(decision.reason) · \(decision.detail)")
+                        .font(VPTheme.mono(7))
+                        .foregroundStyle(VPTheme.textTertiary)
+                        .lineLimit(2)
+                }
+                if let error = governor.error {
+                    Text("\(error.code) · \(error.message)")
+                        .font(VPTheme.mono(7))
+                        .foregroundStyle(VPTheme.warning)
+                        .lineLimit(2)
+                }
+            }
+            .padding(8)
+            .background(VPTheme.surfaceRaised.opacity(0.45), in: RoundedRectangle(cornerRadius: 9))
+        } else if let message = model.governorStatusMessage {
+            Text(message)
+                .font(VPTheme.mono(8))
+                .foregroundStyle(VPTheme.textTertiary)
+        }
+    }
+
     private func footer(_ snapshot: EfficiencySnapshot) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text("Cache read is billed, not free; this is a hit ratio, not a discount.")
@@ -412,5 +516,44 @@ struct CacheHitPill: View {
             Capsule().strokeBorder(tint.opacity(0.24), lineWidth: 1)
         }
         .help("Share of provider input served from cache. Cache reads are still billed.")
+    }
+}
+
+/// Compact governor badge for the Stage budget popover.
+struct GovernorPill: View {
+    let status: GovernorSessionStatus?
+
+    var body: some View {
+        if let status {
+            let active = status.enabled && status.criticalPath != nil
+            let pressure = status.reserve.throttled
+            HStack(spacing: 4) {
+                Image(systemName: active ? "point.topleft.down.curvedto.point.bottomright.up" :
+                    "pause.circle")
+                    .font(.system(size: 8, weight: .semibold))
+                Text(
+                    active
+                        ? "governor \(status.deferred.count) deferred"
+                        : "governor off"
+                )
+                .font(VPTheme.mono(8, weight: .semibold))
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .foregroundStyle(pressure ? VPTheme.warning : (active ? VPTheme.accent : VPTheme.textTertiary))
+            .background(
+                (pressure ? VPTheme.warning : (active ? VPTheme.accent : VPTheme.textTertiary))
+                    .opacity(0.13),
+                in: Capsule()
+            )
+            .overlay {
+                Capsule().strokeBorder(
+                    (pressure ? VPTheme.warning : (active ? VPTheme.accent : VPTheme.textTertiary))
+                        .opacity(0.24),
+                    lineWidth: 1
+                )
+            }
+            .help("Critical-path budget reserve. Deferred tasks stay queued; hard budgets are unchanged.")
+        }
     }
 }

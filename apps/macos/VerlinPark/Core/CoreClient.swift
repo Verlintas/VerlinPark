@@ -1051,6 +1051,60 @@ actor CoreClient {
         .decode(SessionCacheStatus.self)
     }
 
+    func budgetGovernor(
+        sessionID: String,
+        limit: Int = 20
+    ) async throws -> GovernorSessionStatus {
+        try await request(
+            method: "session.budget.governor",
+            params: [
+                "session_id": .string(sessionID),
+                "limit": .number(Double(limit)),
+            ]
+        )
+        .decode(GovernorSessionStatus.self)
+    }
+
+    func governorPreview(
+        sessionID: String,
+        remainingTokens: Int? = nil,
+        limit: Int = 20
+    ) async throws -> GovernorSessionStatus {
+        var params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "limit": .number(Double(limit)),
+        ]
+        if let remainingTokens {
+            params["remaining_tokens"] = .number(Double(remainingTokens))
+        }
+        return try await request(method: "governor.preview", params: params)
+            .decode(GovernorSessionStatus.self)
+    }
+
+    func criticalPathPolicy(projectID: String) async throws -> CriticalPathPolicy {
+        try await request(
+            method: "critical_path.policy.get",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(CriticalPathPolicyResult.self)
+        .policy
+    }
+
+    func setCriticalPathPolicy(
+        projectID: String,
+        policy: CriticalPathPolicy
+    ) async throws -> CriticalPathPolicy {
+        try await request(
+            method: "critical_path.policy.set",
+            params: [
+                "project_id": .string(projectID),
+                "policy": policy.jsonValue(),
+            ]
+        )
+        .decode(CriticalPathPolicyResult.self)
+        .policy
+    }
+
     func toolActivity(
         sessionID: String,
         limit: Int = 50

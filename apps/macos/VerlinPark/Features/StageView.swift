@@ -865,6 +865,7 @@ private struct ContextPopoverView: View {
                         if let ratio = snapshot.cacheHitRatio {
                             CacheHitPill(ratio: ratio)
                         }
+                        GovernorPill(status: model.governorStatus)
                         if let ttl = snapshot.lastCacheTTL {
                             Text("ttl \(ttl)")
                                 .font(.system(size: 9, design: .monospaced))
@@ -894,6 +895,57 @@ private struct ContextPopoverView: View {
                         Spacer()
                     }
                     Text("Cache reads are billed, not free; this is a hit ratio, not a discount.")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+
+                if let governor = model.governorStatus,
+                   governor.enabled || governor.planPresent
+                {
+                    Divider()
+                    HStack(spacing: 8) {
+                        Text("CRITICAL PATH BUDGET")
+                            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                        GovernorPill(status: governor)
+                        Spacer()
+                    }
+                    if let path = governor.criticalPath {
+                        Text(
+                            "Path: \(GovernorMetrics.pathLabel(path.taskIDs)) · \(EfficiencyMetrics.tokenLabel(path.weightTokens)) tokens"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
+                    HStack(spacing: 18) {
+                        metric(
+                            "Protected",
+                            EfficiencyMetrics.tokenLabel(governor.reserve.protectedTokens)
+                        )
+                        metric(
+                            "Remaining",
+                            EfficiencyMetrics.tokenLabel(governor.reserve.remainingTokens)
+                        )
+                        metric("Deferred", "\(governor.deferred.count)")
+                        if governor.reserve.throttled {
+                            Text("THROTTLED")
+                                .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(VPTheme.warning)
+                        }
+                    }
+                    if let last = governor.lastDecisions.last {
+                        Text("Last decision: \(last.action) \(last.reason) · \(last.detail)")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(2)
+                    }
+                    if let error = governor.error {
+                        Text("\(error.code) · \(error.message)")
+                            .font(.caption2)
+                            .foregroundStyle(VPTheme.warning)
+                            .lineLimit(2)
+                    }
+                    Text("Deferred tasks stay queued; hard budgets and provider routing are unchanged.")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }

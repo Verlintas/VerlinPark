@@ -15,9 +15,9 @@ use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
     AcpAgent, AcpAgentConfig, AcpTransport, AgentMessage, AgentRecord, Approval, ApprovalGrant,
     Artifact, ArtifactPolicy, ArtifactVersion, CachePolicy, CheckpointRetentionPolicy,
-    ContextCheckpoint, ContextCheckpointPolicy, ContinuationOutcome, Event, GuiActionInfo,
-    GuiPolicy, IntakeTask, IntegrationPolicy, MailboxPolicy, McpServer, McpServerConfig,
-    McpTransport, MemoryConflict, MemoryEmbeddingJobStatus, MemoryEmbeddingPolicy,
+    ContextCheckpoint, ContextCheckpointPolicy, ContinuationOutcome, CriticalPathPolicy, Event,
+    GuiActionInfo, GuiPolicy, IntakeTask, IntegrationPolicy, MailboxPolicy, McpServer,
+    McpServerConfig, McpTransport, MemoryConflict, MemoryEmbeddingJobStatus, MemoryEmbeddingPolicy,
     MemoryEmbeddingUsage, MemoryEmbeddingsStatusResult, MemoryEvidence, MemoryHealthResult,
     MemoryItem, MemoryPolicy, MemoryStatCount, MergeQueueEntry, MetricCount, ModelPreset,
     OrchestrationDecision, OrchestrationNote, OrchestrationPolicy, OrchestrationRecovery,
@@ -867,6 +867,10 @@ pub struct ProjectManifestSnapshot {
     pub source_embedding_policy: SourceEmbeddingPolicy,
     #[serde(default)]
     pub orchestration_policy: OrchestrationPolicy,
+    /// Project-scoped critical-path budget governor. Older manifests decode as
+    /// the disabled default, so an upgrade never changes task admission.
+    #[serde(default)]
+    pub critical_path_policy: CriticalPathPolicy,
     #[serde(default)]
     pub execution_host: ExecutionHost,
     #[serde(default)]
@@ -2178,6 +2182,12 @@ impl Store {
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS project_critical_path_policies (
+                project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                policy     TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS project_mailbox_policies (
                 project_id    TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
                 max_age_secs  INTEGER,
@@ -3193,6 +3203,7 @@ impl Store {
                 memory_policy: self.get_memory_policy(&project.id)?,
                 source_embedding_policy: self.get_source_embedding_policy(&project.id)?,
                 orchestration_policy: self.get_orchestration_policy(&project.id)?,
+                critical_path_policy: self.get_critical_path_policy(&project.id)?,
                 approval_grants: self.list_approval_grants(&project.id)?,
                 intake_tasks: self.list_intake_tasks(Some(&project.id), None, None)?,
                 programs: self.list_programs(Some(&project.id), None, None)?,
@@ -7735,6 +7746,56 @@ impl Store {
             params![project_id, serde_json::to_string(policy)?, now_rfc3339()],
         )?;
         Ok(())
+    }
+
+    /// Critical-path budget policy. A missing row decodes as the disabled
+    /// default; stored and returned values are normalized into the daemon's
+    /// effective ranges.
+    pub fn get_critical_path_policy(&self, project_id: &str) -> Result<CriticalPathPolicy> {
+        let conn = self.lock()?;
+        let stored = conn
+            .query_row(
+                "SELECT policy FROM project_critical_path_policies WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(stored
+            .and_then(|raw| serde_json::from_str::<CriticalPathPolicy>(&raw).ok())
+            .unwrap_or_default()
+            .normalized())
+    }
+
+    pub fn set_critical_path_policy(
+        &self,
+        project_id: &str,
+        policy: &CriticalPathPolicy,
+    ) -> Result<()> {
+        let normalized = policy.clone().normalized();
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO project_critical_path_policies (project_id, policy, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(project_id) DO UPDATE SET
+                policy = excluded.policy,
+                updated_at = excluded.updated_at",
+            params![
+                project_id,
+                serde_json::to_string(&normalized)?,
+                now_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn has_critical_path_policy(&self, project_id: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM project_critical_path_policies WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count > 0)
     }
 
     pub fn get_integration_policy(&self, project_id: &str) -> Result<IntegrationPolicy> {

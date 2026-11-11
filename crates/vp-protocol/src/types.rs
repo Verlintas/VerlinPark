@@ -310,6 +310,335 @@ pub struct SchedulerStatusResult {
     pub projects: Vec<SchedulerProjectStatus>,
 }
 
+/// Project-scoped critical-path budget governor policy. The governor is
+/// deliberately opt-in: a missing row or an older manifest decodes as
+/// `enabled = false`, and only an explicit operator opt-in changes task
+/// admission. Policy changes never alter model/provider routing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CriticalPathPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Fraction of the remaining session token budget held back for the
+    /// longest remaining plan path, in addition to the path's own weight.
+    #[serde(default = "default_critical_path_reserve_ratio")]
+    pub reserve_ratio: f64,
+    /// Remaining-budget fraction at which non-critical provider calls are
+    /// throttled. `0.0` disables the throttle zone; `1.0` throttles whenever
+    /// the critical path still has unfinished work.
+    #[serde(default = "default_critical_path_throttle_at_ratio")]
+    pub throttle_at_ratio: f64,
+    /// Added to a critical task's effective scheduling priority while the
+    /// governor is enabled. Range 0..100; it never changes the plan itself.
+    #[serde(default = "default_critical_path_boost")]
+    pub critical_boost: i32,
+    /// Hard floor: below this remaining session budget no task is admitted.
+    #[serde(default = "default_critical_path_min_task_budget")]
+    pub min_task_budget: u64,
+}
+
+impl Default for CriticalPathPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            reserve_ratio: default_critical_path_reserve_ratio(),
+            throttle_at_ratio: default_critical_path_throttle_at_ratio(),
+            critical_boost: default_critical_path_boost(),
+            min_task_budget: default_critical_path_min_task_budget(),
+        }
+    }
+}
+
+fn default_critical_path_reserve_ratio() -> f64 {
+    0.25
+}
+
+fn default_critical_path_throttle_at_ratio() -> f64 {
+    0.35
+}
+
+fn default_critical_path_boost() -> i32 {
+    25
+}
+
+fn default_critical_path_min_task_budget() -> u64 {
+    1_000
+}
+
+impl CriticalPathPolicy {
+    pub const MAX_CRITICAL_BOOST: i32 = 100;
+    pub const MAX_MIN_TASK_BUDGET: u64 = 10_000_000;
+
+    /// Clamp persisted or user-provided values into the daemon's effective
+    /// ranges. Validation is separate so an RPC with an invalid value is
+    /// rejected instead of silently changing admission behavior.
+    pub fn normalized(mut self) -> Self {
+        if !self.reserve_ratio.is_finite() {
+            self.reserve_ratio = default_critical_path_reserve_ratio();
+        }
+        self.reserve_ratio = self.reserve_ratio.clamp(0.0, 1.0);
+        if !self.throttle_at_ratio.is_finite() {
+            self.throttle_at_ratio = default_critical_path_throttle_at_ratio();
+        }
+        self.throttle_at_ratio = self.throttle_at_ratio.clamp(0.0, 1.0);
+        self.critical_boost = self.critical_boost.clamp(0, Self::MAX_CRITICAL_BOOST);
+        self.min_task_budget = self.min_task_budget.min(Self::MAX_MIN_TASK_BUDGET);
+        self
+    }
+
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if !self.reserve_ratio.is_finite() || !(0.0..=1.0).contains(&self.reserve_ratio) {
+            return Err("reserve_ratio must be a finite number between 0.0 and 1.0".to_string());
+        }
+        if !self.throttle_at_ratio.is_finite() || !(0.0..=1.0).contains(&self.throttle_at_ratio) {
+            return Err(
+                "throttle_at_ratio must be a finite number between 0.0 and 1.0".to_string(),
+            );
+        }
+        if !(0..=Self::MAX_CRITICAL_BOOST).contains(&self.critical_boost) {
+            return Err(format!(
+                "critical_boost must be between 0 and {}",
+                Self::MAX_CRITICAL_BOOST
+            ));
+        }
+        if self.min_task_budget > Self::MAX_MIN_TASK_BUDGET {
+            return Err(format!(
+                "min_task_budget must be at most {}",
+                Self::MAX_MIN_TASK_BUDGET
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CriticalPathPolicyParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetCriticalPathPolicyParams {
+    pub project_id: String,
+    pub policy: CriticalPathPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CriticalPathPolicyResult {
+    pub project_id: String,
+    pub policy: CriticalPathPolicy,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GovernorStatusParams {
+    pub session_id: String,
+    /// Bounded decision history size. Clamped by the daemon.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GovernorPreviewParams {
+    pub session_id: String,
+    /// Deterministic preview override. When absent the daemon uses the live
+    /// session ledger and in-flight reservations.
+    #[serde(default)]
+    pub remaining_tokens: Option<u64>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// Deterministic longest-remaining-path result for one plan revision.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CriticalPathInfo {
+    pub plan_revision: u32,
+    #[serde(default)]
+    pub task_ids: Vec<String>,
+    #[serde(default)]
+    pub weight_tokens: u64,
+    #[serde(default)]
+    pub remaining_budget_tokens: Option<u64>,
+    #[serde(default)]
+    pub complete: bool,
+    #[serde(default)]
+    pub task_count: u32,
+    #[serde(default)]
+    pub edge_count: u32,
+    #[serde(default)]
+    pub inputs_hash: String,
+}
+
+/// Explainable reserve math for one decision. Every number is derived from the
+/// persisted session ledger, the plan DAG, and the project policy.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GovernorReserveInfo {
+    /// `disabled`, `no_budget`, `complete`, `active`, or `throttled`.
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub reserve_ratio: f64,
+    #[serde(default)]
+    pub throttle_at_ratio: f64,
+    #[serde(default)]
+    pub critical_boost: i32,
+    #[serde(default)]
+    pub min_task_budget: u64,
+    #[serde(default)]
+    pub limit_tokens: Option<u64>,
+    #[serde(default)]
+    pub spent_tokens: u64,
+    #[serde(default)]
+    pub reserved_tokens: u64,
+    #[serde(default)]
+    pub remaining_tokens: Option<u64>,
+    #[serde(default)]
+    pub path_weight_tokens: u64,
+    #[serde(default)]
+    pub ratio_reserve_tokens: u64,
+    #[serde(default)]
+    pub protected_tokens: u64,
+    #[serde(default)]
+    pub headroom_tokens: Option<u64>,
+    #[serde(default)]
+    pub throttled: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GovernorTaskDecisionInfo {
+    pub task_id: String,
+    #[serde(default)]
+    pub department: String,
+    #[serde(default)]
+    pub critical: bool,
+    #[serde(default)]
+    pub weight_tokens: u64,
+    #[serde(default)]
+    pub order: u32,
+    /// `admit` or `defer`.
+    pub action: String,
+    /// Stable lowercase reason (`critical_admit`, `reserve`, `throttle`, ...).
+    pub reason: String,
+    /// Stable Q3 error-contract code for deferrals.
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub remaining_after_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GovernorDeferralInfo {
+    pub task_id: String,
+    #[serde(default)]
+    pub department: String,
+    #[serde(default)]
+    pub critical: bool,
+    #[serde(default)]
+    pub weight_tokens: u64,
+    pub reason: String,
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub remaining_tokens: Option<u64>,
+    #[serde(default)]
+    pub protected_tokens: u64,
+}
+
+/// One persisted `budget.governor.decision` event. Admission events carry the
+/// ordered admitted/deferred lists; provider-call denial events carry a single
+/// task and requested token estimate.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BudgetGovernorDecision {
+    #[serde(default)]
+    pub decision_id: String,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub plan_revision: u32,
+    /// `admission` or `defer`.
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub critical: bool,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub detail: String,
+    #[serde(default)]
+    pub path: Vec<String>,
+    #[serde(default)]
+    pub path_weight_tokens: u64,
+    #[serde(default)]
+    pub limit_tokens: Option<u64>,
+    #[serde(default)]
+    pub spent_tokens: u64,
+    #[serde(default)]
+    pub reserved_tokens: u64,
+    #[serde(default)]
+    pub remaining_tokens: Option<u64>,
+    #[serde(default)]
+    pub protected_tokens: u64,
+    #[serde(default)]
+    pub requested_tokens: Option<u64>,
+    #[serde(default)]
+    pub admitted: Vec<String>,
+    #[serde(default)]
+    pub deferred: Vec<GovernorDeferralInfo>,
+    #[serde(default)]
+    pub inputs_hash: String,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+/// Status for `session.budget.governor` and `governor.preview`. Preview differs
+/// only in that it is computed with an optional remaining-token override and
+/// never writes an event.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GovernorSessionStatus {
+    pub session_id: String,
+    pub project_id: String,
+    #[serde(default)]
+    pub session_status: String,
+    #[serde(default)]
+    pub plan_revision: u32,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub unlimited: bool,
+    #[serde(default)]
+    pub plan_present: bool,
+    #[serde(default)]
+    pub policy: CriticalPathPolicy,
+    #[serde(default)]
+    pub critical_path: Option<CriticalPathInfo>,
+    #[serde(default)]
+    pub reserve: GovernorReserveInfo,
+    #[serde(default)]
+    pub inputs_hash: String,
+    #[serde(default)]
+    pub decisions: Vec<GovernorTaskDecisionInfo>,
+    #[serde(default)]
+    pub admitted: Vec<String>,
+    #[serde(default)]
+    pub deferred: Vec<GovernorDeferralInfo>,
+    #[serde(default)]
+    pub last_decisions: Vec<BudgetGovernorDecision>,
+    /// Present when the governor could not evaluate the plan (for example a
+    /// cycle or an unknown dependency). It is a typed Q3 code, not free text.
+    #[serde(default)]
+    pub error: Option<GovernorFailureInfo>,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GovernorFailureInfo {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+    pub hint: String,
+}
+
 fn default_gui_grace_secs() -> u64 {
     45
 }
@@ -11980,5 +12309,206 @@ mod process_policy_protocol_tests {
         .unwrap();
         assert_eq!(set.policy.max_processes, 4);
         assert!(set.policy.idle_sweep_enabled);
+    }
+}
+
+#[cfg(test)]
+mod critical_path_governor_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn critical_path_policy_defaults_are_off_and_bounded() {
+        let policy = CriticalPathPolicy::default();
+        assert!(!policy.enabled);
+        assert_eq!(policy.reserve_ratio, 0.25);
+        assert_eq!(policy.throttle_at_ratio, 0.35);
+        assert_eq!(policy.critical_boost, 25);
+        assert_eq!(policy.min_task_budget, 1_000);
+        assert!(policy.validate().is_ok());
+    }
+
+    #[test]
+    fn critical_path_policy_decodes_missing_fields_with_defaults() {
+        let policy: CriticalPathPolicy = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(policy, CriticalPathPolicy::default());
+        let policy: CriticalPathPolicy =
+            serde_json::from_value(json!({ "enabled": true })).unwrap();
+        assert!(policy.enabled);
+        assert_eq!(policy.reserve_ratio, 0.25);
+    }
+
+    #[test]
+    fn critical_path_policy_normalizes_and_validates_ranges() {
+        let mut policy = CriticalPathPolicy {
+            enabled: true,
+            reserve_ratio: 3.0,
+            throttle_at_ratio: -1.0,
+            critical_boost: 500,
+            min_task_budget: u64::MAX,
+        };
+        let normalized = policy.clone().normalized();
+        assert_eq!(normalized.reserve_ratio, 1.0);
+        assert_eq!(normalized.throttle_at_ratio, 0.0);
+        assert_eq!(normalized.critical_boost, 100);
+        assert_eq!(normalized.min_task_budget, 10_000_000);
+        assert!(policy.validate().is_err());
+
+        policy.reserve_ratio = f64::NAN;
+        assert!(policy.validate().is_err());
+        assert_eq!(policy.clone().normalized().reserve_ratio, 0.25);
+        policy.reserve_ratio = 0.5;
+        policy.throttle_at_ratio = 0.0;
+        policy.critical_boost = 0;
+        policy.min_task_budget = 0;
+        assert!(policy.validate().is_ok());
+    }
+
+    #[test]
+    fn governor_status_decodes_with_defaults_and_round_trips() {
+        let status: GovernorSessionStatus = serde_json::from_value(json!({
+            "session_id": "s1",
+            "project_id": "p1",
+            "generated_at": "2026-11-11T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(status.session_id, "s1");
+        assert!(!status.enabled);
+        assert!(!status.plan_present);
+        assert_eq!(status.policy, CriticalPathPolicy::default());
+        assert!(status.critical_path.is_none());
+        assert!(status.decisions.is_empty());
+        assert!(status.error.is_none());
+        let encoded = serde_json::to_value(&status).unwrap();
+        let decoded: GovernorSessionStatus = serde_json::from_value(encoded).unwrap();
+        assert_eq!(status, decoded);
+    }
+
+    #[test]
+    fn governor_decision_payload_decodes_partial_history() {
+        let decision: BudgetGovernorDecision = serde_json::from_value(json!({
+            "decision_id": "gov-1",
+            "session_id": "s1",
+            "action": "defer",
+            "reason": "reserve",
+            "code": "BUDGET_RESERVED",
+            "created_at": "2026-11-11T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(decision.action, "defer");
+        assert_eq!(decision.code, "BUDGET_RESERVED");
+        assert!(!decision.critical);
+        assert!(decision.path.is_empty());
+        assert!(decision.deferred.is_empty());
+        assert_eq!(decision.plan_revision, 0);
+    }
+
+    #[test]
+    fn governor_decision_round_trips_admission_and_deferral_lists() {
+        let decision = BudgetGovernorDecision {
+            decision_id: "gov-9".to_string(),
+            session_id: "s1".to_string(),
+            plan_revision: 4,
+            action: "admission".to_string(),
+            task_id: None,
+            critical: false,
+            reason: "reserve".to_string(),
+            code: "BUDGET_RESERVED".to_string(),
+            detail: "path [a] weight 5000".to_string(),
+            path: vec!["a".to_string(), "b".to_string()],
+            path_weight_tokens: 5_000,
+            limit_tokens: Some(10_000),
+            spent_tokens: 2_000,
+            reserved_tokens: 100,
+            remaining_tokens: Some(7_900),
+            protected_tokens: 6_000,
+            requested_tokens: Some(1_500),
+            admitted: vec!["a".to_string()],
+            deferred: vec![GovernorDeferralInfo {
+                task_id: "side".to_string(),
+                department: "impl".to_string(),
+                critical: false,
+                weight_tokens: 2_500,
+                reason: "reserve".to_string(),
+                code: "BUDGET_RESERVED".to_string(),
+                remaining_tokens: Some(7_900),
+                protected_tokens: 6_000,
+            }],
+            inputs_hash: "hash".to_string(),
+            created_at: "2026-11-11T00:00:00Z".to_string(),
+        };
+        let value = serde_json::to_value(&decision).unwrap();
+        assert_eq!(value["deferred"][0]["code"], "BUDGET_RESERVED");
+        assert_eq!(value["path"][1], "b");
+        let decoded: BudgetGovernorDecision = serde_json::from_value(value).unwrap();
+        assert_eq!(decision, decoded);
+    }
+
+    #[test]
+    fn governor_preview_params_are_optional() {
+        let params: GovernorPreviewParams =
+            serde_json::from_value(json!({"session_id": "s1"})).unwrap();
+        assert_eq!(params.session_id, "s1");
+        assert!(params.remaining_tokens.is_none());
+        assert!(params.limit.is_none());
+        let status: GovernorStatusParams =
+            serde_json::from_value(json!({"session_id": "s1", "limit": 5})).unwrap();
+        assert_eq!(status.limit, Some(5));
+    }
+
+    #[test]
+    fn governor_reserve_and_path_info_have_stable_shapes() {
+        let path = CriticalPathInfo {
+            plan_revision: 2,
+            task_ids: vec!["a".to_string(), "b".to_string()],
+            weight_tokens: 5_000,
+            remaining_budget_tokens: Some(10_000),
+            complete: false,
+            task_count: 2,
+            edge_count: 1,
+            inputs_hash: "hash".to_string(),
+        };
+        let value = serde_json::to_value(&path).unwrap();
+        assert_eq!(value["plan_revision"], 2);
+        assert_eq!(value["task_ids"][0], "a");
+        let decoded: CriticalPathInfo = serde_json::from_value(value).unwrap();
+        assert_eq!(path, decoded);
+
+        let reserve = GovernorReserveInfo {
+            state: "active".to_string(),
+            reserve_ratio: 0.25,
+            throttle_at_ratio: 0.35,
+            critical_boost: 25,
+            min_task_budget: 1_000,
+            limit_tokens: Some(10_000),
+            spent_tokens: 2_000,
+            reserved_tokens: 100,
+            remaining_tokens: Some(7_900),
+            path_weight_tokens: 5_000,
+            ratio_reserve_tokens: 1_975,
+            protected_tokens: 6_975,
+            headroom_tokens: Some(925),
+            throttled: false,
+        };
+        let value = serde_json::to_value(&reserve).unwrap();
+        assert_eq!(value["state"], "active");
+        assert_eq!(value["protected_tokens"], 6_975);
+        let decoded: GovernorReserveInfo = serde_json::from_value(value).unwrap();
+        assert_eq!(reserve, decoded);
+    }
+
+    #[test]
+    fn critical_path_policy_result_is_wire_compatible() {
+        let result = CriticalPathPolicyResult {
+            project_id: "p1".to_string(),
+            policy: CriticalPathPolicy {
+                enabled: true,
+                ..CriticalPathPolicy::default()
+            },
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["project_id"], "p1");
+        assert_eq!(value["policy"]["enabled"], true);
+        assert_eq!(value["policy"]["reserve_ratio"], 0.25);
     }
 }

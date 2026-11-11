@@ -313,6 +313,12 @@ tool_error_codes! {
     SKILL_TOOL_DENIED => "SKILL_TOOL_DENIED", false, "general", "Use a tool allowed by the active skill, or deactivate the skill before retrying.";
     TOOL_NOT_AVAILABLE => "TOOL_NOT_AVAILABLE", false, "general", "Check the role/profile tool policy or call tool_search for an available alternative.";
     BUDGET_EXHAUSTED => "BUDGET_EXHAUSTED", false, "general", "Stop expanding the run; report the partial result and let the operator raise the budget.";
+    BUDGET_RESERVED => "BUDGET_RESERVED", false, "general", "A non-critical task was deferred to protect the critical path; retry after the critical path completes or raise the session budget.";
+    BUDGET_THROTTLED => "BUDGET_THROTTLED", true, "general", "The session is inside the critical-path throttle zone; wait for critical work to finish or raise the budget.";
+    BUDGET_PATH_CYCLE => "BUDGET_PATH_CYCLE", false, "general", "Remove the plan dependency cycle; the governor never guesses a path through a cycle.";
+    BUDGET_PATH_UNKNOWN_TASK => "BUDGET_PATH_UNKNOWN_TASK", false, "general", "Revise the plan so every dependency names a task in the same revision; unknown tasks fail closed.";
+    BUDGET_PATH_DUPLICATE_TASK => "BUDGET_PATH_DUPLICATE_TASK", false, "general", "Give every plan task a unique id before enabling the governor.";
+    BUDGET_PATH_TOO_LARGE => "BUDGET_PATH_TOO_LARGE", false, "general", "Split the plan or reduce dependency edges; the governor bounds DAG size.";
     CAPACITY_EXCEEDED => "CAPACITY_EXCEEDED", true, "general", "Wait for an active worker slot to free, or reduce parallel delegation.";
     CANCELLED => "CANCELLED", false, "general", "Do not retry; the run was deliberately cancelled.";
     TIMEOUT => "TIMEOUT", true, "general", "Retry with a smaller scope or a longer explicit timeout.";
