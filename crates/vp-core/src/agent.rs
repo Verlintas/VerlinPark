@@ -11755,6 +11755,10 @@ async fn emit_governor_deferral(input: GovernorDeferralEvent<'_>) -> Result<()> 
             .context
             .map(|context| context.plan_revision)
             .unwrap_or(0),
+        mode: input
+            .context
+            .map(|context| context.policy.mode)
+            .unwrap_or_default(),
         task_id: input.spec.task_id.as_deref().unwrap_or("unknown"),
         task_critical: input
             .context

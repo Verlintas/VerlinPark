@@ -22,13 +22,17 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 use vp_protocol::types::{
-    BudgetGovernorDecision, CriticalPathInfo, CriticalPathPolicy, Event, GovernorDeferralInfo,
-    GovernorFailureInfo, GovernorReserveInfo, GovernorTaskDecisionInfo, PlanTask, TeamPlan,
+    BudgetGovernorDecision, CriticalPathInfo, CriticalPathMode, CriticalPathPolicy, Event,
+    GovernorDeferralInfo, GovernorFailureInfo, GovernorReserveInfo, GovernorTaskDecisionInfo,
+    PlanTask, TeamPlan,
 };
 
 use crate::budget::GovernorGate;
 use crate::critical_path::{
     CriticalPath, CriticalPathError, CriticalPathInput, compute_critical_path, task_weight_tokens,
+};
+use crate::multi_path::{
+    MultiPathAllocation, MultiPathInput, compute_multi_path, starvation_credit,
 };
 
 pub const DECISION_EVENT_KIND: &str = "budget.governor.decision";
@@ -88,6 +92,18 @@ pub struct GovernorReserve {
     pub protected_tokens: u64,
     pub headroom_tokens: Option<u64>,
     pub throttled: bool,
+    /// `single` or `multi`.
+    pub mode: CriticalPathMode,
+    /// Protected path count (0 or 1 in single mode).
+    pub path_count: usize,
+    /// Sum of path allocations inside `protected_tokens`.
+    pub allocated_tokens: u64,
+    /// Sum of per-department/path floors inside the allocations.
+    pub floor_tokens: u64,
+    /// Maximal paths enumerated before selection.
+    pub enumerated_paths: usize,
+    /// Enumeration was truncated at the bound.
+    pub paths_truncated: bool,
 }
 
 impl GovernorReserve {
@@ -107,6 +123,12 @@ impl GovernorReserve {
             protected_tokens: self.protected_tokens,
             headroom_tokens: self.headroom_tokens,
             throttled: self.throttled,
+            mode: self.mode.as_str().to_string(),
+            path_count: self.path_count.min(u32::MAX as usize) as u32,
+            allocated_tokens: self.allocated_tokens,
+            floor_tokens: self.floor_tokens,
+            enumerated_paths: self.enumerated_paths.min(u32::MAX as usize) as u32,
+            paths_truncated: self.paths_truncated,
         }
     }
 }
@@ -163,6 +185,10 @@ pub struct GovernorTaskDecision {
     pub admitted: bool,
     pub reason: GovernorReason,
     pub remaining_after_tokens: Option<u64>,
+    pub path_id: Option<u32>,
+    pub path_ids: Vec<u32>,
+    pub path_deficit_tokens: u64,
+    pub starvation_credit: i64,
 }
 
 impl GovernorTaskDecision {
@@ -177,6 +203,10 @@ impl GovernorTaskDecision {
             reason: self.reason.as_str().to_string(),
             code: self.reason.code().to_string(),
             remaining_after_tokens: self.remaining_after_tokens,
+            path_id: self.path_id,
+            path_ids: self.path_ids.clone(),
+            path_deficit_tokens: self.path_deficit_tokens,
+            starvation_credit: self.starvation_credit,
         }
     }
 }
@@ -190,6 +220,10 @@ pub struct GovernorDeferral {
     pub reason: GovernorReason,
     pub remaining_tokens: Option<u64>,
     pub protected_tokens: u64,
+    pub path_id: Option<u32>,
+    pub path_ids: Vec<u32>,
+    pub path_deficit_tokens: u64,
+    pub starvation_credit: i64,
 }
 
 impl GovernorDeferral {
@@ -203,6 +237,10 @@ impl GovernorDeferral {
             code: self.reason.code().to_string(),
             remaining_tokens: self.remaining_tokens,
             protected_tokens: self.protected_tokens,
+            path_id: self.path_id,
+            path_ids: self.path_ids.clone(),
+            path_deficit_tokens: self.path_deficit_tokens,
+            starvation_credit: self.starvation_credit,
         }
     }
 }
@@ -211,7 +249,10 @@ impl GovernorDeferral {
 #[derive(Debug, Clone, PartialEq)]
 pub struct GovernorAdmission {
     pub enabled: bool,
+    pub mode: CriticalPathMode,
     pub path: CriticalPath,
+    /// Multi-path table when `mode = multi`; `None` in single mode.
+    pub multi: Option<MultiPathAllocation>,
     pub reserve: GovernorReserve,
     pub decisions: Vec<GovernorTaskDecision>,
     pub admitted: Vec<String>,
@@ -222,6 +263,9 @@ pub struct GovernorAdmission {
 impl GovernorAdmission {
     /// A bounded one-line explanation for events and CLI output.
     pub fn detail(&self) -> String {
+        if let Some(multi) = &self.multi {
+            return multi.detail();
+        }
         let path = if self.path.task_ids.is_empty() {
             "none".to_string()
         } else {
@@ -242,6 +286,51 @@ impl GovernorAdmission {
         )
     }
 
+    pub fn path_infos(&self) -> Vec<vp_protocol::types::GovernorPathInfo> {
+        match &self.multi {
+            Some(multi) => multi.path_infos(),
+            None if !self.path.task_ids.is_empty() => {
+                vec![vp_protocol::types::GovernorPathInfo {
+                    path_id: 0,
+                    task_ids: self.path.task_ids.clone(),
+                    departments: Vec::new(),
+                    weight_tokens: self.path.weight_tokens,
+                    declared_weight_tokens: self.path.weight_tokens,
+                    observed_tokens: 0,
+                    floor_tokens: 0,
+                    allocation_tokens: self.reserve.allocated_tokens,
+                    deficit_tokens: self
+                        .path
+                        .weight_tokens
+                        .saturating_sub(self.reserve.allocated_tokens),
+                }]
+            }
+            None => Vec::new(),
+        }
+    }
+
+    pub fn department_infos(&self) -> Vec<vp_protocol::types::GovernorDepartmentInfo> {
+        self.multi
+            .as_ref()
+            .map(MultiPathAllocation::department_infos)
+            .unwrap_or_default()
+    }
+
+    /// Deterministic deferred task ids in decision order.
+    pub fn deferred_order(&self) -> Vec<String> {
+        self.deferred
+            .iter()
+            .map(|deferral| deferral.task_id.clone())
+            .collect()
+    }
+
+    pub fn complete(&self) -> bool {
+        self.multi
+            .as_ref()
+            .map(|multi| multi.complete)
+            .unwrap_or(self.path.complete)
+    }
+
     pub fn reason(&self) -> GovernorReason {
         if let Some(deferral) = self.deferred.first() {
             return deferral.reason;
@@ -252,7 +341,7 @@ impl GovernorAdmission {
         if self.reserve.remaining_tokens.is_none() {
             return GovernorReason::NoBudget;
         }
-        if self.path.complete || self.reserve.path_weight_tokens == 0 {
+        if self.complete() || self.reserve.path_weight_tokens == 0 {
             return GovernorReason::PathComplete;
         }
         GovernorReason::Admit
@@ -315,6 +404,12 @@ pub struct GovernorEvaluation<'a> {
     /// Preview-only override. `Some` replaces the ledger-derived remaining
     /// tokens so a caller can ask "what would happen with N tokens left?".
     pub remaining_override: Option<u64>,
+    /// Observed input+output tokens per task from the usage ledger. Only used
+    /// by `mode = multi` with a positive `observed_weight_ratio`.
+    pub observed_tokens: &'a HashMap<String, u64>,
+    /// Deterministic evaluation instant for starvation aging. The pure
+    /// evaluator never reads the clock itself.
+    pub evaluated_at: &'a str,
 }
 
 /// Evaluate the plan and ordered candidates. This function performs no I/O and
@@ -332,35 +427,109 @@ pub fn evaluate(input: GovernorEvaluation<'_>) -> Result<GovernorAdmission, Gove
         statuses: input.statuses,
         remaining_budget_tokens: remaining,
     })?;
-    let reserve = reserve_math(
+    // Multi mode computes the bounded path table and its water-filled
+    // allocation. Single mode leaves `multi = None` and every later branch
+    // keeps the original F5 ordering and reserve math.
+    let multi = if policy.mode == CriticalPathMode::Multi {
+        Some(compute_multi_path(MultiPathInput {
+            session_id: input.session_id,
+            project_id: input.project_id,
+            plan_revision: input.plan_revision,
+            plan: input.plan,
+            statuses: input.statuses,
+            remaining_budget_tokens: remaining,
+            policy: &policy,
+            observed_tokens: input.observed_tokens,
+        })?)
+    } else {
+        None
+    };
+    let mut reserve = reserve_math(
         &policy,
         input.budget,
         remaining,
-        path.weight_tokens,
-        path.complete,
+        multi
+            .as_ref()
+            .map(|multi| multi.path_weight_tokens)
+            .unwrap_or(path.weight_tokens),
+        multi
+            .as_ref()
+            .map(|multi| multi.complete)
+            .unwrap_or(path.complete),
     );
-    let path_ids = path.task_ids.iter().cloned().collect::<HashSet<String>>();
-    let inputs_hash = admission_hash(&policy, &input, &path, &reserve);
+    if let Some(multi) = multi.as_ref() {
+        reserve.mode = CriticalPathMode::Multi;
+        reserve.path_count = multi.paths.len();
+        reserve.allocated_tokens = multi.allocated_tokens;
+        reserve.floor_tokens = multi.floor_tokens;
+        reserve.enumerated_paths = multi.enumerated_paths;
+        reserve.paths_truncated = multi.truncated;
+        reserve.ratio_reserve_tokens = multi.ratio_reserve_tokens;
+        reserve.protected_tokens = multi.protected_tokens;
+        reserve.headroom_tokens =
+            remaining.map(|remaining| remaining.saturating_sub(multi.protected_tokens));
+    } else {
+        reserve.mode = CriticalPathMode::Single;
+        reserve.path_count = usize::from(!path.task_ids.is_empty());
+        reserve.allocated_tokens = path.weight_tokens.min(reserve.protected_tokens);
+        reserve.floor_tokens = 0;
+        reserve.enumerated_paths = reserve.path_count;
+        reserve.paths_truncated = false;
+    }
+    let path_ids = multi
+        .as_ref()
+        .map(|multi| {
+            multi
+                .critical_task_ids()
+                .into_iter()
+                .map(str::to_string)
+                .collect::<HashSet<String>>()
+        })
+        .unwrap_or_else(|| path.task_ids.iter().cloned().collect::<HashSet<String>>());
+    let inputs_hash = multi
+        .as_ref()
+        .map(|multi| multi.inputs_hash.clone())
+        .unwrap_or_else(|| admission_hash(&policy, &input, &path, &reserve));
+    let complete = multi
+        .as_ref()
+        .map(|multi| multi.complete)
+        .unwrap_or(path.complete);
+    let total_path_weight = multi
+        .as_ref()
+        .map(|multi| multi.path_weight_tokens)
+        .unwrap_or(path.weight_tokens);
 
     if !policy.enabled {
         let decisions = input
             .candidates
             .iter()
             .enumerate()
-            .map(|(order, candidate)| GovernorTaskDecision {
-                task_id: candidate.task.id.clone(),
-                department: candidate.task.department.clone(),
-                critical: path_ids.contains(&candidate.task.id),
-                weight_tokens: task_weight_tokens(candidate.task),
-                order: order.min(u32::MAX as usize) as u32,
-                admitted: true,
-                reason: GovernorReason::Disabled,
-                remaining_after_tokens: remaining,
+            .map(|(order, candidate)| {
+                let critical = path_ids.contains(&candidate.task.id);
+                GovernorTaskDecision {
+                    task_id: candidate.task.id.clone(),
+                    department: candidate.task.department.clone(),
+                    critical,
+                    weight_tokens: task_weight_tokens(candidate.task),
+                    order: order.min(u32::MAX as usize) as u32,
+                    admitted: true,
+                    reason: GovernorReason::Disabled,
+                    remaining_after_tokens: remaining,
+                    path_id: single_path_id(multi.as_ref(), &candidate.task.id, critical),
+                    path_ids: single_path_ids(multi.as_ref(), &candidate.task.id, critical),
+                    path_deficit_tokens: multi
+                        .as_ref()
+                        .map(|multi| multi.task_deficit(&candidate.task.id))
+                        .unwrap_or(0),
+                    starvation_credit: 0,
+                }
             })
             .collect::<Vec<_>>();
         return Ok(GovernorAdmission {
             enabled: false,
+            mode: policy.mode,
             path,
+            multi,
             reserve,
             admitted: decisions
                 .iter()
@@ -376,19 +545,47 @@ pub fn evaluate(input: GovernorEvaluation<'_>) -> Result<GovernorAdmission, Gove
         || reserve
             .remaining_tokens
             .is_some_and(|remaining| remaining <= reserve.protected_tokens);
+    let multi_mode = policy.mode == CriticalPathMode::Multi;
     let mut ordered = input
         .candidates
         .iter()
         .enumerate()
         .map(|(input_order, candidate)| {
             let critical = path_ids.contains(&candidate.task.id);
+            let path_id = single_path_id(multi.as_ref(), &candidate.task.id, critical);
+            let path_ids = single_path_ids(multi.as_ref(), &candidate.task.id, critical);
+            let path_deficit_tokens = multi
+                .as_ref()
+                .map(|multi| multi.task_deficit(&candidate.task.id))
+                .unwrap_or(0);
+            // Single mode intentionally keeps starvation aging at zero so the
+            // original F5 ordering is byte-for-byte identical.
+            let starvation_credit = if multi_mode {
+                starvation_credit(
+                    candidate.enqueued_at,
+                    input.evaluated_at,
+                    policy.starvation_after_secs,
+                )
+            } else {
+                0
+            };
             let boosted = candidate.effective_priority
                 + i64::from(if critical {
                     policy.critical_boost.max(0)
                 } else {
                     0
-                });
-            (input_order, candidate, critical, boosted)
+                })
+                + starvation_credit;
+            (
+                input_order,
+                candidate,
+                critical,
+                path_id,
+                path_deficit_tokens,
+                starvation_credit,
+                boosted,
+                path_ids,
+            )
         })
         .collect::<Vec<_>>();
     ordered.sort_by(|left, right| {
@@ -396,7 +593,16 @@ pub fn evaluate(input: GovernorEvaluation<'_>) -> Result<GovernorAdmission, Gove
         let right_pressure = pressure && right.2;
         right_pressure
             .cmp(&left_pressure)
-            .then_with(|| right.3.cmp(&left.3))
+            // Multi-path ordering is path deficit first, then priority/age.
+            // Single mode keeps the original priority-first ordering.
+            .then_with(|| {
+                if multi_mode {
+                    right.4.cmp(&left.4)
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .then_with(|| right.6.cmp(&left.6))
             .then_with(|| left.1.enqueued_at.cmp(right.1.enqueued_at))
             .then_with(|| left.1.task.id.cmp(&right.1.task.id))
     });
@@ -408,31 +614,29 @@ pub fn evaluate(input: GovernorEvaluation<'_>) -> Result<GovernorAdmission, Gove
     let mut decisions = Vec::with_capacity(ordered.len());
     let mut admitted = Vec::new();
     let mut deferred = Vec::new();
-    for (order, (_, candidate, critical, _)) in ordered.into_iter().enumerate() {
+    for (
+        order,
+        (_, candidate, critical, path_id, path_deficit_tokens, starvation_credit, _, path_ids),
+    ) in ordered.into_iter().enumerate()
+    {
         let task = candidate.task;
         let weight = task_weight_tokens(task);
-        let decision = if !policy.enabled {
-            GovernorTaskDecision {
-                task_id: task.id.clone(),
-                department: task.department.clone(),
-                critical,
-                weight_tokens: weight,
-                order: order.min(u32::MAX as usize) as u32,
-                admitted: true,
-                reason: GovernorReason::Disabled,
-                remaining_after_tokens: current,
-            }
-        } else if let Some(remaining_now) = current {
+        let order = order.min(u32::MAX as usize) as u32;
+        let decision = if let Some(remaining_now) = current {
             if remaining_now < policy.min_task_budget {
                 let decision = GovernorTaskDecision {
                     task_id: task.id.clone(),
                     department: task.department.clone(),
                     critical,
                     weight_tokens: weight,
-                    order: order.min(u32::MAX as usize) as u32,
+                    order,
                     admitted: false,
                     reason: GovernorReason::Exhausted,
                     remaining_after_tokens: Some(remaining_now),
+                    path_id,
+                    path_ids: path_ids.clone(),
+                    path_deficit_tokens,
+                    starvation_credit,
                 };
                 deferred.push(GovernorDeferral {
                     task_id: task.id.clone(),
@@ -442,6 +646,10 @@ pub fn evaluate(input: GovernorEvaluation<'_>) -> Result<GovernorAdmission, Gove
                     reason: GovernorReason::Exhausted,
                     remaining_tokens: Some(remaining_now),
                     protected_tokens: reserve.protected_tokens,
+                    path_id,
+                    path_ids: path_ids.clone(),
+                    path_deficit_tokens,
+                    starvation_credit,
                 });
                 decision
             } else if critical {
@@ -456,10 +664,14 @@ pub fn evaluate(input: GovernorEvaluation<'_>) -> Result<GovernorAdmission, Gove
                     department: task.department.clone(),
                     critical,
                     weight_tokens: weight,
-                    order: order.min(u32::MAX as usize) as u32,
+                    order,
                     admitted: true,
                     reason: GovernorReason::CriticalAdmit,
                     remaining_after_tokens: current,
+                    path_id,
+                    path_ids: path_ids.clone(),
+                    path_deficit_tokens,
+                    starvation_credit,
                 }
             } else if reserve.throttled {
                 let decision = GovernorTaskDecision {
@@ -467,10 +679,14 @@ pub fn evaluate(input: GovernorEvaluation<'_>) -> Result<GovernorAdmission, Gove
                     department: task.department.clone(),
                     critical,
                     weight_tokens: weight,
-                    order: order.min(u32::MAX as usize) as u32,
+                    order,
                     admitted: false,
                     reason: GovernorReason::Throttle,
                     remaining_after_tokens: Some(remaining_now),
+                    path_id,
+                    path_ids: path_ids.clone(),
+                    path_deficit_tokens,
+                    starvation_credit,
                 };
                 deferred.push(GovernorDeferral {
                     task_id: task.id.clone(),
@@ -480,6 +696,10 @@ pub fn evaluate(input: GovernorEvaluation<'_>) -> Result<GovernorAdmission, Gove
                     reason: GovernorReason::Throttle,
                     remaining_tokens: Some(remaining_now),
                     protected_tokens: reserve.protected_tokens,
+                    path_id,
+                    path_ids: path_ids.clone(),
+                    path_deficit_tokens,
+                    starvation_credit,
                 });
                 decision
             } else if weight > free_headroom.unwrap_or(u64::MAX) {
@@ -488,10 +708,14 @@ pub fn evaluate(input: GovernorEvaluation<'_>) -> Result<GovernorAdmission, Gove
                     department: task.department.clone(),
                     critical,
                     weight_tokens: weight,
-                    order: order.min(u32::MAX as usize) as u32,
+                    order,
                     admitted: false,
                     reason: GovernorReason::Reserve,
                     remaining_after_tokens: Some(remaining_now),
+                    path_id,
+                    path_ids: path_ids.clone(),
+                    path_deficit_tokens,
+                    starvation_credit,
                 };
                 deferred.push(GovernorDeferral {
                     task_id: task.id.clone(),
@@ -501,6 +725,10 @@ pub fn evaluate(input: GovernorEvaluation<'_>) -> Result<GovernorAdmission, Gove
                     reason: GovernorReason::Reserve,
                     remaining_tokens: Some(remaining_now),
                     protected_tokens: reserve.protected_tokens,
+                    path_id,
+                    path_ids: path_ids.clone(),
+                    path_deficit_tokens,
+                    starvation_credit,
                 });
                 decision
             } else {
@@ -511,10 +739,14 @@ pub fn evaluate(input: GovernorEvaluation<'_>) -> Result<GovernorAdmission, Gove
                     department: task.department.clone(),
                     critical,
                     weight_tokens: weight,
-                    order: order.min(u32::MAX as usize) as u32,
+                    order,
                     admitted: true,
                     reason: GovernorReason::Admit,
                     remaining_after_tokens: current,
+                    path_id,
+                    path_ids: path_ids.clone(),
+                    path_deficit_tokens,
+                    starvation_credit,
                 }
             }
         } else {
@@ -523,10 +755,14 @@ pub fn evaluate(input: GovernorEvaluation<'_>) -> Result<GovernorAdmission, Gove
                 department: task.department.clone(),
                 critical,
                 weight_tokens: weight,
-                order: order.min(u32::MAX as usize) as u32,
+                order,
                 admitted: true,
                 reason: GovernorReason::NoBudget,
                 remaining_after_tokens: None,
+                path_id,
+                path_ids: path_ids.clone(),
+                path_deficit_tokens,
+                starvation_credit,
             }
         };
         if decision.admitted {
@@ -537,7 +773,7 @@ pub fn evaluate(input: GovernorEvaluation<'_>) -> Result<GovernorAdmission, Gove
 
     // A plan with no remaining path has nothing to protect. Admit ready work
     // in deterministic order instead of keeping a ratio reserve forever.
-    if path.complete || path.weight_tokens == 0 {
+    if complete || total_path_weight == 0 {
         for decision in &mut decisions {
             if !decision.admitted && decision.reason != GovernorReason::Exhausted {
                 decision.admitted = true;
@@ -560,7 +796,9 @@ pub fn evaluate(input: GovernorEvaluation<'_>) -> Result<GovernorAdmission, Gove
 
     Ok(GovernorAdmission {
         enabled: true,
+        mode: policy.mode,
         path,
+        multi,
         reserve,
         decisions,
         admitted,
@@ -633,6 +871,12 @@ pub fn reserve_math(
         protected_tokens,
         headroom_tokens,
         throttled,
+        mode: policy.mode,
+        path_count: 0,
+        allocated_tokens: protected_tokens,
+        floor_tokens: 0,
+        enumerated_paths: 0,
+        paths_truncated: false,
     }
 }
 
@@ -757,6 +1001,21 @@ pub fn admission_payload(
             .collect::<Vec<_>>(),
         "inputs_hash": admission.inputs_hash,
         "created_at": created_at,
+        "mode": admission.mode.as_str(),
+        "paths": admission
+            .path_infos()
+            .into_iter()
+            .take(crate::multi_path::MAX_SELECTED_PATHS)
+            .map(|path| serde_json::to_value(path).unwrap_or(Value::Null))
+            .collect::<Vec<_>>(),
+        "departments": admission
+            .department_infos()
+            .into_iter()
+            .take(crate::multi_path::MAX_DEPARTMENT_ROWS)
+            .map(|department| serde_json::to_value(department).unwrap_or(Value::Null))
+            .collect::<Vec<_>>(),
+        "allocated_tokens": admission.reserve.allocated_tokens,
+        "deferred_order": admission.deferred_order(),
     })
 }
 
@@ -764,6 +1023,7 @@ pub struct GovernorDenial<'a> {
     pub session_id: &'a str,
     pub decision_id: &'a str,
     pub plan_revision: u32,
+    pub mode: CriticalPathMode,
     pub task_id: &'a str,
     pub task_critical: bool,
     pub reason: GovernorReason,
@@ -805,6 +1065,14 @@ pub fn denial_payload(denial: GovernorDenial<'_>) -> Value {
         "deferred": Vec::<GovernorDeferralInfo>::new(),
         "inputs_hash": denial.inputs_hash,
         "created_at": denial.created_at,
+        // A provider-call denial is task-scoped and does not carry a fresh
+        // path table; the admission event owns it. These keys keep the event
+        // shape stable for replay clients.
+        "mode": denial.mode.as_str(),
+        "paths": Vec::<Value>::new(),
+        "departments": Vec::<Value>::new(),
+        "allocated_tokens": 0u64,
+        "deferred_order": vec![denial.task_id],
     })
 }
 
@@ -876,8 +1144,16 @@ pub struct GovernorRunContext {
     pub policy: CriticalPathPolicy,
     pub task_id: Option<String>,
     pub critical: bool,
+    /// Union of every protected path's task ids (bounded by the path table).
     pub path_task_ids: Vec<String>,
+    /// Total selected path weight in multi mode, the F5 path weight otherwise.
     pub path_weight_tokens: u64,
+    /// Protected path count (0/1 in single mode).
+    pub path_count: usize,
+    /// Reserve allocated to the runner's path, when the task is protected.
+    pub path_allocation_tokens: Option<u64>,
+    /// Unfunded demand of the runner's path, when known.
+    pub path_deficit_tokens: u64,
     pub plan_revision: u32,
     pub inputs_hash: String,
 }
@@ -903,6 +1179,10 @@ impl GovernorRunContext {
             self.path_weight_tokens,
             false,
         );
+        // The multi-path pool is bounded by remaining and by the sum of path
+        // demand plus the ratio buffer. reserve_math derives exactly that
+        // bound from `path_weight_tokens`, so the provider pre-flight clamp
+        // is identical to single mode.
         Some(GovernorGate {
             enabled: true,
             task_id: Some(task_id),
@@ -913,6 +1193,29 @@ impl GovernorRunContext {
             min_task_budget: self.policy.min_task_budget,
             policy_fingerprint: self.inputs_hash.clone(),
         })
+    }
+}
+
+/// Path membership for one candidate. Multi mode uses the selected path
+/// table; single mode reports the compatibility row (`#0`) for critical tasks
+/// so per-decision fields agree with `path_infos`.
+fn single_path_id(
+    multi: Option<&MultiPathAllocation>,
+    task_id: &str,
+    critical: bool,
+) -> Option<u32> {
+    match multi {
+        Some(multi) => multi.task_path_id(task_id),
+        None if critical => Some(0),
+        None => None,
+    }
+}
+
+fn single_path_ids(multi: Option<&MultiPathAllocation>, task_id: &str, critical: bool) -> Vec<u32> {
+    match multi {
+        Some(multi) => multi.task_path_ids(task_id),
+        None if critical => vec![0],
+        None => Vec::new(),
     }
 }
 

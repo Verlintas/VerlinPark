@@ -12431,6 +12431,7 @@ mod budget_governor_engine_tests {
             throttle_at_ratio: 0.0,
             critical_boost: 25,
             min_task_budget: 100,
+            ..CriticalPathPolicy::default()
         }
     }
 
@@ -12459,6 +12460,10 @@ mod budget_governor_engine_tests {
         assert_eq!(path.weight_tokens, 6_000);
         assert_eq!(status.reserve.protected_tokens, 8_500);
         assert_eq!(status.reserve.state, "active");
+        assert_eq!(status.paths.len(), 1);
+        assert_eq!(status.paths[0].task_ids, vec!["critical"]);
+        assert!(status.departments.is_empty());
+        assert_eq!(status.reserve.mode, "single");
         assert_eq!(status.admitted, vec!["critical".to_string()]);
         assert_eq!(status.deferred.len(), 1);
         assert_eq!(status.deferred[0].task_id, "side");
@@ -12763,6 +12768,7 @@ mod budget_governor_engine_tests {
             throttle_at_ratio: 0.2,
             critical_boost: 10,
             min_task_budget: 2_000,
+            ..CriticalPathPolicy::default()
         };
         let stored = engine
             .set_critical_path_policy(&project.id, &policy)
@@ -12775,6 +12781,604 @@ mod budget_governor_engine_tests {
         );
         let manifest = vp_store::read_project_manifest(engine.store().data_dir()).unwrap();
         assert_eq!(manifest[0].critical_path_policy, policy);
+    }
+
+    fn multi_policy(max_paths: u32) -> CriticalPathPolicy {
+        CriticalPathPolicy {
+            enabled: true,
+            reserve_ratio: 0.25,
+            throttle_at_ratio: 0.0,
+            critical_boost: 25,
+            min_task_budget: 100,
+            mode: vp_protocol::types::CriticalPathMode::Multi,
+            max_paths,
+            department_min_ratio: 0.0,
+            observed_weight_ratio: 0.0,
+            starvation_after_secs: 900,
+        }
+    }
+
+    fn fair_plan() -> TeamPlan {
+        plan(vec![
+            plan_task("heavy", 1, &[], 10_000),
+            plan_task("medium", 1, &[], 8_000),
+            plan_task("side", 1, &[], 1_000),
+        ])
+    }
+
+    #[tokio::test]
+    async fn multi_path_status_and_preview_expose_a_bounded_table() {
+        let (_data, _repo, engine, project, session) = fixture().await;
+        engine
+            .set_team_plan(&session.id, &fair_plan())
+            .await
+            .unwrap();
+        let mut policy = multi_policy(2);
+        policy.min_task_budget = 0;
+        engine
+            .set_critical_path_policy(&project.id, &policy)
+            .await
+            .unwrap();
+        let status = engine
+            .budget_governor_status(&session.id, 10)
+            .await
+            .unwrap();
+        assert!(status.enabled);
+        assert_eq!(
+            status.policy.mode,
+            vp_protocol::types::CriticalPathMode::Multi
+        );
+        assert_eq!(status.paths.len(), 2);
+        assert_eq!(status.paths[0].task_ids, vec!["heavy"]);
+        assert_eq!(status.paths[1].task_ids, vec!["medium"]);
+        assert_eq!(status.reserve.mode, "multi");
+        assert_eq!(status.reserve.path_count, 2);
+        assert_eq!(status.reserve.protected_tokens, 10_000);
+        assert_eq!(status.reserve.allocated_tokens, 10_000);
+        assert!(
+            status
+                .decisions
+                .iter()
+                .filter(|decision| decision.task_id != "side")
+                .all(|decision| decision.critical)
+        );
+        assert!(
+            !status
+                .decisions
+                .iter()
+                .find(|decision| decision.task_id == "side")
+                .unwrap()
+                .critical
+        );
+        assert_eq!(status.deferred.len(), 1);
+        assert_eq!(status.deferred[0].task_id, "side");
+        assert_eq!(status.deferred[0].reason, "reserve");
+        assert_eq!(status.deferred_order, vec!["side".to_string()]);
+        assert_eq!(status.paths[1].allocation_tokens, 4_444);
+        assert_eq!(status.paths[1].deficit_tokens, 3_556);
+        assert_eq!(status.departments.len(), 1);
+        assert_eq!(status.departments[0].department, "impl");
+        assert_eq!(status.departments[0].weight_tokens, 18_000);
+        assert_eq!(status.departments[0].path_ids, vec![0, 1]);
+
+        let preview = engine
+            .preview_budget_governor(&session.id, Some(10_000), 10)
+            .await
+            .unwrap();
+        assert_eq!(preview.inputs_hash, status.inputs_hash);
+        assert_eq!(preview.paths, status.paths);
+        assert_eq!(preview.decisions, status.decisions);
+
+        let expanded = engine
+            .preview_budget_governor(&session.id, Some(30_000), 10)
+            .await
+            .unwrap();
+        assert_ne!(expanded.inputs_hash, status.inputs_hash);
+        assert!(expanded.deferred.is_empty());
+        assert_eq!(expanded.reserve.allocated_tokens, 18_000);
+        assert_eq!(expanded.paths.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn preview_mode_override_does_not_change_the_stored_policy() {
+        let (_data, _repo, engine, project, session) = fixture().await;
+        let plan = plan(vec![
+            plan_task("a", 1, &[], 5_000),
+            plan_task("b", 1, &[], 4_000),
+        ]);
+        engine.set_team_plan(&session.id, &plan).await.unwrap();
+        engine
+            .set_critical_path_policy(&project.id, &enabled_policy())
+            .await
+            .unwrap();
+        let single = engine
+            .preview_budget_governor(&session.id, Some(20_000), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            single.policy.mode,
+            vp_protocol::types::CriticalPathMode::Single
+        );
+        assert_eq!(single.paths.len(), 1);
+        assert_eq!(single.reserve.mode, "single");
+        let multi = engine
+            .preview_budget_governor_with_mode(
+                &session.id,
+                Some(20_000),
+                10,
+                Some(vp_protocol::types::CriticalPathMode::Multi),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            multi.policy.mode,
+            vp_protocol::types::CriticalPathMode::Multi
+        );
+        assert_eq!(multi.paths.len(), 2);
+        assert_eq!(multi.departments.len(), 1);
+        assert_ne!(single.inputs_hash, multi.inputs_hash);
+        // The stored policy is untouched by a preview override.
+        assert_eq!(
+            engine.critical_path_policy(&project.id).await.unwrap(),
+            enabled_policy()
+        );
+        let again = engine
+            .preview_budget_governor_with_mode(
+                &session.id,
+                Some(20_000),
+                10,
+                Some(vp_protocol::types::CriticalPathMode::Multi),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.inputs_hash, multi.inputs_hash);
+        assert_eq!(again.paths, multi.paths);
+    }
+
+    #[tokio::test]
+    async fn preview_mode_override_can_force_single_on_a_multi_policy() {
+        let (_data, _repo, engine, project, session) = fixture().await;
+        let plan = plan(vec![
+            plan_task("a", 1, &[], 5_000),
+            plan_task("b", 1, &[], 4_000),
+        ]);
+        engine.set_team_plan(&session.id, &plan).await.unwrap();
+        engine
+            .set_critical_path_policy(&project.id, &multi_policy(4))
+            .await
+            .unwrap();
+        let multi = engine
+            .budget_governor_status(&session.id, 10)
+            .await
+            .unwrap();
+        assert_eq!(multi.paths.len(), 2);
+        let single = engine
+            .preview_budget_governor_with_mode(
+                &session.id,
+                Some(20_000),
+                10,
+                Some(vp_protocol::types::CriticalPathMode::Single),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            single.policy.mode,
+            vp_protocol::types::CriticalPathMode::Single
+        );
+        assert_eq!(single.paths.len(), 1);
+        assert_eq!(single.paths[0].task_ids, vec!["a"]);
+        assert!(single.departments.is_empty());
+        assert_eq!(single.reserve.mode, "single");
+        assert_ne!(multi.inputs_hash, single.inputs_hash);
+        // The persisted policy still reports multi mode after the preview.
+        assert_eq!(
+            engine.critical_path_policy(&project.id).await.unwrap().mode,
+            vp_protocol::types::CriticalPathMode::Multi
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_path_status_uses_observed_ledger_spend() {
+        let (_data, _repo, engine, project, session) = fixture().await;
+        let plan = plan(vec![
+            plan_task("declared", 1, &[], 5_000),
+            plan_task("observed", 1, &[], 4_000),
+        ]);
+        engine.set_team_plan(&session.id, &plan).await.unwrap();
+        let mut policy = multi_policy(4);
+        policy.observed_weight_ratio = 1.0;
+        engine
+            .set_critical_path_policy(&project.id, &policy)
+            .await
+            .unwrap();
+        engine
+            .store()
+            .add_usage_entry_with_events(
+                &session.id,
+                "agent",
+                "Agent",
+                "worker",
+                Some("observed"),
+                Some("impl"),
+                "test",
+                6_000,
+                2_000,
+                0,
+                0,
+                false,
+                0.0,
+            )
+            .unwrap();
+        let status = engine
+            .budget_governor_status(&session.id, 10)
+            .await
+            .unwrap();
+        assert_eq!(status.paths[0].task_ids, vec!["observed"]);
+        assert_eq!(status.paths[0].weight_tokens, 8_000);
+        assert_eq!(status.paths[0].declared_weight_tokens, 4_000);
+        assert_eq!(status.paths[0].observed_tokens, 8_000);
+        assert_eq!(status.paths[1].task_ids, vec!["declared"]);
+        assert_eq!(status.paths[1].weight_tokens, 5_000);
+    }
+
+    #[tokio::test]
+    async fn multi_path_status_exposes_department_floors_and_membership() {
+        let (_data, _repo, engine, project, session) = fixture().await;
+        let mut tasks = vec![
+            plan_task("impl-1", 1, &[], 6_000),
+            plan_task("impl-2", 1, &["impl-1"], 4_000),
+            plan_task("qa-1", 1, &[], 2_000),
+            plan_task("qa-2", 1, &["qa-1"], 2_000),
+        ];
+        tasks[2].department = "qa".to_string();
+        tasks[3].department = "qa".to_string();
+        let plan = plan(tasks);
+        engine.set_team_plan(&session.id, &plan).await.unwrap();
+        let mut policy = multi_policy(4);
+        policy.reserve_ratio = 0.0;
+        policy.department_min_ratio = 0.25;
+        engine
+            .set_critical_path_policy(&project.id, &policy)
+            .await
+            .unwrap();
+        let status = engine
+            .budget_governor_status(&session.id, 10)
+            .await
+            .unwrap();
+        assert_eq!(status.paths.len(), 2);
+        assert_eq!(status.paths[0].task_ids, vec!["impl-1", "impl-2"]);
+        assert_eq!(status.paths[1].task_ids, vec!["qa-1", "qa-2"]);
+        assert_eq!(status.departments.len(), 2);
+        assert_eq!(status.departments[0].department, "impl");
+        assert_eq!(status.departments[0].weight_tokens, 10_000);
+        assert_eq!(status.departments[0].floor_tokens, 1_785);
+        assert_eq!(status.departments[0].path_ids, vec![0]);
+        assert_eq!(status.departments[1].department, "qa");
+        assert_eq!(status.departments[1].weight_tokens, 4_000);
+        assert_eq!(status.departments[1].floor_tokens, 714);
+        assert_eq!(status.departments[1].path_ids, vec![1]);
+        let impl_task = status
+            .decisions
+            .iter()
+            .find(|decision| decision.task_id == "impl-1")
+            .unwrap();
+        assert_eq!(impl_task.path_ids, vec![0]);
+        assert_eq!(impl_task.path_id, Some(0));
+        let qa = status
+            .decisions
+            .iter()
+            .find(|decision| decision.task_id == "qa-1")
+            .unwrap();
+        assert_eq!(qa.path_ids, vec![1]);
+        assert_eq!(qa.path_id, Some(1));
+    }
+
+    #[tokio::test]
+    async fn multi_path_run_context_marks_the_union_of_protected_paths() {
+        let (_data, _repo, engine, project, session) = fixture().await;
+        let plan = plan(vec![
+            plan_task("a1", 1, &[], 4_000),
+            plan_task("a2", 1, &["a1"], 4_000),
+            plan_task("b1", 1, &[], 2_000),
+            plan_task("b2", 1, &["b1"], 2_000),
+        ]);
+        engine.set_team_plan(&session.id, &plan).await.unwrap();
+        engine
+            .set_critical_path_policy(&project.id, &multi_policy(4))
+            .await
+            .unwrap();
+        let context = engine
+            .governor_run_context(&session.id, Some("b2"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(context.critical);
+        assert_eq!(context.path_count, 2);
+        assert_eq!(context.path_weight_tokens, 12_000);
+        assert!(context.path_task_ids.contains(&"a1".to_string()));
+        assert!(context.path_task_ids.contains(&"b2".to_string()));
+        assert_eq!(context.path_allocation_tokens, Some(3_333));
+        assert_eq!(context.path_deficit_tokens, 667);
+        let leader = engine
+            .governor_run_context(&session.id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(leader.task_id.is_none());
+        assert!(!leader.critical);
+        assert!(leader.gate(Some(10_000), Some(10_000)).is_none());
+        let gate = context.gate(Some(10_000), Some(10_000)).unwrap();
+        assert!(gate.critical);
+    }
+
+    #[tokio::test]
+    async fn multi_path_scheduler_admits_two_paths_and_defers_the_third() {
+        let (_data, _repo, engine, project, session) = fixture().await;
+        let plan = fair_plan();
+        let (seq, _) = engine.scheduler().sync_plan(&session, &plan).await.unwrap();
+        let mut policy = multi_policy(2);
+        policy.min_task_budget = 0;
+        engine
+            .set_critical_path_policy(&project.id, &policy)
+            .await
+            .unwrap();
+        let selection = engine
+            .scheduler()
+            .ready_tasks_governed(
+                &session,
+                seq,
+                &plan,
+                10,
+                Some(crate::budget_governor::GovernorBudgetView::new(
+                    Some(18_000),
+                    0,
+                    0,
+                )),
+            )
+            .await
+            .unwrap();
+        let admission = selection.governor.as_ref().unwrap();
+        assert_eq!(admission.mode, vp_protocol::types::CriticalPathMode::Multi);
+        assert_eq!(admission.path_infos().len(), 2);
+        assert_eq!(selection.ready.len(), 2);
+        assert_eq!(selection.ready[0].id, "heavy");
+        assert_eq!(selection.ready[1].id, "medium");
+        assert_eq!(selection.deferred.len(), 1);
+        assert_eq!(selection.deferred[0].task_id, "side");
+        assert_eq!(selection.deferred[0].code, "BUDGET_RESERVED");
+    }
+
+    #[tokio::test]
+    async fn multi_path_admission_event_persists_the_path_table() {
+        let (_data, _repo, engine, project, session) = fixture().await;
+        let plan = fair_plan();
+        let (seq, _) = engine.scheduler().sync_plan(&session, &plan).await.unwrap();
+        let mut policy = multi_policy(2);
+        policy.min_task_budget = 0;
+        engine
+            .set_critical_path_policy(&project.id, &policy)
+            .await
+            .unwrap();
+        let selection = engine
+            .scheduler()
+            .ready_tasks_governed(
+                &session,
+                seq,
+                &plan,
+                10,
+                Some(crate::budget_governor::GovernorBudgetView::new(
+                    Some(18_000),
+                    0,
+                    0,
+                )),
+            )
+            .await
+            .unwrap();
+        engine
+            .record_budget_governor_admission(&session.id, selection.governor.as_ref().unwrap())
+            .await
+            .unwrap();
+        let decisions = engine.governor_decisions(&session.id, 5).await.unwrap();
+        assert_eq!(decisions.len(), 1);
+        let decision = &decisions[0];
+        assert_eq!(decision.mode, "multi");
+        assert_eq!(decision.paths.len(), 2);
+        assert_eq!(decision.paths[0].task_ids, vec!["heavy"]);
+        assert_eq!(decision.paths[1].allocation_tokens, 8_000);
+        assert_eq!(decision.departments.len(), 1);
+        assert_eq!(decision.departments[0].department, "impl");
+        assert_eq!(decision.allocated_tokens, 18_000);
+        assert_eq!(decision.deferred_order, vec!["side".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn multi_path_status_without_a_plan_keeps_the_mode_visible() {
+        let (_data, _repo, engine, project, session) = fixture().await;
+        engine
+            .set_critical_path_policy(&project.id, &multi_policy(4))
+            .await
+            .unwrap();
+        let status = engine
+            .budget_governor_status(&session.id, 10)
+            .await
+            .unwrap();
+        assert!(status.enabled);
+        assert!(!status.plan_present);
+        assert!(status.paths.is_empty());
+        assert!(status.departments.is_empty());
+        assert!(status.decisions.is_empty());
+        assert_eq!(status.reserve.mode, "multi");
+        assert_eq!(status.reserve.path_count, 0);
+        assert_eq!(
+            status.policy.mode,
+            vp_protocol::types::CriticalPathMode::Multi
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_path_status_honors_the_configured_path_cap() {
+        let (_data, _repo, engine, project, session) = fixture().await;
+        let plan = plan(vec![
+            plan_task("a", 1, &[], 8_000),
+            plan_task("b", 1, &[], 6_000),
+            plan_task("c", 1, &[], 4_000),
+            plan_task("d", 1, &[], 2_000),
+        ]);
+        engine.set_team_plan(&session.id, &plan).await.unwrap();
+        engine
+            .set_critical_path_policy(&project.id, &multi_policy(2))
+            .await
+            .unwrap();
+        let status = engine
+            .budget_governor_status(&session.id, 10)
+            .await
+            .unwrap();
+        assert_eq!(status.paths.len(), 2);
+        assert_eq!(status.paths[0].task_ids, vec!["a"]);
+        assert_eq!(status.paths[1].task_ids, vec!["b"]);
+        assert_eq!(status.reserve.path_count, 2);
+        assert_eq!(
+            status
+                .decisions
+                .iter()
+                .filter(|decision| decision.critical)
+                .count(),
+            2
+        );
+        assert_eq!(
+            status
+                .decisions
+                .iter()
+                .filter(|decision| !decision.critical)
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_path_policy_validates_persists_and_rebuilds() {
+        let (data, _repo, engine, project, _session) = fixture().await;
+        let invalid_paths = CriticalPathPolicy {
+            max_paths: 1,
+            ..CriticalPathPolicy::default()
+        };
+        assert!(
+            engine
+                .set_critical_path_policy(&project.id, &invalid_paths)
+                .await
+                .is_err()
+        );
+        let invalid_ratio = CriticalPathPolicy {
+            department_min_ratio: 2.0,
+            ..CriticalPathPolicy::default()
+        };
+        assert!(
+            engine
+                .set_critical_path_policy(&project.id, &invalid_ratio)
+                .await
+                .is_err()
+        );
+        let policy = CriticalPathPolicy {
+            enabled: true,
+            mode: vp_protocol::types::CriticalPathMode::Multi,
+            max_paths: 6,
+            department_min_ratio: 0.2,
+            observed_weight_ratio: 0.4,
+            starvation_after_secs: 600,
+            ..CriticalPathPolicy::default()
+        };
+        let stored = engine
+            .set_critical_path_policy(&project.id, &policy)
+            .await
+            .unwrap();
+        assert_eq!(stored, policy);
+        let manifest = vp_store::read_project_manifest(engine.store().data_dir()).unwrap();
+        assert_eq!(manifest[0].critical_path_policy, policy);
+        drop(engine);
+        let reopened = Engine::new(vp_store::Store::open(data.path()).unwrap());
+        assert_eq!(
+            reopened.critical_path_policy(&project.id).await.unwrap(),
+            policy
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_path_policy_survives_database_rebuild() {
+        let (data, _repo, engine, project, _session) = fixture().await;
+        let policy = CriticalPathPolicy {
+            enabled: true,
+            mode: vp_protocol::types::CriticalPathMode::Multi,
+            max_paths: 7,
+            department_min_ratio: 0.3,
+            observed_weight_ratio: 0.6,
+            starvation_after_secs: 1_200,
+            ..CriticalPathPolicy::default()
+        };
+        engine
+            .set_critical_path_policy(&project.id, &policy)
+            .await
+            .unwrap();
+        engine.record_project_manifest().await.unwrap();
+        drop(engine);
+        let report = crate::rebuild::rebuild_database(data.path(), false)
+            .await
+            .unwrap();
+        assert!(report.projects >= 1);
+        let store = vp_store::Store::open(data.path()).unwrap();
+        assert_eq!(store.get_critical_path_policy(&project.id).unwrap(), policy);
+    }
+
+    #[tokio::test]
+    async fn multi_path_status_resets_after_a_task_completes() {
+        let (_data, _repo, engine, project, session) = fixture().await;
+        let plan = plan(vec![
+            plan_task("a", 1, &[], 5_000),
+            plan_task("b", 1, &[], 3_000),
+        ]);
+        engine.set_team_plan(&session.id, &plan).await.unwrap();
+        let (seq, _) = engine.scheduler().sync_plan(&session, &plan).await.unwrap();
+        engine
+            .set_critical_path_policy(&project.id, &multi_policy(4))
+            .await
+            .unwrap();
+        let before = engine.budget_governor_status(&session.id, 5).await.unwrap();
+        assert_eq!(before.paths.len(), 2);
+        engine
+            .scheduler()
+            .finish(&session.id, seq, "a", "completed", None)
+            .await
+            .unwrap();
+        let after = engine.budget_governor_status(&session.id, 5).await.unwrap();
+        assert_eq!(after.paths.len(), 1);
+        assert_eq!(after.paths[0].task_ids, vec!["b"]);
+        assert_ne!(before.inputs_hash, after.inputs_hash);
+    }
+
+    #[tokio::test]
+    async fn disabled_multi_policy_keeps_the_table_visible_and_admits_everything() {
+        let (_data, _repo, engine, project, session) = fixture().await;
+        engine
+            .set_team_plan(&session.id, &fair_plan())
+            .await
+            .unwrap();
+        let mut policy = multi_policy(2);
+        policy.enabled = false;
+        engine
+            .set_critical_path_policy(&project.id, &policy)
+            .await
+            .unwrap();
+        let status = engine.budget_governor_status(&session.id, 5).await.unwrap();
+        assert!(!status.enabled);
+        assert_eq!(status.reserve.state, "disabled");
+        assert_eq!(status.paths.len(), 2);
+        assert_eq!(status.decisions.len(), 3);
+        assert!(
+            status
+                .decisions
+                .iter()
+                .all(|decision| { decision.action == "admit" && decision.reason == "disabled" })
+        );
+        assert!(status.deferred.is_empty());
     }
 }
 

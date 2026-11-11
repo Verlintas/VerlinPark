@@ -358,6 +358,12 @@ struct EfficiencyCard: View {
                     Text(governor.enabled ? "GOVERNOR ON" : "GOVERNOR OFF")
                         .font(VPTheme.mono(8, weight: .semibold))
                         .foregroundStyle(governor.enabled ? VPTheme.accent : VPTheme.textTertiary)
+                    Text(GovernorMetrics.modeLabel(governor.reserve.mode).uppercased())
+                        .font(VPTheme.mono(8, weight: .semibold))
+                        .foregroundStyle(
+                            governor.reserve.mode == "multi"
+                                ? VPTheme.accent : VPTheme.textTertiary
+                        )
                     if governor.unlimited {
                         Text("UNLIMITED")
                             .font(VPTheme.mono(8, weight: .semibold))
@@ -401,6 +407,90 @@ struct EfficiencyCard: View {
                         detail: governor.reserve.throttled ? "throttle zone" : "reserve pool"
                     )
                 }
+                if governor.reserve.mode == "multi" || !governor.paths.isEmpty {
+                    HStack(spacing: 10) {
+                        metric(
+                            "Paths",
+                            "\(governor.reserve.pathCount)",
+                            detail: "max \(governor.policy.maxPaths)"
+                        )
+                        metric(
+                            "Allocated",
+                            EfficiencyMetrics.tokenLabel(governor.reserve.allocatedTokens),
+                            detail: GovernorMetrics.percent(
+                                governor.reserve.protectedTokens > 0
+                                    ? Double(governor.reserve.allocatedTokens)
+                                    / Double(governor.reserve.protectedTokens)
+                                    : nil
+                            ) + " of protected"
+                        )
+                        metric(
+                            "Floors",
+                            EfficiencyMetrics.tokenLabel(governor.reserve.floorTokens),
+                            detail: "department min \(GovernorMetrics.percent(governor.policy.departmentMinRatio))"
+                        )
+                        metric(
+                            "Fairness",
+                            GovernorMetrics.starvationLabel(governor.policy.starvationAfterSecs),
+                            detail: "observed \(GovernorMetrics.percent(governor.policy.observedWeightRatio)) blend"
+                        )
+                    }
+                    if !governor.paths.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("PROTECTED PATHS")
+                                .font(VPTheme.mono(8, weight: .semibold))
+                                .foregroundStyle(VPTheme.textTertiary)
+                            ForEach(Array(governor.paths.prefix(4))) { path in
+                                HStack(spacing: 8) {
+                                    Text("#\(path.pathID)")
+                                        .font(VPTheme.mono(8, weight: .semibold))
+                                        .foregroundStyle(VPTheme.textSecondary)
+                                        .frame(width: 22, alignment: .leading)
+                                    Text(GovernorMetrics.pathRow(path))
+                                        .font(VPTheme.mono(8))
+                                        .foregroundStyle(
+                                            path.deficitTokens > 0
+                                                ? VPTheme.warning : VPTheme.textSecondary
+                                        )
+                                        .lineLimit(1)
+                                    Spacer(minLength: 0)
+                                    Text(GovernorMetrics.departmentLabel(path))
+                                        .font(VPTheme.mono(7))
+                                        .foregroundStyle(VPTheme.textTertiary)
+                                }
+                                if let fraction = GovernorMetrics.allocationFraction(path) {
+                                    VPGradientProgress(
+                                        value: fraction,
+                                        tint: path.deficitTokens > 0 ? VPTheme.warning : VPTheme.accent,
+                                        height: 2
+                                    )
+                                }
+                            }
+                            if governor.paths.count > 4 {
+                                Text("+\(governor.paths.count - 4) more protected paths")
+                                    .font(VPTheme.mono(7))
+                                    .foregroundStyle(VPTheme.textTertiary)
+                            }
+                        }
+                    }
+                    if !governor.departments.isEmpty {
+                        HStack(spacing: 10) {
+                            ForEach(Array(governor.departments.prefix(3))) { department in
+                                metric(
+                                    department.department,
+                                    EfficiencyMetrics.tokenLabel(department.floorTokens),
+                                    detail: "floor · \(department.pathIDs.count) path\(department.pathIDs.count == 1 ? "" : "s")"
+                                )
+                            }
+                            Spacer(minLength: 0)
+                        }
+                        if governor.departments.count > 3 {
+                            Text("+\(governor.departments.count - 3) more departments")
+                                .font(VPTheme.mono(7))
+                                .foregroundStyle(VPTheme.textTertiary)
+                        }
+                    }
+                }
                 if !governor.deferred.isEmpty {
                     ForEach(Array(governor.deferred.prefix(3).enumerated()), id: \.offset) { _, deferral in
                         HStack(spacing: 8) {
@@ -424,6 +514,13 @@ struct EfficiencyCard: View {
                         Text("+\(governor.deferred.count - 3) more deferred tasks")
                             .font(VPTheme.mono(7))
                             .foregroundStyle(VPTheme.textTertiary)
+                    }
+                    let order = GovernorMetrics.deferredOrder(governor)
+                    if !order.isEmpty {
+                        Text("Deferred order: \(order.prefix(6).joined(separator: ", "))")
+                            .font(VPTheme.mono(7))
+                            .foregroundStyle(VPTheme.textTertiary)
+                            .lineLimit(1)
                     }
                 }
                 if let decision = governor.lastDecisions.last {

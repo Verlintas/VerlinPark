@@ -312,6 +312,41 @@ pub struct SchedulerStatusResult {
     pub projects: Vec<SchedulerProjectStatus>,
 }
 
+/// How the budget governor protects remaining plan work.
+///
+/// `single` is the original F5 behavior: only the heaviest remaining chain is
+/// protected. `multi` enumerates bounded root-to-leaf paths and water-fills
+/// the reserve across the top paths with per-department floors. The default is
+/// `single`, so an upgraded daemon with an existing policy changes nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CriticalPathMode {
+    #[default]
+    Single,
+    Multi,
+}
+
+impl CriticalPathMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Multi => "multi",
+        }
+    }
+
+    /// Tolerant parser used by CLI/manual configuration. Unknown values are
+    /// rejected instead of silently falling back to a mode that would change
+    /// admission behavior.
+    pub fn parse(value: &str) -> Option<Self> {
+        let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
+        match normalized.as_str() {
+            "single" | "single_path" | "critical_path" => Some(Self::Single),
+            "multi" | "multi_path" | "fair" | "fairness" => Some(Self::Multi),
+            _ => None,
+        }
+    }
+}
+
 /// Project-scoped critical-path budget governor policy. The governor is
 /// deliberately opt-in: a missing row or an older manifest decodes as
 /// `enabled = false`, and only an explicit operator opt-in changes task
@@ -336,6 +371,26 @@ pub struct CriticalPathPolicy {
     /// Hard floor: below this remaining session budget no task is admitted.
     #[serde(default = "default_critical_path_min_task_budget")]
     pub min_task_budget: u64,
+    /// `single` (default) protects the heaviest chain exactly like F5.
+    /// `multi` protects up to `max_paths` bounded root-to-leaf paths.
+    #[serde(default)]
+    pub mode: CriticalPathMode,
+    /// Maximum number of root-to-leaf paths in the multi-path table. The
+    /// protocol range is 2..=16; single mode does not use it.
+    #[serde(default = "default_critical_path_max_paths")]
+    pub max_paths: u32,
+    /// Per-department minimum share of the protected reserve, range 0.0..=1.0.
+    /// Floors are applied before weighted water-filling. `0.0` disables floors.
+    #[serde(default)]
+    pub department_min_ratio: f64,
+    /// Blend of observed usage-ledger spend into path weights, range 0.0..=1.0.
+    /// `0.0` (default) uses declared task budgets only.
+    #[serde(default)]
+    pub observed_weight_ratio: f64,
+    /// After this many seconds queued, a deferred task receives deterministic
+    /// aging credit. `0` disables starvation aging.
+    #[serde(default = "default_critical_path_starvation_after_secs")]
+    pub starvation_after_secs: u64,
 }
 
 impl Default for CriticalPathPolicy {
@@ -346,6 +401,11 @@ impl Default for CriticalPathPolicy {
             throttle_at_ratio: default_critical_path_throttle_at_ratio(),
             critical_boost: default_critical_path_boost(),
             min_task_budget: default_critical_path_min_task_budget(),
+            mode: CriticalPathMode::Single,
+            max_paths: default_critical_path_max_paths(),
+            department_min_ratio: 0.0,
+            observed_weight_ratio: 0.0,
+            starvation_after_secs: default_critical_path_starvation_after_secs(),
         }
     }
 }
@@ -366,9 +426,24 @@ fn default_critical_path_min_task_budget() -> u64 {
     1_000
 }
 
+fn default_critical_path_max_paths() -> u32 {
+    4
+}
+
+fn default_critical_path_starvation_after_secs() -> u64 {
+    1_800
+}
+
+fn default_governor_mode_name() -> String {
+    CriticalPathMode::Single.as_str().to_string()
+}
+
 impl CriticalPathPolicy {
     pub const MAX_CRITICAL_BOOST: i32 = 100;
     pub const MAX_MIN_TASK_BUDGET: u64 = 10_000_000;
+    pub const MIN_MAX_PATHS: u32 = 2;
+    pub const MAX_MAX_PATHS: u32 = 16;
+    pub const MAX_STARVATION_AFTER_SECS: u64 = 7 * 86_400;
 
     /// Clamp persisted or user-provided values into the daemon's effective
     /// ranges. Validation is separate so an RPC with an invalid value is
@@ -384,6 +459,20 @@ impl CriticalPathPolicy {
         self.throttle_at_ratio = self.throttle_at_ratio.clamp(0.0, 1.0);
         self.critical_boost = self.critical_boost.clamp(0, Self::MAX_CRITICAL_BOOST);
         self.min_task_budget = self.min_task_budget.min(Self::MAX_MIN_TASK_BUDGET);
+        self.max_paths = self
+            .max_paths
+            .clamp(Self::MIN_MAX_PATHS, Self::MAX_MAX_PATHS);
+        if !self.department_min_ratio.is_finite() {
+            self.department_min_ratio = 0.0;
+        }
+        self.department_min_ratio = self.department_min_ratio.clamp(0.0, 1.0);
+        if !self.observed_weight_ratio.is_finite() {
+            self.observed_weight_ratio = 0.0;
+        }
+        self.observed_weight_ratio = self.observed_weight_ratio.clamp(0.0, 1.0);
+        self.starvation_after_secs = self
+            .starvation_after_secs
+            .min(Self::MAX_STARVATION_AFTER_SECS);
         self
     }
 
@@ -406,6 +495,33 @@ impl CriticalPathPolicy {
             return Err(format!(
                 "min_task_budget must be at most {}",
                 Self::MAX_MIN_TASK_BUDGET
+            ));
+        }
+        if !(Self::MIN_MAX_PATHS..=Self::MAX_MAX_PATHS).contains(&self.max_paths) {
+            return Err(format!(
+                "max_paths must be between {} and {}",
+                Self::MIN_MAX_PATHS,
+                Self::MAX_MAX_PATHS
+            ));
+        }
+        if !self.department_min_ratio.is_finite()
+            || !(0.0..=1.0).contains(&self.department_min_ratio)
+        {
+            return Err(
+                "department_min_ratio must be a finite number between 0.0 and 1.0".to_string(),
+            );
+        }
+        if !self.observed_weight_ratio.is_finite()
+            || !(0.0..=1.0).contains(&self.observed_weight_ratio)
+        {
+            return Err(
+                "observed_weight_ratio must be a finite number between 0.0 and 1.0".to_string(),
+            );
+        }
+        if self.starvation_after_secs > Self::MAX_STARVATION_AFTER_SECS {
+            return Err(format!(
+                "starvation_after_secs must be at most {}",
+                Self::MAX_STARVATION_AFTER_SECS
             ));
         }
         Ok(())
@@ -446,6 +562,10 @@ pub struct GovernorPreviewParams {
     pub remaining_tokens: Option<u64>,
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Optional `single`/`multi` mode override. Preview only: the stored
+    /// project policy is never changed. Unknown values are rejected.
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 /// Deterministic longest-remaining-path result for one plan revision.
@@ -501,6 +621,71 @@ pub struct GovernorReserveInfo {
     pub headroom_tokens: Option<u64>,
     #[serde(default)]
     pub throttled: bool,
+    /// Effective governor mode: `single` or `multi`. Older payloads decode as
+    /// `single`, matching the F5 compatibility default.
+    #[serde(default = "default_governor_mode_name")]
+    pub mode: String,
+    /// Number of protected paths in the multi-path table (0 or 1 in single).
+    #[serde(default)]
+    pub path_count: u32,
+    /// Sum of path allocations distributed from the reserve pool.
+    #[serde(default)]
+    pub allocated_tokens: u64,
+    /// Sum of per-department/path floors applied before water-filling.
+    #[serde(default)]
+    pub floor_tokens: u64,
+    /// Number of maximal paths enumerated before selection.
+    #[serde(default)]
+    pub enumerated_paths: u32,
+    /// Enumeration hit its bound before exhausting the DAG; the table is a
+    /// deterministic prefix, not a claim of completeness.
+    #[serde(default)]
+    pub paths_truncated: bool,
+}
+
+/// One bounded root-to-leaf path in the multi-path fairness table. Every
+/// number is derived from the plan, the usage ledger, and the policy; the row
+/// never contains provider or secret data.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GovernorPathInfo {
+    /// Rank in the deterministic path order, 0 = heaviest path.
+    #[serde(default)]
+    pub path_id: u32,
+    #[serde(default)]
+    pub task_ids: Vec<String>,
+    #[serde(default)]
+    pub departments: Vec<String>,
+    /// Blended weight (declared budget plus the optional observed-spend share).
+    #[serde(default)]
+    pub weight_tokens: u64,
+    #[serde(default)]
+    pub declared_weight_tokens: u64,
+    #[serde(default)]
+    pub observed_tokens: u64,
+    /// Minimum reserve granted by department floors before water-filling.
+    #[serde(default)]
+    pub floor_tokens: u64,
+    /// Reserve actually protected for this path.
+    #[serde(default)]
+    pub allocation_tokens: u64,
+    /// Unfunded demand: `weight_tokens - allocation_tokens`.
+    #[serde(default)]
+    pub deficit_tokens: u64,
+}
+
+/// One department's share of the multi-path reserve before it is split across
+/// paths. `weight_tokens` counts each selected path touching the department
+/// once; `path_ids` names those paths. The table is bounded and read-only.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GovernorDepartmentInfo {
+    #[serde(default)]
+    pub department: String,
+    #[serde(default)]
+    pub weight_tokens: u64,
+    #[serde(default)]
+    pub floor_tokens: u64,
+    #[serde(default)]
+    pub path_ids: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -523,6 +708,19 @@ pub struct GovernorTaskDecisionInfo {
     pub code: String,
     #[serde(default)]
     pub remaining_after_tokens: Option<u64>,
+    /// Protected path that made the task critical, when applicable.
+    #[serde(default)]
+    pub path_id: Option<u32>,
+    /// Every protected path containing the task (shared prefixes can belong
+    /// to several paths), in table order.
+    #[serde(default)]
+    pub path_ids: Vec<u32>,
+    /// Unfunded demand of the task's least-funded protected path.
+    #[serde(default)]
+    pub path_deficit_tokens: u64,
+    /// Deterministic priority credit applied after `starvation_after_secs`.
+    #[serde(default)]
+    pub starvation_credit: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -541,6 +739,14 @@ pub struct GovernorDeferralInfo {
     pub remaining_tokens: Option<u64>,
     #[serde(default)]
     pub protected_tokens: u64,
+    #[serde(default)]
+    pub path_id: Option<u32>,
+    #[serde(default)]
+    pub path_ids: Vec<u32>,
+    #[serde(default)]
+    pub path_deficit_tokens: u64,
+    #[serde(default)]
+    pub starvation_credit: i64,
 }
 
 /// One persisted `budget.governor.decision` event. Admission events carry the
@@ -591,6 +797,21 @@ pub struct BudgetGovernorDecision {
     pub inputs_hash: String,
     #[serde(default)]
     pub created_at: String,
+    /// Effective governor mode (`single` or `multi`). Older decisions decode
+    /// as `single`.
+    #[serde(default = "default_governor_mode_name")]
+    pub mode: String,
+    /// Bounded multi-path allocation table carried by the decision.
+    #[serde(default)]
+    pub paths: Vec<GovernorPathInfo>,
+    /// Bounded per-department floor table carried by the decision.
+    #[serde(default)]
+    pub departments: Vec<GovernorDepartmentInfo>,
+    #[serde(default)]
+    pub allocated_tokens: u64,
+    /// Deferred task ids in deterministic reconsideration order.
+    #[serde(default)]
+    pub deferred_order: Vec<String>,
 }
 
 /// Status for `session.budget.governor` and `governor.preview`. Preview differs
@@ -626,6 +847,16 @@ pub struct GovernorSessionStatus {
     pub deferred: Vec<GovernorDeferralInfo>,
     #[serde(default)]
     pub last_decisions: Vec<BudgetGovernorDecision>,
+    /// Deterministic multi-path allocation table. Single mode carries at most
+    /// one row (the F5 critical path) and is entirely additive.
+    #[serde(default)]
+    pub paths: Vec<GovernorPathInfo>,
+    /// Bounded per-department floor table in multi mode.
+    #[serde(default)]
+    pub departments: Vec<GovernorDepartmentInfo>,
+    /// Deferred task ids in deterministic reconsideration order.
+    #[serde(default)]
+    pub deferred_order: Vec<String>,
     /// Present when the governor could not evaluate the plan (for example a
     /// cycle or an unknown dependency). It is a typed Q3 code, not free text.
     #[serde(default)]
@@ -12798,7 +13029,83 @@ mod critical_path_governor_tests {
         assert_eq!(policy.throttle_at_ratio, 0.35);
         assert_eq!(policy.critical_boost, 25);
         assert_eq!(policy.min_task_budget, 1_000);
+        assert_eq!(policy.mode, CriticalPathMode::Single);
+        assert_eq!(policy.max_paths, 4);
+        assert_eq!(policy.department_min_ratio, 0.0);
+        assert_eq!(policy.observed_weight_ratio, 0.0);
+        assert_eq!(policy.starvation_after_secs, 1_800);
         assert!(policy.validate().is_ok());
+    }
+
+    #[test]
+    fn critical_path_mode_parses_aliases_and_rejects_unknown() {
+        assert_eq!(
+            CriticalPathMode::parse("SINGLE"),
+            Some(CriticalPathMode::Single)
+        );
+        assert_eq!(
+            CriticalPathMode::parse("multi-path"),
+            Some(CriticalPathMode::Multi)
+        );
+        assert_eq!(
+            CriticalPathMode::parse("fairness"),
+            Some(CriticalPathMode::Multi)
+        );
+        assert_eq!(CriticalPathMode::parse("weighted"), None);
+        assert_eq!(CriticalPathMode::Single.as_str(), "single");
+        assert_eq!(CriticalPathMode::Multi.as_str(), "multi");
+        assert_eq!(
+            serde_json::to_value(CriticalPathMode::Multi).unwrap(),
+            json!("multi")
+        );
+        assert_eq!(
+            serde_json::from_value::<CriticalPathMode>(json!("single")).unwrap(),
+            CriticalPathMode::Single
+        );
+    }
+
+    #[test]
+    fn critical_path_policy_decodes_and_normalizes_fairness_fields() {
+        let policy: CriticalPathPolicy = serde_json::from_value(json!({
+            "enabled": true,
+            "mode": "multi",
+            "max_paths": 99,
+            "department_min_ratio": 4.0,
+            "observed_weight_ratio": -2.0,
+            "starvation_after_secs": u64::MAX
+        }))
+        .unwrap();
+        assert_eq!(policy.mode, CriticalPathMode::Multi);
+        assert_eq!(policy.max_paths, 99);
+        assert_eq!(policy.department_min_ratio, 4.0);
+        // Invalid values are rejected before normalization.
+        assert!(policy.validate().is_err());
+        let normalized = policy.normalized();
+        assert_eq!(normalized.max_paths, 16);
+        assert_eq!(normalized.department_min_ratio, 1.0);
+        assert_eq!(normalized.observed_weight_ratio, 0.0);
+        assert_eq!(
+            normalized.starvation_after_secs,
+            CriticalPathPolicy::MAX_STARVATION_AFTER_SECS
+        );
+        assert!(normalized.validate().is_ok());
+
+        let too_few: CriticalPathPolicy = serde_json::from_value(json!({
+            "mode": "multi",
+            "max_paths": 1
+        }))
+        .unwrap();
+        assert!(too_few.validate().is_err());
+        assert_eq!(too_few.normalized().max_paths, 2);
+
+        let nan: CriticalPathPolicy = serde_json::from_value(json!({
+            "department_min_ratio": 0.5
+        }))
+        .unwrap();
+        let mut nan = nan;
+        nan.department_min_ratio = f64::NAN;
+        assert!(nan.validate().is_err());
+        assert_eq!(nan.normalized().department_min_ratio, 0.0);
     }
 
     #[test]
@@ -12819,6 +13126,7 @@ mod critical_path_governor_tests {
             throttle_at_ratio: -1.0,
             critical_boost: 500,
             min_task_budget: u64::MAX,
+            ..CriticalPathPolicy::default()
         };
         let normalized = policy.clone().normalized();
         assert_eq!(normalized.reserve_ratio, 1.0);
@@ -12851,10 +13159,67 @@ mod critical_path_governor_tests {
         assert_eq!(status.policy, CriticalPathPolicy::default());
         assert!(status.critical_path.is_none());
         assert!(status.decisions.is_empty());
+        assert!(status.paths.is_empty());
+        assert!(status.deferred_order.is_empty());
         assert!(status.error.is_none());
         let encoded = serde_json::to_value(&status).unwrap();
         let decoded: GovernorSessionStatus = serde_json::from_value(encoded).unwrap();
         assert_eq!(status, decoded);
+    }
+
+    #[test]
+    fn governor_status_decodes_a_multi_path_table() {
+        let status: GovernorSessionStatus = serde_json::from_value(json!({
+            "session_id": "s1",
+            "project_id": "p1",
+            "enabled": true,
+            "policy": {"enabled": true, "mode": "multi", "max_paths": 3},
+            "reserve": {
+                "state": "active",
+                "mode": "multi",
+                "path_count": 2,
+                "protected_tokens": 900,
+                "allocated_tokens": 700,
+                "floor_tokens": 100
+            },
+            "paths": [
+                {
+                    "path_id": 0,
+                    "task_ids": ["a", "b"],
+                    "departments": ["impl"],
+                    "weight_tokens": 600,
+                    "floor_tokens": 60,
+                    "allocation_tokens": 400,
+                    "deficit_tokens": 200
+                },
+                {
+                    "path_id": 1,
+                    "task_ids": ["c"],
+                    "departments": ["qa"],
+                    "weight_tokens": 300,
+                    "floor_tokens": 40,
+                    "allocation_tokens": 300,
+                    "deficit_tokens": 0
+                }
+            ],
+            "departments": [
+                {"department": "impl", "weight_tokens": 900, "floor_tokens": 90, "path_ids": [0]},
+                {"department": "qa", "weight_tokens": 300, "floor_tokens": 30, "path_ids": [1]}
+            ],
+            "deferred_order": ["side"],
+            "generated_at": "2026-11-12T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(status.policy.mode, CriticalPathMode::Multi);
+        assert_eq!(status.reserve.path_count, 2);
+        assert_eq!(status.reserve.allocated_tokens, 700);
+        assert_eq!(status.paths.len(), 2);
+        assert_eq!(status.paths[0].task_ids, vec!["a", "b"]);
+        assert_eq!(status.paths[1].deficit_tokens, 0);
+        assert_eq!(status.departments.len(), 2);
+        assert_eq!(status.departments[0].department, "impl");
+        assert_eq!(status.departments[0].path_ids, vec![0]);
+        assert_eq!(status.deferred_order, vec!["side"]);
     }
 
     #[test]
@@ -12870,6 +13235,7 @@ mod critical_path_governor_tests {
         .unwrap();
         assert_eq!(decision.action, "defer");
         assert_eq!(decision.code, "BUDGET_RESERVED");
+        assert_eq!(decision.mode, "single");
         assert!(!decision.critical);
         assert!(decision.path.is_empty());
         assert!(decision.deferred.is_empty());
@@ -12906,15 +13272,167 @@ mod critical_path_governor_tests {
                 code: "BUDGET_RESERVED".to_string(),
                 remaining_tokens: Some(7_900),
                 protected_tokens: 6_000,
+                path_id: None,
+                path_ids: Vec::new(),
+                path_deficit_tokens: 0,
+                starvation_credit: 0,
             }],
             inputs_hash: "hash".to_string(),
             created_at: "2026-11-11T00:00:00Z".to_string(),
+            mode: "multi".to_string(),
+            paths: vec![GovernorPathInfo {
+                path_id: 0,
+                task_ids: vec!["a".to_string(), "b".to_string()],
+                departments: vec!["impl".to_string()],
+                weight_tokens: 5_000,
+                declared_weight_tokens: 5_000,
+                observed_tokens: 0,
+                floor_tokens: 500,
+                allocation_tokens: 4_000,
+                deficit_tokens: 1_000,
+            }],
+            departments: vec![GovernorDepartmentInfo {
+                department: "impl".to_string(),
+                weight_tokens: 5_000,
+                floor_tokens: 500,
+                path_ids: vec![0],
+            }],
+            allocated_tokens: 4_000,
+            deferred_order: vec!["side".to_string()],
         };
         let value = serde_json::to_value(&decision).unwrap();
         assert_eq!(value["deferred"][0]["code"], "BUDGET_RESERVED");
         assert_eq!(value["path"][1], "b");
+        assert_eq!(value["mode"], "multi");
+        assert_eq!(value["paths"][0]["allocation_tokens"], 4_000);
+        assert_eq!(value["departments"][0]["floor_tokens"], 500);
+        assert_eq!(value["deferred_order"][0], "side");
         let decoded: BudgetGovernorDecision = serde_json::from_value(value).unwrap();
         assert_eq!(decision, decoded);
+    }
+
+    #[test]
+    fn governor_path_table_decodes_partial_rows_with_defaults() {
+        let path: GovernorPathInfo = serde_json::from_value(json!({
+            "task_ids": ["a", "b"]
+        }))
+        .unwrap();
+        assert_eq!(path.path_id, 0);
+        assert_eq!(path.task_ids, vec!["a", "b"]);
+        assert!(path.departments.is_empty());
+        assert_eq!(path.weight_tokens, 0);
+        assert_eq!(path.allocation_tokens, 0);
+        assert_eq!(path.deficit_tokens, 0);
+    }
+
+    #[test]
+    fn critical_path_policy_rejects_unknown_mode_values() {
+        let error = serde_json::from_value::<CriticalPathPolicy>(json!({
+            "enabled": true,
+            "mode": "weighted"
+        }));
+        assert!(error.is_err());
+        let legacy: CriticalPathPolicy = serde_json::from_value(json!({
+            "enabled": true,
+            "reserve_ratio": 0.2
+        }))
+        .unwrap();
+        assert_eq!(legacy.mode, CriticalPathMode::Single);
+        assert_eq!(legacy.max_paths, 4);
+    }
+
+    #[test]
+    fn governor_department_rows_decode_with_defaults_and_bounds() {
+        let row: GovernorDepartmentInfo = serde_json::from_value(json!({
+            "department": "impl"
+        }))
+        .unwrap();
+        assert_eq!(row.department, "impl");
+        assert_eq!(row.weight_tokens, 0);
+        assert_eq!(row.floor_tokens, 0);
+        assert!(row.path_ids.is_empty());
+        let row: GovernorDepartmentInfo = serde_json::from_value(json!({
+            "department": "qa",
+            "weight_tokens": 500,
+            "floor_tokens": 50,
+            "path_ids": [0, 2]
+        }))
+        .unwrap();
+        assert_eq!(row.path_ids, vec![0, 2]);
+        let value = serde_json::to_value(&row).unwrap();
+        assert_eq!(value["department"], "qa");
+        assert_eq!(value["path_ids"][1], 2);
+    }
+
+    #[test]
+    fn critical_path_policy_normalization_is_idempotent_for_fairness() {
+        let policy = CriticalPathPolicy {
+            enabled: true,
+            mode: CriticalPathMode::Multi,
+            max_paths: 6,
+            department_min_ratio: 0.25,
+            observed_weight_ratio: 0.5,
+            starvation_after_secs: 1_200,
+            ..CriticalPathPolicy::default()
+        };
+        let once = policy.clone().normalized();
+        let twice = once.clone().normalized();
+        assert_eq!(once, twice);
+        assert_eq!(once, policy);
+        assert_eq!(
+            serde_json::from_value::<CriticalPathPolicy>(serde_json::to_value(&once).unwrap())
+                .unwrap(),
+            once
+        );
+    }
+
+    #[test]
+    fn governor_decision_decodes_task_membership_path_ids() {
+        let decision: BudgetGovernorDecision = serde_json::from_value(json!({
+            "decision_id": "gov-1",
+            "session_id": "s1",
+            "action": "admission",
+            "mode": "multi",
+            "paths": [{
+                "path_id": 0,
+                "task_ids": ["root", "a"],
+                "allocation_tokens": 500
+            }],
+            "deferred": [{
+                "task_id": "side",
+                "reason": "reserve",
+                "path_ids": []
+            }],
+            "created_at": "2026-11-12T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(decision.mode, "multi");
+        assert_eq!(decision.paths[0].task_ids, vec!["root", "a"]);
+        assert!(decision.deferred[0].path_ids.is_empty());
+        assert!(decision.departments.is_empty());
+    }
+
+    #[test]
+    fn governor_task_decision_info_carries_path_membership() {
+        let info = GovernorTaskDecisionInfo {
+            task_id: "root".to_string(),
+            department: "impl".to_string(),
+            critical: true,
+            weight_tokens: 1_000,
+            order: 0,
+            action: "admit".to_string(),
+            reason: "critical_admit".to_string(),
+            code: String::new(),
+            remaining_after_tokens: Some(9_000),
+            path_id: Some(0),
+            path_ids: vec![0, 1],
+            path_deficit_tokens: 500,
+            starvation_credit: 5,
+        };
+        let value = serde_json::to_value(&info).unwrap();
+        assert_eq!(value["path_ids"][1], 1);
+        let decoded: GovernorTaskDecisionInfo = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, info);
     }
 
     #[test]
@@ -12924,9 +13442,18 @@ mod critical_path_governor_tests {
         assert_eq!(params.session_id, "s1");
         assert!(params.remaining_tokens.is_none());
         assert!(params.limit.is_none());
+        assert!(params.mode.is_none());
         let status: GovernorStatusParams =
             serde_json::from_value(json!({"session_id": "s1", "limit": 5})).unwrap();
         assert_eq!(status.limit, Some(5));
+        let multi: GovernorPreviewParams = serde_json::from_value(json!({
+            "session_id": "s1",
+            "mode": "multi",
+            "remaining_tokens": 500
+        }))
+        .unwrap();
+        assert_eq!(multi.mode.as_deref(), Some("multi"));
+        assert_eq!(multi.remaining_tokens, Some(500));
     }
 
     #[test]
@@ -12962,12 +13489,104 @@ mod critical_path_governor_tests {
             protected_tokens: 6_975,
             headroom_tokens: Some(925),
             throttled: false,
+            mode: "multi".to_string(),
+            path_count: 2,
+            allocated_tokens: 5_000,
+            floor_tokens: 500,
+            enumerated_paths: 7,
+            paths_truncated: true,
         };
         let value = serde_json::to_value(&reserve).unwrap();
         assert_eq!(value["state"], "active");
         assert_eq!(value["protected_tokens"], 6_975);
+        assert_eq!(value["mode"], "multi");
+        assert_eq!(value["path_count"], 2);
         let decoded: GovernorReserveInfo = serde_json::from_value(value).unwrap();
         assert_eq!(reserve, decoded);
+    }
+
+    #[test]
+    fn multi_path_status_round_trips_with_departments_and_membership() {
+        let status = GovernorSessionStatus {
+            session_id: "s1".to_string(),
+            project_id: "p1".to_string(),
+            enabled: true,
+            plan_present: true,
+            policy: CriticalPathPolicy {
+                enabled: true,
+                mode: CriticalPathMode::Multi,
+                ..CriticalPathPolicy::default()
+            },
+            critical_path: Some(CriticalPathInfo {
+                plan_revision: 1,
+                task_ids: vec!["a".to_string()],
+                weight_tokens: 100,
+                ..CriticalPathInfo::default()
+            }),
+            reserve: GovernorReserveInfo {
+                state: "active".to_string(),
+                mode: "multi".to_string(),
+                path_count: 1,
+                protected_tokens: 100,
+                allocated_tokens: 100,
+                floor_tokens: 25,
+                ..GovernorReserveInfo::default()
+            },
+            paths: vec![GovernorPathInfo {
+                path_id: 0,
+                task_ids: vec!["a".to_string()],
+                departments: vec!["impl".to_string()],
+                weight_tokens: 100,
+                floor_tokens: 25,
+                allocation_tokens: 100,
+                ..GovernorPathInfo::default()
+            }],
+            departments: vec![GovernorDepartmentInfo {
+                department: "impl".to_string(),
+                weight_tokens: 100,
+                floor_tokens: 25,
+                path_ids: vec![0],
+            }],
+            deferred_order: vec!["side".to_string()],
+            decisions: vec![GovernorTaskDecisionInfo {
+                task_id: "a".to_string(),
+                critical: true,
+                action: "admit".to_string(),
+                reason: "critical_admit".to_string(),
+                path_id: Some(0),
+                path_ids: vec![0],
+                ..GovernorTaskDecisionInfo::default()
+            }],
+            generated_at: "2026-11-12T00:00:00Z".to_string(),
+            ..GovernorSessionStatus::default()
+        };
+        let value = serde_json::to_value(&status).unwrap();
+        let decoded: GovernorSessionStatus = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, status);
+        assert_eq!(decoded.departments[0].path_ids, vec![0]);
+        assert_eq!(decoded.decisions[0].path_ids, vec![0]);
+    }
+
+    #[test]
+    fn governor_deferral_round_trips_path_membership() {
+        let deferral = GovernorDeferralInfo {
+            task_id: "side".to_string(),
+            department: "impl".to_string(),
+            critical: false,
+            weight_tokens: 500,
+            reason: "reserve".to_string(),
+            code: "BUDGET_RESERVED".to_string(),
+            remaining_tokens: Some(100),
+            protected_tokens: 900,
+            path_id: Some(1),
+            path_ids: vec![1],
+            path_deficit_tokens: 250,
+            starvation_credit: 10,
+        };
+        let value = serde_json::to_value(&deferral).unwrap();
+        assert_eq!(value["path_ids"][0], 1);
+        let decoded: GovernorDeferralInfo = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, deferral);
     }
 
     #[test]

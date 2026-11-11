@@ -54,7 +54,7 @@ use vp_protocol::types::{
     ConsoleReadParams, ConsoleSignalParams, ConsoleWriteParams, ContextCheckpointCreateParams,
     ContextCheckpointDeleteParams, ContextCheckpointDetailParams, ContextCheckpointListParams,
     ContextCheckpointPolicyParams, ContextCheckpointPruneParams, ContextRestoreParams,
-    CreateModelPresetParams, CreateSessionParams, CriticalPathPolicyParams,
+    CreateModelPresetParams, CreateSessionParams, CriticalPathMode, CriticalPathPolicyParams,
     CriticalPathPolicyResult, DaemonMetrics, DaemonMetricsResult, DashboardParams,
     DeleteModelPresetParams, DiscardSessionParams, DoctorCheck, DoctorReport, EventListResult,
     ForkAuditParams, ForkRepairParams, GitLogParams, GitShowParams, GovernorPreviewParams,
@@ -936,18 +936,38 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             Err(response) => response_with_id(id, response),
         },
         "governor.preview" => match parse_params::<GovernorPreviewParams>(request.params) {
-            Ok(params) => match state
-                .engine
-                .preview_budget_governor(
-                    &params.session_id,
-                    params.remaining_tokens,
-                    params.limit.unwrap_or(20),
-                )
-                .await
-            {
-                Ok(status) => RpcResponse::success(id, status),
-                Err(error) => internal_error(id, error),
-            },
+            Ok(params) => {
+                let mode = match params.mode.as_deref() {
+                    None => None,
+                    Some(value) => match CriticalPathMode::parse(value) {
+                        Some(mode) => Some(mode),
+                        None => {
+                            return RpcResponse::error(
+                                id,
+                                RpcError::new(
+                                    codes::INVALID_PARAMS,
+                                    format!(
+                                        "invalid governor preview mode {value:?}; use `single` or `multi`"
+                                    ),
+                                ),
+                            );
+                        }
+                    },
+                };
+                match state
+                    .engine
+                    .preview_budget_governor_with_mode(
+                        &params.session_id,
+                        params.remaining_tokens,
+                        params.limit.unwrap_or(20),
+                        mode,
+                    )
+                    .await
+                {
+                    Ok(status) => RpcResponse::success(id, status),
+                    Err(error) => internal_error(id, error),
+                }
+            }
             Err(response) => response_with_id(id, response),
         },
         "runtime.leases" => match state.engine.list_runtime_leases().await {

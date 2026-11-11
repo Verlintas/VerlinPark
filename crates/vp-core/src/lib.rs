@@ -114,6 +114,7 @@ pub mod mcp;
 pub mod memory;
 pub mod memory_embedding;
 pub mod memory_index;
+pub mod multi_path;
 mod operation;
 pub mod orchestration;
 pub mod permissions;
@@ -6123,6 +6124,24 @@ impl Engine {
         self.critical_path_policy(project_id).await
     }
 
+    /// Observed input+output tokens per task. The read only happens for
+    /// multi-path policies that actually blend observed spend; single mode
+    /// never touches the ledger here.
+    async fn governor_observed_tokens(
+        &self,
+        session_id: &str,
+        policy: &CriticalPathPolicy,
+    ) -> Result<HashMap<String, u64>> {
+        if policy.mode != vp_protocol::types::CriticalPathMode::Multi
+            || policy.observed_weight_ratio <= 0.0
+        {
+            return Ok(HashMap::new());
+        }
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || store.usage_tokens_by_task(&session_id)).await?
+    }
+
     /// Bounded newest `budget.governor.decision` history. The events remain the
     /// source of truth; this is a read-only projection for the CLI/Swift UI.
     pub async fn governor_decisions(
@@ -6145,7 +6164,8 @@ impl Engine {
         session_id: &str,
         limit: u32,
     ) -> Result<GovernorSessionStatus> {
-        self.build_governor_status(session_id, None, limit).await
+        self.build_governor_status(session_id, None, limit, None)
+            .await
     }
 
     pub async fn preview_budget_governor(
@@ -6154,7 +6174,21 @@ impl Engine {
         remaining_tokens: Option<u64>,
         limit: u32,
     ) -> Result<GovernorSessionStatus> {
-        self.build_governor_status(session_id, remaining_tokens, limit)
+        self.preview_budget_governor_with_mode(session_id, remaining_tokens, limit, None)
+            .await
+    }
+
+    /// Preview with an explicit `single`/`multi` override. This changes only
+    /// the preview evaluation; the project policy is not persisted or
+    /// rewritten. The response's `policy` reflects the effective preview mode.
+    pub async fn preview_budget_governor_with_mode(
+        &self,
+        session_id: &str,
+        remaining_tokens: Option<u64>,
+        limit: u32,
+        mode_override: Option<vp_protocol::types::CriticalPathMode>,
+    ) -> Result<GovernorSessionStatus> {
+        self.build_governor_status(session_id, remaining_tokens, limit, mode_override)
             .await
     }
 
@@ -6163,13 +6197,20 @@ impl Engine {
         session_id: &str,
         remaining_override: Option<u64>,
         limit: u32,
+        mode_override: Option<vp_protocol::types::CriticalPathMode>,
     ) -> Result<GovernorSessionStatus> {
         let store = self.store.clone();
         let id = session_id.to_string();
         let session = tokio::task::spawn_blocking(move || store.get_session(&id))
             .await??
             .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
-        let policy = self.critical_path_policy(&session.project_id).await?;
+        let mut policy = self.critical_path_policy(&session.project_id).await?;
+        if let Some(mode) = mode_override {
+            // Preview override only. `normalized` keeps the rest of the policy
+            // exactly as persisted; no write path is touched.
+            policy.mode = mode;
+            policy = policy.normalized();
+        }
         let plan = self.get_team_plan(session_id).await?;
         let queue = self.task_queue(None, Some(session_id.to_string())).await?;
         let tasks = queue.tasks;
@@ -6189,6 +6230,8 @@ impl Engine {
         let spent = session.tokens_in.saturating_add(session.tokens_out);
         let budget = GovernorBudgetView::new(session.token_budget, spent, reserved);
         let remaining = remaining_override.or_else(|| budget.remaining_tokens());
+        let observed_tokens = self.governor_observed_tokens(&session.id, &policy).await?;
+        let evaluated_at = now_rfc3339();
         let last_decisions = self.governor_decisions(session_id, limit).await?;
         let mut status = GovernorSessionStatus {
             session_id: session.id.clone(),
@@ -6207,8 +6250,11 @@ impl Engine {
             admitted: Vec::new(),
             deferred: Vec::new(),
             last_decisions,
+            paths: Vec::new(),
+            departments: Vec::new(),
+            deferred_order: Vec::new(),
             error: None,
-            generated_at: now_rfc3339(),
+            generated_at: evaluated_at.clone(),
         };
         let Some(plan) = plan else {
             return Ok(status);
@@ -6236,6 +6282,22 @@ impl Engine {
             )
             .ok()
             .map(|path| path.info());
+            if policy.mode == vp_protocol::types::CriticalPathMode::Multi {
+                status.paths =
+                    crate::multi_path::compute_multi_path(crate::multi_path::MultiPathInput {
+                        session_id: &session.id,
+                        project_id: &session.project_id,
+                        plan_revision,
+                        plan: &plan,
+                        statuses: &statuses,
+                        remaining_budget_tokens: None,
+                        policy: &policy,
+                        observed_tokens: &observed_tokens,
+                    })
+                    .ok()
+                    .map(|allocation| allocation.path_infos())
+                    .unwrap_or_default();
+            }
             return Ok(status);
         }
         match crate::budget_governor::evaluate(crate::budget_governor::GovernorEvaluation {
@@ -6248,6 +6310,8 @@ impl Engine {
             candidates: &candidates,
             budget,
             remaining_override,
+            observed_tokens: &observed_tokens,
+            evaluated_at: &evaluated_at,
         }) {
             Ok(admission) => {
                 status.enabled = admission.enabled;
@@ -6257,6 +6321,9 @@ impl Engine {
                 status.decisions = admission.decision_infos();
                 status.admitted = admission.admitted.clone();
                 status.deferred = admission.deferral_infos();
+                status.paths = admission.path_infos();
+                status.departments = admission.department_infos();
+                status.deferred_order = admission.deferred_order();
             }
             Err(failure) => {
                 status.enabled = policy.enabled;
@@ -6312,6 +6379,54 @@ impl Engine {
                 statuses: &statuses,
                 remaining_budget_tokens: remaining,
             })?;
+        if policy.mode == vp_protocol::types::CriticalPathMode::Multi {
+            let observed_tokens = self.governor_observed_tokens(&session.id, &policy).await?;
+            let allocation =
+                crate::multi_path::compute_multi_path(crate::multi_path::MultiPathInput {
+                    session_id: &session.id,
+                    project_id: &session.project_id,
+                    plan_revision,
+                    plan: &plan,
+                    statuses: &statuses,
+                    remaining_budget_tokens: remaining,
+                    policy: &policy,
+                    observed_tokens: &observed_tokens,
+                })?;
+            let critical = task_id.is_some_and(|task| {
+                allocation
+                    .paths
+                    .iter()
+                    .any(|path| path.task_ids.iter().any(|id| id == task))
+            });
+            let runner_path = task_id
+                .map(|task| allocation.task_path_id(task))
+                .unwrap_or(None);
+            let runner_allocation = runner_path
+                .and_then(|path_id| allocation.paths.get(path_id as usize))
+                .map(|path| path.allocation_tokens);
+            let mut path_task_ids = allocation
+                .paths
+                .iter()
+                .flat_map(|path| path.task_ids.iter().cloned())
+                .collect::<Vec<_>>();
+            path_task_ids.sort();
+            path_task_ids.dedup();
+            return Ok(Some(crate::budget_governor::GovernorRunContext {
+                enabled: true,
+                policy,
+                task_id: task_id.map(str::to_string),
+                critical,
+                path_task_ids,
+                path_weight_tokens: allocation.path_weight_tokens,
+                path_count: allocation.paths.len(),
+                path_allocation_tokens: runner_allocation,
+                path_deficit_tokens: task_id
+                    .map(|task| allocation.task_deficit(task))
+                    .unwrap_or(0),
+                plan_revision,
+                inputs_hash: allocation.inputs_hash,
+            }));
+        }
         let critical = task_id.is_some_and(|task| path.task_ids.iter().any(|id| id == task));
         Ok(Some(crate::budget_governor::GovernorRunContext {
             enabled: true,
@@ -6320,6 +6435,9 @@ impl Engine {
             critical,
             path_task_ids: path.task_ids.clone(),
             path_weight_tokens: path.weight_tokens,
+            path_count: usize::from(!path.task_ids.is_empty()),
+            path_allocation_tokens: None,
+            path_deficit_tokens: 0,
             plan_revision,
             inputs_hash: path.inputs_hash,
         }))

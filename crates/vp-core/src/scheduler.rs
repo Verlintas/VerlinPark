@@ -247,6 +247,17 @@ impl TaskScheduler {
             }
             let budget = budget.unwrap_or(session_budget);
             let plan_revision = store.plan_revision_count(&session_id)?;
+            let observed_tokens = if critical_policy.mode
+                == vp_protocol::types::CriticalPathMode::Multi
+                && critical_policy.observed_weight_ratio > 0.0
+            {
+                store.usage_tokens_by_task(&session_id)?
+            } else {
+                HashMap::new()
+            };
+            let evaluated_at = now
+                .format(&Rfc3339)
+                .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
             let candidates = ready
                 .iter()
                 .filter_map(|(effective_priority, row)| {
@@ -268,6 +279,8 @@ impl TaskScheduler {
                 candidates: &candidates,
                 budget,
                 remaining_override: None,
+                observed_tokens: &observed_tokens,
+                evaluated_at: &evaluated_at,
             })?;
             let selected = admission
                 .admitted
@@ -880,6 +893,7 @@ mod tests {
                     throttle_at_ratio: 0.0,
                     critical_boost: 25,
                     min_task_budget: 100,
+                    ..vp_protocol::types::CriticalPathPolicy::default()
                 },
             )
             .unwrap();
@@ -923,6 +937,7 @@ mod tests {
                     throttle_at_ratio: 0.0,
                     critical_boost: 0,
                     min_task_budget: 100,
+                    ..vp_protocol::types::CriticalPathPolicy::default()
                 },
             )
             .unwrap();
@@ -944,6 +959,60 @@ mod tests {
                 .as_str(),
             "critical_admit"
         );
+    }
+
+    #[tokio::test]
+    async fn multi_path_policy_admits_several_chains_and_defers_the_rest() {
+        let (_dir, store, _project, session) = store();
+        let project = store.list_projects().unwrap().remove(0);
+        store
+            .set_critical_path_policy(
+                &project.id,
+                &vp_protocol::types::CriticalPathPolicy {
+                    enabled: true,
+                    reserve_ratio: 0.25,
+                    throttle_at_ratio: 0.0,
+                    critical_boost: 0,
+                    min_task_budget: 0,
+                    mode: vp_protocol::types::CriticalPathMode::Multi,
+                    max_paths: 2,
+                    ..vp_protocol::types::CriticalPathPolicy::default()
+                },
+            )
+            .unwrap();
+        let scheduler = TaskScheduler::new_with_aging(store.clone(), Duration::ZERO);
+        let mut heavy = task("heavy", 0, vec![]);
+        heavy.token_budget = Some(10_000);
+        let mut medium = task("medium", 0, vec![]);
+        medium.token_budget = Some(8_000);
+        let mut side = task("side", 0, vec![]);
+        side.token_budget = Some(1_000);
+        let plan = plan(vec![side, medium, heavy]);
+        let (seq, _) = scheduler.sync_plan(&session, &plan).await.unwrap();
+        let selection = scheduler
+            .ready_tasks_governed(
+                &session,
+                seq,
+                &plan,
+                10,
+                Some(GovernorBudgetView::new(Some(10_000), 0, 0)),
+            )
+            .await
+            .unwrap();
+        let governor = selection.governor.as_ref().unwrap();
+        assert_eq!(governor.mode, vp_protocol::types::CriticalPathMode::Multi);
+        assert_eq!(governor.path_infos().len(), 2);
+        assert_eq!(
+            selection
+                .ready
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["heavy", "medium"]
+        );
+        assert_eq!(selection.deferred.len(), 1);
+        assert_eq!(selection.deferred[0].task_id, "side");
+        assert_eq!(selection.deferred[0].code, "BUDGET_RESERVED");
     }
 
     #[tokio::test]

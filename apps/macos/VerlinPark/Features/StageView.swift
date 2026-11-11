@@ -908,6 +908,12 @@ private struct ContextPopoverView: View {
                             .font(.system(size: 9, weight: .semibold, design: .monospaced))
                             .foregroundStyle(.tertiary)
                         GovernorPill(status: governor)
+                        Text(GovernorMetrics.modeLabel(governor.reserve.mode).uppercased())
+                            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(
+                                governor.reserve.mode == "multi"
+                                    ? VPTheme.accent : VPTheme.textTertiary
+                            )
                         Spacer()
                     }
                     if let path = governor.criticalPath {
@@ -927,11 +933,52 @@ private struct ContextPopoverView: View {
                             EfficiencyMetrics.tokenLabel(governor.reserve.remainingTokens)
                         )
                         metric("Deferred", "\(governor.deferred.count)")
+                        if governor.reserve.mode == "multi" {
+                            metric(
+                                "Paths",
+                                "\(governor.reserve.pathCount)/\(governor.policy.maxPaths)"
+                            )
+                            metric(
+                                "Allocated",
+                                EfficiencyMetrics.tokenLabel(governor.reserve.allocatedTokens)
+                            )
+                        }
                         if governor.reserve.throttled {
                             Text("THROTTLED")
                                 .font(.system(size: 9, weight: .semibold, design: .monospaced))
                                 .foregroundStyle(VPTheme.warning)
                         }
+                    }
+                    if governor.reserve.mode == "multi", !governor.paths.isEmpty {
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(Array(governor.paths.prefix(2))) { path in
+                                Text(
+                                    "  #\(path.pathID) \(GovernorMetrics.pathRow(path)) · \(GovernorMetrics.departmentLabel(path))"
+                                )
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundStyle(
+                                    path.deficitTokens > 0
+                                        ? VPTheme.warning : VPTheme.textSecondary
+                                )
+                                .lineLimit(1)
+                            }
+                            if governor.paths.count > 2 {
+                                Text("  +\(governor.paths.count - 2) more protected paths")
+                                    .font(.system(size: 8, design: .monospaced))
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                    }
+                    if governor.reserve.mode == "multi", !governor.departments.isEmpty {
+                        Text(
+                            "Floors: "
+                                + governor.departments.prefix(3).map { department in
+                                    "\(department.department) \(EfficiencyMetrics.tokenLabel(department.floorTokens))"
+                                }.joined(separator: " · ")
+                        )
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
                     }
                     if let last = governor.lastDecisions.last {
                         Text("Last decision: \(last.action) \(last.reason) · \(last.detail)")

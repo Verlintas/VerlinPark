@@ -15562,6 +15562,29 @@ impl Store {
         Ok((task_tokens, task_cost, department_tokens, department_cost))
     }
 
+    /// Observed input+output tokens per plan task for one session. The
+    /// multi-path governor uses this read-only view to blend actual spend into
+    /// path weights; it never writes usage or treats an estimate as fact.
+    /// Tasks without ledger rows are absent, so callers must default to zero.
+    pub fn usage_tokens_by_task(&self, session_id: &str) -> Result<HashMap<String, u64>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT task_id, COALESCE(SUM(input_tokens + output_tokens), 0)
+             FROM usage_ledger
+             WHERE session_id = ?1 AND task_id IS NOT NULL
+             GROUP BY task_id",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+        })?;
+        let mut tokens = HashMap::new();
+        for row in rows {
+            let (task_id, count) = row?;
+            tokens.insert(task_id, count);
+        }
+        Ok(tokens)
+    }
+
     pub fn list_usage_entries(&self, session_id: &str) -> Result<Vec<UsageEntry>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(

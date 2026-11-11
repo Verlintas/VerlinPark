@@ -13588,6 +13588,7 @@ fn critical_path_policy_round_trips_and_normalizes() {
         throttle_at_ratio: -1.0,
         critical_boost: 500,
         min_task_budget: u64::MAX,
+        ..CriticalPathPolicy::default()
     };
     store
         .set_critical_path_policy(&project.id, &stored)
@@ -13608,6 +13609,75 @@ fn critical_path_policy_round_trips_and_normalizes() {
 }
 
 #[test]
+fn critical_path_policy_round_trips_multi_path_fairness_fields() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("fairness"))
+        .unwrap();
+    let policy = CriticalPathPolicy {
+        enabled: true,
+        mode: vp_protocol::types::CriticalPathMode::Multi,
+        max_paths: 99,
+        department_min_ratio: 0.35,
+        observed_weight_ratio: 0.5,
+        starvation_after_secs: 8 * 86_400,
+        ..CriticalPathPolicy::default()
+    };
+    store
+        .set_critical_path_policy(&project.id, &policy)
+        .unwrap();
+    let loaded = store.get_critical_path_policy(&project.id).unwrap();
+    assert_eq!(loaded.mode, vp_protocol::types::CriticalPathMode::Multi);
+    assert_eq!(loaded.max_paths, CriticalPathPolicy::MAX_MAX_PATHS);
+    assert_eq!(loaded.department_min_ratio, 0.35);
+    assert_eq!(loaded.observed_weight_ratio, 0.5);
+    assert_eq!(
+        loaded.starvation_after_secs,
+        CriticalPathPolicy::MAX_STARVATION_AFTER_SECS
+    );
+}
+
+#[test]
+fn usage_tokens_by_task_sums_input_and_output_and_skips_missing_ids() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("usage"))
+        .unwrap();
+    let session = store
+        .create_session_with_limits(&project.id, "usage", Some(100_000), None, None)
+        .unwrap();
+    for (task_id, input, output) in [
+        (Some("a"), 100u64, 50u64),
+        (Some("a"), 25, 5),
+        (Some("b"), 10, 0),
+        (None, 999, 1),
+    ] {
+        store
+            .add_usage_entry_with_events(
+                &session.id,
+                "agent",
+                "Agent",
+                "worker",
+                task_id,
+                Some("impl"),
+                "test",
+                input,
+                output,
+                0,
+                0,
+                false,
+                0.0,
+            )
+            .unwrap();
+    }
+    let tokens = store.usage_tokens_by_task(&session.id).unwrap();
+    assert_eq!(tokens.get("a"), Some(&180));
+    assert_eq!(tokens.get("b"), Some(&10));
+    assert_eq!(tokens.len(), 2);
+    assert!(!tokens.contains_key(""));
+}
+
+#[test]
 fn critical_path_policy_survives_project_manifest_rebuild() {
     let (data, store, repo) = test_store();
     let project = store
@@ -13619,6 +13689,7 @@ fn critical_path_policy_survives_project_manifest_rebuild() {
         throttle_at_ratio: 0.2,
         critical_boost: 10,
         min_task_budget: 2_000,
+        ..CriticalPathPolicy::default()
     };
     store
         .set_critical_path_policy(&project.id, &policy)

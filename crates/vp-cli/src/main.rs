@@ -661,6 +661,9 @@ enum Command {
         /// Deterministic preview override for remaining tokens.
         #[arg(long)]
         remaining_tokens: Option<u64>,
+        /// Preview-only mode override: `single` or `multi`.
+        #[arg(long)]
+        mode: Option<String>,
     },
     /// Preview governor admission without writing a decision event.
     GovernorPreview {
@@ -670,6 +673,9 @@ enum Command {
         remaining_tokens: Option<u64>,
         #[arg(long, default_value_t = 20)]
         limit: u32,
+        /// Preview-only mode override: `single` or `multi`.
+        #[arg(long)]
+        mode: Option<String>,
     },
     /// Show the project's critical-path budget governor policy.
     GovernorPolicy { project: String },
@@ -690,6 +696,21 @@ enum Command {
         /// Hard floor below which no task is admitted.
         #[arg(long)]
         min_task_budget: Option<u64>,
+        /// Protection mode: `single` (default, F5) or `multi`.
+        #[arg(long)]
+        mode: Option<String>,
+        /// Maximum protected root-to-leaf paths in multi mode (2–16).
+        #[arg(long)]
+        max_paths: Option<u32>,
+        /// Per-department minimum reserve share in multi mode (0.0–1.0).
+        #[arg(long)]
+        department_min_ratio: Option<f64>,
+        /// Blend of observed ledger spend into path weights (0.0–1.0).
+        #[arg(long)]
+        observed_weight_ratio: Option<f64>,
+        /// Seconds queued before deferred tasks receive aging credit (0 disables).
+        #[arg(long)]
+        starvation_after_secs: Option<u64>,
     },
     /// Remove old terminal session worktrees while keeping branches by default.
     CleanupWorktrees {
@@ -3599,7 +3620,9 @@ async fn main() -> Result<()> {
         Command::CriticalPath {
             session,
             remaining_tokens,
+            mode,
         } => {
+            let mode = parse_governor_mode(mode.as_deref())?;
             rpc(
                 &discovery,
                 "governor.preview",
@@ -3607,6 +3630,7 @@ async fn main() -> Result<()> {
                     "session_id": session,
                     "remaining_tokens": remaining_tokens,
                     "limit": 1,
+                    "mode": mode,
                 }),
             )
             .await?
@@ -3615,7 +3639,9 @@ async fn main() -> Result<()> {
             session,
             remaining_tokens,
             limit,
+            mode,
         } => {
+            let mode = parse_governor_mode(mode.as_deref())?;
             rpc(
                 &discovery,
                 "governor.preview",
@@ -3623,6 +3649,7 @@ async fn main() -> Result<()> {
                     "session_id": session,
                     "remaining_tokens": remaining_tokens,
                     "limit": limit,
+                    "mode": mode,
                 }),
             )
             .await?
@@ -3642,6 +3669,11 @@ async fn main() -> Result<()> {
             throttle_at_ratio,
             critical_boost,
             min_task_budget,
+            mode,
+            max_paths,
+            department_min_ratio,
+            observed_weight_ratio,
+            starvation_after_secs,
         } => {
             let current = rpc(
                 &discovery,
@@ -3664,6 +3696,25 @@ async fn main() -> Result<()> {
             }
             if let Some(value) = min_task_budget {
                 policy["min_task_budget"] = json!(value);
+            }
+            if let Some(value) = mode {
+                let parsed =
+                    vp_protocol::types::CriticalPathMode::parse(&value).ok_or_else(|| {
+                        anyhow::anyhow!("invalid --mode {value:?}; use `single` or `multi`")
+                    })?;
+                policy["mode"] = json!(parsed.as_str());
+            }
+            if let Some(value) = max_paths {
+                policy["max_paths"] = json!(value);
+            }
+            if let Some(value) = department_min_ratio {
+                policy["department_min_ratio"] = json!(value);
+            }
+            if let Some(value) = observed_weight_ratio {
+                policy["observed_weight_ratio"] = json!(value);
+            }
+            if let Some(value) = starvation_after_secs {
+                policy["starvation_after_secs"] = json!(value);
             }
             rpc(
                 &discovery,
@@ -7614,6 +7665,18 @@ fn context_checkpoint_lines(value: &Value) -> Option<Vec<String>> {
 /// Human rendering for `vp governor`, `vp critical-path`, and the project
 /// policy commands. It reads only the real RPC payload; missing fields stay
 /// absent instead of being invented.
+/// Validate the optional CLI preview mode before the RPC. `None` means "use
+/// the stored policy"; an unknown value is a local argument error, not a
+/// silent fallback that would change admission semantics.
+fn parse_governor_mode(value: Option<&str>) -> anyhow::Result<Option<&'static str>> {
+    match value {
+        None => Ok(None),
+        Some(value) => vp_protocol::types::CriticalPathMode::parse(value)
+            .map(|mode| Some(mode.as_str()))
+            .ok_or_else(|| anyhow::anyhow!("invalid --mode {value:?}; use `single` or `multi`")),
+    }
+}
+
 fn governor_lines(value: &Value) -> Option<Vec<String>> {
     if let Some(policy) = value.get("policy")
         && value.get("session_id").is_none()
@@ -7622,14 +7685,26 @@ fn governor_lines(value: &Value) -> Option<Vec<String>> {
         let enabled = policy["enabled"].as_bool().unwrap_or(false);
         let ratio = policy["reserve_ratio"].as_f64().unwrap_or(0.0) * 100.0;
         let throttle = policy["throttle_at_ratio"].as_f64().unwrap_or(0.0) * 100.0;
-        return Some(vec![format!(
-            "Critical-path governor: {} · reserve {:.0}% · throttle {:.0}% · boost {} · min {} tokens",
+        let mode = policy["mode"].as_str().unwrap_or("single");
+        let mut lines = vec![format!(
+            "Critical-path governor: {} · {} · reserve {:.0}% · throttle {:.0}% · boost {} · min {} tokens",
             if enabled { "enabled" } else { "disabled" },
+            mode,
             ratio.max(0.0),
             throttle.max(0.0),
             policy["critical_boost"].as_i64().unwrap_or(0),
             policy["min_task_budget"].as_u64().unwrap_or(0)
-        )]);
+        )];
+        if mode == "multi" {
+            lines.push(format!(
+                "Fairness: max {} paths · department floor {:.0}% · observed {:.0}% · starvation {} s",
+                policy["max_paths"].as_u64().unwrap_or(4),
+                policy["department_min_ratio"].as_f64().unwrap_or(0.0) * 100.0,
+                policy["observed_weight_ratio"].as_f64().unwrap_or(0.0) * 100.0,
+                policy["starvation_after_secs"].as_u64().unwrap_or(0)
+            ));
+        }
+        return Some(lines);
     }
     let session = value.get("session_id")?.as_str()?;
     let reserve = value.get("reserve")?;
@@ -7694,6 +7769,99 @@ fn governor_lines(value: &Value) -> Option<Vec<String>> {
             ""
         }
     ));
+    let mode = reserve["mode"]
+        .as_str()
+        .or_else(|| value["policy"]["mode"].as_str())
+        .unwrap_or("single");
+    if mode == "multi" {
+        lines.push(format!(
+            "Fairness: {} path(s) · allocated {} · floors {} · observed {}%{}{}",
+            reserve["path_count"].as_u64().unwrap_or(0),
+            reserve["allocated_tokens"].as_u64().unwrap_or(0),
+            reserve["floor_tokens"].as_u64().unwrap_or(0),
+            value["policy"]["observed_weight_ratio"]
+                .as_f64()
+                .unwrap_or(0.0)
+                * 100.0,
+            reserve["enumerated_paths"]
+                .as_u64()
+                .map(|value| format!(" · {value} enumerated"))
+                .unwrap_or_default(),
+            if reserve["paths_truncated"].as_bool().unwrap_or(false) {
+                " · truncated"
+            } else {
+                ""
+            }
+        ));
+        if let Some(paths) = value["paths"].as_array().filter(|paths| !paths.is_empty()) {
+            lines.push("Path table:".to_string());
+            for path in paths.iter().take(4) {
+                let tasks = path["task_ids"]
+                    .as_array()
+                    .map(|tasks| {
+                        tasks
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(" -> ")
+                    })
+                    .unwrap_or_default();
+                let departments = path["departments"]
+                    .as_array()
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "—".to_string());
+                lines.push(format!(
+                    "  #{} weight {} · floor {} · alloc {} · deficit {} · [{}] {}",
+                    path["path_id"].as_u64().unwrap_or(0),
+                    path["weight_tokens"].as_u64().unwrap_or(0),
+                    path["floor_tokens"].as_u64().unwrap_or(0),
+                    path["allocation_tokens"].as_u64().unwrap_or(0),
+                    path["deficit_tokens"].as_u64().unwrap_or(0),
+                    departments,
+                    tasks
+                ));
+            }
+            if paths.len() > 4 {
+                lines.push(format!("  +{} more protected paths", paths.len() - 4));
+            }
+        }
+        if let Some(departments) = value["departments"]
+            .as_array()
+            .filter(|departments| !departments.is_empty())
+        {
+            lines.push("Department floors:".to_string());
+            for department in departments.iter().take(6) {
+                let path_ids = department["path_ids"]
+                    .as_array()
+                    .map(|ids| {
+                        ids.iter()
+                            .filter_map(Value::as_u64)
+                            .map(|id| format!("#{id}"))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "—".to_string());
+                lines.push(format!(
+                    "  {} weight {} · floor {} · paths {}",
+                    department["department"].as_str().unwrap_or("—"),
+                    department["weight_tokens"].as_u64().unwrap_or(0),
+                    department["floor_tokens"].as_u64().unwrap_or(0),
+                    path_ids
+                ));
+            }
+            if departments.len() > 6 {
+                lines.push(format!("  +{} more departments", departments.len() - 6));
+            }
+        }
+    }
     if let Some(admitted) = value["admitted"]
         .as_array()
         .filter(|items| !items.is_empty())
@@ -7722,6 +7890,20 @@ fn governor_lines(value: &Value) -> Option<Vec<String>> {
         }
         if deferred.len() > 5 {
             lines.push(format!("  +{} more deferred tasks", deferred.len() - 5));
+        }
+        if let Some(order) = value["deferred_order"]
+            .as_array()
+            .filter(|order| !order.is_empty())
+        {
+            lines.push(format!(
+                "Deferred order: {}",
+                order
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .take(8)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
         }
     }
     if let Some(error) = value.get("error").filter(|error| error["code"].is_string()) {
@@ -13168,9 +13350,11 @@ mod governor_cli_tests {
             Command::CriticalPath {
                 session,
                 remaining_tokens,
+                mode,
             } => {
                 assert_eq!(session, "session-1");
                 assert_eq!(remaining_tokens, Some(1_234));
+                assert_eq!(mode, None);
             }
             other => panic!("expected critical-path, got {other:?}"),
         }
@@ -13189,10 +13373,12 @@ mod governor_cli_tests {
                 session,
                 remaining_tokens,
                 limit,
+                mode,
             } => {
                 assert_eq!(session, "session-1");
                 assert_eq!(remaining_tokens, Some(99));
                 assert_eq!(limit, 3);
+                assert_eq!(mode, None);
             }
             other => panic!("expected governor-preview, got {other:?}"),
         }
@@ -13225,6 +13411,11 @@ mod governor_cli_tests {
                 throttle_at_ratio,
                 critical_boost,
                 min_task_budget,
+                mode,
+                max_paths,
+                department_min_ratio,
+                observed_weight_ratio,
+                starvation_after_secs,
             } => {
                 assert_eq!(project, "project-1");
                 assert_eq!(enabled, Some(true));
@@ -13232,6 +13423,11 @@ mod governor_cli_tests {
                 assert_eq!(throttle_at_ratio, Some(0.2));
                 assert_eq!(critical_boost, Some(10));
                 assert_eq!(min_task_budget, Some(2_000));
+                assert_eq!(mode, None);
+                assert_eq!(max_paths, None);
+                assert_eq!(department_min_ratio, None);
+                assert_eq!(observed_weight_ratio, None);
+                assert_eq!(starvation_after_secs, None);
             }
             other => panic!("expected governor-policy-set, got {other:?}"),
         }
@@ -13844,5 +14040,315 @@ mod approval_optimizer_cli_tests {
             "pending_count": 1
         });
         print_human(&value);
+    }
+}
+
+#[cfg(test)]
+mod governor_fairness_cli_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        let args = args
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .collect::<Vec<_>>();
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(args).unwrap())
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    #[test]
+    fn fairness_policy_flags_parse() {
+        let cli = parse(&[
+            "vp",
+            "governor-policy-set",
+            "project-1",
+            "--mode",
+            "multi",
+            "--max-paths",
+            "6",
+            "--department-min-ratio",
+            "0.2",
+            "--observed-weight-ratio",
+            "0.5",
+            "--starvation-after-secs",
+            "600",
+        ]);
+        match cli.command {
+            Command::GovernorPolicySet {
+                mode,
+                max_paths,
+                department_min_ratio,
+                observed_weight_ratio,
+                starvation_after_secs,
+                ..
+            } => {
+                assert_eq!(mode.as_deref(), Some("multi"));
+                assert_eq!(max_paths, Some(6));
+                assert_eq!(department_min_ratio, Some(0.2));
+                assert_eq!(observed_weight_ratio, Some(0.5));
+                assert_eq!(starvation_after_secs, Some(600));
+            }
+            other => panic!("expected governor-policy-set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preview_mode_flags_parse_and_validate() {
+        let cli = parse(&[
+            "vp",
+            "governor-preview",
+            "session-1",
+            "--mode",
+            "multi",
+            "--remaining-tokens",
+            "500",
+        ]);
+        match cli.command {
+            Command::GovernorPreview {
+                session,
+                remaining_tokens,
+                mode,
+                ..
+            } => {
+                assert_eq!(session, "session-1");
+                assert_eq!(remaining_tokens, Some(500));
+                assert_eq!(mode.as_deref(), Some("multi"));
+            }
+            other => panic!("expected governor-preview, got {other:?}"),
+        }
+        let cli = parse(&["vp", "critical-path", "session-1", "--mode", "single"]);
+        match cli.command {
+            Command::CriticalPath { mode, .. } => assert_eq!(mode.as_deref(), Some("single")),
+            other => panic!("expected critical-path, got {other:?}"),
+        }
+        assert_eq!(parse_governor_mode(None).unwrap(), None);
+        assert_eq!(
+            parse_governor_mode(Some("multi-path")).unwrap(),
+            Some("multi")
+        );
+        assert_eq!(parse_governor_mode(Some("SINGLE")).unwrap(), Some("single"));
+        assert!(parse_governor_mode(Some("weighted")).is_err());
+    }
+
+    #[test]
+    fn policy_renderer_prints_fairness_fields_for_multi_mode() {
+        let value = json!({
+            "project_id": "p1",
+            "policy": {
+                "enabled": true,
+                "mode": "multi",
+                "reserve_ratio": 0.25,
+                "throttle_at_ratio": 0.1,
+                "critical_boost": 10,
+                "min_task_budget": 100,
+                "max_paths": 6,
+                "department_min_ratio": 0.2,
+                "observed_weight_ratio": 0.5,
+                "starvation_after_secs": 600
+            }
+        });
+        let lines = governor_lines(&value).unwrap().join("\n");
+        assert!(lines.contains("multi"));
+        assert!(lines.contains("max 6 paths"));
+        assert!(lines.contains("department floor 20%"));
+        assert!(lines.contains("observed 50%"));
+        assert!(lines.contains("starvation 600 s"));
+    }
+
+    #[test]
+    fn session_renderer_prints_the_path_table_and_deferred_order() {
+        let value = json!({
+            "session_id": "s1",
+            "session_status": "idle",
+            "plan_revision": 3,
+            "enabled": true,
+            "unlimited": false,
+            "policy": {"enabled": true, "mode": "multi", "observed_weight_ratio": 0.5},
+            "critical_path": {"task_ids": ["heavy"], "weight_tokens": 10000},
+            "reserve": {
+                "state": "active",
+                "mode": "multi",
+                "path_count": 2,
+                "protected_tokens": 10000,
+                "allocated_tokens": 10000,
+                "floor_tokens": 500,
+                "remaining_tokens": 10000,
+                "reserve_ratio": 0.25,
+                "throttle_at_ratio": 0.0,
+                "throttled": false
+            },
+            "paths": [
+                {
+                    "path_id": 0,
+                    "task_ids": ["heavy", "tail"],
+                    "departments": ["impl"],
+                    "weight_tokens": 10000,
+                    "floor_tokens": 400,
+                    "allocation_tokens": 6000,
+                    "deficit_tokens": 4000
+                },
+                {
+                    "path_id": 1,
+                    "task_ids": ["verify"],
+                    "departments": ["qa"],
+                    "weight_tokens": 8000,
+                    "floor_tokens": 100,
+                    "allocation_tokens": 4000,
+                    "deficit_tokens": 4000
+                }
+            ],
+            "departments": [
+                {"department": "impl", "weight_tokens": 10000, "floor_tokens": 400, "path_ids": [0]},
+                {"department": "qa", "weight_tokens": 8000, "floor_tokens": 100, "path_ids": [1]}
+            ],
+            "admitted": [],
+            "deferred": [{
+                "task_id": "side",
+                "reason": "reserve",
+                "code": "BUDGET_RESERVED"
+            }],
+            "deferred_order": ["side"],
+            "last_decisions": [],
+            "generated_at": "2026-11-12T00:00:00Z"
+        });
+        let lines = governor_lines(&value).unwrap().join("\n");
+        assert!(lines.contains("2 path(s) · allocated 10000 · floors 500"));
+        assert!(lines.contains("#0 weight 10000 · floor 400 · alloc 6000 · deficit 4000"));
+        assert!(lines.contains("[impl] heavy -> tail"));
+        assert!(lines.contains("[qa] verify"));
+        assert!(lines.contains("Department floors:"));
+        assert!(lines.contains("impl weight 10000 · floor 400 · paths #0"));
+        assert!(lines.contains("qa weight 8000 · floor 100 · paths #1"));
+        assert!(lines.contains("Deferred order: side"));
+    }
+
+    #[test]
+    fn session_renderer_reports_enumeration_truncation_and_bounded_rows() {
+        let value = json!({
+            "session_id": "s1",
+            "session_status": "running",
+            "plan_revision": 4,
+            "enabled": true,
+            "unlimited": false,
+            "policy": {"enabled": true, "mode": "multi"},
+            "critical_path": {"task_ids": ["t19"], "weight_tokens": 1000},
+            "reserve": {
+                "state": "active",
+                "mode": "multi",
+                "path_count": 16,
+                "protected_tokens": 16000,
+                "allocated_tokens": 16000,
+                "floor_tokens": 0,
+                "remaining_tokens": 50000,
+                "reserve_ratio": 0.0,
+                "throttle_at_ratio": 0.0,
+                "throttled": false,
+                "enumerated_paths": 4096,
+                "paths_truncated": true
+            },
+            "paths": [
+                {"path_id": 0, "task_ids": ["a"], "weight_tokens": 1000, "allocation_tokens": 1000},
+                {"path_id": 1, "task_ids": ["b"], "weight_tokens": 1000, "allocation_tokens": 1000},
+                {"path_id": 2, "task_ids": ["c"], "weight_tokens": 1000, "allocation_tokens": 1000},
+                {"path_id": 3, "task_ids": ["d"], "weight_tokens": 1000, "allocation_tokens": 1000},
+                {"path_id": 4, "task_ids": ["e"], "weight_tokens": 1000, "allocation_tokens": 1000}
+            ],
+            "departments": [],
+            "admitted": ["a", "b", "c", "d", "e"],
+            "deferred": [],
+            "deferred_order": [],
+            "last_decisions": [],
+            "generated_at": "2026-11-12T00:00:00Z"
+        });
+        let lines = governor_lines(&value).unwrap().join("\n");
+        assert!(lines.contains("4096 enumerated"));
+        assert!(lines.contains("truncated"));
+        assert!(lines.contains("+1 more protected paths"));
+        assert!(!lines.contains("Department floors:"));
+    }
+
+    #[test]
+    fn department_renderer_bounds_a_wide_table() {
+        let departments = (0..8)
+            .map(|index| {
+                json!({
+                    "department": format!("dept-{index}"),
+                    "weight_tokens": 100 - index,
+                    "floor_tokens": 10,
+                    "path_ids": [index]
+                })
+            })
+            .collect::<Vec<_>>();
+        let value = json!({
+            "session_id": "s1",
+            "session_status": "idle",
+            "plan_revision": 1,
+            "enabled": true,
+            "unlimited": false,
+            "policy": {"enabled": true, "mode": "multi"},
+            "critical_path": {"task_ids": ["a"], "weight_tokens": 100},
+            "reserve": {
+                "state": "active",
+                "mode": "multi",
+                "path_count": 8,
+                "protected_tokens": 800,
+                "allocated_tokens": 800,
+                "floor_tokens": 80,
+                "remaining_tokens": 8_000,
+                "reserve_ratio": 0.0,
+                "throttle_at_ratio": 0.0,
+                "throttled": false
+            },
+            "paths": [],
+            "departments": departments,
+            "admitted": [],
+            "deferred": [],
+            "deferred_order": [],
+            "last_decisions": [],
+            "generated_at": "2026-11-12T00:00:00Z"
+        });
+        let lines = governor_lines(&value).unwrap().join("\n");
+        assert!(lines.contains("Department floors:"));
+        assert!(lines.contains("dept-0 weight 100 · floor 10 · paths #0"));
+        assert!(lines.contains("dept-5 weight 95 · floor 10 · paths #5"));
+        assert!(!lines.contains("dept-6 weight"));
+        assert!(lines.contains("+2 more departments"));
+    }
+
+    #[test]
+    fn single_mode_renderer_does_not_emit_a_fairness_block() {
+        let value = json!({
+            "session_id": "s1",
+            "session_status": "idle",
+            "plan_revision": 1,
+            "enabled": true,
+            "unlimited": false,
+            "policy": {"enabled": true, "mode": "single"},
+            "critical_path": {"task_ids": ["a"], "weight_tokens": 100},
+            "reserve": {
+                "state": "active",
+                "mode": "single",
+                "path_count": 1,
+                "protected_tokens": 100,
+                "remaining_tokens": 1000,
+                "reserve_ratio": 0.25,
+                "throttle_at_ratio": 0.0,
+                "throttled": false
+            },
+            "paths": [],
+            "admitted": ["a"],
+            "deferred": [],
+            "deferred_order": [],
+            "last_decisions": [],
+            "generated_at": "2026-11-12T00:00:00Z"
+        });
+        let lines = governor_lines(&value).unwrap().join("\n");
+        assert!(!lines.contains("Path table"));
+        assert!(!lines.contains("Fairness:"));
+        assert!(lines.contains("Admit: a"));
     }
 }

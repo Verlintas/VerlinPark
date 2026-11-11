@@ -115,6 +115,8 @@ fn evaluate(
         candidates: &candidates,
         budget,
         remaining_override,
+        observed_tokens: &HashMap::new(),
+        evaluated_at: "2026-11-12T00:00:00Z",
     })
 }
 
@@ -536,6 +538,8 @@ fn plan_revision_change_resets_the_path_identity() {
         candidates: &candidates,
         budget: GovernorBudgetView::new(Some(20_000), 0, 0),
         remaining_override: None,
+        observed_tokens: &HashMap::new(),
+        evaluated_at: "2026-11-12T00:00:00Z",
     })
     .unwrap();
     let second = super::evaluate(GovernorEvaluation {
@@ -548,6 +552,8 @@ fn plan_revision_change_resets_the_path_identity() {
         candidates: &candidates,
         budget: GovernorBudgetView::new(Some(20_000), 0, 0),
         remaining_override: None,
+        observed_tokens: &HashMap::new(),
+        evaluated_at: "2026-11-12T00:00:00Z",
     })
     .unwrap();
     assert_ne!(first.inputs_hash, second.inputs_hash);
@@ -812,6 +818,7 @@ fn denial_payload_carries_the_typed_reason_and_bounds() {
         session_id: "session-1",
         decision_id: "gov-2",
         plan_revision: 3,
+        mode: CriticalPathMode::Single,
         task_id: "side",
         task_critical: false,
         reason: GovernorReason::Reserve,
@@ -844,6 +851,9 @@ fn run_context_gate_is_absent_for_disabled_or_completed_paths() {
         critical: false,
         path_task_ids: vec!["critical".to_string()],
         path_weight_tokens: 5_000,
+        path_count: 1,
+        path_allocation_tokens: None,
+        path_deficit_tokens: 0,
         plan_revision: 1,
         inputs_hash: "hash".to_string(),
     };
@@ -870,6 +880,9 @@ fn critical_run_context_gate_marks_the_reservation_as_critical() {
         critical: true,
         path_task_ids: vec!["critical".to_string()],
         path_weight_tokens: 5_000,
+        path_count: 1,
+        path_allocation_tokens: None,
+        path_deficit_tokens: 0,
         plan_revision: 1,
         inputs_hash: "hash".to_string(),
     };
@@ -903,4 +916,908 @@ impl GovernorAdmission {
     fn reserved_tokens(&self) -> u64 {
         self.reserve.reserved_tokens
     }
+}
+
+fn multi_policy() -> CriticalPathPolicy {
+    CriticalPathPolicy {
+        enabled: true,
+        reserve_ratio: 0.25,
+        throttle_at_ratio: 0.0,
+        critical_boost: 0,
+        min_task_budget: 100,
+        mode: CriticalPathMode::Multi,
+        max_paths: 4,
+        ..CriticalPathPolicy::default()
+    }
+}
+
+fn evaluate_multi(
+    fixture: &Fixture,
+    priorities: &[i64],
+    policy: &CriticalPathPolicy,
+    budget: GovernorBudgetView,
+    observed: &HashMap<String, u64>,
+    evaluated_at: &str,
+) -> Result<GovernorAdmission, GovernorFailure> {
+    let candidates = fixture.candidates(priorities);
+    let plan = fixture.plan();
+    super::evaluate(GovernorEvaluation {
+        session_id: "session-1",
+        project_id: "project-1",
+        plan_revision: 1,
+        plan: &plan,
+        statuses: &fixture.statuses,
+        policy,
+        candidates: &candidates,
+        budget,
+        remaining_override: None,
+        observed_tokens: observed,
+        evaluated_at,
+    })
+}
+
+#[test]
+fn multi_mode_builds_two_independent_paths_with_union_membership() {
+    let fixture = Fixture::new(vec![
+        task("a1", 1, &[], Some(5_000)),
+        task("a2", 1, &["a1"], Some(5_000)),
+        task("b1", 1, &[], Some(3_000)),
+        task("b2", 1, &["b1"], Some(3_000)),
+    ]);
+    let admission = evaluate_multi(
+        &fixture,
+        &[0, 0, 0, 0],
+        &multi_policy(),
+        GovernorBudgetView::new(Some(30_000), 0, 0),
+        &HashMap::new(),
+        "2026-11-11T00:00:03Z",
+    )
+    .unwrap();
+    assert!(admission.enabled);
+    assert_eq!(admission.mode, CriticalPathMode::Multi);
+    let multi = admission.multi.as_ref().unwrap();
+    assert_eq!(admission.path.task_ids, vec!["a1", "a2"]);
+    assert_eq!(multi.paths.len(), 2);
+    assert_eq!(multi.paths[0].task_ids, vec!["a1", "a2"]);
+    assert_eq!(multi.paths[1].task_ids, vec!["b1", "b2"]);
+    assert_eq!(multi.path_weight_tokens, 16_000);
+    assert_eq!(multi.allocated_tokens, 16_000);
+    assert_eq!(multi.ratio_reserve_tokens, 7_500);
+    assert_eq!(multi.protected_tokens, 23_500);
+    assert_eq!(admission.reserve.mode, CriticalPathMode::Multi);
+    assert_eq!(admission.reserve.path_count, 2);
+    assert_eq!(admission.reserve.allocated_tokens, 16_000);
+    assert_eq!(admission.path_infos().len(), 2);
+    assert!(admission.decisions.iter().all(|decision| decision.admitted));
+    assert!(
+        admission.decisions.iter().all(|decision| {
+            decision.reason == GovernorReason::CriticalAdmit && decision.critical
+        })
+    );
+    // Both independent chains are critical, so neither can starve the other.
+    assert_eq!(admission.admitted.len(), 4);
+    assert!(admission.detail().contains("2 paths"));
+}
+
+#[test]
+fn multi_mode_keeps_a_third_path_non_critical_and_deferred() {
+    let fixture = Fixture::new(vec![
+        task("heavy", 1, &[], Some(10_000)),
+        task("medium", 1, &[], Some(8_000)),
+        task("side", 1, &[], Some(1_000)),
+    ]);
+    let mut policy = multi_policy();
+    policy.max_paths = 2;
+    let admission = evaluate_multi(
+        &fixture,
+        &[0, 0, 0],
+        &policy,
+        GovernorBudgetView::new(Some(20_000), 0, 0),
+        &HashMap::new(),
+        "2026-11-11T00:00:03Z",
+    )
+    .unwrap();
+    let multi = admission.multi.as_ref().unwrap();
+    assert_eq!(multi.paths.len(), 2);
+    assert_eq!(multi.paths[0].task_ids, vec!["heavy"]);
+    assert_eq!(multi.paths[1].task_ids, vec!["medium"]);
+    let side = admission
+        .decisions
+        .iter()
+        .find(|decision| decision.task_id == "side")
+        .unwrap();
+    assert!(!side.critical);
+    assert!(!side.admitted);
+    assert_eq!(side.reason, GovernorReason::Reserve);
+    assert_eq!(side.path_id, None);
+    assert_eq!(side.path_deficit_tokens, 0);
+    let deferral = admission
+        .deferred
+        .iter()
+        .find(|deferral| deferral.task_id == "side")
+        .unwrap();
+    assert_eq!(deferral.reason.code(), "BUDGET_RESERVED");
+    // The first two admissions consume the selected path demand and the
+    // ratio buffer protects the rest, leaving no free headroom.
+    assert_eq!(deferral.protected_tokens, 20_000);
+}
+
+#[test]
+fn multi_mode_reports_path_deficit_on_critical_decisions() {
+    let fixture = Fixture::new(vec![
+        task("a", 1, &[], Some(10_000)),
+        task("b", 1, &[], Some(10_000)),
+    ]);
+    let mut policy = multi_policy();
+    policy.reserve_ratio = 0.0;
+    policy.min_task_budget = 0;
+    let admission = evaluate_multi(
+        &fixture,
+        &[0, 0],
+        &policy,
+        GovernorBudgetView::new(Some(10_000), 0, 0),
+        &HashMap::new(),
+        "2026-11-11T00:00:03Z",
+    )
+    .unwrap();
+    let multi = admission.multi.as_ref().unwrap();
+    assert_eq!(multi.allocated_tokens, 10_000);
+    assert!(
+        multi
+            .paths
+            .iter()
+            .all(|path| path.allocation_tokens == 5_000)
+    );
+    assert!(multi.paths.iter().all(|path| path.deficit_tokens == 5_000));
+    for decision in &admission.decisions {
+        assert!(decision.critical);
+        assert!(decision.path_id.is_some());
+        assert_eq!(decision.path_deficit_tokens, 5_000);
+        assert_eq!(decision.reason, GovernorReason::CriticalAdmit);
+    }
+    assert!(admission.deferred.is_empty());
+}
+
+#[test]
+fn single_mode_is_unchanged_and_reports_one_compatibility_row() {
+    let fixture = Fixture::new(vec![
+        task("critical", 1, &[], Some(5_000)),
+        task("side", 1, &[], Some(4_000)),
+    ]);
+    let single = evaluate(
+        &fixture,
+        &[0, 0],
+        &policy(true),
+        GovernorBudgetView::new(Some(10_000), 0, 0),
+        None,
+    )
+    .unwrap();
+    assert_eq!(single.mode, CriticalPathMode::Single);
+    assert!(single.multi.is_none());
+    assert_eq!(single.reserve.mode, CriticalPathMode::Single);
+    assert_eq!(single.reserve.path_count, 1);
+    assert_eq!(single.reserve.allocated_tokens, 5_000);
+    assert_eq!(single.reserve.floor_tokens, 0);
+    let rows = single.path_infos();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].task_ids, single.path.task_ids);
+    assert_eq!(rows[0].allocation_tokens, 5_000);
+    assert!(
+        single
+            .decisions
+            .iter()
+            .all(|decision| decision.path_deficit_tokens == 0)
+    );
+    let critical = single
+        .decisions
+        .iter()
+        .find(|decision| decision.task_id == "critical")
+        .unwrap();
+    assert_eq!(critical.path_id, Some(0));
+    assert_eq!(critical.path_ids, vec![0]);
+    let side = single
+        .decisions
+        .iter()
+        .find(|decision| decision.task_id == "side")
+        .unwrap();
+    assert_eq!(side.path_id, None);
+    assert!(side.path_ids.is_empty());
+    assert!(
+        single
+            .decisions
+            .iter()
+            .all(|decision| decision.starvation_credit == 0)
+    );
+}
+
+#[test]
+fn observed_spend_can_reorder_paths_without_changing_hard_budgets() {
+    let fixture = Fixture::new(vec![
+        task("declared-heavy", 1, &[], Some(5_000)),
+        task("observed-heavy", 1, &[], Some(4_000)),
+    ]);
+    let mut policy = multi_policy();
+    policy.observed_weight_ratio = 1.0;
+    let mut observed = HashMap::new();
+    observed.insert("observed-heavy".to_string(), 8_000u64);
+    let admission = evaluate_multi(
+        &fixture,
+        &[0, 0],
+        &policy,
+        GovernorBudgetView::new(Some(30_000), 0, 0),
+        &observed,
+        "2026-11-11T00:00:03Z",
+    )
+    .unwrap();
+    let multi = admission.multi.as_ref().unwrap();
+    // Observed spend is clamped to 2x declared: 4,000 becomes 8,000, which now
+    // outranks the 5,000 declared path.
+    assert_eq!(multi.paths[0].task_ids, vec!["observed-heavy"]);
+    assert_eq!(multi.paths[0].weight_tokens, 8_000);
+    assert_eq!(multi.paths[0].declared_weight_tokens, 4_000);
+    assert_eq!(multi.paths[0].observed_tokens, 8_000);
+    assert_eq!(multi.paths[1].task_ids, vec!["declared-heavy"]);
+    assert_eq!(multi.paths[1].weight_tokens, 5_000);
+    // Hard session budget is untouched by observed blending.
+    assert_eq!(admission.reserve.limit_tokens, Some(30_000));
+    assert_eq!(admission.reserve.spent_tokens, 0);
+}
+
+#[test]
+fn observed_spend_moves_the_input_hash() {
+    let fixture = Fixture::new(vec![
+        task("a", 1, &[], Some(5_000)),
+        task("b", 1, &[], Some(5_000)),
+    ]);
+    let mut policy = multi_policy();
+    policy.observed_weight_ratio = 0.5;
+    let first = evaluate_multi(
+        &fixture,
+        &[0, 0],
+        &policy,
+        GovernorBudgetView::new(Some(30_000), 0, 0),
+        &HashMap::new(),
+        "2026-11-11T00:00:03Z",
+    )
+    .unwrap();
+    let mut observed = HashMap::new();
+    observed.insert("b".to_string(), 9_000u64);
+    let second = evaluate_multi(
+        &fixture,
+        &[0, 0],
+        &policy,
+        GovernorBudgetView::new(Some(30_000), 0, 0),
+        &observed,
+        "2026-11-11T00:00:03Z",
+    )
+    .unwrap();
+    assert_ne!(first.inputs_hash, second.inputs_hash);
+    assert_eq!(first.reserve.limit_tokens, second.reserve.limit_tokens);
+}
+
+#[test]
+fn starvation_credit_reorders_deferred_side_work_after_the_threshold() {
+    let tasks = vec![
+        task("a", 1, &[], Some(5_000)),
+        task("b", 1, &[], Some(5_000)),
+        task("side", 1, &[], Some(1_000)),
+    ];
+    let plan = plan(tasks.clone());
+    let mut policy = multi_policy();
+    policy.max_paths = 2;
+    policy.starvation_after_secs = 900;
+    policy.critical_boost = 0;
+    // `side` has a lower effective priority and has waited one hour; the two
+    // protected paths were enqueued five minutes ago and receive no credit.
+    let candidates = vec![
+        GovernorCandidate {
+            task: &tasks[0],
+            effective_priority: 0,
+            enqueued_at: "2026-11-11T00:55:00Z",
+        },
+        GovernorCandidate {
+            task: &tasks[1],
+            effective_priority: 0,
+            enqueued_at: "2026-11-11T00:55:00Z",
+        },
+        GovernorCandidate {
+            task: &tasks[2],
+            effective_priority: -10,
+            enqueued_at: "2026-11-11T00:00:00Z",
+        },
+    ];
+    let aged = super::evaluate(GovernorEvaluation {
+        session_id: "session-1",
+        project_id: "project-1",
+        plan_revision: 1,
+        plan: &plan,
+        statuses: &HashMap::new(),
+        policy: &policy,
+        candidates: &candidates,
+        budget: GovernorBudgetView::new(Some(30_000), 0, 0),
+        remaining_override: None,
+        observed_tokens: &HashMap::new(),
+        evaluated_at: "2026-11-11T01:00:00Z",
+    })
+    .unwrap();
+    let side = aged
+        .decisions
+        .iter()
+        .find(|decision| decision.task_id == "side")
+        .unwrap();
+    // Four full 900-second intervals grant 20 points, enough to lift -10
+    // above the two zero-priority protected tasks.
+    assert_eq!(side.starvation_credit, 20);
+    assert_eq!(aged.decisions[0].task_id, "side");
+    assert!(side.admitted);
+
+    policy.starvation_after_secs = 0;
+    let fresh = super::evaluate(GovernorEvaluation {
+        session_id: "session-1",
+        project_id: "project-1",
+        plan_revision: 1,
+        plan: &plan,
+        statuses: &HashMap::new(),
+        policy: &policy,
+        candidates: &candidates,
+        budget: GovernorBudgetView::new(Some(30_000), 0, 0),
+        remaining_override: None,
+        observed_tokens: &HashMap::new(),
+        evaluated_at: "2026-11-11T01:00:00Z",
+    })
+    .unwrap();
+    assert_ne!(fresh.decisions[0].task_id, "side");
+    let side = fresh
+        .decisions
+        .iter()
+        .find(|decision| decision.task_id == "side")
+        .unwrap();
+    assert_eq!(side.starvation_credit, 0);
+}
+
+#[test]
+fn multi_mode_plan_revision_resets_the_table_and_hash() {
+    let fixture = Fixture::new(vec![
+        task("a", 1, &[], Some(5_000)),
+        task("b", 1, &[], Some(5_000)),
+    ]);
+    let plan = fixture.plan();
+    let candidates = fixture.candidates(&[0, 0]);
+    let first = super::evaluate(GovernorEvaluation {
+        session_id: "session-1",
+        project_id: "project-1",
+        plan_revision: 1,
+        plan: &plan,
+        statuses: &fixture.statuses,
+        policy: &multi_policy(),
+        candidates: &candidates,
+        budget: GovernorBudgetView::new(Some(20_000), 0, 0),
+        remaining_override: None,
+        observed_tokens: &HashMap::new(),
+        evaluated_at: "2026-11-11T00:00:03Z",
+    })
+    .unwrap();
+    let second = super::evaluate(GovernorEvaluation {
+        session_id: "session-1",
+        project_id: "project-1",
+        plan_revision: 2,
+        plan: &plan,
+        statuses: &fixture.statuses,
+        policy: &multi_policy(),
+        candidates: &candidates,
+        budget: GovernorBudgetView::new(Some(20_000), 0, 0),
+        remaining_override: None,
+        observed_tokens: &HashMap::new(),
+        evaluated_at: "2026-11-11T00:00:03Z",
+    })
+    .unwrap();
+    assert_ne!(first.inputs_hash, second.inputs_hash);
+    assert_eq!(first.reserve.path_count, second.reserve.path_count);
+}
+
+#[test]
+fn multi_mode_completed_plan_releases_the_reserve() {
+    let fixture = Fixture::new(vec![
+        task("done", 1, &[], Some(90_000)),
+        task("tail", 1, &["done"], Some(5_000)),
+    ])
+    .with_statuses(&[("done", "completed")]);
+    let mut policy = multi_policy();
+    policy.reserve_ratio = 1.0;
+    let admission = evaluate_multi(
+        &fixture,
+        &[0, 0],
+        &policy,
+        GovernorBudgetView::new(Some(20_000), 19_000, 0),
+        &HashMap::new(),
+        "2026-11-11T00:00:03Z",
+    )
+    .unwrap();
+    assert_eq!(admission.multi.as_ref().unwrap().paths.len(), 1);
+    assert_eq!(admission.decisions.len(), 1);
+    assert!(admission.decisions[0].admitted);
+    assert_eq!(admission.reserve.mode, CriticalPathMode::Multi);
+    assert!(admission.deferred.is_empty());
+}
+
+#[test]
+fn multi_mode_unbounded_budget_keeps_the_table_but_admits_without_reserve() {
+    let fixture = Fixture::new(vec![
+        task("a", 1, &[], Some(5_000)),
+        task("b", 1, &[], Some(3_000)),
+    ]);
+    let admission = evaluate_multi(
+        &fixture,
+        &[0, 0],
+        &multi_policy(),
+        GovernorBudgetView::new(None, 0, 0),
+        &HashMap::new(),
+        "2026-11-11T00:00:03Z",
+    )
+    .unwrap();
+    let multi = admission.multi.as_ref().unwrap();
+    assert_eq!(multi.paths.len(), 2);
+    assert_eq!(multi.allocated_tokens, 0);
+    assert_eq!(admission.reserve.state, "no_budget");
+    assert_eq!(admission.decisions[0].reason, GovernorReason::NoBudget);
+    assert!(admission.deferred.is_empty());
+}
+
+#[test]
+fn multi_admission_event_carries_the_path_table_and_deferred_order() {
+    let fixture = Fixture::new(vec![
+        task("heavy", 1, &[], Some(10_000)),
+        task("medium", 1, &[], Some(8_000)),
+        task("side", 1, &[], Some(1_000)),
+    ]);
+    let mut policy = multi_policy();
+    policy.max_paths = 2;
+    let admission = evaluate_multi(
+        &fixture,
+        &[0, 0, 0],
+        &policy,
+        GovernorBudgetView::new(Some(20_000), 0, 0),
+        &HashMap::new(),
+        "2026-11-11T00:00:03Z",
+    )
+    .unwrap();
+    let payload = admission_payload("session-1", "gov-1", &admission, "2026-11-11T00:00:03Z");
+    assert_eq!(payload["mode"], "multi");
+    assert_eq!(payload["paths"].as_array().unwrap().len(), 2);
+    assert_eq!(payload["paths"][0]["task_ids"][0], "heavy");
+    assert_eq!(payload["paths"][1]["allocation_tokens"], 8_000);
+    assert_eq!(payload["allocated_tokens"], 18_000);
+    assert_eq!(payload["deferred_order"][0], "side");
+    assert_eq!(payload["reserve"]["mode"], Value::Null);
+}
+
+#[test]
+fn multi_mode_throttle_defers_a_non_path_task_with_a_typed_code() {
+    let fixture = Fixture::new(vec![
+        task("a", 1, &[], Some(4_000)),
+        task("b", 1, &[], Some(4_000)),
+        task("side", 100, &[], Some(1_000)),
+    ]);
+    let mut policy = multi_policy();
+    policy.max_paths = 2;
+    policy.throttle_at_ratio = 0.9;
+    let admission = evaluate_multi(
+        &fixture,
+        &[0, 0, 100],
+        &policy,
+        GovernorBudgetView::new(Some(100_000), 80_000, 0),
+        &HashMap::new(),
+        "2026-11-11T00:00:03Z",
+    )
+    .unwrap();
+    assert!(admission.reserve.throttled);
+    let side = admission
+        .deferred
+        .iter()
+        .find(|deferral| deferral.task_id == "side")
+        .unwrap();
+    assert_eq!(side.reason, GovernorReason::Throttle);
+    assert_eq!(side.reason.code(), "BUDGET_THROTTLED");
+    assert!(!side.critical);
+}
+
+#[test]
+fn multi_mode_min_task_budget_exhausts_even_protected_paths() {
+    let fixture = Fixture::new(vec![
+        task("a", 1, &[], Some(4_000)),
+        task("b", 1, &[], Some(4_000)),
+    ]);
+    let mut policy = multi_policy();
+    policy.min_task_budget = 2_000;
+    let admission = evaluate_multi(
+        &fixture,
+        &[0, 0],
+        &policy,
+        GovernorBudgetView::new(Some(10_000), 9_500, 0),
+        &HashMap::new(),
+        "2026-11-11T00:00:03Z",
+    )
+    .unwrap();
+    assert_eq!(admission.reserve.state, "exhausted");
+    assert_eq!(admission.deferred.len(), 2);
+    assert!(
+        admission
+            .deferred
+            .iter()
+            .all(|deferral| deferral.reason.code() == "BUDGET_EXHAUSTED")
+    );
+    assert_eq!(admission.multi.as_ref().unwrap().paths.len(), 2);
+}
+
+#[test]
+fn multi_mode_disabled_policy_keeps_path_ids_on_decisions() {
+    let fixture = Fixture::new(vec![
+        task("a", 1, &[], Some(4_000)),
+        task("b", 1, &[], Some(2_000)),
+    ]);
+    let mut policy = multi_policy();
+    policy.enabled = false;
+    let admission = evaluate_multi(
+        &fixture,
+        &[0, 0],
+        &policy,
+        GovernorBudgetView::new(Some(10_000), 0, 0),
+        &HashMap::new(),
+        "2026-11-11T00:00:03Z",
+    )
+    .unwrap();
+    assert!(!admission.enabled);
+    assert_eq!(admission.mode, CriticalPathMode::Multi);
+    assert_eq!(admission.multi.as_ref().unwrap().paths.len(), 2);
+    assert!(admission.decisions.iter().all(|decision| {
+        decision.admitted
+            && decision.reason == GovernorReason::Disabled
+            && !decision.path_ids.is_empty()
+    }));
+    assert_eq!(admission.reserve.state, "disabled");
+    assert!(admission.deferred.is_empty());
+}
+
+#[test]
+fn shared_prefix_decisions_report_all_member_paths() {
+    let fixture = Fixture::new(vec![
+        task("root", 1, &[], Some(1_000)),
+        task("a", 1, &["root"], Some(4_000)),
+        task("b", 1, &["root"], Some(3_000)),
+    ]);
+    let admission = evaluate_multi(
+        &fixture,
+        &[0, 0, 0],
+        &multi_policy(),
+        GovernorBudgetView::new(Some(20_000), 0, 0),
+        &HashMap::new(),
+        "2026-11-11T00:00:03Z",
+    )
+    .unwrap();
+    let root = admission
+        .decisions
+        .iter()
+        .find(|decision| decision.task_id == "root")
+        .unwrap();
+    assert_eq!(root.path_ids, vec![0, 1]);
+    assert_eq!(root.path_id, Some(0));
+    let a = admission
+        .decisions
+        .iter()
+        .find(|decision| decision.task_id == "a")
+        .unwrap();
+    let b = admission
+        .decisions
+        .iter()
+        .find(|decision| decision.task_id == "b")
+        .unwrap();
+    assert_eq!(a.path_ids, vec![0]);
+    assert_eq!(b.path_ids, vec![1]);
+}
+
+#[test]
+fn multi_mode_pressure_admits_protected_paths_before_a_high_priority_side_task() {
+    let fixture = Fixture::new(vec![
+        task("a", 1, &[], Some(4_000)),
+        task("b", 1, &[], Some(4_000)),
+        task("side", 100, &[], Some(1_000)),
+    ]);
+    let mut policy = multi_policy();
+    policy.max_paths = 2;
+    policy.throttle_at_ratio = 0.95;
+    policy.min_task_budget = 0;
+    let admission = evaluate_multi(
+        &fixture,
+        &[0, 0, 100],
+        &policy,
+        GovernorBudgetView::new(Some(10_000), 0, 0),
+        &HashMap::new(),
+        "2026-11-11T00:00:03Z",
+    )
+    .unwrap();
+    assert_eq!(admission.reserve.protected_tokens, 10_000);
+    assert_eq!(admission.reserve.remaining_tokens, Some(10_000));
+    assert!(admission.decisions[0].critical);
+    assert!(admission.decisions[1].critical);
+    assert_eq!(admission.decisions[2].task_id, "side");
+    assert!(!admission.decisions[2].admitted);
+    assert_eq!(admission.decisions[2].reason, GovernorReason::Reserve);
+    assert!(admission.admitted.contains(&"a".to_string()));
+    assert!(admission.admitted.contains(&"b".to_string()));
+}
+
+#[test]
+fn multi_admission_event_path_table_is_bounded() {
+    let mut tasks = Vec::new();
+    for index in 0..20 {
+        tasks.push(task(&format!("t{index:02}"), 1, &[], Some(1_000 + index)));
+    }
+    let fixture = Fixture::new(tasks);
+    let mut policy = multi_policy();
+    policy.max_paths = 16;
+    let admission = evaluate_multi(
+        &fixture,
+        &[0; 20],
+        &policy,
+        GovernorBudgetView::new(Some(1_000_000), 0, 0),
+        &HashMap::new(),
+        "2026-11-11T00:00:03Z",
+    )
+    .unwrap();
+    assert_eq!(admission.multi.as_ref().unwrap().paths.len(), 16);
+    let payload = admission_payload("session-1", "gov-1", &admission, "now");
+    assert_eq!(payload["paths"].as_array().unwrap().len(), 16);
+    assert_eq!(payload["departments"].as_array().unwrap().len(), 1);
+    assert_eq!(payload["paths"][0]["task_ids"][0], "t19");
+}
+
+#[test]
+fn multi_denial_payload_carries_mode_and_an_empty_table() {
+    let path = vec!["a".to_string()];
+    let payload = denial_payload(GovernorDenial {
+        session_id: "session-1",
+        decision_id: "gov-2",
+        plan_revision: 3,
+        mode: CriticalPathMode::Multi,
+        task_id: "side",
+        task_critical: false,
+        reason: GovernorReason::Reserve,
+        requested_tokens: 1_000,
+        limit_tokens: Some(10_000),
+        spent_tokens: 5_000,
+        reserved_tokens: 0,
+        remaining_tokens: Some(5_000),
+        protected_tokens: 4_000,
+        path: &path,
+        path_weight_tokens: 3_500,
+        inputs_hash: "hash",
+        detail: "multi deferral".to_string(),
+        created_at: "2026-11-11T00:00:00Z",
+    });
+    assert_eq!(payload["mode"], "multi");
+    assert!(payload["paths"].as_array().unwrap().is_empty());
+    assert!(payload["departments"].as_array().unwrap().is_empty());
+    assert_eq!(payload["deferred_order"][0], "side");
+}
+
+#[test]
+fn observed_spend_quarter_blend_is_exact() {
+    let fixture = Fixture::new(vec![task("a", 1, &[], Some(4_000))]);
+    let mut policy = multi_policy();
+    policy.observed_weight_ratio = 0.25;
+    let mut observed = HashMap::new();
+    observed.insert("a".to_string(), 8_000u64);
+    let admission = evaluate_multi(
+        &fixture,
+        &[0],
+        &policy,
+        GovernorBudgetView::new(Some(20_000), 0, 0),
+        &observed,
+        "2026-11-11T00:00:03Z",
+    )
+    .unwrap();
+    let path = &admission.multi.as_ref().unwrap().paths[0];
+    assert_eq!(path.declared_weight_tokens, 4_000);
+    assert_eq!(path.observed_tokens, 8_000);
+    // 4,000 * 0.75 + 8,000 * 0.25 = 5,000.
+    assert_eq!(path.weight_tokens, 5_000);
+}
+
+#[test]
+fn multi_mode_orders_by_path_deficit_before_priority() {
+    let fixture = Fixture::new(vec![
+        task("heavy", 1, &[], Some(10_000)),
+        task("light", 1, &[], Some(4_000)),
+    ]);
+    let mut policy = multi_policy();
+    policy.reserve_ratio = 0.0;
+    policy.min_task_budget = 0;
+    // Pool 10,000 => allocations 7,143 / 2,857 and deficits 2,857 / 1,143.
+    // `light` has the higher priority but the heavier path sorts first.
+    let admission = evaluate_multi(
+        &fixture,
+        &[0, 100],
+        &policy,
+        GovernorBudgetView::new(Some(10_000), 0, 0),
+        &HashMap::new(),
+        "2026-11-11T00:00:03Z",
+    )
+    .unwrap();
+    let multi = admission.multi.as_ref().unwrap();
+    assert_eq!(multi.paths[0].deficit_tokens, 2_857);
+    assert_eq!(multi.paths[1].deficit_tokens, 1_143);
+    assert_eq!(admission.decisions[0].task_id, "heavy");
+    assert_eq!(admission.decisions[0].path_deficit_tokens, 2_857);
+    assert_eq!(admission.decisions[1].task_id, "light");
+    assert_eq!(admission.decisions[1].path_deficit_tokens, 1_143);
+    assert!(admission.deferred_order().is_empty());
+}
+
+#[test]
+fn multi_mode_critical_tasks_bypass_the_throttle_zone() {
+    let fixture = Fixture::new(vec![
+        task("a", 1, &[], Some(4_000)),
+        task("b", 1, &[], Some(4_000)),
+        task("side", 1, &[], Some(1_000)),
+    ]);
+    let mut policy = multi_policy();
+    policy.max_paths = 2;
+    policy.throttle_at_ratio = 1.0;
+    policy.min_task_budget = 0;
+    let admission = evaluate_multi(
+        &fixture,
+        &[0, 0, 0],
+        &policy,
+        GovernorBudgetView::new(Some(10_000), 5_000, 0),
+        &HashMap::new(),
+        "2026-11-11T00:00:03Z",
+    )
+    .unwrap();
+    assert!(admission.reserve.throttled);
+    assert!(admission.admitted.contains(&"a".to_string()));
+    assert!(admission.admitted.contains(&"b".to_string()));
+    assert!(!admission.admitted.contains(&"side".to_string()));
+    let side = admission
+        .deferred
+        .iter()
+        .find(|deferral| deferral.task_id == "side")
+        .unwrap();
+    assert_eq!(side.reason, GovernorReason::Throttle);
+}
+
+#[test]
+fn multi_mode_deferred_order_lists_every_deferral_once() {
+    let fixture = Fixture::new(vec![
+        task("a", 1, &[], Some(6_000)),
+        task("b", 1, &[], Some(5_000)),
+        task("c", 1, &[], Some(1_000)),
+        task("d", 1, &[], Some(1_000)),
+    ]);
+    let mut policy = multi_policy();
+    policy.max_paths = 2;
+    policy.min_task_budget = 0;
+    let admission = evaluate_multi(
+        &fixture,
+        &[0, 0, 0, 0],
+        &policy,
+        GovernorBudgetView::new(Some(10_000), 0, 0),
+        &HashMap::new(),
+        "2026-11-11T00:00:03Z",
+    )
+    .unwrap();
+    assert_eq!(admission.deferred.len(), 2);
+    let order = admission.deferred_order();
+    assert_eq!(order.len(), 2);
+    assert_eq!(order[0], "c");
+    assert_eq!(order[1], "d");
+    assert_eq!(
+        order,
+        admission
+            .deferral_infos()
+            .iter()
+            .map(|item| item.task_id.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn multi_mode_complete_plan_has_no_path_table_and_admits_the_tail() {
+    let fixture = Fixture::new(vec![
+        task("done", 1, &[], Some(9_000)),
+        task("tail", 1, &["done"], Some(1_000)),
+    ])
+    .with_statuses(&[("done", "completed")]);
+    let mut policy = multi_policy();
+    policy.reserve_ratio = 1.0;
+    let admission = evaluate_multi(
+        &fixture,
+        &[0, 0],
+        &policy,
+        GovernorBudgetView::new(Some(10_000), 9_500, 0),
+        &HashMap::new(),
+        "2026-11-11T00:00:03Z",
+    )
+    .unwrap();
+    let multi = admission.multi.as_ref().unwrap();
+    // `tail` remains, so the plan is not complete yet; only `done` was
+    // removed. The table has one path and the ratio reserve is bounded.
+    assert_eq!(multi.paths.len(), 1);
+    assert_eq!(multi.paths[0].task_ids, vec!["tail"]);
+    assert_eq!(admission.decisions.len(), 1);
+    assert!(admission.decisions[0].admitted);
+    let complete = run_complete_multi(&fixture);
+    assert!(complete.complete);
+    assert!(complete.paths.is_empty());
+}
+
+fn run_complete_multi(fixture: &Fixture) -> super::MultiPathAllocation {
+    let mut statuses = fixture.statuses.clone();
+    statuses.insert("tail".to_string(), "completed".to_string());
+    let plan = fixture.plan();
+    crate::multi_path::compute_multi_path(crate::multi_path::MultiPathInput {
+        session_id: "session-1",
+        project_id: "project-1",
+        plan_revision: 1,
+        plan: &plan,
+        statuses: &statuses,
+        remaining_budget_tokens: Some(10_000),
+        policy: &multi_policy(),
+        observed_tokens: &HashMap::new(),
+    })
+    .unwrap()
+}
+
+#[test]
+fn multi_admission_event_carries_department_floors() {
+    let fixture = Fixture::new(vec![
+        task("a", 1, &[], Some(4_000)),
+        task("b", 1, &[], Some(2_000)),
+    ]);
+    let mut policy = multi_policy();
+    policy.department_min_ratio = 0.5;
+    let admission = evaluate_multi(
+        &fixture,
+        &[0, 0],
+        &policy,
+        GovernorBudgetView::new(Some(10_000), 0, 0),
+        &HashMap::new(),
+        "2026-11-11T00:00:03Z",
+    )
+    .unwrap();
+    let payload = admission_payload("session-1", "gov-1", &admission, "now");
+    let departments = payload["departments"].as_array().unwrap();
+    assert_eq!(departments.len(), 1);
+    assert_eq!(departments[0]["department"], "impl");
+    assert!(departments[0]["floor_tokens"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn policy_mode_switch_moves_the_inputs_hash() {
+    let fixture = Fixture::new(vec![
+        task("a", 1, &[], Some(5_000)),
+        task("b", 1, &[], Some(5_000)),
+    ]);
+    let mut policy = multi_policy();
+    policy.mode = CriticalPathMode::Multi;
+    let multi = evaluate_multi(
+        &fixture,
+        &[0, 0],
+        &policy,
+        GovernorBudgetView::new(Some(20_000), 0, 0),
+        &HashMap::new(),
+        "2026-11-11T00:00:03Z",
+    )
+    .unwrap();
+    policy.mode = CriticalPathMode::Single;
+    let single = evaluate_multi(
+        &fixture,
+        &[0, 0],
+        &policy,
+        GovernorBudgetView::new(Some(20_000), 0, 0),
+        &HashMap::new(),
+        "2026-11-11T00:00:03Z",
+    )
+    .unwrap();
+    assert_ne!(multi.inputs_hash, single.inputs_hash);
+    assert_eq!(single.mode, CriticalPathMode::Single);
 }

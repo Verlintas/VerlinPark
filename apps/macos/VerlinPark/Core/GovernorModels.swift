@@ -9,6 +9,12 @@ struct CriticalPathPolicy: Codable, Sendable, Equatable {
     var throttleAtRatio: Double = 0.35
     var criticalBoost: Int = 25
     var minTaskBudget: Int = 1000
+    /// `single` (the F5 default) or `multi`.
+    var mode: String = "single"
+    var maxPaths: Int = 4
+    var departmentMinRatio: Double = 0
+    var observedWeightRatio: Double = 0
+    var starvationAfterSecs: Int = 1800
 
     enum CodingKeys: String, CodingKey {
         case enabled
@@ -16,6 +22,11 @@ struct CriticalPathPolicy: Codable, Sendable, Equatable {
         case throttleAtRatio = "throttle_at_ratio"
         case criticalBoost = "critical_boost"
         case minTaskBudget = "min_task_budget"
+        case mode
+        case maxPaths = "max_paths"
+        case departmentMinRatio = "department_min_ratio"
+        case observedWeightRatio = "observed_weight_ratio"
+        case starvationAfterSecs = "starvation_after_secs"
     }
 
     init() {}
@@ -25,13 +36,23 @@ struct CriticalPathPolicy: Codable, Sendable, Equatable {
         reserveRatio: Double,
         throttleAtRatio: Double,
         criticalBoost: Int,
-        minTaskBudget: Int
+        minTaskBudget: Int,
+        mode: String = "single",
+        maxPaths: Int = 4,
+        departmentMinRatio: Double = 0,
+        observedWeightRatio: Double = 0,
+        starvationAfterSecs: Int = 1800
     ) {
         self.enabled = enabled
         self.reserveRatio = reserveRatio
         self.throttleAtRatio = throttleAtRatio
         self.criticalBoost = criticalBoost
         self.minTaskBudget = minTaskBudget
+        self.mode = mode
+        self.maxPaths = maxPaths
+        self.departmentMinRatio = departmentMinRatio
+        self.observedWeightRatio = observedWeightRatio
+        self.starvationAfterSecs = starvationAfterSecs
     }
 
     init(from decoder: Decoder) throws {
@@ -41,6 +62,14 @@ struct CriticalPathPolicy: Codable, Sendable, Equatable {
         throttleAtRatio = try container.decodeIfPresent(Double.self, forKey: .throttleAtRatio) ?? 0.35
         criticalBoost = try container.decodeIfPresent(Int.self, forKey: .criticalBoost) ?? 25
         minTaskBudget = try container.decodeIfPresent(Int.self, forKey: .minTaskBudget) ?? 1000
+        mode = try container.decodeIfPresent(String.self, forKey: .mode) ?? "single"
+        maxPaths = try container.decodeIfPresent(Int.self, forKey: .maxPaths) ?? 4
+        departmentMinRatio =
+            try container.decodeIfPresent(Double.self, forKey: .departmentMinRatio) ?? 0
+        observedWeightRatio =
+            try container.decodeIfPresent(Double.self, forKey: .observedWeightRatio) ?? 0
+        starvationAfterSecs =
+            try container.decodeIfPresent(Int.self, forKey: .starvationAfterSecs) ?? 1800
     }
 
     func jsonValue() -> JSONValue {
@@ -50,7 +79,16 @@ struct CriticalPathPolicy: Codable, Sendable, Equatable {
             "throttle_at_ratio": .number(throttleAtRatio),
             "critical_boost": .number(Double(criticalBoost)),
             "min_task_budget": .number(Double(minTaskBudget)),
+            "mode": .string(mode),
+            "max_paths": .number(Double(maxPaths)),
+            "department_min_ratio": .number(departmentMinRatio),
+            "observed_weight_ratio": .number(observedWeightRatio),
+            "starvation_after_secs": .number(Double(starvationAfterSecs)),
         ])
+    }
+
+    var isMultiPath: Bool {
+        mode == "multi"
     }
 }
 
@@ -88,6 +126,85 @@ struct GovernorCriticalPath: Decodable, Sendable, Equatable {
     }
 }
 
+/// One protected root-to-leaf path from the daemon's multi-path allocator.
+/// Every value is read-only explainability data; the client never recomputes
+/// the allocation.
+struct GovernorPath: Decodable, Sendable, Equatable, Identifiable {
+    var pathID: Int = 0
+    var taskIDs: [String] = []
+    var departments: [String] = []
+    var weightTokens: Int = 0
+    var declaredWeightTokens: Int = 0
+    var observedTokens: Int = 0
+    var floorTokens: Int = 0
+    var allocationTokens: Int = 0
+    var deficitTokens: Int = 0
+
+    var id: Int {
+        pathID
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case pathID = "path_id"
+        case taskIDs = "task_ids"
+        case departments
+        case weightTokens = "weight_tokens"
+        case declaredWeightTokens = "declared_weight_tokens"
+        case observedTokens = "observed_tokens"
+        case floorTokens = "floor_tokens"
+        case allocationTokens = "allocation_tokens"
+        case deficitTokens = "deficit_tokens"
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        pathID = try container.decodeIfPresent(Int.self, forKey: .pathID) ?? 0
+        taskIDs = try container.decodeIfPresent([String].self, forKey: .taskIDs) ?? []
+        departments = try container.decodeIfPresent([String].self, forKey: .departments) ?? []
+        weightTokens = try container.decodeIfPresent(Int.self, forKey: .weightTokens) ?? 0
+        declaredWeightTokens =
+            try container.decodeIfPresent(Int.self, forKey: .declaredWeightTokens) ?? 0
+        observedTokens = try container.decodeIfPresent(Int.self, forKey: .observedTokens) ?? 0
+        floorTokens = try container.decodeIfPresent(Int.self, forKey: .floorTokens) ?? 0
+        allocationTokens =
+            try container.decodeIfPresent(Int.self, forKey: .allocationTokens) ?? 0
+        deficitTokens = try container.decodeIfPresent(Int.self, forKey: .deficitTokens) ?? 0
+    }
+}
+
+/// One department's floor share from the multi-path allocator. `pathIDs`
+/// names the protected paths touching the department; weights count each path
+/// once, so shared prefixes are not double-counted.
+struct GovernorDepartment: Decodable, Sendable, Equatable, Identifiable {
+    var department: String = ""
+    var weightTokens: Int = 0
+    var floorTokens: Int = 0
+    var pathIDs: [Int] = []
+
+    var id: String {
+        department
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case department
+        case weightTokens = "weight_tokens"
+        case floorTokens = "floor_tokens"
+        case pathIDs = "path_ids"
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        department = try container.decodeIfPresent(String.self, forKey: .department) ?? ""
+        weightTokens = try container.decodeIfPresent(Int.self, forKey: .weightTokens) ?? 0
+        floorTokens = try container.decodeIfPresent(Int.self, forKey: .floorTokens) ?? 0
+        pathIDs = try container.decodeIfPresent([Int].self, forKey: .pathIDs) ?? []
+    }
+}
+
 struct GovernorReserve: Decodable, Sendable, Equatable {
     var state: String = "disabled"
     var reserveRatio: Double = 0.25
@@ -103,6 +220,12 @@ struct GovernorReserve: Decodable, Sendable, Equatable {
     var protectedTokens: Int = 0
     var headroomTokens: Int?
     var throttled: Bool = false
+    var mode: String = "single"
+    var pathCount: Int = 0
+    var allocatedTokens: Int = 0
+    var floorTokens: Int = 0
+    var enumeratedPaths: Int = 0
+    var pathsTruncated: Bool = false
 
     enum CodingKeys: String, CodingKey {
         case state
@@ -119,6 +242,12 @@ struct GovernorReserve: Decodable, Sendable, Equatable {
         case protectedTokens = "protected_tokens"
         case headroomTokens = "headroom_tokens"
         case throttled
+        case mode
+        case pathCount = "path_count"
+        case allocatedTokens = "allocated_tokens"
+        case floorTokens = "floor_tokens"
+        case enumeratedPaths = "enumerated_paths"
+        case pathsTruncated = "paths_truncated"
     }
 
     init() {}
@@ -139,6 +268,14 @@ struct GovernorReserve: Decodable, Sendable, Equatable {
         protectedTokens = try container.decodeIfPresent(Int.self, forKey: .protectedTokens) ?? 0
         headroomTokens = try container.decodeIfPresent(Int.self, forKey: .headroomTokens)
         throttled = try container.decodeIfPresent(Bool.self, forKey: .throttled) ?? false
+        mode = try container.decodeIfPresent(String.self, forKey: .mode) ?? "single"
+        pathCount = try container.decodeIfPresent(Int.self, forKey: .pathCount) ?? 0
+        allocatedTokens = try container.decodeIfPresent(Int.self, forKey: .allocatedTokens) ?? 0
+        floorTokens = try container.decodeIfPresent(Int.self, forKey: .floorTokens) ?? 0
+        enumeratedPaths =
+            try container.decodeIfPresent(Int.self, forKey: .enumeratedPaths) ?? 0
+        pathsTruncated =
+            try container.decodeIfPresent(Bool.self, forKey: .pathsTruncated) ?? false
     }
 }
 
@@ -152,6 +289,10 @@ struct GovernorTaskDecision: Decodable, Sendable, Equatable {
     var reason: String = ""
     var code: String = ""
     var remainingAfterTokens: Int?
+    var pathID: Int?
+    var pathIDs: [Int] = []
+    var pathDeficitTokens: Int = 0
+    var starvationCredit: Int = 0
 
     enum CodingKeys: String, CodingKey {
         case taskID = "task_id"
@@ -163,6 +304,10 @@ struct GovernorTaskDecision: Decodable, Sendable, Equatable {
         case reason
         case code
         case remainingAfterTokens = "remaining_after_tokens"
+        case pathID = "path_id"
+        case pathIDs = "path_ids"
+        case pathDeficitTokens = "path_deficit_tokens"
+        case starvationCredit = "starvation_credit"
     }
 
     init(from decoder: Decoder) throws {
@@ -176,6 +321,12 @@ struct GovernorTaskDecision: Decodable, Sendable, Equatable {
         reason = try container.decodeIfPresent(String.self, forKey: .reason) ?? ""
         code = try container.decodeIfPresent(String.self, forKey: .code) ?? ""
         remainingAfterTokens = try container.decodeIfPresent(Int.self, forKey: .remainingAfterTokens)
+        pathID = try container.decodeIfPresent(Int.self, forKey: .pathID)
+        pathIDs = try container.decodeIfPresent([Int].self, forKey: .pathIDs) ?? []
+        pathDeficitTokens =
+            try container.decodeIfPresent(Int.self, forKey: .pathDeficitTokens) ?? 0
+        starvationCredit =
+            try container.decodeIfPresent(Int.self, forKey: .starvationCredit) ?? 0
     }
 }
 
@@ -188,6 +339,10 @@ struct GovernorDeferral: Decodable, Sendable, Equatable {
     var code: String = ""
     var remainingTokens: Int?
     var protectedTokens: Int = 0
+    var pathID: Int?
+    var pathIDs: [Int] = []
+    var pathDeficitTokens: Int = 0
+    var starvationCredit: Int = 0
 
     enum CodingKeys: String, CodingKey {
         case taskID = "task_id"
@@ -198,6 +353,10 @@ struct GovernorDeferral: Decodable, Sendable, Equatable {
         case code
         case remainingTokens = "remaining_tokens"
         case protectedTokens = "protected_tokens"
+        case pathID = "path_id"
+        case pathIDs = "path_ids"
+        case pathDeficitTokens = "path_deficit_tokens"
+        case starvationCredit = "starvation_credit"
     }
 
     init(from decoder: Decoder) throws {
@@ -210,6 +369,12 @@ struct GovernorDeferral: Decodable, Sendable, Equatable {
         code = try container.decodeIfPresent(String.self, forKey: .code) ?? ""
         remainingTokens = try container.decodeIfPresent(Int.self, forKey: .remainingTokens)
         protectedTokens = try container.decodeIfPresent(Int.self, forKey: .protectedTokens) ?? 0
+        pathID = try container.decodeIfPresent(Int.self, forKey: .pathID)
+        pathIDs = try container.decodeIfPresent([Int].self, forKey: .pathIDs) ?? []
+        pathDeficitTokens =
+            try container.decodeIfPresent(Int.self, forKey: .pathDeficitTokens) ?? 0
+        starvationCredit =
+            try container.decodeIfPresent(Int.self, forKey: .starvationCredit) ?? 0
     }
 }
 
@@ -235,6 +400,11 @@ struct GovernorDecision: Decodable, Sendable, Identifiable, Equatable {
     var deferred: [GovernorDeferral] = []
     var inputsHash: String = ""
     var createdAt: String = ""
+    var mode: String = "single"
+    var paths: [GovernorPath] = []
+    var departments: [GovernorDepartment] = []
+    var allocatedTokens: Int = 0
+    var deferredOrder: [String] = []
 
     var id: String {
         decisionID
@@ -262,6 +432,11 @@ struct GovernorDecision: Decodable, Sendable, Identifiable, Equatable {
         case deferred
         case inputsHash = "inputs_hash"
         case createdAt = "created_at"
+        case mode
+        case paths
+        case departments
+        case allocatedTokens = "allocated_tokens"
+        case deferredOrder = "deferred_order"
     }
 
     init(from decoder: Decoder) throws {
@@ -287,6 +462,13 @@ struct GovernorDecision: Decodable, Sendable, Identifiable, Equatable {
         deferred = try container.decodeIfPresent([GovernorDeferral].self, forKey: .deferred) ?? []
         inputsHash = try container.decodeIfPresent(String.self, forKey: .inputsHash) ?? ""
         createdAt = try container.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
+        mode = try container.decodeIfPresent(String.self, forKey: .mode) ?? "single"
+        paths = try container.decodeIfPresent([GovernorPath].self, forKey: .paths) ?? []
+        departments =
+            try container.decodeIfPresent([GovernorDepartment].self, forKey: .departments) ?? []
+        allocatedTokens = try container.decodeIfPresent(Int.self, forKey: .allocatedTokens) ?? 0
+        deferredOrder =
+            try container.decodeIfPresent([String].self, forKey: .deferredOrder) ?? []
     }
 }
 
@@ -328,6 +510,9 @@ struct GovernorSessionStatus: Decodable, Sendable, Equatable {
     var admitted: [String] = []
     var deferred: [GovernorDeferral] = []
     var lastDecisions: [GovernorDecision] = []
+    var paths: [GovernorPath] = []
+    var departments: [GovernorDepartment] = []
+    var deferredOrder: [String] = []
     var error: GovernorFailure?
     var generatedAt: String = ""
 
@@ -347,6 +532,9 @@ struct GovernorSessionStatus: Decodable, Sendable, Equatable {
         case admitted
         case deferred
         case lastDecisions = "last_decisions"
+        case paths
+        case departments
+        case deferredOrder = "deferred_order"
         case error
         case generatedAt = "generated_at"
     }
@@ -370,6 +558,11 @@ struct GovernorSessionStatus: Decodable, Sendable, Equatable {
         admitted = try container.decodeIfPresent([String].self, forKey: .admitted) ?? []
         deferred = try container.decodeIfPresent([GovernorDeferral].self, forKey: .deferred) ?? []
         lastDecisions = try container.decodeIfPresent([GovernorDecision].self, forKey: .lastDecisions) ?? []
+        paths = try container.decodeIfPresent([GovernorPath].self, forKey: .paths) ?? []
+        departments =
+            try container.decodeIfPresent([GovernorDepartment].self, forKey: .departments) ?? []
+        deferredOrder =
+            try container.decodeIfPresent([String].self, forKey: .deferredOrder) ?? []
         error = try container.decodeIfPresent(GovernorFailure.self, forKey: .error)
         generatedAt = try container.decodeIfPresent(String.self, forKey: .generatedAt) ?? ""
     }
@@ -404,6 +597,60 @@ enum GovernorMetrics {
 
     static func isPressure(_ reserve: GovernorReserve) -> Bool {
         reserve.throttled
+    }
+
+    static func modeLabel(_ mode: String?) -> String {
+        switch mode {
+        case "multi":
+            "multi-path"
+        case "single":
+            "single path"
+        case let .some(value):
+            value
+        case nil:
+            "single path"
+        }
+    }
+
+    static func allocationFraction(_ path: GovernorPath) -> Double? {
+        guard path.weightTokens > 0 else { return nil }
+        return min(1, max(0, Double(path.allocationTokens) / Double(path.weightTokens)))
+    }
+
+    /// Compact one-line row for the Efficiency card. Shows the protected path,
+    /// funded fraction, and unfunded deficit without inventing values.
+    static func pathRow(_ path: GovernorPath) -> String {
+        let fraction = allocationFraction(path).map { String(format: "%.0f%%", $0 * 100) } ?? "—"
+        return "#\(path.pathID) \(fraction) · \(EfficiencyMetrics.tokenLabel(path.allocationTokens))/\(EfficiencyMetrics.tokenLabel(path.weightTokens)) · \(pathLabel(path.taskIDs, limit: 4))"
+    }
+
+    static func departmentLabel(_ path: GovernorPath, limit: Int = 3) -> String {
+        guard !path.departments.isEmpty else { return "—" }
+        let head = path.departments.prefix(limit).joined(separator: ",")
+        if path.departments.count > limit {
+            return head + "+\(path.departments.count - limit)"
+        }
+        return head
+    }
+
+    static func starvationLabel(_ seconds: Int) -> String {
+        guard seconds > 0 else { return "overflow off" }
+        if seconds % 3600 == 0 {
+            return "overflow \(seconds / 3600)h"
+        }
+        if seconds % 60 == 0 {
+            return "overflow \(seconds / 60)m"
+        }
+        return "overflow \(seconds)s"
+    }
+
+    /// Deferred ordering is daemon-provided; fall back to the deferral list
+    /// only when an older daemon did not send the explicit order.
+    static func deferredOrder(_ status: GovernorSessionStatus) -> [String] {
+        if !status.deferredOrder.isEmpty {
+            return status.deferredOrder
+        }
+        return status.deferred.map(\.taskID)
     }
 }
 
