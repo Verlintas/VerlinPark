@@ -1853,6 +1853,218 @@ async fn lands_a_committed_session_into_the_default_branch() {
     assert!(events.iter().any(|event| event.kind == "session.landed"));
 }
 
+static PR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct EnvGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
+struct PrFixture {
+    engine: Engine,
+    project: Project,
+    session: Session,
+    _data: TempDir,
+    _repo: TempDir,
+    _remote: TempDir,
+}
+
+async fn pr_fixture(name: &str) -> PrFixture {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let remote = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let status = Command::new("git")
+        .args(["init", "--bare", "-q"])
+        .arg(remote.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["remote", "add", "origin", remote.path().to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(repo.path().to_string_lossy().to_string(), Some(name.into()))
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "PR me".into(), None)
+        .await
+        .unwrap();
+    let worktree = session.worktree.clone().unwrap();
+    std::fs::write(Path::new(&worktree).join("README.md"), format!("{name}\n")).unwrap();
+    engine
+        .commit_session(&session.id, "session change")
+        .await
+        .unwrap();
+    PrFixture {
+        engine,
+        project,
+        session,
+        _data: data,
+        _repo: repo,
+        _remote: remote,
+    }
+}
+
+fn write_executable(path: &Path, contents: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, contents).unwrap();
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).unwrap();
+}
+
+#[tokio::test]
+async fn opens_a_gitea_pull_request_with_tea_from_provider_env() {
+    let _lock = PR_ENV_LOCK.lock().await;
+    let fixture = pr_fixture("gitea").await;
+    let log = fixture._data.path().join("tea-args");
+    let cwd_log = fixture._data.path().join("tea-cwd");
+    let tea = fixture._data.path().join("fake-tea");
+    write_executable(
+        &tea,
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = \"login\" ]; then exit 0; fi\nif [ \"$1\" = \"pr\" ]; then\nprintf '%s\\n' \"$@\" > '{}'\npwd > '{}'\necho https://gitea.example/owner/repo/pulls/1\nexit 0\nfi\nexit 1\n",
+            log.display(),
+            cwd_log.display()
+        ),
+    );
+    let _provider = EnvGuard::set("VERLINPARK_PR_PROVIDER", "gitea");
+    let _bin = EnvGuard::set("VERLINPARK_TEA_BIN", tea.to_str().unwrap());
+
+    let result = fixture
+        .engine
+        .open_pull_request(&fixture.session.id)
+        .await
+        .unwrap();
+    assert!(result.pushed);
+    assert_eq!(
+        result.url.as_deref(),
+        Some("https://gitea.example/owner/repo/pulls/1")
+    );
+    assert!(result.detail.contains("PR opened"));
+
+    let branch = fixture.session.branch.clone().unwrap();
+    let remote_ref = Command::new("git")
+        .arg("--git-dir")
+        .arg(fixture._remote.path())
+        .args(["rev-parse", &format!("refs/heads/{branch}")])
+        .output()
+        .unwrap();
+    assert!(remote_ref.status.success());
+
+    let args = std::fs::read_to_string(&log).unwrap();
+    let args: Vec<&str> = args.lines().collect();
+    assert_eq!(&args[..3], &["pr", "create", "--head"]);
+    assert_eq!(args[3], branch);
+    assert_eq!(args[4], "--base");
+    assert_eq!(args[5], fixture.project.default_branch);
+    assert_eq!(args[6], "--title");
+    assert_eq!(args[7], "PR me");
+    assert_eq!(args[8], "--description");
+    assert!(args[9].starts_with("Opened from VerlinPark session"));
+
+    let cli_cwd = std::fs::read_to_string(&cwd_log).unwrap();
+    let cli_cwd = std::fs::canonicalize(cli_cwd.trim()).unwrap();
+    let session_worktree =
+        std::fs::canonicalize(fixture.session.worktree.as_deref().unwrap()).unwrap();
+    assert_eq!(cli_cwd, session_worktree);
+}
+
+#[tokio::test]
+async fn forgejo_provider_maps_to_tea() {
+    let _lock = PR_ENV_LOCK.lock().await;
+    let fixture = pr_fixture("forgejo").await;
+    let tea = fixture._data.path().join("fake-tea");
+    write_executable(
+        &tea,
+        "#!/bin/sh\nif [ \"$1\" = \"login\" ]; then exit 0; fi\nif [ \"$1\" = \"pr\" ]; then echo https://forgejo.example/owner/repo/pulls/2; exit 0; fi\nexit 1\n",
+    );
+    let _provider = EnvGuard::set("VERLINPARK_PR_PROVIDER", "forgejo");
+    let _bin = EnvGuard::set("VERLINPARK_TEA_BIN", tea.to_str().unwrap());
+
+    let result = fixture
+        .engine
+        .open_pull_request(&fixture.session.id)
+        .await
+        .unwrap();
+    assert!(result.pushed);
+    assert_eq!(
+        result.url.as_deref(),
+        Some("https://forgejo.example/owner/repo/pulls/2")
+    );
+    assert!(result.detail.contains("PR opened"));
+}
+
+#[tokio::test]
+async fn gitea_login_failure_is_clear_and_does_not_push() {
+    let _lock = PR_ENV_LOCK.lock().await;
+    let fixture = pr_fixture("gitea-auth").await;
+    let marker = fixture._data.path().join("tea-create-called");
+    let tea = fixture._data.path().join("fake-tea");
+    write_executable(
+        &tea,
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = \"login\" ]; then echo 'no login found' >&2; exit 1; fi\nif [ \"$1\" = \"pr\" ]; then touch '{}'; echo https://gitea.example/owner/repo/pulls/3; exit 0; fi\nexit 1\n",
+            marker.display()
+        ),
+    );
+    let _provider = EnvGuard::set("VERLINPARK_PR_PROVIDER", "gitea");
+    let _bin = EnvGuard::set("VERLINPARK_TEA_BIN", tea.to_str().unwrap());
+
+    let error = fixture
+        .engine
+        .open_pull_request(&fixture.session.id)
+        .await
+        .unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("tea is not authenticated"), "{message}");
+    assert!(message.contains("no login found"), "{message}");
+    assert!(!marker.exists());
+
+    let branch = fixture.session.branch.clone().unwrap();
+    let remote_ref = Command::new("git")
+        .arg("--git-dir")
+        .arg(fixture._remote.path())
+        .args(["rev-parse", &format!("refs/heads/{branch}")])
+        .output()
+        .unwrap();
+    assert!(!remote_ref.status.success());
+    let events = fixture
+        .engine
+        .list_events(fixture.session.id.clone(), 0, 100)
+        .await
+        .unwrap();
+    assert!(!events.iter().any(|event| event.kind == "session.pushed"));
+    assert!(!events.iter().any(|event| event.kind == "session.pr_opened"));
+}
+
 #[tokio::test]
 async fn pushes_a_branch_and_opens_a_pull_request() {
     use std::os::unix::fs::PermissionsExt;

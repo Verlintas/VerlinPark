@@ -1089,7 +1089,8 @@ enum Command {
     Resolve { entry: String },
     /// Land the session branch into the project default branch.
     Land { session: String },
-    /// Push the session branch and open a GitHub pull request with gh.
+    /// Push the session branch and open a pull request (GitHub gh, GitLab glab,
+    /// or Gitea/Forgejo tea with VERLINPARK_PR_PROVIDER=gitea|forgejo).
     Pr { session: String },
     /// Export a portable session bundle (events + projections).
     Export {

@@ -442,6 +442,7 @@ fn normalize_shell_policy(mut policy: ShellPolicy) -> Result<ShellPolicy> {
 enum PrCli {
     GitHub,
     GitLab,
+    Gitea,
 }
 
 impl PrCli {
@@ -449,6 +450,7 @@ impl PrCli {
         match self {
             Self::GitHub => "gh",
             Self::GitLab => "glab",
+            Self::Gitea => "tea",
         }
     }
 
@@ -456,11 +458,15 @@ impl PrCli {
         match self {
             Self::GitHub => "PR",
             Self::GitLab => "MR",
+            Self::Gitea => "PR",
         }
     }
 
     fn auth_args(self) -> &'static [&'static str] {
-        &["auth", "status"]
+        match self {
+            Self::GitHub | Self::GitLab => &["auth", "status"],
+            Self::Gitea => &["login", "list"],
+        }
     }
 
     fn create_args(self, base_branch: &str, branch: &str, title: &str, body: &str) -> Vec<String> {
@@ -490,6 +496,18 @@ impl PrCli {
                 body.into(),
                 "--yes".into(),
             ],
+            Self::Gitea => vec![
+                "pr".into(),
+                "create".into(),
+                "--head".into(),
+                branch.into(),
+                "--base".into(),
+                base_branch.into(),
+                "--title".into(),
+                title.into(),
+                "--description".into(),
+                body.into(),
+            ],
         }
     }
 
@@ -497,6 +515,7 @@ impl PrCli {
         match self {
             Self::GitHub => "gh pr create",
             Self::GitLab => "glab mr create",
+            Self::Gitea => "tea pr create",
         }
     }
 }
@@ -5942,12 +5961,14 @@ impl Engine {
         {
             Some("gitlab") => PrCli::GitLab,
             Some("github") => PrCli::GitHub,
+            Some("gitea" | "forgejo") => PrCli::Gitea,
             Some(other) => anyhow::bail!("unsupported PR provider: {other}"),
             None => detect_pr_cli(&self.pull_request_origin(session_id).await?),
         };
         let bin = match kind {
             PrCli::GitHub => std::env::var("VERLINPARK_GH_BIN").unwrap_or_else(|_| "gh".into()),
             PrCli::GitLab => std::env::var("VERLINPARK_GLAB_BIN").unwrap_or_else(|_| "glab".into()),
+            PrCli::Gitea => std::env::var("VERLINPARK_TEA_BIN").unwrap_or_else(|_| "tea".into()),
         };
         self.open_pull_request_with_cli(session_id, &bin, kind)
             .await
@@ -5989,6 +6010,7 @@ impl Engine {
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("session has no worktree"))?,
         );
+        let session_worktree_for_cli = session_worktree.clone();
         let status = tokio::task::spawn_blocking(move || {
             git_output(&session_worktree, &["status", "--porcelain"])
         })
@@ -6080,13 +6102,19 @@ impl Engine {
         )
         .await?;
 
-        let project_root_for_cli = PathBuf::from(&project.root);
+        // Gitea/Forgejo run from the session worktree where the branch is
+        // checked out; GitHub/GitLab keep their existing project-root cwd.
+        let cli_cwd = if matches!(kind, PrCli::Gitea) {
+            session_worktree_for_cli
+        } else {
+            PathBuf::from(&project.root)
+        };
         let branch_for_pr = branch.clone();
         let base_for_pr = base_branch.clone();
         let url = tokio::task::spawn_blocking(move || -> Result<String> {
             let output = std::process::Command::new(&cli_bin_for_create)
                 .args(kind.create_args(&base_for_pr, &branch_for_pr, &title_for_cli, &body_for_cli))
-                .current_dir(&project_root_for_cli)
+                .current_dir(&cli_cwd)
                 .output()
                 .with_context(|| format!("running {}", kind.create_label()))?;
             if !output.status.success() {
