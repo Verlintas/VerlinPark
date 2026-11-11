@@ -336,6 +336,32 @@ final class AppModel {
     var intakeDraftLabels = ""
     var intakeDraftDeps: Set<String> = []
     var intakeEditingID: String?
+    var programEntries: [ProgramListEntry] = []
+    var programBusy = false
+    var programStatus: String?
+    var programActionBusyID: String?
+    var selectedProgramID: String?
+    var programDetail: ProgramStatusResult?
+    var programDetailBusy = false
+    var programDraftGoal = ""
+    var programDraftActivate = true
+    var programDraftAutoDispatch = true
+    var programDraftTokenBudget = ""
+    var programDraftCostBudget = ""
+    var programDraftMaxAttemptsText = "2"
+    var programDraftBackoffText = "60"
+    var programDraftParallelText = "2"
+    var programDraftDependencyFailure = "block"
+    var programMilestoneDraftTitle = ""
+    var programMilestoneDraftObjective = ""
+    var programMilestoneDraftAcceptance = ""
+    var programMilestoneDraftScope = "src"
+    var programMilestoneDraftPriorityText = "0"
+    var programMilestoneDraftMaxAttemptsText = "2"
+    var programMilestoneDraftProfile = "coding"
+    var programMilestoneDraftTokenBudget = ""
+    var programMilestoneDraftCostBudget = ""
+    var programMilestoneDraftDeps: Set<String> = []
     var contextStatus: SessionContextStatus?
     var compactBusy = false
     var compactNotice: String?
@@ -854,6 +880,13 @@ final class AppModel {
         intakeStatus = nil
         intakeEditingID = nil
         intakeDraftDeps = []
+        programEntries = []
+        programStatus = nil
+        programActionBusyID = nil
+        selectedProgramID = nil
+        programDetail = nil
+        programDetailBusy = false
+        programMilestoneDraftDeps = []
         scheduledSessionTasks = []
         scheduledSessionTasksSessionID = nil
         orchestrationSnapshot = nil
@@ -4911,6 +4944,352 @@ final class AppModel {
     func openIntakeSession(_ task: IntakeTask) {
         guard let sessionID = task.sessionID else { return }
         selectSession(sessionID)
+    }
+
+    func loadPrograms(silent: Bool = false) async {
+        guard let projectID = selectedProjectID else {
+            programEntries = []
+            programDetail = nil
+            selectedProgramID = nil
+            return
+        }
+        let generation = selectionGeneration
+        if !silent {
+            programBusy = true
+        }
+        defer {
+            if !silent {
+                programBusy = false
+            }
+        }
+        do {
+            let result = try await core.programs(projectID: projectID, limit: 100)
+            guard selectionGeneration == generation, projectID == selectedProjectID else {
+                return
+            }
+            programEntries = result.programs
+            if let selected = selectedProgramID,
+               !result.programs.contains(where: { $0.program.id == selected })
+            {
+                selectedProgramID = nil
+                programDetail = nil
+            }
+            if !silent {
+                programStatus = nil
+            }
+        } catch {
+            guard selectionGeneration == generation, projectID == selectedProjectID else {
+                return
+            }
+            if !silent {
+                programStatus = error.localizedDescription
+            }
+        }
+    }
+
+    func loadProgramDetail(silent: Bool = false) async {
+        guard let programID = selectedProgramID else {
+            programDetail = nil
+            return
+        }
+        let generation = selectionGeneration
+        if !silent {
+            programDetailBusy = true
+        }
+        defer {
+            if !silent {
+                programDetailBusy = false
+            }
+        }
+        do {
+            let result = try await core.programStatus(id: programID, eventLimit: 50)
+            guard selectionGeneration == generation,
+                  programID == selectedProgramID else { return }
+            programDetail = result
+            if !silent {
+                programStatus = nil
+            }
+        } catch {
+            guard selectionGeneration == generation,
+                  programID == selectedProgramID else { return }
+            if !silent {
+                programStatus = error.localizedDescription
+            }
+        }
+    }
+
+    func selectProgram(_ programID: String) async {
+        selectedProgramID = programID
+        await loadProgramDetail()
+    }
+
+    func createProgram() async {
+        guard let projectID = selectedProjectID else {
+            programStatus = "Select a project first."
+            return
+        }
+        let goal = programDraftGoal.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !goal.isEmpty else {
+            programStatus = "Give the program a goal."
+            return
+        }
+        let attemptsText = programDraftMaxAttemptsText.trimmingCharacters(in: .whitespaces)
+        guard let maxAttempts = UInt32(attemptsText), (1 ... 5).contains(maxAttempts) else {
+            programStatus = "Max attempts must be between 1 and 5."
+            return
+        }
+        let backoffText = programDraftBackoffText.trimmingCharacters(in: .whitespaces)
+        guard let backoff = UInt64(backoffText), backoff <= 86400 else {
+            programStatus = "Retry backoff must be between 0 and 86400 seconds."
+            return
+        }
+        let parallelText = programDraftParallelText.trimmingCharacters(in: .whitespaces)
+        guard let parallel = Int(parallelText), (1 ... 10).contains(parallel) else {
+            programStatus = "Parallel milestones must be between 1 and 10."
+            return
+        }
+        let tokenText = programDraftTokenBudget.trimmingCharacters(in: .whitespaces)
+        let tokenBudget = tokenText.isEmpty ? nil : UInt64(tokenText)
+        if !tokenText.isEmpty, tokenBudget == nil || tokenBudget == 0 {
+            programStatus = "Token budget must be a positive whole number."
+            return
+        }
+        let costText = programDraftCostBudget.trimmingCharacters(in: .whitespaces)
+        let costBudget = costText.isEmpty ? nil : Double(costText)
+        if !costText.isEmpty, costBudget == nil || costBudget! <= 0 {
+            programStatus = "Cost budget must be a positive number."
+            return
+        }
+        let policy = ProgramPolicy(
+            autoDispatch: programDraftAutoDispatch,
+            maxAttempts: maxAttempts,
+            retryBackoffSecs: backoff,
+            dependencyFailure: programDraftDependencyFailure,
+            tokenBudget: nil,
+            costBudgetUsd: nil,
+            maxParallelMilestones: parallel
+        )
+        programBusy = true
+        defer { programBusy = false }
+        do {
+            let program = try await core.createProgram(
+                projectID: projectID,
+                goal: goal,
+                policy: policy,
+                tokenBudget: tokenBudget,
+                costBudgetUsd: costBudget,
+                activate: programDraftActivate
+            )
+            programDraftGoal = ""
+            programDraftTokenBudget = ""
+            programDraftCostBudget = ""
+            selectedProgramID = program.id
+            programStatus = programDraftActivate
+                ? "Program activated; ready milestones dispatch deterministically."
+                : "Program saved as a draft."
+            await loadPrograms(silent: true)
+            await loadProgramDetail(silent: true)
+        } catch {
+            programStatus = error.localizedDescription
+        }
+    }
+
+    func createProgramMilestone() async {
+        guard let programID = selectedProgramID else {
+            programStatus = "Select a program first."
+            return
+        }
+        let title = programMilestoneDraftTitle
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let objective = programMilestoneDraftObjective
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else {
+            programStatus = "Give the milestone a title."
+            return
+        }
+        guard !objective.isEmpty else {
+            programStatus = "Describe the milestone objective."
+            return
+        }
+        let acceptance = parseIntakeItems(programMilestoneDraftAcceptance)
+        guard !acceptance.isEmpty else {
+            programStatus = "Add at least one acceptance criterion."
+            return
+        }
+        let priorityText = programMilestoneDraftPriorityText
+            .trimmingCharacters(in: .whitespaces)
+        guard let priority = Int(priorityText), (-100 ... 100).contains(priority) else {
+            programStatus = "Milestone priority must be between -100 and 100."
+            return
+        }
+        let attemptsText = programMilestoneDraftMaxAttemptsText
+            .trimmingCharacters(in: .whitespaces)
+        guard let maxAttempts = UInt32(attemptsText), (1 ... 5).contains(maxAttempts) else {
+            programStatus = "Milestone max attempts must be between 1 and 5."
+            return
+        }
+        let tokenText = programMilestoneDraftTokenBudget
+            .trimmingCharacters(in: .whitespaces)
+        let tokenBudget = tokenText.isEmpty ? nil : UInt64(tokenText)
+        if !tokenText.isEmpty, tokenBudget == nil || tokenBudget == 0 {
+            programStatus = "Milestone token budget must be a positive whole number."
+            return
+        }
+        let costText = programMilestoneDraftCostBudget
+            .trimmingCharacters(in: .whitespaces)
+        let costBudget = costText.isEmpty ? nil : Double(costText)
+        if !costText.isEmpty, costBudget == nil || costBudget! <= 0 {
+            programStatus = "Milestone cost budget must be a positive number."
+            return
+        }
+        let scope = parseIntakeItems(programMilestoneDraftScope)
+        let deps = programMilestoneDraftDeps.sorted()
+        programBusy = true
+        defer { programBusy = false }
+        do {
+            _ = try await core.createProgramMilestone(
+                programID: programID,
+                key: nil,
+                title: title,
+                objective: objective,
+                acceptance: acceptance,
+                deps: deps,
+                priority: priority,
+                maxAttempts: maxAttempts,
+                profile: programMilestoneDraftProfile,
+                writeScope: scope,
+                tokenBudget: tokenBudget,
+                costBudgetUsd: costBudget
+            )
+            clearProgramMilestoneDraft()
+            programStatus = "Milestone added."
+            await loadPrograms(silent: true)
+            await loadProgramDetail(silent: true)
+        } catch {
+            programStatus = error.localizedDescription
+        }
+    }
+
+    func toggleProgramMilestoneDependency(_ id: String) {
+        if programMilestoneDraftDeps.contains(id) {
+            programMilestoneDraftDeps.remove(id)
+        } else {
+            programMilestoneDraftDeps.insert(id)
+        }
+    }
+
+    func clearProgramMilestoneDraft() {
+        programMilestoneDraftTitle = ""
+        programMilestoneDraftObjective = ""
+        programMilestoneDraftAcceptance = ""
+        programMilestoneDraftScope = "src"
+        programMilestoneDraftPriorityText = "0"
+        programMilestoneDraftMaxAttemptsText = "2"
+        programMilestoneDraftProfile = "coding"
+        programMilestoneDraftTokenBudget = ""
+        programMilestoneDraftCostBudget = ""
+        programMilestoneDraftDeps = []
+    }
+
+    func pauseProgram(_ program: ProjectProgram) async {
+        programActionBusyID = program.id
+        defer { programActionBusyID = nil }
+        do {
+            _ = try await core.pauseProgram(id: program.id, reason: "paused from Manage Dash")
+            programStatus = "Program paused; in-flight work continues."
+            await loadPrograms(silent: true)
+            await loadProgramDetail(silent: true)
+        } catch {
+            programStatus = error.localizedDescription
+        }
+    }
+
+    func resumeProgram(_ program: ProjectProgram) async {
+        programActionBusyID = program.id
+        defer { programActionBusyID = nil }
+        do {
+            _ = try await core.resumeProgram(id: program.id)
+            programStatus = "Program resumed."
+            await loadPrograms(silent: true)
+            await loadProgramDetail(silent: true)
+        } catch {
+            programStatus = error.localizedDescription
+        }
+    }
+
+    func cancelProgram(_ program: ProjectProgram) async {
+        programActionBusyID = program.id
+        defer { programActionBusyID = nil }
+        do {
+            _ = try await core.cancelProgram(
+                id: program.id,
+                reason: "cancelled from Manage Dash"
+            )
+            programStatus = "Program cancelled; all non-terminal milestones were cancelled."
+            await loadPrograms(silent: true)
+            await loadProgramDetail(silent: true)
+        } catch {
+            programStatus = error.localizedDescription
+        }
+    }
+
+    func deleteProgram(_ program: ProjectProgram) async {
+        programActionBusyID = program.id
+        defer { programActionBusyID = nil }
+        do {
+            _ = try await core.deleteProgram(id: program.id)
+            if selectedProgramID == program.id {
+                selectedProgramID = nil
+                programDetail = nil
+            }
+            programStatus = "Program deleted."
+            await loadPrograms(silent: true)
+        } catch {
+            programStatus = error.localizedDescription
+        }
+    }
+
+    func retryProgramMilestone(_ milestone: ProgramMilestone) async {
+        programActionBusyID = milestone.id
+        defer { programActionBusyID = nil }
+        do {
+            _ = try await core.retryProgramMilestone(id: milestone.id)
+            programStatus = "Milestone reset for another attempt."
+            await loadProgramDetail(silent: true)
+            await loadPrograms(silent: true)
+        } catch {
+            programStatus = error.localizedDescription
+        }
+    }
+
+    func skipProgramMilestone(_ milestone: ProgramMilestone) async {
+        programActionBusyID = milestone.id
+        defer { programActionBusyID = nil }
+        do {
+            _ = try await core.skipProgramMilestone(
+                id: milestone.id,
+                reason: "skipped from Manage Dash"
+            )
+            programStatus = "Milestone skipped."
+            await loadProgramDetail(silent: true)
+            await loadPrograms(silent: true)
+        } catch {
+            programStatus = error.localizedDescription
+        }
+    }
+
+    func startProgramMilestone(_ milestone: ProgramMilestone) async {
+        programActionBusyID = milestone.id
+        defer { programActionBusyID = nil }
+        do {
+            _ = try await core.startProgramMilestone(id: milestone.id)
+            programStatus = "Milestone dispatched through the normal verifier path."
+            await loadProgramDetail(silent: true)
+            await loadPrograms(silent: true)
+            await loadSessions()
+        } catch {
+            programStatus = error.localizedDescription
+        }
     }
 
     private func parseIntakeItems(_ text: String) -> [String] {

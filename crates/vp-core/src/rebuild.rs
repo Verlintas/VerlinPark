@@ -106,6 +106,15 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
                 }
                 store.insert_intake_task_snapshot(&task)?;
             }
+            for program in &snapshot.programs {
+                store.insert_program_snapshot(program)?;
+            }
+            for milestone in &snapshot.program_milestones {
+                store.insert_program_milestone_snapshot(milestone)?;
+            }
+            for event in &snapshot.program_events {
+                store.insert_program_event_snapshot(event)?;
+            }
         }
         let engine = Engine::new(store);
         match engine.restore_sources_from_disk().await {
@@ -531,5 +540,114 @@ mod tests {
         assert!(report.backup.is_none());
         assert!(database.exists());
         assert_eq!(std::fs::metadata(&database).unwrap().len(), before);
+    }
+}
+
+#[cfg(test)]
+mod program_rebuild_tests {
+    use super::*;
+    use crate::Engine;
+    use crate::program::ProgramController;
+    use std::path::Path;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn init_repo(path: &Path) {
+        std::fs::write(path.join("README.md"), "hello\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@verlinpark.local"],
+            vec!["config", "user.name", "VerlinPark Test"],
+            vec!["add", "."],
+            vec!["commit", "-q", "-m", "initial"],
+        ] {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+    }
+
+    #[tokio::test]
+    async fn rebuilds_program_ledger_and_events_from_the_project_manifest() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let (project_id, program_id) = {
+            let engine = Engine::new(Store::open(data.path()).unwrap());
+            let project = engine
+                .add_project(
+                    repo.path().to_string_lossy().to_string(),
+                    Some("program-rebuild".into()),
+                )
+                .await
+                .unwrap();
+            let program = engine
+                .create_program(vp_protocol::types::ProgramCreateParams {
+                    project_id: project.id.clone(),
+                    goal: "Rebuild the program ledger".into(),
+                    policy: Some(vp_protocol::types::ProgramPolicy {
+                        auto_dispatch: false,
+                        max_attempts: 3,
+                        retry_backoff_secs: 30,
+                        dependency_failure: vp_protocol::types::DependencyFailurePolicy::Block,
+                        token_budget: Some(50_000),
+                        cost_budget_usd: Some(5.0),
+                        max_parallel_milestones: 2,
+                    }),
+                    token_budget: Some(100_000),
+                    cost_budget_usd: Some(10.0),
+                    activate: true,
+                })
+                .await
+                .unwrap();
+            engine
+                .create_program_milestone(vp_protocol::types::ProgramMilestoneCreateParams {
+                    program_id: program.id.clone(),
+                    key: Some("1".into()),
+                    title: "Survives rebuild".into(),
+                    objective: "Keep the ledger event-backed.".into(),
+                    acceptance: vec!["row and event exist".into()],
+                    deps: Vec::new(),
+                    priority: Some(4),
+                    max_attempts: Some(3),
+                    profile: Some("coding".into()),
+                    write_scope: vec!["src".into()],
+                    token_budget: Some(10_000),
+                    cost_budget_usd: None,
+                })
+                .await
+                .unwrap();
+            engine.record_project_manifest().await.unwrap();
+            (project.id, program.id)
+        };
+
+        let report = rebuild_database(data.path(), false).await.unwrap();
+        assert_eq!(report.projects, 1);
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        let store = Store::open(data.path()).unwrap();
+        let program = store.get_program(&program_id).unwrap().unwrap();
+        assert_eq!(program.project_id, project_id);
+        assert_eq!(program.goal, "Rebuild the program ledger");
+        assert_eq!(program.token_budget, Some(100_000));
+        assert_eq!(program.status, vp_protocol::types::ProgramStatus::Active);
+        assert!(!program.archived);
+        let milestones = store.list_program_milestones(&program_id).unwrap();
+        assert_eq!(milestones.len(), 1);
+        assert_eq!(milestones[0].title, "Survives rebuild");
+        assert_eq!(milestones[0].max_attempts, 3);
+        let events = store.list_program_events(&program_id, Some(100)).unwrap();
+        assert!(events.iter().any(|event| event.kind == "program.created"));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "program.milestone.created")
+        );
+        let controller = ProgramController::new(store);
+        let replay = controller.replay(&program_id, false).unwrap();
+        assert!(replay.consistent, "{:?}", replay.mismatches);
     }
 }

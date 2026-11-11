@@ -402,6 +402,7 @@ struct DashboardView: View {
             QuestionCenterCard()
         case .team:
             AgentsCard()
+            ProgramsCard()
             IntakeTasksCard()
             OrchestrationOverviewCard()
             if let status = model.longTaskStatus, !status.isEmpty {

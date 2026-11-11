@@ -11315,3 +11315,223 @@ async fn prompt_operation_failed_can_be_retried_with_the_same_id() {
         .unwrap();
     assert_eq!(requests.lock().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn program_tick_creates_one_session_and_never_duplicates_it() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let program = engine
+        .create_program(vp_protocol::types::ProgramCreateParams {
+            project_id: project.id.clone(),
+            goal: "Program dispatch".into(),
+            policy: Some(vp_protocol::types::ProgramPolicy {
+                auto_dispatch: true,
+                max_attempts: 2,
+                retry_backoff_secs: 60,
+                dependency_failure: vp_protocol::types::DependencyFailurePolicy::Block,
+                token_budget: None,
+                cost_budget_usd: None,
+                max_parallel_milestones: 1,
+            }),
+            token_budget: None,
+            cost_budget_usd: None,
+            activate: true,
+        })
+        .await
+        .unwrap();
+    let milestone = engine
+        .create_program_milestone(vp_protocol::types::ProgramMilestoneCreateParams {
+            program_id: program.id.clone(),
+            key: Some("1".into()),
+            title: "Dispatch once".into(),
+            objective: "Create exactly one normal session.".into(),
+            acceptance: vec!["one session exists".into()],
+            deps: Vec::new(),
+            priority: Some(0),
+            max_attempts: Some(2),
+            profile: Some("coding".into()),
+            write_scope: vec!["src".into()],
+            token_budget: None,
+            cost_budget_usd: None,
+        })
+        .await
+        .unwrap();
+
+    let tick = service.reconcile_programs(Some(&project.id)).await.unwrap();
+    assert_eq!(tick.sessions_started, 1);
+    let sessions = engine
+        .list_sessions(Some(project.id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(sessions.len(), 1);
+    let stored = engine
+        .store()
+        .get_program_milestone(&milestone.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.session_id.as_deref(), Some(sessions[0].id.as_str()));
+    assert_eq!(stored.plan_revision, Some(1));
+
+    let tick = service.reconcile_programs(Some(&project.id)).await.unwrap();
+    assert_eq!(tick.sessions_started, 0);
+    assert_eq!(
+        engine
+            .list_sessions(Some(project.id.clone()))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    service.cancel(&sessions[0].id);
+}
+
+#[tokio::test]
+async fn cancelling_a_program_cancels_every_non_terminal_milestone() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let program = engine
+        .create_program(vp_protocol::types::ProgramCreateParams {
+            project_id: project.id.clone(),
+            goal: "Cancel ledger".into(),
+            policy: Some(vp_protocol::types::ProgramPolicy {
+                auto_dispatch: false,
+                max_attempts: 2,
+                retry_backoff_secs: 60,
+                dependency_failure: vp_protocol::types::DependencyFailurePolicy::Block,
+                token_budget: None,
+                cost_budget_usd: None,
+                max_parallel_milestones: 2,
+            }),
+            token_budget: None,
+            cost_budget_usd: None,
+            activate: true,
+        })
+        .await
+        .unwrap();
+    let first = engine
+        .create_program_milestone(vp_protocol::types::ProgramMilestoneCreateParams {
+            program_id: program.id.clone(),
+            key: Some("1".into()),
+            title: "Pending work".into(),
+            objective: "Never starts".into(),
+            acceptance: vec!["done".into()],
+            deps: Vec::new(),
+            priority: Some(0),
+            max_attempts: Some(2),
+            profile: Some("coding".into()),
+            write_scope: Vec::new(),
+            token_budget: None,
+            cost_budget_usd: None,
+        })
+        .await
+        .unwrap();
+    let second = engine
+        .create_program_milestone(vp_protocol::types::ProgramMilestoneCreateParams {
+            program_id: program.id.clone(),
+            key: Some("2".into()),
+            title: "Dependent work".into(),
+            objective: "Never starts".into(),
+            acceptance: vec!["done".into()],
+            deps: vec![first.id.clone()],
+            priority: Some(0),
+            max_attempts: Some(2),
+            profile: Some("coding".into()),
+            write_scope: Vec::new(),
+            token_budget: None,
+            cost_budget_usd: None,
+        })
+        .await
+        .unwrap();
+
+    let cancelled = service
+        .cancel_program(&program.id, "operator stop")
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status, vp_protocol::types::ProgramStatus::Failed);
+    assert!(cancelled.reason.unwrap().contains("operator stop"));
+    for milestone in [first, second] {
+        let stored = engine
+            .store()
+            .get_program_milestone(&milestone.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.status,
+            vp_protocol::types::ProgramMilestoneStatus::Cancelled
+        );
+        assert!(stored.last_error.unwrap().contains("program cancelled"));
+    }
+    let events = engine
+        .store()
+        .list_program_events(&program.id, Some(100))
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .filter(|event| event.kind == "program.milestone.cancelled")
+            .count()
+            >= 2
+    );
+    assert!(events.iter().any(|event| event.kind == "program.failed"));
+}
+
+#[tokio::test]
+async fn program_start_fails_before_claim_without_a_provider() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let program = engine
+        .create_program(vp_protocol::types::ProgramCreateParams {
+            project_id: project.id.clone(),
+            goal: "No provider".into(),
+            policy: Some(vp_protocol::types::ProgramPolicy {
+                auto_dispatch: true,
+                max_attempts: 2,
+                retry_backoff_secs: 60,
+                dependency_failure: vp_protocol::types::DependencyFailurePolicy::Block,
+                token_budget: None,
+                cost_budget_usd: None,
+                max_parallel_milestones: 1,
+            }),
+            token_budget: None,
+            cost_budget_usd: None,
+            activate: true,
+        })
+        .await
+        .unwrap();
+    let milestone = engine
+        .create_program_milestone(vp_protocol::types::ProgramMilestoneCreateParams {
+            program_id: program.id.clone(),
+            key: Some("1".into()),
+            title: "Never claimed".into(),
+            objective: "Do not spend an attempt".into(),
+            acceptance: vec!["done".into()],
+            deps: Vec::new(),
+            priority: Some(0),
+            max_attempts: Some(2),
+            profile: Some("coding".into()),
+            write_scope: Vec::new(),
+            token_budget: None,
+            cost_budget_usd: None,
+        })
+        .await
+        .unwrap();
+    let config = service.config.write().unwrap().take();
+    let error = service
+        .start_program_milestone(&milestone.id)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("provider is not configured"));
+    assert!(service.config.write().unwrap().is_none());
+    *service.config.write().unwrap() = config;
+    let stored = engine
+        .store()
+        .get_program_milestone(&milestone.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.status,
+        vp_protocol::types::ProgramMilestoneStatus::Pending
+    );
+    assert_eq!(stored.attempts, 0);
+    assert!(stored.session_id.is_none());
+}

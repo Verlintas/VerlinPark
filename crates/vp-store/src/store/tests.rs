@@ -4720,3 +4720,349 @@ fn startup_marks_pending_session_operations_unknown() {
     );
     assert_eq!(store.mark_pending_session_operations_unknown().unwrap(), 0);
 }
+
+fn program_input(project_id: &str, status: ProgramStatus) -> NewProgram {
+    NewProgram {
+        project_id: project_id.to_string(),
+        goal: "Program goal".into(),
+        policy: ProgramPolicy {
+            auto_dispatch: true,
+            max_attempts: 3,
+            retry_backoff_secs: 30,
+            dependency_failure: vp_protocol::types::DependencyFailurePolicy::Block,
+            token_budget: Some(50_000),
+            cost_budget_usd: Some(5.0),
+            max_parallel_milestones: 2,
+        },
+        token_budget: Some(100_000),
+        cost_budget_usd: Some(10.0),
+        status,
+        archived: false,
+    }
+}
+
+fn milestone_input(program_id: &str, key: &str, deps: Vec<String>) -> NewProgramMilestone {
+    NewProgramMilestone {
+        program_id: program_id.to_string(),
+        key: key.to_string(),
+        title: format!("Milestone {key}"),
+        objective: "Deliver the milestone".into(),
+        acceptance: vec!["accepted".into()],
+        deps,
+        priority: 3,
+        max_attempts: 2,
+        profile: "coding".into(),
+        write_scope: vec!["src".into()],
+        token_budget: Some(20_000),
+        cost_budget_usd: None,
+    }
+}
+
+#[test]
+fn program_rows_round_trip_with_full_row_events() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("programs"))
+        .unwrap();
+    let (program, created) = store
+        .create_program(&program_input(&project.id, ProgramStatus::Active))
+        .unwrap();
+    assert_eq!(created.seq, 1);
+    assert_eq!(created.kind, "program.created");
+    let created_payload: Program = serde_json::from_value(created.payload).unwrap();
+    assert_eq!(created_payload, program);
+
+    let (first, first_event) = store
+        .create_program_milestone(&milestone_input(&program.id, "1", Vec::new()))
+        .unwrap();
+    let (second, second_event) = store
+        .create_program_milestone(&milestone_input(&program.id, "2", vec![first.id.clone()]))
+        .unwrap();
+    assert_eq!(first_event.seq, 2);
+    assert_eq!(second_event.seq, 3);
+    assert_eq!(second.deps, vec![first.id.clone()]);
+
+    let update = ProgramUpdate {
+        goal: "Updated program goal".into(),
+        policy: program.policy.clone(),
+        token_budget: Some(200_000),
+        cost_budget_usd: Some(20.0),
+    };
+    let (updated, update_event) = store.update_program(&program.id, &update).unwrap().unwrap();
+    assert_eq!(updated.goal, "Updated program goal");
+    assert_eq!(update_event.seq, 4);
+    assert_eq!(update_event.kind, "program.updated");
+
+    let listed = store
+        .list_programs(Some(&project.id), Some(ProgramStatus::Active), Some(10))
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].token_budget, Some(200_000));
+    let milestones = store.list_program_milestones(&program.id).unwrap();
+    assert_eq!(milestones.len(), 2);
+    assert_eq!(milestones[0].key, "1");
+    assert_eq!(milestones[1].key, "2");
+    let events = store.list_program_events(&program.id, Some(100)).unwrap();
+    assert_eq!(events.len(), 4);
+    assert_eq!(events[0].kind, "program.created");
+    assert_eq!(events[3].kind, "program.updated");
+    assert_eq!(
+        events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
+    );
+}
+
+#[test]
+fn program_claim_respects_dependencies_attempts_and_backoff() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("claim"))
+        .unwrap();
+    let (program, _) = store
+        .create_program(&program_input(&project.id, ProgramStatus::Active))
+        .unwrap();
+    let (first, _) = store
+        .create_program_milestone(&milestone_input(&program.id, "1", Vec::new()))
+        .unwrap();
+    let (second, _) = store
+        .create_program_milestone(&milestone_input(&program.id, "2", vec![first.id.clone()]))
+        .unwrap();
+
+    assert!(
+        store
+            .claim_program_milestone_start(&second.id)
+            .unwrap()
+            .is_none(),
+        "dependency must be complete before claiming the child"
+    );
+    let (claimed, started) = store
+        .claim_program_milestone_start(&first.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.status, ProgramMilestoneStatus::Running);
+    assert_eq!(claimed.attempts, 1);
+    assert_eq!(started.kind, "program.milestone.started");
+    assert!(
+        store
+            .claim_program_milestone_start(&first.id)
+            .unwrap()
+            .is_none(),
+        "a running milestone cannot be claimed twice"
+    );
+
+    store.mark_program_milestone_verifying(&first.id).unwrap();
+    store.complete_program_milestone(&first.id, "done").unwrap();
+    let (child, _) = store
+        .claim_program_milestone_start(&second.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(child.status, ProgramMilestoneStatus::Running);
+    assert_eq!(child.attempts, 1);
+
+    let (third, _) = store
+        .create_program_milestone(&milestone_input(&program.id, "3", Vec::new()))
+        .unwrap();
+    let _ = store
+        .claim_program_milestone_start(&third.id)
+        .unwrap()
+        .unwrap();
+    let future = (time::OffsetDateTime::now_utc() + time::Duration::hours(1))
+        .format(&Rfc3339)
+        .unwrap();
+    store
+        .fail_program_milestone(&third.id, "test failure", Some(&future))
+        .unwrap();
+    assert!(
+        store
+            .claim_program_milestone_start(&third.id)
+            .unwrap()
+            .is_none(),
+        "a failed milestone inside its backoff window is not runnable"
+    );
+    let row = store.get_program_milestone(&third.id).unwrap().unwrap();
+    assert_eq!(row.status, ProgramMilestoneStatus::Failed);
+    assert_eq!(row.next_attempt_at.as_deref(), Some(future.as_str()));
+
+    store.pause_program(&program.id, Some("pause")).unwrap();
+    let (fourth, _) = store
+        .create_program_milestone(&milestone_input(&program.id, "4", Vec::new()))
+        .unwrap();
+    assert!(
+        store
+            .claim_program_milestone_start(&fourth.id)
+            .unwrap()
+            .is_none(),
+        "a paused program cannot claim new work"
+    );
+    store.resume_program(&program.id).unwrap();
+    assert!(
+        store
+            .claim_program_milestone_start(&fourth.id)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn program_usage_counts_each_linked_session_once() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("usage"))
+        .unwrap();
+    let (program, _) = store
+        .create_program(&program_input(&project.id, ProgramStatus::Active))
+        .unwrap();
+    let session = store
+        .create_session(&project.id, "program session")
+        .unwrap();
+    store.add_session_usage(&session.id, 120, 30).unwrap();
+    store.add_session_cost_with_event(&session.id, 1.5).unwrap();
+    let mut first = store
+        .create_program_milestone(&milestone_input(&program.id, "1", Vec::new()))
+        .unwrap()
+        .0;
+    let mut second = store
+        .create_program_milestone(&milestone_input(&program.id, "2", Vec::new()))
+        .unwrap()
+        .0;
+    first.session_id = Some(session.id.clone());
+    second.session_id = Some(session.id.clone());
+    store.insert_program_milestone_snapshot(&first).unwrap();
+    store.insert_program_milestone_snapshot(&second).unwrap();
+    let usage = store.program_usage(&program.id).unwrap();
+    assert_eq!(usage.token_spent, 150);
+    assert!((usage.cost_spent_usd - 1.5).abs() < 1e-9);
+    assert_eq!(
+        store.count_active_program_milestones(&program.id).unwrap(),
+        0
+    );
+}
+
+#[test]
+fn project_manifest_round_trips_program_rows_policy_and_events() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("manifest"))
+        .unwrap();
+    let (program, _) = store
+        .create_program(&program_input(&project.id, ProgramStatus::Active))
+        .unwrap();
+    store
+        .create_program_milestone(&milestone_input(&program.id, "1.1", Vec::new()))
+        .unwrap();
+    store.record_project_manifest().unwrap();
+    let snapshots = read_project_manifest(store.data_dir()).unwrap();
+    assert_eq!(snapshots.len(), 1);
+    let snapshot = &snapshots[0];
+    assert_eq!(snapshot.programs.len(), 1);
+    assert_eq!(snapshot.programs[0].id, program.id);
+    assert!(snapshot.programs[0].policy.auto_dispatch);
+    assert_eq!(snapshot.programs[0].policy.max_attempts, 3);
+    assert_eq!(snapshot.program_milestones.len(), 1);
+    assert_eq!(snapshot.program_milestones[0].key, "1.1");
+    assert!(
+        snapshot
+            .program_events
+            .iter()
+            .any(|event| event.kind == "program.created")
+    );
+}
+
+#[test]
+fn program_delete_tombstones_without_erasing_the_event_log() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("delete"))
+        .unwrap();
+    let (program, _) = store
+        .create_program(&program_input(&project.id, ProgramStatus::Draft))
+        .unwrap();
+    store
+        .create_program_milestone(&milestone_input(&program.id, "1", Vec::new()))
+        .unwrap();
+    assert!(store.get_program(&program.id).unwrap().is_some());
+    assert!(store.delete_program(&program.id).unwrap());
+    assert!(store.get_program(&program.id).unwrap().is_none());
+    assert!(
+        store
+            .list_program_milestones(&program.id)
+            .unwrap()
+            .is_empty()
+    );
+    let events = store.list_program_events(&program.id, Some(100)).unwrap();
+    assert!(events.iter().any(|event| event.kind == "program.deleted"));
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "program.milestone.created")
+    );
+}
+
+#[test]
+fn program_event_sequences_are_independent_per_program() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("sequences"))
+        .unwrap();
+    let (first, _) = store
+        .create_program(&program_input(&project.id, ProgramStatus::Active))
+        .unwrap();
+    let (second, _) = store
+        .create_program(&program_input(&project.id, ProgramStatus::Draft))
+        .unwrap();
+    store
+        .create_program_milestone(&milestone_input(&first.id, "1", Vec::new()))
+        .unwrap();
+    store
+        .create_program_milestone(&milestone_input(&second.id, "1", Vec::new()))
+        .unwrap();
+    store
+        .create_program_milestone(&milestone_input(&first.id, "2", Vec::new()))
+        .unwrap();
+    let first_events = store.list_program_events(&first.id, Some(100)).unwrap();
+    let second_events = store.list_program_events(&second.id, Some(100)).unwrap();
+    assert_eq!(
+        first_events
+            .iter()
+            .map(|event| event.seq)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        second_events
+            .iter()
+            .map(|event| event.seq)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert!(
+        first_events
+            .iter()
+            .all(|event| event.program_id == first.id)
+    );
+    assert!(
+        second_events
+            .iter()
+            .all(|event| event.program_id == second.id)
+    );
+    let project_events = store
+        .list_program_events_for_project(&project.id, None)
+        .unwrap();
+    assert_eq!(project_events.len(), 5);
+    let appended = store
+        .append_program_event(
+            &project.id,
+            &first.id,
+            "program.updated",
+            &serde_json::to_value(&first).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(appended.seq, 4);
+    assert_eq!(
+        store
+            .list_program_events(&second.id, Some(100))
+            .unwrap()
+            .len(),
+        2
+    );
+}

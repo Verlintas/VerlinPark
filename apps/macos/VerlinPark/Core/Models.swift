@@ -2695,6 +2695,444 @@ struct IntakeDeleteResult: Codable, Sendable {
     let deleted: Bool
 }
 
+struct ProgramPolicy: Codable, Hashable, Sendable {
+    var autoDispatch: Bool
+    var maxAttempts: UInt32
+    var retryBackoffSecs: UInt64
+    var dependencyFailure: String
+    var tokenBudget: UInt64?
+    var costBudgetUsd: Double?
+    var maxParallelMilestones: Int
+
+    static let draft = ProgramPolicy(
+        autoDispatch: false,
+        maxAttempts: 2,
+        retryBackoffSecs: 60,
+        dependencyFailure: "block",
+        tokenBudget: nil,
+        costBudgetUsd: nil,
+        maxParallelMilestones: 2
+    )
+
+    init(
+        autoDispatch: Bool,
+        maxAttempts: UInt32,
+        retryBackoffSecs: UInt64,
+        dependencyFailure: String,
+        tokenBudget: UInt64?,
+        costBudgetUsd: Double?,
+        maxParallelMilestones: Int
+    ) {
+        self.autoDispatch = autoDispatch
+        self.maxAttempts = maxAttempts
+        self.retryBackoffSecs = retryBackoffSecs
+        self.dependencyFailure = dependencyFailure
+        self.tokenBudget = tokenBudget
+        self.costBudgetUsd = costBudgetUsd
+        self.maxParallelMilestones = maxParallelMilestones
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case autoDispatch = "auto_dispatch"
+        case maxAttempts = "max_attempts"
+        case retryBackoffSecs = "retry_backoff_secs"
+        case dependencyFailure = "dependency_failure"
+        case tokenBudget = "token_budget"
+        case costBudgetUsd = "cost_budget_usd"
+        case maxParallelMilestones = "max_parallel_milestones"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        autoDispatch = try container.decodeIfPresent(Bool.self, forKey: .autoDispatch) ?? false
+        maxAttempts = try container.decodeIfPresent(UInt32.self, forKey: .maxAttempts) ?? 2
+        retryBackoffSecs = try container.decodeIfPresent(UInt64.self, forKey: .retryBackoffSecs) ?? 60
+        dependencyFailure = try container.decodeIfPresent(String.self, forKey: .dependencyFailure)
+            ?? "block"
+        tokenBudget = try container.decodeIfPresent(UInt64.self, forKey: .tokenBudget)
+        costBudgetUsd = try container.decodeIfPresent(Double.self, forKey: .costBudgetUsd)
+        maxParallelMilestones = try container.decodeIfPresent(
+            Int.self,
+            forKey: .maxParallelMilestones
+        ) ?? 2
+    }
+
+    var jsonValue: JSONValue {
+        .object([
+            "auto_dispatch": .bool(autoDispatch),
+            "max_attempts": .number(Double(maxAttempts)),
+            "retry_backoff_secs": .number(Double(retryBackoffSecs)),
+            "dependency_failure": .string(dependencyFailure),
+            "token_budget": tokenBudget.map { .number(Double($0)) } ?? .null,
+            "cost_budget_usd": costBudgetUsd.map { .number($0) } ?? .null,
+            "max_parallel_milestones": .number(Double(maxParallelMilestones)),
+        ])
+    }
+}
+
+struct ProjectProgram: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let projectID: String
+    let goal: String
+    let status: String
+    let policy: ProgramPolicy
+    let tokenBudget: UInt64?
+    let costBudgetUsd: Double?
+    let reason: String?
+    let archived: Bool
+    let createdAt: String
+    let updatedAt: String
+    let completedAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case projectID = "project_id"
+        case goal
+        case status
+        case policy
+        case tokenBudget = "token_budget"
+        case costBudgetUsd = "cost_budget_usd"
+        case reason
+        case archived
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+        case completedAt = "completed_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        projectID = try container.decode(String.self, forKey: .projectID)
+        goal = try container.decode(String.self, forKey: .goal)
+        status = try container.decode(String.self, forKey: .status)
+        policy = try container.decodeIfPresent(ProgramPolicy.self, forKey: .policy) ?? .draft
+        tokenBudget = try container.decodeIfPresent(UInt64.self, forKey: .tokenBudget)
+        costBudgetUsd = try container.decodeIfPresent(Double.self, forKey: .costBudgetUsd)
+        reason = try container.decodeIfPresent(String.self, forKey: .reason)
+        archived = try container.decodeIfPresent(Bool.self, forKey: .archived) ?? false
+        createdAt = try container.decode(String.self, forKey: .createdAt)
+        updatedAt = try container.decode(String.self, forKey: .updatedAt)
+        completedAt = try container.decodeIfPresent(String.self, forKey: .completedAt)
+    }
+
+    var isActive: Bool {
+        status == "active"
+    }
+
+    var isTerminal: Bool {
+        status == "completed" || status == "failed"
+    }
+
+    var canPause: Bool {
+        isActive && !archived
+    }
+
+    var canResume: Bool {
+        (status == "paused" || status == "draft") && !archived
+    }
+
+    var canDelete: Bool {
+        !archived && (status == "draft" || isTerminal)
+    }
+}
+
+struct ProgramMilestone: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let programID: String
+    let key: String
+    let title: String
+    let objective: String
+    let acceptance: [String]
+    let deps: [String]
+    let priority: Int
+    let status: String
+    let sessionID: String?
+    let planRevision: UInt32?
+    let attempts: UInt32
+    let maxAttempts: UInt32
+    let nextAttemptAt: String?
+    let result: String?
+    let lastError: String?
+    let profile: String
+    let writeScope: [String]
+    let tokenBudget: UInt64?
+    let costBudgetUsd: Double?
+    let createdAt: String
+    let updatedAt: String
+    let completedAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case programID = "program_id"
+        case key
+        case title
+        case objective
+        case acceptance
+        case deps
+        case priority
+        case status
+        case sessionID = "session_id"
+        case planRevision = "plan_revision"
+        case attempts
+        case maxAttempts = "max_attempts"
+        case nextAttemptAt = "next_attempt_at"
+        case result
+        case lastError = "last_error"
+        case profile
+        case writeScope = "write_scope"
+        case tokenBudget = "token_budget"
+        case costBudgetUsd = "cost_budget_usd"
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+        case completedAt = "completed_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        programID = try container.decode(String.self, forKey: .programID)
+        key = try container.decode(String.self, forKey: .key)
+        title = try container.decode(String.self, forKey: .title)
+        objective = try container.decode(String.self, forKey: .objective)
+        acceptance = try container.decodeIfPresent([String].self, forKey: .acceptance) ?? []
+        deps = try container.decodeIfPresent([String].self, forKey: .deps) ?? []
+        priority = try container.decodeIfPresent(Int.self, forKey: .priority) ?? 0
+        status = try container.decode(String.self, forKey: .status)
+        sessionID = try container.decodeIfPresent(String.self, forKey: .sessionID)
+        planRevision = try container.decodeIfPresent(UInt32.self, forKey: .planRevision)
+        attempts = try container.decodeIfPresent(UInt32.self, forKey: .attempts) ?? 0
+        maxAttempts = try container.decodeIfPresent(UInt32.self, forKey: .maxAttempts) ?? 2
+        nextAttemptAt = try container.decodeIfPresent(String.self, forKey: .nextAttemptAt)
+        result = try container.decodeIfPresent(String.self, forKey: .result)
+        lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
+        profile = try container.decodeIfPresent(String.self, forKey: .profile) ?? "coding"
+        writeScope = try container.decodeIfPresent([String].self, forKey: .writeScope) ?? []
+        tokenBudget = try container.decodeIfPresent(UInt64.self, forKey: .tokenBudget)
+        costBudgetUsd = try container.decodeIfPresent(Double.self, forKey: .costBudgetUsd)
+        createdAt = try container.decode(String.self, forKey: .createdAt)
+        updatedAt = try container.decode(String.self, forKey: .updatedAt)
+        completedAt = try container.decodeIfPresent(String.self, forKey: .completedAt)
+    }
+
+    var isActive: Bool {
+        status == "running" || status == "verifying"
+    }
+
+    var isTerminal: Bool {
+        ["completed", "blocked", "cancelled"].contains(status)
+    }
+
+    var canRetry: Bool {
+        ["failed", "blocked", "cancelled"].contains(status)
+    }
+
+    var canStart: Bool {
+        ["pending", "ready", "failed"].contains(status) && attempts < maxAttempts
+    }
+
+    var canSkip: Bool {
+        !isTerminal && !isActive
+    }
+}
+
+struct ProgramMilestoneCounts: Codable, Hashable, Sendable {
+    let pending: Int
+    let ready: Int
+    let running: Int
+    let verifying: Int
+    let completed: Int
+    let failed: Int
+    let blocked: Int
+    let cancelled: Int
+
+    enum CodingKeys: String, CodingKey {
+        case pending
+        case ready
+        case running
+        case verifying
+        case completed
+        case failed
+        case blocked
+        case cancelled
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        pending = try container.decodeIfPresent(Int.self, forKey: .pending) ?? 0
+        ready = try container.decodeIfPresent(Int.self, forKey: .ready) ?? 0
+        running = try container.decodeIfPresent(Int.self, forKey: .running) ?? 0
+        verifying = try container.decodeIfPresent(Int.self, forKey: .verifying) ?? 0
+        completed = try container.decodeIfPresent(Int.self, forKey: .completed) ?? 0
+        failed = try container.decodeIfPresent(Int.self, forKey: .failed) ?? 0
+        blocked = try container.decodeIfPresent(Int.self, forKey: .blocked) ?? 0
+        cancelled = try container.decodeIfPresent(Int.self, forKey: .cancelled) ?? 0
+    }
+
+    var total: Int {
+        pending + ready + running + verifying + completed + failed + blocked + cancelled
+    }
+
+    var active: Int {
+        running + verifying
+    }
+}
+
+struct ProgramListEntry: Codable, Identifiable, Hashable, Sendable {
+    let program: ProjectProgram
+    let counts: ProgramMilestoneCounts
+
+    var id: String {
+        program.id
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case program
+        case counts
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        program = try container.decode(ProjectProgram.self, forKey: .program)
+        counts = try container.decodeIfPresent(
+            ProgramMilestoneCounts.self,
+            forKey: .counts
+        ) ?? ProgramMilestoneCounts.empty
+    }
+}
+
+extension ProgramMilestoneCounts {
+    static let empty = try! JSONDecoder().decode(
+        ProgramMilestoneCounts.self,
+        from: Data("{}".utf8)
+    )
+}
+
+struct ProgramListResult: Codable, Sendable {
+    let programs: [ProgramListEntry]
+}
+
+struct ProgramResult: Codable, Sendable {
+    let program: ProjectProgram
+}
+
+struct ProgramMilestoneResult: Codable, Sendable {
+    let milestone: ProgramMilestone
+}
+
+struct ProgramDeleteResult: Codable, Sendable {
+    let deleted: Bool
+}
+
+struct ProgramUsageSummary: Codable, Hashable, Sendable {
+    let tokenSpent: UInt64
+    let costSpentUsd: Double
+
+    enum CodingKeys: String, CodingKey {
+        case tokenSpent = "token_spent"
+        case costSpentUsd = "cost_spent_usd"
+    }
+
+    init(tokenSpent: UInt64, costSpentUsd: Double) {
+        self.tokenSpent = tokenSpent
+        self.costSpentUsd = costSpentUsd
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        tokenSpent = try container.decodeIfPresent(UInt64.self, forKey: .tokenSpent) ?? 0
+        costSpentUsd = try container.decodeIfPresent(Double.self, forKey: .costSpentUsd) ?? 0
+    }
+}
+
+struct ProgramEventRecord: Codable, Hashable, Identifiable, Sendable {
+    let programID: String
+    let projectID: String
+    let seq: UInt64
+    let type: String
+    let createdAt: String
+
+    var id: String {
+        "\(programID)-\(seq)"
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case programID = "program_id"
+        case projectID = "project_id"
+        case seq
+        case type
+        case createdAt = "created_at"
+    }
+}
+
+struct ProgramStatusResult: Codable, Sendable {
+    let program: ProjectProgram
+    let milestones: [ProgramMilestone]
+    let counts: ProgramMilestoneCounts
+    let usage: ProgramUsageSummary
+    let events: [ProgramEventRecord]
+
+    enum CodingKeys: String, CodingKey {
+        case program
+        case milestones
+        case counts
+        case usage
+        case events
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        program = try container.decode(ProjectProgram.self, forKey: .program)
+        milestones = try container.decodeIfPresent([ProgramMilestone].self, forKey: .milestones) ?? []
+        counts = try container.decodeIfPresent(
+            ProgramMilestoneCounts.self,
+            forKey: .counts
+        ) ?? ProgramMilestoneCounts.empty
+        usage = try container.decodeIfPresent(
+            ProgramUsageSummary.self,
+            forKey: .usage
+        ) ?? ProgramUsageSummary(tokenSpent: 0, costSpentUsd: 0)
+        events = try container.decodeIfPresent([ProgramEventRecord].self, forKey: .events) ?? []
+    }
+}
+
+struct ProgramReplayResult: Codable, Sendable {
+    let programID: String
+    let eventCount: Int
+    let programMatches: Bool
+    let milestonesMatch: Bool
+    let consistent: Bool
+    let repaired: Bool
+    let mismatches: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case programID = "program_id"
+        case eventCount = "event_count"
+        case programMatches = "program_matches"
+        case milestonesMatch = "milestones_match"
+        case consistent
+        case repaired
+        case mismatches
+    }
+}
+
+struct ProgramTickResult: Codable, Sendable {
+    let programs: Int
+    let milestonesAdvanced: Int
+    let sessionsStarted: Int
+    let completed: Int
+    let failed: Int
+    let ready: [ProgramMilestone]
+
+    enum CodingKeys: String, CodingKey {
+        case programs
+        case milestonesAdvanced = "milestones_advanced"
+        case sessionsStarted = "sessions_started"
+        case completed
+        case failed
+        case ready
+    }
+}
+
 struct TaskSchedulerPolicyResult: Codable, Sendable {
     let projectID: String
     let policy: TaskSchedulerPolicy

@@ -251,6 +251,197 @@ actor CoreClient {
             .decode(IntakeDeleteResult.self)
     }
 
+    func programs(
+        projectID: String?,
+        status: String? = nil,
+        limit: Int = 100
+    ) async throws -> ProgramListResult {
+        try await request(
+            method: "program.list",
+            params: [
+                "project_id": projectID.map(JSONValue.string) ?? .null,
+                "status": status.map(JSONValue.string) ?? .null,
+                "limit": .number(Double(limit)),
+            ]
+        )
+        .decode(ProgramListResult.self)
+    }
+
+    func programStatus(id: String, eventLimit: Int = 50) async throws -> ProgramStatusResult {
+        try await request(
+            method: "program.status",
+            params: [
+                "program_id": .string(id),
+                "event_limit": .number(Double(eventLimit)),
+            ]
+        )
+        .decode(ProgramStatusResult.self)
+    }
+
+    func createProgram(
+        projectID: String,
+        goal: String,
+        policy: ProgramPolicy,
+        tokenBudget: UInt64?,
+        costBudgetUsd: Double?,
+        activate: Bool
+    ) async throws -> ProjectProgram {
+        try await request(
+            method: "program.create",
+            params: [
+                "project_id": .string(projectID),
+                "goal": .string(goal),
+                "policy": policy.jsonValue,
+                "token_budget": tokenBudget.map { .number(Double($0)) } ?? .null,
+                "cost_budget_usd": costBudgetUsd.map { .number($0) } ?? .null,
+                "activate": .bool(activate),
+            ]
+        )
+        .decode(ProgramResult.self)
+        .program
+    }
+
+    func updateProgram(
+        id: String,
+        goal: String,
+        policy: ProgramPolicy,
+        tokenBudget: UInt64?,
+        costBudgetUsd: Double?
+    ) async throws -> ProjectProgram {
+        try await request(
+            method: "program.update",
+            params: [
+                "program_id": .string(id),
+                "goal": .string(goal),
+                "policy": policy.jsonValue,
+                "token_budget": tokenBudget.map { .number(Double($0)) } ?? .null,
+                "cost_budget_usd": costBudgetUsd.map { .number($0) } ?? .null,
+            ]
+        )
+        .decode(ProgramResult.self)
+        .program
+    }
+
+    func pauseProgram(id: String, reason: String? = nil) async throws -> ProjectProgram {
+        try await request(
+            method: "program.pause",
+            params: [
+                "program_id": .string(id),
+                "reason": reason.map(JSONValue.string) ?? .null,
+            ]
+        )
+        .decode(ProgramResult.self)
+        .program
+    }
+
+    func resumeProgram(id: String) async throws -> ProjectProgram {
+        try await request(method: "program.resume", params: ["program_id": .string(id)])
+            .decode(ProgramResult.self)
+            .program
+    }
+
+    func cancelProgram(id: String, reason: String) async throws -> ProjectProgram {
+        try await request(
+            method: "program.cancel",
+            params: [
+                "program_id": .string(id),
+                "reason": .string(reason),
+            ]
+        )
+        .decode(ProgramResult.self)
+        .program
+    }
+
+    func deleteProgram(id: String) async throws -> Bool {
+        try await request(method: "program.delete", params: ["program_id": .string(id)])
+            .decode(ProgramDeleteResult.self)
+            .deleted
+    }
+
+    func createProgramMilestone(
+        programID: String,
+        key: String?,
+        title: String,
+        objective: String,
+        acceptance: [String],
+        deps: [String],
+        priority: Int,
+        maxAttempts: UInt32,
+        profile: String,
+        writeScope: [String],
+        tokenBudget: UInt64?,
+        costBudgetUsd: Double?
+    ) async throws -> ProgramMilestone {
+        try await request(
+            method: "program.milestone.create",
+            params: [
+                "program_id": .string(programID),
+                "key": key.map(JSONValue.string) ?? .null,
+                "title": .string(title),
+                "objective": .string(objective),
+                "acceptance": .array(acceptance.map(JSONValue.string)),
+                "deps": .array(deps.map(JSONValue.string)),
+                "priority": .number(Double(priority)),
+                "max_attempts": .number(Double(maxAttempts)),
+                "profile": .string(profile),
+                "write_scope": .array(writeScope.map(JSONValue.string)),
+                "token_budget": tokenBudget.map { .number(Double($0)) } ?? .null,
+                "cost_budget_usd": costBudgetUsd.map { .number($0) } ?? .null,
+            ]
+        )
+        .decode(ProgramMilestoneResult.self)
+        .milestone
+    }
+
+    func retryProgramMilestone(id: String) async throws -> ProgramMilestone {
+        try await request(
+            method: "program.milestone.retry",
+            params: ["milestone_id": .string(id)]
+        )
+        .decode(ProgramMilestoneResult.self)
+        .milestone
+    }
+
+    func skipProgramMilestone(id: String, reason: String? = nil) async throws -> ProgramMilestone {
+        try await request(
+            method: "program.milestone.skip",
+            params: [
+                "milestone_id": .string(id),
+                "reason": reason.map(JSONValue.string) ?? .null,
+            ]
+        )
+        .decode(ProgramMilestoneResult.self)
+        .milestone
+    }
+
+    func startProgramMilestone(id: String) async throws -> ProgramMilestone {
+        try await request(
+            method: "program.milestone.start",
+            params: ["milestone_id": .string(id)]
+        )
+        .decode(ProgramMilestoneResult.self)
+        .milestone
+    }
+
+    func programTick(projectID: String?) async throws -> ProgramTickResult {
+        try await request(
+            method: "program.tick",
+            params: ["project_id": projectID.map(JSONValue.string) ?? .null]
+        )
+        .decode(ProgramTickResult.self)
+    }
+
+    func replayProgram(id: String, repair: Bool = false) async throws -> ProgramReplayResult {
+        try await request(
+            method: "program.replay",
+            params: [
+                "program_id": .string(id),
+                "repair": .bool(repair),
+            ]
+        )
+        .decode(ProgramReplayResult.self)
+    }
+
     func shellPolicy(projectID: String) async throws -> ShellPolicy {
         let params: [String: JSONValue] = ["project_id": .string(projectID)]
         return try await request(method: "project.shell_policy.get", params: params)

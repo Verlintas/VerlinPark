@@ -1984,3 +1984,612 @@ struct AgentsCard: View {
         }
     }
 }
+
+struct ProgramsCard: View {
+    @Environment(AppModel.self) private var model
+    @State private var showComposer = false
+    @State private var showDetail = false
+    @State private var pendingDelete: ProjectProgram?
+
+    private var activeCount: Int {
+        model.programEntries.count(where: { $0.program.status == "active" })
+    }
+
+    private var activeMilestones: Int {
+        model.programEntries.reduce(0) { $0 + $1.counts.active }
+    }
+
+    private var completedMilestones: Int {
+        model.programEntries.reduce(0) { $0 + $1.counts.completed }
+    }
+
+    private var blockedMilestones: Int {
+        model.programEntries.reduce(0) { $0 + $1.counts.blocked }
+    }
+
+    var body: some View {
+        @Bindable var model = model
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Programs")
+                    Text("Project-scoped milestones across normal sessions")
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.programBusy || model.programDetailBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Button(showComposer ? "Hide composer" : "New program") {
+                    withAnimation(VPMotion.smooth) {
+                        showComposer.toggle()
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                Button("Refresh") {
+                    Task {
+                        await model.loadPrograms()
+                        await model.loadProgramDetail()
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.programBusy)
+            }
+
+            HStack(spacing: 16) {
+                programMetric("active", activeCount)
+                programMetric("milestones running", activeMilestones)
+                programMetric("completed", completedMilestones)
+                programMetric("blocked", blockedMilestones)
+                Spacer()
+                Text("deterministic controller · no hidden routing")
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
+
+            Text(
+                "A milestone starts a normal session with a one-task TeamPlan. Admission, budgets, capacity, approvals, sandboxing, the Verifier, the Integrator, and the merge queue are unchanged. Completion needs an idle session, a completed plan task, integration evidence, and recorded acceptance."
+            )
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary)
+
+            if let status = model.programStatus {
+                Text(status)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+
+            if showComposer {
+                composer
+                    .transition(.vpContent)
+            }
+
+            if model.programEntries.isEmpty {
+                Text("No programs yet. A draft program is a safe way to stage milestones before activation.")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            } else {
+                ForEach(model.programEntries.prefix(10)) { entry in
+                    programRow(entry)
+                }
+                if model.programEntries.count > 10 {
+                    Text("+\(model.programEntries.count - 10) more programs")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 0)
+        .sheet(isPresented: $showDetail) {
+            ProgramDetailSheet()
+                .environment(model)
+        }
+        .confirmationDialog(
+            "Delete this program?",
+            isPresented: Binding(
+                get: { pendingDelete != nil },
+                set: {
+                    if !$0 {
+                        pendingDelete = nil
+                    }
+                }
+            )
+        ) {
+            Button("Delete", role: .destructive) {
+                if let program = pendingDelete {
+                    Task { await model.deleteProgram(program) }
+                }
+                pendingDelete = nil
+            }
+            Button("Cancel", role: .cancel) { pendingDelete = nil }
+        } message: {
+            Text(pendingDelete?.goal ?? "")
+        }
+        .task(id: model.selectedProjectID) {
+            var silent = false
+            while !Task.isCancelled {
+                await model.loadPrograms(silent: silent)
+                if model.selectedProgramID != nil, showDetail {
+                    await model.loadProgramDetail(silent: true)
+                }
+                silent = true
+                try? await Task.sleep(for: .seconds(6))
+            }
+        }
+    }
+
+    private var composer: some View {
+        @Bindable var model = model
+        return VStack(alignment: .leading, spacing: 8) {
+            Text("Stage a program")
+                .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.secondary)
+            TextField("Program goal", text: $model.programDraftGoal)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 11, weight: .medium))
+            HStack(spacing: 8) {
+                TextField("Token budget", text: $model.programDraftTokenBudget)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 120)
+                TextField("USD budget", text: $model.programDraftCostBudget)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 100)
+                TextField("Attempts", text: $model.programDraftMaxAttemptsText)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 70)
+                TextField("Backoff s", text: $model.programDraftBackoffText)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 85)
+                TextField("Parallel", text: $model.programDraftParallelText)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 70)
+                Picker("Dependency failure", selection: $model.programDraftDependencyFailure) {
+                    Text("block").tag("block")
+                    Text("cancel").tag("cancel")
+                    Text("retry").tag("retry")
+                }
+                .pickerStyle(.menu)
+                .frame(width: 150)
+            }
+            HStack(spacing: 12) {
+                Toggle("Activate", isOn: $model.programDraftActivate)
+                Toggle("Auto-dispatch", isOn: $model.programDraftAutoDispatch)
+                Spacer()
+                Button("Create program") {
+                    Task { await model.createProgram() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.programBusy)
+            }
+            .font(.system(size: 10, design: .monospaced))
+        }
+        .padding(10)
+        .background(.white.opacity(0.025), in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func programRow(_ entry: ProgramListEntry) -> some View {
+        let program = entry.program
+        return VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 8) {
+                Image(systemName: program.archived ? "archivebox" : "point.3.connected.trianglepath.dotted")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(programColor(program.status))
+                Text(program.goal)
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .lineLimit(1)
+                Text(program.status)
+                    .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(programColor(program.status))
+                if program.archived {
+                    Text("archive")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+                Spacer()
+                Text("\(entry.counts.completed)/\(entry.counts.total) done")
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                if entry.counts.active > 0 {
+                    Text("\(entry.counts.active) active")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.green)
+                }
+                if entry.counts.blocked > 0 {
+                    Text("\(entry.counts.blocked) blocked")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.orange)
+                }
+                if program.canPause {
+                    programAction("pause.fill", tint: .yellow, help: "Pause new dispatch") {
+                        Task { await model.pauseProgram(program) }
+                    }
+                }
+                if program.canResume {
+                    programAction("play.fill", tint: .green, help: "Resume program") {
+                        Task { await model.resumeProgram(program) }
+                    }
+                }
+                if !program.isTerminal, !program.archived {
+                    programAction("xmark.circle", tint: .orange, help: "Cancel program") {
+                        Task { await model.cancelProgram(program) }
+                    }
+                }
+                programAction("info.circle", tint: .secondary, help: "Program detail") {
+                    model.selectedProgramID = program.id
+                    showDetail = true
+                    Task { await model.loadProgramDetail() }
+                }
+                if program.canDelete {
+                    programAction("trash", tint: .orange, help: "Delete program") {
+                        pendingDelete = program
+                    }
+                }
+            }
+            HStack(spacing: 12) {
+                if let tokens = program.tokenBudget {
+                    Text("\(tokens.formatted()) tokens")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                if let cost = program.costBudgetUsd {
+                    Text(String(format: "$%.2f", cost))
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                Text(
+                    "priority \(entry.counts.ready) ready · \(entry.counts.failed) failed · \(entry.counts.cancelled) cancelled"
+                )
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.tertiary)
+                Spacer()
+                Text(
+                    "auto-dispatch \(program.policy.autoDispatch ? "on" : "off") · parallel \(program.policy.maxParallelMilestones)"
+                )
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.tertiary)
+            }
+            if let reason = program.reason {
+                Text(reason)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.orange.opacity(0.9))
+                    .lineLimit(2)
+            }
+        }
+        .padding(8)
+        .background(.white.opacity(0.02), in: RoundedRectangle(cornerRadius: 9))
+        .contentShape(Rectangle())
+        .onTapGesture {
+            model.selectedProgramID = program.id
+            showDetail = true
+            Task { await model.loadProgramDetail() }
+        }
+    }
+
+    private func programMetric(_ title: String, _ value: Int) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text("\(value)")
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+            Text(title)
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func programAction(
+        _ icon: String,
+        tint: Color,
+        help: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(tint)
+                .frame(width: 22, height: 22)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+
+    private func programColor(_ status: String) -> Color {
+        switch status {
+        case "active": .green
+        case "paused": .yellow
+        case "completed": .cyan
+        case "failed": .orange
+        default: .secondary
+        }
+    }
+}
+
+struct ProgramDetailSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    @State private var showMilestoneComposer = false
+
+    var body: some View {
+        @Bindable var model = model
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Program detail")
+                    Text(model.programDetail?.program.goal ?? "Select a program")
+                        .font(.system(size: 15, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                if model.programDetailBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Close") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+            }
+            .padding(18)
+            Divider()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    if let detail = model.programDetail {
+                        header(detail)
+                        milestoneComposer(detail)
+                        ForEach(detail.milestones) { milestone in
+                            milestoneRow(milestone, all: detail.milestones)
+                        }
+                        if detail.events.isEmpty {
+                            Text("No program events yet.")
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                        } else {
+                            Text("Recent program events")
+                                .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                            ForEach(detail.events.suffix(8)) { event in
+                                Text("\(event.seq)  \(event.type)  \(event.createdAt)")
+                                    .font(.system(size: 8, design: .monospaced))
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                    } else {
+                        Text("No program selected.")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(18)
+            }
+        }
+        .frame(minWidth: 760, minHeight: 600)
+        .task {
+            await model.loadProgramDetail()
+        }
+    }
+
+    private func header(_ detail: ProgramStatusResult) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Text(detail.program.status)
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(statusColor(detail.program.status))
+                Text("\(detail.counts.completed)/\(detail.counts.total) milestones complete")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if detail.program.canPause {
+                    Button("Pause") {
+                        Task { await model.pauseProgram(detail.program) }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+                if detail.program.canResume {
+                    Button("Resume") {
+                        Task { await model.resumeProgram(detail.program) }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
+                if !detail.program.isTerminal, !detail.program.archived {
+                    Button("Cancel") {
+                        Task { await model.cancelProgram(detail.program) }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+            HStack(spacing: 16) {
+                Text("\(detail.counts.running) running")
+                Text("\(detail.counts.verifying) verifying")
+                Text("\(detail.counts.completed) completed")
+                Text("\(detail.counts.blocked) blocked")
+                Text("\(detail.counts.cancelled) cancelled")
+                Spacer()
+                Text(
+                    "usage \(detail.usage.tokenSpent.formatted()) tokens · \(String(format: "$%.4f", detail.usage.costSpentUsd))"
+                )
+            }
+            .font(.system(size: 8, design: .monospaced))
+            .foregroundStyle(.secondary)
+            if let reason = detail.program.reason {
+                Text(reason)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.orange)
+            }
+            Text(
+                "policy: auto-dispatch \(detail.program.policy.autoDispatch ? "on" : "off") · attempts 1–\(detail.program.policy.maxAttempts) · backoff \(detail.program.policy.retryBackoffSecs)s · dependency \(detail.program.policy.dependencyFailure) · parallel \(detail.program.policy.maxParallelMilestones)"
+            )
+            .font(.system(size: 8, design: .monospaced))
+            .foregroundStyle(.tertiary)
+        }
+        .padding(10)
+        .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func milestoneComposer(_ detail: ProgramStatusResult) -> some View {
+        @Bindable var model = model
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Milestones")
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button(showMilestoneComposer ? "Hide add form" : "Add milestone") {
+                    withAnimation(VPMotion.smooth) {
+                        showMilestoneComposer.toggle()
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+            if showMilestoneComposer {
+                TextField("Milestone title", text: $model.programMilestoneDraftTitle)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 11, weight: .medium))
+                TextField("Objective", text: $model.programMilestoneDraftObjective, axis: .vertical)
+                    .textFieldStyle(.roundedBorder)
+                    .lineLimit(2 ... 4)
+                    .font(.system(size: 11))
+                HStack(spacing: 8) {
+                    TextField("Acceptance (comma separated)", text: $model.programMilestoneDraftAcceptance)
+                        .textFieldStyle(.roundedBorder)
+                    TextField("Scope", text: $model.programMilestoneDraftScope)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 120)
+                    TextField("Priority", text: $model.programMilestoneDraftPriorityText)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 70)
+                    TextField("Attempts", text: $model.programMilestoneDraftMaxAttemptsText)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 70)
+                    Picker("Profile", selection: $model.programMilestoneDraftProfile) {
+                        ForEach(["coding", "research", "verification", "generic"], id: \.self) {
+                            Text($0).tag($0)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .frame(width: 120)
+                }
+                HStack(spacing: 8) {
+                    TextField("Token budget", text: $model.programMilestoneDraftTokenBudget)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 120)
+                    TextField("USD budget", text: $model.programMilestoneDraftCostBudget)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 100)
+                    Text("deps")
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    ForEach(detail.milestones) { dependency in
+                        Toggle(dependency.key, isOn: Binding(
+                            get: { model.programMilestoneDraftDeps.contains(dependency.id) },
+                            set: { _ in model.toggleProgramMilestoneDependency(dependency.id) }
+                        ))
+                        .toggleStyle(.button)
+                        .controlSize(.small)
+                    }
+                    Spacer()
+                    Button("Add") {
+                        Task { await model.createProgramMilestone() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
+                .font(.system(size: 9, design: .monospaced))
+            }
+        }
+    }
+
+    private func milestoneRow(_ milestone: ProgramMilestone, all: [ProgramMilestone]) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 8) {
+                Text(milestone.key)
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 42, alignment: .leading)
+                Text(milestone.title)
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                Text(milestone.status)
+                    .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(statusColor(milestone.status))
+                Spacer()
+                Text("\(milestone.attempts)/\(milestone.maxAttempts)")
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                if milestone.canStart {
+                    Button("Start") {
+                        Task { await model.startProgramMilestone(milestone) }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+                if milestone.canRetry {
+                    Button("Retry") {
+                        Task { await model.retryProgramMilestone(milestone) }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+                if milestone.canSkip {
+                    Button("Skip") {
+                        Task { await model.skipProgramMilestone(milestone) }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+                if let sessionID = milestone.sessionID {
+                    Button("Session") {
+                        model.selectSession(sessionID)
+                        dismiss()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+            if !milestone.deps.isEmpty {
+                Text("deps: " + milestone.deps.map { dependency in
+                    all.first(where: { $0.id == dependency })?.key ?? String(dependency.prefix(8))
+                }.joined(separator: ", "))
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
+            Text(milestone.objective)
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+            if let error = milestone.lastError {
+                Text(error)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.orange)
+                    .lineLimit(2)
+            }
+            if let result = milestone.result {
+                Text(result)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.cyan.opacity(0.85))
+                    .lineLimit(2)
+            }
+        }
+        .padding(8)
+        .background(.white.opacity(0.02), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func statusColor(_ status: String) -> Color {
+        switch status {
+        case "active", "running": .green
+        case "ready", "verifying": .cyan
+        case "paused", "failed": .yellow
+        case "blocked": .orange
+        case "completed": .cyan
+        case "cancelled": .secondary
+        default: .secondary
+        }
+    }
+}

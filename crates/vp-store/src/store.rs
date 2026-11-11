@@ -8,6 +8,8 @@ use anyhow::{Context, Result, anyhow};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
@@ -16,11 +18,12 @@ use vp_protocol::types::{
     IntegrationPolicy, MailboxPolicy, McpServer, McpServerConfig, McpTransport, MemoryConflict,
     MemoryEvidence, MemoryHealthResult, MemoryItem, MemoryPolicy, MemoryStatCount, MergeQueueEntry,
     MetricCount, ModelPreset, OrchestrationDecision, OrchestrationNote, OrchestrationPolicy,
-    OrchestrationRecovery, PlanTaskProgress, Project, ProjectBudget, ProjectUsageSession, Question,
-    ScheduledTask, SearchHit, Session, SessionBundle, SessionContinuation, ShellPolicy, Skill,
-    Source, SourceChunk, SourceCollection, SourceSearchHit, SourceStats, SteeringMessage,
-    StoredMessage, TaskSchedulerPolicy, TaskStall, TeamPlan, TodoItem, UsageEntry,
-    WorktreeRetentionPolicy, WriteLease, cache_hit_ratio,
+    OrchestrationRecovery, PlanTaskProgress, Program, ProgramEvent, ProgramMilestone,
+    ProgramMilestoneStatus, ProgramPolicy, ProgramStatus, ProgramUsage, Project, ProjectBudget,
+    ProjectUsageSession, Question, ScheduledTask, SearchHit, Session, SessionBundle,
+    SessionContinuation, ShellPolicy, Skill, Source, SourceChunk, SourceCollection,
+    SourceSearchHit, SourceStats, SteeringMessage, StoredMessage, TaskSchedulerPolicy, TaskStall,
+    TeamPlan, TodoItem, UsageEntry, WorktreeRetentionPolicy, WriteLease, cache_hit_ratio,
 };
 
 use crate::paths;
@@ -134,6 +137,167 @@ pub struct NewIntakeTask {
     pub origin: String,
     pub labels: Vec<String>,
 }
+
+/// Input for creating a project program. The engine validates all bounds and
+/// passes a pre-normalized policy; the store still enforces uniqueness and
+/// foreign keys.
+#[derive(Debug, Clone)]
+pub struct NewProgram {
+    pub project_id: String,
+    pub goal: String,
+    pub policy: ProgramPolicy,
+    pub token_budget: Option<u64>,
+    pub cost_budget_usd: Option<f64>,
+    pub status: ProgramStatus,
+    pub archived: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProgramUpdate {
+    pub goal: String,
+    pub policy: ProgramPolicy,
+    pub token_budget: Option<u64>,
+    pub cost_budget_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewProgramMilestone {
+    pub program_id: String,
+    pub key: String,
+    pub title: String,
+    pub objective: String,
+    pub acceptance: Vec<String>,
+    pub deps: Vec<String>,
+    pub priority: i32,
+    pub max_attempts: u32,
+    pub profile: String,
+    pub write_scope: Vec<String>,
+    pub token_budget: Option<u64>,
+    pub cost_budget_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProgramMilestoneUpdate {
+    pub key: String,
+    pub title: String,
+    pub objective: String,
+    pub acceptance: Vec<String>,
+    pub deps: Vec<String>,
+    pub priority: i32,
+    pub max_attempts: u32,
+    pub profile: String,
+    pub write_scope: Vec<String>,
+    pub token_budget: Option<u64>,
+    pub cost_budget_usd: Option<f64>,
+}
+
+fn map_program(row: &rusqlite::Row<'_>) -> rusqlite::Result<Program> {
+    let status: String = row.get(3)?;
+    let policy: String = row.get(4)?;
+    Ok(Program {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        goal: row.get(2)?,
+        status: ProgramStatus::parse(&status).unwrap_or_default(),
+        policy: serde_json::from_str(&policy).unwrap_or_default(),
+        token_budget: row
+            .get::<_, Option<i64>>(5)?
+            .map(|value| value.max(0) as u64),
+        cost_budget_usd: row.get(6)?,
+        reason: row.get(7)?,
+        archived: row.get::<_, i64>(8)? != 0,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+        completed_at: row.get(11)?,
+    })
+}
+
+fn map_program_milestone(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProgramMilestone> {
+    let acceptance: String = row.get(4)?;
+    let deps: String = row.get(5)?;
+    let status: String = row.get(7)?;
+    let write_scope: String = row.get(15)?;
+    Ok(ProgramMilestone {
+        id: row.get(0)?,
+        program_id: row.get(1)?,
+        key: row.get(2)?,
+        title: row.get(3)?,
+        objective: row.get(16)?,
+        acceptance: serde_json::from_str(&acceptance).unwrap_or_default(),
+        deps: serde_json::from_str(&deps).unwrap_or_default(),
+        priority: row.get(6)?,
+        status: ProgramMilestoneStatus::parse(&status).unwrap_or_default(),
+        session_id: row.get(8)?,
+        plan_revision: row
+            .get::<_, Option<i64>>(9)?
+            .map(|value| value.max(1) as u32),
+        attempts: row.get::<_, i64>(10)?.max(0) as u32,
+        max_attempts: row.get::<_, i64>(11)?.max(1) as u32,
+        next_attempt_at: row.get(12)?,
+        result: row.get(13)?,
+        last_error: row.get(14)?,
+        profile: row.get(17)?,
+        write_scope: serde_json::from_str(&write_scope).unwrap_or_default(),
+        token_budget: row
+            .get::<_, Option<i64>>(18)?
+            .map(|value| value.max(0) as u64),
+        cost_budget_usd: row.get(19)?,
+        created_at: row.get(20)?,
+        updated_at: row.get(21)?,
+        completed_at: row.get(22)?,
+    })
+}
+
+fn map_program_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProgramEvent> {
+    let payload: String = row.get(4)?;
+    Ok(ProgramEvent {
+        program_id: row.get(0)?,
+        project_id: row.get(1)?,
+        seq: row.get::<_, i64>(2)?.max(0) as u64,
+        kind: row.get(3)?,
+        payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
+        created_at: row.get(5)?,
+    })
+}
+
+/// Append one program-scoped event and return the full row. The caller must
+/// use the same transaction for the projection update; this helper never
+/// commits on its own.
+fn insert_program_event_tx(
+    tx: &Transaction<'_>,
+    project_id: &str,
+    program_id: &str,
+    kind: &str,
+    payload: &serde_json::Value,
+) -> Result<ProgramEvent> {
+    let seq: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM program_events WHERE program_id = ?1",
+        params![program_id],
+        |row| row.get(0),
+    )?;
+    let created_at = now_rfc3339();
+    let payload_text = serde_json::to_string(payload)?;
+    tx.execute(
+        "INSERT INTO program_events (project_id, program_id, seq, kind, payload, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![project_id, program_id, seq, kind, payload_text, created_at],
+    )?;
+    Ok(ProgramEvent {
+        program_id: program_id.to_string(),
+        project_id: project_id.to_string(),
+        seq: seq.max(0) as u64,
+        kind: kind.to_string(),
+        payload: payload.clone(),
+        created_at,
+    })
+}
+
+const PROGRAM_COLUMNS: &str = "id, project_id, goal, status, policy, token_budget, cost_budget_usd, reason, archived, \
+     created_at, updated_at, completed_at";
+
+const PROGRAM_MILESTONE_COLUMNS: &str = "id, program_id, key, title, acceptance, deps, priority, status, session_id, plan_revision, \
+     attempts, max_attempts, next_attempt_at, result, last_error, write_scope, objective, \
+     profile, token_budget, cost_budget_usd, created_at, updated_at, completed_at";
 
 fn map_intake_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<IntakeTask> {
     let write_scope: String = row.get(7)?;
@@ -429,6 +593,15 @@ pub struct ProjectManifestSnapshot {
     /// session-scoped, so the project manifest is their rebuild snapshot.
     #[serde(default)]
     pub intake_tasks: Vec<IntakeTask>,
+    /// Project-scoped program ledgers and their append-only event logs. The
+    /// program projection is rebuilt from these rows by `db-rebuild`; the
+    /// events preserve replay/audit across a database restore.
+    #[serde(default)]
+    pub programs: Vec<Program>,
+    #[serde(default)]
+    pub program_milestones: Vec<ProgramMilestone>,
+    #[serde(default)]
+    pub program_events: Vec<ProgramEvent>,
     #[serde(default)]
     pub skills: Vec<Skill>,
 }
@@ -627,6 +800,50 @@ fn validate_session_bundle(bundle: &SessionBundle) -> Result<()> {
             return Err(anyhow!(
                 "bundle recovery {} belongs to a different project",
                 recovery.task_id
+            ));
+        }
+    }
+    let mut program_ids = std::collections::HashSet::new();
+    for program in &bundle.programs {
+        validate_storage_id("program", &program.id)?;
+        if program.project_id != bundle.project.id {
+            return Err(anyhow!(
+                "bundle program {} belongs to a different project",
+                program.id
+            ));
+        }
+        if !program_ids.insert(program.id.clone()) {
+            return Err(anyhow!("bundle program {} is duplicated", program.id));
+        }
+    }
+    let mut milestone_keys = std::collections::HashSet::new();
+    for milestone in &bundle.program_milestones {
+        validate_storage_id("program milestone", &milestone.id)?;
+        if !program_ids.contains(&milestone.program_id) {
+            return Err(anyhow!(
+                "bundle milestone {} references a program not in the bundle",
+                milestone.id
+            ));
+        }
+        if !milestone_keys.insert((milestone.program_id.clone(), milestone.key.clone())) {
+            return Err(anyhow!(
+                "bundle milestone key '{}' is duplicated in program {}",
+                milestone.key,
+                milestone.program_id
+            ));
+        }
+    }
+    for event in &bundle.program_events {
+        if event.project_id != bundle.project.id {
+            return Err(anyhow!(
+                "bundle program event {} belongs to a different project",
+                event.program_id
+            ));
+        }
+        if !program_ids.contains(&event.program_id) {
+            return Err(anyhow!(
+                "bundle program event {} references a program not in the bundle",
+                event.program_id
             ));
         }
     }
@@ -1271,6 +1488,69 @@ impl Store {
                 ON intake_tasks(project_id, status, created_at);
             CREATE INDEX IF NOT EXISTS idx_intake_tasks_runnable
                 ON intake_tasks(status, next_attempt_at);
+
+            CREATE TABLE IF NOT EXISTS programs (
+                id              TEXT PRIMARY KEY,
+                project_id      TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                goal            TEXT NOT NULL,
+                status          TEXT NOT NULL,
+                policy          TEXT NOT NULL DEFAULT '{}',
+                token_budget    INTEGER,
+                cost_budget_usd REAL,
+                reason          TEXT,
+                archived        INTEGER NOT NULL DEFAULT 0,
+                created_at      TEXT NOT NULL,
+                updated_at      TEXT NOT NULL,
+                completed_at    TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_programs_project_status
+                ON programs(project_id, status, created_at);
+
+            CREATE TABLE IF NOT EXISTS program_milestones (
+                id              TEXT PRIMARY KEY,
+                program_id      TEXT NOT NULL REFERENCES programs(id) ON DELETE CASCADE,
+                key             TEXT NOT NULL,
+                title           TEXT NOT NULL,
+                objective       TEXT NOT NULL,
+                acceptance      TEXT NOT NULL DEFAULT '[]',
+                deps            TEXT NOT NULL DEFAULT '[]',
+                priority        INTEGER NOT NULL DEFAULT 0,
+                status          TEXT NOT NULL,
+                session_id      TEXT,
+                plan_revision   INTEGER,
+                attempts        INTEGER NOT NULL DEFAULT 0,
+                max_attempts    INTEGER NOT NULL DEFAULT 2,
+                next_attempt_at TEXT,
+                result          TEXT,
+                last_error      TEXT,
+                profile         TEXT NOT NULL DEFAULT 'coding',
+                write_scope     TEXT NOT NULL DEFAULT '[]',
+                token_budget    INTEGER,
+                cost_budget_usd REAL,
+                created_at      TEXT NOT NULL,
+                updated_at      TEXT NOT NULL,
+                completed_at    TEXT,
+                UNIQUE(program_id, key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_program_milestones_program_status
+                ON program_milestones(program_id, status, next_attempt_at);
+            CREATE INDEX IF NOT EXISTS idx_program_milestones_session
+                ON program_milestones(session_id);
+
+            CREATE TABLE IF NOT EXISTS program_events (
+                project_id  TEXT NOT NULL,
+                program_id  TEXT NOT NULL,
+                seq         INTEGER NOT NULL,
+                kind        TEXT NOT NULL,
+                payload     TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                PRIMARY KEY (program_id, seq)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_program_events_project
+                ON program_events(project_id, created_at);
 
             CREATE TABLE IF NOT EXISTS project_orchestration_policies (
                 project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
@@ -1932,6 +2212,9 @@ impl Store {
                 orchestration_policy: self.get_orchestration_policy(&project.id)?,
                 approval_grants: self.list_approval_grants(&project.id)?,
                 intake_tasks: self.list_intake_tasks(Some(&project.id), None, None)?,
+                programs: self.list_programs(Some(&project.id), None, None)?,
+                program_milestones: self.list_program_milestones_for_project(&project.id)?,
+                program_events: self.list_program_events_for_project(&project.id, Some(100_000))?,
                 skills: self.list_skills(Some(&project.id), true)?,
                 project,
             };
@@ -2482,12 +2765,1416 @@ impl Store {
         Ok(())
     }
 
+    pub fn list_programs(
+        &self,
+        project_id: Option<&str>,
+        status: Option<ProgramStatus>,
+        limit: Option<u32>,
+    ) -> Result<Vec<Program>> {
+        let conn = self.lock()?;
+        let limit = limit.unwrap_or(500).clamp(1, 2_000) as i64;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {PROGRAM_COLUMNS}
+             FROM programs
+             WHERE (?1 IS NULL OR project_id = ?1)
+               AND (?2 IS NULL OR status = ?2)
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?3"
+        ))?;
+        let rows = stmt.query_map(
+            params![project_id, status.map(ProgramStatus::as_str), limit],
+            map_program,
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn get_program(&self, id: &str) -> Result<Option<Program>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            &format!("SELECT {PROGRAM_COLUMNS} FROM programs WHERE id = ?1"),
+            params![id],
+            map_program,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_program_milestones(&self, program_id: &str) -> Result<Vec<ProgramMilestone>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {PROGRAM_MILESTONE_COLUMNS}
+             FROM program_milestones
+             WHERE program_id = ?1
+             ORDER BY created_at ASC, key ASC, id ASC"
+        ))?;
+        let rows = stmt.query_map(params![program_id], map_program_milestone)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_program_milestones_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<ProgramMilestone>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {}
+             FROM program_milestones m
+             JOIN programs p ON p.id = m.program_id
+             WHERE p.project_id = ?1
+             ORDER BY m.created_at ASC, m.key ASC, m.id ASC",
+            PROGRAM_MILESTONE_COLUMNS
+                .split(", ")
+                .map(|column| format!("m.{column}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))?;
+        let rows = stmt.query_map(params![project_id], map_program_milestone)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn get_program_milestone(&self, id: &str) -> Result<Option<ProgramMilestone>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            &format!("SELECT {PROGRAM_MILESTONE_COLUMNS} FROM program_milestones WHERE id = ?1"),
+            params![id],
+            map_program_milestone,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn create_program(&self, input: &NewProgram) -> Result<(Program, ProgramEvent)> {
+        let id = Uuid::now_v7().to_string();
+        let now = now_rfc3339();
+        let program = Program {
+            id,
+            project_id: input.project_id.clone(),
+            goal: input.goal.clone(),
+            status: input.status,
+            policy: input.policy.clone(),
+            token_budget: input.token_budget,
+            cost_budget_usd: input.cost_budget_usd,
+            reason: None,
+            archived: input.archived,
+            created_at: now.clone(),
+            updated_at: now,
+            completed_at: None,
+        };
+        let payload = serde_json::to_value(&program)?;
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        if tx.query_row(
+            "SELECT COUNT(*) FROM projects WHERE id = ?1",
+            params![program.project_id],
+            |row| row.get::<_, i64>(0),
+        )? == 0
+        {
+            anyhow::bail!("project not found: {}", program.project_id);
+        }
+        let event = insert_program_event_tx(
+            &tx,
+            &program.project_id,
+            &program.id,
+            "program.created",
+            &payload,
+        )?;
+        tx.execute(
+            "INSERT INTO programs
+             (id, project_id, goal, status, policy, token_budget, cost_budget_usd, reason,
+              archived, created_at, updated_at, completed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                program.id,
+                program.project_id,
+                program.goal,
+                program.status.as_str(),
+                serde_json::to_string(&program.policy)?,
+                program.token_budget.map(|value| value as i64),
+                program.cost_budget_usd,
+                program.reason,
+                if program.archived { 1 } else { 0 },
+                program.created_at,
+                program.updated_at,
+                program.completed_at,
+            ],
+        )?;
+        tx.commit()?;
+        Ok((program, event))
+    }
+
+    pub fn update_program(
+        &self,
+        id: &str,
+        update: &ProgramUpdate,
+    ) -> Result<Option<(Program, ProgramEvent)>> {
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let Some(mut program) = tx
+            .query_row(
+                &format!("SELECT {PROGRAM_COLUMNS} FROM programs WHERE id = ?1"),
+                params![id],
+                map_program,
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        if program.archived || program.status.is_terminal() {
+            anyhow::bail!("program {id} is archived or terminal and cannot be updated");
+        }
+        program.goal = update.goal.clone();
+        program.policy = update.policy.clone();
+        program.token_budget = update.token_budget;
+        program.cost_budget_usd = update.cost_budget_usd;
+        program.updated_at = now;
+        let payload = serde_json::to_value(&program)?;
+        let event =
+            insert_program_event_tx(&tx, &program.project_id, id, "program.updated", &payload)?;
+        tx.execute(
+            "UPDATE programs
+             SET goal = ?2, policy = ?3, token_budget = ?4, cost_budget_usd = ?5, updated_at = ?6
+             WHERE id = ?1",
+            params![
+                id,
+                program.goal,
+                serde_json::to_string(&program.policy)?,
+                program.token_budget.map(|value| value as i64),
+                program.cost_budget_usd,
+                program.updated_at,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(Some((program, event)))
+    }
+
+    pub fn pause_program(
+        &self,
+        id: &str,
+        reason: Option<&str>,
+    ) -> Result<Option<(Program, ProgramEvent)>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let Some(mut program) = tx
+            .query_row(
+                &format!("SELECT {PROGRAM_COLUMNS} FROM programs WHERE id = ?1"),
+                params![id],
+                map_program,
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        if program.status == ProgramStatus::Paused {
+            return Ok(None);
+        }
+        if program.status != ProgramStatus::Active {
+            anyhow::bail!("program {id} is not active");
+        }
+        program.status = ProgramStatus::Paused;
+        program.reason = reason.map(str::to_string);
+        program.updated_at = now_rfc3339();
+        let payload = serde_json::to_value(&program)?;
+        let event =
+            insert_program_event_tx(&tx, &program.project_id, id, "program.paused", &payload)?;
+        tx.execute(
+            "UPDATE programs SET status = ?2, reason = ?3, updated_at = ?4 WHERE id = ?1",
+            params![
+                id,
+                program.status.as_str(),
+                program.reason,
+                program.updated_at
+            ],
+        )?;
+        tx.commit()?;
+        Ok(Some((program, event)))
+    }
+
+    pub fn resume_program(&self, id: &str) -> Result<Option<(Program, ProgramEvent)>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let Some(mut program) = tx
+            .query_row(
+                &format!("SELECT {PROGRAM_COLUMNS} FROM programs WHERE id = ?1"),
+                params![id],
+                map_program,
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        if program.archived {
+            anyhow::bail!("program {id} is an imported archive and cannot be activated");
+        }
+        if program.status.is_terminal() {
+            anyhow::bail!("program {id} is terminal and cannot be resumed");
+        }
+        if program.status == ProgramStatus::Active {
+            return Ok(None);
+        }
+        program.status = ProgramStatus::Active;
+        program.reason = None;
+        program.updated_at = now_rfc3339();
+        let payload = serde_json::to_value(&program)?;
+        let event =
+            insert_program_event_tx(&tx, &program.project_id, id, "program.resumed", &payload)?;
+        tx.execute(
+            "UPDATE programs SET status = ?2, reason = NULL, updated_at = ?3 WHERE id = ?1",
+            params![id, program.status.as_str(), program.updated_at],
+        )?;
+        tx.commit()?;
+        Ok(Some((program, event)))
+    }
+
+    pub fn complete_program(
+        &self,
+        id: &str,
+        reason: &str,
+    ) -> Result<Option<(Program, ProgramEvent)>> {
+        self.finish_program(id, ProgramStatus::Completed, reason)
+    }
+
+    pub fn fail_program(&self, id: &str, reason: &str) -> Result<Option<(Program, ProgramEvent)>> {
+        self.finish_program(id, ProgramStatus::Failed, reason)
+    }
+
+    fn finish_program(
+        &self,
+        id: &str,
+        status: ProgramStatus,
+        reason: &str,
+    ) -> Result<Option<(Program, ProgramEvent)>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let Some(mut program) = tx
+            .query_row(
+                &format!("SELECT {PROGRAM_COLUMNS} FROM programs WHERE id = ?1"),
+                params![id],
+                map_program,
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        if program.status.is_terminal() {
+            return Ok(None);
+        }
+        if program.archived {
+            anyhow::bail!("program {id} is an imported archive");
+        }
+        let now = now_rfc3339();
+        program.status = status;
+        program.reason = Some(reason.to_string());
+        program.updated_at = now.clone();
+        program.completed_at = Some(now.clone());
+        let payload = serde_json::to_value(&program)?;
+        let kind = match status {
+            ProgramStatus::Completed => "program.completed",
+            ProgramStatus::Failed => "program.failed",
+            _ => anyhow::bail!("invalid terminal program status: {status}"),
+        };
+        let event = insert_program_event_tx(&tx, &program.project_id, id, kind, &payload)?;
+        tx.execute(
+            "UPDATE programs
+             SET status = ?2, reason = ?3, completed_at = ?4, updated_at = ?4
+             WHERE id = ?1",
+            params![id, program.status.as_str(), program.reason, now],
+        )?;
+        tx.commit()?;
+        Ok(Some((program, event)))
+    }
+
+    pub fn delete_program(&self, id: &str) -> Result<bool> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let Some(program) = tx
+            .query_row(
+                &format!("SELECT {PROGRAM_COLUMNS} FROM programs WHERE id = ?1"),
+                params![id],
+                map_program,
+            )
+            .optional()?
+        else {
+            return Ok(false);
+        };
+        let active = tx.query_row(
+            "SELECT COUNT(*) FROM program_milestones
+             WHERE program_id = ?1 AND status IN ('running', 'verifying')",
+            params![id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if active > 0 {
+            anyhow::bail!("program {id} still has running or verifying milestones");
+        }
+        if !program.status.is_terminal() && program.status != ProgramStatus::Draft {
+            anyhow::bail!("only draft or terminal programs can be deleted");
+        }
+        let payload = serde_json::json!({"id": id});
+        insert_program_event_tx(&tx, &program.project_id, id, "program.deleted", &payload)?;
+        tx.execute("DELETE FROM programs WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn create_program_milestone(
+        &self,
+        input: &NewProgramMilestone,
+    ) -> Result<(ProgramMilestone, ProgramEvent)> {
+        let now = now_rfc3339();
+        let id = Uuid::now_v7().to_string();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let Some(program) = tx
+            .query_row(
+                &format!("SELECT {PROGRAM_COLUMNS} FROM programs WHERE id = ?1"),
+                params![input.program_id],
+                map_program,
+            )
+            .optional()?
+        else {
+            anyhow::bail!("program not found: {}", input.program_id);
+        };
+        if program.archived || program.status.is_terminal() {
+            anyhow::bail!("program {} is archived or terminal", program.id);
+        }
+        if tx.query_row(
+            "SELECT COUNT(*) FROM program_milestones WHERE program_id = ?1 AND key = ?2",
+            params![input.program_id, input.key],
+            |row| row.get::<_, i64>(0),
+        )? > 0
+        {
+            anyhow::bail!("milestone key '{}' already exists", input.key);
+        }
+        let milestone = ProgramMilestone {
+            id,
+            program_id: input.program_id.clone(),
+            key: input.key.clone(),
+            title: input.title.clone(),
+            objective: input.objective.clone(),
+            acceptance: input.acceptance.clone(),
+            deps: input.deps.clone(),
+            priority: input.priority,
+            status: ProgramMilestoneStatus::Pending,
+            session_id: None,
+            plan_revision: None,
+            attempts: 0,
+            max_attempts: input.max_attempts,
+            next_attempt_at: None,
+            result: None,
+            last_error: None,
+            profile: input.profile.clone(),
+            write_scope: input.write_scope.clone(),
+            token_budget: input.token_budget,
+            cost_budget_usd: input.cost_budget_usd,
+            created_at: now.clone(),
+            updated_at: now,
+            completed_at: None,
+        };
+        let payload = serde_json::to_value(&milestone)?;
+        let event = insert_program_event_tx(
+            &tx,
+            &program.project_id,
+            &program.id,
+            "program.milestone.created",
+            &payload,
+        )?;
+        tx.execute(
+            "INSERT INTO program_milestones
+             (id, program_id, key, title, acceptance, deps, priority, status, session_id,
+              plan_revision, attempts, max_attempts, next_attempt_at, result, last_error,
+              write_scope, objective, profile, token_budget, cost_budget_usd, created_at,
+              updated_at, completed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, 0, ?9, NULL, NULL, NULL,
+                     ?10, ?11, ?12, ?13, ?14, ?15, ?16, NULL)",
+            params![
+                milestone.id,
+                milestone.program_id,
+                milestone.key,
+                milestone.title,
+                serde_json::to_string(&milestone.acceptance)?,
+                serde_json::to_string(&milestone.deps)?,
+                milestone.priority,
+                milestone.status.as_str(),
+                milestone.max_attempts as i64,
+                serde_json::to_string(&milestone.write_scope)?,
+                milestone.objective,
+                milestone.profile,
+                milestone.token_budget.map(|value| value as i64),
+                milestone.cost_budget_usd,
+                milestone.created_at,
+                milestone.updated_at,
+            ],
+        )?;
+        tx.commit()?;
+        Ok((milestone, event))
+    }
+
+    pub fn update_program_milestone(
+        &self,
+        id: &str,
+        update: &ProgramMilestoneUpdate,
+    ) -> Result<Option<(ProgramMilestone, ProgramEvent)>> {
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let Some(mut milestone) = tx
+            .query_row(
+                &format!(
+                    "SELECT {PROGRAM_MILESTONE_COLUMNS} FROM program_milestones WHERE id = ?1"
+                ),
+                params![id],
+                map_program_milestone,
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        if matches!(
+            milestone.status,
+            ProgramMilestoneStatus::Running
+                | ProgramMilestoneStatus::Verifying
+                | ProgramMilestoneStatus::Completed
+        ) {
+            anyhow::bail!(
+                "milestone {id} is {} and cannot be edited",
+                milestone.status
+            );
+        }
+        if tx.query_row(
+            "SELECT COUNT(*) FROM program_milestones
+                 WHERE program_id = ?1 AND key = ?2 AND id <> ?3",
+            params![milestone.program_id, update.key, id],
+            |row| row.get::<_, i64>(0),
+        )? > 0
+        {
+            anyhow::bail!("milestone key '{}' already exists", update.key);
+        }
+        milestone.key = update.key.clone();
+        milestone.title = update.title.clone();
+        milestone.objective = update.objective.clone();
+        milestone.acceptance = update.acceptance.clone();
+        milestone.deps = update.deps.clone();
+        milestone.priority = update.priority;
+        milestone.max_attempts = update.max_attempts;
+        milestone.profile = update.profile.clone();
+        milestone.write_scope = update.write_scope.clone();
+        milestone.token_budget = update.token_budget;
+        milestone.cost_budget_usd = update.cost_budget_usd;
+        milestone.updated_at = now;
+        let payload = serde_json::to_value(&milestone)?;
+        let project_id: String = tx.query_row(
+            "SELECT project_id FROM programs WHERE id = ?1",
+            params![milestone.program_id],
+            |row| row.get(0),
+        )?;
+        let event = insert_program_event_tx(
+            &tx,
+            &project_id,
+            &milestone.program_id,
+            "program.milestone.updated",
+            &payload,
+        )?;
+        tx.execute(
+            "UPDATE program_milestones
+             SET key = ?2, title = ?3, objective = ?4, acceptance = ?5, deps = ?6,
+                 priority = ?7, max_attempts = ?8, profile = ?9, write_scope = ?10,
+                 token_budget = ?11, cost_budget_usd = ?12, updated_at = ?13
+             WHERE id = ?1",
+            params![
+                id,
+                milestone.key,
+                milestone.title,
+                milestone.objective,
+                serde_json::to_string(&milestone.acceptance)?,
+                serde_json::to_string(&milestone.deps)?,
+                milestone.priority,
+                milestone.max_attempts as i64,
+                milestone.profile,
+                serde_json::to_string(&milestone.write_scope)?,
+                milestone.token_budget.map(|value| value as i64),
+                milestone.cost_budget_usd,
+                milestone.updated_at,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(Some((milestone, event)))
+    }
+
+    pub fn mark_program_milestone_ready(
+        &self,
+        id: &str,
+    ) -> Result<Option<(ProgramMilestone, ProgramEvent)>> {
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let Some(mut milestone) = tx
+            .query_row(
+                &format!(
+                    "SELECT {PROGRAM_MILESTONE_COLUMNS} FROM program_milestones WHERE id = ?1"
+                ),
+                params![id],
+                map_program_milestone,
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        if !matches!(
+            milestone.status,
+            ProgramMilestoneStatus::Pending | ProgramMilestoneStatus::Failed
+        ) || milestone.attempts >= milestone.max_attempts
+        {
+            return Ok(None);
+        }
+        milestone.status = ProgramMilestoneStatus::Ready;
+        milestone.next_attempt_at = None;
+        milestone.updated_at = now;
+        let payload = serde_json::to_value(&milestone)?;
+        let project_id: String = tx.query_row(
+            "SELECT project_id FROM programs WHERE id = ?1",
+            params![milestone.program_id],
+            |row| row.get(0),
+        )?;
+        let event = insert_program_event_tx(
+            &tx,
+            &project_id,
+            &milestone.program_id,
+            "program.milestone.updated",
+            &payload,
+        )?;
+        tx.execute(
+            "UPDATE program_milestones
+             SET status = 'ready', next_attempt_at = NULL, updated_at = ?2
+             WHERE id = ?1",
+            params![id, milestone.updated_at],
+        )?;
+        tx.commit()?;
+        Ok(Some((milestone, event)))
+    }
+
+    /// Atomically claim a milestone for dispatch. The caller creates the
+    /// session only after this succeeds, so two scheduler ticks cannot launch
+    /// duplicate sessions for the same milestone.
+    pub fn claim_program_milestone_start(
+        &self,
+        id: &str,
+    ) -> Result<Option<(ProgramMilestone, ProgramEvent)>> {
+        let now = OffsetDateTime::now_utc();
+        let now_text = now.format(&Rfc3339)?;
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let Some(program) = tx
+            .query_row(
+                "SELECT p.id, p.project_id, p.status, p.archived
+                 FROM programs p
+                 JOIN program_milestones m ON m.program_id = p.id
+                 WHERE m.id = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)? != 0,
+                    ))
+                },
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        if program.2 != ProgramStatus::Active.as_str() || program.3 {
+            return Ok(None);
+        }
+        let Some(mut milestone) = tx
+            .query_row(
+                &format!(
+                    "SELECT {PROGRAM_MILESTONE_COLUMNS} FROM program_milestones WHERE id = ?1"
+                ),
+                params![id],
+                map_program_milestone,
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let retry_due = milestone
+            .next_attempt_at
+            .as_deref()
+            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+            .is_some_and(|next| next <= now);
+        let runnable = matches!(
+            milestone.status,
+            ProgramMilestoneStatus::Pending
+                | ProgramMilestoneStatus::Ready
+                | ProgramMilestoneStatus::Failed
+        );
+        if !runnable || milestone.attempts >= milestone.max_attempts {
+            return Ok(None);
+        }
+        if milestone.status == ProgramMilestoneStatus::Failed
+            && milestone.next_attempt_at.is_some()
+            && !retry_due
+        {
+            return Ok(None);
+        }
+        let statuses = tx
+            .prepare("SELECT id, status FROM program_milestones WHERE program_id = ?1")?
+            .query_map(params![milestone.program_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<HashMap<_, _>, _>>()?;
+        let deps_ready = milestone.deps.iter().all(|dep| {
+            statuses.get(dep).map(String::as_str)
+                == Some(ProgramMilestoneStatus::Completed.as_str())
+        });
+        if !deps_ready {
+            return Ok(None);
+        }
+        milestone.status = ProgramMilestoneStatus::Running;
+        milestone.session_id = None;
+        milestone.plan_revision = None;
+        milestone.attempts = milestone.attempts.saturating_add(1);
+        milestone.next_attempt_at = None;
+        milestone.result = None;
+        milestone.last_error = None;
+        milestone.updated_at = now_text;
+        milestone.completed_at = None;
+        let payload = serde_json::to_value(&milestone)?;
+        let event = insert_program_event_tx(
+            &tx,
+            &program.1,
+            &milestone.program_id,
+            "program.milestone.started",
+            &payload,
+        )?;
+        tx.execute(
+            "UPDATE program_milestones
+             SET status = 'running', session_id = NULL, plan_revision = NULL,
+                 attempts = ?2, next_attempt_at = NULL, result = NULL, last_error = NULL,
+                 completed_at = NULL, updated_at = ?3
+             WHERE id = ?1",
+            params![id, milestone.attempts as i64, milestone.updated_at],
+        )?;
+        tx.commit()?;
+        Ok(Some((milestone, event)))
+    }
+
+    pub fn attach_program_milestone_session(
+        &self,
+        id: &str,
+        session_id: &str,
+        plan_revision: u32,
+    ) -> Result<Option<(ProgramMilestone, ProgramEvent)>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let Some(mut milestone) = tx
+            .query_row(
+                &format!(
+                    "SELECT {PROGRAM_MILESTONE_COLUMNS} FROM program_milestones WHERE id = ?1"
+                ),
+                params![id],
+                map_program_milestone,
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        if milestone.status != ProgramMilestoneStatus::Running {
+            anyhow::bail!("milestone {id} is not running");
+        }
+        milestone.session_id = Some(session_id.to_string());
+        milestone.plan_revision = Some(plan_revision.max(1));
+        milestone.updated_at = now_rfc3339();
+        let payload = serde_json::to_value(&milestone)?;
+        let project_id: String = tx.query_row(
+            "SELECT project_id FROM programs WHERE id = ?1",
+            params![milestone.program_id],
+            |row| row.get(0),
+        )?;
+        let event = insert_program_event_tx(
+            &tx,
+            &project_id,
+            &milestone.program_id,
+            "program.milestone.updated",
+            &payload,
+        )?;
+        tx.execute(
+            "UPDATE program_milestones
+             SET session_id = ?2, plan_revision = ?3, updated_at = ?4
+             WHERE id = ?1",
+            params![id, session_id, plan_revision as i64, milestone.updated_at],
+        )?;
+        tx.commit()?;
+        Ok(Some((milestone, event)))
+    }
+
+    pub fn mark_program_milestone_verifying(
+        &self,
+        id: &str,
+    ) -> Result<Option<(ProgramMilestone, ProgramEvent)>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let Some(mut milestone) = tx
+            .query_row(
+                &format!(
+                    "SELECT {PROGRAM_MILESTONE_COLUMNS} FROM program_milestones WHERE id = ?1"
+                ),
+                params![id],
+                map_program_milestone,
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        if milestone.status != ProgramMilestoneStatus::Running {
+            return Ok(None);
+        }
+        milestone.status = ProgramMilestoneStatus::Verifying;
+        milestone.updated_at = now_rfc3339();
+        let payload = serde_json::to_value(&milestone)?;
+        let project_id: String = tx.query_row(
+            "SELECT project_id FROM programs WHERE id = ?1",
+            params![milestone.program_id],
+            |row| row.get(0),
+        )?;
+        let event = insert_program_event_tx(
+            &tx,
+            &project_id,
+            &milestone.program_id,
+            "program.milestone.verified",
+            &payload,
+        )?;
+        tx.execute(
+            "UPDATE program_milestones SET status = 'verifying', updated_at = ?2 WHERE id = ?1",
+            params![id, milestone.updated_at],
+        )?;
+        tx.commit()?;
+        Ok(Some((milestone, event)))
+    }
+
+    pub fn complete_program_milestone(
+        &self,
+        id: &str,
+        result: &str,
+    ) -> Result<Option<(ProgramMilestone, ProgramEvent)>> {
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let Some(mut milestone) = tx
+            .query_row(
+                &format!(
+                    "SELECT {PROGRAM_MILESTONE_COLUMNS} FROM program_milestones WHERE id = ?1"
+                ),
+                params![id],
+                map_program_milestone,
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        if !matches!(
+            milestone.status,
+            ProgramMilestoneStatus::Verifying | ProgramMilestoneStatus::Running
+        ) {
+            return Ok(None);
+        }
+        milestone.status = ProgramMilestoneStatus::Completed;
+        milestone.result = Some(result.trim().chars().take(8_000).collect());
+        milestone.last_error = None;
+        milestone.next_attempt_at = None;
+        milestone.completed_at = Some(now.clone());
+        milestone.updated_at = now.clone();
+        let payload = serde_json::to_value(&milestone)?;
+        let project_id: String = tx.query_row(
+            "SELECT project_id FROM programs WHERE id = ?1",
+            params![milestone.program_id],
+            |row| row.get(0),
+        )?;
+        let event = insert_program_event_tx(
+            &tx,
+            &project_id,
+            &milestone.program_id,
+            "program.milestone.completed",
+            &payload,
+        )?;
+        tx.execute(
+            "UPDATE program_milestones
+             SET status = 'completed', result = ?2, last_error = NULL, next_attempt_at = NULL,
+                 completed_at = ?3, updated_at = ?3
+             WHERE id = ?1",
+            params![id, milestone.result, now],
+        )?;
+        tx.commit()?;
+        Ok(Some((milestone, event)))
+    }
+
+    /// Record a failed attempt. When `next_attempt_at` is set the row stays
+    /// `failed` until the backoff becomes due; otherwise the caller follows up
+    /// with `block_program_milestone` so the milestone becomes permanently
+    /// terminal.
+    pub fn fail_program_milestone(
+        &self,
+        id: &str,
+        reason: &str,
+        next_attempt_at: Option<&str>,
+    ) -> Result<Option<(ProgramMilestone, Vec<ProgramEvent>)>> {
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let Some(mut milestone) = tx
+            .query_row(
+                &format!(
+                    "SELECT {PROGRAM_MILESTONE_COLUMNS} FROM program_milestones WHERE id = ?1"
+                ),
+                params![id],
+                map_program_milestone,
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        if matches!(
+            milestone.status,
+            ProgramMilestoneStatus::Completed
+                | ProgramMilestoneStatus::Blocked
+                | ProgramMilestoneStatus::Cancelled
+        ) {
+            return Ok(None);
+        }
+        milestone.status = ProgramMilestoneStatus::Failed;
+        milestone.last_error = Some(reason.trim().chars().take(4_000).collect());
+        milestone.next_attempt_at = next_attempt_at.map(str::to_string);
+        milestone.result = None;
+        milestone.completed_at = None;
+        milestone.updated_at = now.clone();
+        let payload = serde_json::to_value(&milestone)?;
+        let project_id: String = tx.query_row(
+            "SELECT project_id FROM programs WHERE id = ?1",
+            params![milestone.program_id],
+            |row| row.get(0),
+        )?;
+        let mut events = vec![insert_program_event_tx(
+            &tx,
+            &project_id,
+            &milestone.program_id,
+            "program.milestone.failed",
+            &payload,
+        )?];
+        if next_attempt_at.is_some() {
+            events.push(insert_program_event_tx(
+                &tx,
+                &project_id,
+                &milestone.program_id,
+                "program.milestone.retried",
+                &payload,
+            )?);
+        }
+        tx.execute(
+            "UPDATE program_milestones
+             SET status = 'failed', last_error = ?2, next_attempt_at = ?3,
+                 result = NULL, completed_at = NULL, updated_at = ?4
+             WHERE id = ?1",
+            params![id, milestone.last_error, next_attempt_at, now],
+        )?;
+        tx.commit()?;
+        Ok(Some((milestone, events)))
+    }
+
+    pub fn block_program_milestone(
+        &self,
+        id: &str,
+        reason: &str,
+    ) -> Result<Option<(ProgramMilestone, ProgramEvent)>> {
+        self.set_program_milestone_terminal(
+            id,
+            ProgramMilestoneStatus::Blocked,
+            reason,
+            "program.milestone.blocked",
+        )
+    }
+
+    pub fn cancel_program_milestone(
+        &self,
+        id: &str,
+        reason: &str,
+        skipped: bool,
+    ) -> Result<Option<(ProgramMilestone, ProgramEvent)>> {
+        self.set_program_milestone_terminal(
+            id,
+            ProgramMilestoneStatus::Cancelled,
+            reason,
+            if skipped {
+                "program.milestone.skipped"
+            } else {
+                "program.milestone.cancelled"
+            },
+        )
+    }
+
+    fn set_program_milestone_terminal(
+        &self,
+        id: &str,
+        status: ProgramMilestoneStatus,
+        reason: &str,
+        kind: &str,
+    ) -> Result<Option<(ProgramMilestone, ProgramEvent)>> {
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let Some(mut milestone) = tx
+            .query_row(
+                &format!(
+                    "SELECT {PROGRAM_MILESTONE_COLUMNS} FROM program_milestones WHERE id = ?1"
+                ),
+                params![id],
+                map_program_milestone,
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        if matches!(
+            milestone.status,
+            ProgramMilestoneStatus::Completed | ProgramMilestoneStatus::Cancelled
+        ) {
+            return Ok(None);
+        }
+        milestone.status = status;
+        milestone.last_error = Some(reason.trim().chars().take(4_000).collect());
+        milestone.next_attempt_at = None;
+        milestone.completed_at = Some(now.clone());
+        milestone.updated_at = now.clone();
+        let payload = serde_json::to_value(&milestone)?;
+        let project_id: String = tx.query_row(
+            "SELECT project_id FROM programs WHERE id = ?1",
+            params![milestone.program_id],
+            |row| row.get(0),
+        )?;
+        let event =
+            insert_program_event_tx(&tx, &project_id, &milestone.program_id, kind, &payload)?;
+        tx.execute(
+            "UPDATE program_milestones
+             SET status = ?2, last_error = ?3, next_attempt_at = NULL,
+                 completed_at = ?4, updated_at = ?4
+             WHERE id = ?1",
+            params![id, status.as_str(), milestone.last_error, now],
+        )?;
+        tx.commit()?;
+        Ok(Some((milestone, event)))
+    }
+
+    /// Explicit operator retry. Resets the automatic attempt budget but keeps
+    /// the configured maximum; the next controller tick revalidates every
+    /// dependency, budget, and admission gate.
+    pub fn retry_program_milestone(
+        &self,
+        id: &str,
+    ) -> Result<Option<(ProgramMilestone, ProgramEvent)>> {
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let Some(mut milestone) = tx
+            .query_row(
+                &format!(
+                    "SELECT {PROGRAM_MILESTONE_COLUMNS} FROM program_milestones WHERE id = ?1"
+                ),
+                params![id],
+                map_program_milestone,
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        if !matches!(
+            milestone.status,
+            ProgramMilestoneStatus::Failed
+                | ProgramMilestoneStatus::Blocked
+                | ProgramMilestoneStatus::Cancelled
+        ) {
+            return Ok(None);
+        }
+        milestone.status = ProgramMilestoneStatus::Pending;
+        milestone.attempts = 0;
+        milestone.next_attempt_at = None;
+        milestone.last_error = None;
+        milestone.result = None;
+        milestone.session_id = None;
+        milestone.plan_revision = None;
+        milestone.completed_at = None;
+        milestone.updated_at = now.clone();
+        let payload = serde_json::to_value(&milestone)?;
+        let project_id: String = tx.query_row(
+            "SELECT project_id FROM programs WHERE id = ?1",
+            params![milestone.program_id],
+            |row| row.get(0),
+        )?;
+        let event = insert_program_event_tx(
+            &tx,
+            &project_id,
+            &milestone.program_id,
+            "program.milestone.retried",
+            &payload,
+        )?;
+        tx.execute(
+            "UPDATE program_milestones
+             SET status = 'pending', attempts = 0, next_attempt_at = NULL, last_error = NULL,
+                 result = NULL, session_id = NULL, plan_revision = NULL, completed_at = NULL,
+                 updated_at = ?2
+             WHERE id = ?1",
+            params![id, now],
+        )?;
+        tx.commit()?;
+        Ok(Some((milestone, event)))
+    }
+
+    pub fn list_programs_for_session(&self, session_id: &str) -> Result<Vec<Program>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT DISTINCT {}
+             FROM programs p
+             JOIN program_milestones m ON m.program_id = p.id
+             WHERE m.session_id = ?1
+             ORDER BY p.created_at ASC, p.id ASC",
+            PROGRAM_COLUMNS
+                .split(", ")
+                .map(|column| format!("p.{column}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))?;
+        let rows = stmt.query_map(params![session_id], map_program)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn append_program_event(
+        &self,
+        project_id: &str,
+        program_id: &str,
+        kind: &str,
+        payload: &serde_json::Value,
+    ) -> Result<ProgramEvent> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let event = insert_program_event_tx(&tx, project_id, program_id, kind, payload)?;
+        tx.commit()?;
+        Ok(event)
+    }
+
+    pub fn list_program_events(
+        &self,
+        program_id: &str,
+        limit: Option<u32>,
+    ) -> Result<Vec<ProgramEvent>> {
+        let conn = self.lock()?;
+        let limit = limit.unwrap_or(1_000).clamp(1, 10_000) as i64;
+        let mut stmt = conn.prepare(
+            "SELECT program_id, project_id, seq, kind, payload, created_at
+             FROM program_events
+             WHERE program_id = ?1
+             ORDER BY seq DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![program_id, limit], map_program_event)?;
+        let mut events = rows.collect::<Result<Vec<_>, _>>()?;
+        events.reverse();
+        Ok(events)
+    }
+
+    pub fn list_program_events_for_project(
+        &self,
+        project_id: &str,
+        limit: Option<u32>,
+    ) -> Result<Vec<ProgramEvent>> {
+        let conn = self.lock()?;
+        let limit = limit.unwrap_or(10_000).clamp(1, 100_000) as i64;
+        let mut stmt = conn.prepare(
+            "SELECT program_id, project_id, seq, kind, payload, created_at
+             FROM program_events
+             WHERE project_id = ?1
+             ORDER BY created_at ASC, program_id ASC, seq ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![project_id, limit], map_program_event)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn program_usage(&self, program_id: &str) -> Result<ProgramUsage> {
+        let conn = self.lock()?;
+        let (tokens, cost) = conn.query_row(
+            "SELECT COALESCE(SUM(s.tokens_in + s.tokens_out), 0),
+                    COALESCE(SUM(s.cost_spent_usd), 0.0)
+             FROM sessions s
+             WHERE s.id IN (
+                 SELECT session_id FROM program_milestones
+                 WHERE program_id = ?1 AND session_id IS NOT NULL
+             )",
+            params![program_id],
+            |row| Ok((row.get::<_, i64>(0)?.max(0) as u64, row.get::<_, f64>(1)?)),
+        )?;
+        Ok(ProgramUsage {
+            token_spent: tokens,
+            cost_spent_usd: cost,
+        })
+    }
+
+    pub fn count_active_program_milestones(&self, program_id: &str) -> Result<u32> {
+        let conn = self.lock()?;
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM program_milestones
+             WHERE program_id = ?1 AND status IN ('running', 'verifying')",
+            params![program_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count.max(0) as u32)
+    }
+
+    pub fn insert_program_snapshot(&self, program: &Program) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO programs
+             (id, project_id, goal, status, policy, token_budget, cost_budget_usd, reason,
+              archived, created_at, updated_at, completed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(id) DO UPDATE SET
+                goal = excluded.goal,
+                status = excluded.status,
+                policy = excluded.policy,
+                token_budget = excluded.token_budget,
+                cost_budget_usd = excluded.cost_budget_usd,
+                reason = excluded.reason,
+                archived = excluded.archived,
+                updated_at = excluded.updated_at,
+                completed_at = excluded.completed_at",
+            params![
+                program.id,
+                program.project_id,
+                program.goal,
+                program.status.as_str(),
+                serde_json::to_string(&program.policy)?,
+                program.token_budget.map(|value| value as i64),
+                program.cost_budget_usd,
+                program.reason,
+                if program.archived { 1 } else { 0 },
+                program.created_at,
+                program.updated_at,
+                program.completed_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_program_milestone_snapshot(&self, milestone: &ProgramMilestone) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO program_milestones
+             (id, program_id, key, title, acceptance, deps, priority, status, session_id,
+              plan_revision, attempts, max_attempts, next_attempt_at, result, last_error,
+              write_scope, objective, profile, token_budget, cost_budget_usd, created_at,
+              updated_at, completed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
+             ON CONFLICT(id) DO UPDATE SET
+                key = excluded.key,
+                title = excluded.title,
+                acceptance = excluded.acceptance,
+                deps = excluded.deps,
+                priority = excluded.priority,
+                status = excluded.status,
+                session_id = excluded.session_id,
+                plan_revision = excluded.plan_revision,
+                attempts = excluded.attempts,
+                max_attempts = excluded.max_attempts,
+                next_attempt_at = excluded.next_attempt_at,
+                result = excluded.result,
+                last_error = excluded.last_error,
+                write_scope = excluded.write_scope,
+                objective = excluded.objective,
+                profile = excluded.profile,
+                token_budget = excluded.token_budget,
+                cost_budget_usd = excluded.cost_budget_usd,
+                updated_at = excluded.updated_at,
+                completed_at = excluded.completed_at",
+            params![
+                milestone.id,
+                milestone.program_id,
+                milestone.key,
+                milestone.title,
+                serde_json::to_string(&milestone.acceptance)?,
+                serde_json::to_string(&milestone.deps)?,
+                milestone.priority,
+                milestone.status.as_str(),
+                milestone.session_id,
+                milestone.plan_revision.map(|value| value as i64),
+                milestone.attempts as i64,
+                milestone.max_attempts as i64,
+                milestone.next_attempt_at,
+                milestone.result,
+                milestone.last_error,
+                serde_json::to_string(&milestone.write_scope)?,
+                milestone.objective,
+                milestone.profile,
+                milestone.token_budget.map(|value| value as i64),
+                milestone.cost_budget_usd,
+                milestone.created_at,
+                milestone.updated_at,
+                milestone.completed_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_program_event_snapshot(&self, event: &ProgramEvent) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO program_events
+             (project_id, program_id, seq, kind, payload, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                event.project_id,
+                event.program_id,
+                event.seq as i64,
+                event.kind,
+                serde_json::to_string(&event.payload)?,
+                event.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Replace the whole program projection with an event-derived expectation.
+    /// This is used by explicit replay repair and never appends new events.
+    pub fn replace_program_projection(
+        &self,
+        program_id: &str,
+        program: Option<&Program>,
+        milestones: &[ProgramMilestone],
+    ) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let expected_ids = milestones
+            .iter()
+            .map(|milestone| milestone.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let existing = tx
+            .prepare("SELECT id FROM program_milestones WHERE program_id = ?1")?
+            .query_map(params![program_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for id in existing {
+            if !expected_ids.contains(&id) {
+                tx.execute("DELETE FROM program_milestones WHERE id = ?1", params![id])?;
+            }
+        }
+        match program {
+            Some(program) => {
+                tx.execute(
+                    "INSERT INTO programs
+                     (id, project_id, goal, status, policy, token_budget, cost_budget_usd, reason,
+                      archived, created_at, updated_at, completed_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                     ON CONFLICT(id) DO UPDATE SET
+                        project_id = excluded.project_id,
+                        goal = excluded.goal,
+                        status = excluded.status,
+                        policy = excluded.policy,
+                        token_budget = excluded.token_budget,
+                        cost_budget_usd = excluded.cost_budget_usd,
+                        reason = excluded.reason,
+                        archived = excluded.archived,
+                        updated_at = excluded.updated_at,
+                        completed_at = excluded.completed_at",
+                    params![
+                        program.id,
+                        program.project_id,
+                        program.goal,
+                        program.status.as_str(),
+                        serde_json::to_string(&program.policy)?,
+                        program.token_budget.map(|value| value as i64),
+                        program.cost_budget_usd,
+                        program.reason,
+                        if program.archived { 1 } else { 0 },
+                        program.created_at,
+                        program.updated_at,
+                        program.completed_at,
+                    ],
+                )?;
+                for milestone in milestones {
+                    Self::insert_program_milestone_tx(&tx, milestone)?;
+                }
+            }
+            None => {
+                tx.execute("DELETE FROM programs WHERE id = ?1", params![program_id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn insert_program_milestone_tx(
+        tx: &Transaction<'_>,
+        milestone: &ProgramMilestone,
+    ) -> Result<()> {
+        tx.execute(
+            "INSERT INTO program_milestones
+             (id, program_id, key, title, acceptance, deps, priority, status, session_id,
+              plan_revision, attempts, max_attempts, next_attempt_at, result, last_error,
+              write_scope, objective, profile, token_budget, cost_budget_usd, created_at,
+              updated_at, completed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
+             ON CONFLICT(id) DO UPDATE SET
+                key = excluded.key,
+                title = excluded.title,
+                acceptance = excluded.acceptance,
+                deps = excluded.deps,
+                priority = excluded.priority,
+                status = excluded.status,
+                session_id = excluded.session_id,
+                plan_revision = excluded.plan_revision,
+                attempts = excluded.attempts,
+                max_attempts = excluded.max_attempts,
+                next_attempt_at = excluded.next_attempt_at,
+                result = excluded.result,
+                last_error = excluded.last_error,
+                write_scope = excluded.write_scope,
+                objective = excluded.objective,
+                profile = excluded.profile,
+                token_budget = excluded.token_budget,
+                cost_budget_usd = excluded.cost_budget_usd,
+                updated_at = excluded.updated_at,
+                completed_at = excluded.completed_at",
+            params![
+                milestone.id,
+                milestone.program_id,
+                milestone.key,
+                milestone.title,
+                serde_json::to_string(&milestone.acceptance)?,
+                serde_json::to_string(&milestone.deps)?,
+                milestone.priority,
+                milestone.status.as_str(),
+                milestone.session_id,
+                milestone.plan_revision.map(|value| value as i64),
+                milestone.attempts as i64,
+                milestone.max_attempts as i64,
+                milestone.next_attempt_at,
+                milestone.result,
+                milestone.last_error,
+                serde_json::to_string(&milestone.write_scope)?,
+                milestone.objective,
+                milestone.profile,
+                milestone.token_budget.map(|value| value as i64),
+                milestone.cost_budget_usd,
+                milestone.created_at,
+                milestone.updated_at,
+                milestone.completed_at,
+            ],
+        )?;
+        Ok(())
+    }
+
     const SOURCE_COLUMNS: &'static str = "id, project_id, kind, title, uri, mime_type, status, \
         size_bytes, sha256, revision, chunk_count, char_count, token_count, error, labels, \
         created_at, updated_at, indexed_at, collection";
 
-    /// Upsert one source and replace its chunks in a single transaction. The
-    /// FTS triggers keep the external-content index in sync with the chunks.
     pub fn insert_source(&self, source: &Source, chunks: &[SourceChunk]) -> Result<Source> {
         let labels = serde_json::to_string(&source.labels)?;
         let mut conn = self.lock()?;
@@ -12452,6 +14139,96 @@ impl Store {
                     entry.created_at
                 ],
             )?;
+        }
+        for program in &bundle.programs {
+            let existing: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM programs WHERE id = ?1",
+                    params![program.id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if existing.is_some() {
+                // Imported archives never overwrite a live program ledger.
+                continue;
+            }
+            let mut archived = program.clone();
+            archived.archived = true;
+            if matches!(
+                archived.status,
+                ProgramStatus::Active | ProgramStatus::Draft
+            ) {
+                archived.status = ProgramStatus::Paused;
+            }
+            archived.reason = Some("imported archive".to_string());
+            archived.updated_at = now_rfc3339();
+            tx.execute(
+                "INSERT INTO programs
+                 (id, project_id, goal, status, policy, token_budget, cost_budget_usd, reason,
+                  archived, created_at, updated_at, completed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11)",
+                params![
+                    archived.id,
+                    archived.project_id,
+                    archived.goal,
+                    archived.status.as_str(),
+                    serde_json::to_string(&archived.policy)?,
+                    archived.token_budget.map(|value| value as i64),
+                    archived.cost_budget_usd,
+                    archived.reason,
+                    archived.created_at,
+                    archived.updated_at,
+                    archived.completed_at,
+                ],
+            )?;
+            for milestone in bundle
+                .program_milestones
+                .iter()
+                .filter(|milestone| milestone.program_id == archived.id)
+            {
+                Self::insert_program_milestone_tx(&tx, milestone)?;
+            }
+            for event in bundle
+                .program_events
+                .iter()
+                .filter(|event| event.program_id == archived.id)
+            {
+                tx.execute(
+                    "INSERT OR REPLACE INTO program_events
+                     (project_id, program_id, seq, kind, payload, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        event.project_id,
+                        event.program_id,
+                        event.seq as i64,
+                        event.kind,
+                        serde_json::to_string(&event.payload)?,
+                        event.created_at,
+                    ],
+                )?;
+            }
+            let archive_payload = serde_json::to_value(&archived)?;
+            insert_program_event_tx(
+                &tx,
+                &archived.project_id,
+                &archived.id,
+                "program.updated",
+                &archive_payload,
+            )?;
+            for milestone in bundle
+                .program_milestones
+                .iter()
+                .filter(|milestone| milestone.program_id == archived.id)
+            {
+                let payload = serde_json::to_value(milestone)?;
+                insert_program_event_tx(
+                    &tx,
+                    &archived.project_id,
+                    &archived.id,
+                    "program.milestone.updated",
+                    &payload,
+                )?;
+            }
         }
         let status_event = insert_event_tx(
             &tx,

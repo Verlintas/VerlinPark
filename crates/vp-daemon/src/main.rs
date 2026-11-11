@@ -92,6 +92,13 @@ use vp_protocol::types::{
     PlanRevisionListParams, PlanRevisionListResult, PlanRevisionRestoreParams,
     ReviseTeamPlanParams, SetOrchestrationPolicyParams, TaskEditParams,
 };
+use vp_protocol::types::{
+    ProgramActionParams, ProgramCreateParams, ProgramDeleteParams, ProgramDeleteResult,
+    ProgramListParams, ProgramMilestoneActionParams, ProgramMilestoneCreateParams,
+    ProgramMilestoneParams, ProgramMilestoneResult, ProgramMilestoneUpdateParams, ProgramParams,
+    ProgramReplayParams, ProgramResult, ProgramStatusParams, ProgramTickParams,
+    ProgramUpdateParams,
+};
 use vp_protocol::{APP_VERSION, PROTOCOL_VERSION, now_rfc3339};
 use vp_store::Store;
 use vp_store::paths;
@@ -1216,6 +1223,155 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "intake.delete" => match parse_params::<IntakeTaskParams>(request.params) {
             Ok(params) => match state.agent.delete_intake_task(&params.id).await {
                 Ok(()) => RpcResponse::success(id, IntakeDeleteResult { deleted: true }),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "program.list" => match parse_params::<ProgramListParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .list_programs(params.project_id, params.status, params.limit)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "program.create" => match parse_params::<ProgramCreateParams>(request.params) {
+            Ok(params) => match state.engine.create_program(params).await {
+                Ok(program) => RpcResponse::success(id, ProgramResult { program }),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "program.update" => match parse_params::<ProgramUpdateParams>(request.params) {
+            Ok(params) => match state.engine.update_program(params).await {
+                Ok(program) => RpcResponse::success(id, ProgramResult { program }),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "program.pause" => match parse_params::<ProgramActionParams>(request.params) {
+            Ok(params) => match state.engine.pause_program(params).await {
+                Ok(program) => RpcResponse::success(id, ProgramResult { program }),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "program.resume" => match parse_params::<ProgramActionParams>(request.params) {
+            Ok(params) => match state.engine.resume_program(params).await {
+                Ok(program) => RpcResponse::success(id, ProgramResult { program }),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "program.cancel" => match parse_params::<ProgramActionParams>(request.params) {
+            Ok(params) => {
+                let reason = params
+                    .reason
+                    .unwrap_or_else(|| "cancelled from program.cancel".to_string());
+                match state
+                    .agent
+                    .cancel_program(&params.program_id, &reason)
+                    .await
+                {
+                    Ok(program) => RpcResponse::success(id, ProgramResult { program }),
+                    Err(error) => internal_error(id, error),
+                }
+            }
+            Err(response) => response_with_id(id, response),
+        },
+        "program.delete" => match parse_params::<ProgramDeleteParams>(request.params) {
+            Ok(params) => match state.engine.delete_program(params).await {
+                Ok(deleted) => RpcResponse::success(id, ProgramDeleteResult { deleted }),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "program.status" => match parse_params::<ProgramStatusParams>(request.params) {
+            Ok(params) => match state.engine.program_status(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "program.milestone.list" => match parse_params::<ProgramParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .list_program_milestones(params.program_id)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "program.milestone.create" => {
+            match parse_params::<ProgramMilestoneCreateParams>(request.params) {
+                Ok(params) => match state.engine.create_program_milestone(params).await {
+                    Ok(milestone) => RpcResponse::success(id, ProgramMilestoneResult { milestone }),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "program.milestone.update" => {
+            match parse_params::<ProgramMilestoneUpdateParams>(request.params) {
+                Ok(params) => match state.engine.update_program_milestone(params).await {
+                    Ok(milestone) => RpcResponse::success(id, ProgramMilestoneResult { milestone }),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "program.milestone.retry" => {
+            match parse_params::<ProgramMilestoneActionParams>(request.params) {
+                Ok(params) => match state.engine.retry_program_milestone(params).await {
+                    Ok(milestone) => RpcResponse::success(id, ProgramMilestoneResult { milestone }),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "program.milestone.skip" => {
+            match parse_params::<ProgramMilestoneActionParams>(request.params) {
+                Ok(params) => match state.engine.skip_program_milestone(params).await {
+                    Ok(milestone) => RpcResponse::success(id, ProgramMilestoneResult { milestone }),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "program.milestone.start" => match parse_params::<ProgramMilestoneParams>(request.params) {
+            Ok(params) => match state
+                .agent
+                .start_program_milestone(&params.milestone_id)
+                .await
+            {
+                Ok(milestone) => RpcResponse::success(id, ProgramMilestoneResult { milestone }),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "program.replay" => match parse_params::<ProgramReplayParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .replay_program(&params.program_id, params.repair)
+                .await
+            {
+                Ok(report) => RpcResponse::success(id, report),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "program.tick" => match parse_params::<ProgramTickParams>(request.params) {
+            Ok(params) => match state
+                .agent
+                .reconcile_programs(params.project_id.as_deref())
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),

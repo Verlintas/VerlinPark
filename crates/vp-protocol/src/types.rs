@@ -3789,6 +3789,14 @@ pub struct SessionBundle {
     /// list; importing the archive replays the recovery events it carries.
     #[serde(default)]
     pub recoveries: Vec<OrchestrationRecovery>,
+    /// Program ledgers linked to this session. Exported as an archive
+    /// snapshot; imported programs are marked archived and never auto-run.
+    #[serde(default)]
+    pub programs: Vec<Program>,
+    #[serde(default)]
+    pub program_milestones: Vec<ProgramMilestone>,
+    #[serde(default)]
+    pub program_events: Vec<ProgramEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4961,6 +4969,545 @@ pub struct OrchestrationSnapshotResult {
     pub snapshot: OrchestrationSnapshot,
 }
 
+// ---------------------------------------------------------------------------
+// Project programs and milestones (ADR-0157)
+// ---------------------------------------------------------------------------
+
+/// Lifecycle of a project-scoped program. Programs outlive sessions and hold
+/// a milestone ledger; they are not a second kind of TeamPlan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramStatus {
+    #[default]
+    Draft,
+    Active,
+    Paused,
+    Completed,
+    Failed,
+}
+
+impl ProgramStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::Active => "active",
+            Self::Paused => "paused",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "draft" => Some(Self::Draft),
+            "active" => Some(Self::Active),
+            "paused" => Some(Self::Paused),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed)
+    }
+}
+
+impl std::fmt::Display for ProgramStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Lifecycle of one milestone. `ready` is a persisted, event-backed state so a
+/// paused program can preserve dispatch eligibility without repeatedly
+/// recomputing it, and `verifying` records the acceptance check between a
+/// completed session task and terminal completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramMilestoneStatus {
+    #[default]
+    Pending,
+    Ready,
+    Running,
+    Verifying,
+    Completed,
+    Failed,
+    Blocked,
+    Cancelled,
+}
+
+impl ProgramMilestoneStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Ready => "ready",
+            Self::Running => "running",
+            Self::Verifying => "verifying",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Blocked => "blocked",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "ready" => Some(Self::Ready),
+            "running" => Some(Self::Running),
+            "verifying" => Some(Self::Verifying),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            "blocked" => Some(Self::Blocked),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        // `failed` is transient while a bounded retry or an explicit operator
+        // retry is still possible. Only completed, blocked, and cancelled are
+        // final states for program completion accounting.
+        matches!(self, Self::Completed | Self::Blocked | Self::Cancelled)
+    }
+
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Running | Self::Verifying)
+    }
+}
+
+impl std::fmt::Display for ProgramMilestoneStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Declarative, deterministic program policy. The controller never asks a
+/// model which milestone to run; it applies these fields directly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProgramPolicy {
+    /// Opt-in autonomous dispatch. Creating an active program with no explicit
+    /// policy enables this; a plain draft does not. Paused programs never
+    /// dispatch regardless of this flag.
+    pub auto_dispatch: bool,
+    /// Automatic starts per milestone before it needs operator intervention.
+    pub max_attempts: u32,
+    /// Delay before an automatic retry becomes ready.
+    pub retry_backoff_secs: u64,
+    /// What happens to dependents when a milestone ends permanently failed.
+    pub dependency_failure: DependencyFailurePolicy,
+    /// Default token budget inherited by a milestone that declares none.
+    pub token_budget: Option<u64>,
+    /// Default USD budget inherited by a milestone that declares none.
+    pub cost_budget_usd: Option<f64>,
+    /// Maximum milestones in `running` or `verifying` at once.
+    pub max_parallel_milestones: u32,
+}
+
+impl Default for ProgramPolicy {
+    fn default() -> Self {
+        Self {
+            auto_dispatch: false,
+            max_attempts: 2,
+            retry_backoff_secs: 60,
+            dependency_failure: DependencyFailurePolicy::Block,
+            token_budget: None,
+            cost_budget_usd: None,
+            max_parallel_milestones: 2,
+        }
+    }
+}
+
+/// One project-scoped program. This row is a ledger, not an execution runtime:
+/// execution always happens in a normal session with a normal one-task plan.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Program {
+    pub id: String,
+    pub project_id: String,
+    pub goal: String,
+    pub status: ProgramStatus,
+    #[serde(default)]
+    pub policy: ProgramPolicy,
+    #[serde(default)]
+    pub token_budget: Option<u64>,
+    #[serde(default)]
+    pub cost_budget_usd: Option<f64>,
+    /// Operator-visible pause/failure/block reason. `None` for a clean run.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Imported bundle ledgers are archives. The controller never dispatches
+    /// them, and `program.resume` refuses to activate them.
+    #[serde(default)]
+    pub archived: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+}
+
+/// One milestone in a program. `deps` contains milestone ids in the same
+/// program; the store validates uniqueness and acyclicity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProgramMilestone {
+    pub id: String,
+    pub program_id: String,
+    /// Stable human key such as `1` or `1.2`; unique inside the program.
+    pub key: String,
+    pub title: String,
+    pub objective: String,
+    #[serde(default)]
+    pub acceptance: Vec<String>,
+    #[serde(default)]
+    pub deps: Vec<String>,
+    #[serde(default)]
+    pub priority: i32,
+    pub status: ProgramMilestoneStatus,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub plan_revision: Option<u32>,
+    #[serde(default)]
+    pub attempts: u32,
+    pub max_attempts: u32,
+    #[serde(default)]
+    pub next_attempt_at: Option<String>,
+    #[serde(default)]
+    pub result: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default = "default_program_milestone_profile")]
+    pub profile: String,
+    #[serde(default)]
+    pub write_scope: Vec<String>,
+    #[serde(default)]
+    pub token_budget: Option<u64>,
+    #[serde(default)]
+    pub cost_budget_usd: Option<f64>,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+}
+
+fn default_program_milestone_profile() -> String {
+    "coding".to_string()
+}
+
+/// Append-only program-scoped event. Program events are separate from the
+/// session event stream because a program outlives every one of its sessions.
+/// Payloads contain the full program or milestone row so replay can rebuild
+/// the projection without joining other tables.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProgramEvent {
+    pub program_id: String,
+    pub project_id: String,
+    pub seq: u64,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub payload: Value,
+    pub created_at: String,
+}
+
+/// Read-only aggregate of the sessions linked to a program.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProgramUsage {
+    #[serde(default)]
+    pub token_spent: u64,
+    #[serde(default)]
+    pub cost_spent_usd: f64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgramMilestoneCounts {
+    pub pending: usize,
+    pub ready: usize,
+    pub running: usize,
+    pub verifying: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub blocked: usize,
+    pub cancelled: usize,
+}
+
+impl ProgramMilestoneCounts {
+    pub fn total(&self) -> usize {
+        self.pending
+            + self.ready
+            + self.running
+            + self.verifying
+            + self.completed
+            + self.failed
+            + self.blocked
+            + self.cancelled
+    }
+
+    pub fn add(&mut self, status: ProgramMilestoneStatus) {
+        match status {
+            ProgramMilestoneStatus::Pending => self.pending += 1,
+            ProgramMilestoneStatus::Ready => self.ready += 1,
+            ProgramMilestoneStatus::Running => self.running += 1,
+            ProgramMilestoneStatus::Verifying => self.verifying += 1,
+            ProgramMilestoneStatus::Completed => self.completed += 1,
+            ProgramMilestoneStatus::Failed => self.failed += 1,
+            ProgramMilestoneStatus::Blocked => self.blocked += 1,
+            ProgramMilestoneStatus::Cancelled => self.cancelled += 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramListEntry {
+    pub program: Program,
+    #[serde(default)]
+    pub counts: ProgramMilestoneCounts,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProgramListResult {
+    pub programs: Vec<ProgramListEntry>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ProgramListParams {
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub status: Option<ProgramStatus>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProgramCreateParams {
+    pub project_id: String,
+    pub goal: String,
+    #[serde(default)]
+    pub policy: Option<ProgramPolicy>,
+    #[serde(default)]
+    pub token_budget: Option<u64>,
+    #[serde(default)]
+    pub cost_budget_usd: Option<f64>,
+    /// Draft programs do not dispatch. An explicit activation creates an
+    /// `active` row and, when `policy` was omitted, opts into auto-dispatch.
+    #[serde(default)]
+    pub activate: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProgramUpdateParams {
+    pub program_id: String,
+    pub goal: String,
+    pub policy: ProgramPolicy,
+    #[serde(default)]
+    pub token_budget: Option<u64>,
+    #[serde(default)]
+    pub cost_budget_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProgramParams {
+    pub program_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProgramActionParams {
+    pub program_id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProgramDeleteParams {
+    pub program_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProgramStatusParams {
+    pub program_id: String,
+    #[serde(default)]
+    pub event_limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProgramResult {
+    pub program: Program,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProgramStatusResult {
+    pub program: Program,
+    pub milestones: Vec<ProgramMilestone>,
+    #[serde(default)]
+    pub counts: ProgramMilestoneCounts,
+    #[serde(default)]
+    pub usage: ProgramUsage,
+    #[serde(default)]
+    pub events: Vec<ProgramEvent>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProgramDeleteResult {
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProgramMilestoneCreateParams {
+    pub program_id: String,
+    #[serde(default)]
+    pub key: Option<String>,
+    pub title: String,
+    pub objective: String,
+    #[serde(default)]
+    pub acceptance: Vec<String>,
+    #[serde(default)]
+    pub deps: Vec<String>,
+    #[serde(default)]
+    pub priority: Option<i32>,
+    #[serde(default)]
+    pub max_attempts: Option<u32>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub write_scope: Vec<String>,
+    #[serde(default)]
+    pub token_budget: Option<u64>,
+    #[serde(default)]
+    pub cost_budget_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProgramMilestoneUpdateParams {
+    pub milestone_id: String,
+    pub title: String,
+    pub objective: String,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub acceptance: Vec<String>,
+    #[serde(default)]
+    pub deps: Vec<String>,
+    #[serde(default)]
+    pub priority: Option<i32>,
+    #[serde(default)]
+    pub max_attempts: Option<u32>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub write_scope: Vec<String>,
+    #[serde(default)]
+    pub token_budget: Option<u64>,
+    #[serde(default)]
+    pub cost_budget_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProgramMilestoneParams {
+    pub milestone_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProgramMilestoneActionParams {
+    pub milestone_id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProgramMilestoneResult {
+    pub milestone: ProgramMilestone,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProgramMilestoneListResult {
+    pub milestones: Vec<ProgramMilestone>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ProgramTickParams {
+    #[serde(default)]
+    pub project_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProgramTickResult {
+    pub programs: usize,
+    pub milestones_advanced: usize,
+    pub sessions_started: usize,
+    pub completed: usize,
+    pub failed: usize,
+    #[serde(default)]
+    pub ready: Vec<ProgramMilestone>,
+}
+
+/// Result of replaying the program event log into its projection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramReplayReport {
+    pub program_id: String,
+    pub event_count: usize,
+    pub program_matches: bool,
+    pub milestones_match: bool,
+    pub consistent: bool,
+    #[serde(default)]
+    pub repaired: bool,
+    #[serde(default)]
+    pub mismatches: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProgramReplayParams {
+    pub program_id: String,
+    #[serde(default)]
+    pub repair: bool,
+}
+
+/// Rebuild the expected projection from the ordered event log. Events carry
+/// full rows, so replay is a fold of program rows and milestone upserts plus a
+/// delete tombstone.
+pub fn rebuild_program_from_events(
+    events: &[ProgramEvent],
+) -> (Option<Program>, Vec<ProgramMilestone>) {
+    let mut program: Option<Program> = None;
+    let mut milestones: Vec<ProgramMilestone> = Vec::new();
+    for event in events {
+        match event.kind.as_str() {
+            "program.deleted" => {
+                program = None;
+                milestones.clear();
+            }
+            kind if kind.starts_with("program.milestone.") => {
+                let Ok(milestone) =
+                    serde_json::from_value::<ProgramMilestone>(event.payload.clone())
+                else {
+                    continue;
+                };
+                if let Some(existing) = milestones
+                    .iter_mut()
+                    .find(|existing| existing.id == milestone.id)
+                {
+                    *existing = milestone;
+                } else {
+                    milestones.push(milestone);
+                }
+            }
+            kind if kind.starts_with("program.") => {
+                if let Ok(row) = serde_json::from_value::<Program>(event.payload.clone()) {
+                    program = Some(row);
+                }
+            }
+            _ => {}
+        }
+    }
+    milestones.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.key.cmp(&right.key))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    (program, milestones)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5561,5 +6108,284 @@ mod tests {
         let legacy: DaemonMetrics = serde_json::from_value(value).unwrap();
         assert_eq!(legacy.cache_hit_ratio, 0.0);
         assert!(legacy.preamble_tokens_estimate.is_none());
+    }
+}
+
+#[cfg(test)]
+mod program_type_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn program_row() -> Program {
+        Program {
+            id: "prog-1".into(),
+            project_id: "project-1".into(),
+            goal: "Ship the program".into(),
+            status: ProgramStatus::Active,
+            policy: ProgramPolicy {
+                auto_dispatch: true,
+                max_attempts: 3,
+                retry_backoff_secs: 30,
+                dependency_failure: DependencyFailurePolicy::Retry,
+                token_budget: Some(10_000),
+                cost_budget_usd: Some(2.0),
+                max_parallel_milestones: 3,
+            },
+            token_budget: Some(100_000),
+            cost_budget_usd: Some(20.0),
+            reason: None,
+            archived: false,
+            created_at: "2026-11-11T00:00:00Z".into(),
+            updated_at: "2026-11-11T00:00:01Z".into(),
+            completed_at: None,
+        }
+    }
+
+    fn milestone_row() -> ProgramMilestone {
+        ProgramMilestone {
+            id: "ms-1".into(),
+            program_id: "prog-1".into(),
+            key: "1.2".into(),
+            title: "Milestone".into(),
+            objective: "Deliver it".into(),
+            acceptance: vec!["accepted".into()],
+            deps: Vec::new(),
+            priority: 7,
+            status: ProgramMilestoneStatus::Ready,
+            session_id: None,
+            plan_revision: None,
+            attempts: 0,
+            max_attempts: 3,
+            next_attempt_at: None,
+            result: None,
+            last_error: None,
+            profile: "coding".into(),
+            write_scope: vec!["src".into()],
+            token_budget: None,
+            cost_budget_usd: None,
+            created_at: "2026-11-11T00:00:00Z".into(),
+            updated_at: "2026-11-11T00:00:01Z".into(),
+            completed_at: None,
+        }
+    }
+
+    #[test]
+    fn program_rows_decode_with_additive_defaults() {
+        let program: Program = serde_json::from_value(json!({
+            "id": "prog-legacy",
+            "project_id": "project-1",
+            "goal": "Legacy program",
+            "status": "draft",
+            "created_at": "2026-11-11T00:00:00Z",
+            "updated_at": "2026-11-11T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(program.policy, ProgramPolicy::default());
+        assert!(!program.policy.auto_dispatch);
+        assert_eq!(program.token_budget, None);
+        assert!(!program.archived);
+        assert!(program.completed_at.is_none());
+
+        let milestone: ProgramMilestone = serde_json::from_value(json!({
+            "id": "ms-legacy",
+            "program_id": "prog-legacy",
+            "key": "1",
+            "title": "Legacy milestone",
+            "objective": "Keep decoding",
+            "status": "pending",
+            "max_attempts": 2,
+            "created_at": "2026-11-11T00:00:00Z",
+            "updated_at": "2026-11-11T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(milestone.profile, "coding");
+        assert!(milestone.acceptance.is_empty());
+        assert!(milestone.deps.is_empty());
+        assert_eq!(milestone.attempts, 0);
+        assert!(milestone.session_id.is_none());
+    }
+
+    #[test]
+    fn program_status_and_milestone_status_round_trip() {
+        for status in [
+            ProgramStatus::Draft,
+            ProgramStatus::Active,
+            ProgramStatus::Paused,
+            ProgramStatus::Completed,
+            ProgramStatus::Failed,
+        ] {
+            let value = serde_json::to_value(status).unwrap();
+            assert_eq!(value, json!(status.as_str()));
+            assert_eq!(ProgramStatus::parse(status.as_str()), Some(status));
+        }
+        for status in [
+            ProgramMilestoneStatus::Pending,
+            ProgramMilestoneStatus::Ready,
+            ProgramMilestoneStatus::Running,
+            ProgramMilestoneStatus::Verifying,
+            ProgramMilestoneStatus::Completed,
+            ProgramMilestoneStatus::Failed,
+            ProgramMilestoneStatus::Blocked,
+            ProgramMilestoneStatus::Cancelled,
+        ] {
+            let value = serde_json::to_value(status).unwrap();
+            assert_eq!(value, json!(status.as_str()));
+            assert_eq!(ProgramMilestoneStatus::parse(status.as_str()), Some(status));
+        }
+        assert!(!ProgramMilestoneStatus::Failed.is_terminal());
+        assert!(ProgramMilestoneStatus::Blocked.is_terminal());
+    }
+
+    #[test]
+    fn event_replay_folds_full_rows_and_honors_delete_tombstones() {
+        let mut program = program_row();
+        let mut milestone = milestone_row();
+        let mut events = vec![ProgramEvent {
+            program_id: program.id.clone(),
+            project_id: program.project_id.clone(),
+            seq: 1,
+            kind: "program.created".into(),
+            payload: serde_json::to_value(&program).unwrap(),
+            created_at: "2026-11-11T00:00:00Z".into(),
+        }];
+        milestone.status = ProgramMilestoneStatus::Running;
+        events.push(ProgramEvent {
+            program_id: program.id.clone(),
+            project_id: program.project_id.clone(),
+            seq: 2,
+            kind: "program.milestone.created".into(),
+            payload: serde_json::to_value(&milestone).unwrap(),
+            created_at: "2026-11-11T00:00:01Z".into(),
+        });
+        milestone.status = ProgramMilestoneStatus::Completed;
+        milestone.result = Some("done".into());
+        events.push(ProgramEvent {
+            program_id: program.id.clone(),
+            project_id: program.project_id.clone(),
+            seq: 3,
+            kind: "program.milestone.completed".into(),
+            payload: serde_json::to_value(&milestone).unwrap(),
+            created_at: "2026-11-11T00:00:02Z".into(),
+        });
+        program.status = ProgramStatus::Completed;
+        events.push(ProgramEvent {
+            program_id: program.id.clone(),
+            project_id: program.project_id.clone(),
+            seq: 4,
+            kind: "program.completed".into(),
+            payload: serde_json::to_value(&program).unwrap(),
+            created_at: "2026-11-11T00:00:03Z".into(),
+        });
+        let (rebuilt, milestones) = rebuild_program_from_events(&events);
+        assert_eq!(rebuilt.unwrap().status, ProgramStatus::Completed);
+        assert_eq!(milestones.len(), 1);
+        assert_eq!(milestones[0].status, ProgramMilestoneStatus::Completed);
+
+        events.push(ProgramEvent {
+            program_id: program.id.clone(),
+            project_id: program.project_id.clone(),
+            seq: 5,
+            kind: "program.deleted".into(),
+            payload: json!({"id": program.id}),
+            created_at: "2026-11-11T00:00:04Z".into(),
+        });
+        let (rebuilt, milestones) = rebuild_program_from_events(&events);
+        assert!(rebuilt.is_none());
+        assert!(milestones.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod program_wire_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn program_create_params_accept_legacy_minimal_input() {
+        let params: ProgramCreateParams = serde_json::from_value(json!({
+            "project_id": "project-1",
+            "goal": "Ship it"
+        }))
+        .unwrap();
+        assert!(params.policy.is_none());
+        assert!(!params.activate);
+        assert!(params.token_budget.is_none());
+        assert!(params.cost_budget_usd.is_none());
+    }
+
+    #[test]
+    fn program_status_result_round_trips_through_json() {
+        let detail = ProgramStatusResult {
+            program: Program {
+                id: "prog-1".into(),
+                project_id: "project-1".into(),
+                goal: "Status".into(),
+                status: ProgramStatus::Paused,
+                policy: ProgramPolicy::default(),
+                token_budget: Some(10_000),
+                cost_budget_usd: Some(2.0),
+                reason: Some("operator pause".into()),
+                archived: false,
+                created_at: "2026-11-11T00:00:00Z".into(),
+                updated_at: "2026-11-11T00:00:01Z".into(),
+                completed_at: None,
+            },
+            milestones: Vec::new(),
+            counts: ProgramMilestoneCounts::default(),
+            usage: ProgramUsage {
+                token_spent: 10,
+                cost_spent_usd: 0.1,
+            },
+            events: Vec::new(),
+        };
+        let value = serde_json::to_value(&detail).unwrap();
+        assert_eq!(value["program"]["status"], "paused");
+        assert_eq!(value["program"]["policy"]["auto_dispatch"], false);
+        assert_eq!(value["usage"]["cost_spent_usd"], 0.1);
+        assert_eq!(value["counts"]["pending"], 0);
+    }
+
+    #[test]
+    fn legacy_session_bundle_decodes_without_a_program_ledger() {
+        let bundle: SessionBundle = serde_json::from_value(json!({
+            "version": 1,
+            "exported_at": "2026-11-11T00:00:00Z",
+            "project": {
+                "id": "project-1",
+                "name": "Legacy",
+                "root": "/tmp/legacy",
+                "default_branch": "main",
+                "created_at": "2026-11-11T00:00:00Z"
+            },
+            "session": {
+                "id": "session-1",
+                "project_id": "project-1",
+                "goal": "Legacy bundle",
+                "status": "imported",
+                "created_at": "2026-11-11T00:00:00Z"
+            },
+            "events": [],
+            "agents": [],
+            "messages": [],
+            "todos": [],
+            "merge_queue": []
+        }))
+        .unwrap();
+        assert!(bundle.programs.is_empty());
+        assert!(bundle.program_milestones.is_empty());
+        assert!(bundle.program_events.is_empty());
+        assert!(bundle.recoveries.is_empty());
+    }
+
+    #[test]
+    fn program_tick_and_milestone_action_params_decode_additive_fields() {
+        let tick: ProgramTickParams = serde_json::from_value(json!({})).unwrap();
+        assert!(tick.project_id.is_none());
+        let action: ProgramMilestoneActionParams =
+            serde_json::from_value(json!({"milestone_id": "ms-1"})).unwrap();
+        assert!(action.reason.is_none());
+        let list: ProgramListParams = serde_json::from_value(json!({"status": "active"})).unwrap();
+        assert_eq!(list.status, Some(ProgramStatus::Active));
+        assert!(list.project_id.is_none());
     }
 }

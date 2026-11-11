@@ -609,6 +609,126 @@ enum Command {
         #[arg(long)]
         project: Option<String>,
     },
+    /// List project programs and their milestone counts.
+    Programs {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+    /// Show a program, its milestones, usage, and recent program events.
+    ProgramStatus {
+        id: String,
+        #[arg(long, default_value_t = 50)]
+        events: u32,
+    },
+    /// Create a project program. Draft programs do not dispatch until activated.
+    ProgramCreate {
+        project: String,
+        goal: String,
+        /// Activate immediately. With no explicit policy this opts into dispatch.
+        #[arg(long)]
+        activate: bool,
+        /// Explicitly enable autonomous milestone dispatch.
+        #[arg(long)]
+        auto_dispatch: bool,
+        #[arg(long)]
+        token_budget: Option<u64>,
+        #[arg(long)]
+        cost_budget_usd: Option<f64>,
+        #[arg(long, default_value_t = 2)]
+        max_attempts: u32,
+        #[arg(long, default_value_t = 60)]
+        retry_backoff_secs: u64,
+        #[arg(long, default_value_t = 2)]
+        max_parallel: u32,
+        /// block, cancel, or retry.
+        #[arg(long, default_value = "block")]
+        dependency_failure: String,
+    },
+    /// Update a program goal, policy, or aggregate budgets.
+    ProgramUpdate {
+        id: String,
+        goal: String,
+        #[arg(long)]
+        auto_dispatch: bool,
+        #[arg(long)]
+        token_budget: Option<u64>,
+        #[arg(long)]
+        cost_budget_usd: Option<f64>,
+        #[arg(long, default_value_t = 2)]
+        max_attempts: u32,
+        #[arg(long, default_value_t = 60)]
+        retry_backoff_secs: u64,
+        #[arg(long, default_value_t = 2)]
+        max_parallel: u32,
+        #[arg(long, default_value = "block")]
+        dependency_failure: String,
+    },
+    /// Pause new milestone dispatch; in-flight work continues.
+    ProgramPause {
+        id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Resume a paused or draft program.
+    ProgramResume { id: String },
+    /// Cooperatively cancel all non-terminal milestones and fail the program.
+    ProgramCancel {
+        id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Delete a draft or terminal program.
+    ProgramDelete { id: String },
+    /// Add a milestone to a program.
+    ProgramMilestoneAdd {
+        program: String,
+        title: String,
+        /// Milestone objective; use '-' to read from stdin.
+        objective: String,
+        #[arg(long)]
+        key: Option<String>,
+        #[arg(long = "accept")]
+        acceptance: Vec<String>,
+        #[arg(long = "depends-on")]
+        depends_on: Vec<String>,
+        #[arg(long, default_value_t = 0)]
+        priority: i32,
+        #[arg(long, default_value_t = 2)]
+        max_attempts: u32,
+        #[arg(long, default_value = "coding")]
+        profile: String,
+        #[arg(long = "scope")]
+        scope: Vec<String>,
+        #[arg(long)]
+        token_budget: Option<u64>,
+        #[arg(long)]
+        cost_budget_usd: Option<f64>,
+    },
+    /// Reset a failed, blocked, or cancelled milestone for another attempt.
+    ProgramMilestoneRetry { id: String },
+    /// Skip a milestone (recorded as cancelled with a skipped event).
+    ProgramMilestoneSkip {
+        id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Start one ready milestone now through the normal session path.
+    ProgramRun { milestone: String },
+    /// Run one deterministic program controller tick (may start ready work).
+    ProgramTick {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Replay a program projection from its append-only event log.
+    ProgramReplay {
+        id: String,
+        #[arg(long)]
+        repair: bool,
+    },
     /// List the persistent global task-DAG queue and write leases.
     Tasks {
         #[arg(long)]
@@ -2244,6 +2364,190 @@ async fn main() -> Result<()> {
             )
             .await?
         }
+        Command::Programs {
+            project,
+            status,
+            limit,
+        } => {
+            rpc(
+                &discovery,
+                "program.list",
+                json!({"project_id": project, "status": status, "limit": limit}),
+            )
+            .await?
+        }
+        Command::ProgramStatus { id, events } => {
+            rpc(
+                &discovery,
+                "program.status",
+                json!({"program_id": id, "event_limit": events}),
+            )
+            .await?
+        }
+        Command::ProgramCreate {
+            project,
+            goal,
+            activate,
+            auto_dispatch,
+            token_budget,
+            cost_budget_usd,
+            max_attempts,
+            retry_backoff_secs,
+            max_parallel,
+            dependency_failure,
+        } => {
+            let dependency_failure = parse_dependency_failure(&dependency_failure)?;
+            rpc(
+                &discovery,
+                "program.create",
+                json!({
+                    "project_id": project,
+                    "goal": goal,
+                    "activate": activate,
+                    "token_budget": token_budget,
+                    "cost_budget_usd": cost_budget_usd,
+                    "policy": {
+                        "auto_dispatch": auto_dispatch || activate,
+                        "max_attempts": max_attempts,
+                        "retry_backoff_secs": retry_backoff_secs,
+                        "dependency_failure": dependency_failure,
+                        "max_parallel_milestones": max_parallel,
+                    },
+                }),
+            )
+            .await?
+        }
+        Command::ProgramUpdate {
+            id,
+            goal,
+            auto_dispatch,
+            token_budget,
+            cost_budget_usd,
+            max_attempts,
+            retry_backoff_secs,
+            max_parallel,
+            dependency_failure,
+        } => {
+            let dependency_failure = parse_dependency_failure(&dependency_failure)?;
+            rpc(
+                &discovery,
+                "program.update",
+                json!({
+                    "program_id": id,
+                    "goal": goal,
+                    "token_budget": token_budget,
+                    "cost_budget_usd": cost_budget_usd,
+                    "policy": {
+                        "auto_dispatch": auto_dispatch,
+                        "max_attempts": max_attempts,
+                        "retry_backoff_secs": retry_backoff_secs,
+                        "dependency_failure": dependency_failure,
+                        "max_parallel_milestones": max_parallel,
+                    },
+                }),
+            )
+            .await?
+        }
+        Command::ProgramPause { id, reason } => {
+            rpc(
+                &discovery,
+                "program.pause",
+                json!({"program_id": id, "reason": reason}),
+            )
+            .await?
+        }
+        Command::ProgramResume { id } => {
+            rpc(&discovery, "program.resume", json!({"program_id": id})).await?
+        }
+        Command::ProgramCancel { id, reason } => {
+            rpc(
+                &discovery,
+                "program.cancel",
+                json!({"program_id": id, "reason": reason}),
+            )
+            .await?
+        }
+        Command::ProgramDelete { id } => {
+            rpc(&discovery, "program.delete", json!({"program_id": id})).await?
+        }
+        Command::ProgramMilestoneAdd {
+            program,
+            title,
+            objective,
+            key,
+            acceptance,
+            depends_on,
+            priority,
+            max_attempts,
+            profile,
+            scope,
+            token_budget,
+            cost_budget_usd,
+        } => {
+            let objective = if objective == "-" {
+                let mut buffer = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut buffer)
+                    .context("reading milestone objective from stdin")?;
+                buffer
+            } else {
+                objective
+            };
+            rpc(
+                &discovery,
+                "program.milestone.create",
+                json!({
+                    "program_id": program,
+                    "key": key,
+                    "title": title,
+                    "objective": objective,
+                    "acceptance": acceptance,
+                    "deps": depends_on,
+                    "priority": priority,
+                    "max_attempts": max_attempts,
+                    "profile": profile,
+                    "write_scope": scope,
+                    "token_budget": token_budget,
+                    "cost_budget_usd": cost_budget_usd,
+                }),
+            )
+            .await?
+        }
+        Command::ProgramMilestoneRetry { id } => {
+            rpc(
+                &discovery,
+                "program.milestone.retry",
+                json!({"milestone_id": id}),
+            )
+            .await?
+        }
+        Command::ProgramMilestoneSkip { id, reason } => {
+            rpc(
+                &discovery,
+                "program.milestone.skip",
+                json!({"milestone_id": id, "reason": reason}),
+            )
+            .await?
+        }
+        Command::ProgramRun { milestone } => {
+            rpc(
+                &discovery,
+                "program.milestone.start",
+                json!({"milestone_id": milestone}),
+            )
+            .await?
+        }
+        Command::ProgramTick { project } => {
+            rpc(&discovery, "program.tick", json!({"project_id": project})).await?
+        }
+        Command::ProgramReplay { id, repair } => {
+            rpc(
+                &discovery,
+                "program.replay",
+                json!({"program_id": id, "repair": repair}),
+            )
+            .await?
+        }
         Command::Tasks { project, session } => {
             rpc(
                 &discovery,
@@ -3584,7 +3888,112 @@ fn read_json_input(file: Option<&std::path::Path>) -> Result<String> {
     }
 }
 
+fn parse_dependency_failure(value: &str) -> Result<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "block" => Ok("block"),
+        "cancel" => Ok("cancel"),
+        "retry" => Ok("retry"),
+        other => bail!("dependency failure policy must be block, cancel, or retry (got {other})"),
+    }
+}
+
+fn print_program_line(program: &Value) {
+    let id = program["id"].as_str().unwrap_or("?");
+    let status = program["status"].as_str().unwrap_or("?");
+    let goal = program["goal"].as_str().unwrap_or("");
+    println!("{id}  {status:<10}  {goal}");
+    let mut budget = Vec::new();
+    if let Some(tokens) = program["token_budget"].as_u64() {
+        budget.push(format!("{tokens} tokens"));
+    }
+    if let Some(cost) = program["cost_budget_usd"].as_f64() {
+        budget.push(format!("${cost:.2}"));
+    }
+    if !budget.is_empty() {
+        println!("  budget {}", budget.join(" / "));
+    }
+    if let Some(reason) = program["reason"].as_str() {
+        println!("  {reason}");
+    }
+}
+
 fn print_human(value: &Value) {
+    if let Some(programs) = value.get("programs").and_then(Value::as_array) {
+        if programs.is_empty() {
+            println!("No programs.");
+            return;
+        }
+        for entry in programs {
+            let program = entry.get("program").unwrap_or(entry);
+            let id = program["id"].as_str().unwrap_or("?");
+            let status = program["status"].as_str().unwrap_or("?");
+            let goal = program["goal"].as_str().unwrap_or("");
+            let counts = &entry["counts"];
+            println!(
+                "{id}  {status:<10}  {goal}  milestones {}/{} done · {} running · {} blocked",
+                counts["completed"].as_u64().unwrap_or(0),
+                counts["pending"].as_u64().unwrap_or(0)
+                    + counts["ready"].as_u64().unwrap_or(0)
+                    + counts["running"].as_u64().unwrap_or(0)
+                    + counts["verifying"].as_u64().unwrap_or(0)
+                    + counts["completed"].as_u64().unwrap_or(0)
+                    + counts["failed"].as_u64().unwrap_or(0)
+                    + counts["blocked"].as_u64().unwrap_or(0)
+                    + counts["cancelled"].as_u64().unwrap_or(0),
+                counts["running"].as_u64().unwrap_or(0) + counts["verifying"].as_u64().unwrap_or(0),
+                counts["blocked"].as_u64().unwrap_or(0),
+            );
+            print_program_line(program);
+        }
+        return;
+    }
+    if let Some(program) = value
+        .get("program")
+        .filter(|program| program["id"].is_string())
+    {
+        print_program_line(program);
+        if let Some(milestones) = value.get("milestones").and_then(Value::as_array) {
+            for milestone in milestones {
+                let key = milestone["key"].as_str().unwrap_or("?");
+                let id = milestone["id"].as_str().unwrap_or("?");
+                let status = milestone["status"].as_str().unwrap_or("?");
+                let title = milestone["title"].as_str().unwrap_or("");
+                println!(
+                    "  {key:<8} {status:<10} {title}  attempts {}/{}{}",
+                    milestone["attempts"].as_u64().unwrap_or(0),
+                    milestone["max_attempts"].as_u64().unwrap_or(0),
+                    milestone["session_id"]
+                        .as_str()
+                        .map(|session| format!("  session {session}"))
+                        .unwrap_or_default()
+                );
+                if let Some(deps) = milestone["deps"].as_array().filter(|deps| !deps.is_empty()) {
+                    println!(
+                        "    deps {}",
+                        deps.iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                if let Some(error) = milestone["last_error"].as_str() {
+                    println!("    {error}");
+                }
+                if let Some(next) = milestone["next_attempt_at"].as_str() {
+                    println!("    retry after {next}");
+                }
+                let _ = id;
+            }
+        }
+        if let Some(usage) = value.get("usage") {
+            println!(
+                "  usage {} tokens / ${:.4}",
+                usage["token_spent"].as_u64().unwrap_or(0),
+                usage["cost_spent_usd"].as_f64().unwrap_or(0.0)
+            );
+        }
+        return;
+    }
     if value.as_object().is_some_and(|object| {
         object.len() == 2
             && object.contains_key("session_id")
