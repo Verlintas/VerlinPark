@@ -2489,6 +2489,26 @@ actor CoreClient {
         .decode(MemoryEmbeddingsTestResult.self)
     }
 
+    func memoryEmbeddingIndexStatus(
+        projectID: String
+    ) async throws -> MemoryEmbeddingsIndexStatusResult {
+        try await request(
+            method: "memory.embeddings.index.status",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(MemoryEmbeddingsIndexStatusResult.self)
+    }
+
+    func rebuildMemoryEmbeddingIndex(
+        projectID: String
+    ) async throws -> MemoryEmbeddingsIndexRebuildResult {
+        try await request(
+            method: "memory.embeddings.index.rebuild",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(MemoryEmbeddingsIndexRebuildResult.self)
+    }
+
     func createMemory(
         sessionID: String,
         kind: String,

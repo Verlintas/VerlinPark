@@ -7957,6 +7957,7 @@ fn embedding_policy(model: &str) -> MemoryPolicy {
             max_candidates: 8,
             min_similarity: 0.3,
             api_key_env: None,
+            ..MemoryEmbeddingPolicy::default()
         }),
     }
 }
@@ -8451,6 +8452,1028 @@ fn corrupted_vectors_are_counted_invalid_and_requeued() {
     assert_eq!(status.coverage, 1.0);
 }
 
+fn embedded_memory(
+    store: &Store,
+    project: &Project,
+    session: &Session,
+    title: &str,
+    seed: u8,
+    model: &str,
+) -> MemoryItem {
+    let memory = create_embedding_memory(store, project, session, title);
+    store
+        .mark_memory_embedding_attempted(&memory.id, model, false)
+        .unwrap();
+    store
+        .record_memory_embedding_success(
+            &memory.id,
+            model,
+            8,
+            &format!("hash-{seed}"),
+            &tiny_vector(seed),
+        )
+        .unwrap();
+    memory
+}
+
+#[test]
+fn memory_embedding_index_generations_are_monotonic_and_assignments_are_fenced() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "ivf").unwrap();
+    let first = embedded_memory(&store, &project, &session, "One", 1, "embed-ivf");
+    let second = embedded_memory(&store, &project, &session, "Two", 2, "embed-ivf");
+    let third = embedded_memory(&store, &project, &session, "Three", 3, "embed-ivf");
+
+    let counts = store
+        .memory_embedding_index_counts(&project.id, "embed-ivf", 8, 0, 0)
+        .unwrap();
+    assert_eq!(counts.vector_count, 3);
+    assert_eq!(counts.assigned_vectors, 0);
+    assert!(
+        store
+            .memory_embedding_index_row(&project.id)
+            .unwrap()
+            .is_none()
+    );
+
+    let generation = store
+        .save_memory_embedding_index(&project.id, "embed-ivf", 8, 0, 2, 2, 3, b"centroids-v1")
+        .unwrap();
+    assert_eq!(generation, 1);
+    let row = store
+        .memory_embedding_index_row(&project.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.generation, 1);
+    assert_eq!(row.model, "embed-ivf");
+    assert_eq!(row.nlist, 2);
+    assert_eq!(row.cluster_count, 2);
+    assert_eq!(row.vector_count, 3);
+    assert_eq!(row.centroids, b"centroids-v1");
+    assert_eq!(row.fallback_count, 0);
+
+    let assignments = vec![(first.id.clone(), 0u32), (second.id.clone(), 1u32)];
+    assert_eq!(
+        store
+            .save_memory_embedding_assignments(&project.id, 1, &assignments)
+            .unwrap(),
+        2
+    );
+    let counts = store
+        .memory_embedding_index_counts(&project.id, "embed-ivf", 8, 1, 2)
+        .unwrap();
+    assert_eq!(counts.vector_count, 3);
+    assert_eq!(counts.assigned_vectors, 2);
+
+    // A racing build that asks for the same/lower generation is bumped, and
+    // old-generation assignments are deleted in the same transaction.
+    let second_generation = store
+        .save_memory_embedding_index(&project.id, "embed-ivf", 8, 1, 2, 2, 3, b"centroids-v2")
+        .unwrap();
+    assert_eq!(second_generation, 2);
+    assert_eq!(
+        store
+            .save_memory_embedding_assignments(&project.id, 1, &assignments)
+            .unwrap(),
+        0,
+        "stale assignment writes are fenced by generation"
+    );
+    let counts = store
+        .memory_embedding_index_counts(&project.id, "embed-ivf", 8, 2, 2)
+        .unwrap();
+    assert_eq!(counts.assigned_vectors, 0);
+    assert_eq!(
+        store
+            .save_memory_embedding_assignments(&project.id, 2, &[(third.id.clone(), 0u32)])
+            .unwrap(),
+        1
+    );
+
+    // A new vector invalidates only its own assignment; the rest stay current.
+    store
+        .record_memory_embedding_success(&first.id, "embed-ivf", 8, "hash-new", &tiny_vector(9))
+        .unwrap();
+    let counts = store
+        .memory_embedding_index_counts(&project.id, "embed-ivf", 8, 2, 2)
+        .unwrap();
+    assert_eq!(counts.assigned_vectors, 1);
+
+    assert_eq!(store.delete_memory_embedding_index(&project.id).unwrap(), 2);
+    assert!(
+        store
+            .memory_embedding_index_row(&project.id)
+            .unwrap()
+            .is_none()
+    );
+    let counts = store
+        .memory_embedding_index_counts(&project.id, "embed-ivf", 8, 2, 2)
+        .unwrap();
+    assert_eq!(counts.vector_count, 3);
+    assert_eq!(counts.assigned_vectors, 0);
+}
+
+#[test]
+fn concurrent_index_builds_get_unique_monotonic_generations() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "ivf race").unwrap();
+    let memory = embedded_memory(&store, &project, &session, "One", 1, "embed-race");
+    let base = store
+        .save_memory_embedding_index(&project.id, "embed-race", 8, 0, 4, 1, 1, b"generation-0")
+        .unwrap();
+    assert_eq!(base, 1);
+    store
+        .save_memory_embedding_assignments(&project.id, base, &[(memory.id.clone(), 0u32)])
+        .unwrap();
+
+    let mut handles = Vec::new();
+    for worker in 0..4u8 {
+        let store = store.clone();
+        let project_id = project.id.clone();
+        handles.push(std::thread::spawn(move || {
+            let mut generations = Vec::new();
+            for attempt in 0..5u8 {
+                generations.push(
+                    store
+                        .save_memory_embedding_index(
+                            &project_id,
+                            "embed-race",
+                            8,
+                            1,
+                            4,
+                            1,
+                            1,
+                            format!("worker-{worker}-attempt-{attempt}").as_bytes(),
+                        )
+                        .unwrap(),
+                );
+            }
+            generations
+        }));
+    }
+    let mut generations = Vec::new();
+    for handle in handles {
+        generations.extend(handle.join().unwrap());
+    }
+    let unique = generations
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        unique.len(),
+        generations.len(),
+        "every build must receive a distinct generation"
+    );
+    assert_eq!(*unique.iter().next().unwrap(), base + 1);
+    assert_eq!(
+        *unique.iter().next_back().unwrap(),
+        base + u64::try_from(generations.len()).unwrap()
+    );
+    let row = store
+        .memory_embedding_index_row(&project.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.generation, *unique.iter().next_back().unwrap());
+    assert_eq!(row.fallback_count, 0);
+    // Every prior assignment was deleted by the winning generation; the
+    // original memory has no assignment in the final generation yet.
+    let counts = store
+        .memory_embedding_index_counts(&project.id, "embed-race", 8, row.generation, 1)
+        .unwrap();
+    assert_eq!(counts.vector_count, 1);
+    assert_eq!(counts.assigned_vectors, 0);
+}
+
+#[test]
+fn assignment_writes_are_fenced_when_a_build_races_them() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store
+        .create_session(&project.id, "ivf assignment race")
+        .unwrap();
+    let first = embedded_memory(&store, &project, &session, "One", 1, "embed-fence");
+    let second = embedded_memory(&store, &project, &session, "Two", 2, "embed-fence");
+    let generation = store
+        .save_memory_embedding_index(&project.id, "embed-fence", 8, 0, 4, 1, 2, b"centroids-a")
+        .unwrap();
+    let writer_store = store.clone();
+    let writer_project = project.id.clone();
+    let writer_first = first.id.clone();
+    let writer_generation = generation;
+    let writer = std::thread::spawn(move || {
+        let mut written = 0u32;
+        for _ in 0..20 {
+            written += writer_store
+                .save_memory_embedding_assignments(
+                    &writer_project,
+                    writer_generation,
+                    &[(writer_first.clone(), 0u32)],
+                )
+                .unwrap();
+        }
+        written
+    });
+    let upgraded = store
+        .save_memory_embedding_index(&project.id, "embed-fence", 8, 0, 4, 1, 2, b"centroids-b")
+        .unwrap();
+    assert!(upgraded > generation);
+    let written = writer.join().unwrap();
+    assert!(
+        written <= 20,
+        "a fenced writer can only report writes that committed before the new generation"
+    );
+    // No matter the interleaving, no assignment from the old generation is
+    // visible to the new generation.
+    let counts = store
+        .memory_embedding_index_counts(&project.id, "embed-fence", 8, upgraded, 1)
+        .unwrap();
+    assert_eq!(counts.vector_count, 2);
+    assert_eq!(counts.assigned_vectors, 0);
+    assert_eq!(
+        store
+            .save_memory_embedding_assignments(&project.id, upgraded, &[(second.id.clone(), 0u32)])
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn memory_embedding_index_vectors_are_bounded_and_deterministic() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "ivf sample").unwrap();
+    let mut memories = Vec::new();
+    for index in 0..6u8 {
+        memories.push(embedded_memory(
+            &store,
+            &project,
+            &session,
+            &format!("Memory {index}"),
+            index,
+            "embed-sample",
+        ));
+    }
+    // A corrupt header is excluded by the same SQL predicate as status.
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE memory_embeddings SET vector = x'00' WHERE memory_id = ?1",
+            params![memories[0].id],
+        )
+        .unwrap();
+    // An archived row is not eligible.
+    store
+        .update_memory_with_event(&memories[1].id, Some("archived"), None, None)
+        .unwrap();
+
+    let first = store
+        .memory_embedding_vectors_for_index(&project.id, "embed-sample", 8, 100, 1024 * 1024)
+        .unwrap();
+    assert_eq!(first.len(), 4);
+    let second = store
+        .memory_embedding_vectors_for_index(&project.id, "embed-sample", 8, 100, 1024 * 1024)
+        .unwrap();
+    assert_eq!(
+        first.iter().map(|row| &row.memory.id).collect::<Vec<_>>(),
+        second.iter().map(|row| &row.memory.id).collect::<Vec<_>>()
+    );
+    assert!(
+        first.iter().all(|row| row.vector.len() == 9 + 4 * 8),
+        "only structurally valid vectors are sampled"
+    );
+
+    let small = store
+        .memory_embedding_vectors_for_index(&project.id, "embed-sample", 8, 100, 48)
+        .unwrap();
+    assert_eq!(small.len(), 1, "the byte ceiling bounds the sample");
+    let limited = store
+        .memory_embedding_vectors_for_index(&project.id, "embed-sample", 8, 2, 1024 * 1024)
+        .unwrap();
+    assert_eq!(limited.len(), 2);
+    assert!(
+        store
+            .memory_embedding_vectors_for_index(&project.id, "embed-other", 8, 100, 1024 * 1024)
+            .unwrap()
+            .is_empty(),
+        "a model change cannot sample the previous model's vectors"
+    );
+    assert!(
+        store
+            .memory_embedding_vectors_for_index(&project.id, "embed-sample", 16, 100, 1024 * 1024)
+            .unwrap()
+            .is_empty(),
+        "a dimension change cannot sample mismatched vectors"
+    );
+}
+
+#[test]
+fn unassigned_vectors_follow_new_writes_and_generation_changes() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "ivf assignment").unwrap();
+    let first = embedded_memory(&store, &project, &session, "One", 1, "embed-assign");
+    let second = embedded_memory(&store, &project, &session, "Two", 2, "embed-assign");
+    let generation = store
+        .save_memory_embedding_index(&project.id, "embed-assign", 8, 0, 2, 2, 2, b"centroids")
+        .unwrap();
+    assert_eq!(
+        store
+            .memory_embedding_unassigned_vectors(&project.id, "embed-assign", 8, generation, 10)
+            .unwrap()
+            .len(),
+        2
+    );
+    store
+        .save_memory_embedding_assignments(&project.id, generation, &[(first.id.clone(), 0u32)])
+        .unwrap();
+    let pending = store
+        .memory_embedding_unassigned_vectors(&project.id, "embed-assign", 8, generation, 10)
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].memory.id, second.id);
+    assert_eq!(
+        store
+            .memory_embedding_unassigned_vectors(&project.id, "embed-assign", 8, generation, 0)
+            .unwrap()
+            .len(),
+        1,
+        "zero is clamped to one, not interpreted as unbounded"
+    );
+
+    // A refreshed vector is unassigned again even though the row still has an
+    // old assignment timestamp; the delete happens in the success transaction.
+    store
+        .record_memory_embedding_success(&first.id, "embed-assign", 8, "hash-new", &tiny_vector(7))
+        .unwrap();
+    let pending = store
+        .memory_embedding_unassigned_vectors(&project.id, "embed-assign", 8, generation, 10)
+        .unwrap();
+    assert_eq!(pending.len(), 2);
+
+    let newer = store
+        .save_memory_embedding_index(&project.id, "embed-assign", 8, 0, 2, 2, 2, b"centroids-v2")
+        .unwrap();
+    assert_eq!(newer, generation + 1);
+    assert!(
+        store
+            .memory_embedding_unassigned_vectors(&project.id, "embed-assign", 8, generation, 10)
+            .unwrap()
+            .len()
+            == 2
+    );
+    assert_eq!(
+        store
+            .memory_embedding_unassigned_vectors(&project.id, "embed-assign", 8, newer, 10)
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn index_counts_require_valid_headers_and_current_status() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "ivf counts").unwrap();
+    let first = embedded_memory(&store, &project, &session, "One", 1, "embed-counts");
+    let second = embedded_memory(&store, &project, &session, "Two", 2, "embed-counts");
+    let generation = store
+        .save_memory_embedding_index(&project.id, "embed-counts", 8, 0, 4, 2, 2, b"centroids")
+        .unwrap();
+    store
+        .save_memory_embedding_assignments(
+            &project.id,
+            generation,
+            &[(first.id.clone(), 0u32), (second.id.clone(), 1u32)],
+        )
+        .unwrap();
+    let counts = store
+        .memory_embedding_index_counts(&project.id, "embed-counts", 8, generation, 2)
+        .unwrap();
+    assert_eq!(counts.vector_count, 2);
+    assert_eq!(counts.assigned_vectors, 2);
+
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE memory_embeddings SET vector = x'00' WHERE memory_id = ?1",
+            params![first.id],
+        )
+        .unwrap();
+    let counts = store
+        .memory_embedding_index_counts(&project.id, "embed-counts", 8, generation, 2)
+        .unwrap();
+    assert_eq!(counts.vector_count, 1);
+    assert_eq!(counts.assigned_vectors, 1);
+
+    store
+        .update_memory_with_event(&second.id, Some("archived"), None, None)
+        .unwrap();
+    let counts = store
+        .memory_embedding_index_counts(&project.id, "embed-counts", 8, generation, 2)
+        .unwrap();
+    assert_eq!(counts.vector_count, 0);
+    assert_eq!(counts.assigned_vectors, 0);
+
+    // Out-of-range assignments never inflate the live assigned count.
+    let third = embedded_memory(&store, &project, &session, "Three", 3, "embed-counts");
+    store
+        .save_memory_embedding_assignments(&project.id, generation, &[(third.id, 99u32)])
+        .unwrap();
+    let counts = store
+        .memory_embedding_index_counts(&project.id, "embed-counts", 8, generation, 2)
+        .unwrap();
+    assert_eq!(counts.vector_count, 1);
+    assert_eq!(counts.assigned_vectors, 0);
+}
+
+#[test]
+fn ivf_candidate_queries_are_deterministic_deduplicated_and_bounded() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "ivf ordering").unwrap();
+    let mut memories = Vec::new();
+    for index in 0..8u8 {
+        memories.push(embedded_memory(
+            &store,
+            &project,
+            &session,
+            &format!("Memory {index}"),
+            index,
+            "embed-order",
+        ));
+    }
+    let generation = store
+        .save_memory_embedding_index(&project.id, "embed-order", 8, 0, 4, 2, 8, b"centroids")
+        .unwrap();
+    store
+        .save_memory_embedding_assignments(
+            &project.id,
+            generation,
+            &[
+                (memories[0].id.clone(), 0u32),
+                (memories[1].id.clone(), 0u32),
+                (memories[2].id.clone(), 1u32),
+                (memories[3].id.clone(), 1u32),
+            ],
+        )
+        .unwrap();
+    let first = store
+        .memory_ivf_semantic_candidates(
+            &project.id,
+            "embed-order",
+            8,
+            generation,
+            &[0, 1],
+            false,
+            100,
+        )
+        .unwrap();
+    let second = store
+        .memory_ivf_semantic_candidates(
+            &project.id,
+            "embed-order",
+            8,
+            generation,
+            &[0, 1],
+            false,
+            100,
+        )
+        .unwrap();
+    assert_eq!(first.len(), 4);
+    assert_eq!(
+        first.iter().map(|row| &row.memory.id).collect::<Vec<_>>(),
+        second.iter().map(|row| &row.memory.id).collect::<Vec<_>>()
+    );
+    let mut ids = first
+        .iter()
+        .map(|row| row.memory.id.clone())
+        .collect::<Vec<_>>();
+    let unique = ids
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(ids.len(), unique.len(), "one assignment per memory id");
+    ids.sort();
+    assert_eq!(ids.len(), 4);
+    // Reverse cluster order must produce the same candidate set.
+    let reversed = store
+        .memory_ivf_semantic_candidates(
+            &project.id,
+            "embed-order",
+            8,
+            generation,
+            &[1, 0],
+            false,
+            100,
+        )
+        .unwrap();
+    let mut reversed_ids = reversed
+        .iter()
+        .map(|row| row.memory.id.clone())
+        .collect::<Vec<_>>();
+    reversed_ids.sort();
+    ids.sort();
+    assert_eq!(ids, reversed_ids);
+    // The limit is a hard cap, including a zero/oversized hand edit.
+    assert_eq!(
+        store
+            .memory_ivf_semantic_candidates(
+                &project.id,
+                "embed-order",
+                8,
+                generation,
+                &[0, 1],
+                false,
+                1,
+            )
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .memory_ivf_semantic_candidates(
+                &project.id,
+                "embed-order",
+                8,
+                generation,
+                &[0, 1],
+                false,
+                0,
+            )
+            .unwrap()
+            .len(),
+        1,
+        "zero is clamped to one, not interpreted as unbounded"
+    );
+}
+
+#[test]
+fn empty_index_operations_are_safe_and_scoped() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    assert!(
+        store
+            .memory_embedding_index_row(&project.id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(store.delete_memory_embedding_index(&project.id).unwrap(), 0);
+    assert_eq!(
+        store
+            .save_memory_embedding_assignments(&project.id, 0, &[])
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .memory_embedding_unassigned_vectors(&project.id, "embed-none", 8, 0, 10)
+            .unwrap()
+            .len(),
+        0
+    );
+    let audit = store
+        .memory_embedding_assignment_audit(&project.id, "embed-none", 8, 0, 0)
+        .unwrap();
+    assert_eq!(audit.total, 0);
+    assert_eq!(audit.invalid(), 0);
+    store
+        .note_memory_embedding_index_fallback(&project.id, "embed-none", 8, 64, "not_built")
+        .unwrap();
+    let row = store
+        .memory_embedding_index_row(&project.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.generation, 0);
+    assert_eq!(row.fallback_count, 1);
+    assert_eq!(row.centroids, Vec::<u8>::new());
+    // An explicit deletion clears diagnostic-only state too.
+    assert_eq!(store.delete_memory_embedding_index(&project.id).unwrap(), 1);
+    assert!(
+        store
+            .memory_embedding_index_row(&project.id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn ivf_candidates_are_scoped_by_generation_cluster_and_lifecycle() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "ivf candidates").unwrap();
+    let first = embedded_memory(&store, &project, &session, "One", 1, "embed-cand");
+    let second = embedded_memory(&store, &project, &session, "Two", 2, "embed-cand");
+    let stale = embedded_memory(&store, &project, &session, "Stale", 3, "embed-cand");
+    store
+        .update_memory_with_event(&stale.id, Some("stale"), None, None)
+        .unwrap();
+    let generation = store
+        .save_memory_embedding_index(&project.id, "embed-cand", 8, 0, 2, 2, 3, b"centroids")
+        .unwrap();
+    store
+        .save_memory_embedding_assignments(
+            &project.id,
+            generation,
+            &[
+                (first.id.clone(), 0u32),
+                (second.id.clone(), 1u32),
+                (stale.id.clone(), 0u32),
+            ],
+        )
+        .unwrap();
+
+    let cluster_zero = store
+        .memory_ivf_semantic_candidates(&project.id, "embed-cand", 8, generation, &[0], false, 20)
+        .unwrap();
+    assert_eq!(cluster_zero.len(), 1);
+    assert_eq!(cluster_zero[0].memory.id, first.id);
+    let cluster_zero_with_stale = store
+        .memory_ivf_semantic_candidates(&project.id, "embed-cand", 8, generation, &[0], true, 20)
+        .unwrap();
+    assert_eq!(cluster_zero_with_stale.len(), 2);
+    let cluster_one = store
+        .memory_ivf_semantic_candidates(&project.id, "embed-cand", 8, generation, &[1], false, 20)
+        .unwrap();
+    assert_eq!(cluster_one.len(), 1);
+    assert_eq!(cluster_one[0].memory.id, second.id);
+    assert!(
+        store
+            .memory_ivf_semantic_candidates(
+                &project.id,
+                "embed-cand",
+                8,
+                generation,
+                &[],
+                false,
+                20,
+            )
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .memory_ivf_semantic_candidates(
+                &project.id,
+                "embed-cand",
+                8,
+                generation + 1,
+                &[0, 1],
+                true,
+                20,
+            )
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .memory_ivf_semantic_candidates(
+                &project.id,
+                "embed-cand",
+                8,
+                generation,
+                &[0, 1],
+                true,
+                1,
+            )
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        store
+            .memory_ivf_semantic_candidates(
+                &project.id,
+                "embed-cand",
+                16,
+                generation,
+                &[0, 1],
+                true,
+                20,
+            )
+            .unwrap()
+            .is_empty(),
+        "dimension mismatch cannot reuse a current assignment"
+    );
+}
+
+#[test]
+fn assignment_audit_finds_out_of_range_missing_and_stale_rows() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "ivf audit").unwrap();
+    let first = embedded_memory(&store, &project, &session, "One", 1, "embed-audit");
+    let second = embedded_memory(&store, &project, &session, "Two", 2, "embed-audit");
+    let third = embedded_memory(&store, &project, &session, "Three", 3, "embed-audit");
+    let fourth = embedded_memory(&store, &project, &session, "Four", 4, "embed-audit");
+    let generation = store
+        .save_memory_embedding_index(&project.id, "embed-audit", 8, 0, 2, 2, 4, b"centroids")
+        .unwrap();
+    store
+        .save_memory_embedding_assignments(
+            &project.id,
+            generation,
+            &[
+                (first.id.clone(), 0u32),
+                (second.id.clone(), 9u32),
+                (third.id.clone(), 1u32),
+                (fourth.id.clone(), 0u32),
+            ],
+        )
+        .unwrap();
+    // Simulate a partially restored database: one assignment has no valid
+    // current vector and one belongs to an older generation.
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "DELETE FROM memory_embeddings WHERE memory_id = ?1",
+            params![third.id],
+        )
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE memory_embedding_assignments SET generation = ?2 WHERE memory_id = ?1",
+            params![fourth.id, 0i64],
+        )
+        .unwrap();
+
+    let audit = store
+        .memory_embedding_assignment_audit(&project.id, "embed-audit", 8, generation, 2)
+        .unwrap();
+    assert_eq!(audit.total, 4);
+    assert_eq!(audit.out_of_range, 1);
+    assert_eq!(audit.missing_vector, 1);
+    assert_eq!(audit.stale_generation, 1);
+    assert_eq!(audit.invalid(), 3);
+
+    let counts = store
+        .memory_embedding_index_counts(&project.id, "embed-audit", 8, generation, 2)
+        .unwrap();
+    assert_eq!(counts.vector_count, 3);
+    assert_eq!(counts.assigned_vectors, 1);
+
+    assert_eq!(
+        store
+            .delete_invalid_memory_embedding_assignments(
+                &project.id,
+                "embed-audit",
+                8,
+                generation,
+                2
+            )
+            .unwrap(),
+        3
+    );
+    let audit = store
+        .memory_embedding_assignment_audit(&project.id, "embed-audit", 8, generation, 2)
+        .unwrap();
+    assert_eq!(audit.total, 1);
+    assert_eq!(audit.invalid(), 0);
+    let counts = store
+        .memory_embedding_index_counts(&project.id, "embed-audit", 8, generation, 2)
+        .unwrap();
+    assert_eq!(counts.assigned_vectors, 1);
+}
+
+#[test]
+fn a_successful_generation_preserves_fallback_diagnostics() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "ivf fallback").unwrap();
+    let memory = embedded_memory(&store, &project, &session, "One", 1, "embed-fallback");
+    let first = store
+        .save_memory_embedding_index(&project.id, "embed-fallback", 8, 0, 4, 1, 1, b"centroids-a")
+        .unwrap();
+    store
+        .save_memory_embedding_assignments(&project.id, first, &[(memory.id.clone(), 0u32)])
+        .unwrap();
+    store
+        .note_memory_embedding_index_fallback(&project.id, "embed-fallback", 8, 4, "model_mismatch")
+        .unwrap();
+    let second = store
+        .save_memory_embedding_index(&project.id, "embed-fallback", 8, 0, 4, 1, 1, b"centroids-b")
+        .unwrap();
+    assert!(second > first);
+    let row = store
+        .memory_embedding_index_row(&project.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.generation, second);
+    assert_eq!(row.fallback_count, 1);
+    assert_eq!(row.last_fallback_reason.as_deref(), Some("model_mismatch"));
+    assert_eq!(row.last_error, None);
+}
+
+#[test]
+fn memory_embedding_index_errors_preserve_generation_and_count_fallbacks() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "ivf error").unwrap();
+    let memory = embedded_memory(&store, &project, &session, "One", 1, "embed-error");
+    let generation = store
+        .save_memory_embedding_index(&project.id, "embed-error", 8, 0, 2, 1, 1, b"centroids")
+        .unwrap();
+    store
+        .save_memory_embedding_assignments(&project.id, generation, &[(memory.id, 0u32)])
+        .unwrap();
+    store
+        .record_memory_embedding_index_error(&project.id, "embed-error", 8, 2, "build failed")
+        .unwrap();
+    let row = store
+        .memory_embedding_index_row(&project.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.generation, generation);
+    assert_eq!(row.centroids, b"centroids");
+    assert_eq!(row.last_error.as_deref(), Some("build failed"));
+    assert_eq!(row.nlist, 2, "error rows do not rewrite current metadata");
+
+    store
+        .note_memory_embedding_index_fallback(&project.id, "embed-error", 8, 2, "model_mismatch")
+        .unwrap();
+    store
+        .note_memory_embedding_index_fallback(&project.id, "embed-error", 8, 2, "below_min_vectors")
+        .unwrap();
+    let row = store
+        .memory_embedding_index_row(&project.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.fallback_count, 2);
+    assert_eq!(
+        row.last_fallback_reason.as_deref(),
+        Some("below_min_vectors")
+    );
+    assert!(row.last_fallback_at.is_some());
+
+    // An error on a project with no index creates diagnostic-only state that
+    // cannot be mistaken for a usable generation.
+    let other_repo = TempDir::new().unwrap();
+    let other = store
+        .add_project(other_repo.path().to_str().unwrap(), Some("other"))
+        .unwrap();
+    store
+        .record_memory_embedding_index_error(&other.id, "embed-error", 8, 64, "no vectors")
+        .unwrap();
+    let row = store
+        .memory_embedding_index_row(&other.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.generation, 0);
+    assert_eq!(row.centroids, Vec::<u8>::new());
+    assert_eq!(row.last_error.as_deref(), Some("no vectors"));
+}
+
+#[test]
+fn delete_prune_archive_and_clear_remove_assignments_and_index_state() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "ivf gc").unwrap();
+    let first = embedded_memory(&store, &project, &session, "Delete", 1, "embed-gc-ivf");
+    let second = embedded_memory(&store, &project, &session, "Prune", 2, "embed-gc-ivf");
+    let third = embedded_memory(&store, &project, &session, "Archive", 3, "embed-gc-ivf");
+    let generation = store
+        .save_memory_embedding_index(&project.id, "embed-gc-ivf", 8, 0, 2, 2, 3, b"centroids")
+        .unwrap();
+    store
+        .save_memory_embedding_assignments(
+            &project.id,
+            generation,
+            &[
+                (first.id.clone(), 0u32),
+                (second.id.clone(), 1u32),
+                (third.id.clone(), 0u32),
+            ],
+        )
+        .unwrap();
+    let assignment_count = |id: &str| -> i64 {
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM memory_embedding_assignments WHERE memory_id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(assignment_count(&first.id), 1);
+
+    store
+        .delete_memories_with_events(std::slice::from_ref(&first.id))
+        .unwrap();
+    assert_eq!(assignment_count(&first.id), 0);
+    store
+        .update_memory_with_event(&third.id, Some("archived"), None, None)
+        .unwrap();
+    assert_eq!(assignment_count(&third.id), 0);
+
+    let prune_ids = store
+        .memory_ids_for_prune(&project.id, None, Some(0))
+        .unwrap();
+    assert!(prune_ids.contains(&second.id), "the unpinned row is pruned");
+    store.delete_memories_with_events(&prune_ids).unwrap();
+    assert_eq!(assignment_count(&second.id), 0);
+
+    let cleared = store.clear_memory_embeddings(&project.id).unwrap();
+    assert!(cleared >= 1, "the stored index row is derived state too");
+    assert!(
+        store
+            .memory_embedding_index_row(&project.id)
+            .unwrap()
+            .is_none()
+    );
+    let remaining: i64 = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM memory_embedding_assignments",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining, 0);
+}
+
+#[test]
+fn index_rows_reject_empty_centroids_and_survive_project_isolation() {
+    let (_data, store, repo) = test_store();
+    let first = store
+        .add_project(repo.path().to_str().unwrap(), Some("first"))
+        .unwrap();
+    let second_repo = TempDir::new().unwrap();
+    let second = store
+        .add_project(second_repo.path().to_str().unwrap(), Some("second"))
+        .unwrap();
+    let session = store.create_session(&first.id, "ivf isolation").unwrap();
+    let memory = embedded_memory(&store, &first, &session, "One", 1, "embed-iso");
+    let generation = store
+        .save_memory_embedding_index(&first.id, "embed-iso", 8, 0, 4, 1, 1, b"first-centroids")
+        .unwrap();
+    store
+        .save_memory_embedding_assignments(&first.id, generation, &[(memory.id.clone(), 0u32)])
+        .unwrap();
+    // A second project cannot see the first project's counts, and a stale
+    // assignment fenced by the first project's generation cannot be reused.
+    let counts = store
+        .memory_embedding_index_counts(&second.id, "embed-iso", 8, generation, 1)
+        .unwrap();
+    assert_eq!(counts.vector_count, 0);
+    assert_eq!(counts.assigned_vectors, 0);
+    assert!(
+        store
+            .save_memory_embedding_assignments(&second.id, 0, &[(memory.id, 0u32)])
+            .unwrap()
+            == 0,
+        "no index row means assignment writes are ignored"
+    );
+    assert!(
+        store
+            .save_memory_embedding_index(&first.id, "embed-iso", 8, 0, 4, 1, 1, b"")
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .memory_embedding_index_row(&first.id)
+            .unwrap()
+            .unwrap()
+            .centroids,
+        b"first-centroids"
+    );
+}
+
 #[test]
 fn malformed_embedding_policy_json_is_ignored_defensively() {
     let (_data, store, repo) = test_store();
@@ -8921,7 +9944,13 @@ fn project_manifest_captures_the_embedding_policy_without_secrets() {
     let project = store
         .add_project(repo.path().to_str().unwrap(), Some("demo"))
         .unwrap();
-    let policy = embedding_policy("embed-manifest");
+    let mut policy = embedding_policy("embed-manifest");
+    let embedding = policy.embedding.as_mut().unwrap();
+    embedding.index = vp_protocol::types::MemoryIndexMode::Ivf;
+    embedding.ivf_nlist = 128;
+    embedding.ivf_nprobe = 12;
+    embedding.ivf_min_vectors = 300;
+    embedding.ivf_rebuild_vectors = 6000;
     store.set_memory_policy(&project.id, &policy).unwrap();
     store.record_project_manifest().unwrap();
     let manifest = read_project_manifest(data.path()).unwrap();
@@ -8930,6 +9959,11 @@ fn project_manifest_captures_the_embedding_policy_without_secrets() {
     assert_eq!(stored.model.as_deref(), Some("embed-manifest"));
     assert_eq!(stored.dimensions, 8);
     assert_eq!(stored.api_key_env, None);
+    assert_eq!(stored.index, vp_protocol::types::MemoryIndexMode::Ivf);
+    assert_eq!(stored.ivf_nlist, 128);
+    assert_eq!(stored.ivf_nprobe, 12);
+    assert_eq!(stored.ivf_min_vectors, 300);
+    assert_eq!(stored.ivf_rebuild_vectors, 6000);
     let encoded = serde_json::to_string(&manifest).unwrap();
     assert!(!encoded.contains("sk-"));
     assert!(!encoded.contains("api_key\":"));

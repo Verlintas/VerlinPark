@@ -1453,6 +1453,13 @@ pub struct MemoryMatch {
 /// was requested but could not run (disabled, unhealthy, timeout, bad
 /// response); ranking then stays lexical and the reason is also copied onto
 /// each match.
+///
+/// `index_source` is `scan` (the default exact lane), `ivf` (a valid ANN probe
+/// contributed candidates), or absent on older daemons. `index_fallback` is
+/// independent from `fallback`: an IVF index can fail its validation while the
+/// exact semantic scan still succeeds, in which case semantic recall remains
+/// active and only the index fallback is reported. Neither field carries
+/// vectors, centroids, or user text.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MemorySemanticSummary {
     pub enabled: bool,
@@ -1464,6 +1471,23 @@ pub struct MemorySemanticSummary {
     pub semantic_candidates: u32,
     #[serde(default)]
     pub fallback: Option<String>,
+    /// `scan` or `ivf`. Absent means the daemon predates the ANN index.
+    #[serde(default)]
+    pub index_source: Option<String>,
+    /// Derived index generation used for this recall, when the index was
+    /// built and selected.
+    #[serde(default)]
+    pub index_generation: Option<u64>,
+    /// Why the ANN probe was not used. Semantic recall still ran through the
+    /// exact scan unless `fallback` is also set.
+    #[serde(default)]
+    pub index_fallback: Option<String>,
+    /// Number of centroids probed for this recall (0 for a scan).
+    #[serde(default)]
+    pub probed_clusters: u32,
+    /// Number of stored vectors whose cosine was computed after probing.
+    #[serde(default)]
+    pub candidate_vectors: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1765,6 +1789,29 @@ pub struct MemoryPruneResult {
     pub dry_run: bool,
 }
 
+/// Retrieval index mode for the optional semantic memory lane.
+///
+/// `Scan` (the default) scores a bounded exact candidate window. `Ivf` is an
+/// explicit, project-scoped opt-in to a derived inverted-file index. The mode
+/// never changes the embedding provider, model, or budget, and disabling
+/// embeddings performs zero index work in either mode.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryIndexMode {
+    #[default]
+    Scan,
+    Ivf,
+}
+
+impl MemoryIndexMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Scan => "scan",
+            Self::Ivf => "ivf",
+        }
+    }
+}
+
 /// Opt-in semantic lane for project memory.
 ///
 /// The endpoint is an explicit OpenAI-compatible `/embeddings` base URL. The
@@ -1796,6 +1843,39 @@ pub struct MemoryEmbeddingPolicy {
     /// never persisted, returned by status, or logged.
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// `scan` keeps exact bounded recall. `ivf` opts into a derived,
+    /// rebuildable inverted-file index with exact cosine scoring of probed
+    /// candidates and an automatic scan fallback.
+    #[serde(default)]
+    pub index: MemoryIndexMode,
+    /// Target number of k-means centroids. Bounded 4–1024.
+    #[serde(default = "default_ivf_nlist")]
+    pub ivf_nlist: u32,
+    /// Number of nearest centroids probed per recall. Bounded 1..=nlist.
+    #[serde(default = "default_ivf_nprobe")]
+    pub ivf_nprobe: u32,
+    /// Below this many valid vectors, recall uses the exact scan.
+    #[serde(default = "default_ivf_min_vectors")]
+    pub ivf_min_vectors: u32,
+    /// Growth threshold that triggers a deterministic centroid rebuild.
+    #[serde(default = "default_ivf_rebuild_vectors")]
+    pub ivf_rebuild_vectors: u32,
+}
+
+fn default_ivf_nlist() -> u32 {
+    64
+}
+
+fn default_ivf_nprobe() -> u32 {
+    8
+}
+
+fn default_ivf_min_vectors() -> u32 {
+    256
+}
+
+fn default_ivf_rebuild_vectors() -> u32 {
+    4096
 }
 
 fn default_embedding_dimensions() -> u32 {
@@ -1830,6 +1910,11 @@ impl Default for MemoryEmbeddingPolicy {
             max_candidates: default_embedding_max_candidates(),
             min_similarity: default_embedding_min_similarity(),
             api_key_env: None,
+            index: MemoryIndexMode::Scan,
+            ivf_nlist: default_ivf_nlist(),
+            ivf_nprobe: default_ivf_nprobe(),
+            ivf_min_vectors: default_ivf_min_vectors(),
+            ivf_rebuild_vectors: default_ivf_rebuild_vectors(),
         }
     }
 }
@@ -1846,6 +1931,12 @@ impl MemoryEmbeddingPolicy {
                 .model
                 .as_deref()
                 .is_some_and(|model| !model.trim().is_empty())
+    }
+
+    /// True only when the semantic lane is enabled, configured, and the
+    /// operator explicitly selected the derived IVF index.
+    pub fn uses_ivf_index(&self) -> bool {
+        self.enabled && self.is_configured() && self.index == MemoryIndexMode::Ivf
     }
 }
 
@@ -1948,6 +2039,86 @@ pub struct MemoryEmbeddingUsage {
     pub provider_reported_calls: u64,
 }
 
+/// Bounded health of the derived IVF index. This is *operational* state: it
+/// can be deleted and rebuilt from embeddings at any time, is not a replay
+/// projection, and never contains centroids, vectors, or embedded text.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct MemoryEmbeddingIndexStatus {
+    /// `scan` or `ivf` (the configured mode).
+    pub mode: String,
+    /// True when a structurally valid, generation-matched index can serve
+    /// recall right now.
+    pub ready: bool,
+    /// Monotonic derived index generation; absent before the first build.
+    pub generation: Option<u64>,
+    /// Model and dimensions the stored index was built from.
+    pub model: Option<String>,
+    pub dimensions: u32,
+    /// Current valid vectors eligible for semantic recall.
+    pub vector_count: u32,
+    /// Vectors with an assignment in the current generation.
+    pub assigned_vectors: u32,
+    /// Assignments that are stale, out of range, or lack a current valid
+    /// vector. Maintenance removes them; a nonzero value is diagnostic.
+    pub invalid_assignments: u32,
+    pub cluster_count: u32,
+    pub nlist: u32,
+    pub nprobe: u32,
+    /// `assigned_vectors / vector_count`, or 0 when there are no vectors.
+    pub coverage: f64,
+    pub min_vectors: u32,
+    pub rebuild_vectors: u32,
+    /// Centroid blob size. Never the blob itself.
+    pub bytes: u64,
+    pub last_rebuilt_at: Option<String>,
+    /// Last automatic or explicit build error, sanitized by the builder.
+    pub last_error: Option<String>,
+    /// Recalls that fell back to the exact scan because the index could not
+    /// be used. This counter is diagnostic only.
+    pub fallback_count: u64,
+    pub last_fallback_at: Option<String>,
+    pub last_fallback_reason: Option<String>,
+    /// Why the index is not ready now (`not_built`, `below_min_vectors`,
+    /// `model_mismatch`, `dimensions_mismatch`, `nlist_mismatch`,
+    /// `index_corrupt: ...`, `no_assignments`, `scan_mode`, ...).
+    pub fallback_reason: Option<String>,
+}
+
+impl Default for MemoryEmbeddingIndexStatus {
+    fn default() -> Self {
+        Self {
+            mode: "scan".to_string(),
+            ready: false,
+            generation: None,
+            model: None,
+            dimensions: default_embedding_dimensions(),
+            vector_count: 0,
+            assigned_vectors: 0,
+            invalid_assignments: 0,
+            cluster_count: 0,
+            nlist: default_ivf_nlist(),
+            nprobe: default_ivf_nprobe(),
+            coverage: 0.0,
+            min_vectors: default_ivf_min_vectors(),
+            rebuild_vectors: default_ivf_rebuild_vectors(),
+            bytes: 0,
+            last_rebuilt_at: None,
+            last_error: None,
+            fallback_count: 0,
+            last_fallback_at: None,
+            last_fallback_reason: None,
+            fallback_reason: None,
+        }
+    }
+}
+
+impl MemoryEmbeddingIndexStatus {
+    pub fn coverage_label(&self) -> String {
+        format!("{:.1}%", self.coverage.clamp(0.0, 1.0) * 100.0)
+    }
+}
+
 /// Health and coverage snapshot. Deliberately excludes vectors, request
 /// bodies, endpoint query strings, and credentials.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1991,6 +2162,47 @@ pub struct MemoryEmbeddingsStatusResult {
     /// At most 20 recent job rows, newest first.
     #[serde(default)]
     pub recent_jobs: Vec<MemoryEmbeddingJobStatus>,
+    /// Derived ANN index health. Absent on older daemons and when the policy
+    /// has no embedding object.
+    #[serde(default)]
+    pub index: Option<MemoryEmbeddingIndexStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryEmbeddingsIndexStatusParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryEmbeddingsIndexStatusResult {
+    pub project_id: String,
+    pub index: MemoryEmbeddingIndexStatus,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryEmbeddingsIndexRebuildParams {
+    pub project_id: String,
+}
+
+/// Explicit derived-index rebuild outcome. `rebuilt = false` is not an error:
+/// the index may be disabled, in scan mode, or below the policy minimum.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryEmbeddingsIndexRebuildResult {
+    pub project_id: String,
+    #[serde(default)]
+    pub rebuilt: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub generation: Option<u64>,
+    #[serde(default)]
+    pub vector_count: u32,
+    #[serde(default)]
+    pub assigned_vectors: u32,
+    #[serde(default)]
+    pub cluster_count: u32,
+    #[serde(default)]
+    pub nlist: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -7988,10 +8200,169 @@ mod program_wire_tests {
             lexical_candidates: 3,
             semantic_candidates: 2,
             fallback: Some("endpoint unavailable".to_string()),
+            index_source: Some("ivf".to_string()),
+            index_generation: Some(4),
+            index_fallback: None,
+            probed_clusters: 8,
+            candidate_vectors: 31,
         };
         let decoded: MemorySemanticSummary =
             serde_json::from_value(serde_json::to_value(&summary).unwrap()).unwrap();
         assert_eq!(decoded, summary);
+    }
+
+    #[test]
+    fn ivf_index_policy_and_status_are_additive_and_default_off() {
+        let minimal: MemoryEmbeddingPolicy = serde_json::from_value(json!({
+            "enabled": true,
+            "endpoint": "http://127.0.0.1:9/v1",
+            "model": "embed-test"
+        }))
+        .unwrap();
+        assert_eq!(minimal.index, MemoryIndexMode::Scan);
+        assert_eq!(minimal.ivf_nlist, 64);
+        assert_eq!(minimal.ivf_nprobe, 8);
+        assert_eq!(minimal.ivf_min_vectors, 256);
+        assert_eq!(minimal.ivf_rebuild_vectors, 4096);
+        assert!(!minimal.uses_ivf_index());
+
+        let ivf: MemoryEmbeddingPolicy = serde_json::from_value(json!({
+            "enabled": true,
+            "endpoint": "http://127.0.0.1:9/v1",
+            "model": "embed-test",
+            "index": "ivf",
+            "ivf_nlist": 32,
+            "ivf_nprobe": 4
+        }))
+        .unwrap();
+        assert_eq!(ivf.index, MemoryIndexMode::Ivf);
+        assert!(ivf.uses_ivf_index());
+        assert_eq!(ivf.index.as_str(), "ivf");
+        let invalid = serde_json::from_value::<MemoryEmbeddingPolicy>(json!({
+            "enabled": true,
+            "endpoint": "http://127.0.0.1:9/v1",
+            "model": "embed-test",
+            "index": "hnsw"
+        }));
+        assert!(invalid.is_err(), "unknown index modes fail closed");
+
+        let index: MemoryEmbeddingIndexStatus = serde_json::from_value(json!({
+            "mode": "ivf",
+            "ready": true,
+            "generation": 7,
+            "model": "embed-test",
+            "dimensions": 8,
+            "vector_count": 400,
+            "assigned_vectors": 380,
+            "invalid_assignments": 2,
+            "cluster_count": 32,
+            "nlist": 32,
+            "nprobe": 4,
+            "coverage": 0.95,
+            "min_vectors": 256,
+            "rebuild_vectors": 4096,
+            "bytes": 1024,
+            "last_rebuilt_at": "2026-11-11T00:00:00Z",
+            "fallback_count": 2,
+            "last_fallback_reason": "model_mismatch"
+        }))
+        .unwrap();
+        assert!(index.ready);
+        assert_eq!(index.generation, Some(7));
+        assert_eq!(index.coverage_label(), "95.0%");
+        assert_eq!(index.invalid_assignments, 2);
+        assert_eq!(index.fallback_count, 2);
+        assert!(index.last_error.is_none());
+        let encoded = serde_json::to_value(&index).unwrap();
+        assert_eq!(encoded["mode"], "ivf");
+        assert!(encoded.get("centroids").is_none());
+        assert!(encoded.get("vector").is_none());
+        let decoded: MemoryEmbeddingIndexStatus = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded, index);
+
+        let defaulted: MemoryEmbeddingIndexStatus = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(defaulted.mode, "scan");
+        assert!(!defaulted.ready);
+        assert_eq!(defaulted.dimensions, 1536);
+        assert_eq!(defaulted.nlist, 64);
+        assert_eq!(defaulted.nprobe, 8);
+        assert_eq!(defaulted.invalid_assignments, 0);
+        assert_eq!(defaulted.fallback_count, 0);
+
+        let status = MemoryEmbeddingsStatusResult {
+            project_id: "prj-1".to_string(),
+            enabled: true,
+            configured: true,
+            model: Some("embed-test".to_string()),
+            dimensions: 8,
+            indexable: 400,
+            indexed: 400,
+            invalid: 0,
+            pending: 0,
+            failed: 0,
+            skipped: 0,
+            coverage: 1.0,
+            last_error: None,
+            usage: MemoryEmbeddingUsage::default(),
+            recent_jobs: Vec::new(),
+            index: Some(index.clone()),
+        };
+        let decoded: MemoryEmbeddingsStatusResult =
+            serde_json::from_value(serde_json::to_value(&status).unwrap()).unwrap();
+        assert_eq!(decoded.index.as_ref().unwrap().generation, Some(7));
+
+        let legacy: MemoryEmbeddingsStatusResult = serde_json::from_value(json!({
+            "project_id": "old",
+            "indexable": 0
+        }))
+        .unwrap();
+        assert!(legacy.index.is_none());
+
+        let params: MemoryEmbeddingsIndexStatusParams =
+            serde_json::from_value(json!({"project_id": "prj-1"})).unwrap();
+        assert_eq!(params.project_id, "prj-1");
+        let result = MemoryEmbeddingsIndexStatusResult {
+            project_id: "prj-1".to_string(),
+            index,
+        };
+        let decoded: MemoryEmbeddingsIndexStatusResult =
+            serde_json::from_value(serde_json::to_value(&result).unwrap()).unwrap();
+        assert_eq!(decoded, result);
+
+        let replay = MemoryEmbeddingsIndexRebuildResult {
+            project_id: "prj-1".to_string(),
+            rebuilt: true,
+            reason: None,
+            generation: Some(8),
+            vector_count: 400,
+            assigned_vectors: 400,
+            cluster_count: 32,
+            nlist: 32,
+        };
+        let decoded: MemoryEmbeddingsIndexRebuildResult =
+            serde_json::from_value(serde_json::to_value(&replay).unwrap()).unwrap();
+        assert_eq!(decoded, replay);
+
+        let minimal_rebuild: MemoryEmbeddingsIndexRebuildResult =
+            serde_json::from_value(json!({"project_id": "prj-1"})).unwrap();
+        assert!(!minimal_rebuild.rebuilt);
+        assert_eq!(minimal_rebuild.generation, None);
+        assert_eq!(minimal_rebuild.vector_count, 0);
+        assert_eq!(minimal_rebuild.nlist, 0);
+
+        let summary: MemorySemanticSummary = serde_json::from_value(json!({
+            "enabled": true,
+            "index_source": "ivf",
+            "index_generation": 8,
+            "index_fallback": null,
+            "probed_clusters": 4,
+            "candidate_vectors": 48
+        }))
+        .unwrap();
+        assert_eq!(summary.index_source.as_deref(), Some("ivf"));
+        assert_eq!(summary.index_generation, Some(8));
+        assert_eq!(summary.probed_clusters, 4);
+        assert_eq!(summary.candidate_vectors, 48);
     }
 
     #[test]

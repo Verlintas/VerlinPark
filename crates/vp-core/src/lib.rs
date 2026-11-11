@@ -29,28 +29,28 @@ use vp_protocol::types::{
     McpPromptListResult, McpReadResourceResult, McpResourceListResult, McpServer, McpServerConfig,
     McpServerListResult, McpToolListResult, MemoryBriefResult, MemoryConflict,
     MemoryConflictResolveResult, MemoryConflictScanResult, MemoryConflictsResult,
-    MemoryDeleteResult, MemoryEmbeddingPolicy, MemoryEmbeddingsRebuildResult,
-    MemoryEmbeddingsStatusResult, MemoryEmbeddingsTestResult, MemoryEvidence, MemoryHealthResult,
-    MemoryItem, MemoryListResult, MemoryMatch, MemoryPolicy, MemoryPolicyResult, MemoryPruneResult,
-    MemorySearchParams, MemorySearchResult, MemorySemanticSummary, MemoryStatsResult,
-    MemorySweepResult, MemoryUpdateResult, MemoryVerificationCheck, MemoryVerifyResult,
-    MergeQueueEntry, MessageCitation, ModelPreset, ModelPresetListResult, OrchestrationDecision,
-    OrchestrationNote, OrchestrationOverviewResult, OrchestrationOverviewTotals,
-    OrchestrationPolicy, OrchestrationPreviewAction, OrchestrationPreviewResult,
-    OrchestrationRecoveriesResult, OrchestrationRecovery, OrchestrationSessionSummary,
-    OrchestrationSnapshot, PlanRevisionDetailResult, PlanRevisionInfo, Program,
-    ProgramActionParams, ProgramCreateParams, ProgramDeleteParams, ProgramListResult,
-    ProgramMilestone, ProgramMilestoneActionParams, ProgramMilestoneCreateParams,
-    ProgramMilestoneListResult, ProgramMilestoneUpdateParams, ProgramPolicy, ProgramReplayReport,
-    ProgramStatus, ProgramStatusParams, ProgramStatusResult, ProgramTickParams, ProgramTickResult,
-    ProgramUpdateParams, Project, ProjectBudget, ProjectBudgetResult, ProjectUsageResult,
-    PullRequestResult, Question, QuestionListResult, ReviseTeamPlanResult, ScheduledTask,
-    SearchResult, Session, SessionBundle, SessionCacheStatus, SessionCheckpoint,
-    SessionCheckpointDeleteResult, SessionCheckpointDiffResult, SessionCheckpointListResult,
-    SessionCheckpointPruneResult, SessionCheckpointRestoreResult, SessionCheckpointStatsResult,
-    SessionCitationAuditResult, SessionCitationsResult, SessionCommit, SessionCompareFile,
-    SessionCompareResult, SessionContextStatus, SessionContinuation,
-    SessionContinuationCancelResult, SessionContinuationClaimInfo,
+    MemoryDeleteResult, MemoryEmbeddingPolicy, MemoryEmbeddingsIndexRebuildResult,
+    MemoryEmbeddingsIndexStatusResult, MemoryEmbeddingsRebuildResult, MemoryEmbeddingsStatusResult,
+    MemoryEmbeddingsTestResult, MemoryEvidence, MemoryHealthResult, MemoryItem, MemoryListResult,
+    MemoryMatch, MemoryPolicy, MemoryPolicyResult, MemoryPruneResult, MemorySearchParams,
+    MemorySearchResult, MemorySemanticSummary, MemoryStatsResult, MemorySweepResult,
+    MemoryUpdateResult, MemoryVerificationCheck, MemoryVerifyResult, MergeQueueEntry,
+    MessageCitation, ModelPreset, ModelPresetListResult, OrchestrationDecision, OrchestrationNote,
+    OrchestrationOverviewResult, OrchestrationOverviewTotals, OrchestrationPolicy,
+    OrchestrationPreviewAction, OrchestrationPreviewResult, OrchestrationRecoveriesResult,
+    OrchestrationRecovery, OrchestrationSessionSummary, OrchestrationSnapshot,
+    PlanRevisionDetailResult, PlanRevisionInfo, Program, ProgramActionParams, ProgramCreateParams,
+    ProgramDeleteParams, ProgramListResult, ProgramMilestone, ProgramMilestoneActionParams,
+    ProgramMilestoneCreateParams, ProgramMilestoneListResult, ProgramMilestoneUpdateParams,
+    ProgramPolicy, ProgramReplayReport, ProgramStatus, ProgramStatusParams, ProgramStatusResult,
+    ProgramTickParams, ProgramTickResult, ProgramUpdateParams, Project, ProjectBudget,
+    ProjectBudgetResult, ProjectUsageResult, PullRequestResult, Question, QuestionListResult,
+    ReviseTeamPlanResult, ScheduledTask, SearchResult, Session, SessionBundle, SessionCacheStatus,
+    SessionCheckpoint, SessionCheckpointDeleteResult, SessionCheckpointDiffResult,
+    SessionCheckpointListResult, SessionCheckpointPruneResult, SessionCheckpointRestoreResult,
+    SessionCheckpointStatsResult, SessionCitationAuditResult, SessionCitationsResult,
+    SessionCommit, SessionCompareFile, SessionCompareResult, SessionContextStatus,
+    SessionContinuation, SessionContinuationCancelResult, SessionContinuationClaimInfo,
     SessionContinuationReclaimResult, SessionContinuationStatusResult, SessionContinuationsResult,
     SessionDeferResult, SessionDiff, SessionForkResult, SessionForkTreeNode, SessionForkTreeResult,
     SessionImportResult, SessionLandResult, SessionLineageEntry, SessionLineageResult,
@@ -95,6 +95,7 @@ pub mod history;
 pub mod mcp;
 pub mod memory;
 pub mod memory_embedding;
+pub mod memory_index;
 mod operation;
 pub mod orchestration;
 pub mod permissions;
@@ -8614,6 +8615,11 @@ impl Engine {
             lexical_candidates: u32::try_from(candidates.len()).unwrap_or(u32::MAX),
             semantic_candidates: 0,
             fallback: None,
+            index_source: None,
+            index_generation: None,
+            index_fallback: None,
+            probed_clusters: 0,
+            candidate_vectors: 0,
         };
         let mut semantic_ranking = crate::memory::SemanticRanking::Disabled;
         if let Some(policy) = embedding_policy.as_ref().filter(|policy| policy.enabled) {
@@ -8687,25 +8693,87 @@ impl Engine {
                                         let model = policy.model.clone().unwrap_or_default();
                                         let dimensions = policy.dimensions;
                                         let max_candidates = policy.max_candidates.clamp(1, 256);
-                                        let store = self.store.clone();
-                                        let project = params.project_id.clone();
-                                        let semantic_candidates =
-                                            tokio::task::spawn_blocking(move || {
-                                                store.memory_semantic_candidates(
+                                        let scored = if policy.uses_ivf_index() {
+                                            let store = self.store.clone();
+                                            let project = params.project_id.clone();
+                                            let probe_policy = policy.clone();
+                                            let probe_query = query_vector.clone();
+                                            let probe = tokio::task::spawn_blocking(move || {
+                                                crate::memory_index::probe_ivf(
+                                                    &store,
                                                     &project,
-                                                    &model,
-                                                    dimensions,
+                                                    &probe_policy,
                                                     include_stale,
-                                                    max_candidates,
+                                                    &probe_query,
                                                 )
                                             })
-                                            .await??;
-                                        let scored = crate::memory::semantic_scores(
-                                            semantic_candidates,
-                                            &query_vector,
-                                            dimensions,
-                                            f64::from(policy.min_similarity),
-                                        );
+                                            .await?;
+                                            match probe.fallback {
+                                                Some(reason) => {
+                                                    let store = self.store.clone();
+                                                    let project = params.project_id.clone();
+                                                    let fallback_model = model.clone();
+                                                    let nlist = policy.ivf_nlist;
+                                                    let reason_for_log = reason.clone();
+                                                    let _ = tokio::task::spawn_blocking(move || {
+                                                        store.note_memory_embedding_index_fallback(
+                                                            &project,
+                                                            &fallback_model,
+                                                            dimensions,
+                                                            nlist,
+                                                            &reason_for_log,
+                                                        )
+                                                    })
+                                                    .await;
+                                                    semantic_summary.index_source =
+                                                        Some("scan".to_string());
+                                                    semantic_summary.index_generation =
+                                                        probe.generation;
+                                                    semantic_summary.index_fallback = Some(reason);
+                                                    semantic_summary.probed_clusters = 0;
+                                                    semantic_summary.candidate_vectors = 0;
+                                                    self.scan_semantic_candidates(
+                                                        &params.project_id,
+                                                        &model,
+                                                        dimensions,
+                                                        include_stale,
+                                                        max_candidates,
+                                                        &query_vector,
+                                                        f64::from(policy.min_similarity),
+                                                    )
+                                                    .await?
+                                                }
+                                                None => {
+                                                    semantic_summary.index_source =
+                                                        Some("ivf".to_string());
+                                                    semantic_summary.index_generation =
+                                                        probe.generation;
+                                                    semantic_summary.index_fallback = None;
+                                                    semantic_summary.probed_clusters =
+                                                        probe.probed_clusters;
+                                                    semantic_summary.candidate_vectors =
+                                                        probe.candidate_vectors;
+                                                    probe.scored
+                                                }
+                                            }
+                                        } else {
+                                            semantic_summary.index_source =
+                                                Some("scan".to_string());
+                                            semantic_summary.index_generation = None;
+                                            semantic_summary.index_fallback = None;
+                                            semantic_summary.probed_clusters = 0;
+                                            semantic_summary.candidate_vectors = 0;
+                                            self.scan_semantic_candidates(
+                                                &params.project_id,
+                                                &model,
+                                                dimensions,
+                                                include_stale,
+                                                max_candidates,
+                                                &query_vector,
+                                                f64::from(policy.min_similarity),
+                                            )
+                                            .await?
+                                        };
                                         semantic_summary.semantic_candidates =
                                             u32::try_from(scored.len()).unwrap_or(u32::MAX);
                                         let mut semantic_by_id = scored
@@ -8760,6 +8828,42 @@ impl Engine {
             memories: matches,
             semantic: Some(semantic_summary),
         })
+    }
+
+    /// Exact semantic scan used by the default lane and by every IVF fallback.
+    /// The candidate window is bounded by the policy and decoded/scored by the
+    /// same function as the ANN probe, so a fallback cannot change cosine
+    /// semantics.
+    #[allow(clippy::too_many_arguments)]
+    async fn scan_semantic_candidates(
+        &self,
+        project_id: &str,
+        model: &str,
+        dimensions: u32,
+        include_stale: bool,
+        max_candidates: u32,
+        query_vector: &[f32],
+        min_similarity: f64,
+    ) -> Result<Vec<(MemoryItem, f64)>> {
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let model = model.to_string();
+        let semantic_candidates = tokio::task::spawn_blocking(move || {
+            store.memory_semantic_candidates(
+                &project,
+                &model,
+                dimensions,
+                include_stale,
+                max_candidates,
+            )
+        })
+        .await??;
+        Ok(crate::memory::semantic_scores(
+            semantic_candidates,
+            query_vector,
+            dimensions,
+            min_similarity,
+        ))
     }
 
     /// Build the injected project-memory brief. Usage is observed per selected
@@ -9197,7 +9301,77 @@ impl Engine {
                 ));
             }
         }
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let index_policy = embedding.clone();
+        let index = tokio::task::spawn_blocking(move || {
+            crate::memory_index::index_status(&store, &project, index_policy.as_ref())
+        })
+        .await??;
+        status.index = Some(index);
         Ok(status)
+    }
+
+    /// Derived IVF index health for one project. Contains aggregate counts and
+    /// generation metadata only; centroids and vectors never leave the store.
+    pub async fn memory_embedding_index_status(
+        &self,
+        project_id: &str,
+    ) -> Result<MemoryEmbeddingsIndexStatusResult> {
+        self.ensure_project_exists(project_id).await?;
+        let policy = self.get_memory_policy(project_id).await?.policy;
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let index = tokio::task::spawn_blocking(move || {
+            crate::memory_index::index_status(&store, &project, policy.embedding.as_ref())
+        })
+        .await??;
+        Ok(MemoryEmbeddingsIndexStatusResult {
+            project_id: project_id.to_string(),
+            index,
+        })
+    }
+
+    /// Explicit derived-index rebuild. Never calls the embedding endpoint,
+    /// never changes memory truth, and never deletes vectors. Scan mode or a
+    /// below-minimum vector count removes stale derived index state and
+    /// returns `rebuilt = false` with a reason.
+    pub async fn memory_embedding_index_rebuild(
+        &self,
+        project_id: &str,
+    ) -> Result<MemoryEmbeddingsIndexRebuildResult> {
+        self.ensure_project_exists(project_id).await?;
+        let policy = self.get_memory_policy(project_id).await?.policy;
+        let Some(embedding) = policy.embedding else {
+            return Ok(MemoryEmbeddingsIndexRebuildResult {
+                project_id: project_id.to_string(),
+                rebuilt: false,
+                reason: Some("not_configured".to_string()),
+                generation: None,
+                vector_count: 0,
+                assigned_vectors: 0,
+                cluster_count: 0,
+                nlist: 0,
+            });
+        };
+        crate::memory_embedding::validate_embedding_policy(&embedding)?;
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let embedding_for_build = embedding.clone();
+        let report = tokio::task::spawn_blocking(move || {
+            crate::memory_index::rebuild_index(&store, &project, &embedding_for_build)
+        })
+        .await??;
+        Ok(MemoryEmbeddingsIndexRebuildResult {
+            project_id: project_id.to_string(),
+            rebuilt: report.rebuilt,
+            reason: report.reason,
+            generation: report.generation,
+            vector_count: report.vector_count,
+            assigned_vectors: report.assigned_vectors,
+            cluster_count: report.cluster_count,
+            nlist: report.nlist,
+        })
     }
 
     /// Clear derived vectors/jobs and queue every active/stale memory. This is
@@ -9376,6 +9550,11 @@ impl Engine {
         if !policy.enabled {
             return Ok((0, 0, 0));
         }
+        // Index maintenance does not depend on the embedding endpoint. Run one
+        // bounded pass before the client is built so a corrupt/stale index can
+        // still repair itself while the endpoint or API key is unavailable.
+        self.maintain_project_memory_index(project_id, &policy)
+            .await;
         let runtime = crate::memory_embedding::EmbeddingRuntimePolicy::from_policy(&policy)?;
         let client = match crate::memory_embedding::EmbeddingClient::from_policy(&policy) {
             Ok(client) => client,
@@ -9445,6 +9624,8 @@ impl Engine {
             }
         }
         if needs.is_empty() {
+            self.maintain_project_memory_index(project_id, &policy)
+                .await;
             return Ok((0, 0, skipped));
         }
 
@@ -9585,7 +9766,65 @@ impl Engine {
                 }
             }
         }
+        self.maintain_project_memory_index(project_id, &policy)
+            .await;
         Ok((indexed, failed, skipped))
+    }
+
+    /// Look up the project embedding policy and run bounded index
+    /// maintenance. Used after delete/prune so assignments and centroid
+    /// metadata cannot drift from the live vector set.
+    async fn maintain_memory_index_if_configured(&self, project_id: &str) {
+        match self.get_memory_policy(project_id).await {
+            Ok(policy) => {
+                if let Some(embedding) = policy.policy.embedding {
+                    self.maintain_project_memory_index(project_id, &embedding)
+                        .await;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, %project_id, "could not load memory policy for index maintenance");
+            }
+        }
+    }
+
+    /// Bounded derived-index maintenance after an embedding batch. This is
+    /// best-effort: a failed index build never fails memory writes or the
+    /// embedding reconciler, and recall falls back to the exact scan.
+    async fn maintain_project_memory_index(
+        &self,
+        project_id: &str,
+        policy: &MemoryEmbeddingPolicy,
+    ) {
+        if !policy.uses_ivf_index() {
+            return;
+        }
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let policy = policy.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::memory_index::maintain_index(&store, &project, &policy)
+        })
+        .await
+        {
+            Ok(Ok(report)) => {
+                if let Some(generation) = report.rebuilt_generation {
+                    tracing::info!(
+                        %project_id,
+                        generation,
+                        assigned = report.assigned_vectors,
+                        vectors = report.vector_count,
+                        "memory embedding IVF index rebuilt"
+                    );
+                }
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(%error, %project_id, "memory embedding IVF index maintenance failed");
+            }
+            Err(error) => {
+                tracing::warn!(%error, %project_id, "memory embedding IVF index task failed");
+            }
+        }
     }
 
     async fn record_embedding_failure(
@@ -9704,8 +9943,12 @@ impl Engine {
         let removed =
             tokio::task::spawn_blocking(move || store.delete_memories_with_events(&[lookup]))
                 .await??;
+        let project_id = removed.first().map(|(memory, _)| memory.project_id.clone());
         for (_, event) in &removed {
             let _ = self.events.send(event.clone());
+        }
+        if let Some(project_id) = project_id {
+            self.maintain_memory_index_if_configured(&project_id).await;
         }
         Ok(MemoryDeleteResult {
             memory_id,
@@ -9742,6 +9985,9 @@ impl Engine {
             tokio::task::spawn_blocking(move || store.delete_memories_with_events(&ids)).await??;
         for (_, event) in &removed {
             let _ = self.events.send(event.clone());
+        }
+        if !removed.is_empty() {
+            self.maintain_memory_index_if_configured(project_id).await;
         }
         Ok(MemoryPruneResult {
             candidates,

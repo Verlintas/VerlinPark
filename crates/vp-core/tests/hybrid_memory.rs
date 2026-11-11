@@ -36,6 +36,7 @@ fn embedding_policy(server_uri: String, env_name: &str, model: &str) -> MemoryEm
         max_candidates: 32,
         min_similarity: 0.2,
         api_key_env: Some(env_name.to_string()),
+        ..MemoryEmbeddingPolicy::default()
     }
 }
 
@@ -583,6 +584,7 @@ async fn malformed_policy_is_rejected_before_storage() {
         max_candidates: 8,
         min_similarity: 0.2,
         api_key_env: None,
+        ..MemoryEmbeddingPolicy::default()
     });
     policy.embedding.as_mut().unwrap().dimensions = 1;
     let error = engine
@@ -1282,6 +1284,7 @@ async fn embedding_policy_round_trips_through_the_rpc_surface() {
         max_candidates: 12,
         min_similarity: 0.42,
         api_key_env: Some("EMBED_ROUNDTRIP_KEY".to_string()),
+        ..MemoryEmbeddingPolicy::default()
     };
     let policy = policy_with(embedding.clone());
     engine

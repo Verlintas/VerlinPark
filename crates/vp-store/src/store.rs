@@ -38,6 +38,12 @@ use crate::paths;
 /// blob while still allowing large build logs and diffs to be paged.
 pub const MAX_TOOL_OUTPUT_BLOB_BYTES: usize = 32 * 1024 * 1024;
 
+/// Hard ceiling for one stored centroid blob. The longest supported embedding
+/// (8,192 dims) at the maximum centroid count (1,024) is ~32 MiB, so this
+/// leaves room for the versioned header while still failing closed on a
+/// corrupt or hand-edited row.
+pub const MAX_MEMORY_INDEX_BLOB_BYTES: usize = 64 * 1024 * 1024;
+
 pub fn tool_output_line_count(content: &str) -> u64 {
     if content.is_empty() {
         0
@@ -616,6 +622,57 @@ pub struct MemorySemanticCandidate {
     pub dimensions: u32,
     pub content_hash: String,
     pub vector: Vec<u8>,
+}
+
+/// One persisted derived IVF index generation. `centroids` is the versioned
+/// little-endian f32 blob described by `vp_core::memory_index`; it is never
+/// serialized into an RPC, event, log, or UI payload.
+#[derive(Debug, Clone)]
+pub struct MemoryEmbeddingIndexRow {
+    pub project_id: String,
+    pub model: String,
+    pub dimensions: u32,
+    pub generation: u64,
+    pub nlist: u32,
+    pub cluster_count: u32,
+    pub vector_count: u32,
+    pub centroids: Vec<u8>,
+    pub updated_at: String,
+    pub last_error: Option<String>,
+    pub fallback_count: u64,
+    pub last_fallback_at: Option<String>,
+    pub last_fallback_reason: Option<String>,
+}
+
+/// Live vector and assignment counts for one index generation. Both counts
+/// are scoped to active/stale memories with structurally valid current-model
+/// embeddings, so an archived row or a corrupt vector cannot inflate
+/// coverage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemoryEmbeddingIndexCounts {
+    pub vector_count: u32,
+    pub assigned_vectors: u32,
+}
+
+/// Structural audit of assignment rows for one project/generation. A derived
+/// assignment can become invalid after a manual database edit, a partially
+/// restored database, or a cluster-count change; recall already joins only
+/// valid current embeddings, but maintenance should remove the stale rows so
+/// coverage is honest.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemoryEmbeddingAssignmentAudit {
+    pub total: u32,
+    pub stale_generation: u32,
+    pub out_of_range: u32,
+    pub missing_vector: u32,
+}
+
+impl MemoryEmbeddingAssignmentAudit {
+    pub fn invalid(&self) -> u32 {
+        self.stale_generation
+            .saturating_add(self.out_of_range)
+            .saturating_add(self.missing_vector)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1434,6 +1491,32 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_memory_embedding_usage_project
                 ON memory_embedding_usage(project_id, model, created_at);
+
+            CREATE TABLE IF NOT EXISTS memory_embedding_index (
+                project_id           TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                model                TEXT NOT NULL,
+                dimensions           INTEGER NOT NULL,
+                generation           INTEGER NOT NULL,
+                nlist                INTEGER NOT NULL,
+                cluster_count        INTEGER NOT NULL,
+                vector_count         INTEGER NOT NULL,
+                centroids            BLOB NOT NULL,
+                updated_at           TEXT NOT NULL,
+                last_error           TEXT,
+                fallback_count       INTEGER NOT NULL DEFAULT 0,
+                last_fallback_at     TEXT,
+                last_fallback_reason TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_embedding_assignments (
+                memory_id  TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+                generation INTEGER NOT NULL,
+                cluster    INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memory_embedding_assignments_generation
+                ON memory_embedding_assignments(generation, cluster);
 
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
                 title,
@@ -2502,7 +2585,30 @@ impl Store {
                  created_at         TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_memory_embedding_usage_project
-                 ON memory_embedding_usage(project_id, model, created_at);",
+                 ON memory_embedding_usage(project_id, model, created_at);
+             CREATE TABLE IF NOT EXISTS memory_embedding_index (
+                 project_id           TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                 model                TEXT NOT NULL,
+                 dimensions           INTEGER NOT NULL,
+                 generation           INTEGER NOT NULL,
+                 nlist                INTEGER NOT NULL,
+                 cluster_count        INTEGER NOT NULL,
+                 vector_count         INTEGER NOT NULL,
+                 centroids            BLOB NOT NULL,
+                 updated_at           TEXT NOT NULL,
+                 last_error           TEXT,
+                 fallback_count       INTEGER NOT NULL DEFAULT 0,
+                 last_fallback_at     TEXT,
+                 last_fallback_reason TEXT
+             );
+             CREATE TABLE IF NOT EXISTS memory_embedding_assignments (
+                 memory_id  TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+                 generation INTEGER NOT NULL,
+                 cluster    INTEGER NOT NULL,
+                 updated_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_memory_embedding_assignments_generation
+                 ON memory_embedding_assignments(generation, cluster);",
         )?;
         ensure_column(
             &conn,
@@ -8509,6 +8615,10 @@ impl Store {
                 "DELETE FROM memory_embedding_jobs WHERE memory_id = ?1",
                 params![id],
             )?;
+            tx.execute(
+                "DELETE FROM memory_embedding_assignments WHERE memory_id = ?1",
+                params![id],
+            )?;
             tx.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
             let event = insert_event_tx(
                 &tx,
@@ -9261,6 +9371,13 @@ impl Store {
                 now
             ],
         )?;
+        // The vector may have changed cluster membership. Removing the old
+        // assignment keeps recall from scoring a stale cluster until the
+        // bounded maintenance pass assigns the new vector.
+        tx.execute(
+            "DELETE FROM memory_embedding_assignments WHERE memory_id = ?1",
+            params![memory_id],
+        )?;
         tx.execute(
             "INSERT INTO memory_embedding_jobs
              (memory_id, model, status, attempts, last_error, next_attempt_at, updated_at)
@@ -9569,6 +9686,7 @@ impl Store {
             last_error: last_error.map(|error| truncate_chars(&error, 2_000)),
             usage,
             recent_jobs: recent,
+            index: None,
         })
     }
 
@@ -9587,8 +9705,26 @@ impl Store {
              WHERE memory_id IN (SELECT id FROM memories WHERE project_id = ?1)",
             params![project_id],
         )?;
+        // The ANN index is derived state too. The explicit rebuild/clear path
+        // is also the privacy cleanup path, so it must remove centroids and
+        // assignments along with vectors and jobs.
+        let assignments = tx.execute(
+            "DELETE FROM memory_embedding_assignments
+             WHERE memory_id IN (SELECT id FROM memories WHERE project_id = ?1)",
+            params![project_id],
+        )?;
+        let index = tx.execute(
+            "DELETE FROM memory_embedding_index WHERE project_id = ?1",
+            params![project_id],
+        )?;
         tx.commit()?;
-        Ok(u32::try_from(embeddings.saturating_add(jobs)).unwrap_or(u32::MAX))
+        Ok(u32::try_from(
+            embeddings
+                .saturating_add(jobs)
+                .saturating_add(assignments)
+                .saturating_add(index),
+        )
+        .unwrap_or(u32::MAX))
     }
 
     /// Queue every active/stale memory for indexing. Existing jobs are reset
@@ -9612,6 +9748,589 @@ impl Store {
             params![project_id, model, now],
         )?;
         Ok(u32::try_from(changed).unwrap_or(u32::MAX))
+    }
+
+    /// Current derived IVF index row for one project. `None` means no index
+    /// has ever been built (or it was explicitly removed). The centroid blob
+    /// is returned only to `vp-core`, which owns validation and decoding; it
+    /// must never be copied into an RPC, event, log, or UI payload.
+    pub fn memory_embedding_index_row(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<MemoryEmbeddingIndexRow>> {
+        let conn = self.lock()?;
+        let row = conn
+            .query_row(
+                "SELECT project_id, model, dimensions, generation, nlist, cluster_count,
+                        vector_count, centroids, updated_at, last_error, fallback_count,
+                        last_fallback_at, last_fallback_reason
+                 FROM memory_embedding_index WHERE project_id = ?1",
+                params![project_id],
+                |row| {
+                    Ok(MemoryEmbeddingIndexRow {
+                        project_id: row.get(0)?,
+                        model: row.get(1)?,
+                        dimensions: u32::try_from(row.get::<_, i64>(2)?).unwrap_or(u32::MAX),
+                        generation: u64::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+                        nlist: u32::try_from(row.get::<_, i64>(4)?).unwrap_or(u32::MAX),
+                        cluster_count: u32::try_from(row.get::<_, i64>(5)?).unwrap_or(u32::MAX),
+                        vector_count: u32::try_from(row.get::<_, i64>(6)?).unwrap_or(u32::MAX),
+                        centroids: row.get(7)?,
+                        updated_at: row.get(8)?,
+                        last_error: row.get(9)?,
+                        fallback_count: u64::try_from(row.get::<_, i64>(10)?).unwrap_or(u64::MAX),
+                        last_fallback_at: row.get(11)?,
+                        last_fallback_reason: row.get(12)?,
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(row) = &row
+            && row.centroids.len() > MAX_MEMORY_INDEX_BLOB_BYTES
+        {
+            anyhow::bail!(
+                "stored memory embedding index exceeds the {MAX_MEMORY_INDEX_BLOB_BYTES}-byte ceiling"
+            );
+        }
+        Ok(row)
+    }
+
+    /// Live vector and assignment counts. A vector counts only when the
+    /// memory is active/stale, the embedding belongs to the requested
+    /// model/dimensions, and its header passes the same structural checks as
+    /// status. Assignments are counted only for the requested generation.
+    pub fn memory_embedding_index_counts(
+        &self,
+        project_id: &str,
+        model: &str,
+        dimensions: u32,
+        generation: u64,
+        cluster_count: u32,
+    ) -> Result<MemoryEmbeddingIndexCounts> {
+        let conn = self.lock()?;
+        let (vectors, assigned): (i64, i64) = conn.query_row(
+            "SELECT
+                 (SELECT COUNT(*)
+                    FROM memories m
+                    JOIN memory_embeddings e ON e.memory_id = m.id
+                   WHERE m.project_id = ?1
+                     AND m.status IN ('active', 'stale')
+                     AND e.model = ?2
+                     AND e.dimensions = ?3
+                     AND substr(e.vector, 1, 4) = x'5650454d'
+                     AND substr(e.vector, 5, 1) = x'01'
+                     AND length(e.vector) = 9 + 4 * ?3),
+                 (SELECT COUNT(*)
+                    FROM memory_embedding_assignments a
+                    JOIN memories m ON m.id = a.memory_id
+                    JOIN memory_embeddings e ON e.memory_id = m.id
+                   WHERE m.project_id = ?1
+                     AND a.generation = ?4
+                     AND a.cluster >= 0
+                     AND a.cluster < ?5
+                     AND m.status IN ('active', 'stale')
+                     AND e.model = ?2
+                     AND e.dimensions = ?3
+                     AND substr(e.vector, 1, 4) = x'5650454d'
+                     AND substr(e.vector, 5, 1) = x'01'
+                     AND length(e.vector) = 9 + 4 * ?3)",
+            params![
+                project_id,
+                model,
+                i64::from(dimensions),
+                i64::try_from(generation).unwrap_or(i64::MAX),
+                i64::from(cluster_count)
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(MemoryEmbeddingIndexCounts {
+            vector_count: u32::try_from(vectors).unwrap_or(u32::MAX),
+            assigned_vectors: u32::try_from(assigned).unwrap_or(u32::MAX),
+        })
+    }
+
+    /// Audit assignments against one generation, the current model/dimensions,
+    /// and the centroid count. Counts are bounded SQL aggregates; no vector is
+    /// read.
+    pub fn memory_embedding_assignment_audit(
+        &self,
+        project_id: &str,
+        model: &str,
+        dimensions: u32,
+        generation: u64,
+        cluster_count: u32,
+    ) -> Result<MemoryEmbeddingAssignmentAudit> {
+        let conn = self.lock()?;
+        let (total, stale, out_of_range, missing): (i64, i64, i64, i64) = conn.query_row(
+            "SELECT
+                 COUNT(*),
+                 COALESCE(SUM(CASE WHEN a.generation != ?4 THEN 1 ELSE 0 END), 0),
+                 COALESCE(SUM(CASE WHEN a.cluster < 0 OR a.cluster >= ?5 THEN 1 ELSE 0 END), 0),
+                 COALESCE(SUM(CASE WHEN a.generation = ?4
+                                       AND a.cluster >= 0 AND a.cluster < ?5
+                                       AND (e.memory_id IS NULL
+                                            OR e.model != ?2
+                                            OR e.dimensions != ?3
+                                            OR substr(e.vector, 1, 4) != x'5650454d'
+                                            OR substr(e.vector, 5, 1) != x'01'
+                                            OR length(e.vector) != 9 + 4 * ?3
+                                            OR m.status NOT IN ('active', 'stale'))
+                                  THEN 1 ELSE 0 END), 0)
+             FROM memory_embedding_assignments a
+             JOIN memories m ON m.id = a.memory_id
+             LEFT JOIN memory_embeddings e ON e.memory_id = a.memory_id
+             WHERE m.project_id = ?1",
+            params![
+                project_id,
+                model,
+                i64::from(dimensions),
+                i64::try_from(generation).unwrap_or(i64::MAX),
+                i64::from(cluster_count)
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        Ok(MemoryEmbeddingAssignmentAudit {
+            total: u32::try_from(total).unwrap_or(u32::MAX),
+            stale_generation: u32::try_from(stale).unwrap_or(u32::MAX),
+            out_of_range: u32::try_from(out_of_range).unwrap_or(u32::MAX),
+            missing_vector: u32::try_from(missing).unwrap_or(u32::MAX),
+        })
+    }
+
+    /// Delete assignments that are not usable by the current generation. This
+    /// is bounded by the number of assignment rows for one project and is only
+    /// called from maintenance/rebuild, never from recall.
+    pub fn delete_invalid_memory_embedding_assignments(
+        &self,
+        project_id: &str,
+        model: &str,
+        dimensions: u32,
+        generation: u64,
+        cluster_count: u32,
+    ) -> Result<u32> {
+        let conn = self.lock()?;
+        let deleted = conn.execute(
+            "DELETE FROM memory_embedding_assignments
+             WHERE memory_id IN (
+                 SELECT a.memory_id
+                 FROM memory_embedding_assignments a
+                 JOIN memories m ON m.id = a.memory_id
+                 LEFT JOIN memory_embeddings e ON e.memory_id = a.memory_id
+                 WHERE m.project_id = ?1
+                   AND (a.generation != ?4
+                        OR a.cluster < 0
+                        OR a.cluster >= ?5
+                        OR e.memory_id IS NULL
+                        OR e.model != ?2
+                        OR e.dimensions != ?3
+                        OR substr(e.vector, 1, 4) != x'5650454d'
+                        OR substr(e.vector, 5, 1) != x'01'
+                        OR length(e.vector) != 9 + 4 * ?3
+                        OR m.status NOT IN ('active', 'stale'))
+             )",
+            params![
+                project_id,
+                model,
+                i64::from(dimensions),
+                i64::try_from(generation).unwrap_or(i64::MAX),
+                i64::from(cluster_count)
+            ],
+        )?;
+        Ok(u32::try_from(deleted).unwrap_or(u32::MAX))
+    }
+
+    /// Deterministic bounded sample of current vectors for a k-means rebuild.
+    ///
+    /// Rows are ordered by a prefix of their SHA-256 content hash, so the
+    /// sample is stable for an unchanged database and does not simply take the
+    /// first memory ids. `limit` is additionally capped by `max_bytes`, which
+    /// bounds the transient allocation regardless of embedding dimension.
+    pub fn memory_embedding_vectors_for_index(
+        &self,
+        project_id: &str,
+        model: &str,
+        dimensions: u32,
+        limit: u32,
+        max_bytes: usize,
+    ) -> Result<Vec<MemorySemanticCandidate>> {
+        let row_bytes = 9usize.saturating_add(dimensions as usize * 4).max(1);
+        let rows_by_bytes = max_bytes / row_bytes;
+        let effective_limit = (limit as usize).min(rows_by_bytes.max(1)).clamp(1, 16_384);
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.session_id, m.project_id, m.agent_id, m.agent_name, m.kind,
+                    m.title, m.body, m.tags, m.created_at, m.status, m.source, m.evidence,
+                    m.supersedes, m.superseded_by, m.pinned, m.use_count, m.last_used_at,
+                    m.last_verified_at, m.verify_after, m.stale_reason,
+                    e.model, e.dimensions, e.content_hash, e.vector
+             FROM memories m
+             JOIN memory_embeddings e ON e.memory_id = m.id
+             WHERE m.project_id = ?1
+               AND m.status IN ('active', 'stale')
+               AND e.model = ?2
+               AND e.dimensions = ?3
+               AND substr(e.vector, 1, 4) = x'5650454d'
+               AND substr(e.vector, 5, 1) = x'01'
+               AND length(e.vector) = 9 + 4 * ?3
+             ORDER BY substr(e.content_hash, 1, 16) ASC, m.id ASC
+             LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                project_id,
+                model,
+                i64::from(dimensions),
+                i64::try_from(effective_limit).unwrap_or(i64::MAX)
+            ],
+            map_memory_semantic_candidate,
+        )?;
+        let mut candidates = Vec::new();
+        let mut bytes = 0usize;
+        for row in rows {
+            let candidate = row?;
+            bytes = bytes.saturating_add(candidate.vector.len());
+            if bytes > max_bytes && !candidates.is_empty() {
+                break;
+            }
+            candidates.push(candidate);
+        }
+        Ok(candidates)
+    }
+
+    /// Current vectors that have no assignment, or whose assignment belongs
+    /// to an older generation. Used by bounded incremental maintenance and by
+    /// explicit rebuilds. Ordered by memory id for deterministic batches.
+    pub fn memory_embedding_unassigned_vectors(
+        &self,
+        project_id: &str,
+        model: &str,
+        dimensions: u32,
+        generation: u64,
+        limit: u32,
+    ) -> Result<Vec<MemorySemanticCandidate>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.session_id, m.project_id, m.agent_id, m.agent_name, m.kind,
+                    m.title, m.body, m.tags, m.created_at, m.status, m.source, m.evidence,
+                    m.supersedes, m.superseded_by, m.pinned, m.use_count, m.last_used_at,
+                    m.last_verified_at, m.verify_after, m.stale_reason,
+                    e.model, e.dimensions, e.content_hash, e.vector
+             FROM memories m
+             JOIN memory_embeddings e ON e.memory_id = m.id
+             LEFT JOIN memory_embedding_assignments a ON a.memory_id = m.id
+             WHERE m.project_id = ?1
+               AND m.status IN ('active', 'stale')
+               AND e.model = ?2
+               AND e.dimensions = ?3
+               AND substr(e.vector, 1, 4) = x'5650454d'
+               AND substr(e.vector, 5, 1) = x'01'
+               AND length(e.vector) = 9 + 4 * ?3
+               AND (a.memory_id IS NULL OR a.generation != ?4)
+             ORDER BY m.id ASC
+             LIMIT ?5",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                project_id,
+                model,
+                i64::from(dimensions),
+                i64::try_from(generation).unwrap_or(i64::MAX),
+                i64::from(limit.clamp(1, 1_024))
+            ],
+            map_memory_semantic_candidate,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Vectors assigned to the probed clusters in one index generation.
+    /// `limit` is a hard candidate window; `vp-core` scores at most that many
+    /// vectors exactly and then keeps the policy candidate budget.
+    #[allow(clippy::too_many_arguments)]
+    pub fn memory_ivf_semantic_candidates(
+        &self,
+        project_id: &str,
+        model: &str,
+        dimensions: u32,
+        generation: u64,
+        clusters: &[u32],
+        include_stale: bool,
+        limit: u32,
+    ) -> Result<Vec<MemorySemanticCandidate>> {
+        if clusters.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut sql = String::from(
+            "SELECT m.id, m.session_id, m.project_id, m.agent_id, m.agent_name, m.kind,
+                    m.title, m.body, m.tags, m.created_at, m.status, m.source, m.evidence,
+                    m.supersedes, m.superseded_by, m.pinned, m.use_count, m.last_used_at,
+                    m.last_verified_at, m.verify_after, m.stale_reason,
+                    e.model, e.dimensions, e.content_hash, e.vector
+             FROM memory_embedding_assignments a
+             JOIN memories m ON m.id = a.memory_id
+             JOIN memory_embeddings e ON e.memory_id = m.id
+             WHERE m.project_id = ?
+               AND a.generation = ?
+               AND e.model = ?
+               AND e.dimensions = ?
+               AND (? = 1 OR m.status = 'active')
+               AND m.status IN ('active', 'stale')
+               AND substr(e.vector, 1, 4) = x'5650454d'
+               AND substr(e.vector, 5, 1) = x'01'
+               AND length(e.vector) = 9 + 4 * ?
+               AND a.cluster IN (",
+        );
+        let placeholders = std::iter::repeat_n("?", clusters.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        sql.push_str(&placeholders);
+        sql.push_str(
+            ")
+             ORDER BY m.created_at DESC, m.id ASC
+             LIMIT ?",
+        );
+        let mut values = vec![
+            rusqlite::types::Value::Text(project_id.to_string()),
+            rusqlite::types::Value::Integer(i64::try_from(generation).unwrap_or(i64::MAX)),
+            rusqlite::types::Value::Text(model.to_string()),
+            rusqlite::types::Value::Integer(i64::from(dimensions)),
+            rusqlite::types::Value::Integer(if include_stale { 1 } else { 0 }),
+            rusqlite::types::Value::Integer(i64::from(dimensions)),
+        ];
+        values.extend(
+            clusters
+                .iter()
+                .map(|cluster| rusqlite::types::Value::Integer(i64::from(*cluster))),
+        );
+        values.push(rusqlite::types::Value::Integer(i64::from(
+            limit.clamp(1, 4_096),
+        )));
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(values),
+            map_memory_semantic_candidate,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Persist a complete centroid generation transactionally. The returned
+    /// generation is strictly monotonic even if two builds race: a request
+    /// below the stored generation is bumped to `stored + 1`. Assignments from
+    /// older generations are removed in the same transaction, so a recall
+    /// either sees the new generation or falls back; it cannot mix them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_memory_embedding_index(
+        &self,
+        project_id: &str,
+        model: &str,
+        dimensions: u32,
+        requested_generation: u64,
+        nlist: u32,
+        cluster_count: u32,
+        vector_count: u32,
+        centroids: &[u8],
+    ) -> Result<u64> {
+        if centroids.is_empty() {
+            anyhow::bail!("refusing to persist an empty centroid blob");
+        }
+        if centroids.len() > MAX_MEMORY_INDEX_BLOB_BYTES {
+            anyhow::bail!("centroid blob exceeds the {MAX_MEMORY_INDEX_BLOB_BYTES}-byte ceiling");
+        }
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let current: Option<i64> = tx
+            .query_row(
+                "SELECT generation FROM memory_embedding_index WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let floor = current
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or(0)
+            .saturating_add(1);
+        let generation = requested_generation.max(floor).max(1);
+        let generation = i64::try_from(generation).unwrap_or(i64::MAX);
+        let now = now_rfc3339();
+        tx.execute(
+            "INSERT INTO memory_embedding_index
+             (project_id, model, dimensions, generation, nlist, cluster_count, vector_count,
+              centroids, updated_at, last_error, fallback_count, last_fallback_at,
+              last_fallback_reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL,
+                     COALESCE((SELECT fallback_count FROM memory_embedding_index WHERE project_id = ?1), 0),
+                     (SELECT last_fallback_at FROM memory_embedding_index WHERE project_id = ?1),
+                     (SELECT last_fallback_reason FROM memory_embedding_index WHERE project_id = ?1))
+             ON CONFLICT(project_id) DO UPDATE SET
+                model = excluded.model,
+                dimensions = excluded.dimensions,
+                generation = excluded.generation,
+                nlist = excluded.nlist,
+                cluster_count = excluded.cluster_count,
+                vector_count = excluded.vector_count,
+                centroids = excluded.centroids,
+                updated_at = excluded.updated_at,
+                last_error = NULL",
+            params![
+                project_id,
+                model,
+                i64::from(dimensions),
+                generation,
+                i64::from(nlist),
+                i64::from(cluster_count),
+                i64::from(vector_count),
+                centroids,
+                now
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM memory_embedding_assignments
+             WHERE generation != ?1
+               AND memory_id IN (SELECT id FROM memories WHERE project_id = ?2)",
+            params![generation, project_id],
+        )?;
+        tx.commit()?;
+        Ok(u64::try_from(generation).unwrap_or(u64::MAX))
+    }
+
+    /// Persist cluster assignments for the current generation. If another
+    /// build committed a newer generation first, this batch is discarded and
+    /// returns 0 instead of writing assignments that recall would ignore.
+    pub fn save_memory_embedding_assignments(
+        &self,
+        project_id: &str,
+        generation: u64,
+        assignments: &[(String, u32)],
+    ) -> Result<u32> {
+        if assignments.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let current: Option<i64> = tx
+            .query_row(
+                "SELECT generation FROM memory_embedding_index WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current.and_then(|value| u64::try_from(value).ok()) != Some(generation) {
+            tx.commit()?;
+            return Ok(0);
+        }
+        let now = now_rfc3339();
+        let generation = i64::try_from(generation).unwrap_or(i64::MAX);
+        let mut written = 0u32;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO memory_embedding_assignments
+                 (memory_id, generation, cluster, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(memory_id) DO UPDATE SET
+                    generation = excluded.generation,
+                    cluster = excluded.cluster,
+                    updated_at = excluded.updated_at",
+            )?;
+            for (memory_id, cluster) in assignments {
+                stmt.execute(params![memory_id, generation, i64::from(*cluster), now])?;
+                written = written.saturating_add(1);
+            }
+        }
+        tx.commit()?;
+        Ok(written)
+    }
+
+    /// Remove the derived index and all of its assignments for one project.
+    /// Memories and stored embeddings are untouched.
+    pub fn delete_memory_embedding_index(&self, project_id: &str) -> Result<u32> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let assignments = tx.execute(
+            "DELETE FROM memory_embedding_assignments
+             WHERE memory_id IN (SELECT id FROM memories WHERE project_id = ?1)",
+            params![project_id],
+        )?;
+        let index = tx.execute(
+            "DELETE FROM memory_embedding_index WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        tx.commit()?;
+        Ok(u32::try_from(index.saturating_add(assignments)).unwrap_or(u32::MAX))
+    }
+
+    /// Record a sanitized build/maintenance error. A valid previous generation
+    /// is preserved: recall keeps using it only if model/dimensions/nlist still
+    /// match, otherwise it fails closed to the exact scan.
+    pub fn record_memory_embedding_index_error(
+        &self,
+        project_id: &str,
+        model: &str,
+        dimensions: u32,
+        nlist: u32,
+        error: &str,
+    ) -> Result<()> {
+        let error = truncate_chars(error.trim(), 2_000);
+        let conn = self.lock()?;
+        let now = now_rfc3339();
+        conn.execute(
+            "INSERT INTO memory_embedding_index
+             (project_id, model, dimensions, generation, nlist, cluster_count, vector_count,
+              centroids, updated_at, last_error)
+             VALUES (?1, ?2, ?3, 0, ?4, 0, 0, x'', ?5, ?6)
+             ON CONFLICT(project_id) DO UPDATE SET
+                last_error = excluded.last_error,
+                updated_at = excluded.updated_at",
+            params![
+                project_id,
+                model,
+                i64::from(dimensions),
+                i64::from(nlist),
+                now,
+                error
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Increment the diagnostic fallback counter. This is the only write the
+    /// recall read path performs, and only when an IVF probe actually falls
+    /// back; a scan-mode project never touches these rows.
+    ///
+    /// A generation-0 diagnostic row is created when no index exists so
+    /// "below minimum" and "not built" fallbacks are observable in status.
+    /// It has an empty centroid blob and can never be used by recall.
+    #[allow(clippy::too_many_arguments)]
+    pub fn note_memory_embedding_index_fallback(
+        &self,
+        project_id: &str,
+        model: &str,
+        dimensions: u32,
+        nlist: u32,
+        reason: &str,
+    ) -> Result<()> {
+        let reason = truncate_chars(reason.trim(), 500);
+        let conn = self.lock()?;
+        let now = now_rfc3339();
+        conn.execute(
+            "INSERT INTO memory_embedding_index
+             (project_id, model, dimensions, generation, nlist, cluster_count, vector_count,
+              centroids, updated_at, last_error, fallback_count, last_fallback_at,
+              last_fallback_reason)
+             VALUES (?1, ?2, ?3, 0, ?4, 0, 0, x'', ?5, NULL, 1, ?5, ?6)
+             ON CONFLICT(project_id) DO UPDATE SET
+                fallback_count = memory_embedding_index.fallback_count + 1,
+                last_fallback_at = excluded.last_fallback_at,
+                last_fallback_reason = excluded.last_fallback_reason",
+            params![
+                project_id,
+                model,
+                i64::from(dimensions),
+                i64::from(nlist),
+                now,
+                reason
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn plan_task_exists(&self, project_id: &str, task_id: &str) -> Result<bool> {
@@ -18432,6 +19151,18 @@ fn map_memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryItem> {
     })
 }
 
+fn map_memory_semantic_candidate(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<MemorySemanticCandidate> {
+    Ok(MemorySemanticCandidate {
+        memory: map_memory_row(row)?,
+        model: row.get(21)?,
+        dimensions: u32::try_from(row.get::<_, i64>(22)?).unwrap_or(u32::MAX),
+        content_hash: row.get(23)?,
+        vector: row.get(24)?,
+    })
+}
+
 fn map_memory_policy_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryPolicy> {
     Ok(MemoryPolicy {
         enabled: row.get::<_, i64>(0)? != 0,
@@ -18616,6 +19347,10 @@ fn update_memory_projection_tx(tx: &Transaction<'_>, memory: &MemoryItem) -> Res
         )?;
         tx.execute(
             "DELETE FROM memory_embedding_jobs WHERE memory_id = ?1",
+            params![&memory.id],
+        )?;
+        tx.execute(
+            "DELETE FROM memory_embedding_assignments WHERE memory_id = ?1",
             params![&memory.id],
         )?;
     }

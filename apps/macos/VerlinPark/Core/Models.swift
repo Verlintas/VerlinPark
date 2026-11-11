@@ -517,6 +517,27 @@ struct McpCallResult: Codable, Sendable {
     }
 }
 
+/// Retrieval index mode for the optional semantic lane. `scan` is the exact
+/// bounded default; `ivf` is an explicit opt-in derived index with automatic
+/// fallback. The enum is decoded leniently so a newer daemon value cannot
+/// break an older client.
+enum MemoryIndexMode: String, Codable, Sendable, CaseIterable, Hashable {
+    case scan
+    case ivf
+
+    init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = MemoryIndexMode(rawValue: raw) ?? .scan
+    }
+
+    var label: String {
+        switch self {
+        case .scan: "exact scan"
+        case .ivf: "IVF"
+        }
+    }
+}
+
 struct MemoryEmbeddingPolicy: Codable, Equatable, Sendable {
     var enabled: Bool
     var endpoint: String?
@@ -527,6 +548,11 @@ struct MemoryEmbeddingPolicy: Codable, Equatable, Sendable {
     var maxCandidates: Int
     var minSimilarity: Double
     var apiKeyEnv: String?
+    var index: MemoryIndexMode
+    var ivfNlist: Int
+    var ivfNprobe: Int
+    var ivfMinVectors: Int
+    var ivfRebuildVectors: Int
 
     static let defaults = MemoryEmbeddingPolicy(
         enabled: false,
@@ -537,7 +563,12 @@ struct MemoryEmbeddingPolicy: Codable, Equatable, Sendable {
         timeoutSecs: 30,
         maxCandidates: 64,
         minSimilarity: 0.20,
-        apiKeyEnv: nil
+        apiKeyEnv: nil,
+        index: .scan,
+        ivfNlist: 64,
+        ivfNprobe: 8,
+        ivfMinVectors: 256,
+        ivfRebuildVectors: 4096
     )
 
     enum CodingKeys: String, CodingKey {
@@ -550,6 +581,11 @@ struct MemoryEmbeddingPolicy: Codable, Equatable, Sendable {
         case maxCandidates = "max_candidates"
         case minSimilarity = "min_similarity"
         case apiKeyEnv = "api_key_env"
+        case index
+        case ivfNlist = "ivf_nlist"
+        case ivfNprobe = "ivf_nprobe"
+        case ivfMinVectors = "ivf_min_vectors"
+        case ivfRebuildVectors = "ivf_rebuild_vectors"
     }
 
     init(
@@ -561,7 +597,12 @@ struct MemoryEmbeddingPolicy: Codable, Equatable, Sendable {
         timeoutSecs: Int,
         maxCandidates: Int,
         minSimilarity: Double,
-        apiKeyEnv: String?
+        apiKeyEnv: String?,
+        index: MemoryIndexMode = .scan,
+        ivfNlist: Int = 64,
+        ivfNprobe: Int = 8,
+        ivfMinVectors: Int = 256,
+        ivfRebuildVectors: Int = 4096
     ) {
         self.enabled = enabled
         self.endpoint = endpoint
@@ -572,6 +613,11 @@ struct MemoryEmbeddingPolicy: Codable, Equatable, Sendable {
         self.maxCandidates = maxCandidates
         self.minSimilarity = minSimilarity
         self.apiKeyEnv = apiKeyEnv
+        self.index = index
+        self.ivfNlist = ivfNlist
+        self.ivfNprobe = ivfNprobe
+        self.ivfMinVectors = ivfMinVectors
+        self.ivfRebuildVectors = ivfRebuildVectors
     }
 
     init(from decoder: Decoder) throws {
@@ -585,11 +631,21 @@ struct MemoryEmbeddingPolicy: Codable, Equatable, Sendable {
         maxCandidates = try container.decodeIfPresent(Int.self, forKey: .maxCandidates) ?? 64
         minSimilarity = try container.decodeIfPresent(Double.self, forKey: .minSimilarity) ?? 0.20
         apiKeyEnv = try container.decodeIfPresent(String.self, forKey: .apiKeyEnv)
+        index = try container.decodeIfPresent(MemoryIndexMode.self, forKey: .index) ?? .scan
+        ivfNlist = try container.decodeIfPresent(Int.self, forKey: .ivfNlist) ?? 64
+        ivfNprobe = try container.decodeIfPresent(Int.self, forKey: .ivfNprobe) ?? 8
+        ivfMinVectors = try container.decodeIfPresent(Int.self, forKey: .ivfMinVectors) ?? 256
+        ivfRebuildVectors = try container.decodeIfPresent(Int.self, forKey: .ivfRebuildVectors)
+            ?? 4096
     }
 
     var isConfigured: Bool {
         !(endpoint?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
             && !(model?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+    }
+
+    var usesIVF: Bool {
+        index == .ivf && enabled && isConfigured
     }
 
     /// JSON-RPC form. The key environment *name* is sent; no secret is ever
@@ -609,6 +665,11 @@ struct MemoryEmbeddingPolicy: Codable, Equatable, Sendable {
                     ? nil
                     : JSONValue.string(value)
             } ?? .null,
+            "index": .string(index.rawValue),
+            "ivf_nlist": .number(Double(ivfNlist)),
+            "ivf_nprobe": .number(Double(ivfNprobe)),
+            "ivf_min_vectors": .number(Double(ivfMinVectors)),
+            "ivf_rebuild_vectors": .number(Double(ivfRebuildVectors)),
         ]
     }
 }
@@ -720,6 +781,163 @@ struct MemoryEmbeddingJobStatus: Codable, Identifiable, Hashable, Sendable {
     }
 }
 
+/// Derived IVF index health. Aggregate counts only: the daemon never sends
+/// centroids, vectors, or embedded text.
+struct MemoryEmbeddingIndexStatus: Codable, Sendable, Equatable {
+    let mode: String
+    let ready: Bool
+    let generation: UInt64?
+    let model: String?
+    let dimensions: Int
+    let vectorCount: Int
+    let assignedVectors: Int
+    let invalidAssignments: Int
+    let clusterCount: Int
+    let nlist: Int
+    let nprobe: Int
+    let coverage: Double
+    let minVectors: Int
+    let rebuildVectors: Int
+    let bytes: Int
+    let lastRebuiltAt: String?
+    let lastError: String?
+    let fallbackCount: Int
+    let lastFallbackAt: String?
+    let lastFallbackReason: String?
+    let fallbackReason: String?
+
+    enum CodingKeys: String, CodingKey {
+        case mode
+        case ready
+        case generation
+        case model
+        case dimensions
+        case vectorCount = "vector_count"
+        case assignedVectors = "assigned_vectors"
+        case invalidAssignments = "invalid_assignments"
+        case clusterCount = "cluster_count"
+        case nlist
+        case nprobe
+        case coverage
+        case minVectors = "min_vectors"
+        case rebuildVectors = "rebuild_vectors"
+        case bytes
+        case lastRebuiltAt = "last_rebuilt_at"
+        case lastError = "last_error"
+        case fallbackCount = "fallback_count"
+        case lastFallbackAt = "last_fallback_at"
+        case lastFallbackReason = "last_fallback_reason"
+        case fallbackReason = "fallback_reason"
+    }
+
+    init(
+        mode: String,
+        ready: Bool,
+        generation: UInt64?,
+        model: String?,
+        dimensions: Int,
+        vectorCount: Int,
+        assignedVectors: Int,
+        invalidAssignments: Int,
+        clusterCount: Int,
+        nlist: Int,
+        nprobe: Int,
+        coverage: Double,
+        minVectors: Int,
+        rebuildVectors: Int,
+        bytes: Int,
+        lastRebuiltAt: String?,
+        lastError: String?,
+        fallbackCount: Int,
+        lastFallbackAt: String?,
+        lastFallbackReason: String?,
+        fallbackReason: String?
+    ) {
+        self.mode = mode
+        self.ready = ready
+        self.generation = generation
+        self.model = model
+        self.dimensions = dimensions
+        self.vectorCount = vectorCount
+        self.assignedVectors = assignedVectors
+        self.invalidAssignments = invalidAssignments
+        self.clusterCount = clusterCount
+        self.nlist = nlist
+        self.nprobe = nprobe
+        self.coverage = coverage
+        self.minVectors = minVectors
+        self.rebuildVectors = rebuildVectors
+        self.bytes = bytes
+        self.lastRebuiltAt = lastRebuiltAt
+        self.lastError = lastError
+        self.fallbackCount = fallbackCount
+        self.lastFallbackAt = lastFallbackAt
+        self.lastFallbackReason = lastFallbackReason
+        self.fallbackReason = fallbackReason
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        mode = try container.decodeIfPresent(String.self, forKey: .mode) ?? "scan"
+        ready = try container.decodeIfPresent(Bool.self, forKey: .ready) ?? false
+        generation = try container.decodeIfPresent(UInt64.self, forKey: .generation)
+        model = try container.decodeIfPresent(String.self, forKey: .model)
+        dimensions = try container.decodeIfPresent(Int.self, forKey: .dimensions) ?? 1536
+        vectorCount = try container.decodeIfPresent(Int.self, forKey: .vectorCount) ?? 0
+        assignedVectors = try container.decodeIfPresent(Int.self, forKey: .assignedVectors) ?? 0
+        invalidAssignments = try container.decodeIfPresent(Int.self, forKey: .invalidAssignments) ?? 0
+        clusterCount = try container.decodeIfPresent(Int.self, forKey: .clusterCount) ?? 0
+        nlist = try container.decodeIfPresent(Int.self, forKey: .nlist) ?? 64
+        nprobe = try container.decodeIfPresent(Int.self, forKey: .nprobe) ?? 8
+        coverage = try container.decodeIfPresent(Double.self, forKey: .coverage) ?? 0
+        minVectors = try container.decodeIfPresent(Int.self, forKey: .minVectors) ?? 256
+        rebuildVectors = try container.decodeIfPresent(Int.self, forKey: .rebuildVectors) ?? 4096
+        bytes = try container.decodeIfPresent(Int.self, forKey: .bytes) ?? 0
+        lastRebuiltAt = try container.decodeIfPresent(String.self, forKey: .lastRebuiltAt)
+        lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
+        fallbackCount = try container.decodeIfPresent(Int.self, forKey: .fallbackCount) ?? 0
+        lastFallbackAt = try container.decodeIfPresent(String.self, forKey: .lastFallbackAt)
+        lastFallbackReason = try container.decodeIfPresent(String.self, forKey: .lastFallbackReason)
+        fallbackReason = try container.decodeIfPresent(String.self, forKey: .fallbackReason)
+    }
+
+    var modeLabel: String {
+        mode == "ivf" ? "IVF" : "exact scan"
+    }
+
+    var coveragePercent: Double {
+        min(max(coverage, 0), 1) * 100
+    }
+
+    var coverageLabel: String {
+        vectorCount > 0 ? String(format: "%.1f%%", coveragePercent) : "no vectors"
+    }
+
+    var generationLabel: String {
+        generation.map { "generation \($0)" } ?? "not built"
+    }
+
+    var statusLabel: String {
+        if ready {
+            return "ready"
+        }
+        if let fallbackReason {
+            return fallbackReason
+        }
+        return "not ready"
+    }
+
+    /// Rebuild is meaningful only for an enabled IVF policy. Scan mode and an
+    /// absent/disabled lane intentionally expose no action.
+    var canRebuild: Bool {
+        mode == "ivf"
+    }
+
+    var byteLabel: String {
+        ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+    }
+}
+
 struct MemoryEmbeddingsStatusResult: Codable, Sendable {
     let projectId: String
     let enabled: Bool
@@ -736,6 +954,7 @@ struct MemoryEmbeddingsStatusResult: Codable, Sendable {
     let lastError: String?
     let usage: MemoryEmbeddingUsage
     let recentJobs: [MemoryEmbeddingJobStatus]
+    let index: MemoryEmbeddingIndexStatus?
 
     enum CodingKeys: String, CodingKey {
         case projectId = "project_id"
@@ -753,6 +972,7 @@ struct MemoryEmbeddingsStatusResult: Codable, Sendable {
         case lastError = "last_error"
         case usage
         case recentJobs = "recent_jobs"
+        case index
     }
 
     init(
@@ -770,7 +990,8 @@ struct MemoryEmbeddingsStatusResult: Codable, Sendable {
         coverage: Double,
         lastError: String?,
         usage: MemoryEmbeddingUsage,
-        recentJobs: [MemoryEmbeddingJobStatus]
+        recentJobs: [MemoryEmbeddingJobStatus],
+        index: MemoryEmbeddingIndexStatus? = nil
     ) {
         self.projectId = projectId
         self.enabled = enabled
@@ -787,6 +1008,7 @@ struct MemoryEmbeddingsStatusResult: Codable, Sendable {
         self.lastError = lastError
         self.usage = usage
         self.recentJobs = recentJobs
+        self.index = index
     }
 
     init(from decoder: Decoder) throws {
@@ -810,6 +1032,10 @@ struct MemoryEmbeddingsStatusResult: Codable, Sendable {
             [MemoryEmbeddingJobStatus].self,
             forKey: .recentJobs
         ) ?? []
+        index = try container.decodeIfPresent(
+            MemoryEmbeddingIndexStatus.self,
+            forKey: .index
+        )
     }
 
     var coveragePercent: Double {
@@ -853,6 +1079,61 @@ struct MemoryEmbeddingsRebuildResult: Codable, Sendable {
         case dimensions
         case cleared
         case enqueued
+    }
+}
+
+struct MemoryEmbeddingsIndexStatusResult: Codable, Sendable {
+    let projectId: String
+    let index: MemoryEmbeddingIndexStatus
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case index
+    }
+}
+
+struct MemoryEmbeddingsIndexRebuildResult: Codable, Sendable {
+    let projectId: String
+    let rebuilt: Bool
+    let reason: String?
+    let generation: UInt64?
+    let vectorCount: Int
+    let assignedVectors: Int
+    let invalidAssignments: Int
+    let clusterCount: Int
+    let nlist: Int
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case rebuilt
+        case reason
+        case generation
+        case vectorCount = "vector_count"
+        case assignedVectors = "assigned_vectors"
+        case invalidAssignments = "invalid_assignments"
+        case clusterCount = "cluster_count"
+        case nlist
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        projectId = try container.decode(String.self, forKey: .projectId)
+        rebuilt = try container.decodeIfPresent(Bool.self, forKey: .rebuilt) ?? false
+        reason = try container.decodeIfPresent(String.self, forKey: .reason)
+        generation = try container.decodeIfPresent(UInt64.self, forKey: .generation)
+        vectorCount = try container.decodeIfPresent(Int.self, forKey: .vectorCount) ?? 0
+        assignedVectors = try container.decodeIfPresent(Int.self, forKey: .assignedVectors) ?? 0
+        invalidAssignments = try container.decodeIfPresent(Int.self, forKey: .invalidAssignments) ?? 0
+        clusterCount = try container.decodeIfPresent(Int.self, forKey: .clusterCount) ?? 0
+        nlist = try container.decodeIfPresent(Int.self, forKey: .nlist) ?? 0
+    }
+
+    var summaryLabel: String {
+        if rebuilt {
+            let generationLabel = generation.map(String.init) ?? "?"
+            return "rebuilt generation \(generationLabel) · \(assignedVectors)/\(vectorCount) assigned"
+        }
+        return reason ?? "not rebuilt"
     }
 }
 

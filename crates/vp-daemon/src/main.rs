@@ -47,19 +47,19 @@ use vp_protocol::types::{
     MailboxPolicyResult, MarkMessageReadParams, McpCallParams, McpGetPromptParams, McpProbeParams,
     McpReadResourceParams, McpServerIdParams, MemoryBriefParams, MemoryConflictResolveParams,
     MemoryConflictScanParams, MemoryConflictsParams, MemoryCreateParams, MemoryCreateResult,
-    MemoryDeleteParams, MemoryEmbeddingsRebuildParams, MemoryEmbeddingsStatusParams,
-    MemoryEmbeddingsTestParams, MemoryHealthParams, MemoryListParams, MemoryPolicyParams,
-    MemoryPruneParams, MemorySearchParams, MemoryStatsParams, MemorySweepParams,
-    MemoryUpdateParams, MemoryVerifyParams, MergeQueueListParams, MergeQueueListResult,
-    OpenPullRequestParams, PingResult, ProjectBudgetParams, ProjectForkForestParams,
-    ProjectListResult, ProjectUsageParams, PromptParams, PromptResult, QuestionListParams,
-    RehydrateSessionParams, ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult,
-    ResolveMergeParams, ResolveMergeResult, RetryMergeParams, RetryMergeResult,
-    SchedulerStatusParams, SearchParams, ServerInfo, SessionCacheParams,
-    SessionCheckpointDeleteParams, SessionCheckpointDiffParams, SessionCheckpointListParams,
-    SessionCheckpointParams, SessionCheckpointPruneParams, SessionCheckpointRestoreParams,
-    SessionCheckpointStatsParams, SessionCitationAuditParams, SessionCitationsParams,
-    SessionCompactParams, SessionCompareParams, SessionContextParams,
+    MemoryDeleteParams, MemoryEmbeddingsIndexRebuildParams, MemoryEmbeddingsIndexStatusParams,
+    MemoryEmbeddingsRebuildParams, MemoryEmbeddingsStatusParams, MemoryEmbeddingsTestParams,
+    MemoryHealthParams, MemoryListParams, MemoryPolicyParams, MemoryPruneParams,
+    MemorySearchParams, MemoryStatsParams, MemorySweepParams, MemoryUpdateParams,
+    MemoryVerifyParams, MergeQueueListParams, MergeQueueListResult, OpenPullRequestParams,
+    PingResult, ProjectBudgetParams, ProjectForkForestParams, ProjectListResult,
+    ProjectUsageParams, PromptParams, PromptResult, QuestionListParams, RehydrateSessionParams,
+    ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams,
+    ResolveMergeResult, RetryMergeParams, RetryMergeResult, SchedulerStatusParams, SearchParams,
+    ServerInfo, SessionCacheParams, SessionCheckpointDeleteParams, SessionCheckpointDiffParams,
+    SessionCheckpointListParams, SessionCheckpointParams, SessionCheckpointPruneParams,
+    SessionCheckpointRestoreParams, SessionCheckpointStatsParams, SessionCitationAuditParams,
+    SessionCitationsParams, SessionCompactParams, SessionCompareParams, SessionContextParams,
     SessionContinuationCancelParams, SessionContinuationReclaimParams,
     SessionContinuationStatusParams, SessionContinuationsParams, SessionDeferParams,
     SessionDiffParams, SessionExportParams, SessionForkParams, SessionForkTreeParams,
@@ -2884,6 +2884,32 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 Ok(params) => match state
                     .engine
                     .memory_embedding_test(&params.project_id, params.text.as_deref())
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "memory.embeddings.index.status" => {
+            match parse_params::<MemoryEmbeddingsIndexStatusParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .memory_embedding_index_status(&params.project_id)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "memory.embeddings.index.rebuild" => {
+            match parse_params::<MemoryEmbeddingsIndexRebuildParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .memory_embedding_index_rebuild(&params.project_id)
                     .await
                 {
                     Ok(result) => RpcResponse::success(id, result),

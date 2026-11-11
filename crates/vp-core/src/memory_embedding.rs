@@ -30,6 +30,33 @@ use crate::memory::{
     encode_embedding_vector,
 };
 
+/// Bounds for the derived IVF index. They are validated here (the single
+/// policy validation path) and re-checked when the index is loaded, so a
+/// hand-edited database cannot create an unbounded probe.
+pub const MIN_IVF_NLIST: u32 = 4;
+pub const MAX_IVF_NLIST: u32 = 1024;
+pub const DEFAULT_IVF_NLIST: u32 = 64;
+pub const DEFAULT_IVF_NPROBE: u32 = 8;
+pub const DEFAULT_IVF_MIN_VECTORS: u32 = 256;
+pub const DEFAULT_IVF_REBUILD_VECTORS: u32 = 4096;
+pub const MAX_IVF_MIN_VECTORS: u32 = 10_000_000;
+pub const MAX_IVF_REBUILD_VECTORS: u32 = 10_000_000;
+/// Hard ceiling on vectors scored for one recall, regardless of hand-edited
+/// policy values. The policy `max_candidates` bound is 256; probing 1024
+/// centroids can legitimately widen the pre-scoring candidate window.
+pub const MAX_IVF_CANDIDATES: u32 = 2_048;
+/// One build samples at most this many vectors. Centroid quality is measured,
+/// not assumed, and a bounded sample keeps rebuild latency predictable.
+pub const MAX_IVF_SAMPLE_VECTORS: u32 = 8_192;
+/// Hard byte ceiling for one sampled build and for one loaded centroid blob.
+pub const MAX_IVF_INDEX_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum number of vectors assigned to centroids in one maintenance tick.
+pub const MAX_IVF_ASSIGNMENTS_PER_TICK: u32 = 2_048;
+/// Maximum number of vectors assigned during one explicit operator rebuild.
+pub const MAX_IVF_ASSIGNMENTS_PER_REBUILD: u32 = 8_192;
+/// k-means iterations are bounded; convergence typically happens in < 10.
+pub const MAX_KMEANS_ITERATIONS: u32 = 24;
+
 /// Retry budget for the daemon reconciler. HTTP-level retries are separate and
 /// bounded inside one call; this catches persistent endpoint failure with
 /// exponential backoff.
@@ -172,6 +199,34 @@ pub fn validate_embedding_policy(policy: &MemoryEmbeddingPolicy) -> Result<()> {
         .is_some_and(|name| !name.trim().is_empty())
     {
         anyhow::bail!("embedding api_key_env must not be blank");
+    }
+    validate_index_policy(policy)?;
+    Ok(())
+}
+
+/// Validate the additive IVF fields. These checks run for every embedding
+/// policy, including a disabled one, so a stored policy cannot become
+/// unbounded when it is later enabled. Scan mode still validates the bounds:
+/// the values are retained while disabled and a later mode switch must not
+/// surface a surprise.
+pub fn validate_index_policy(policy: &MemoryEmbeddingPolicy) -> Result<()> {
+    if !(MIN_IVF_NLIST..=MAX_IVF_NLIST).contains(&policy.ivf_nlist) {
+        anyhow::bail!("ivf_nlist must be between {MIN_IVF_NLIST} and {MAX_IVF_NLIST}");
+    }
+    if policy.ivf_nprobe == 0 || policy.ivf_nprobe > policy.ivf_nlist {
+        anyhow::bail!(
+            "ivf_nprobe must be between 1 and ivf_nlist ({})",
+            policy.ivf_nlist
+        );
+    }
+    if !(1..=MAX_IVF_MIN_VECTORS).contains(&policy.ivf_min_vectors) {
+        anyhow::bail!("ivf_min_vectors must be between 1 and {MAX_IVF_MIN_VECTORS}");
+    }
+    if !(1..=MAX_IVF_REBUILD_VECTORS).contains(&policy.ivf_rebuild_vectors) {
+        anyhow::bail!("ivf_rebuild_vectors must be between 1 and {MAX_IVF_REBUILD_VECTORS}");
+    }
+    if policy.ivf_rebuild_vectors < policy.ivf_min_vectors {
+        anyhow::bail!("ivf_rebuild_vectors must be greater than or equal to ivf_min_vectors");
     }
     Ok(())
 }
@@ -762,6 +817,7 @@ mod tests {
             max_candidates: 16,
             min_similarity: 0.2,
             api_key_env: None,
+            ..MemoryEmbeddingPolicy::default()
         }
     }
 
@@ -1152,6 +1208,72 @@ mod tests {
             normalize_embedding_endpoint("  https://example.com/v1/  ").unwrap(),
             "https://example.com/v1/embeddings"
         );
+    }
+
+    #[test]
+    fn ivf_policy_bounds_are_validated() {
+        let mut policy = MemoryEmbeddingPolicy {
+            endpoint: Some("https://example.com/v1".to_string()),
+            model: Some("embed".to_string()),
+            ..MemoryEmbeddingPolicy::default()
+        };
+        assert!(validate_embedding_policy(&policy).is_ok());
+        assert_eq!(policy.ivf_nlist, 64);
+        assert_eq!(policy.ivf_nprobe, 8);
+        assert_eq!(policy.ivf_min_vectors, 256);
+        assert_eq!(policy.ivf_rebuild_vectors, 4096);
+
+        policy.ivf_nlist = MIN_IVF_NLIST - 1;
+        assert!(validate_embedding_policy(&policy).is_err());
+        policy.ivf_nlist = MAX_IVF_NLIST + 1;
+        assert!(validate_embedding_policy(&policy).is_err());
+        policy.ivf_nlist = 8;
+        policy.ivf_nprobe = 0;
+        assert!(validate_embedding_policy(&policy).is_err());
+        policy.ivf_nprobe = 9;
+        assert!(validate_embedding_policy(&policy).is_err());
+        policy.ivf_nprobe = 8;
+        policy.ivf_min_vectors = 0;
+        assert!(validate_embedding_policy(&policy).is_err());
+        policy.ivf_min_vectors = 300;
+        policy.ivf_rebuild_vectors = 299;
+        assert!(validate_embedding_policy(&policy).is_err());
+        policy.ivf_rebuild_vectors = MAX_IVF_REBUILD_VECTORS + 1;
+        assert!(validate_embedding_policy(&policy).is_err());
+        policy.ivf_rebuild_vectors = 1_000;
+        assert!(validate_embedding_policy(&policy).is_ok());
+        policy.index = vp_protocol::types::MemoryIndexMode::Ivf;
+        assert!(validate_embedding_policy(&policy).is_ok());
+        policy.dimensions = 1;
+        assert!(validate_embedding_policy(&policy).is_err());
+    }
+
+    #[test]
+    fn index_mode_json_defaults_to_scan_and_decodes_ivf() {
+        let base: MemoryEmbeddingPolicy = serde_json::from_value(json!({
+            "endpoint": "https://example.com/v1",
+            "model": "embed"
+        }))
+        .unwrap();
+        assert_eq!(base.index, vp_protocol::types::MemoryIndexMode::Scan);
+        assert_eq!(base.ivf_nlist, 64);
+        let ivf: MemoryEmbeddingPolicy = serde_json::from_value(json!({
+            "endpoint": "https://example.com/v1",
+            "model": "embed",
+            "index": "ivf",
+            "ivf_nlist": 128,
+            "ivf_nprobe": 12,
+            "ivf_min_vectors": 512,
+            "ivf_rebuild_vectors": 8192
+        }))
+        .unwrap();
+        assert_eq!(ivf.index, vp_protocol::types::MemoryIndexMode::Ivf);
+        assert_eq!(ivf.ivf_nlist, 128);
+        assert_eq!(ivf.ivf_nprobe, 12);
+        assert_eq!(ivf.ivf_min_vectors, 512);
+        assert_eq!(ivf.ivf_rebuild_vectors, 8192);
+        assert!(validate_embedding_policy(&ivf).is_ok());
+        assert!(!ivf.uses_ivf_index(), "disabled by default");
     }
 
     #[test]

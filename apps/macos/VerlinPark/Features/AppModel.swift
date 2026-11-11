@@ -227,11 +227,37 @@ final class AppModel {
     var memoryEmbeddingMaxCandidates = "64"
     var memoryEmbeddingMinSimilarity = "0.20"
     var memoryEmbeddingAPIKeyEnv = ""
+    var memoryEmbeddingIndex: MemoryIndexMode = .scan
+    var memoryEmbeddingIVFNlist = "64"
+    var memoryEmbeddingIVFNprobe = "8"
+    var memoryEmbeddingIVFMinVectors = "256"
+    var memoryEmbeddingIVFRebuildVectors = "4096"
     var memoryEmbeddingsStatus: MemoryEmbeddingsStatusResult?
+    var memoryEmbeddingIndexStatus: MemoryEmbeddingIndexStatus?
     var memoryEmbeddingBusy = false
     var memoryEmbeddingStatusMessage: String?
     var memoryEmbeddingTestResult: MemoryEmbeddingsTestResult?
     var memoryEmbeddingRebuildResult: MemoryEmbeddingsRebuildResult?
+    var memoryEmbeddingIndexRebuildResult: MemoryEmbeddingsIndexRebuildResult?
+
+    /// Mirrors the daemon gates for the explicit ANN rebuild action: a project
+    /// must be selected, no policy operation may be in flight, the semantic
+    /// lane must be enabled and configured, and the operator must have chosen
+    /// IVF. This is UI gating only; the daemon re-validates everything.
+    var canRebuildMemoryEmbeddingIndex: Bool {
+        guard selectedProjectID != nil,
+              !memoryEmbeddingBusy,
+              !memoryPolicyBusy,
+              memoryEmbeddingEnabled,
+              memoryEmbeddingIndex == .ivf
+        else { return false }
+        let endpoint = memoryEmbeddingEndpoint
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let model = memoryEmbeddingModel
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return !endpoint.isEmpty && !model.isEmpty
+    }
+
     var memoryNewKind = "note"
     var memoryNewTitle = ""
     var memoryNewBody = ""
@@ -1930,10 +1956,17 @@ final class AppModel {
             memoryEmbeddingMaxCandidates = "64"
             memoryEmbeddingMinSimilarity = "0.20"
             memoryEmbeddingAPIKeyEnv = ""
+            memoryEmbeddingIndex = .scan
+            memoryEmbeddingIVFNlist = "64"
+            memoryEmbeddingIVFNprobe = "8"
+            memoryEmbeddingIVFMinVectors = "256"
+            memoryEmbeddingIVFRebuildVectors = "4096"
             memoryEmbeddingsStatus = nil
+            memoryEmbeddingIndexStatus = nil
             memoryEmbeddingStatusMessage = nil
             memoryEmbeddingTestResult = nil
             memoryEmbeddingRebuildResult = nil
+            memoryEmbeddingIndexRebuildResult = nil
             return
         }
         memoryPolicyBusy = true
@@ -2008,6 +2041,18 @@ final class AppModel {
         let minSimilarity = Double(
             memoryEmbeddingMinSimilarity.trimmingCharacters(in: .whitespacesAndNewlines)
         )
+        let ivfNlist = Int(
+            memoryEmbeddingIVFNlist.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        let ivfNprobe = Int(
+            memoryEmbeddingIVFNprobe.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        let ivfMinVectors = Int(
+            memoryEmbeddingIVFMinVectors.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        let ivfRebuildVectors = Int(
+            memoryEmbeddingIVFRebuildVectors.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
         if memoryEmbeddingEnabled || !endpoint.isEmpty || !model.isEmpty {
             guard !endpoint.isEmpty, !model.isEmpty else {
                 memoryPolicyStatus = "Embedding endpoint and model are both required."
@@ -2033,6 +2078,25 @@ final class AppModel {
                 memoryPolicyStatus = "Minimum similarity must be between 0 and 1."
                 return
             }
+            guard let ivfNlist, (4 ... 1024).contains(ivfNlist) else {
+                memoryPolicyStatus = "IVF nlist must be between 4 and 1024."
+                return
+            }
+            guard let ivfNprobe, (1 ... ivfNlist).contains(ivfNprobe) else {
+                memoryPolicyStatus = "IVF nprobe must be between 1 and nlist."
+                return
+            }
+            guard let ivfMinVectors, (1 ... 10_000_000).contains(ivfMinVectors) else {
+                memoryPolicyStatus = "IVF minimum vectors must be between 1 and 10000000."
+                return
+            }
+            guard let ivfRebuildVectors,
+                  (1 ... 10_000_000).contains(ivfRebuildVectors),
+                  ivfRebuildVectors >= ivfMinVectors
+            else {
+                memoryPolicyStatus = "IVF rebuild threshold must be at least the minimum and at most 10000000."
+                return
+            }
         }
         let embedding: MemoryEmbeddingPolicy? = if endpoint.isEmpty, model.isEmpty {
             nil
@@ -2046,7 +2110,12 @@ final class AppModel {
                 timeoutSecs: timeoutSecs ?? 30,
                 maxCandidates: maxCandidates ?? 64,
                 minSimilarity: minSimilarity ?? 0.20,
-                apiKeyEnv: apiKeyEnv.isEmpty ? nil : apiKeyEnv
+                apiKeyEnv: apiKeyEnv.isEmpty ? nil : apiKeyEnv,
+                index: memoryEmbeddingIndex,
+                ivfNlist: ivfNlist ?? 64,
+                ivfNprobe: ivfNprobe ?? 8,
+                ivfMinVectors: ivfMinVectors ?? 256,
+                ivfRebuildVectors: ivfRebuildVectors ?? 4096
             )
         }
         memoryPolicyBusy = true
@@ -2094,6 +2163,11 @@ final class AppModel {
         memoryEmbeddingMaxCandidates = String(embedding.maxCandidates)
         memoryEmbeddingMinSimilarity = String(format: "%.2f", embedding.minSimilarity)
         memoryEmbeddingAPIKeyEnv = embedding.apiKeyEnv ?? ""
+        memoryEmbeddingIndex = embedding.index
+        memoryEmbeddingIVFNlist = String(embedding.ivfNlist)
+        memoryEmbeddingIVFNprobe = String(embedding.ivfNprobe)
+        memoryEmbeddingIVFMinVectors = String(embedding.ivfMinVectors)
+        memoryEmbeddingIVFRebuildVectors = String(embedding.ivfRebuildVectors)
     }
 
     func loadMemoryEmbeddingStatus() async {
@@ -2105,7 +2179,11 @@ final class AppModel {
             let status = try await core.memoryEmbeddingsStatus(projectID: projectID)
             guard projectID == selectedProjectID else { return }
             memoryEmbeddingsStatus = status
+            memoryEmbeddingIndexStatus = status.index
             memoryEmbeddingStatusMessage = nil
+            let index = try await core.memoryEmbeddingIndexStatus(projectID: projectID)
+            guard projectID == selectedProjectID else { return }
+            memoryEmbeddingIndexStatus = index.index
         } catch {
             guard projectID == selectedProjectID else { return }
             memoryEmbeddingStatusMessage = error.localizedDescription
@@ -2148,6 +2226,29 @@ final class AppModel {
             memoryEmbeddingRebuildResult = result
             memoryEmbeddingStatusMessage =
                 "Queued \(result.enqueued) memories and cleared \(result.cleared) derived rows."
+            await loadMemoryEmbeddingStatus()
+        } catch {
+            memoryEmbeddingStatusMessage = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    /// Explicit derived ANN rebuild. No embedding request is made; the daemon
+    /// rebuilds centroids from stored vectors and re-assigns them. The action
+    /// is gated on an enabled, configured IVF policy.
+    func rebuildMemoryEmbeddingIndex() async {
+        guard let projectID = selectedProjectID else {
+            memoryEmbeddingStatusMessage = "Select a project first."
+            return
+        }
+        guard canRebuildMemoryEmbeddingIndex else { return }
+        memoryEmbeddingBusy = true
+        defer { memoryEmbeddingBusy = false }
+        do {
+            let result = try await core.rebuildMemoryEmbeddingIndex(projectID: projectID)
+            guard projectID == selectedProjectID else { return }
+            memoryEmbeddingIndexRebuildResult = result
+            memoryEmbeddingStatusMessage = result.summaryLabel
             await loadMemoryEmbeddingStatus()
         } catch {
             memoryEmbeddingStatusMessage = error.localizedDescription

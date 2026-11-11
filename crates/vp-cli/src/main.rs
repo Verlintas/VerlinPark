@@ -1327,6 +1327,11 @@ enum Command {
         #[arg(long)]
         text: Option<String>,
     },
+    /// Show derived IVF index mode, generation, coverage, and fallback state.
+    MemoryEmbeddingsIndex { project: String },
+    /// Rebuild the derived IVF index from stored vectors. Never calls the
+    /// embedding endpoint and never changes memory truth.
+    MemoryEmbeddingsIndexRebuild { project: String },
     /// Add a project memory tied to a session.
     Remember {
         session: String,
@@ -1399,6 +1404,21 @@ enum Command {
         /// stored or printed.
         #[arg(long = "embedding-api-key-env")]
         embedding_api_key_env: Option<String>,
+        /// Retrieval index mode: exact bounded scan or opt-in IVF.
+        #[arg(long = "embedding-index", value_parser = ["scan", "ivf"])]
+        embedding_index: Option<String>,
+        /// IVF centroid count (4-1024).
+        #[arg(long = "ivf-nlist")]
+        ivf_nlist: Option<u32>,
+        /// IVF centroids probed per recall (1..=nlist).
+        #[arg(long = "ivf-nprobe")]
+        ivf_nprobe: Option<u32>,
+        /// Below this many vectors recall uses the exact scan.
+        #[arg(long = "ivf-min-vectors")]
+        ivf_min_vectors: Option<u32>,
+        /// Vector growth that triggers a deterministic centroid rebuild.
+        #[arg(long = "ivf-rebuild-vectors")]
+        ivf_rebuild_vectors: Option<u32>,
         /// Remove the entire embedding policy object.
         #[arg(long = "embedding-clear")]
         embedding_clear: bool,
@@ -4176,6 +4196,11 @@ async fn main() -> Result<()> {
             embedding_max_candidates,
             embedding_min_similarity,
             embedding_api_key_env,
+            embedding_index,
+            ivf_nlist,
+            ivf_nprobe,
+            ivf_min_vectors,
+            ivf_rebuild_vectors,
             embedding_clear,
         } => {
             if embedding_enable && embedding_disable {
@@ -4191,7 +4216,12 @@ async fn main() -> Result<()> {
                     || embedding_timeout_secs.is_some()
                     || embedding_max_candidates.is_some()
                     || embedding_min_similarity.is_some()
-                    || embedding_api_key_env.is_some())
+                    || embedding_api_key_env.is_some()
+                    || embedding_index.is_some()
+                    || ivf_nlist.is_some()
+                    || ivf_nprobe.is_some()
+                    || ivf_min_vectors.is_some()
+                    || ivf_rebuild_vectors.is_some())
             {
                 bail!("--embedding-clear cannot be combined with other embedding flags");
             }
@@ -4220,7 +4250,12 @@ async fn main() -> Result<()> {
                 || embedding_timeout_secs.is_some()
                 || embedding_max_candidates.is_some()
                 || embedding_min_similarity.is_some()
-                || embedding_api_key_env.is_some();
+                || embedding_api_key_env.is_some()
+                || embedding_index.is_some()
+                || ivf_nlist.is_some()
+                || ivf_nprobe.is_some()
+                || ivf_min_vectors.is_some()
+                || ivf_rebuild_vectors.is_some();
             let embedding = if embedding_clear {
                 Value::Null
             } else if !embedding_flags {
@@ -4248,6 +4283,21 @@ async fn main() -> Result<()> {
                 }
                 if object.get("min_similarity").is_none() {
                     object["min_similarity"] = json!(0.20);
+                }
+                if object.get("index").is_none() {
+                    object["index"] = json!("scan");
+                }
+                if object.get("ivf_nlist").is_none() {
+                    object["ivf_nlist"] = json!(64);
+                }
+                if object.get("ivf_nprobe").is_none() {
+                    object["ivf_nprobe"] = json!(8);
+                }
+                if object.get("ivf_min_vectors").is_none() {
+                    object["ivf_min_vectors"] = json!(256);
+                }
+                if object.get("ivf_rebuild_vectors").is_none() {
+                    object["ivf_rebuild_vectors"] = json!(4096);
                 }
                 if embedding_enable {
                     object["enabled"] = json!(true);
@@ -4278,6 +4328,21 @@ async fn main() -> Result<()> {
                 }
                 if let Some(env_name) = embedding_api_key_env {
                     object["api_key_env"] = json!(env_name);
+                }
+                if let Some(index) = embedding_index {
+                    object["index"] = json!(index);
+                }
+                if let Some(nlist) = ivf_nlist {
+                    object["ivf_nlist"] = json!(nlist);
+                }
+                if let Some(nprobe) = ivf_nprobe {
+                    object["ivf_nprobe"] = json!(nprobe);
+                }
+                if let Some(min_vectors) = ivf_min_vectors {
+                    object["ivf_min_vectors"] = json!(min_vectors);
+                }
+                if let Some(rebuild_vectors) = ivf_rebuild_vectors {
+                    object["ivf_rebuild_vectors"] = json!(rebuild_vectors);
                 }
                 object
             };
@@ -4330,6 +4395,22 @@ async fn main() -> Result<()> {
                 &discovery,
                 "memory.embeddings.test",
                 json!({"project_id": project, "text": text}),
+            )
+            .await?
+        }
+        Command::MemoryEmbeddingsIndex { project } => {
+            rpc(
+                &discovery,
+                "memory.embeddings.index.status",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::MemoryEmbeddingsIndexRebuild { project } => {
+            rpc(
+                &discovery,
+                "memory.embeddings.index.rebuild",
+                json!({"project_id": project}),
             )
             .await?
         }
@@ -7825,6 +7906,67 @@ mod hybrid_memory_cli_tests {
                     }
                     other => panic!("expected memory-embeddings-test, got {other:?}"),
                 }
+
+                let cli = Cli::try_parse_from(["vp", "memory-embeddings-index", "proj-1"]).unwrap();
+                match cli.command {
+                    Command::MemoryEmbeddingsIndex { project } => assert_eq!(project, "proj-1"),
+                    other => panic!("expected memory-embeddings-index, got {other:?}"),
+                }
+
+                let cli = Cli::try_parse_from(["vp", "memory-embeddings-index-rebuild", "proj-1"])
+                    .unwrap();
+                match cli.command {
+                    Command::MemoryEmbeddingsIndexRebuild { project } => {
+                        assert_eq!(project, "proj-1")
+                    }
+                    other => panic!("expected memory-embeddings-index-rebuild, got {other:?}"),
+                }
+
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "memory-policy-set",
+                    "proj-1",
+                    "--embedding-index",
+                    "ivf",
+                    "--ivf-nlist",
+                    "128",
+                    "--ivf-nprobe",
+                    "12",
+                    "--ivf-min-vectors",
+                    "300",
+                    "--ivf-rebuild-vectors",
+                    "6000",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::MemoryPolicySet {
+                        embedding_index,
+                        ivf_nlist,
+                        ivf_nprobe,
+                        ivf_min_vectors,
+                        ivf_rebuild_vectors,
+                        ..
+                    } => {
+                        assert_eq!(embedding_index.as_deref(), Some("ivf"));
+                        assert_eq!(ivf_nlist, Some(128));
+                        assert_eq!(ivf_nprobe, Some(12));
+                        assert_eq!(ivf_min_vectors, Some(300));
+                        assert_eq!(ivf_rebuild_vectors, Some(6000));
+                    }
+                    other => panic!("expected memory-policy-set, got {other:?}"),
+                }
+
+                assert!(
+                    Cli::try_parse_from([
+                        "vp",
+                        "memory-policy-set",
+                        "proj-1",
+                        "--embedding-index",
+                        "hnsw",
+                    ])
+                    .is_err(),
+                    "unknown index modes are rejected by the CLI parser"
+                );
 
                 let cli = Cli::try_parse_from([
                     "vp",

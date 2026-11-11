@@ -3,6 +3,28 @@ import Foundation
 import XCTest
 
 final class ProtocolCompatibilityTests: XCTestCase {
+    func testLegacyEmbeddingPolicyDefaultsToExactScanIndex() throws {
+        let policy = try JSONDecoder().decode(
+            MemoryEmbeddingPolicy.self,
+            from: Data(
+                """
+                {
+                  "enabled": true,
+                  "endpoint": "https://example.test/v1",
+                  "model": "embed"
+                }
+                """.utf8
+            )
+        )
+        XCTAssertEqual(policy.index, .scan)
+        XCTAssertEqual(policy.ivfNlist, 64)
+        XCTAssertEqual(policy.ivfNprobe, 8)
+        XCTAssertEqual(policy.ivfMinVectors, 256)
+        XCTAssertEqual(policy.ivfRebuildVectors, 4096)
+        XCTAssertFalse(policy.usesIVF)
+        XCTAssertEqual(policy.jsonObject()["index"]?.stringValue, "scan")
+    }
+
     func testAgentInfoWithoutCapacityStillDecodes() throws {
         let json = """
         {

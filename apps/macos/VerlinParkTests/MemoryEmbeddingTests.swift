@@ -45,6 +45,12 @@ final class MemoryEmbeddingTests: XCTestCase {
         XCTAssertEqual(policy.maxCandidates, 64)
         XCTAssertEqual(policy.minSimilarity, 0.20, accuracy: 0.0001)
         XCTAssertNil(policy.apiKeyEnv)
+        XCTAssertEqual(policy.index, .scan)
+        XCTAssertEqual(policy.ivfNlist, 64)
+        XCTAssertEqual(policy.ivfNprobe, 8)
+        XCTAssertEqual(policy.ivfMinVectors, 256)
+        XCTAssertEqual(policy.ivfRebuildVectors, 4096)
+        XCTAssertFalse(policy.usesIVF)
         XCTAssertTrue(policy.isConfigured)
     }
 
@@ -85,6 +91,11 @@ final class MemoryEmbeddingTests: XCTestCase {
         XCTAssertEqual(body["max_candidates"]?.intValue, 32)
         XCTAssertEqual(body["min_similarity"]?.doubleValue ?? 0, 0.35, accuracy: 0.0001)
         XCTAssertEqual(body["api_key_env"]?.stringValue, "EMBED_API_KEY")
+        XCTAssertEqual(body["index"]?.stringValue, "scan")
+        XCTAssertEqual(body["ivf_nlist"]?.intValue, 64)
+        XCTAssertEqual(body["ivf_nprobe"]?.intValue, 8)
+        XCTAssertEqual(body["ivf_min_vectors"]?.intValue, 256)
+        XCTAssertEqual(body["ivf_rebuild_vectors"]?.intValue, 4096)
         // The environment variable *name* is the only key-related value sent.
         XCTAssertFalse(body.values.contains { $0.stringValue?.hasPrefix("sk-") == true })
     }
@@ -409,6 +420,220 @@ final class MemoryEmbeddingTests: XCTestCase {
         XCTAssertEqual(usage.estimatedTokens, 0)
         XCTAssertEqual(usage.bytes, 0)
         XCTAssertEqual(usage.providerReportedCalls, 0)
+    }
+
+    func testIndexModeDecodesUnknownValuesLeniently() throws {
+        let scan = try JSONDecoder().decode(
+            MemoryIndexMode.self,
+            from: Data("\"future_mode\"".utf8)
+        )
+        XCTAssertEqual(scan, .scan)
+        let ivf = try JSONDecoder().decode(
+            MemoryIndexMode.self,
+            from: Data("\"ivf\"".utf8)
+        )
+        XCTAssertEqual(ivf, .ivf)
+        XCTAssertEqual(ivf.label, "IVF")
+        XCTAssertEqual(MemoryIndexMode.scan.label, "exact scan")
+    }
+
+    func testIVFPolicyEncodesAndGatesRebuild() throws {
+        var policy = MemoryEmbeddingPolicy.defaults
+        policy.enabled = true
+        policy.endpoint = "https://example.test/v1"
+        policy.model = "embed"
+        policy.index = .ivf
+        policy.ivfNlist = 128
+        policy.ivfNprobe = 12
+        policy.ivfMinVectors = 300
+        policy.ivfRebuildVectors = 6000
+        XCTAssertTrue(policy.usesIVF)
+        let body = policy.jsonObject()
+        XCTAssertEqual(body["index"]?.stringValue, "ivf")
+        XCTAssertEqual(body["ivf_nlist"]?.intValue, 128)
+        XCTAssertEqual(body["ivf_nprobe"]?.intValue, 12)
+        XCTAssertEqual(body["ivf_min_vectors"]?.intValue, 300)
+        XCTAssertEqual(body["ivf_rebuild_vectors"]?.intValue, 6000)
+        let decoded = try JSONDecoder().decode(
+            MemoryEmbeddingPolicy.self,
+            from: JSONEncoder().encode(policy)
+        )
+        XCTAssertEqual(decoded.index, .ivf)
+        XCTAssertEqual(decoded.ivfNlist, 128)
+        XCTAssertEqual(decoded.ivfNprobe, 12)
+        XCTAssertTrue(decoded.usesIVF)
+
+        var disabled = policy
+        disabled.enabled = false
+        XCTAssertFalse(disabled.usesIVF)
+        var scan = policy
+        scan.index = .scan
+        XCTAssertFalse(scan.usesIVF)
+        var unconfigured = policy
+        unconfigured.model = "   "
+        XCTAssertFalse(unconfigured.usesIVF)
+
+        let index = try JSONDecoder().decode(
+            MemoryEmbeddingIndexStatus.self,
+            from: Data(
+                """
+                {
+                  "mode": "ivf",
+                  "ready": true,
+                  "generation": 7,
+                  "model": "embed",
+                  "dimensions": 8,
+                  "vector_count": 400,
+                  "assigned_vectors": 380,
+                  "invalid_assignments": 2,
+                  "cluster_count": 32,
+                  "nlist": 32,
+                  "nprobe": 4,
+                  "coverage": 0.95,
+                  "min_vectors": 256,
+                  "rebuild_vectors": 4096,
+                  "bytes": 1024,
+                  "last_rebuilt_at": "2026-11-11T00:00:00Z",
+                  "fallback_count": 2,
+                  "last_fallback_reason": "model_mismatch",
+                  "fallback_reason": null
+                }
+                """.utf8
+            )
+        )
+        XCTAssertTrue(index.ready)
+        XCTAssertEqual(index.modeLabel, "IVF")
+        XCTAssertEqual(index.generationLabel, "generation 7")
+        XCTAssertEqual(index.coverageLabel, "95.0%")
+        XCTAssertEqual(index.coveragePercent, 95, accuracy: 0.0001)
+        XCTAssertEqual(index.invalidAssignments, 2)
+        XCTAssertEqual(index.fallbackCount, 2)
+        XCTAssertTrue(index.canRebuild)
+
+        let fallback = try JSONDecoder().decode(
+            MemoryEmbeddingIndexStatus.self,
+            from: Data(
+                """
+                {
+                  "mode": "scan",
+                  "fallback_reason": "scan_mode"
+                }
+                """.utf8
+            )
+        )
+        XCTAssertFalse(fallback.ready)
+        XCTAssertFalse(fallback.canRebuild)
+        XCTAssertEqual(fallback.modeLabel, "exact scan")
+        XCTAssertEqual(fallback.statusLabel, "scan_mode")
+        XCTAssertEqual(fallback.coverageLabel, "no vectors")
+        XCTAssertEqual(fallback.nlist, 64)
+        XCTAssertEqual(fallback.invalidAssignments, 0)
+
+        let rebuild = try JSONDecoder().decode(
+            MemoryEmbeddingsIndexRebuildResult.self,
+            from: Data(
+                """
+                {
+                  "project_id": "prj-1",
+                  "rebuilt": true,
+                  "generation": 8,
+                  "vector_count": 400,
+                  "assigned_vectors": 400,
+                  "cluster_count": 32,
+                  "nlist": 32
+                }
+                """.utf8
+            )
+        )
+        XCTAssertTrue(rebuild.rebuilt)
+        XCTAssertTrue(rebuild.summaryLabel.contains("generation 8"))
+        XCTAssertTrue(rebuild.summaryLabel.contains("400/400"))
+        let skipped = try JSONDecoder().decode(
+            MemoryEmbeddingsIndexRebuildResult.self,
+            from: Data(
+                """
+                {"project_id": "prj-1", "rebuilt": false, "reason": "below_min_vectors"}
+                """.utf8
+            )
+        )
+        XCTAssertEqual(skipped.reason, "below_min_vectors")
+        XCTAssertEqual(skipped.summaryLabel, "below_min_vectors")
+    }
+
+    func testStatusDecodesOptionalIndexAndLegacyStatusHasNone() throws {
+        let status = try JSONDecoder().decode(
+            MemoryEmbeddingsStatusResult.self,
+            from: Data(
+                """
+                {
+                  "project_id": "prj-1",
+                  "enabled": true,
+                  "configured": true,
+                  "indexable": 4,
+                  "indexed": 4,
+                  "coverage": 1.0,
+                  "index": {
+                    "mode": "ivf",
+                    "ready": true,
+                    "generation": 2,
+                    "vector_count": 4,
+                    "assigned_vectors": 4,
+                    "nlist": 4,
+                    "nprobe": 2,
+                    "coverage": 1.0
+                  }
+                }
+                """.utf8
+            )
+        )
+        XCTAssertEqual(status.index?.generation, 2)
+        XCTAssertTrue(status.index?.ready ?? false)
+        XCTAssertEqual(status.index?.nprobe, 2)
+
+        let legacy = try JSONDecoder().decode(
+            MemoryEmbeddingsStatusResult.self,
+            from: Data("{\"project_id\":\"p\",\"indexable\":1}".utf8)
+        )
+        XCTAssertNil(legacy.index)
+    }
+
+    @MainActor
+    func testRebuildActionGatingRequiresEnabledConfiguredIVF() {
+        let model = AppModel()
+        XCTAssertFalse(model.canRebuildMemoryEmbeddingIndex)
+
+        model.selectedProjectID = "prj-1"
+        model.memoryEmbeddingEnabled = true
+        model.memoryEmbeddingEndpoint = "https://example.test/v1"
+        model.memoryEmbeddingModel = "embed"
+        model.memoryEmbeddingIndex = .scan
+        XCTAssertFalse(model.canRebuildMemoryEmbeddingIndex, "scan mode has no ANN action")
+
+        model.memoryEmbeddingIndex = .ivf
+        XCTAssertTrue(model.canRebuildMemoryEmbeddingIndex)
+
+        model.memoryEmbeddingEnabled = false
+        XCTAssertFalse(model.canRebuildMemoryEmbeddingIndex)
+        model.memoryEmbeddingEnabled = true
+
+        model.memoryEmbeddingBusy = true
+        XCTAssertFalse(model.canRebuildMemoryEmbeddingIndex)
+        model.memoryEmbeddingBusy = false
+
+        model.memoryPolicyBusy = true
+        XCTAssertFalse(model.canRebuildMemoryEmbeddingIndex)
+        model.memoryPolicyBusy = false
+
+        model.memoryEmbeddingEndpoint = "   "
+        XCTAssertFalse(model.canRebuildMemoryEmbeddingIndex)
+        model.memoryEmbeddingEndpoint = "https://example.test/v1"
+
+        model.memoryEmbeddingModel = ""
+        XCTAssertFalse(model.canRebuildMemoryEmbeddingIndex)
+        model.memoryEmbeddingModel = "embed"
+
+        model.selectedProjectID = nil
+        XCTAssertFalse(model.canRebuildMemoryEmbeddingIndex)
     }
 
     func testInvalidVectorsAloneMarkHealthDegraded() {

@@ -249,6 +249,39 @@ struct MemoryPolicyCard: View {
                     )
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 9, design: .monospaced))
+                    Picker("Retrieval index", selection: $model.memoryEmbeddingIndex) {
+                        Text("exact scan").tag(MemoryIndexMode.scan)
+                        Text("IVF (opt-in)").tag(MemoryIndexMode.ivf)
+                    }
+                    .pickerStyle(.segmented)
+                    .controlSize(.small)
+                    .frame(width: 260)
+                    if model.memoryEmbeddingIndex == .ivf {
+                        HStack(spacing: 8) {
+                            TextField("nlist", text: $model.memoryEmbeddingIVFNlist)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 9, design: .monospaced))
+                                .frame(width: 64)
+                            TextField("nprobe", text: $model.memoryEmbeddingIVFNprobe)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 9, design: .monospaced))
+                                .frame(width: 64)
+                            TextField(
+                                "min vectors",
+                                text: $model.memoryEmbeddingIVFMinVectors
+                            )
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 9, design: .monospaced))
+                            .frame(width: 86)
+                            TextField(
+                                "rebuild growth",
+                                text: $model.memoryEmbeddingIVFRebuildVectors
+                            )
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 9, design: .monospaced))
+                            .frame(width: 100)
+                        }
+                    }
                     HStack(spacing: 8) {
                         Button("Test endpoint") {
                             Task { await model.testMemoryEmbeddings() }
@@ -262,6 +295,12 @@ struct MemoryPolicyCard: View {
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                         .disabled(model.memoryEmbeddingBusy || model.memoryPolicyBusy)
+                        Button("Rebuild ANN index") {
+                            Task { await model.rebuildMemoryEmbeddingIndex() }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(!model.canRebuildMemoryEmbeddingIndex)
                         if model.memoryEmbeddingBusy {
                             ProgressView().controlSize(.small)
                         }
@@ -299,6 +338,46 @@ struct MemoryPolicyCard: View {
                                 .foregroundStyle(VPTheme.warning)
                                 .lineLimit(3)
                         }
+                    }
+                    if let index = model.memoryEmbeddingIndexStatus {
+                        HStack(spacing: 10) {
+                            Text(verbatim: "index \(index.modeLabel) · \(index.statusLabel)")
+                            Text(verbatim: index.generationLabel)
+                            Text(verbatim: "coverage \(index.coverageLabel)")
+                            Text(verbatim: "\(index.assignedVectors)/\(index.vectorCount) assigned")
+                            if index.clusterCount > 0 {
+                                Text(verbatim: "\(index.clusterCount) clusters")
+                            }
+                            if index.invalidAssignments > 0 {
+                                Text(verbatim: "\(index.invalidAssignments) stale assignments")
+                                    .foregroundStyle(VPTheme.warning)
+                            }
+                            Text(verbatim: "nprobe \(index.nprobe)")
+                            if index.fallbackCount > 0 {
+                                Text(verbatim: "\(index.fallbackCount) fallbacks")
+                                    .foregroundStyle(VPTheme.warning)
+                            }
+                        }
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        if let reason = index.fallbackReason {
+                            Text(reason)
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(VPTheme.warning)
+                                .lineLimit(2)
+                        }
+                        if let error = index.lastError {
+                            Text(error)
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(VPTheme.warning)
+                                .lineLimit(2)
+                        }
+                    }
+                    if let result = model.memoryEmbeddingIndexRebuildResult {
+                        Text(result.summaryLabel)
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(result.rebuilt ? VPTheme.success : .secondary)
+                            .lineLimit(2)
                     }
                     if let result = model.memoryEmbeddingTestResult {
                         Text(
