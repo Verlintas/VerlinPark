@@ -1120,126 +1120,6 @@ private struct ShowcasePanel: View {
     }
 }
 
-private struct ArtifactRow: View {
-    @Environment(AppModel.self) private var model
-    let artifact: Artifact
-    @State private var preview: ArtifactPreviewData?
-    @State private var showingVersions = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 6) {
-                Text(artifact.name)
-                    .font(.system(size: 10, weight: .medium))
-                Text(artifact.kind)
-                    .font(.system(size: 8, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                Text(artifact.storage)
-                    .font(.system(size: 8, design: .monospaced))
-                    .foregroundStyle(.tertiary)
-                if let compression = artifact.compression, compression != "none" {
-                    Text(compression)
-                        .font(.system(size: 8, design: .monospaced))
-                        .foregroundStyle(.tertiary)
-                }
-                Text("v\(artifact.version)")
-                    .font(.system(size: 8, design: .monospaced))
-                    .foregroundStyle(VPTheme.textTertiary)
-                if artifact.storage == "inline" {
-                    Button {
-                        showingVersions = true
-                    } label: {
-                        Image(systemName: "clock.arrow.circlepath")
-                            .font(.system(size: 9))
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(VPTheme.textTertiary)
-                    .help(L10n.t("Version history"))
-                }
-                Spacer()
-                Text(artifact.agentName)
-                    .font(.system(size: 8, design: .monospaced))
-                    .foregroundStyle(.tertiary)
-            }
-            Text("\(artifact.sizeBytes) bytes · \(artifact.mimeType)")
-                .font(.system(size: 8, design: .monospaced))
-                .foregroundStyle(.tertiary)
-            if let image = preview?.image {
-                Image(nsImage: image)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(maxHeight: 180)
-                    .clipShape(RoundedRectangle(cornerRadius: 7))
-            }
-            if let text = preview?.text {
-                ScrollView {
-                    Text(text)
-                        .font(.system(size: 8, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .frame(maxHeight: 180)
-                .padding(6)
-                .background(.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 6))
-            }
-            if let hex = preview?.hex {
-                ScrollView([.horizontal, .vertical]) {
-                    Text(hex)
-                        .font(.system(size: 8, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: true, vertical: false)
-                }
-                .frame(maxHeight: 160)
-                .padding(6)
-                .background(.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 6))
-                Text("Binary preview · first 1 KB")
-                    .font(.system(size: 8, design: .monospaced))
-                    .foregroundStyle(.tertiary)
-            }
-            if artifact.storage == "file" || preview != nil {
-                HStack(spacing: 8) {
-                    Text(preview?.path ?? artifact.path ?? "path unavailable")
-                        .font(.system(size: 8, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    if preview != nil || artifact.path != nil {
-                        Button("Open") {
-                            Task { await model.openArtifact(artifact) }
-                        }
-                        .buttonStyle(.plain)
-                        .font(.system(size: 9))
-                        .foregroundStyle(.secondary)
-                    }
-                }
-            } else {
-                Text(artifact.content)
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(8)
-                    .textSelection(.enabled)
-            }
-            if preview?.truncated == true {
-                Text("Preview truncated at 64 KB. Open the artifact for the full file.")
-                    .font(.system(size: 8, design: .monospaced))
-                    .foregroundStyle(.tertiary)
-            }
-        }
-        .padding(9)
-        .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 9))
-        .vpHoverLift(scale: 1.005, lift: 1)
-        .task(id: artifact.id) {
-            preview = await model.artifactPreviewData(artifact)
-        }
-        .sheet(isPresented: $showingVersions) {
-            ArtifactVersionsSheet(artifact: artifact)
-                .environment(model)
-        }
-    }
-}
-
 private struct UsageMetric: View {
     let title: String
     let value: String
@@ -2668,7 +2548,7 @@ private struct PreviewEventRow: View {
     }
 }
 
-private struct ArtifactVersionsSheet: View {
+struct ArtifactVersionsSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     let artifact: Artifact

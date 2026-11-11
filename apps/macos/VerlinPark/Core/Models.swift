@@ -1488,6 +1488,7 @@ struct Artifact: Codable, Identifiable, Hashable, Sendable {
     let sizeBytes: Int
     let sha256: String
     let path: String?
+    let dataBase64: String?
     let version: Int
     let createdAt: String
 
@@ -1506,6 +1507,7 @@ struct Artifact: Codable, Identifiable, Hashable, Sendable {
         case sizeBytes = "size_bytes"
         case sha256
         case path
+        case dataBase64 = "data_base64"
         case version
         case createdAt = "created_at"
     }
@@ -1526,6 +1528,7 @@ struct Artifact: Codable, Identifiable, Hashable, Sendable {
         sizeBytes = try container.decodeIfPresent(Int.self, forKey: .sizeBytes) ?? 0
         sha256 = try container.decodeIfPresent(String.self, forKey: .sha256) ?? ""
         path = try container.decodeIfPresent(String.self, forKey: .path)
+        dataBase64 = try container.decodeIfPresent(String.self, forKey: .dataBase64)
         version = try container.decodeIfPresent(Int.self, forKey: .version) ?? 1
         createdAt = try container.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
     }

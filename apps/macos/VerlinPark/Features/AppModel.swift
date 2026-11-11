@@ -2,11 +2,24 @@ import AppKit
 import Observation
 
 struct ArtifactPreviewData {
-    let path: String
+    let kind: ArtifactPreviewKind
+    let sourceURL: URL?
+    let inlineData: Data?
     let image: NSImage?
     let text: String?
-    let hex: String?
+    let totalBytes: Int
     let truncated: Bool
+    let error: String?
+
+    var hexSource: ArtifactHexSource? {
+        if let sourceURL {
+            return .file(sourceURL)
+        }
+        if let inlineData {
+            return .inline(inlineData)
+        }
+        return nil
+    }
 }
 
 struct WorkspaceDirectoryState: Equatable {
@@ -527,6 +540,7 @@ final class AppModel {
         started = true
         loadNotices()
         loadOrgCaps()
+        ArtifactPreviewCache.sweepStaleFiles()
         SystemNotifier.shared.requestAuthorization()
         SystemNotifier.shared.onResolveApproval = { [weak self] approvalID, approved in
             guard let self else { return }
@@ -4855,75 +4869,205 @@ final class AppModel {
         }
     }
 
-    func artifactPreviewData(_ artifact: Artifact) async -> ArtifactPreviewData? {
-        do {
-            let materialized = try await core.materializeArtifact(artifactID: artifact.id)
-            let data = try await Task.detached(priority: .userInitiated) {
-                try Data(
-                    contentsOf: URL(fileURLWithPath: materialized.path),
-                    options: [.mappedIfSafe]
+    func artifactPreviewData(_ artifact: Artifact) async -> ArtifactPreviewData {
+        // File-backed artifacts are read from the daemon path only; their
+        // `content` field is intentionally empty and is not a fallback source.
+        let inlineData: Data?
+        if artifact.storage == "file" {
+            inlineData = nil
+        } else {
+            do {
+                inlineData = try ArtifactInlineContent.bytes(
+                    content: artifact.content,
+                    dataBase64: artifact.dataBase64
                 )
-            }.value
-            let mime = artifact.mimeType.lowercased()
-            if mime.hasPrefix("image/"), let image = NSImage(data: data) {
+            } catch {
                 return ArtifactPreviewData(
-                    path: materialized.path,
-                    image: image,
+                    kind: .other,
+                    sourceURL: nil,
+                    inlineData: nil,
+                    image: nil,
                     text: nil,
-                    hex: nil,
-                    truncated: false
+                    totalBytes: artifact.sizeBytes,
+                    truncated: false,
+                    error: error.localizedDescription
                 )
             }
-            let limit = 64 * 1024
-            let truncated = data.count > limit
-            let slice = data.prefix(limit)
-            if isTextMime(mime) {
+        }
+
+        var sourceURL: URL?
+        var loadError: String?
+        if artifact.storage == "file" {
+            if artifact.compression != "zstd",
+               let stored = ArtifactLocalFile.storedURL(for: artifact)
+            {
+                sourceURL = stored
+            } else {
+                do {
+                    let materialized = try await core.materializeArtifact(artifactID: artifact.id)
+                    if (materialized.path as NSString).isAbsolutePath {
+                        sourceURL = URL(fileURLWithPath: materialized.path)
+                    } else {
+                        loadError = L10n.t("Preview unavailable.")
+                    }
+                } catch {
+                    if artifact.compression != "zstd",
+                       let stored = ArtifactLocalFile.storedURL(for: artifact)
+                    {
+                        sourceURL = stored
+                    } else {
+                        loadError = error.localizedDescription
+                    }
+                }
+            }
+        }
+
+        let totalBytes = artifactTotalBytes(
+            artifact: artifact,
+            sourceURL: sourceURL,
+            inlineData: inlineData
+        )
+        let sample = await artifactBytes(
+            sourceURL: sourceURL,
+            inlineData: inlineData,
+            limit: 4096
+        )
+        let kind = ArtifactPreviewClassifier.classify(
+            mimeType: artifact.mimeType,
+            fileName: artifact.name,
+            contentSample: sample
+        )
+
+        switch kind {
+        case .image:
+            let data = await artifactBytes(
+                sourceURL: sourceURL,
+                inlineData: inlineData,
+                limit: 64 * 1024 * 1024
+            )
+            if let data, let image = NSImage(data: data) {
                 return ArtifactPreviewData(
-                    path: materialized.path,
+                    kind: .image,
+                    sourceURL: sourceURL,
+                    inlineData: inlineData,
+                    image: image,
+                    text: nil,
+                    totalBytes: totalBytes,
+                    truncated: false,
+                    error: loadError
+                )
+            }
+            if let data,
+               let text = String(data: data.prefix(64 * 1024), encoding: .utf8)
+            {
+                return ArtifactPreviewData(
+                    kind: .text,
+                    sourceURL: sourceURL,
+                    inlineData: inlineData,
                     image: nil,
-                    text: String(decoding: slice, as: UTF8.self),
-                    hex: nil,
-                    truncated: truncated
+                    text: text,
+                    totalBytes: totalBytes,
+                    truncated: totalBytes > 64 * 1024,
+                    error: loadError
                 )
             }
             return ArtifactPreviewData(
-                path: materialized.path,
+                kind: .binary,
+                sourceURL: sourceURL,
+                inlineData: inlineData,
                 image: nil,
                 text: nil,
-                hex: hexDump(Data(slice.prefix(1024))),
-                truncated: truncated
+                totalBytes: totalBytes,
+                truncated: false,
+                error: loadError
             )
-        } catch {
-            return nil
+        case .text:
+            guard let data = await artifactBytes(
+                sourceURL: sourceURL,
+                inlineData: inlineData,
+                limit: 64 * 1024
+            ) else {
+                return ArtifactPreviewData(
+                    kind: .text,
+                    sourceURL: sourceURL,
+                    inlineData: inlineData,
+                    image: nil,
+                    text: nil,
+                    totalBytes: totalBytes,
+                    truncated: false,
+                    error: loadError ?? L10n.t("Preview unavailable.")
+                )
+            }
+            return ArtifactPreviewData(
+                kind: .text,
+                sourceURL: sourceURL,
+                inlineData: inlineData,
+                image: nil,
+                text: String(decoding: data, as: UTF8.self),
+                totalBytes: totalBytes,
+                truncated: totalBytes > 64 * 1024 || (totalBytes == 0 && data.count >= 64 * 1024),
+                error: loadError
+            )
+        case .binary:
+            return ArtifactPreviewData(
+                kind: .binary,
+                sourceURL: sourceURL,
+                inlineData: inlineData,
+                image: nil,
+                text: nil,
+                totalBytes: totalBytes,
+                truncated: false,
+                error: loadError
+            )
+        case .pdf, .video, .audio, .archive, .other:
+            let error = loadError
+                ?? (sourceURL == nil && inlineData == nil
+                    ? L10n.t("Preview unavailable.")
+                    : nil)
+            return ArtifactPreviewData(
+                kind: kind,
+                sourceURL: sourceURL,
+                inlineData: inlineData,
+                image: nil,
+                text: nil,
+                totalBytes: totalBytes,
+                truncated: false,
+                error: error
+            )
         }
     }
 
-    private func isTextMime(_ mime: String) -> Bool {
-        mime.hasPrefix("text/")
-            || mime.contains("json")
-            || mime.contains("xml")
-            || mime.contains("yaml")
-            || mime.contains("javascript")
-            || mime.contains("toml")
-            || mime.contains("csv")
-            || mime.contains("svg")
-            || mime.contains("sql")
-            || mime.contains("shellscript")
+    private func artifactBytes(
+        sourceURL: URL?,
+        inlineData: Data?,
+        limit: Int
+    ) async -> Data? {
+        if let sourceURL {
+            return try? await Task.detached(priority: .userInitiated) {
+                try ArtifactFileReader.readPrefix(limit, from: sourceURL)
+            }.value
+        }
+        return inlineData.map { Data($0.prefix(limit)) }
     }
 
-    private func hexDump(_ data: Data) -> String {
-        let bytes = [UInt8](data)
-        return stride(from: 0, to: bytes.count, by: 16).map { offset in
-            let end = min(offset + 16, bytes.count)
-            let chunk = bytes[offset ..< end]
-            let hex = chunk.map { String(format: "%02x", $0) }.joined(separator: " ")
-            let ascii = chunk.map { byte in
-                (32 ... 126).contains(byte) ? String(UnicodeScalar(byte)) : "."
-            }.joined()
-            return String(format: "%08x  ", offset)
-                + hex.padding(toLength: 47, withPad: " ", startingAt: 0)
-                + "  " + ascii
-        }.joined(separator: "\n")
+    private func artifactTotalBytes(
+        artifact: Artifact,
+        sourceURL: URL?,
+        inlineData: Data?
+    ) -> Int {
+        if artifact.sizeBytes > 0 {
+            return artifact.sizeBytes
+        }
+        if let inlineData {
+            return inlineData.count
+        }
+        if let sourceURL,
+           let attributes = try? FileManager.default.attributesOfItem(atPath: sourceURL.path),
+           let size = attributes[.size] as? NSNumber
+        {
+            return size.intValue
+        }
+        return 0
     }
 
     func loadSessionCitations() async {
@@ -5008,8 +5152,34 @@ final class AppModel {
 
     func openArtifact(_ artifact: Artifact) async {
         do {
-            let materialized = try await core.materializeArtifact(artifactID: artifact.id)
-            NSWorkspace.shared.open(URL(fileURLWithPath: materialized.path))
+            let url: URL
+            if artifact.storage == "file" {
+                let materialized = try await core.materializeArtifact(artifactID: artifact.id)
+                guard (materialized.path as NSString).isAbsolutePath else {
+                    throw ArtifactPreviewError.invalidDaemonPath
+                }
+                let source = URL(fileURLWithPath: materialized.path)
+                if source.pathExtension.isEmpty {
+                    url = try ArtifactPreviewCache.writeCached(
+                        data: Data(contentsOf: source),
+                        artifactID: artifact.id,
+                        mimeType: artifact.mimeType
+                    )
+                } else {
+                    url = source
+                }
+            } else {
+                let data = try ArtifactInlineContent.bytes(
+                    content: artifact.content,
+                    dataBase64: artifact.dataBase64
+                )
+                url = try ArtifactPreviewCache.writeCached(
+                    data: data,
+                    artifactID: artifact.id,
+                    mimeType: artifact.mimeType
+                )
+            }
+            NSWorkspace.shared.open(url)
         } catch {
             handle(error)
         }
