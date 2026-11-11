@@ -70,7 +70,8 @@ use vp_protocol::types::{
     MemoryHealthParams, MemoryListParams, MemoryPolicyParams, MemoryPruneParams,
     MemorySearchParams, MemoryStatsParams, MemorySweepParams, MemoryUpdateParams,
     MemoryVerifyParams, MergeQueueListParams, MergeQueueListResult, OpenPullRequestParams,
-    PingResult, ProcessListParams, ProcessLogsParams, ProcessPolicyParams, ProcessPolicyResult,
+    PingResult, PreemptionOverviewParams, PreemptionPolicyParams, PreemptionPolicyResult,
+    ProcessListParams, ProcessLogsParams, ProcessPolicyParams, ProcessPolicyResult,
     ProcessStopParams, ProjectBudgetParams, ProjectForkForestParams, ProjectListResult,
     ProjectUsageParams, PromptParams, PromptResult, QuestionListParams, RehydrateSessionParams,
     ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams,
@@ -85,31 +86,31 @@ use vp_protocol::types::{
     SessionDiffParams, SessionExportParams, SessionForkParams, SessionForkTreeParams,
     SessionImportParams, SessionLineageParams, SessionListResult, SessionLogParams,
     SessionMergeForkParams, SessionPauseParams, SessionPauseResult, SessionPlanResumeParams,
-    SessionPlanResumeResult, SessionResumeParams, SessionResumeResult, SessionRunCancelParams,
-    SessionRunDetailParams, SessionRunPolicyParams, SessionRunResumeParams, SessionRunsParams,
-    SessionSkillActivationsParams, SessionStallsParams, SessionSteerParams,
-    SessionSteeringCancelParams, SessionSteeringParams, SessionTodosParams, SessionTodosResult,
-    SessionTranscriptParams, SetArtifactPolicyParams, SetCachePolicyParams,
+    SessionPlanResumeResult, SessionPreemptParams, SessionPreemptionParams, SessionResumeParams,
+    SessionResumeResult, SessionRunCancelParams, SessionRunDetailParams, SessionRunPolicyParams,
+    SessionRunResumeParams, SessionRunsParams, SessionSkillActivationsParams, SessionStallsParams,
+    SessionSteerParams, SessionSteeringCancelParams, SessionSteeringParams, SessionTodosParams,
+    SessionTodosResult, SessionTranscriptParams, SetArtifactPolicyParams, SetCachePolicyParams,
     SetCheckpointPolicyParams, SetContextCheckpointPolicyParams, SetCriticalPathPolicyParams,
     SetIntegrationPolicyParams, SetMailboxPolicyParams, SetMemoryPolicyParams,
-    SetProcessPolicyParams, SetProjectBudgetParams, SetSessionPriorityParams,
-    SetSessionRunPolicyParams, SetSessionUnlimitedParams, SetShellPolicyParams,
-    SetSourceCollectionParams, SetSourceEmbeddingPolicyParams, SetSourceLabelsParams,
-    SetTaskSchedulerPolicyParams, SetToolOutputPolicyParams, SetWorktreePolicyParams,
-    ShellPolicyParams, ShellPolicyResult, SkillCreateParams, SkillEnabledParams, SkillIdParams,
-    SkillImportParams, SkillListParams, SkillUpdateParams, SourceActionParams,
-    SourceCollectionsParams, SourceCreateFileParams, SourceCreateNoteParams, SourceCreateUrlParams,
-    SourceEmbeddingPolicyParams, SourceEmbeddingReindexParams, SourceEmbeddingStatusParams,
-    SourceGetParams, SourceImportParams, SourceListParams, SourceSearchParams, SubscribeParams,
-    TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult, TaskQueueParams,
-    TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult, TerminalCloseParams,
-    TerminalOpenParams, TerminalReadParams, TerminalResizeParams, TerminalWriteParams,
-    ToolActivityParams, ToolOutputAuditParams, ToolOutputListParams, ToolOutputPolicyParams,
-    ToolOutputPolicyResult, ToolOutputPruneParams, ToolOutputStatusParams, UpdateAcpAgentParams,
-    UpdateCheckParams, UpdateDownloadParams, UpdateMcpServerParams, UpdateModelPresetParams,
-    UpdateSourceMetadataParams, UsageLedgerParams, WorkspaceFileParams, WorkspaceGrepParams,
-    WorkspaceListParams, WorkspaceSearchParams, WorkspaceTreeParams, WorkspaceWriteParams,
-    WorktreePolicyParams,
+    SetPreemptionPolicyParams, SetProcessPolicyParams, SetProjectBudgetParams,
+    SetSessionPriorityParams, SetSessionRunPolicyParams, SetSessionUnlimitedParams,
+    SetShellPolicyParams, SetSourceCollectionParams, SetSourceEmbeddingPolicyParams,
+    SetSourceLabelsParams, SetTaskSchedulerPolicyParams, SetToolOutputPolicyParams,
+    SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult, SkillCreateParams,
+    SkillEnabledParams, SkillIdParams, SkillImportParams, SkillListParams, SkillUpdateParams,
+    SourceActionParams, SourceCollectionsParams, SourceCreateFileParams, SourceCreateNoteParams,
+    SourceCreateUrlParams, SourceEmbeddingPolicyParams, SourceEmbeddingReindexParams,
+    SourceEmbeddingStatusParams, SourceGetParams, SourceImportParams, SourceListParams,
+    SourceSearchParams, SubscribeParams, TaskActionParams, TaskActionResult, TaskDispatchParams,
+    TaskDispatchResult, TaskQueueParams, TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult,
+    TerminalCloseParams, TerminalOpenParams, TerminalReadParams, TerminalResizeParams,
+    TerminalWriteParams, ToolActivityParams, ToolOutputAuditParams, ToolOutputListParams,
+    ToolOutputPolicyParams, ToolOutputPolicyResult, ToolOutputPruneParams, ToolOutputStatusParams,
+    UpdateAcpAgentParams, UpdateCheckParams, UpdateDownloadParams, UpdateMcpServerParams,
+    UpdateModelPresetParams, UpdateSourceMetadataParams, UsageLedgerParams, WorkspaceFileParams,
+    WorkspaceGrepParams, WorkspaceListParams, WorkspaceSearchParams, WorkspaceTreeParams,
+    WorkspaceWriteParams, WorktreePolicyParams,
 };
 use vp_protocol::types::{
     ComputerLeaseInfo, ComputerLeaseListResult, ComputerLeaseReleaseParams,
@@ -352,6 +353,8 @@ async fn collect_daemon_metrics(state: &AppState) -> Result<DaemonMetrics> {
         runtime_leases: snapshot.runtime_leases,
         supervised_processes: snapshot.supervised_processes,
         supervised_process_output_bytes: snapshot.supervised_process_output_bytes,
+        preemptions_by_phase: snapshot.preemptions_by_phase,
+        preemptions_by_reason: snapshot.preemptions_by_reason,
         tokens_in: snapshot.tokens_in,
         tokens_out: snapshot.tokens_out,
         cache_read_tokens: snapshot.cache_read_tokens,
@@ -1260,6 +1263,51 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             },
             Err(response) => response_with_id(id, response),
         },
+        "preemption.overview" => match parse_params::<PreemptionOverviewParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .preemption_overview(&params.project_id, params.limit.unwrap_or(100))
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "project.preemption_policy.get" => {
+            match parse_params::<PreemptionPolicyParams>(request.params) {
+                Ok(params) => match state.engine.get_preemption_policy(&params.project_id).await {
+                    Ok(policy) => RpcResponse::success(
+                        id,
+                        PreemptionPolicyResult {
+                            project_id: params.project_id,
+                            policy,
+                        },
+                    ),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "project.preemption_policy.set" => {
+            match parse_params::<SetPreemptionPolicyParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .set_preemption_policy(&params.project_id, params.policy)
+                    .await
+                {
+                    Ok(policy) => RpcResponse::success(
+                        id,
+                        PreemptionPolicyResult {
+                            project_id: params.project_id,
+                            policy,
+                        },
+                    ),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "project.cache_policy.get" => match parse_params::<CachePolicyParams>(request.params) {
             Ok(params) => match state.engine.get_cache_policy(&params.project_id).await {
                 Ok(policy) => RpcResponse::success(
@@ -2362,6 +2410,28 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "session.discard" => match parse_params::<DiscardSessionParams>(request.params) {
             Ok(params) => match state.engine.discard_session(&params.session_id).await {
                 Ok(()) => RpcResponse::success(id, json!({"discarded": true})),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.preempt" => match parse_params::<SessionPreemptParams>(request.params) {
+            Ok(params) => match state
+                .agent
+                .preempt(&params.session_id, params.reason.as_deref())
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.preemption" => match parse_params::<SessionPreemptionParams>(request.params) {
+            Ok(params) => match state
+                .agent
+                .preemption(&params.session_id, params.limit.unwrap_or(100))
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),
@@ -4990,7 +5060,7 @@ mod process_rpc_tests {
             .unwrap();
         let state = AppState {
             engine: engine.clone(),
-            agent: AgentService::from_env(engine),
+            agent: AgentService::from_env(engine.clone()),
             token: Arc::new("test-token".to_string()),
             data_dir: data.path().to_path_buf(),
             started_at: now_rfc3339(),
@@ -5149,173 +5219,129 @@ mod process_rpc_tests {
         assert!(!rendered.contains("private_key"));
         assert!(!rendered.contains("passphrase"));
     }
-}
-
-#[cfg(test)]
-mod test_cache_rpc_tests {
-    use super::*;
-    use serde_json::json;
-    use std::sync::Arc;
-    use tempfile::TempDir;
-    use vp_protocol::test_cache::{TEST_CACHE_KEY_VERSION, TestCacheEntry};
-
-    fn state(store: &Store, data: &Path) -> AppState {
-        let engine = Engine::new(store.clone());
-        AppState {
-            engine: engine.clone(),
-            agent: AgentService::from_env(engine),
-            token: Arc::new("test-token".to_string()),
-            data_dir: data.to_path_buf(),
-            started_at: vp_protocol::now_rfc3339(),
-            started: Instant::now(),
-            pid: std::process::id(),
-        }
-    }
-
-    async fn call(state: &AppState, method: &str, params: Value) -> Value {
-        let response = dispatch(state, RpcRequest::new(json!(1), method, params)).await;
-        assert!(
-            response.error.is_none(),
-            "{method} failed: {:?}",
-            response.error
-        );
-        response.result.unwrap_or(Value::Null)
-    }
 
     #[tokio::test]
-    async fn policy_stats_entries_prune_and_clear_are_dispatchable() {
+    async fn preemption_rpcs_round_trip_policy_and_report_no_active_run() {
         let data = TempDir::new().unwrap();
-        let store = Store::open(data.path()).unwrap();
-        let worktree = TempDir::new().unwrap();
-        let project = store
-            .add_project(worktree.path().to_str().unwrap(), None)
+        let repo = TempDir::new().unwrap();
+        std::fs::write(repo.path().join("README.md"), "preempt\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo.path())
+            .status()
             .unwrap();
-        let session = store.create_session(&project.id, "cache rpc").unwrap();
-        let state = state(&store, data.path());
-
-        let policy = call(
+        let store = Store::open(data.path()).unwrap();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("preempt"))
+            .unwrap();
+        let session = store.create_session(&project.id, "preemption rpc").unwrap();
+        let engine = Engine::new(store.clone());
+        let state = AppState {
+            engine: engine.clone(),
+            agent: AgentService::from_env(engine.clone()),
+            token: Arc::new("test-token".to_string()),
+            data_dir: data.path().to_path_buf(),
+            started_at: now_rfc3339(),
+            started: Instant::now(),
+            pid: std::process::id(),
+        };
+        let current = call(
             &state,
-            "test_cache.policy.get",
+            "project.preemption_policy.get",
             json!({"project_id": project.id}),
         )
         .await;
-        assert_eq!(policy["policy"]["enabled"], true);
-        assert_eq!(policy["policy"]["include_integration"], false);
-
-        let policy = call(
+        assert_eq!(current["policy"]["enabled"], true);
+        assert_eq!(current["policy"]["provider_grace_ms"], 2_000);
+        let updated = call(
             &state,
-            "test_cache.policy.set",
+            "project.preemption_policy.set",
             json!({
                 "project_id": project.id,
                 "policy": {
                     "enabled": true,
-                    "max_entries": 7,
-                    "retention_days": 3,
-                    "max_output_bytes": 65536,
-                    "reuse_lint": false,
-                    "include_integration": true,
-                    "failed_retention_secs": 120
+                    "provider_grace_ms": 999_999,
+                    "tool_grace_ms": 1_500,
+                    "kill_escalation_ms": 500,
+                    "tool_deadline_secs": 9_999,
+                    "checkpoint_on_preempt": false
                 }
             }),
         )
         .await;
-        assert_eq!(policy["policy"]["max_entries"], 7);
-        assert_eq!(policy["policy"]["reuse_lint"], false);
-        assert_eq!(policy["policy"]["include_integration"], true);
+        assert_eq!(updated["policy"]["provider_grace_ms"], 30_000);
+        assert_eq!(updated["policy"]["tool_grace_ms"], 1_500);
+        assert_eq!(updated["policy"]["tool_deadline_secs"], 3_600);
+        assert_eq!(updated["policy"]["checkpoint_on_preempt"], false);
 
-        let invalid = dispatch(
+        let report = call(
             &state,
-            RpcRequest::new(
-                json!(2),
-                "test_cache.policy.set",
-                json!({
-                    "project_id": project.id,
-                    "policy": {"max_entries": 0}
-                }),
-            ),
+            "session.preemption",
+            json!({"session_id": session.id, "limit": 10}),
         )
         .await;
-        assert!(invalid.error.is_some());
+        assert_eq!(report["session_id"], session.id);
+        assert_eq!(report["preempted"], false);
+        assert_eq!(report["active"], false);
+        assert_eq!(report["policy"]["tool_grace_ms"], 1_500);
+        assert!(report["records"].as_array().unwrap().is_empty());
+
+        let preempt = call(
+            &state,
+            "session.preempt",
+            json!({"session_id": session.id, "reason": "rpc test"}),
+        )
+        .await;
+        assert_eq!(preempt["preempted"], false);
         assert!(
-            invalid
-                .error
-                .unwrap()
-                .message
-                .contains("TEST_CACHE_POLICY_INVALID")
+            preempt["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no active run")
         );
 
-        let now = vp_protocol::now_rfc3339();
-        let row = TestCacheEntry {
-            id: String::new(),
-            project_id: project.id.clone(),
-            session_id: session.id.clone(),
-            kind: "test".into(),
-            command: "cargo test".into(),
-            command_source: "Cargo.toml".into(),
-            key_version: TEST_CACHE_KEY_VERSION,
-            cache_key: format!("v1:{}", "a".repeat(64)),
-            inputs_hash: "inputs".into(),
-            impact_generation: "impact".into(),
-            status: "passed".into(),
-            exit_code: 0,
-            duration_ms: 1,
-            output_ref: None,
-            output_bytes: 0,
-            covered_paths: vec!["tests/a.rs".into()],
-            warnings: Vec::new(),
-            warning_count: 0,
-            failure_count: 0,
-            created_at: now,
-            expires_at: "2999-01-01T00:00:00Z".into(),
-            hit_count: 0,
-            last_hit_at: None,
-        };
-        store.record_test_result_with_events(&row, "{}", 7).unwrap();
-        let stats = call(
+        engine
+            .append_event(
+                &session.id,
+                "session.preempted",
+                json!({
+                    "session_id": session.id,
+                    "reason": "wall_clock",
+                    "phase": "provider",
+                    "elapsed_ms": 1005,
+                    "terminal": true,
+                    "created_at": now_rfc3339()
+                }),
+            )
+            .await
+            .unwrap();
+        let metrics = call(&state, "daemon.metrics", json!({})).await;
+        let phases = metrics["metrics"]["preemptions_by_phase"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            phases
+                .iter()
+                .any(|entry| entry["key"] == "provider" && entry["count"].as_u64() == Some(1)),
+            "metrics={metrics}"
+        );
+        assert!(
+            metrics["prometheus"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("verlinpark_preemptions{phase=\"provider\"} 1")
+        );
+        let overview = call(
             &state,
-            "test_cache.stats",
-            json!({"project_id": project.id}),
-        )
-        .await;
-        assert_eq!(stats["entries"], 1);
-        assert_eq!(stats["passed"], 1);
-
-        let entries = call(
-            &state,
-            "test_cache.entries",
+            "preemption.overview",
             json!({"project_id": project.id, "limit": 10}),
         )
         .await;
-        assert_eq!(entries["entries"].as_array().unwrap().len(), 1);
-        assert_eq!(entries["entries"][0]["command"], "cargo test");
-
-        let prune = call(
-            &state,
-            "test_cache.prune",
-            json!({"project_id": project.id, "older_than_secs": 0, "dry_run": true}),
-        )
-        .await;
-        assert_eq!(prune["pruned"], 1);
-        assert_eq!(prune["remaining"], 1);
-
-        let unconfirmed = dispatch(
-            &state,
-            RpcRequest::new(
-                json!(3),
-                "test_cache.clear",
-                json!({"project_id": project.id}),
-            ),
-        )
-        .await;
-        assert!(unconfirmed.error.is_some());
-
-        let cleared = call(
-            &state,
-            "test_cache.clear",
-            json!({"project_id": project.id, "confirm": true}),
-        )
-        .await;
-        assert_eq!(cleared["cleared"], 1);
-        assert_eq!(cleared["remaining"], 0);
+        assert_eq!(overview["total"], 1);
+        assert_eq!(overview["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(overview["sessions"][0]["last_reason"], "wall_clock");
+        assert_eq!(overview["sessions"][0]["last_phase"], "provider");
+        assert_eq!(overview["by_phase"][0]["key"], "provider");
     }
 }

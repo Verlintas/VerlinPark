@@ -9,6 +9,28 @@ use vp_providers::{EventStream, ProviderError};
 use vp_store::Store;
 use vp_store::store::Claim;
 
+/// Four-tier delegation polls several nested boxed run loops. Debug builds
+/// need more than the harness default 2 MiB stack, so this one test owns a
+/// bounded 8 MiB thread instead of changing global test settings.
+fn run_with_large_stack<F, Fut>(build: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()>,
+{
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(build());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
 fn prices(input: f64, output: f64) -> RolePrices {
     RolePrices {
         input,
@@ -390,6 +412,34 @@ impl Provider for PartialSlowProvider {
             futures_util::stream::iter(vec![Ok(StreamEvent::TextDelta("partial".into()))]).chain(
                 futures_util::stream::pending::<Result<StreamEvent, ProviderError>>(),
             ),
+        ))
+    }
+}
+
+/// Emits partial text and provider-reported usage, then stalls. A preemption
+/// must persist the reported usage (not an estimate) and never replay the turn.
+struct PreemptUsageProvider;
+
+#[async_trait]
+impl Provider for PreemptUsageProvider {
+    fn id(&self) -> &str {
+        "preempt-usage"
+    }
+
+    async fn stream_chat(&self, _request: ChatRequest) -> Result<EventStream, ProviderError> {
+        Ok(Box::pin(
+            futures_util::stream::iter(vec![
+                Ok(StreamEvent::TextDelta("partial answer".into())),
+                Ok(StreamEvent::Usage {
+                    input_tokens: 40,
+                    output_tokens: 5,
+                    cache_read_tokens: 8,
+                    cache_write_tokens: 2,
+                }),
+            ])
+            .chain(futures_util::stream::pending::<
+                Result<StreamEvent, ProviderError>,
+            >()),
         ))
     }
 }
@@ -1061,130 +1111,132 @@ async fn writes_a_persisted_plan() {
     assert!(events.iter().any(|event| event.kind == "todo.updated"));
 }
 
-#[tokio::test]
-async fn delegates_through_four_tiers() {
-    let dir = TempDir::new().unwrap();
-    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
-        responses: Mutex::new(VecDeque::from(vec![
-            vec![
-                StreamEvent::ToolCall(ToolCall {
-                    id: "call_manager".into(),
-                    name: "delegate".into(),
-                    arguments: serde_json::json!({
-                        "role": "manager",
-                        "title": "Discovery",
-                        "objective": "handle the department"
-                    })
-                    .to_string(),
-                }),
-                StreamEvent::Done,
-            ],
-            vec![
-                StreamEvent::ToolCall(ToolCall {
-                    id: "call_worker".into(),
-                    name: "delegate".into(),
-                    arguments: serde_json::json!({
-                        "role": "worker",
-                        "objective": "inspect the readme"
-                    })
-                    .to_string(),
-                }),
-                StreamEvent::Done,
-            ],
-            vec![
-                StreamEvent::ToolCall(ToolCall {
-                    id: "call_labour".into(),
-                    name: "delegate".into(),
-                    arguments: serde_json::json!({
-                        "role": "labour",
-                        "objective": "read the readme"
-                    })
-                    .to_string(),
-                }),
-                StreamEvent::Done,
-            ],
-            vec![
-                StreamEvent::ToolCall(ToolCall {
-                    id: "call_read".into(),
-                    name: "read_file".into(),
-                    arguments: r#"{"path":"README.md"}"#.into(),
-                }),
-                StreamEvent::Done,
-            ],
-            vec![
-                StreamEvent::TextDelta("labour done".into()),
-                StreamEvent::Done,
-            ],
-            vec![
-                StreamEvent::TextDelta("worker done".into()),
-                StreamEvent::Done,
-            ],
-            vec![
-                StreamEvent::TextDelta("manager done".into()),
-                StreamEvent::Done,
-            ],
-            vec![
-                StreamEvent::TextDelta("leader done".into()),
-                StreamEvent::Done,
-            ],
-        ])),
-    });
-    let (engine, service, project) = test_service_with_provider(&dir, provider);
-    let session = engine
-        .create_session(project.id, "delegate the work".into(), None)
-        .await
-        .unwrap();
-    engine
-        .create_leader_agent(&session.id, "test")
-        .await
-        .unwrap();
-    service
-        .start(&session.id, "delegate the work")
-        .await
-        .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(8);
-    loop {
-        let agents = engine.list_agents(&session.id).await.unwrap();
-        let roles = agents
-            .iter()
-            .map(|agent| agent.role.as_str())
-            .collect::<Vec<_>>();
-        let settled = roles.contains(&"leader")
-            && roles.contains(&"manager")
-            && roles.contains(&"worker")
-            && roles.contains(&"labour")
-            && agents
+#[test]
+fn delegates_through_four_tiers() {
+    run_with_large_stack(|| async {
+        let dir = TempDir::new().unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+            responses: Mutex::new(VecDeque::from(vec![
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_manager".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::json!({
+                            "role": "manager",
+                            "title": "Discovery",
+                            "objective": "handle the department"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_worker".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::json!({
+                            "role": "worker",
+                            "objective": "inspect the readme"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_labour".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::json!({
+                            "role": "labour",
+                            "objective": "read the readme"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_read".into(),
+                        name: "read_file".into(),
+                        arguments: r#"{"path":"README.md"}"#.into(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("labour done".into()),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("worker done".into()),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("manager done".into()),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("leader done".into()),
+                    StreamEvent::Done,
+                ],
+            ])),
+        });
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        let session = engine
+            .create_session(project.id, "delegate the work".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+        service
+            .start(&session.id, "delegate the work")
+            .await
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let agents = engine.list_agents(&session.id).await.unwrap();
+            let roles = agents
                 .iter()
-                .filter(|agent| agent.role != "leader")
-                .all(|agent| agent.status == "idle");
-        if settled {
-            break;
+                .map(|agent| agent.role.as_str())
+                .collect::<Vec<_>>();
+            let settled = roles.contains(&"leader")
+                && roles.contains(&"manager")
+                && roles.contains(&"worker")
+                && roles.contains(&"labour")
+                && agents
+                    .iter()
+                    .filter(|agent| agent.role != "leader")
+                    .all(|agent| agent.status == "idle");
+            if settled {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "agents did not settle: {agents:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "agents did not settle: {agents:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
 
-    let sessions = wait_until_idle(&engine, &session).await;
-    assert_eq!(sessions.status, "idle");
-    let events = engine
-        .list_events(session.id.clone(), 0, 200)
-        .await
-        .unwrap();
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| event.kind == "agent.spawned")
-            .count(),
-        3
-    );
-    assert!(
-        events
-            .iter()
-            .any(|event| event.kind == "agent.message" && event.payload["text"] == "leader done")
-    );
+        let sessions = wait_until_idle(&engine, &session).await;
+        assert_eq!(sessions.status, "idle");
+        let events = engine
+            .list_events(session.id.clone(), 0, 200)
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "agent.spawned")
+                .count(),
+            3
+        );
+        assert!(
+            events.iter().any(
+                |event| event.kind == "agent.message" && event.payload["text"] == "leader done"
+            )
+        );
+    });
 }
 
 #[tokio::test]
@@ -6670,158 +6722,160 @@ for line in sys.stdin:
 }
 
 #[cfg(target_os = "macos")]
-#[tokio::test]
-async fn delegates_to_an_external_acp_agent_and_integrates_it() {
-    let dir = TempDir::new().unwrap();
-    let script = dir.path().join("fake-acp-agent.py");
-    write_acp_agent(&script);
-    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
-        responses: Mutex::new(VecDeque::from(vec![
-            vec![
-                StreamEvent::ToolCall(ToolCall {
-                    id: "call_manager".into(),
-                    name: "delegate".into(),
-                    arguments: serde_json::json!({
-                        "role": "manager",
-                        "title": "Implementation",
-                        "objective": "use the external agent"
-                    })
-                    .to_string(),
-                }),
-                StreamEvent::Done,
-            ],
-            vec![
-                StreamEvent::ToolCall(ToolCall {
-                    id: "call_acp".into(),
-                    name: "delegate_acp".into(),
-                    arguments: serde_json::json!({
-                        "agent": "fake-acp",
-                        "objective": "write acp.txt",
-                        "write_scope": ["acp.txt"]
-                    })
-                    .to_string(),
-                }),
-                StreamEvent::Done,
-            ],
-            vec![
-                StreamEvent::ToolCall(ToolCall {
-                    id: "call_verdict".into(),
-                    name: "submit_verdict".into(),
-                    arguments: serde_json::json!({
-                        "approved": true,
-                        "summary": "acp.txt exists with the expected content"
-                    })
-                    .to_string(),
-                }),
-                StreamEvent::Done,
-            ],
-            vec![
-                StreamEvent::TextDelta("manager done".into()),
-                StreamEvent::Done,
-            ],
-            vec![
-                StreamEvent::TextDelta("leader done".into()),
-                StreamEvent::Done,
-            ],
-        ])),
-    });
-    let (engine, service, project) = test_service_with_provider(&dir, provider);
-    engine
-        .add_acp_agent(
-            "fake-acp",
-            "/usr/bin/python3",
-            vec![script.to_string_lossy().to_string()],
-            std::collections::BTreeMap::new(),
-            true,
-            false,
-            120,
-        )
-        .await
-        .unwrap();
-    let session = engine
-        .create_session(project.id, "external".into(), None)
-        .await
-        .unwrap();
-    engine
-        .create_leader_agent(&session.id, "test")
-        .await
-        .unwrap();
+#[test]
+fn delegates_to_an_external_acp_agent_and_integrates_it() {
+    run_with_large_stack(|| async {
+        let dir = TempDir::new().unwrap();
+        let script = dir.path().join("fake-acp-agent.py");
+        write_acp_agent(&script);
+        let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+            responses: Mutex::new(VecDeque::from(vec![
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_manager".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::json!({
+                            "role": "manager",
+                            "title": "Implementation",
+                            "objective": "use the external agent"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_acp".into(),
+                        name: "delegate_acp".into(),
+                        arguments: serde_json::json!({
+                            "agent": "fake-acp",
+                            "objective": "write acp.txt",
+                            "write_scope": ["acp.txt"]
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_verdict".into(),
+                        name: "submit_verdict".into(),
+                        arguments: serde_json::json!({
+                            "approved": true,
+                            "summary": "acp.txt exists with the expected content"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("manager done".into()),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("leader done".into()),
+                    StreamEvent::Done,
+                ],
+            ])),
+        });
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        engine
+            .add_acp_agent(
+                "fake-acp",
+                "/usr/bin/python3",
+                vec![script.to_string_lossy().to_string()],
+                std::collections::BTreeMap::new(),
+                true,
+                false,
+                120,
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id, "external".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
 
-    let approver_engine = engine.clone();
-    let approver_session = session.id.clone();
-    let approver = tokio::spawn(async move {
-        for _ in 0..300 {
-            if let Ok(approvals) = approver_engine
-                .list_approvals(Some(approver_session.clone()))
-                .await
-            {
-                for approval in approvals
-                    .iter()
-                    .filter(|approval| approval.status == "pending")
+        let approver_engine = engine.clone();
+        let approver_session = session.id.clone();
+        let approver = tokio::spawn(async move {
+            for _ in 0..300 {
+                if let Ok(approvals) = approver_engine
+                    .list_approvals(Some(approver_session.clone()))
+                    .await
                 {
-                    let _ = approver_engine.resolve_approval(&approval.id, true).await;
+                    for approval in approvals
+                        .iter()
+                        .filter(|approval| approval.status == "pending")
+                    {
+                        let _ = approver_engine.resolve_approval(&approval.id, true).await;
+                    }
                 }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    });
+        });
 
-    set_approval_mode(&service, ApprovalMode::Strict);
-    let worktree = session.worktree.clone().unwrap();
-    service.start(&session.id, "external").await.unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        if std::fs::read_to_string(std::path::Path::new(&worktree).join("acp.txt"))
-            .ok()
-            .as_deref()
-            == Some("from acp\n")
-        {
-            break;
+        set_approval_mode(&service, ApprovalMode::Strict);
+        let worktree = session.worktree.clone().unwrap();
+        service.start(&session.id, "external").await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if std::fs::read_to_string(std::path::Path::new(&worktree).join("acp.txt"))
+                .ok()
+                .as_deref()
+                == Some("from acp\n")
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "external ACP changes were not integrated"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "external ACP changes were not integrated"
+        let _ = wait_until_idle(&engine, &session).await;
+        approver.abort();
+        assert_eq!(
+            std::fs::read_to_string(std::path::Path::new(&worktree).join("acp.txt")).unwrap(),
+            "from acp\n"
         );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    let _ = wait_until_idle(&engine, &session).await;
-    approver.abort();
-    assert_eq!(
-        std::fs::read_to_string(std::path::Path::new(&worktree).join("acp.txt")).unwrap(),
-        "from acp\n"
-    );
-    let agents = engine.list_agents(&session.id).await.unwrap();
-    let external = agents
-        .iter()
-        .find(|agent| agent.model == "acp:fake-acp")
-        .expect("external ACP worker is recorded as a worker");
-    assert_eq!(external.role, "worker");
-    assert_eq!(external.status, "idle");
-    assert_eq!(external.title.as_deref(), Some("ACP · fake-acp"));
-    let queue = engine.list_merge_queue(&session.id).await.unwrap();
-    assert_eq!(queue.len(), 1);
-    assert_eq!(queue[0].status, "merged");
-    let events = engine
-        .list_events(session.id.clone(), 0, 300)
-        .await
-        .unwrap();
-    assert!(
-        events
+        let agents = engine.list_agents(&session.id).await.unwrap();
+        let external = agents
             .iter()
-            .any(|event| { event.kind == "agent.spawned" && event.payload["backend"] == "acp" })
-    );
-    assert!(events.iter().any(|event| {
-        event.kind == "approval.requested"
-            && event.payload["tool"]
-                .as_str()
-                .is_some_and(|tool| tool.starts_with("acp."))
-            && event.payload["approval_risk"] == "workspace_write"
-    }));
-    assert!(events.iter().any(|event| {
-        event.kind == "agent.finished"
-            && event.payload["agent_role"] == "worker"
-            && event.payload["merged"] == true
-    }));
+            .find(|agent| agent.model == "acp:fake-acp")
+            .expect("external ACP worker is recorded as a worker");
+        assert_eq!(external.role, "worker");
+        assert_eq!(external.status, "idle");
+        assert_eq!(external.title.as_deref(), Some("ACP · fake-acp"));
+        let queue = engine.list_merge_queue(&session.id).await.unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].status, "merged");
+        let events = engine
+            .list_events(session.id.clone(), 0, 300)
+            .await
+            .unwrap();
+        assert!(
+            events.iter().any(|event| {
+                event.kind == "agent.spawned" && event.payload["backend"] == "acp"
+            })
+        );
+        assert!(events.iter().any(|event| {
+            event.kind == "approval.requested"
+                && event.payload["tool"]
+                    .as_str()
+                    .is_some_and(|tool| tool.starts_with("acp."))
+                && event.payload["approval_risk"] == "workspace_write"
+        }));
+        assert!(events.iter().any(|event| {
+            event.kind == "agent.finished"
+                && event.payload["agent_role"] == "worker"
+                && event.payload["merged"] == true
+        }));
+    });
 }
 
 #[tokio::test]
@@ -18955,4 +19009,756 @@ async fn integration_command_cache_is_off_by_default_and_opt_in_when_enabled() {
         3,
         "the explicitly enabled integration cache must skip the second command"
     );
+}
+
+#[tokio::test]
+async fn preempts_a_provider_stream_and_persists_reported_partial_usage() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(PreemptUsageProvider);
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "preempt stream".into(), None)
+        .await
+        .unwrap();
+    service.start(&session.id, "preempt stream").await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let events = engine
+            .list_events(session.id.clone(), 0, 100)
+            .await
+            .unwrap();
+        if events.iter().any(|event| {
+            event.kind == "agent.message_delta" && event.payload["text"] == "partial answer"
+        }) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the provider stream did not start"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let result = service
+        .preempt(&session.id, Some("test preemption"))
+        .await
+        .unwrap();
+    assert!(result.preempted, "{}", result.detail);
+    assert_eq!(result.reason, "explicit");
+    let finished = wait_until_idle(&engine, &session).await;
+    assert_eq!(finished.status, "cancelled");
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "provider.preempted"
+            && event.payload["reason"] == "explicit"
+            && event.payload["phase"] == "provider"
+            && event.payload["terminal"] == false
+            && event.payload["partial_output_bytes"].as_u64().unwrap_or(0) > 0
+    }));
+    let terminal = events
+        .iter()
+        .find(|event| event.kind == "session.preempted")
+        .expect("terminal preemption event");
+    assert_eq!(terminal.payload["reason"], "explicit");
+    assert_eq!(terminal.payload["phase"], "provider");
+    assert_eq!(terminal.payload["terminal"], true);
+    assert!(terminal.payload["checkpoint_id"].as_str().is_some());
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "agent.stream_retry"),
+        "a preempted stream must not be retried or replayed"
+    );
+    let ledger = engine.usage_ledger(&session.id).await.unwrap();
+    assert_eq!(ledger.entries.len(), 1);
+    assert_eq!(ledger.entries[0].input_tokens, 40);
+    assert_eq!(ledger.entries[0].output_tokens, 5);
+    assert_eq!(ledger.entries[0].cache_read_tokens, 8);
+    assert!(
+        !ledger.entries[0].estimated,
+        "provider usage must be honest"
+    );
+
+    let preemption = engine.session_preemption(&session.id, 100).await.unwrap();
+    assert!(preemption.preempted);
+    assert_eq!(preemption.records.len(), 2);
+    assert_eq!(preemption.by_phase.len(), 1);
+    assert_eq!(preemption.by_phase[0].key, "provider");
+    assert_eq!(preemption.by_phase[0].count, 1);
+    assert_eq!(preemption.by_reason[0].key, "explicit");
+    let live = service.preemption(&session.id, 100).await.unwrap();
+    assert!(!live.active);
+    assert!(live.preempted);
+    let limited = engine.session_preemption(&session.id, 0).await.unwrap();
+    assert_eq!(limited.records.len(), 1);
+
+    // The history is derived from events, not a mutable projection: replay and
+    // rebuild reproduce it.
+    engine.rebuild_session(&session.id).await.unwrap();
+    let replayed = engine.session_preemption(&session.id, 100).await.unwrap();
+    assert_eq!(replayed.records.len(), 2);
+    assert!(replayed.preempted);
+}
+
+#[tokio::test]
+async fn wall_clock_budget_preempts_an_in_flight_provider_stream() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(SlowProvider);
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session_with_limits(project.id, "deadline".into(), None, None, Some(1))
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    service.start(&session.id, "deadline").await.unwrap();
+    let finished = wait_until_idle(&engine, &session).await;
+    assert_eq!(finished.status, "cancelled");
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "the wall-clock deadline fired too early"
+    );
+    let events = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    let terminal = events
+        .iter()
+        .find(|event| event.kind == "session.preempted")
+        .expect("wall-clock preemption event");
+    assert_eq!(terminal.payload["reason"], "wall_clock");
+    assert_eq!(terminal.payload["phase"], "provider");
+    assert!(terminal.payload["created_at"].as_str().is_some());
+    assert!(!service.cancel(&session.id));
+}
+
+#[tokio::test]
+async fn disabled_policy_does_not_auto_preempt_a_healthy_run() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(SlowProvider);
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    engine
+        .set_preemption_policy(
+            &project.id,
+            vp_protocol::types::PreemptionPolicy {
+                enabled: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session_with_limits(project.id, "no deadline".into(), None, None, Some(1))
+        .await
+        .unwrap();
+    service.start(&session.id, "no deadline").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let sessions = engine
+        .list_sessions(Some(session.project_id.clone()))
+        .await
+        .unwrap();
+    let current = sessions
+        .iter()
+        .find(|candidate| candidate.id == session.id)
+        .unwrap();
+    assert_eq!(current.status, "running");
+    assert!(service.cancel(&session.id));
+    let finished = wait_until_idle(&engine, &session).await;
+    assert_eq!(finished.status, "cancelled");
+    let events = engine
+        .list_events(session.id.clone(), 0, 100)
+        .await
+        .unwrap();
+    assert!(
+        !events.iter().any(|event| event.kind == "session.preempted"),
+        "disabling the policy must disable automatic wall-clock preemption"
+    );
+}
+
+#[tokio::test]
+async fn tool_deadline_stops_only_the_tool_and_the_run_continues() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(ScriptedStreamProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                Ok(StreamEvent::ToolCall(ToolCall {
+                    id: "call_sleep".into(),
+                    name: "shell".into(),
+                    arguments: json!({"command": "sleep 30"}).to_string(),
+                })),
+                Ok(StreamEvent::Done),
+            ],
+            vec![
+                Ok(StreamEvent::TextDelta("recovered after deadline".into())),
+                Ok(StreamEvent::Done),
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    engine
+        .set_preemption_policy(
+            &project.id,
+            vp_protocol::types::PreemptionPolicy {
+                tool_deadline_secs: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "tool deadline".into(), None)
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    service.start(&session.id, "tool deadline").await.unwrap();
+    let finished = wait_until_idle(&engine, &session).await;
+    assert_eq!(finished.status, "idle");
+    assert!(started.elapsed() < Duration::from_secs(8));
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "tool.preempted"
+            && event.payload["reason"] == "tool_deadline"
+            && event.payload["phase"] == "tool"
+            && event.payload["side_effects_unknown"] == true
+    }));
+    assert!(events.iter().any(|event| {
+        event.kind == "tool.finished"
+            && event.payload["tool_call_id"] == "call_sleep"
+            && event.payload["error_code"] == "DEADLINE_EXCEEDED"
+    }));
+    assert!(
+        !events.iter().any(|event| event.kind == "session.preempted"),
+        "a tool deadline is not a terminal session preemption"
+    );
+    assert!(events.iter().any(|event| {
+        event.kind == "agent.message" && event.payload["text"] == "recovered after deadline"
+    }));
+}
+
+#[tokio::test]
+async fn preempting_a_shell_kills_its_process_tree_and_marks_side_effects_unknown() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(ScriptedStreamProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            Ok(StreamEvent::ToolCall(ToolCall {
+                id: "call_tree".into(),
+                name: "shell".into(),
+                arguments:
+                    json!({"command": "echo $$ > shell.pid; sleep 30 & echo $! > child.pid; wait"})
+                        .to_string(),
+            })),
+            Ok(StreamEvent::Done),
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "kill tree".into(), None)
+        .await
+        .unwrap();
+    service.start(&session.id, "kill tree").await.unwrap();
+    let worktree = std::path::PathBuf::from(session.worktree.as_deref().unwrap());
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let (shell_pid, child_pid) = loop {
+        let shell = std::fs::read_to_string(worktree.join("shell.pid"))
+            .ok()
+            .and_then(|value| value.trim().parse::<i32>().ok());
+        let child = std::fs::read_to_string(worktree.join("child.pid"))
+            .ok()
+            .and_then(|value| value.trim().parse::<i32>().ok());
+        if let (Some(shell), Some(child)) = (shell, child) {
+            break (shell, child);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the shell process tree did not start"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    let result = service
+        .preempt(&session.id, Some("kill the tree"))
+        .await
+        .unwrap();
+    assert!(result.preempted);
+    let finished = wait_until_idle(&engine, &session).await;
+    assert_eq!(finished.status, "cancelled");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    for pid in [shell_pid, child_pid] {
+        // SAFETY: signal 0 only checks existence for a pid the test observed
+        // in its own process group.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "process {pid} survived preemption");
+    }
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "tool.preempted"
+            && event.payload["tool"] == "shell"
+            && event.payload["side_effects_unknown"] == true
+    }));
+    assert!(events.iter().any(|event| {
+        event.kind == "tool.finished"
+            && event.payload["tool_call_id"] == "call_tree"
+            && event.payload["error_code"] == "PREEMPTED"
+    }));
+    let queue = engine.list_merge_queue(&session.id).await.unwrap();
+    assert!(
+        queue.is_empty(),
+        "preempted work must never enter the merge queue"
+    );
+}
+
+#[tokio::test]
+async fn explicit_preemption_creates_a_clean_checkpoint_for_resume() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(SlowProvider);
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "checkpoint".into(), None)
+        .await
+        .unwrap();
+    service.start(&session.id, "checkpoint").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(service.preempt(&session.id, None).await.unwrap().preempted);
+    let finished = wait_until_idle(&engine, &session).await;
+    assert_eq!(finished.status, "cancelled");
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    let checkpoint = events
+        .iter()
+        .find(|event| event.kind == "session.checkpoint")
+        .expect("preemption checkpoint");
+    let terminal = events
+        .iter()
+        .find(|event| event.kind == "session.preempted")
+        .expect("terminal preemption");
+    assert_eq!(
+        terminal.payload["checkpoint_id"].as_str(),
+        checkpoint.payload["checkpoint_id"].as_str()
+    );
+}
+
+#[tokio::test]
+async fn a_fast_run_finishes_normally_before_the_wall_clock_deadline() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(ScriptedStreamProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            Ok(StreamEvent::TextDelta("finished in time".into())),
+            Ok(StreamEvent::Done),
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session_with_limits(project.id, "fast".into(), None, None, Some(5))
+        .await
+        .unwrap();
+    service.start(&session.id, "fast").await.unwrap();
+    let finished = wait_until_idle(&engine, &session).await;
+    assert_eq!(finished.status, "idle");
+    let events = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    assert!(
+        !events.iter().any(|event| event.kind == "session.preempted"),
+        "a healthy run must not be preempted"
+    );
+    assert!(events.iter().any(|event| {
+        event.kind == "agent.message" && event.payload["text"] == "finished in time"
+    }));
+}
+
+#[tokio::test]
+async fn preemption_while_waiting_for_approval_records_the_queue_phase() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(ScriptedStreamProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                Ok(StreamEvent::ToolCall(ToolCall {
+                    id: "call_approval".into(),
+                    name: "shell".into(),
+                    arguments: json!({"command": "echo approved > approved.txt"}).to_string(),
+                })),
+                Ok(StreamEvent::Done),
+            ],
+            vec![
+                Ok(StreamEvent::TextDelta("not reached".into())),
+                Ok(StreamEvent::Done),
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    set_approval_mode(&service, ApprovalMode::Strict);
+    let session = engine
+        .create_session(project.id, "approval queue".into(), None)
+        .await
+        .unwrap();
+    service.start(&session.id, "approval queue").await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let events = engine
+            .list_events(session.id.clone(), 0, 200)
+            .await
+            .unwrap();
+        if events
+            .iter()
+            .any(|event| event.kind == "approval.requested")
+        {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "the approval was not requested: {:?}",
+                events
+                    .iter()
+                    .map(|event| (event.kind.clone(), event.payload.clone()))
+                    .collect::<Vec<_>>()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        service
+            .preempt(&session.id, Some("queue test"))
+            .await
+            .unwrap()
+            .preempted
+    );
+    let finished = wait_until_idle(&engine, &session).await;
+    assert_eq!(finished.status, "cancelled");
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "session.preempt_requested" && event.payload["phase"] == "queue"
+    }));
+    assert!(events.iter().any(|event| {
+        event.kind == "session.preempted"
+            && event.payload["phase"] == "queue"
+            && event.payload["terminal"] == true
+    }));
+    assert!(
+        !events.iter().any(|event| event.kind == "tool.started"),
+        "a tool that never passed approval must not start"
+    );
+    let approvals = engine
+        .list_approvals(Some(session.id.clone()))
+        .await
+        .unwrap();
+    assert!(
+        approvals
+            .iter()
+            .all(|approval| approval.status != "pending"),
+        "preemption must resolve the pending approval"
+    );
+}
+
+#[tokio::test]
+async fn preempted_task_worktree_snapshot_preserves_untracked_work_without_moving_the_branch() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(ScriptedStreamProvider {
+        responses: Mutex::new(VecDeque::new()),
+    });
+    let (engine, _service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "task snapshot".into(), None)
+        .await
+        .unwrap();
+    let worktree = std::path::PathBuf::from(session.worktree.as_deref().unwrap());
+    std::fs::write(worktree.join("partial-task.txt"), "unfinished\n").unwrap();
+    let head = |path: &std::path::Path| {
+        std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(path)
+            .output()
+            .unwrap()
+    };
+    let before = String::from_utf8(head(&worktree).stdout).unwrap();
+    let commit = engine
+        .snapshot_preempted_task_worktree(&session.id, "T1", &worktree, "test preemption")
+        .await
+        .unwrap();
+    assert_eq!(commit.len(), 40);
+    let after = String::from_utf8(head(&worktree).stdout).unwrap();
+    assert_eq!(before, after, "the task branch must not move");
+    let exists = std::process::Command::new("git")
+        .args(["cat-file", "-e", &format!("{commit}^{{commit}}")])
+        .current_dir(&worktree)
+        .status()
+        .unwrap();
+    assert!(
+        exists.success(),
+        "the preemption snapshot commit must exist"
+    );
+    assert!(worktree.join("partial-task.txt").is_file());
+}
+
+#[tokio::test]
+async fn preemption_estimates_partial_usage_when_the_provider_reported_none() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(PartialSlowProvider);
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "estimated partial".into(), None)
+        .await
+        .unwrap();
+    service
+        .start(&session.id, "estimated partial")
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let events = engine
+            .list_events(session.id.clone(), 0, 100)
+            .await
+            .unwrap();
+        if events
+            .iter()
+            .any(|event| event.kind == "agent.message_delta" && event.payload["text"] == "partial")
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the partial stream did not start"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(service.preempt(&session.id, None).await.unwrap().preempted);
+    let finished = wait_until_idle(&engine, &session).await;
+    assert_eq!(finished.status, "cancelled");
+    let events = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    let provider_event = events
+        .iter()
+        .find(|event| event.kind == "provider.preempted")
+        .expect("provider preemption event");
+    assert_eq!(provider_event.payload["usage_estimated"], true);
+    assert!(
+        provider_event.payload["partial_input_tokens"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+    );
+    assert!(
+        provider_event.payload["partial_output_tokens"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+    );
+    let ledger = engine.usage_ledger(&session.id).await.unwrap();
+    assert_eq!(ledger.entries.len(), 1);
+    assert!(ledger.entries[0].estimated);
+    assert!(ledger.entries[0].input_tokens > 0);
+    assert!(ledger.entries[0].output_tokens > 0);
+}
+
+#[tokio::test]
+async fn preempting_a_paused_run_cancels_instead_of_leaving_it_paused() {
+    let dir = TempDir::new().unwrap();
+    let provider = Arc::new(PausingProvider {
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let provider_trait: Arc<dyn Provider> = provider.clone();
+    let (engine, service, project) = test_service_with_provider(&dir, provider_trait);
+    let session = engine
+        .create_session(project.id, "paused preempt".into(), None)
+        .await
+        .unwrap();
+    service.start(&session.id, "paused preempt").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), provider.started.notified())
+        .await
+        .unwrap();
+    assert!(service.pause(&session.id).await.unwrap());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let sessions = engine
+        .list_sessions(Some(session.project_id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(sessions[0].status, "paused");
+    assert!(
+        service
+            .preempt(&session.id, Some("stop paused"))
+            .await
+            .unwrap()
+            .preempted
+    );
+    let finished = wait_until_idle(&engine, &session).await;
+    assert_eq!(finished.status, "cancelled");
+    let events = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "session.preempted" && event.payload["reason"] == "explicit"
+    }));
+    assert!(
+        !events.iter().any(|event| event.kind == "agent.resumed"),
+        "preemption must not resume a paused run"
+    );
+    let preemption = engine.session_preemption(&session.id, 100).await.unwrap();
+    assert!(preemption.preempted);
+}
+
+#[tokio::test]
+async fn preempting_a_session_waiting_for_admission_records_the_queue_phase() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(SlowProvider);
+    let (engine, service, project) = test_service_with_provider_cap(&dir, provider, 1);
+    let first = engine
+        .create_session(project.id.clone(), "first".into(), None)
+        .await
+        .unwrap();
+    let second = engine
+        .create_session(project.id, "second".into(), None)
+        .await
+        .unwrap();
+    service.start(&first.id, "first").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    service.start(&second.id, "second").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let sessions = engine
+        .list_sessions(Some(second.project_id.clone()))
+        .await
+        .unwrap();
+    let queued = sessions
+        .iter()
+        .find(|candidate| candidate.id == second.id)
+        .expect("second session");
+    assert_eq!(queued.status, "queued");
+    assert!(
+        service
+            .preempt(&second.id, Some("leave the queue"))
+            .await
+            .unwrap()
+            .preempted
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let sessions = engine
+            .list_sessions(Some(second.project_id.clone()))
+            .await
+            .unwrap();
+        let current = sessions
+            .iter()
+            .find(|candidate| candidate.id == second.id)
+            .unwrap();
+        if current.status == "cancelled" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "queued session did not cancel: {}",
+            current.status
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let events = engine.list_events(second.id.clone(), 0, 200).await.unwrap();
+    assert!(
+        {
+            let found = events.iter().any(|event| {
+                event.kind == "session.preempted" && event.payload["phase"] == "queue"
+            });
+            if !found {
+                eprintln!(
+                    "events: {:?}",
+                    events
+                        .iter()
+                        .map(|event| (event.kind.clone(), event.payload.clone()))
+                        .collect::<Vec<_>>()
+                );
+            }
+            found
+        },
+        "missing queue preemption"
+    );
+    assert!(
+        !events.iter().any(|event| event.kind == "agent.started"),
+        "a queued session must not start after preemption"
+    );
+    assert!(service.cancel(&first.id));
+    let _ = wait_until_idle(&engine, &first).await;
+}
+
+#[tokio::test]
+async fn a_tool_deadline_aborts_a_hanging_local_http_request_and_continues() {
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let mut request = [0u8; 4096];
+        let _ = socket.read(&mut request).await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(ScriptedStreamProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                Ok(StreamEvent::ToolCall(ToolCall {
+                    id: "call_http".into(),
+                    name: "local_http".into(),
+                    arguments: json!({
+                        "url": format!("http://{address}/hang"),
+                        "timeout_secs": 60
+                    })
+                    .to_string(),
+                })),
+                Ok(StreamEvent::Done),
+            ],
+            vec![
+                Ok(StreamEvent::TextDelta("http deadline recovered".into())),
+                Ok(StreamEvent::Done),
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    engine
+        .set_preemption_policy(
+            &project.id,
+            vp_protocol::types::PreemptionPolicy {
+                tool_deadline_secs: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "http deadline".into(), None)
+        .await
+        .unwrap();
+    service.start(&session.id, "http deadline").await.unwrap();
+    let finished = wait_until_idle(&engine, &session).await;
+    assert_eq!(finished.status, "idle");
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "tool.preempted"
+            && event.payload["tool"] == "local_http"
+            && event.payload["reason"] == "tool_deadline"
+    }));
+    assert!(events.iter().any(|event| {
+        event.kind == "tool.finished"
+            && event.payload["tool_call_id"] == "call_http"
+            && event.payload["error_code"] == "DEADLINE_EXCEEDED"
+    }));
+    assert!(events.iter().any(|event| {
+        event.kind == "agent.message" && event.payload["text"] == "http deadline recovered"
+    }));
 }

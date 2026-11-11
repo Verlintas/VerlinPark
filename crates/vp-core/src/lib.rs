@@ -41,12 +41,13 @@ use vp_protocol::types::{
     MemoryEvidence, MemoryHealthResult, MemoryItem, MemoryListResult, MemoryMatch, MemoryPolicy,
     MemoryPolicyResult, MemoryPruneResult, MemorySearchParams, MemorySearchResult,
     MemorySemanticSummary, MemoryStatsResult, MemorySweepResult, MemoryUpdateResult,
-    MemoryVerificationCheck, MemoryVerifyResult, MergeQueueEntry, MessageCitation, ModelPreset,
-    ModelPresetListResult, OrchestrationDecision, OrchestrationNote, OrchestrationOverviewResult,
-    OrchestrationOverviewTotals, OrchestrationPolicy, OrchestrationPreviewAction,
-    OrchestrationPreviewResult, OrchestrationRecoveriesResult, OrchestrationRecovery,
-    OrchestrationSessionSummary, OrchestrationSnapshot, PlanRevisionDetailResult, PlanRevisionInfo,
-    ProcessListResult, ProcessLogsResult, ProcessPolicy, ProcessStopResult,
+    MemoryVerificationCheck, MemoryVerifyResult, MergeQueueEntry, MessageCitation, MetricCount,
+    ModelPreset, ModelPresetListResult, OrchestrationDecision, OrchestrationNote,
+    OrchestrationOverviewResult, OrchestrationOverviewTotals, OrchestrationPolicy,
+    OrchestrationPreviewAction, OrchestrationPreviewResult, OrchestrationRecoveriesResult,
+    OrchestrationRecovery, OrchestrationSessionSummary, OrchestrationSnapshot,
+    PlanRevisionDetailResult, PlanRevisionInfo, PreemptionOverviewResult, PreemptionPolicy,
+    PreemptionRecord, ProcessListResult, ProcessLogsResult, ProcessPolicy, ProcessStopResult,
     ProcessSupervisorStatus, Program, ProgramActionParams, ProgramCreateParams,
     ProgramDeleteParams, ProgramListResult, ProgramMilestone, ProgramMilestoneActionParams,
     ProgramMilestoneCreateParams, ProgramMilestoneListResult, ProgramMilestoneUpdateParams,
@@ -62,8 +63,8 @@ use vp_protocol::types::{
     SessionContinuationReclaimResult, SessionContinuationStatusResult, SessionContinuationsResult,
     SessionDeferResult, SessionDiff, SessionForkResult, SessionForkTreeNode, SessionForkTreeResult,
     SessionImportResult, SessionLandResult, SessionLineageEntry, SessionLineageResult,
-    SessionLogStatus, SessionPriorityResult, SessionRehydrateResult, SessionReplayReport,
-    SessionSkillActivationsResult, SessionStallsResult, SessionSteerResult,
+    SessionLogStatus, SessionPreemptionResult, SessionPriorityResult, SessionRehydrateResult,
+    SessionReplayReport, SessionSkillActivationsResult, SessionStallsResult, SessionSteerResult,
     SessionSteeringCancelResult, SessionSteeringListResult, SessionTranscriptResult,
     SessionUnlimitedResult, ShellPolicy, Skill, SkillActivation, SkillCreateParams,
     SkillDeleteResult, SkillEnabledParams, SkillImportParams, SkillListResult, SkillUpdateParams,
@@ -118,6 +119,7 @@ pub mod multi_path;
 mod operation;
 pub mod orchestration;
 pub mod permissions;
+pub mod preemption;
 pub mod process_supervisor;
 pub mod program;
 pub mod prompt_cache;
@@ -1529,6 +1531,135 @@ impl Engine {
         })
         .await??;
         Ok(policy)
+    }
+
+    /// Project-scoped hard-preemption policy. This never changes cooperative
+    /// pause/cancel and never widens a grace past its hard bound.
+    pub async fn get_preemption_policy(&self, project_id: &str) -> Result<PreemptionPolicy> {
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            if store.get_project(&project_id)?.is_none() {
+                return Err(anyhow::anyhow!("project not found: {project_id}"));
+            }
+            store.get_preemption_policy(&project_id)
+        })
+        .await?
+    }
+
+    pub async fn set_preemption_policy(
+        &self,
+        project_id: &str,
+        policy: PreemptionPolicy,
+    ) -> Result<PreemptionPolicy> {
+        let policy = policy
+            .normalized()
+            .map_err(|error| anyhow::anyhow!("invalid preemption policy: {error}"))?;
+        let store = self.store.clone();
+        let project_id_for_store = project_id.to_string();
+        let policy_for_store = policy.clone();
+        tokio::task::spawn_blocking(move || {
+            if store.get_project(&project_id_for_store)?.is_none() {
+                return Err(anyhow::anyhow!("project not found: {project_id_for_store}"));
+            }
+            store.set_preemption_policy(&project_id_for_store, &policy_for_store)
+        })
+        .await??;
+        Ok(policy)
+    }
+
+    /// Event-derived preemption history. This intentionally reads the session
+    /// event stream rather than a mutable projection, so replay, repair, bundle
+    /// import, and `db-rebuild` all reproduce the same records.
+    pub async fn session_preemption(
+        &self,
+        session_id: &str,
+        limit: u32,
+    ) -> Result<SessionPreemptionResult> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let session = tokio::task::spawn_blocking(move || store.get_session(&id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+        let policy = self.get_preemption_policy(&session.project_id).await?;
+        let events = self
+            .recent_events_of_kind(session_id, "session.preempted", 1_000)
+            .await?;
+        let provider_events = self
+            .recent_events_of_kind(session_id, "provider.preempted", 1_000)
+            .await?;
+        let tool_events = self
+            .recent_events_of_kind(session_id, "tool.preempted", 1_000)
+            .await?;
+        let mut records = Vec::new();
+        for event in provider_events.into_iter().chain(tool_events).chain(events) {
+            if let Ok(record) = serde_json::from_value::<PreemptionRecord>(event.payload) {
+                records.push(record);
+            }
+        }
+        records.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.phase.cmp(&right.phase))
+        });
+        let cap = limit.clamp(1, 1_000) as usize;
+        if records.len() > cap {
+            records = records.split_off(records.len() - cap);
+        }
+        let mut phases: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        let mut reasons: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
+        let mut terminal = false;
+        for record in &records {
+            if !record.terminal {
+                continue;
+            }
+            terminal = true;
+            *phases.entry(record.phase.clone()).or_default() += 1;
+            *reasons.entry(record.reason.clone()).or_default() += 1;
+        }
+        Ok(SessionPreemptionResult {
+            session_id: session_id.to_string(),
+            policy,
+            active: false,
+            preempted: terminal,
+            records,
+            by_phase: phases
+                .into_iter()
+                .map(|(key, count)| MetricCount { key, count })
+                .collect(),
+            by_reason: reasons
+                .into_iter()
+                .map(|(key, count)| MetricCount { key, count })
+                .collect(),
+        })
+    }
+
+    /// Event-derived project overview for Manage Dash and operational audit.
+    pub async fn preemption_overview(
+        &self,
+        project_id: &str,
+        limit: u32,
+    ) -> Result<PreemptionOverviewResult> {
+        let policy = self.get_preemption_policy(project_id).await?;
+        let store = self.store.clone();
+        let project_id_string = project_id.to_string();
+        let (sessions, by_phase, by_reason) = tokio::task::spawn_blocking(move || {
+            store.preemption_overview(&project_id_string, limit)
+        })
+        .await??;
+        let total = sessions
+            .iter()
+            .map(|summary| summary.terminal_count)
+            .sum::<u64>();
+        Ok(PreemptionOverviewResult {
+            project_id: project_id.to_string(),
+            policy,
+            total,
+            sessions,
+            by_phase,
+            by_reason,
+        })
     }
 
     /// Read-only language-server availability for a project checkout. This
@@ -4437,17 +4568,81 @@ impl Engine {
 
     /// Snapshot the active conversation and committed session branch. The
     /// worktree must be clean so the checkpoint commit is reproducible.
+    /// Snapshot a preempted Worker/Labour task worktree under a daemon-owned
+    /// ref. This preserves incomplete work for inspection and an explicit
+    /// retry; it never merges, commits to the task branch, or enters the merge
+    /// queue.
+    pub(crate) async fn snapshot_preempted_task_worktree(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        worktree_path: &Path,
+        label: &str,
+    ) -> Result<String> {
+        let data_dir = self.store.data_dir().to_path_buf();
+        let session_id = session_id.to_string();
+        let task_id = task_id.to_string();
+        let worktree_path = worktree_path.to_path_buf();
+        let checkpoint_id = format!("preempt-{}", Uuid::now_v7());
+        let label = format!(
+            "{} [task {}]",
+            label.chars().take(80).collect::<String>(),
+            task_id.chars().take(80).collect::<String>()
+        );
+        let git_lock = self.git_lock.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = git_lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("git mutex poisoned"))?;
+            if !worktree_path.is_dir() {
+                anyhow::bail!("task worktree is missing: {}", worktree_path.display());
+            }
+            worktree::snapshot_worktree(
+                &worktree_path,
+                &data_dir,
+                &session_id,
+                &checkpoint_id,
+                &label,
+            )
+        })
+        .await?
+    }
+
     pub async fn checkpoint_session(
         &self,
         session_id: &str,
         label: Option<String>,
+    ) -> Result<SessionCheckpoint> {
+        self.checkpoint_session_inner(session_id, label, false)
+            .await
+    }
+
+    /// Checkpoint at a hard-preemption boundary. The run loop has already
+    /// stopped provider/tool work and is the only writer, so the normal
+    /// running/paused quiescence gate is intentionally bypassed. This is not a
+    /// general-purpose escape hatch and is not exposed over RPC.
+    pub(crate) async fn checkpoint_session_at_preemption(
+        &self,
+        session_id: &str,
+        label: Option<String>,
+    ) -> Result<SessionCheckpoint> {
+        self.checkpoint_session_inner(session_id, label, true).await
+    }
+
+    async fn checkpoint_session_inner(
+        &self,
+        session_id: &str,
+        label: Option<String>,
+        preemption_safe: bool,
     ) -> Result<SessionCheckpoint> {
         let store = self.store.clone();
         let id = session_id.to_string();
         let session = tokio::task::spawn_blocking(move || store.get_session(&id))
             .await??
             .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
-        ensure_session_quiescent(&session, "create a checkpoint")?;
+        if !preemption_safe {
+            ensure_session_quiescent(&session, "create a checkpoint")?;
+        }
         let worktree = PathBuf::from(
             session
                 .worktree

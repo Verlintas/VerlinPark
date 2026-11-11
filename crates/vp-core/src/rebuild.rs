@@ -114,6 +114,7 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
                 &snapshot.context_checkpoint_policy,
             )?;
             store.set_process_policy(&snapshot.project.id, &snapshot.process_policy)?;
+            store.set_preemption_policy(&snapshot.project.id, &snapshot.preemption_policy)?;
             store.set_project_budget(&snapshot.project.id, &snapshot.budget)?;
             store
                 .set_task_scheduler_policy(&snapshot.project.id, &snapshot.task_scheduler_policy)?;
@@ -428,6 +429,19 @@ mod tests {
                 .await
                 .unwrap();
             engine
+                .set_preemption_policy(
+                    &project.id,
+                    vp_protocol::types::PreemptionPolicy {
+                        provider_grace_ms: 500,
+                        tool_grace_ms: 1_000,
+                        kill_escalation_ms: 250,
+                        tool_deadline_secs: Some(45),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            engine
                 .create_intake_task(vp_protocol::types::IntakeCreateParams {
                     project_id: project.id.clone(),
                     title: "Rebuild intake".into(),
@@ -563,6 +577,11 @@ mod tests {
         let store = Store::open(data.path()).unwrap();
         let project = store.get_project(&project_id).unwrap().unwrap();
         assert_eq!(project.name, "rebuild");
+        let policy = store.get_preemption_policy(&project.id).unwrap();
+        assert_eq!(policy.provider_grace_ms, 500);
+        assert_eq!(policy.tool_grace_ms, 1_000);
+        assert_eq!(policy.kill_escalation_ms, 250);
+        assert_eq!(policy.tool_deadline_secs, Some(45));
         let session = store.get_session(&session_id).unwrap().unwrap();
         assert_eq!(session.goal, "rebuild me");
         assert_eq!(session.token_budget, Some(1000));

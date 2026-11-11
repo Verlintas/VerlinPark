@@ -125,11 +125,16 @@ impl McpSession {
         }
     }
 
-    async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+    async fn request_preemptible(
+        &mut self,
+        method: &str,
+        params: Value,
+        token: Option<&vp_providers::PreemptToken>,
+    ) -> Result<Value> {
         match self {
-            Self::Stdio(session) => session.request(method, params).await,
-            Self::Http(session) => session.request(method, params).await,
-            Self::Sse(session) => session.request(method, params).await,
+            Self::Stdio(session) => session.request_preemptible(method, params, token).await,
+            Self::Http(session) => session.request_preemptible(method, params, token).await,
+            Self::Sse(session) => session.request_preemptible(method, params, token).await,
         }
     }
 
@@ -760,8 +765,13 @@ impl McpManager {
         method: &str,
         params: Value,
     ) -> Result<Value> {
+        let token = crate::preemption::current_token();
         let mut session = connection.session.lock().await;
-        let result = timeout(method, session.request(method, params)).await;
+        let result = timeout(
+            method,
+            session.request_preemptible(method, params, token.as_ref()),
+        )
+        .await;
         drop(session);
         if result.is_ok() {
             connection.touch();
@@ -1661,6 +1671,9 @@ for line in sys.stdin:
         else:
             result = {"tools": [{"name": "echo", "description": "Echo text", "inputSchema": {"type": "object"}}]}
     elif method == "tools/call":
+        if os.environ.get("MOCK_SLOW") == "1":
+            import time
+            time.sleep(30)
         result = {"content": [{"type": "text", "text": message.get("params", {}).get("arguments", {}).get("text", "")}]}
     elif method == "resources/list":
         result = {"resources": [{"uri": "file:///notes.md", "name": "notes", "description": "Project notes", "mimeType": "text/markdown"}]}
@@ -1819,5 +1832,36 @@ for line in sys.stdin:
         let manager = McpManager::new(Duration::from_secs(60));
         assert!(manager.list_tools(&server).await.is_err());
         assert!(manager.call_tool(&server, "echo", json!({})).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn preemption_abandons_a_slow_mcp_call_within_a_bounded_window() {
+        let dir = TempDir::new().unwrap();
+        let mut server = mock_server(&dir);
+        server.env.insert("MOCK_SLOW".to_string(), "1".to_string());
+        let manager = McpManager::new(Duration::from_secs(60));
+        let token = crate::preemption::Token::disabled();
+        let trigger = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            trigger.trigger(
+                crate::preemption::Reason::Explicit,
+                crate::preemption::Phase::Tool,
+                true,
+            );
+        });
+        let started = std::time::Instant::now();
+        let result = crate::preemption::scope_token(token, async {
+            manager
+                .call_tool(&server, "echo", json!({"text": "slow"}))
+                .await
+        })
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let error = result.expect_err("preempted MCP call");
+        assert!(
+            error.to_string().contains("preempted"),
+            "unexpected MCP error: {error}"
+        );
     }
 }

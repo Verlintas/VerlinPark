@@ -59,6 +59,16 @@ private struct ProjectStageView: View {
         VStack(spacing: 0) {
             stageHeader
             VPHairline()
+            if let session = model.selectedSession,
+               let preemption = model.sessionPreemption,
+               preemption.preempted,
+               ["cancelled", "failed"].contains(session.status)
+            {
+                PreemptionBanner(result: preemption)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 9)
+                VPHairline()
+            }
             if let session = model.selectedSession {
                 SessionChatView(session: session)
                     .id(session.id)
@@ -366,6 +376,16 @@ private struct ProjectStageView: View {
                         }
                         if ["running", "paused", "queued"].contains(session.status) {
                             Divider()
+                            Button("Preempt Now") {
+                                Task {
+                                    await model.preemptActiveRun(
+                                        reason: "operator preemption from the Stage"
+                                    )
+                                }
+                            }
+                            .help(
+                                "Hard-preempt the run: abort an in-flight provider stream or tool call with bounded cleanup."
+                            )
                             Button("Stop", role: .destructive) {
                                 Task { await model.cancelSession() }
                             }
@@ -1890,5 +1910,74 @@ private struct WelcomeStageView: View {
                 .strokeBorder(tint.opacity(0.14), lineWidth: 1)
         }
         .vpHoverLift(scale: 1.015, lift: 2, glow: tint)
+    }
+}
+
+/// Stage-level notice for a hard preemption. It is informational: it never
+/// retries, resumes, or merges the interrupted work.
+struct PreemptionBanner: View {
+    let result: SessionPreemptionResult
+
+    private var latest: PreemptionRecord? {
+        result.records.last(where: { $0.terminal }) ?? result.records.last
+    }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: "bolt.slash.fill")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(VPTheme.danger)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Run preempted")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(VPTheme.textPrimary)
+                if let latest {
+                    Text(bannerDetail(latest))
+                        .font(VPTheme.mono(9.5))
+                        .foregroundStyle(VPTheme.textSecondary)
+                        .lineLimit(2)
+                } else {
+                    Text("Incomplete work was not merged. Inspect the worktree before resuming.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(VPTheme.textSecondary)
+                }
+            }
+            Spacer(minLength: 0)
+            if latest?.checkpointId != nil {
+                Label("checkpoint", systemImage: "camera.aperture")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(VPTheme.textTertiary)
+            }
+        }
+        .padding(.horizontal, 11)
+        .padding(.vertical, 7)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(VPTheme.surface)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(VPTheme.danger.opacity(0.35), lineWidth: 1)
+                }
+        )
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            latest.map { L10n.t("Run preempted: \($0.summary)") }
+                ?? L10n.t("Run preempted")
+        )
+    }
+
+    private func bannerDetail(_ record: PreemptionRecord) -> String {
+        var detail = record.summary
+        if record.sideEffectsUnknown {
+            detail += " · verify side effects"
+        }
+        if record.partialInputTokens + record.partialOutputTokens > 0 {
+            detail +=
+                " · partial \(record.partialInputTokens) in / \(record.partialOutputTokens) out"
+            if record.usageEstimated {
+                detail += " (estimated)"
+            }
+        }
+        return detail
     }
 }

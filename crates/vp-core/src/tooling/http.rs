@@ -48,6 +48,12 @@ impl AgentTool for LocalHttp {
     }
 
     async fn execute(&self, _context: &ToolContext, input: Value) -> Result<ToolOutput> {
+        let token = crate::preemption::current_token();
+        if let Some(token) = &token
+            && let Some(snapshot) = token.snapshot()
+        {
+            return Ok(crate::preemption::tool_output("local_http", &snapshot));
+        }
         let request_id = format!("http_{}", &Uuid::now_v7().simple().to_string()[..12]);
         let method = input
             .get("method")
@@ -164,9 +170,41 @@ impl AgentTool for LocalHttp {
             if let Some(body) = &body {
                 request = request.body(body.clone());
             }
-            let sent = match request.send().await {
+            let sent = match &token {
+                Some(token) => {
+                    tokio::select! {
+                        _ = token.cancelled() => {
+                            return Ok(crate::preemption::tool_output(
+                                "local_http",
+                                &token.snapshot().unwrap_or_else(|| {
+                                    crate::preemption::fallback_snapshot(
+                                        crate::preemption::Phase::Tool,
+                                        Some("local_http"),
+                                    )
+                                }),
+                            ));
+                        }
+                        sent = request.send() => sent,
+                    }
+                }
+                None => request.send().await,
+            };
+            let sent = match sent {
                 Ok(sent) => sent,
                 Err(error) => {
+                    if let Some(token) = &token
+                        && token.is_preempted()
+                    {
+                        return Ok(crate::preemption::tool_output(
+                            "local_http",
+                            &token.snapshot().unwrap_or_else(|| {
+                                crate::preemption::fallback_snapshot(
+                                    crate::preemption::Phase::Tool,
+                                    Some("local_http"),
+                                )
+                            }),
+                        ));
+                    }
                     return Ok(ToolOutput::error_structured(
                         format!("{method} {current} failed: {error}"),
                         json!({
@@ -237,7 +275,29 @@ impl AgentTool for LocalHttp {
         let mut bytes = Vec::new();
         let mut truncated = false;
         let mut response = response;
-        while let Some(chunk) = response.chunk().await? {
+        loop {
+            let next = match &token {
+                Some(token) => {
+                    tokio::select! {
+                        _ = token.cancelled() => {
+                            return Ok(crate::preemption::tool_output(
+                                "local_http",
+                                &token.snapshot().unwrap_or_else(|| {
+                                    crate::preemption::fallback_snapshot(
+                                        crate::preemption::Phase::Tool,
+                                        Some("local_http"),
+                                    )
+                                }),
+                            ));
+                        }
+                        chunk = response.chunk() => chunk?,
+                    }
+                }
+                None => response.chunk().await?,
+            };
+            let Some(chunk) = next else {
+                break;
+            };
             bytes.extend_from_slice(&chunk);
             if bytes.len() >= MAX_BODY_BYTES {
                 truncated = true;
@@ -445,5 +505,51 @@ mod tests {
         assert!(!is_local_url("https://example.com"));
         assert!(!is_local_url("file:///etc/passwd"));
         assert!(!is_local_url("http://user:pass@localhost:8080"));
+    }
+
+    #[tokio::test]
+    async fn preemption_aborts_a_hanging_local_http_request() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let dir = TempDir::new().unwrap();
+        let token = crate::preemption::Token::disabled();
+        let trigger = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            trigger.trigger(
+                crate::preemption::Reason::Explicit,
+                crate::preemption::Phase::Tool,
+                true,
+            );
+        });
+        let started = Instant::now();
+        let output = crate::preemption::scope_token(
+            token,
+            LocalHttp.execute(
+                &context(&dir),
+                json!({
+                    "url": format!("http://{address}/hang"),
+                    "timeout_secs": 60
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(output.is_error, "{}", output.content);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let snapshot = crate::preemption::output_snapshot(&output).expect("typed preemption");
+        assert_eq!(snapshot.reason, crate::preemption::Reason::Explicit);
+        assert_eq!(snapshot.phase, crate::preemption::Phase::Tool);
+        assert!(snapshot.side_effects_unknown);
+        assert!(output.content.contains("PREEMPTED"));
     }
 }

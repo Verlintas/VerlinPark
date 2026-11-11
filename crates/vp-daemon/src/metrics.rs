@@ -104,6 +104,20 @@ pub fn render_prometheus(metrics: &DaemonMetrics) -> String {
         "state",
         &metrics.supervised_processes,
     );
+    render_group(
+        &mut out,
+        "verlinpark_preemptions",
+        "Terminal hard preemptions by phase.",
+        "phase",
+        &metrics.preemptions_by_phase,
+    );
+    render_group(
+        &mut out,
+        "verlinpark_preemptions_by_reason",
+        "Terminal hard preemptions by reason.",
+        "reason",
+        &metrics.preemptions_by_reason,
+    );
     let _ = writeln!(
         out,
         "# HELP verlinpark_supervised_process_output_bytes Retained bytes across supervised-process logs."
@@ -254,6 +268,8 @@ mod tests {
             runtime_leases: vec![count("session", 2)],
             supervised_processes: vec![count("running", 1), count("lost", 1)],
             supervised_process_output_bytes: 512,
+            preemptions_by_phase: vec![count("provider", 1), count("tool", 1)],
+            preemptions_by_reason: vec![count("wall_clock", 1), count("explicit", 1)],
             tokens_in: 1000,
             tokens_out: 250,
             cache_read_tokens: 400,
@@ -382,5 +398,15 @@ mod tests {
 
         metrics.cache_hit_ratio = f64::NAN;
         assert!(render_prometheus(&metrics).contains("verlinpark_cache_hit_ratio 0\n"));
+    }
+
+    #[test]
+    fn renders_preemption_metrics_by_phase_and_reason() {
+        let rendered = render_prometheus(&sample_metrics());
+        assert!(rendered.contains("verlinpark_preemptions{phase=\"provider\"} 1"));
+        assert!(rendered.contains("verlinpark_preemptions{phase=\"tool\"} 1"));
+        assert!(rendered.contains("verlinpark_preemptions_by_reason{reason=\"explicit\"} 1"));
+        assert!(rendered.contains("verlinpark_preemptions_by_reason{reason=\"wall_clock\"} 1"));
+        assert!(!rendered.contains("session_id="));
     }
 }

@@ -1312,6 +1312,12 @@ pub struct DaemonMetrics {
     /// Retained bytes across daemon-owned supervised-process logs.
     #[serde(default)]
     pub supervised_process_output_bytes: u64,
+    /// Terminal preemptions by phase (`provider`, `tool`, `queue`).
+    #[serde(default)]
+    pub preemptions_by_phase: Vec<MetricCount>,
+    /// Terminal preemptions by reason (`wall_clock`, `explicit`).
+    #[serde(default)]
+    pub preemptions_by_reason: Vec<MetricCount>,
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub cache_read_tokens: u64,
@@ -2688,11 +2694,295 @@ impl ProcessPolicy {
     }
 }
 
+/// Project-scoped hard-preemption policy. This is separate from cooperative
+/// pause/cancel: it bounds the grace the runtime gives in-flight provider and
+/// tool work after a wall-clock, explicit, or per-tool deadline fires. Every
+/// grace has a finite upper bound, so no configuration can create an infinite
+/// shutdown window.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreemptionPolicy {
+    /// Enable automatic wall-clock preemption. Default true. An explicit
+    /// `session.preempt` is an operator action and still works when this is
+    /// false; a per-tool deadline only applies when `tool_deadline_secs` is
+    /// set and this switch is true.
+    #[serde(default = "default_preemption_enabled")]
+    pub enabled: bool,
+    /// Time allowed for an in-flight provider read to close and report usage
+    /// after a preemption. The adapter never starts another request.
+    #[serde(default = "default_provider_grace_ms")]
+    pub provider_grace_ms: u64,
+    /// Time allowed for a tool to observe cancellation before termination.
+    #[serde(default = "default_tool_grace_ms")]
+    pub tool_grace_ms: u64,
+    /// Time between the graceful termination signal and the forced kill for a
+    /// process group. Also used as the bounded wait after a forced kill.
+    #[serde(default = "default_kill_escalation_ms")]
+    pub kill_escalation_ms: u64,
+    /// Optional per-tool deadline. `None` disables tool deadlines.
+    #[serde(default)]
+    pub tool_deadline_secs: Option<u64>,
+    /// Create a session checkpoint after a safe preemption when the worktree is
+    /// available. Default true; a checkpoint failure never changes the
+    /// preempted status and never merges incomplete work.
+    #[serde(default = "default_preemption_checkpoint")]
+    pub checkpoint_on_preempt: bool,
+}
+
+fn default_preemption_enabled() -> bool {
+    true
+}
+
+fn default_provider_grace_ms() -> u64 {
+    2_000
+}
+
+fn default_tool_grace_ms() -> u64 {
+    5_000
+}
+
+fn default_kill_escalation_ms() -> u64 {
+    2_000
+}
+
+fn default_preemption_checkpoint() -> bool {
+    true
+}
+
+impl Default for PreemptionPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            provider_grace_ms: default_provider_grace_ms(),
+            tool_grace_ms: default_tool_grace_ms(),
+            kill_escalation_ms: default_kill_escalation_ms(),
+            tool_deadline_secs: None,
+            checkpoint_on_preempt: true,
+        }
+    }
+}
+
+impl PreemptionPolicy {
+    /// Validate and clamp to the documented bounds. A request may narrow a
+    /// grace but cannot widen it past the hard upper bound.
+    pub fn normalized(mut self) -> Result<Self, String> {
+        self.provider_grace_ms = self.provider_grace_ms.min(30_000);
+        self.tool_grace_ms = self.tool_grace_ms.min(60_000);
+        self.kill_escalation_ms = self.kill_escalation_ms.min(30_000);
+        self.tool_deadline_secs = self.tool_deadline_secs.map(|secs| secs.clamp(1, 3_600));
+        Ok(self)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.provider_grace_ms > 30_000 {
+            return Err("provider_grace_ms must be at most 30000".to_string());
+        }
+        if self.tool_grace_ms > 60_000 {
+            return Err("tool_grace_ms must be at most 60000".to_string());
+        }
+        if self.kill_escalation_ms > 30_000 {
+            return Err("kill_escalation_ms must be at most 30000".to_string());
+        }
+        if let Some(secs) = self.tool_deadline_secs
+            && !(1..=3_600).contains(&secs)
+        {
+            return Err("tool_deadline_secs must be 1..3600".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn provider_grace(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.provider_grace_ms.min(30_000))
+    }
+
+    pub fn tool_grace(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.tool_grace_ms.min(60_000))
+    }
+
+    pub fn kill_escalation(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.kill_escalation_ms.min(30_000))
+    }
+
+    pub fn tool_deadline(&self) -> Option<std::time::Duration> {
+        self.tool_deadline_secs
+            .map(|secs| std::time::Duration::from_secs(secs.clamp(1, 3_600)))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PreemptionPolicyParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetPreemptionPolicyParams {
+    pub project_id: String,
+    pub policy: PreemptionPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreemptionPolicyResult {
+    pub project_id: String,
+    pub policy: PreemptionPolicy,
+}
+
+/// One bounded preemption observation. It never contains prompt text, tool
+/// input, file contents, command output, or credentials.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreemptionRecord {
+    pub session_id: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub agent_id: String,
+    #[serde(default)]
+    pub agent_name: String,
+    #[serde(default)]
+    pub agent_role: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub department: Option<String>,
+    /// `wall_clock`, `explicit`, or `tool_deadline`.
+    pub reason: String,
+    /// `provider`, `tool`, or `queue`.
+    pub phase: String,
+    #[serde(default)]
+    pub tool: Option<String>,
+    #[serde(default)]
+    pub elapsed_ms: u64,
+    #[serde(default)]
+    pub side_effects_unknown: bool,
+    #[serde(default)]
+    pub partial_input_tokens: u64,
+    #[serde(default)]
+    pub partial_output_tokens: u64,
+    #[serde(default)]
+    pub partial_output_bytes: u64,
+    #[serde(default)]
+    pub usage_estimated: bool,
+    #[serde(default)]
+    pub checkpoint_id: Option<String>,
+    /// Snapshot commit of the preempted Worker/Labour task worktree. It is
+    /// never merged automatically; it only preserves incomplete work for
+    /// inspection or an explicit retry.
+    #[serde(default)]
+    pub task_checkpoint_commit: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// True for the authoritative `session.preempted` terminal record. Tool
+    /// deadline sub-events are false.
+    #[serde(default)]
+    pub terminal: bool,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+impl PreemptionRecord {
+    pub fn summary(&self) -> String {
+        let mut text = format!(
+            "{} preempted during {} after {}ms",
+            self.reason, self.phase, self.elapsed_ms
+        );
+        if let Some(tool) = &self.tool {
+            text.push_str(&format!(" ({tool})"));
+        }
+        if self.side_effects_unknown {
+            text.push_str("; side effects unknown");
+        }
+        text
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionPreemptParams {
+    pub session_id: String,
+    /// Operator-supplied bounded reason. It is persisted in the audit event.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionPreemptResult {
+    pub session_id: String,
+    /// True when an active run received the preemption signal. It is not a
+    /// claim that the run finished instantly.
+    pub preempted: bool,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionPreemptionParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionPreemptionResult {
+    pub session_id: String,
+    pub policy: PreemptionPolicy,
+    /// The run currently holds an in-memory preempt token and that token has
+    /// fired. False once the run finishes and is removed.
+    #[serde(default)]
+    pub active: bool,
+    /// True when any terminal preemption record exists for the session.
+    #[serde(default)]
+    pub preempted: bool,
+    #[serde(default)]
+    pub records: Vec<PreemptionRecord>,
+    #[serde(default)]
+    pub by_phase: Vec<MetricCount>,
+    #[serde(default)]
+    pub by_reason: Vec<MetricCount>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PreemptionOverviewParams {
+    pub project_id: String,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreemptionSessionSummary {
+    pub session_id: String,
+    #[serde(default)]
+    pub goal: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub terminal_count: u64,
+    #[serde(default)]
+    pub last_reason: String,
+    #[serde(default)]
+    pub last_phase: String,
+    #[serde(default)]
+    pub last_tool: Option<String>,
+    #[serde(default)]
+    pub last_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreemptionOverviewResult {
+    pub project_id: String,
+    pub policy: PreemptionPolicy,
+    #[serde(default)]
+    pub total: u64,
+    #[serde(default)]
+    pub sessions: Vec<PreemptionSessionSummary>,
+    #[serde(default)]
+    pub by_phase: Vec<MetricCount>,
+    #[serde(default)]
+    pub by_reason: Vec<MetricCount>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProcessPolicyParams {
     pub project_id: String,
 }
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct SetProcessPolicyParams {
     pub project_id: String,
@@ -10273,6 +10563,14 @@ mod tests {
                 count: 1,
             }],
             supervised_process_output_bytes: 512,
+            preemptions_by_phase: vec![MetricCount {
+                key: "provider".to_string(),
+                count: 1,
+            }],
+            preemptions_by_reason: vec![MetricCount {
+                key: "wall_clock".to_string(),
+                count: 1,
+            }],
             tokens_in: 1000,
             tokens_out: 250,
             cache_read_tokens: 400,
@@ -10661,6 +10959,8 @@ mod tests {
             runtime_leases: Vec::new(),
             supervised_processes: Vec::new(),
             supervised_process_output_bytes: 0,
+            preemptions_by_phase: Vec::new(),
+            preemptions_by_reason: Vec::new(),
             tokens_in: 10,
             tokens_out: 2,
             cache_read_tokens: 4,
@@ -13602,6 +13902,140 @@ mod critical_path_governor_tests {
         assert_eq!(value["project_id"], "p1");
         assert_eq!(value["policy"]["enabled"], true);
         assert_eq!(value["policy"]["reserve_ratio"], 0.25);
+    }
+
+    #[test]
+    fn preemption_policy_defaults_are_enabled_and_bounded() {
+        let policy = PreemptionPolicy::default();
+        assert!(policy.enabled);
+        assert_eq!(policy.provider_grace_ms, 2_000);
+        assert_eq!(policy.tool_grace_ms, 5_000);
+        assert_eq!(policy.kill_escalation_ms, 2_000);
+        assert_eq!(policy.tool_deadline_secs, None);
+        assert!(policy.checkpoint_on_preempt);
+        let decoded: PreemptionPolicy = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(decoded, policy);
+        assert!(policy.validate().is_ok());
+    }
+
+    #[test]
+    fn preemption_policy_clamps_every_grace_and_deadline() {
+        let policy = PreemptionPolicy {
+            enabled: false,
+            provider_grace_ms: 9_999_999,
+            tool_grace_ms: 9_999_999,
+            kill_escalation_ms: 9_999_999,
+            tool_deadline_secs: Some(999_999),
+            checkpoint_on_preempt: false,
+        };
+        assert!(policy.validate().is_err());
+        let normalized = policy.clone().normalized().unwrap();
+        assert!(!normalized.enabled);
+        assert_eq!(normalized.provider_grace_ms, 30_000);
+        assert_eq!(normalized.tool_grace_ms, 60_000);
+        assert_eq!(normalized.kill_escalation_ms, 30_000);
+        assert_eq!(normalized.tool_deadline_secs, Some(3_600));
+        assert!(!normalized.checkpoint_on_preempt);
+        assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn preemption_record_wire_shape_defaults_optional_fields() {
+        let record = PreemptionRecord {
+            session_id: "s1".to_string(),
+            project_id: "p1".to_string(),
+            agent_id: "a1".to_string(),
+            agent_name: "Leader".to_string(),
+            agent_role: "leader".to_string(),
+            task_id: None,
+            department: None,
+            reason: "wall_clock".to_string(),
+            phase: "provider".to_string(),
+            tool: None,
+            elapsed_ms: 1_005,
+            side_effects_unknown: false,
+            partial_input_tokens: 40,
+            partial_output_tokens: 5,
+            partial_output_bytes: 14,
+            usage_estimated: false,
+            checkpoint_id: Some("cp1".to_string()),
+            task_checkpoint_commit: None,
+            detail: None,
+            terminal: true,
+            created_at: "2026-11-12T00:00:00Z".to_string(),
+        };
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["reason"], "wall_clock");
+        assert_eq!(value["terminal"], true);
+        let decoded: PreemptionRecord = serde_json::from_value(serde_json::json!({
+            "session_id": "s1",
+            "reason": "explicit",
+            "phase": "tool"
+        }))
+        .unwrap();
+        assert_eq!(decoded.elapsed_ms, 0);
+        assert!(!decoded.side_effects_unknown);
+        assert!(!decoded.terminal);
+        assert_eq!(
+            record.summary(),
+            "wall_clock preempted during provider after 1005ms"
+        );
+    }
+
+    #[test]
+    fn session_preemption_result_is_backward_compatible() {
+        let result = SessionPreemptionResult {
+            session_id: "s1".to_string(),
+            policy: PreemptionPolicy::default(),
+            active: true,
+            preempted: true,
+            records: Vec::new(),
+            by_phase: vec![MetricCount {
+                key: "provider".to_string(),
+                count: 1,
+            }],
+            by_reason: vec![MetricCount {
+                key: "wall_clock".to_string(),
+                count: 1,
+            }],
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["by_phase"][0]["key"], "provider");
+        let decoded: SessionPreemptionResult = serde_json::from_value(serde_json::json!({
+            "session_id": "s1",
+            "policy": {}
+        }))
+        .unwrap();
+        assert!(!decoded.active);
+        assert!(!decoded.preempted);
+        assert!(decoded.records.is_empty());
+    }
+
+    #[test]
+    fn daemon_metrics_decode_older_payloads_without_preemption_groups() {
+        let value = serde_json::json!({
+            "version": "0.1",
+            "protocol": 1,
+            "uptime_secs": 1,
+            "projects": 1,
+            "sessions": [],
+            "plan_tasks": [],
+            "merge_queue": [],
+            "intake": [],
+            "continuations": [],
+            "recoveries": [],
+            "memories": [],
+            "memory_conflicts": [],
+            "runtime_leases": [],
+            "tokens_in": 0,
+            "tokens_out": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "cost_spent_usd": 0.0
+        });
+        let metrics: DaemonMetrics = serde_json::from_value(value).unwrap();
+        assert!(metrics.preemptions_by_phase.is_empty());
+        assert!(metrics.preemptions_by_reason.is_empty());
     }
 }
 

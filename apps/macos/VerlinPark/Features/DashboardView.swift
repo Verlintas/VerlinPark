@@ -413,6 +413,7 @@ struct DashboardView: View {
             ContinuationCard()
             SteeringCard()
             TaskStallCard()
+            PreemptionCard()
             TaskSchedulerCard()
             ScalingCard()
             OrchestrationPolicyCard()

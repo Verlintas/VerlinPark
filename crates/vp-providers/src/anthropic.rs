@@ -11,7 +11,7 @@ use crate::cache::{
 };
 use crate::{
     ChatMessage, ChatRequest, EventStream, Provider, ProviderError, StreamEvent, ToolCall,
-    ToolSchema, provider_client, provider_error_from_stream, send_with_retry,
+    ToolSchema, provider_client, provider_error_from_stream,
 };
 
 /// Anthropic Messages API adapter.
@@ -228,6 +228,24 @@ impl Provider for AnthropicProvider {
     }
 
     async fn stream_chat(&self, request: ChatRequest) -> Result<EventStream, ProviderError> {
+        self.stream_chat_inner(request, None).await
+    }
+
+    async fn stream_chat_preemptible(
+        &self,
+        request: ChatRequest,
+        token: Option<crate::PreemptToken>,
+    ) -> Result<EventStream, ProviderError> {
+        self.stream_chat_inner(request, token).await
+    }
+}
+
+impl AnthropicProvider {
+    async fn stream_chat_inner(
+        &self,
+        request: ChatRequest,
+        preempt: Option<crate::PreemptToken>,
+    ) -> Result<EventStream, ProviderError> {
         let api_key = self.api_key.as_ref().ok_or(ProviderError::MissingApiKey)?;
 
         let messages: Vec<Value> = request
@@ -299,14 +317,17 @@ impl Provider for AnthropicProvider {
             body["tools"] = anthropic_tools_with_plan(&request.tools, plan.as_ref());
         }
 
-        let response = match send_with_retry(|| {
-            self.client
-                .post(self.endpoint())
-                .header("x-api-key", api_key)
-                .header("anthropic-version", "2023-06-01")
-                .header("content-type", "application/json")
-                .json(&body)
-        })
+        let response = match crate::send_with_retry_preemptible(
+            || {
+                self.client
+                    .post(self.endpoint())
+                    .header("x-api-key", api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .header("content-type", "application/json")
+                    .json(&body)
+            },
+            preempt.as_ref(),
+        )
         .await
         {
             Ok(response) => response,
@@ -334,6 +355,7 @@ impl Provider for AnthropicProvider {
             ));
         }
         let stream = Box::pin(response.bytes_stream().eventsource());
+        let preempt = preempt.clone();
         let mapped = async_stream::stream! {
             let mut input_tokens = 0u32;
             let mut output_tokens = 0u32;
@@ -342,7 +364,20 @@ impl Provider for AnthropicProvider {
             let mut tool_calls: BTreeMap<u64, ToolCall> = BTreeMap::new();
             let mut saw_done = false;
             let mut stream = stream;
-            while let Some(item) = stream.next().await {
+            loop {
+                let next = match &preempt {
+                    Some(token) => tokio::select! {
+                        _ = token.cancelled() => {
+                            yield Err(ProviderError::preempted(token));
+                            break;
+                        }
+                        item = stream.next() => item,
+                    },
+                    None => stream.next().await,
+                };
+                let Some(item) = next else {
+                    break;
+                };
                 match item {
                     Err(error) => {
                         yield Err(provider_error_from_stream(error));
@@ -1098,5 +1133,86 @@ mod tests {
             arguments: "{\"path\":\"README.md\"}".to_string(),
         })));
         assert_eq!(events.last(), Some(&StreamEvent::Done));
+    }
+
+    async fn spawn_slow_anthropic_sse() -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = vec![0u8; 8192];
+            let _ = socket.read(&mut request).await;
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )
+                .await;
+            for event in [
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12}}}\n\n",
+                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"first\"}}\n\n",
+            ] {
+                let _ = socket
+                    .write_all(format!("{:x}\r\n{event}\r\n", event.len()).as_bytes())
+                    .await;
+            }
+            let _ = socket.flush().await;
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let event = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+            let _ = socket
+                .write_all(format!("{:x}\r\n{event}\r\n", event.len()).as_bytes())
+                .await;
+            let _ = socket.write_all(b"0\r\n\r\n").await;
+        });
+        address
+    }
+
+    #[tokio::test]
+    async fn preempts_a_slow_anthropic_stream_between_chunks() {
+        let address = spawn_slow_anthropic_sse().await;
+        let provider = AnthropicProvider::with_base_url(
+            "test",
+            format!("http://{address}/v1"),
+            Some("test-key".to_string()),
+        );
+        let token = crate::PreemptToken::disabled();
+        let mut stream = provider
+            .stream_chat_preemptible(
+                ChatRequest::new("claude-test", vec![ChatMessage::user("hi")]),
+                Some(token.clone()),
+            )
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let mut text = String::new();
+        let mut error = None;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(StreamEvent::TextDelta(delta)) => {
+                    text.push_str(&delta);
+                    if text == "first" {
+                        token.trigger(
+                            crate::PreemptReason::Explicit,
+                            crate::PreemptPhase::Provider,
+                            false,
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(item) => {
+                    error = Some(item);
+                    break;
+                }
+            }
+        }
+        assert_eq!(text, "first");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(matches!(
+            error,
+            Some(ProviderError::Preempted { reason, phase, .. })
+                if reason == "explicit" && phase == "provider"
+        ));
     }
 }

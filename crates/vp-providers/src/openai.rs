@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     ChatMessage, ChatRequest, EventStream, Provider, ProviderError, StreamEvent, ToolCall,
-    openai_usage, provider_client, provider_error_from_stream, send_with_retry,
+    openai_usage, provider_client, provider_error_from_stream,
 };
 
 /// Adapter for OpenAI's chat completions API and compatible endpoints:
@@ -41,14 +41,21 @@ impl OpenAiCompatibleProvider {
         format!("{}/chat/completions", self.base_url)
     }
 
-    async fn send_body(&self, body: &Value) -> Result<reqwest::Response, ProviderError> {
-        send_with_retry(|| {
-            let mut builder = self.client.post(self.endpoint()).json(body);
-            if let Some(api_key) = &self.api_key {
-                builder = builder.bearer_auth(api_key);
-            }
-            builder
-        })
+    async fn send_body(
+        &self,
+        body: &Value,
+        preempt: Option<&crate::PreemptToken>,
+    ) -> Result<reqwest::Response, ProviderError> {
+        crate::send_with_retry_preemptible(
+            || {
+                let mut builder = self.client.post(self.endpoint()).json(body);
+                if let Some(api_key) = &self.api_key {
+                    builder = builder.bearer_auth(api_key);
+                }
+                builder
+            },
+            preempt,
+        )
         .await
     }
 }
@@ -60,6 +67,24 @@ impl Provider for OpenAiCompatibleProvider {
     }
 
     async fn stream_chat(&self, request: ChatRequest) -> Result<EventStream, ProviderError> {
+        self.stream_chat_inner(request, None).await
+    }
+
+    async fn stream_chat_preemptible(
+        &self,
+        request: ChatRequest,
+        token: Option<crate::PreemptToken>,
+    ) -> Result<EventStream, ProviderError> {
+        self.stream_chat_inner(request, token).await
+    }
+}
+
+impl OpenAiCompatibleProvider {
+    async fn stream_chat_inner(
+        &self,
+        request: ChatRequest,
+        preempt: Option<crate::PreemptToken>,
+    ) -> Result<EventStream, ProviderError> {
         let mut messages = Vec::with_capacity(request.messages.len() + 4);
         if !request
             .system_sections
@@ -118,7 +143,7 @@ impl Provider for OpenAiCompatibleProvider {
             body["tool_choice"] = json!("auto");
         }
 
-        let response = match self.send_body(&body).await {
+        let response = match self.send_body(&body, preempt.as_ref()).await {
             Ok(response) => response,
             Err(ProviderError::Api {
                 status: 400,
@@ -129,7 +154,7 @@ impl Provider for OpenAiCompatibleProvider {
                 if let Some(object) = body.as_object_mut() {
                     object.remove("stream_options");
                 }
-                match self.send_body(&body).await {
+                match self.send_body(&body, preempt.as_ref()).await {
                     Ok(response) => response,
                     Err(error) => return Err(error),
                 }
@@ -148,12 +173,26 @@ impl Provider for OpenAiCompatibleProvider {
             ));
         }
         let stream = Box::pin(response.bytes_stream().eventsource());
+        let preempt = preempt.clone();
         let mapped = async_stream::stream! {
             let mut tool_calls: BTreeMap<usize, ToolCall> = BTreeMap::new();
             let mut saw_done = false;
             let mut stream_failed = false;
             let mut stream = stream;
-            while let Some(item) = stream.next().await {
+            loop {
+                let next = match &preempt {
+                    Some(token) => tokio::select! {
+                        _ = token.cancelled() => {
+                            yield Err(ProviderError::preempted(token));
+                            break;
+                        }
+                        item = stream.next() => item,
+                    },
+                    None => stream.next().await,
+                };
+                let Some(item) = next else {
+                    break;
+                };
                 match item {
                     Err(error) => {
                         yield Err(provider_error_from_stream(error));
@@ -805,5 +844,122 @@ mod tests {
             Err(error) => error,
         };
         assert!(matches!(error, ProviderError::Api { status: 401, .. }));
+    }
+
+    /// Minimal chunked SSE server: one fast text chunk, then a long pause, so a
+    /// preemption can be observed between chunks without a second provider
+    /// call or a whole-turn replay.
+    async fn spawn_slow_sse() -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = vec![0u8; 8192];
+            let _ = socket.read(&mut request).await;
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )
+                .await;
+            let first = "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n";
+            let _ = socket
+                .write_all(format!("{:x}\r\n{first}\r\n", first.len()).as_bytes())
+                .await;
+            let _ = socket.flush().await;
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let second = "data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\n";
+            let _ = socket
+                .write_all(format!("{:x}\r\n{second}\r\n", second.len()).as_bytes())
+                .await;
+            let _ = socket.write_all(b"0\r\n\r\n").await;
+        });
+        address
+    }
+
+    #[tokio::test]
+    async fn preempts_a_slow_sse_stream_between_chunks() {
+        let address = spawn_slow_sse().await;
+        let provider = OpenAiCompatibleProvider::local("test", format!("http://{address}/v1"));
+        let token = crate::PreemptToken::disabled();
+        let mut stream = provider
+            .stream_chat_preemptible(
+                ChatRequest::new("test-model", vec![ChatMessage::user("hi")]),
+                Some(token.clone()),
+            )
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let mut text = String::new();
+        let mut error = None;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(StreamEvent::TextDelta(delta)) => {
+                    text.push_str(&delta);
+                    if text == "first" {
+                        token.trigger(
+                            crate::PreemptReason::Explicit,
+                            crate::PreemptPhase::Provider,
+                            false,
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(item) => {
+                    error = Some(item);
+                    break;
+                }
+            }
+        }
+        assert_eq!(text, "first");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(matches!(
+            error,
+            Some(ProviderError::Preempted {
+                reason,
+                phase,
+                ..
+            }) if reason == "explicit" && phase == "provider"
+        ));
+    }
+
+    #[tokio::test]
+    async fn preemption_aborts_a_retry_backoff() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .insert_header("retry-after", "2")
+                    .set_body_string("busy"),
+            )
+            .mount(&server)
+            .await;
+        let provider = OpenAiCompatibleProvider::local("test", format!("{}/v1", server.uri()));
+        let token = crate::PreemptToken::disabled();
+        let trigger = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            trigger.trigger(
+                crate::PreemptReason::Explicit,
+                crate::PreemptPhase::Provider,
+                false,
+            );
+        });
+        let started = std::time::Instant::now();
+        let error = match provider
+            .stream_chat_preemptible(
+                ChatRequest::new("test-model", vec![ChatMessage::user("hi")]),
+                Some(token),
+            )
+            .await
+        {
+            Ok(_) => panic!("expected preemption"),
+            Err(error) => error,
+        };
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(matches!(error, ProviderError::Preempted { .. }));
     }
 }

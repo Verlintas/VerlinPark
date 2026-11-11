@@ -555,6 +555,8 @@ pub(crate) enum LspError {
         message: String,
         data: Option<Value>,
     },
+    #[error("language server request {method} was preempted")]
+    Preempted { method: String },
     #[error("language server protocol error: {0}")]
     Protocol(String),
     #[error("{0}")]
@@ -573,9 +575,14 @@ impl LspError {
         matches!(self, Self::Rpc { code: -32601, .. })
     }
 
+    pub(crate) fn is_preempted(&self) -> bool {
+        matches!(self, Self::Preempted { .. })
+    }
+
     pub(crate) fn status(&self) -> Status {
         match self {
             Self::Timeout { .. } => Status::Timeout,
+            Self::Preempted { .. } => Status::Unavailable,
             Self::NotRunning | Self::Transport(_) | Self::Closed { .. } => Status::Crashed,
             Self::Rpc { code: -32601, .. } => Status::Unsupported,
             _ => Status::Unavailable,
@@ -585,6 +592,7 @@ impl LspError {
     pub(crate) fn reason(&self) -> &'static str {
         match self {
             Self::Timeout { .. } => "lsp_timeout",
+            Self::Preempted { .. } => "preempted",
             Self::NotRunning | Self::Transport(_) | Self::Closed { .. } => "lsp_crashed",
             Self::Rpc { code: -32601, .. } => "lsp_unsupported_method",
             Self::Rpc { .. } => "lsp_error",
@@ -595,6 +603,7 @@ impl LspError {
     pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::Timeout { .. } => "LSP_TIMEOUT",
+            Self::Preempted { .. } => "LSP_PREEMPTED",
             Self::NotRunning | Self::Transport(_) | Self::Closed { .. } => "LSP_CRASHED",
             Self::Rpc { code: -32601, .. } => "LSP_METHOD_UNAVAILABLE",
             Self::Rpc { .. } => "LSP_ERROR",
@@ -1145,6 +1154,14 @@ impl LspServer {
         if !self.alive.load(Ordering::SeqCst) {
             return Err(LspError::NotRunning);
         }
+        let token = crate::preemption::current_token();
+        if let Some(token) = &token
+            && token.is_preempted()
+        {
+            return Err(LspError::Preempted {
+                method: method.to_string(),
+            });
+        }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (sender, receiver) = oneshot::channel();
         if let Ok(mut pending) = self.pending.lock() {
@@ -1162,7 +1179,26 @@ impl LspServer {
             }
             return Err(error);
         }
-        match timeout(wait, receiver).await {
+        let response = match &token {
+            Some(token) => {
+                tokio::select! {
+                    _ = token.cancelled() => None,
+                    response = timeout(wait, receiver) => Some(response),
+                }
+            }
+            None => Some(timeout(wait, receiver).await),
+        };
+        let Some(response) = response else {
+            if let Ok(mut pending) = self.pending.lock() {
+                pending.remove(&id);
+            }
+            // Best-effort protocol cancellation. The request is never replayed.
+            let _ = self.notify("$/cancelRequest", json!({"id": id})).await;
+            return Err(LspError::Preempted {
+                method: method.to_string(),
+            });
+        };
+        match response {
             Ok(Ok(Ok(value))) => Ok(value),
             Ok(Ok(Err(error))) => Err(error),
             Ok(Err(_)) => Err(LspError::Closed {
@@ -2169,6 +2205,10 @@ impl LspAttemptError {
         }
     }
 
+    pub(crate) fn is_preempted(&self) -> bool {
+        matches!(self, Self::Failed { error, .. } if error.is_preempted())
+    }
+
     pub(crate) fn reason(&self) -> &'static str {
         match self {
             Self::Unavailable { .. } => "lsp_unavailable",
@@ -2252,6 +2292,9 @@ impl LspAttemptError {
                     .map(|language| language.id.to_string())
                     .collect(),
             };
+        }
+        if let Some(error) = errors.iter().find(|error| error.is_preempted()) {
+            return error.clone();
         }
         if let Some(error) = errors.iter().find(|error| {
             matches!(
@@ -3817,6 +3860,16 @@ while True:
             error("workspace/symbol not supported", ident)
         elif mode == "timeout":
             time.sleep(30)
+        elif mode == "cancel_marker":
+            # Wait for the client's best-effort $/cancelRequest and record it.
+            while True:
+                cancelled = read_message()
+                if cancelled is None:
+                    break
+                if cancelled.get("method") == "$/cancelRequest":
+                    if marker:
+                        open(marker, "w").write(str((cancelled.get("params") or {}).get("id")))
+                    break
         elif mode == "crash":
             sys.exit(3)
         elif mode == "crash_once":
@@ -5083,5 +5136,68 @@ while True:
             .find(|language| language.language == "rust")
             .unwrap();
         assert!(!rust.install_hint.is_empty());
+    }
+
+    #[tokio::test]
+    async fn preemption_sends_a_best_effort_lsp_cancel_request() {
+        let root = TempDir::new().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/lib.rs"), "fn widget() {}\n").unwrap();
+        write_fake_server(root.path());
+        let context = context(root.path());
+        let canonical = root.path().canonicalize().unwrap();
+        let key = ServerKey {
+            root: canonical.clone(),
+            language: "rust".into(),
+        };
+        let language = language_for_path(Path::new("a.rs")).unwrap();
+        let marker = root.path().join("cancelled.txt");
+        let server = start_server_with(
+            &context,
+            &key,
+            language,
+            "python3",
+            &["fake_lsp.py", "cancel_marker", marker.to_str().unwrap()],
+        )
+        .await
+        .unwrap();
+        registry().lock().unwrap().insert(key, server);
+        let token = crate::preemption::Token::disabled();
+        let trigger = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            trigger.trigger(
+                crate::preemption::Reason::Explicit,
+                crate::preemption::Phase::Tool,
+                true,
+            );
+        });
+        let started = std::time::Instant::now();
+        let result = crate::preemption::scope_token(
+            token,
+            search_symbols(
+                &context,
+                &[language],
+                "widget",
+                &[canonical.join("src/lib.rs")],
+                10,
+                true,
+            ),
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let error = result.expect_err("preempted LSP request");
+        assert!(error.is_preempted(), "{error}");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if marker.is_file() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no $/cancelRequest was sent"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }

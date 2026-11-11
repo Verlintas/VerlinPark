@@ -22,15 +22,15 @@ use vp_protocol::types::{
     MemoryEmbeddingUsage, MemoryEmbeddingsStatusResult, MemoryEvidence, MemoryHealthResult,
     MemoryItem, MemoryPolicy, MemoryStatCount, MergeQueueEntry, MergeQueueSource, MetricCount,
     ModelPreset, OrchestrationDecision, OrchestrationNote, OrchestrationPolicy,
-    OrchestrationRecovery, PlanTaskProgress, ProcessPolicy, Program, ProgramEvent,
-    ProgramMilestone, ProgramMilestoneStatus, ProgramPolicy, ProgramStatus, ProgramUsage, Project,
-    ProjectBudget, ProjectUsageSession, Question, RunBudgetSnapshot, RunCheckpoint, RunStep,
-    RunToolCall, ScheduledTask, SearchHit, Session, SessionBundle, SessionContinuation, SessionRun,
-    SessionRunPolicy, ShellPolicy, Skill, Source, SourceChunk, SourceCollection,
-    SourceEmbeddingIntegrity, SourceEmbeddingJobStatus, SourceEmbeddingPolicy,
-    SourceEmbeddingStatusResult, SourceEmbeddingUsage, SourceSearchHit, SourceStats,
-    SteeringMessage, StoredMessage, SupervisedProcess, TaskSchedulerPolicy, TaskStall, TeamPlan,
-    TodoItem, ToolOutputAuditResult, ToolOutputPolicy, ToolOutputToolStat, UsageEntry,
+    OrchestrationRecovery, PlanTaskProgress, PreemptionPolicy, PreemptionSessionSummary,
+    ProcessPolicy, Program, ProgramEvent, ProgramMilestone, ProgramMilestoneStatus, ProgramPolicy,
+    ProgramStatus, ProgramUsage, Project, ProjectBudget, ProjectUsageSession, Question,
+    RunBudgetSnapshot, RunCheckpoint, RunStep, RunToolCall, ScheduledTask, SearchHit, Session,
+    SessionBundle, SessionContinuation, SessionRun, SessionRunPolicy, ShellPolicy, Skill, Source,
+    SourceChunk, SourceCollection, SourceEmbeddingIntegrity, SourceEmbeddingJobStatus,
+    SourceEmbeddingPolicy, SourceEmbeddingStatusResult, SourceEmbeddingUsage, SourceSearchHit,
+    SourceStats, SteeringMessage, StoredMessage, SupervisedProcess, TaskSchedulerPolicy, TaskStall,
+    TeamPlan, TodoItem, ToolOutputAuditResult, ToolOutputPolicy, ToolOutputToolStat, UsageEntry,
     WorktreeRetentionPolicy, WriteLease, cache_hit_ratio,
 };
 
@@ -1090,6 +1090,10 @@ pub struct ProjectManifestSnapshot {
     /// decode as the historical 8-process/1-hour defaults.
     #[serde(default)]
     pub process_policy: ProcessPolicy,
+    /// Project-scoped hard-preemption policy. Older manifests decode as the
+    /// enabled, bounded default.
+    #[serde(default)]
+    pub preemption_policy: PreemptionPolicy,
     pub budget: ProjectBudget,
     #[serde(default)]
     pub task_scheduler_policy: TaskSchedulerPolicy,
@@ -1197,6 +1201,8 @@ pub struct DaemonMetricsSnapshot {
     pub runtime_leases: Vec<MetricCount>,
     pub supervised_processes: Vec<MetricCount>,
     pub supervised_process_output_bytes: u64,
+    pub preemptions_by_phase: Vec<MetricCount>,
+    pub preemptions_by_reason: Vec<MetricCount>,
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub cache_read_tokens: u64,
@@ -1558,13 +1564,22 @@ impl Store {
                 updated_at          TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS project_preemption_policies (
+                project_id              TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                enabled                 INTEGER NOT NULL DEFAULT 1,
+                provider_grace_ms       INTEGER NOT NULL DEFAULT 2000,
+                tool_grace_ms           INTEGER NOT NULL DEFAULT 5000,
+                kill_escalation_ms      INTEGER NOT NULL DEFAULT 2000,
+                tool_deadline_secs      INTEGER,
+                checkpoint_on_preempt   INTEGER NOT NULL DEFAULT 1,
+                updated_at              TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS project_cache_policies (
                 project_id      TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
                 policy          TEXT NOT NULL,
                 updated_at      TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS project_execution_hosts (
+            );            CREATE TABLE IF NOT EXISTS project_execution_hosts (
                 project_id      TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
                 config          TEXT NOT NULL,
                 updated_at      TEXT NOT NULL
@@ -3606,6 +3621,7 @@ impl Store {
                 checkpoint_policy: self.get_checkpoint_policy(&project.id)?,
                 context_checkpoint_policy: self.get_context_checkpoint_policy(&project.id)?,
                 process_policy: self.get_process_policy(&project.id)?,
+                preemption_policy: self.get_preemption_policy(&project.id)?,
                 budget: self.get_project_budget(&project.id)?,
                 task_scheduler_policy: self.get_task_scheduler_policy(&project.id)?,
                 scaling_policy: self.get_scaling_policy(&project.id)?,
@@ -3798,6 +3814,167 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn get_preemption_policy(&self, project_id: &str) -> Result<PreemptionPolicy> {
+        let conn = self.lock()?;
+        let stored = conn
+            .query_row(
+                "SELECT enabled, provider_grace_ms, tool_grace_ms,
+                        kill_escalation_ms, tool_deadline_secs,
+                        checkpoint_on_preempt
+                 FROM project_preemption_policies WHERE project_id = ?1",
+                params![project_id],
+                |row| {
+                    Ok(PreemptionPolicy {
+                        enabled: row.get::<_, i64>(0)? != 0,
+                        provider_grace_ms: row.get::<_, i64>(1)?.max(0) as u64,
+                        tool_grace_ms: row.get::<_, i64>(2)?.max(0) as u64,
+                        kill_escalation_ms: row.get::<_, i64>(3)?.max(0) as u64,
+                        tool_deadline_secs: row
+                            .get::<_, Option<i64>>(4)?
+                            .map(|value| value.max(1) as u64),
+                        checkpoint_on_preempt: row.get::<_, i64>(5)? != 0,
+                    })
+                },
+            )
+            .optional()?;
+        match stored {
+            Some(policy) => {
+                policy
+                    .validate()
+                    .map_err(|error| anyhow!("stored preemption policy is invalid: {error}"))?;
+                Ok(policy)
+            }
+            None => Ok(PreemptionPolicy::default()),
+        }
+    }
+
+    pub fn set_preemption_policy(&self, project_id: &str, policy: &PreemptionPolicy) -> Result<()> {
+        policy
+            .validate()
+            .map_err(|error| anyhow!("invalid preemption policy: {error}"))?;
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO project_preemption_policies
+             (project_id, enabled, provider_grace_ms, tool_grace_ms,
+              kill_escalation_ms, tool_deadline_secs, checkpoint_on_preempt, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(project_id) DO UPDATE SET
+                enabled = excluded.enabled,
+                provider_grace_ms = excluded.provider_grace_ms,
+                tool_grace_ms = excluded.tool_grace_ms,
+                kill_escalation_ms = excluded.kill_escalation_ms,
+                tool_deadline_secs = excluded.tool_deadline_secs,
+                checkpoint_on_preempt = excluded.checkpoint_on_preempt,
+                updated_at = excluded.updated_at",
+            params![
+                project_id,
+                if policy.enabled { 1 } else { 0 },
+                policy.provider_grace_ms as i64,
+                policy.tool_grace_ms as i64,
+                policy.kill_escalation_ms as i64,
+                policy.tool_deadline_secs.map(|value| value as i64),
+                if policy.checkpoint_on_preempt { 1 } else { 0 },
+                now_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Project-wide terminal preemption summary. Only authoritative
+    /// `session.preempted` events with `terminal: true` are counted; provider
+    /// and tool sub-events are diagnostics. Rows are bounded by `limit`.
+    pub fn preemption_overview(
+        &self,
+        project_id: &str,
+        limit: u32,
+    ) -> Result<(
+        Vec<PreemptionSessionSummary>,
+        Vec<MetricCount>,
+        Vec<MetricCount>,
+    )> {
+        let limit = limit.clamp(1, 500);
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT e.session_id, s.goal, s.status, e.payload, e.created_at
+             FROM events e
+             JOIN sessions s ON s.id = e.session_id
+             WHERE e.type = 'session.preempted' AND s.project_id = ?1
+             ORDER BY julianday(e.created_at) DESC, e.seq DESC
+             LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![project_id, i64::from(limit) * 20], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut sessions: Vec<PreemptionSessionSummary> = Vec::new();
+        let mut phases: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        let mut reasons: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for row in rows {
+            let (session_id, goal, status, payload, created_at) = row?;
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) else {
+                continue;
+            };
+            if value.get("terminal").and_then(serde_json::Value::as_bool) == Some(false) {
+                continue;
+            }
+            let reason = value
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let phase = value
+                .get("phase")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            *phases.entry(phase.clone()).or_default() += 1;
+            *reasons.entry(reason.clone()).or_default() += 1;
+            if !seen.insert(session_id.clone()) {
+                if let Some(existing) = sessions
+                    .iter_mut()
+                    .find(|summary| summary.session_id == session_id)
+                {
+                    existing.terminal_count = existing.terminal_count.saturating_add(1);
+                }
+                continue;
+            }
+            sessions.push(PreemptionSessionSummary {
+                session_id,
+                goal,
+                status,
+                terminal_count: 1,
+                last_reason: reason,
+                last_phase: phase,
+                last_tool: value
+                    .get("tool")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                last_at: created_at,
+            });
+            if sessions.len() >= limit as usize {
+                break;
+            }
+        }
+        Ok((
+            sessions,
+            phases
+                .into_iter()
+                .map(|(key, count)| MetricCount { key, count })
+                .collect(),
+            reasons
+                .into_iter()
+                .map(|(key, count)| MetricCount { key, count })
+                .collect(),
+        ))
     }
 
     pub fn get_remote_integration_policy(
@@ -16284,6 +16461,7 @@ impl Store {
             },
         )?;
         let (tokens_in, tokens_out, cache_read_tokens, cache_write_tokens, cost_spent_usd) = usage;
+        let (preemptions_by_phase, preemptions_by_reason) = preemption_metric_counts(&conn)?;
         let preamble_payload = conn
             .query_row(
                 "SELECT payload FROM events
@@ -16325,6 +16503,8 @@ impl Store {
                     |row| row.get::<_, i64>(0),
                 )?
                 .max(0) as u64,
+            preemptions_by_phase,
+            preemptions_by_reason,
             tokens_in,
             tokens_out,
             cache_read_tokens,
@@ -25023,6 +25203,55 @@ fn like_memory_lexical(memory: &MemoryItem, query: &str) -> f64 {
 /// groups anyway so a corrupted or imported database cannot create unbounded
 /// metric cardinality. `table` and `column` are fixed call-site literals.
 const MAX_METRIC_GROUPS: usize = 64;
+
+/// Terminal preemptions grouped by phase and reason. Only the authoritative
+/// `session.preempted` event is counted, so provider/tool sub-events cannot
+/// double-count one run. The payload is parsed in Rust because SQLite JSON1 is
+/// not guaranteed on every supported build.
+fn preemption_metric_counts(conn: &Connection) -> Result<(Vec<MetricCount>, Vec<MetricCount>)> {
+    let mut stmt = conn.prepare(
+        "SELECT payload FROM events
+         WHERE type = 'session.preempted'
+         ORDER BY created_at DESC, seq DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![MAX_METRIC_GROUPS as i64 * 20], |row| {
+        row.get::<_, String>(0)
+    })?;
+    let mut phases: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut reasons: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for payload in rows {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload?) else {
+            continue;
+        };
+        if value.get("terminal").and_then(serde_json::Value::as_bool) == Some(false) {
+            continue;
+        }
+        if let Some(phase) = value
+            .get("phase")
+            .and_then(serde_json::Value::as_str)
+            .filter(|phase| matches!(*phase, "provider" | "tool" | "queue"))
+        {
+            *phases.entry(phase.to_string()).or_default() += 1;
+        }
+        if let Some(reason) = value
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .filter(|reason| matches!(*reason, "wall_clock" | "explicit" | "tool_deadline"))
+        {
+            *reasons.entry(reason.to_string()).or_default() += 1;
+        }
+    }
+    Ok((
+        phases
+            .into_iter()
+            .map(|(key, count)| MetricCount { key, count })
+            .collect(),
+        reasons
+            .into_iter()
+            .map(|(key, count)| MetricCount { key, count })
+            .collect(),
+    ))
+}
 
 fn bounded_metric_counts(conn: &Connection, table: &str, column: &str) -> Result<Vec<MetricCount>> {
     let mut stmt = conn.prepare(&format!(

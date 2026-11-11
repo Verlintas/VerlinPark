@@ -3318,6 +3318,70 @@ actor CoreClient {
         .decode(SessionPriorityResult.self)
     }
 
+    func preemptSession(sessionID: String, reason: String? = nil) async throws -> SessionPreemptResult {
+        var params: [String: JSONValue] = ["session_id": .string(sessionID)]
+        if let reason, !reason.isEmpty {
+            params["reason"] = .string(reason)
+        }
+        return try await request(method: "session.preempt", params: params)
+            .decode(SessionPreemptResult.self)
+    }
+
+    func sessionPreemption(sessionID: String, limit: Int = 100) async throws -> SessionPreemptionResult {
+        try await request(
+            method: "session.preemption",
+            params: [
+                "session_id": .string(sessionID),
+                "limit": .number(Double(limit)),
+            ]
+        )
+        .decode(SessionPreemptionResult.self)
+    }
+
+    func preemptionOverview(projectID: String, limit: Int = 100) async throws -> PreemptionOverviewResult {
+        try await request(
+            method: "preemption.overview",
+            params: [
+                "project_id": .string(projectID),
+                "limit": .number(Double(limit)),
+            ]
+        )
+        .decode(PreemptionOverviewResult.self)
+    }
+
+    func preemptionPolicy(projectID: String) async throws -> PreemptionPolicy {
+        try await request(
+            method: "project.preemption_policy.get",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(PreemptionPolicyResult.self)
+        .policy
+    }
+
+    func setPreemptionPolicy(projectID: String, policy: PreemptionPolicy) async throws -> PreemptionPolicy {
+        var object: [String: JSONValue] = [
+            "enabled": .bool(policy.enabled),
+            "provider_grace_ms": .number(Double(policy.providerGraceMs)),
+            "tool_grace_ms": .number(Double(policy.toolGraceMs)),
+            "kill_escalation_ms": .number(Double(policy.killEscalationMs)),
+            "checkpoint_on_preempt": .bool(policy.checkpointOnPreempt),
+        ]
+        if let deadline = policy.toolDeadlineSecs {
+            object["tool_deadline_secs"] = .number(Double(deadline))
+        } else {
+            object["tool_deadline_secs"] = .null
+        }
+        return try await request(
+            method: "project.preemption_policy.set",
+            params: [
+                "project_id": .string(projectID),
+                "policy": .object(object),
+            ]
+        )
+        .decode(PreemptionPolicyResult.self)
+        .policy
+    }
+
     func cancelSession(sessionID: String) async throws -> Bool {
         let params: [String: JSONValue] = ["session_id": .string(sessionID)]
         return try await request(method: "session.cancel", params: params)

@@ -453,10 +453,37 @@ impl BrowserManager {
         };
         let deadline = action_deadline(&action, &input);
         let started = std::time::Instant::now();
+        let token = crate::preemption::current_token();
+        let mut preempted = None;
         let result = {
             let mut helper = helper.lock().await;
-            helper.request(&action, params, deadline).await
+            match token {
+                Some(token) => {
+                    tokio::select! {
+                        _ = token.cancelled() => {
+                            helper.shutdown().await;
+                            preempted = Some(token.snapshot().unwrap_or_else(|| {
+                                crate::preemption::fallback_snapshot(
+                                    crate::preemption::Phase::Tool,
+                                    Some("browser"),
+                                )
+                            }));
+                            Err(anyhow::anyhow!("browser action was preempted"))
+                        }
+                        result = helper.request(&action, params, deadline) => result,
+                    }
+                }
+                None => helper.request(&action, params, deadline).await,
+            }
         };
+        if let Some(snapshot) = preempted {
+            outcome.latency_ms = started.elapsed().as_millis() as u64;
+            outcome.result = "preempted".to_string();
+            outcome.error_code = Some("PREEMPTED".to_string());
+            engine.gui_finish_action(&ticket, outcome).await;
+            engine.gui_end_session(target.session_id, "preempted").await;
+            return Ok(crate::preemption::tool_output("browser", &snapshot));
+        }
         outcome.latency_ms = started.elapsed().as_millis() as u64;
         let result = match result {
             Ok(result) => result,
@@ -1682,5 +1709,85 @@ done
         assert!(!closed_browser.is_error);
         assert_eq!(browsers.warm_helpers(), 0);
         assert_eq!(browsers.stop_session(&session.id).await, 0);
+    }
+
+    #[tokio::test]
+    async fn preemption_cancels_a_hanging_browser_rpc_and_releases_the_lease() {
+        if !Path::new(SANDBOX_EXEC).is_file() {
+            eprintln!("skipping: sandbox-exec is not available");
+            return;
+        }
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let helper_path = data.path().join("fake-slow-browser-helper.sh");
+        write_script(
+            &helper_path,
+            r#"#!/bin/sh
+printf '{"event":"ready","version":"1","pid":%s}
+' "$$"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"action":"snapshot"'*)
+      sleep 30
+      printf '{"id":"%s","ok":true,"result":{}}
+' "$id"
+      ;;
+    *'"action":"close"'*)
+      exit 0
+      ;;
+  esac
+done
+"#,
+        );
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("browser preempt".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id, "preempt".into(), None)
+            .await
+            .unwrap();
+        let worktree = PathBuf::from(session.worktree.clone().unwrap());
+        let manager = BrowserManager::with_helper(data.path().to_path_buf(), helper_path);
+        let target = BrowserTarget {
+            session_id: &session.id,
+            worktree: &worktree,
+            agent_id: "agent",
+            agent_name: "Agent",
+        };
+        let token = crate::preemption::Token::disabled();
+        let trigger = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            trigger.trigger(
+                crate::preemption::Reason::Explicit,
+                crate::preemption::Phase::Tool,
+                true,
+            );
+        });
+        let started = std::time::Instant::now();
+        let output = crate::preemption::scope_token(token, async {
+            manager
+                .action(&engine, &target, json!({"action": "snapshot"}))
+                .await
+        })
+        .await
+        .unwrap();
+        assert!(output.is_error, "{}", output.content);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let snapshot = crate::preemption::output_snapshot(&output).expect("typed preemption");
+        assert_eq!(snapshot.reason, crate::preemption::Reason::Explicit);
+        assert_eq!(snapshot.phase, crate::preemption::Phase::Tool);
+        assert!(snapshot.side_effects_unknown);
+        assert!(
+            engine.list_computer_leases().await.unwrap().is_empty(),
+            "a preempted browser action must release the GUI lease"
+        );
     }
 }

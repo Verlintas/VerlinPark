@@ -14768,3 +14768,208 @@ fn approval_audit_rows_are_persisted_and_restored() {
     let audit = store.list_approval_audit(&project.id, None).unwrap();
     assert_eq!(audit, vec![event]);
 }
+
+#[test]
+fn preemption_policy_round_trips_and_is_validated() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("preempt"))
+        .unwrap();
+    assert_eq!(
+        store.get_preemption_policy(&project.id).unwrap(),
+        PreemptionPolicy::default()
+    );
+    let policy = PreemptionPolicy {
+        enabled: true,
+        provider_grace_ms: 750,
+        tool_grace_ms: 1_500,
+        kill_escalation_ms: 500,
+        tool_deadline_secs: Some(30),
+        checkpoint_on_preempt: false,
+    };
+    store.set_preemption_policy(&project.id, &policy).unwrap();
+    assert_eq!(store.get_preemption_policy(&project.id).unwrap(), policy);
+    let invalid = PreemptionPolicy {
+        tool_grace_ms: 60_001,
+        ..policy.clone()
+    };
+    assert!(store.set_preemption_policy(&project.id, &invalid).is_err());
+    assert_eq!(store.get_preemption_policy(&project.id).unwrap(), policy);
+    store.record_project_manifest().unwrap();
+    let snapshot = crate::read_project_manifest(store.data_dir())
+        .unwrap()
+        .into_iter()
+        .find(|snapshot| snapshot.project.id == project.id)
+        .unwrap();
+    assert_eq!(snapshot.preemption_policy, policy);
+}
+
+#[test]
+fn legacy_project_manifest_without_preemption_policy_decodes_the_default() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("legacy"))
+        .unwrap();
+    store.record_project_manifest().unwrap();
+    let encoded = serde_json::to_value(
+        crate::read_project_manifest(store.data_dir())
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| snapshot.project.id == project.id)
+            .unwrap(),
+    )
+    .unwrap();
+    let mut value = encoded;
+    value.as_object_mut().unwrap().remove("preemption_policy");
+    let decoded: ProjectManifestSnapshot = serde_json::from_value(value).unwrap();
+    assert_eq!(decoded.preemption_policy, PreemptionPolicy::default());
+}
+
+#[test]
+fn daemon_metrics_count_terminal_preemptions_by_phase_and_reason() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("metrics"))
+        .unwrap();
+    let session = store
+        .create_session(&project.id, "preemption metrics")
+        .unwrap();
+    store
+        .append_event(
+            &session.id,
+            "session.preempted",
+            serde_json::json!({
+                "reason": "wall_clock",
+                "phase": "provider",
+                "terminal": true
+            }),
+        )
+        .unwrap();
+    store
+        .append_event(
+            &session.id,
+            "session.preempted",
+            serde_json::json!({
+                "reason": "explicit",
+                "phase": "tool",
+                "terminal": true
+            }),
+        )
+        .unwrap();
+    store
+        .append_event(
+            &session.id,
+            "session.preempted",
+            serde_json::json!({
+                "reason": "tool_deadline",
+                "phase": "tool",
+                "terminal": false
+            }),
+        )
+        .unwrap();
+    let snapshot = store.daemon_metrics_snapshot().unwrap();
+    let phase = |key: &str| {
+        snapshot
+            .preemptions_by_phase
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.count)
+    };
+    let reason = |key: &str| {
+        snapshot
+            .preemptions_by_reason
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.count)
+    };
+    assert_eq!(phase("provider"), Some(1));
+    assert_eq!(phase("tool"), Some(1));
+    assert_eq!(reason("wall_clock"), Some(1));
+    assert_eq!(reason("explicit"), Some(1));
+    assert_eq!(reason("tool_deadline"), None, "sub-events are not terminal");
+}
+
+#[test]
+fn preemption_overview_groups_terminal_events_by_session_and_skips_sub_events() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("overview"))
+        .unwrap();
+    let first = store
+        .create_session(&project.id, "first preempted")
+        .unwrap();
+    let second = store
+        .create_session(&project.id, "second preempted")
+        .unwrap();
+    store
+        .append_event(
+            &first.id,
+            "session.preempted",
+            serde_json::json!({
+                "reason": "wall_clock",
+                "phase": "provider",
+                "terminal": true
+            }),
+        )
+        .unwrap();
+    store
+        .append_event(
+            &first.id,
+            "session.preempted",
+            serde_json::json!({
+                "reason": "explicit",
+                "phase": "tool",
+                "tool": "shell",
+                "terminal": true
+            }),
+        )
+        .unwrap();
+    store
+        .append_event(
+            &second.id,
+            "session.preempted",
+            serde_json::json!({
+                "reason": "explicit",
+                "phase": "queue",
+                "terminal": true
+            }),
+        )
+        .unwrap();
+    store
+        .append_event(
+            &second.id,
+            "session.preempted",
+            serde_json::json!({
+                "reason": "tool_deadline",
+                "phase": "tool",
+                "terminal": false
+            }),
+        )
+        .unwrap();
+    let (sessions, by_phase, by_reason) = store.preemption_overview(&project.id, 10).unwrap();
+    assert_eq!(sessions.len(), 2);
+    let first_summary = sessions
+        .iter()
+        .find(|summary| summary.session_id == first.id)
+        .unwrap();
+    assert_eq!(first_summary.terminal_count, 2);
+    assert_eq!(first_summary.last_reason, "explicit");
+    assert_eq!(first_summary.last_phase, "tool");
+    assert_eq!(first_summary.last_tool.as_deref(), Some("shell"));
+    let second_summary = sessions
+        .iter()
+        .find(|summary| summary.session_id == second.id)
+        .unwrap();
+    assert_eq!(second_summary.terminal_count, 1);
+    assert_eq!(second_summary.last_phase, "queue");
+    let count = |rows: &[MetricCount], key: &str| {
+        rows.iter().find(|row| row.key == key).map(|row| row.count)
+    };
+    assert_eq!(count(&by_phase, "provider"), Some(1));
+    assert_eq!(count(&by_phase, "tool"), Some(1));
+    assert_eq!(count(&by_phase, "queue"), Some(1));
+    assert_eq!(count(&by_reason, "explicit"), Some(2));
+    assert_eq!(count(&by_reason, "tool_deadline"), None);
+    let (limited, _, _) = store.preemption_overview(&project.id, 1).unwrap();
+    assert_eq!(limited.len(), 1);
+}

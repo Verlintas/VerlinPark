@@ -368,6 +368,13 @@ final class AppModel {
     var recoveries: [OrchestrationRecovery] = []
     var taskProgress: [PlanTaskProgress] = []
     var taskStalls: [TaskStall] = []
+    var sessionPreemption: SessionPreemptionResult?
+    var preemptionOverview: PreemptionOverviewResult?
+    var preemptionBusy = false
+    var preemptionStatus: String?
+    var preemptionPolicyDraft = PreemptionPolicy()
+    var preemptionPolicyBusy = false
+    var preemptionPolicyStatus: String?
     var stallThresholdSecs: UInt64 = 0
     var longTaskBusy = false
     var longTaskStatus: String?
@@ -724,6 +731,13 @@ final class AppModel {
         taskProgress = []
         taskStalls = []
         stallThresholdSecs = 0
+        sessionPreemption = nil
+        preemptionOverview = nil
+        preemptionBusy = false
+        preemptionStatus = nil
+        preemptionPolicyDraft = PreemptionPolicy()
+        preemptionPolicyBusy = false
+        preemptionPolicyStatus = nil
         longTaskBusy = false
         longTaskStatus = nil
         steeringSubmitBusy = false
@@ -4919,6 +4933,88 @@ final class AppModel {
         }
     }
 
+    private func loadPreemption(sessionID: String, generation: Int) async {
+        do {
+            let result = try await core.sessionPreemption(sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            sessionPreemption = result
+            preemptionPolicyDraft = result.policy
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            // Preemption history is diagnostics, not a reason to blank the stage.
+            preemptionStatus = error.localizedDescription
+        }
+        if let project = selectedProject,
+           let overview = try? await core.preemptionOverview(projectID: project.id)
+        {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            preemptionOverview = overview
+        }
+    }
+
+    func loadPreemption() async {
+        guard let sessionID = selectedSessionID else {
+            sessionPreemption = nil
+            return
+        }
+        await loadPreemption(sessionID: sessionID, generation: selectionGeneration)
+    }
+
+    @discardableResult
+    func savePreemptionPolicy() async -> String? {
+        guard let project = selectedProject else {
+            let message = L10n.t("Select a project first.")
+            preemptionPolicyStatus = message
+            return message
+        }
+        guard !preemptionPolicyBusy else { return nil }
+        preemptionPolicyBusy = true
+        defer { preemptionPolicyBusy = false }
+        do {
+            let saved = try await core.setPreemptionPolicy(
+                projectID: project.id,
+                policy: preemptionPolicyDraft
+            )
+            preemptionPolicyDraft = saved
+            if let sessionID = selectedSessionID {
+                await loadPreemption(sessionID: sessionID, generation: selectionGeneration)
+            }
+            preemptionPolicyStatus = L10n.t("Preemption policy saved.")
+            return nil
+        } catch {
+            let message = error.localizedDescription
+            preemptionPolicyStatus = message
+            return message
+        }
+    }
+
+    @discardableResult
+    func preemptActiveRun(reason: String? = nil) async -> String? {
+        guard let sessionID = selectedSessionID else {
+            let message = L10n.t("Select a session first.")
+            preemptionStatus = message
+            return message
+        }
+        guard !preemptionBusy else { return nil }
+        let generation = selectionGeneration
+        preemptionBusy = true
+        defer { preemptionBusy = false }
+        do {
+            let result = try await core.preemptSession(sessionID: sessionID, reason: reason)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return nil }
+            preemptionStatus = result.detail
+            await loadPreemption(sessionID: sessionID, generation: generation)
+            await loadSessions()
+            return result.detail
+        } catch {
+            let message = error.localizedDescription
+            if isCurrent(sessionID: sessionID, generation: generation) {
+                preemptionStatus = message
+            }
+            return message
+        }
+    }
+
     func refreshRecoveries() async {
         await loadRecoveries()
     }
@@ -4948,6 +5044,7 @@ final class AppModel {
         await loadContinuations(sessionID: sessionID, generation: generation)
         await loadRecoveries(sessionID: sessionID, generation: generation)
         await loadStalls(sessionID: sessionID, generation: generation)
+        await loadPreemption(sessionID: sessionID, generation: generation)
     }
 
     private func refreshLongTaskStateSoon() {

@@ -105,6 +105,15 @@ impl StdioSession {
     }
 
     pub(super) async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.request_preemptible(method, params, None).await
+    }
+
+    pub(super) async fn request_preemptible(
+        &mut self,
+        method: &str,
+        params: Value,
+        token: Option<&vp_providers::PreemptToken>,
+    ) -> Result<Value> {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         self.write_message(&json!({
@@ -116,13 +125,30 @@ impl StdioSession {
         .await
         .map_err(|error| transport(format!("MCP {method} write failed: {error}")))?;
         loop {
-            let line = timeout("response", async {
+            if let Some(token) = token
+                && token.is_preempted()
+            {
+                self.cancel_request(id, method).await;
+                bail!("MCP {method} was preempted");
+            }
+            let read = timeout("response", async {
                 self.lines
                     .next_line()
                     .await
                     .map_err(|error| transport(format!("MCP {method} read failed: {error}")))
-            })
-            .await?
+            });
+            let line = match token {
+                Some(token) => {
+                    tokio::select! {
+                        _ = token.cancelled() => {
+                            self.cancel_request(id, method).await;
+                            bail!("MCP {method} was preempted");
+                        }
+                        line = read => line?,
+                    }
+                }
+                None => read.await?,
+            }
             .ok_or_else(|| transport(format!("MCP server {} closed stdout", self.name)))?;
             if line.len() > 2 * 1024 * 1024 {
                 bail!("MCP response line exceeds 2 MiB");
@@ -166,6 +192,22 @@ impl StdioSession {
                 .cloned()
                 .ok_or_else(|| anyhow!("MCP {method} response has no result"));
         }
+    }
+
+    /// Best-effort protocol cancellation. The request is never replayed and a
+    /// server that does not implement cancellation simply ignores the
+    /// notification.
+    async fn cancel_request(&mut self, id: u64, method: &str) {
+        let _ = self
+            .write_message(&json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {
+                    "requestId": id,
+                    "reason": format!("preempted while running {method}"),
+                }
+            }))
+            .await;
     }
 
     async fn write_message(&mut self, message: &Value) -> Result<()> {

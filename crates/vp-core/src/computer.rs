@@ -431,6 +431,9 @@ impl ComputerManager {
             )
             .await;
         engine.gui_finish_action(&ticket, outcome).await;
+        if crate::preemption::output_snapshot(&output).is_some() {
+            engine.gui_end_session(target.session_id, "preempted").await;
+        }
         Ok(output)
     }
 
@@ -473,10 +476,35 @@ impl ComputerManager {
         };
         let deadline = action_deadline(action, input);
         let started = std::time::Instant::now();
+        let token = crate::preemption::current_token();
+        let mut preempted = None;
         let result = {
             let mut helper = helper.lock().await;
-            helper.request(action, params.clone(), deadline).await
+            match token {
+                Some(token) => {
+                    tokio::select! {
+                        _ = token.cancelled() => {
+                            helper.shutdown().await;
+                            preempted = Some(token.snapshot().unwrap_or_else(|| {
+                                crate::preemption::fallback_snapshot(
+                                    crate::preemption::Phase::Tool,
+                                    Some("computer"),
+                                )
+                            }));
+                            Err(anyhow::anyhow!("computer action was preempted"))
+                        }
+                        result = helper.request(action, params.clone(), deadline) => result,
+                    }
+                }
+                None => helper.request(action, params.clone(), deadline).await,
+            }
         };
+        if let Some(snapshot) = preempted {
+            outcome.latency_ms = started.elapsed().as_millis() as u64;
+            outcome.result = "preempted".to_string();
+            outcome.error_code = Some("PREEMPTED".to_string());
+            return crate::preemption::tool_output("computer", &snapshot);
+        }
         outcome.latency_ms = started.elapsed().as_millis() as u64;
         let result = match result {
             Ok(result) => result,

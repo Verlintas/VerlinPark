@@ -1711,6 +1711,44 @@ enum Command {
     },
     /// Ask the running Leader to stop.
     Cancel { session: String },
+    /// Hard-preempt the running Leader or Worker, aborting an in-flight provider stream or tool call.
+    Preempt {
+        session: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Show hard-preemption history and the project policy for a session.
+    Preemption {
+        session: String,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+    /// Show a project's hard-preemption policy.
+    PreemptionPolicy { project: String },
+    /// Show project-wide terminal preemptions across sessions.
+    Preemptions {
+        project: String,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+    /// Update a project's hard-preemption policy; unspecified values are kept.
+    PreemptionPolicySet {
+        project: String,
+        #[arg(long)]
+        disabled: bool,
+        #[arg(long)]
+        provider_grace_ms: Option<u64>,
+        #[arg(long)]
+        tool_grace_ms: Option<u64>,
+        #[arg(long)]
+        kill_escalation_ms: Option<u64>,
+        #[arg(long)]
+        tool_deadline_secs: Option<u64>,
+        #[arg(long)]
+        clear_tool_deadline: bool,
+        #[arg(long)]
+        no_checkpoint: bool,
+    },
     /// Pause the running Leader between turns/tools.
     Pause { session: String },
     /// Resume a paused Leader.
@@ -5806,6 +5844,83 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Cancel { session } => {
             rpc(&discovery, "session.cancel", json!({"session_id": session})).await?
+        }
+        Command::Preempt { session, reason } => {
+            rpc(
+                &discovery,
+                "session.preempt",
+                json!({"session_id": session, "reason": reason}),
+            )
+            .await?
+        }
+        Command::Preemption { session, limit } => {
+            rpc(
+                &discovery,
+                "session.preemption",
+                json!({"session_id": session, "limit": limit}),
+            )
+            .await?
+        }
+        Command::PreemptionPolicy { project } => {
+            rpc(
+                &discovery,
+                "project.preemption_policy.get",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::Preemptions { project, limit } => {
+            rpc(
+                &discovery,
+                "preemption.overview",
+                json!({"project_id": project, "limit": limit}),
+            )
+            .await?
+        }
+        Command::PreemptionPolicySet {
+            project,
+            disabled,
+            provider_grace_ms,
+            tool_grace_ms,
+            kill_escalation_ms,
+            tool_deadline_secs,
+            clear_tool_deadline,
+            no_checkpoint,
+        } => {
+            let current = rpc(
+                &discovery,
+                "project.preemption_policy.get",
+                json!({"project_id": project}),
+            )
+            .await?;
+            let mut policy = current.get("policy").cloned().unwrap_or_else(|| json!({}));
+            let object = policy
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("preemption policy result is not an object"))?;
+            object.insert("enabled".into(), json!(!disabled));
+            if let Some(value) = provider_grace_ms {
+                object.insert("provider_grace_ms".into(), json!(value));
+            }
+            if let Some(value) = tool_grace_ms {
+                object.insert("tool_grace_ms".into(), json!(value));
+            }
+            if let Some(value) = kill_escalation_ms {
+                object.insert("kill_escalation_ms".into(), json!(value));
+            }
+            if clear_tool_deadline {
+                object.insert("tool_deadline_secs".into(), Value::Null);
+            } else if let Some(value) = tool_deadline_secs {
+                object.insert("tool_deadline_secs".into(), json!(value));
+            }
+            if no_checkpoint {
+                object.insert("checkpoint_on_preempt".into(), json!(false));
+            }
+            rpc(
+                &discovery,
+                "project.preemption_policy.set",
+                json!({"project_id": project, "policy": policy}),
+            )
+            .await?
         }
         Command::Pause { session } => {
             rpc(&discovery, "session.pause", json!({"session_id": session})).await?
@@ -12130,6 +12245,24 @@ fn print_human(value: &Value) {
         );
         return;
     }
+    if let Some(preempted) = value.get("preempted").and_then(Value::as_bool)
+        && value.get("records").is_none()
+        && value.get("detail").is_some()
+    {
+        let detail = value
+            .get("detail")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if preempted {
+            println!("hard preemption signalled.");
+        } else {
+            println!("no active run was preempted.");
+        }
+        if !detail.is_empty() {
+            println!("  {detail}");
+        }
+        return;
+    }
     if let Some(cancelled) = value.get("cancelled").and_then(Value::as_bool) {
         println!(
             "{}",
@@ -14570,6 +14703,73 @@ mod remote_integration_cli_tests {
         let explicit = dir.path().join("custom-anchor.json");
         let store = anchor_store(dir.path(), Some(&explicit));
         assert_eq!(store.path(), explicit);
+    }
+    #[test]
+    fn preemption_commands_and_flags_parse() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli =
+                    Cli::try_parse_from(["vp", "preempt", "ses-1", "--reason", "rotate the run"])
+                        .unwrap();
+                match cli.command {
+                    Command::Preempt { session, reason } => {
+                        assert_eq!(session, "ses-1");
+                        assert_eq!(reason.as_deref(), Some("rotate the run"));
+                    }
+                    other => panic!("unexpected command: {other:?}"),
+                }
+                let cli =
+                    Cli::try_parse_from(["vp", "preemption", "ses-1", "--limit", "25"]).unwrap();
+                match cli.command {
+                    Command::Preemption { session, limit } => {
+                        assert_eq!(session, "ses-1");
+                        assert_eq!(limit, 25);
+                    }
+                    other => panic!("unexpected command: {other:?}"),
+                }
+                let cli =
+                    Cli::try_parse_from(["vp", "preemptions", "proj-1", "--limit", "5"]).unwrap();
+                match cli.command {
+                    Command::Preemptions { project, limit } => {
+                        assert_eq!(project, "proj-1");
+                        assert_eq!(limit, 5);
+                    }
+                    other => panic!("unexpected command: {other:?}"),
+                }
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "preemption-policy-set",
+                    "proj-1",
+                    "--disabled",
+                    "--tool-grace-ms",
+                    "1500",
+                    "--tool-deadline-secs",
+                    "30",
+                    "--no-checkpoint",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::PreemptionPolicySet {
+                        project,
+                        disabled,
+                        tool_grace_ms,
+                        tool_deadline_secs,
+                        no_checkpoint,
+                        ..
+                    } => {
+                        assert_eq!(project, "proj-1");
+                        assert!(disabled);
+                        assert_eq!(tool_grace_ms, Some(1_500));
+                        assert_eq!(tool_deadline_secs, Some(30));
+                        assert!(no_checkpoint);
+                    }
+                    other => panic!("unexpected command: {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }
 

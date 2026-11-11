@@ -103,6 +103,15 @@ impl HttpSession {
     }
 
     pub(super) async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.request_preemptible(method, params, None).await
+    }
+
+    pub(super) async fn request_preemptible(
+        &mut self,
+        method: &str,
+        params: Value,
+        token: Option<&vp_providers::PreemptToken>,
+    ) -> Result<Value> {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         let message = json!({
@@ -111,9 +120,27 @@ impl HttpSession {
             "method": method,
             "params": params,
         });
-        self.post(message, true)
-            .await?
-            .ok_or_else(|| transport(format!("MCP {method} was accepted without a response")))
+        let response = match token {
+            Some(token) => {
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        let _ = self
+                            .notify(
+                                "notifications/cancelled",
+                                json!({
+                                    "requestId": id,
+                                    "reason": format!("preempted while running {method}"),
+                                }),
+                            )
+                            .await;
+                        bail!("MCP {method} was preempted");
+                    }
+                    response = self.post(message, true) => response,
+                }
+            }
+            None => self.post(message, true).await,
+        };
+        response?.ok_or_else(|| transport(format!("MCP {method} was accepted without a response")))
     }
 
     pub(super) async fn close(&mut self) {
@@ -425,6 +452,15 @@ impl SseSession {
     }
 
     pub(super) async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.request_preemptible(method, params, None).await
+    }
+
+    pub(super) async fn request_preemptible(
+        &mut self,
+        method: &str,
+        params: Value,
+        token: Option<&vp_providers::PreemptToken>,
+    ) -> Result<Value> {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         let message = json!({
@@ -433,8 +469,27 @@ impl SseSession {
             "method": method,
             "params": params,
         });
-        self.post(message, true)
-            .await?
+        let response = match token {
+            Some(token) => {
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        let _ = self
+                            .notify(
+                                "notifications/cancelled",
+                                json!({
+                                    "requestId": id,
+                                    "reason": format!("preempted while running {method}"),
+                                }),
+                            )
+                            .await;
+                        bail!("MCP SSE {method} was preempted");
+                    }
+                    response = self.post(message, true) => response,
+                }
+            }
+            None => self.post(message, true).await,
+        };
+        response?
             .ok_or_else(|| transport(format!("MCP SSE {method} was accepted without a response")))
     }
 

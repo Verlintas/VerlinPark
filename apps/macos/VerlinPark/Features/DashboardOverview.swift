@@ -74,6 +74,12 @@ struct DashboardOverviewView: View {
                 detail: "\(brand.config.style.title) mark",
                 index: 7
             )
+            metric(
+                "Preemptions",
+                value: "\(preemptionCount)",
+                detail: preemptionDetail,
+                index: 8
+            )
         }
 
         DashboardPendingActions(section: $section)
@@ -87,6 +93,23 @@ struct DashboardOverviewView: View {
         DashboardRuntimeCard()
 
         DashboardRecentActivityCard(section: $section)
+    }
+
+    private var preemptionCount: Int {
+        if let overview = model.preemptionOverview {
+            return Int(overview.total)
+        }
+        return model.sessionPreemption?.records.count(where: { $0.terminal }) ?? 0
+    }
+
+    private var preemptionDetail: String {
+        if let overview = model.preemptionOverview, let reason = overview.byReason.first {
+            return "\(overview.sessions.count) sessions · \(reason.key) \(reason.count)"
+        }
+        guard let preemption = model.sessionPreemption, let last = preemption.records.last else {
+            return "no hard preemptions"
+        }
+        return "\(last.reason) · \(last.phase)"
     }
 
     private var approvalCount: Int {

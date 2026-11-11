@@ -1,7 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -647,11 +647,25 @@ pub(crate) async fn fetch_public_url(
     max_chars: usize,
     max_bytes: usize,
 ) -> Result<FetchedUrl> {
+    fetch_public_url_with(raw_url, max_chars, max_bytes, None).await
+}
+
+pub(crate) async fn fetch_public_url_with(
+    raw_url: &str,
+    max_chars: usize,
+    max_bytes: usize,
+    preempt: Option<vp_providers::PreemptToken>,
+) -> Result<FetchedUrl> {
     let max_chars = max_chars.clamp(100, 4_000_000);
     let max_bytes = max_bytes.clamp(1_024, 8 * 1024 * 1024);
     let mut current = reqwest::Url::parse(raw_url).context("invalid URL")?;
     let mut redirects = Vec::new();
     for hop in 0..=5 {
+        if let Some(token) = &preempt
+            && token.is_preempted()
+        {
+            bail!("fetch was preempted");
+        }
         validate_public_url(&current).await?;
         let host = current
             .host_str()
@@ -672,11 +686,17 @@ pub(crate) async fn fetch_public_url(
             client_builder = client_builder.resolve(&host, address);
         }
         let client = client_builder.build().context("building HTTP client")?;
-        let response = client
-            .get(current.clone())
-            .send()
-            .await
-            .map_err(|error| anyhow!("fetch failed: {error}"))?;
+        let request = client.get(current.clone()).send();
+        let response = match &preempt {
+            Some(token) => {
+                tokio::select! {
+                    _ = token.cancelled() => bail!("fetch was preempted"),
+                    response = request => response,
+                }
+            }
+            None => request.await,
+        }
+        .map_err(|error| anyhow!("fetch failed: {error}"))?;
         let status = response.status();
         if status.is_redirection() {
             let location = response
@@ -703,7 +723,19 @@ pub(crate) async fn fetch_public_url(
         let mut body = Vec::new();
         let mut response = response;
         let mut truncated = false;
-        while let Some(chunk) = response.chunk().await? {
+        loop {
+            let chunk = match &preempt {
+                Some(token) => {
+                    tokio::select! {
+                        _ = token.cancelled() => bail!("fetch was preempted"),
+                        chunk = response.chunk() => chunk?,
+                    }
+                }
+                None => response.chunk().await?,
+            };
+            let Some(chunk) = chunk else {
+                break;
+            };
             body.extend_from_slice(&chunk);
             if body.len() >= max_bytes {
                 truncated = true;
@@ -830,7 +862,15 @@ impl AgentTool for FetchUrl {
             .get("include_links")
             .and_then(Value::as_bool)
             .unwrap_or(true);
-        match fetch_public_url(raw_url, max_chars, max_chars.saturating_mul(4)).await {
+        let token = crate::preemption::current_token();
+        match fetch_public_url_with(
+            raw_url,
+            max_chars,
+            max_chars.saturating_mul(4),
+            token.clone(),
+        )
+        .await
+        {
             Ok(fetched) => {
                 let content_type = fetched.content_type.to_ascii_lowercase();
                 if content_type.starts_with("image/")
@@ -904,6 +944,19 @@ impl AgentTool for FetchUrl {
                 ))
             }
             Err(error) => {
+                if let Some(token) = &token
+                    && token.is_preempted()
+                {
+                    return Ok(crate::preemption::tool_output(
+                        "fetch_url",
+                        &token.snapshot().unwrap_or_else(|| {
+                            crate::preemption::fallback_snapshot(
+                                crate::preemption::Phase::Tool,
+                                Some("fetch_url"),
+                            )
+                        }),
+                    ));
+                }
                 let message = error.to_string();
                 let lower = message.to_ascii_lowercase();
                 let code = if lower.contains("timed out") {
@@ -1799,7 +1852,7 @@ impl AgentTool for Shell {
             .unwrap_or(120)
             .min(900);
         let started = std::time::Instant::now();
-        let captured =
+        let mut captured =
             match run_sandboxed_shell_captured(context, command, Duration::from_secs(timeout_secs))
                 .await
             {
@@ -1817,6 +1870,30 @@ impl AgentTool for Shell {
                         )));
                 }
             };
+        if let Some(snapshot) = captured.preempted.take() {
+            let mut output = crate::preemption::tool_output("shell", &snapshot);
+            if let Some(serde_json::Value::Object(object)) = output.structured.as_mut() {
+                object.insert("stdout".into(), json!(captured.stdout));
+                object.insert("stderr".into(), json!(captured.stderr));
+                object.insert("stdout_truncated".into(), json!(captured.stdout_truncated));
+                object.insert("stderr_truncated".into(), json!(captured.stderr_truncated));
+                object.insert("exit_code".into(), json!(captured.exit_code));
+                object.insert("command".into(), json!(command));
+            }
+            if !captured.stdout.is_empty() || !captured.stderr.is_empty() {
+                output
+                    .content
+                    .push_str("\n[partial output before termination]\n");
+                if !captured.stdout.is_empty() {
+                    output.content.push_str(&captured.stdout);
+                }
+                if !captured.stderr.is_empty() {
+                    output.content.push_str("[stderr]\n");
+                    output.content.push_str(&captured.stderr);
+                }
+            }
+            return Ok(output);
+        }
         crate::tooling::code::invalidate_index(&context.root);
         let mut warnings = Vec::new();
         if captured.stdout_truncated {
@@ -1878,6 +1955,8 @@ pub(crate) struct ShellCapture {
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
     pub duration_ms: u64,
+    /// Set when the shell was stopped by a hard preemption or tool deadline.
+    pub preempted: Option<vp_providers::PreemptSnapshot>,
 }
 
 pub(crate) async fn run_sandboxed_shell_captured(
@@ -1899,6 +1978,13 @@ pub(crate) async fn run_sandboxed_login_shell(
     let captured =
         run_sandboxed_shell_with_captured(context, "/bin/sh", &["-lc"], command, timeout_duration)
             .await?;
+    if let Some(snapshot) = &captured.preempted {
+        return Err(anyhow!(
+            "integration command was preempted during {} ({})",
+            snapshot.phase.as_str(),
+            snapshot.reason.as_str()
+        ));
+    }
     let mut text = captured.stdout;
     if !captured.stderr.is_empty() {
         if !text.is_empty() && !text.ends_with('\n') {
@@ -1924,7 +2010,11 @@ async fn run_sandboxed_shell_with_captured(
         .arg(command)
         .stdin(Stdio::null());
     let mut child = process.spawn().context("spawning sandboxed shell")?;
-    let _group = ProcessGroupGuard::new(child.id());
+    let pid = child
+        .id()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .ok_or_else(|| anyhow!("sandboxed shell has no process id"))?;
+    let _group = ProcessGroupGuard::new(Some(pid as u32));
     let stdout = child
         .stdout
         .take()
@@ -1933,28 +2023,91 @@ async fn run_sandboxed_shell_with_captured(
         .stderr
         .take()
         .ok_or_else(|| anyhow!("shell stderr pipe is unavailable"))?;
-    let stdout_task = tokio::spawn(read_capped_stream(stdout));
-    let stderr_task = tokio::spawn(read_capped_stream(stderr));
-    let status = match timeout(timeout_duration, child.wait()).await {
-        Ok(status) => status?,
-        Err(_) => {
-            let _ = child.kill().await;
-            // Do not await the readers: a background process may still hold
-            // the pipe open, and waiting would delay process-group cleanup.
+    let stdout_buffer = Arc::new(Mutex::new(ShellBuffer::default()));
+    let stderr_buffer = Arc::new(Mutex::new(ShellBuffer::default()));
+    let stdout_task = tokio::spawn(read_capped_stream_shared(
+        stdout,
+        Arc::clone(&stdout_buffer),
+    ));
+    let stderr_task = tokio::spawn(read_capped_stream_shared(
+        stderr,
+        Arc::clone(&stderr_buffer),
+    ));
+    let token = crate::preemption::current_token();
+    let status = match token {
+        Some(token) if token.is_preempted() => {
+            terminate_shell_group(&mut child, pid, token.grace()).await;
             stdout_task.abort();
             stderr_task.abort();
-            return Err(anyhow!(
-                "command timed out after {}s",
-                timeout_duration.as_secs()
-            ));
+            let stdout = snapshot_shell_buffer(&stdout_buffer);
+            let stderr = snapshot_shell_buffer(&stderr_buffer);
+            return Ok(ShellCapture {
+                exit_code: -1,
+                stdout: stdout.text,
+                stderr: stderr.text,
+                stdout_truncated: stdout.truncated,
+                stderr_truncated: stderr.truncated,
+                duration_ms: started.elapsed().as_millis() as u64,
+                preempted: Some(token.snapshot().unwrap_or_else(|| {
+                    crate::preemption::fallback_snapshot(
+                        crate::preemption::Phase::Tool,
+                        Some("shell"),
+                    )
+                })),
+            });
         }
+        Some(token) => {
+            tokio::select! {
+                result = timeout(timeout_duration, child.wait()) => result??,
+                _ = token.cancelled() => {
+                    let grace = token.grace();
+                    terminate_shell_group(&mut child, pid, grace).await;
+                    stdout_task.abort();
+                    stderr_task.abort();
+                    let stdout = snapshot_shell_buffer(&stdout_buffer);
+                    let stderr = snapshot_shell_buffer(&stderr_buffer);
+                    return Ok(ShellCapture {
+                        exit_code: -1,
+                        stdout: stdout.text,
+                        stderr: stderr.text,
+                        stdout_truncated: stdout.truncated,
+                        stderr_truncated: stderr.truncated,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        preempted: Some(
+                            token.snapshot().unwrap_or_else(|| {
+                                crate::preemption::fallback_snapshot(
+                                    crate::preemption::Phase::Tool,
+                                    Some("shell"),
+                                )
+                            }),
+                        ),
+                    });
+                }
+            }
+        }
+        None => match timeout(timeout_duration, child.wait()).await {
+            Ok(status) => status?,
+            Err(_) => {
+                let _ = child.kill().await;
+                // Do not await the readers: a background process may still hold
+                // the pipe open, and waiting would delay process-group cleanup.
+                stdout_task.abort();
+                stderr_task.abort();
+                return Err(anyhow!(
+                    "command timed out after {}s",
+                    timeout_duration.as_secs()
+                ));
+            }
+        },
     };
-    let stdout = stdout_task
+    stdout_task
         .await
         .map_err(|error| anyhow!("shell stdout reader failed: {error}"))?;
-    let stderr = stderr_task
+    stderr_task
         .await
         .map_err(|error| anyhow!("shell stderr reader failed: {error}"))?;
+    let stdout = snapshot_shell_buffer(&stdout_buffer);
+    let stderr = snapshot_shell_buffer(&stderr_buffer);
     Ok(ShellCapture {
         exit_code: status.code().unwrap_or(-1),
         stdout: stdout.text,
@@ -1962,40 +2115,82 @@ async fn run_sandboxed_shell_with_captured(
         stdout_truncated: stdout.truncated,
         stderr_truncated: stderr.truncated,
         duration_ms: started.elapsed().as_millis() as u64,
+        preempted: None,
     })
 }
 
-pub(crate) struct CappedStream {
-    text: String,
+/// Bounded TERM → KILL escalation for one shell process group. `grace` is the
+/// final wait for the child to be reaped after SIGKILL; `kill_escalation` is
+/// the TERM → KILL window. Both are clamped by the project policy before they
+/// reach this function and can never be infinite.
+async fn terminate_shell_group(
+    child: &mut tokio::process::Child,
+    pid: i32,
+    grace: vp_providers::ToolGrace,
+) {
+    #[cfg(unix)]
+    unsafe {
+        // SAFETY: a negative pid targets the process group created with
+        // process_group(0). ESRCH is the expected no-op when it already exited.
+        libc::kill(-pid, libc::SIGTERM);
+    }
+    if timeout(grace.kill_escalation, child.wait()).await.is_ok() {
+        return;
+    }
+    #[cfg(unix)]
+    unsafe {
+        // SAFETY: see above; SIGKILL is the bounded escalation step.
+        libc::kill(-pid, libc::SIGKILL);
+    }
+    let _ = timeout(grace.grace, child.wait()).await;
+}
+
+#[derive(Default)]
+struct ShellBuffer {
+    bytes: Vec<u8>,
     truncated: bool,
 }
 
-pub(crate) async fn read_capped_stream<R>(mut reader: R) -> CappedStream
+fn snapshot_shell_buffer(buffer: &Mutex<ShellBuffer>) -> CappedStream {
+    let buffer = buffer
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    CappedStream {
+        text: String::from_utf8_lossy(&buffer.bytes).to_string(),
+        truncated: buffer.truncated,
+    }
+}
+
+async fn read_capped_stream_shared<R>(mut reader: R, buffer: Arc<Mutex<ShellBuffer>>)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let mut buffer = [0u8; 8192];
-    let mut bytes = Vec::new();
-    let mut truncated = false;
+    let mut chunk = [0u8; 8192];
     loop {
-        match reader.read(&mut buffer).await {
+        match reader.read(&mut chunk).await {
             Ok(0) => break,
             Ok(read) => {
-                let remaining = MAX_SHELL_STREAM_BYTES.saturating_sub(bytes.len());
+                let mut buffer = buffer
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let remaining = MAX_SHELL_STREAM_BYTES.saturating_sub(buffer.bytes.len());
                 if remaining > 0 {
-                    bytes.extend_from_slice(&buffer[..read.min(remaining)]);
+                    buffer
+                        .bytes
+                        .extend_from_slice(&chunk[..read.min(remaining)]);
                 }
                 if read > remaining {
-                    truncated = true;
+                    buffer.truncated = true;
                 }
             }
             Err(_) => break,
         }
     }
-    CappedStream {
-        text: String::from_utf8_lossy(&bytes).to_string(),
-        truncated,
-    }
+}
+
+pub(crate) struct CappedStream {
+    text: String,
+    truncated: bool,
 }
 
 /// Kills the command's process group when dropped. `kill_on_drop` only kills the

@@ -259,11 +259,21 @@ pub(crate) fn checkpoints_from_events(events: &[Event]) -> Option<Vec<ContextChe
         }
     }
     rows.sort_by(|left, right| {
-        left.created_at
-            .cmp(&right.created_at)
+        checkpoint_time_key(&left.created_at)
+            .cmp(&checkpoint_time_key(&right.created_at))
             .then_with(|| left.id.cmp(&right.id))
     });
     Some(rows)
+}
+
+/// RFC3339 strings are not lexicographically chronological when fractional
+/// digits vary in length (`…23.9Z` sorts after `…23.10Z`). Replay must use the
+/// same numeric ordering as the SQLite `julianday()` projection query.
+fn checkpoint_time_key(value: &str) -> (i128, &str) {
+    let nanos = time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+        .map(|timestamp| timestamp.unix_timestamp_nanos())
+        .unwrap_or(i128::MIN);
+    (nanos, value)
 }
 
 pub(crate) fn context_checkpoints_match(

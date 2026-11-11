@@ -40,6 +40,15 @@ const MAX_FIND_RESULTS: usize = 100;
 const MAX_REFERENCES: usize = 200;
 const MAX_GRAPH_NODES: usize = 200;
 const MAX_SCAN_FILES: usize = 2_000;
+
+/// A preempted LSP-backed tool must not fall back to lexical results that look
+/// like a successful outcome. The typed marker lets the run loop emit
+/// `tool.preempted` and stop (or, for a tool deadline, feed the failure back).
+fn preempted_tool_output(tool: &str) -> Option<ToolOutput> {
+    crate::preemption::current_token()
+        .and_then(|token| token.snapshot())
+        .map(|snapshot| crate::preemption::tool_output(tool, &snapshot))
+}
 const MAX_SCAN_BYTES: u64 = 64 * 1024 * 1024;
 const INDEX_TTL: Duration = Duration::from_secs(20);
 const MAX_CONTEXT_TOKENS: usize = 16_000;
@@ -945,6 +954,9 @@ impl AgentTool for FindSymbol {
     }
 
     async fn execute(&self, context: &ToolContext, input: Value) -> Result<ToolOutput> {
+        if let Some(output) = preempted_tool_output("find_symbol") {
+            return Ok(output);
+        }
         let query = input
             .get("query")
             .and_then(Value::as_str)
@@ -1027,6 +1039,15 @@ impl AgentTool for FindSymbol {
                         return Ok(ToolOutput::ok_structured(truncate(text), structured));
                     }
                     Err(error) => {
+                        if error.is_preempted() {
+                            return Ok(preempted_tool_output("find_symbol").unwrap_or_else(|| {
+                                ToolOutput::error_coded(
+                                    "find_symbol",
+                                    crate::tooling::errors::ToolErrorCode::PREEMPTED,
+                                    "the symbol search was preempted",
+                                )
+                            }));
+                        }
                         if source == SourceChoice::Lsp {
                             return Ok(lsp_unavailable_output(&error, "find_symbol"));
                         }
@@ -1458,6 +1479,9 @@ impl AgentTool for FindReferences {
     }
 
     async fn execute(&self, context: &ToolContext, input: Value) -> Result<ToolOutput> {
+        if let Some(output) = preempted_tool_output("find_references") {
+            return Ok(output);
+        }
         let index = cached_index(&context.root);
         let source = match parse_source_choice(&input, SourceChoice::Auto) {
             Ok(source) => source,
@@ -1578,6 +1602,15 @@ impl AgentTool for FindReferences {
                     return Ok(ToolOutput::ok_structured(truncate(text), structured));
                 }
                 Err(error) => {
+                    if error.is_preempted() {
+                        return Ok(preempted_tool_output("find_references").unwrap_or_else(|| {
+                            ToolOutput::error_coded(
+                                "find_references",
+                                crate::tooling::errors::ToolErrorCode::PREEMPTED,
+                                "the reference search was preempted",
+                            )
+                        }));
+                    }
                     if source == SourceChoice::Lsp {
                         return Ok(lsp_unavailable_output(&error, "find_references"));
                     }
@@ -1754,6 +1787,9 @@ impl AgentTool for CodeDiagnostics {
     }
 
     async fn execute(&self, context: &ToolContext, input: Value) -> Result<ToolOutput> {
+        if let Some(output) = preempted_tool_output("code_diagnostics") {
+            return Ok(output);
+        }
         let source = match parse_source_choice(&input, SourceChoice::Auto) {
             Ok(source) => source,
             Err(output) => return Ok(*output),
@@ -1853,6 +1889,17 @@ impl AgentTool for CodeDiagnostics {
                 Ok(ToolOutput::ok_structured(truncate(text), structured))
             }
             Err(error) => {
+                if error.is_preempted() {
+                    return Ok(
+                        preempted_tool_output("code_diagnostics").unwrap_or_else(|| {
+                            ToolOutput::error_coded(
+                                "code_diagnostics",
+                                crate::tooling::errors::ToolErrorCode::PREEMPTED,
+                                "diagnostics were preempted",
+                            )
+                        }),
+                    );
+                }
                 if source == SourceChoice::Lsp {
                     return Ok(lsp_unavailable_output(&error, "code_diagnostics"));
                 }

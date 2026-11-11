@@ -9,6 +9,7 @@
 pub mod anthropic;
 pub mod cache;
 pub mod openai;
+pub mod preempt;
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,6 +25,10 @@ pub use cache::{
     looks_like_cache_ttl_rejection, plan_cache_breakpoints,
 };
 pub use openai::OpenAiCompatibleProvider;
+pub use preempt::{
+    PreemptPhase, PreemptReason, PreemptSnapshot, PreemptToken, ToolGrace,
+    current as current_preempt, scoped as scoped_preempt,
+};
 
 static TOOL_CALL_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -163,6 +168,32 @@ pub enum ProviderError {
     Parse(String),
     #[error("provider does not support this request: {0}")]
     Unsupported(String),
+    /// The run or tool deadline fired while the provider request was in
+    /// flight. The adapter aborts the read between chunks and never resumes or
+    /// replays the partial turn.
+    #[error("provider preempted during {phase} ({reason}) after {elapsed_ms}ms")]
+    Preempted {
+        reason: String,
+        phase: String,
+        elapsed_ms: u64,
+        side_effects_unknown: bool,
+    },
+}
+
+impl ProviderError {
+    pub fn preempted(token: &PreemptToken) -> Self {
+        let (reason, phase, elapsed_ms, side_effects_unknown) = preempt::error_snapshot(token);
+        Self::Preempted {
+            reason,
+            phase,
+            elapsed_ms,
+            side_effects_unknown,
+        }
+    }
+
+    pub fn is_preempted(&self) -> bool {
+        matches!(self, Self::Preempted { .. })
+    }
 }
 
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>;
@@ -203,14 +234,31 @@ fn backoff(attempt: u32) -> std::time::Duration {
 
 /// Send a provider request, retrying transient connection failures and
 /// rate-limit/server responses. The request body is rebuilt for every attempt.
-pub(crate) async fn send_with_retry<F>(mut build: F) -> Result<reqwest::Response, ProviderError>
+/// A retry delay or in-flight attempt observes the optional preemption token;
+/// retries never ignore a hard preemption.
+pub(crate) async fn send_with_retry_preemptible<F>(
+    mut build: F,
+    preempt: Option<&PreemptToken>,
+) -> Result<reqwest::Response, ProviderError>
 where
     F: FnMut() -> reqwest::RequestBuilder,
 {
     let mut attempt = 0;
     loop {
+        if preempt.is_some_and(PreemptToken::is_preempted) {
+            return Err(preempt
+                .map(ProviderError::preempted)
+                .unwrap_or_else(|| ProviderError::Stream("request preempted".into())));
+        }
         attempt += 1;
-        match build().send().await {
+        let sent = match preempt {
+            Some(token) => tokio::select! {
+                _ = token.cancelled() => return Err(ProviderError::preempted(token)),
+                response = build().send() => response,
+            },
+            None => build().send().await,
+        };
+        match sent {
             Ok(response) if response.status().is_success() => return Ok(response),
             Ok(response) => {
                 let status = response.status().as_u16();
@@ -222,14 +270,39 @@ where
                     .unwrap_or_else(|| backoff(attempt))
                     .min(RETRY_MAX_DELAY);
                 drop(response);
-                tokio::time::sleep(delay).await;
+                if !sleep_preemptible(delay, preempt).await {
+                    return Err(preempt
+                        .map(ProviderError::preempted)
+                        .unwrap_or_else(|| ProviderError::Stream("retry aborted".into())));
+                }
             }
             Err(error) => {
                 if attempt >= PROVIDER_ATTEMPTS || !(error.is_timeout() || error.is_connect()) {
                     return Err(ProviderError::Http(error));
                 }
-                tokio::time::sleep(backoff(attempt)).await;
+                if !sleep_preemptible(backoff(attempt), preempt).await {
+                    return Err(preempt
+                        .map(ProviderError::preempted)
+                        .unwrap_or_else(|| ProviderError::Stream("retry aborted".into())));
+                }
             }
+        }
+    }
+}
+
+/// Sleep for a retry delay unless the token fires first. Returns false when
+/// preempted.
+async fn sleep_preemptible(delay: std::time::Duration, preempt: Option<&PreemptToken>) -> bool {
+    match preempt {
+        Some(token) => {
+            tokio::select! {
+                _ = token.cancelled() => false,
+                _ = tokio::time::sleep(delay) => !token.is_preempted(),
+            }
+        }
+        None => {
+            tokio::time::sleep(delay).await;
+            true
         }
     }
 }
@@ -239,6 +312,20 @@ pub trait Provider: Send + Sync {
     fn id(&self) -> &str;
 
     async fn stream_chat(&self, request: ChatRequest) -> Result<EventStream, ProviderError>;
+
+    /// Start a stream that observes a hard preemption token. The default
+    /// implementation ignores the token so test and third-party providers keep
+    /// their existing behavior; the runtime consumer still watches the token
+    /// between chunks. First-party adapters override this and abort the
+    /// HTTP/SSE read between chunks.
+    async fn stream_chat_preemptible(
+        &self,
+        request: ChatRequest,
+        token: Option<PreemptToken>,
+    ) -> Result<EventStream, ProviderError> {
+        let _ = token;
+        self.stream_chat(request).await
+    }
 }
 
 pub(crate) fn openai_usage(value: &Value) -> Option<StreamEvent> {

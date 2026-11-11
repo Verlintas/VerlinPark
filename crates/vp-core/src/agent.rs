@@ -31,8 +31,9 @@ use vp_protocol::types::{
     SchedulerProjectStatus, SchedulerStatusResult, Session, SessionCachePlanResult,
     SessionCachePlanRole, SessionCacheWarmResult, SessionCheckpoint, SessionCheckpointDiffResult,
     SessionCheckpointRestoreResult, SessionCompactResult, SessionForkResult,
-    SessionMergeForkResult, SessionRunCancelResult, SessionRunResumeResult, Skill, SourceCitation,
-    SourceSearchHit, StallRecoveryMode, StoredMessage, TeamPlan, TodoItem,
+    SessionMergeForkResult, SessionPreemptResult, SessionPreemptionResult, SessionRunCancelResult,
+    SessionRunResumeResult, Skill, SourceCitation, SourceSearchHit, StallRecoveryMode,
+    StoredMessage, TeamPlan, TodoItem,
 };
 use vp_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, OpenAiCompatibleProvider, Provider, ProviderError,
@@ -581,6 +582,8 @@ struct RunControl {
     finalized: tokio::sync::Mutex<Option<String>>,
     manual: bool,
     cancellable: bool,
+    preempt: crate::preemption::Token,
+    preemption_policy: Mutex<vp_protocol::types::PreemptionPolicy>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -611,7 +614,63 @@ impl RunControl {
             finalized: tokio::sync::Mutex::new(None),
             manual,
             cancellable,
+            preempt: crate::preemption::Token::disabled(),
+            preemption_policy: Mutex::new(vp_protocol::types::PreemptionPolicy::default()),
         }
+    }
+
+    /// Arm automatic wall-clock preemption for this run. The token is created
+    /// with the control so an explicit `session.preempt` can fire during
+    /// admission, before the run loop has its exact budget start.
+    fn arm_preemption(
+        &self,
+        time_budget_secs: Option<u64>,
+        policy: vp_protocol::types::PreemptionPolicy,
+    ) {
+        let deadline =
+            time_budget_secs.map(|secs| Instant::now() + Duration::from_secs(secs.max(1)));
+        self.arm_preemption_deadline(deadline, policy);
+    }
+
+    fn arm_preemption_deadline(
+        &self,
+        deadline: Option<Instant>,
+        policy: vp_protocol::types::PreemptionPolicy,
+    ) {
+        crate::preemption::apply_policy(&self.preempt, &policy);
+        self.preempt
+            .set_deadline(deadline.filter(|_| policy.enabled));
+        if let Ok(mut stored) = self.preemption_policy.lock() {
+            *stored = policy;
+        }
+    }
+
+    fn preemption_policy(&self) -> vp_protocol::types::PreemptionPolicy {
+        self.preemption_policy
+            .lock()
+            .map(|policy| policy.clone())
+            .unwrap_or_default()
+    }
+
+    fn preempt_report(&self) -> Option<crate::preemption::Snapshot> {
+        self.preempt.snapshot()
+    }
+
+    fn is_preempted(&self) -> bool {
+        self.preempt.is_preempted()
+    }
+
+    /// Operator-triggered hard preemption. This is distinct from `cancel`:
+    /// it aborts provider/tool work in flight instead of waiting for the next
+    /// turn boundary.
+    fn request_preempt(&self) -> crate::preemption::Snapshot {
+        let phase = self.preempt.phase();
+        let side_effects_unknown = phase == crate::preemption::Phase::Tool;
+        self.preempt.trigger(
+            crate::preemption::Reason::Explicit,
+            phase,
+            side_effects_unknown,
+        )
     }
 
     async fn finalize_session(
@@ -844,7 +903,7 @@ async fn wait_for_resume(control: &RunControl) -> bool {
     let mut paused = control.subscribe_paused();
     let mut cancelled = control.subscribe();
     loop {
-        if control.is_cancelled() {
+        if control.is_cancelled() || control.is_preempted() {
             return false;
         }
         if !*paused.borrow() {
@@ -861,6 +920,7 @@ async fn wait_for_resume(control: &RunControl) -> bool {
                     return false;
                 }
             }
+            _ = control.preempt.cancelled() => return false,
         }
     }
 }
@@ -875,7 +935,7 @@ async fn wait_for_task_resume(
         if !wait_for_resume(control).await {
             return Ok(false);
         }
-        if control.is_cancelled() {
+        if control.is_cancelled() || control.is_preempted() {
             return Ok(false);
         }
         let Some(task_id) = &spec.task_id else {
@@ -918,14 +978,20 @@ async fn wait_for_task_resume(
 }
 
 async fn wait_for_cancel(control: &RunControl) {
-    if control.is_cancelled() {
+    if control.is_cancelled() || control.is_preempted() {
         return;
     }
     let mut cancelled = control.subscribe();
-    loop {
-        if cancelled.changed().await.is_err() || control.is_cancelled() {
-            return;
-        }
+    let preempt = control.preempt.clone();
+    tokio::select! {
+        _ = async {
+            loop {
+                if cancelled.changed().await.is_err() || control.is_cancelled() {
+                    break;
+                }
+            }
+        } => {}
+        _ = preempt.cancelled() => {}
     }
 }
 
@@ -1583,6 +1649,12 @@ impl SessionBudget {
         self.started.elapsed().as_secs()
     }
 
+    /// Exact instant at which the wall-clock budget expires, using the same
+    /// `started` clock as `exceeded_reason`.
+    fn wall_clock_deadline(&self) -> Option<Instant> {
+        self.time_limit.map(|limit| self.started + limit)
+    }
+
     fn worker_cap(&self) -> usize {
         if let Some(slots) = &self.scaling_slots {
             return slots.targets().0;
@@ -2024,6 +2096,94 @@ async fn emit(
     agent_fields(&mut payload, spec);
     engine.append_event(session_id, kind, payload).await?;
     Ok(())
+}
+
+/// Cold diagnostics for a preempted provider stream. Kept in a separate async
+/// function and called through `Box::pin` so the recursive run-loop future
+/// does not retain this formatting/emission state at every delegation depth.
+async fn emit_provider_preempted(
+    engine: &Engine,
+    session: &Session,
+    project: &Project,
+    spec: &AgentSpec,
+    snapshot: &crate::preemption::Snapshot,
+    text: &str,
+    tool_calls: &[ToolCall],
+) -> Result<()> {
+    if !text.is_empty() {
+        emit(
+            engine,
+            &session.id,
+            spec,
+            "agent.message",
+            serde_json::json!({
+                "text": text,
+                "tool_calls": tool_calls,
+                "partial": true,
+                "preempted": true,
+                "preempt_reason": snapshot.reason.as_str(),
+            }),
+        )
+        .await?;
+    }
+    let attribution = crate::preemption::PreemptAttribution {
+        session_id: &session.id,
+        project_id: &project.id,
+        agent_id: &spec.id,
+        agent_name: &spec.name,
+        agent_role: spec.role.as_str(),
+        task_id: spec.task_id.as_deref(),
+        department: spec.department.as_deref(),
+    };
+    emit(
+        engine,
+        &session.id,
+        spec,
+        "provider.preempted",
+        serde_json::to_value(crate::preemption::record(
+            &attribution,
+            snapshot,
+            false,
+            None,
+            None,
+            None,
+        ))?,
+    )
+    .await
+}
+
+/// Cold diagnostics for a preempted tool. See `emit_provider_preempted`.
+async fn emit_tool_preempted(
+    engine: &Engine,
+    session: &Session,
+    project: &Project,
+    spec: &AgentSpec,
+    snapshot: &crate::preemption::Snapshot,
+) -> Result<()> {
+    let attribution = crate::preemption::PreemptAttribution {
+        session_id: &session.id,
+        project_id: &project.id,
+        agent_id: &spec.id,
+        agent_name: &spec.name,
+        agent_role: spec.role.as_str(),
+        task_id: spec.task_id.as_deref(),
+        department: spec.department.as_deref(),
+    };
+    emit(
+        engine,
+        &session.id,
+        spec,
+        "tool.preempted",
+        serde_json::to_value(crate::preemption::record(
+            &attribution,
+            snapshot,
+            false,
+            None,
+            None,
+            None,
+        ))?,
+    )
+    .await
 }
 
 /// Additive per-tool observability. The existing output/structured fields stay
@@ -5821,6 +5981,11 @@ impl AgentService {
         }
 
         let control = Arc::new(RunControl::new());
+        let preemption_policy = self
+            .engine
+            .get_preemption_policy(&session.project_id)
+            .await?;
+        control.arm_preemption(session.time_budget_secs, preemption_policy);
         {
             let mut runs = self
                 .runs
@@ -6069,7 +6234,10 @@ impl AgentService {
                     run.top_level
                         && crate::run_journal::is_resumable_status(&run.status)
                         && !run.failure.as_ref().is_some_and(|failure| {
-                            matches!(failure.kind.as_str(), "cancelled" | "superseded")
+                            matches!(
+                                failure.kind.as_str(),
+                                "cancelled" | "superseded" | "preempted"
+                            )
                         })
                 })
                 .ok_or_else(|| {
@@ -6103,7 +6271,13 @@ impl AgentService {
                 .clone()
                 .ok_or_else(|| anyhow!("session has no worktree"))?,
         );
-        let control = self.begin_resumable_run(session_id)?;
+        let control = self.begin_resumable_run(
+            session_id,
+            session.time_budget_secs,
+            self.engine
+                .get_preemption_policy(&session.project_id)
+                .await?,
+        )?;
         let lease = match self
             .engine
             .acquire_session_lease(session_id, std::time::Duration::from_secs(180))
@@ -6224,6 +6398,9 @@ impl AgentService {
         let runs = self.runs.clone();
         let global_slots = self.global_slots.clone();
         tokio::spawn(async move {
+            control
+                .preempt
+                .set_phase(crate::preemption::Phase::Queue, None);
             let permit = tokio::select! {
                 permit = global_slots.acquire(&session_id, &project_id, priority, &control) => permit,
                 _ = wait_for_cancel(&control) => None,
@@ -6238,12 +6415,34 @@ impl AgentService {
                         )
                         .await;
                 }
-                let _ = engine
-                    .append_event(&session_id, "agent.cancelled", serde_json::json!({}))
+                if let Some(snapshot) = control.preempt_report() {
+                    let _ = engine
+                        .append_event(
+                            &session_id,
+                            "agent.cancelled",
+                            serde_json::json!({
+                                "preempted": true,
+                                "reason": snapshot.reason.as_str(),
+                                "phase": snapshot.phase.as_str(),
+                            }),
+                        )
+                        .await;
+                    let _ = record_queued_preemption(
+                        &engine,
+                        &session_id,
+                        &project_id,
+                        &control,
+                        &snapshot,
+                    )
                     .await;
-                let _ = control
-                    .finalize_session(&engine, &session_id, "cancelled")
-                    .await;
+                } else {
+                    let _ = engine
+                        .append_event(&session_id, "agent.cancelled", serde_json::json!({}))
+                        .await;
+                    let _ = control
+                        .finalize_session(&engine, &session_id, "cancelled")
+                        .await;
+                }
                 if let Ok(mut runs) = runs.lock() {
                     runs.remove(&session_id);
                 }
@@ -6322,6 +6521,23 @@ impl AgentService {
         let mut started = 0;
         for (session_id, project_id, prompt, priority) in queued {
             let control = Arc::new(RunControl::new());
+            match load_session_project(self.engine.store().clone(), &session_id).await {
+                Ok((session, _)) => {
+                    match self.engine.get_preemption_policy(&session.project_id).await {
+                        Ok(policy) => control.arm_preemption(session.time_budget_secs, policy),
+                        Err(error) => tracing::warn!(
+                            %error,
+                            %session_id,
+                            "could not read preemption policy for a queued session"
+                        ),
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    %session_id,
+                    "could not read a queued session for preemption policy"
+                ),
+            }
             {
                 let mut runs = self
                     .runs
@@ -6716,7 +6932,12 @@ impl AgentService {
 
     /// A resumed or normal long run is cancellable and pausable. Foreground
     /// operations use the non-cancellable variants above.
-    fn begin_resumable_run(&self, session_id: &str) -> Result<Arc<RunControl>> {
+    fn begin_resumable_run(
+        &self,
+        session_id: &str,
+        time_budget_secs: Option<u64>,
+        policy: vp_protocol::types::PreemptionPolicy,
+    ) -> Result<Arc<RunControl>> {
         let mut runs = self
             .runs
             .lock()
@@ -6725,6 +6946,7 @@ impl AgentService {
             anyhow::bail!("session is already running");
         }
         let control = Arc::new(RunControl::new());
+        control.arm_preemption(time_budget_secs, policy);
         runs.insert(session_id.to_string(), control.clone());
         Ok(control)
     }
@@ -8138,6 +8360,11 @@ impl AgentService {
         }
 
         let control = Arc::new(RunControl::new());
+        let preemption_policy = self
+            .engine
+            .get_preemption_policy(&session.project_id)
+            .await?;
+        control.arm_preemption(session.time_budget_secs, preemption_policy);
         {
             let mut runs = self
                 .runs
@@ -8212,17 +8439,42 @@ impl AgentService {
         let runs = self.runs.clone();
         let global_slots = self.global_slots.clone();
         tokio::spawn(async move {
+            control
+                .preempt
+                .set_phase(crate::preemption::Phase::Queue, None);
             let permit = tokio::select! {
                 permit = global_slots.acquire(&session_id, &project_id, priority, &control) => permit,
                 _ = wait_for_cancel(&control) => None,
             };
             let Some(_permit) = permit else {
-                let _ = engine
-                    .append_event(&session_id, "agent.cancelled", serde_json::json!({}))
+                if let Some(snapshot) = control.preempt_report() {
+                    let _ = engine
+                        .append_event(
+                            &session_id,
+                            "agent.cancelled",
+                            serde_json::json!({
+                                "preempted": true,
+                                "reason": snapshot.reason.as_str(),
+                                "phase": snapshot.phase.as_str(),
+                            }),
+                        )
+                        .await;
+                    let _ = record_queued_preemption(
+                        &engine,
+                        &session_id,
+                        &project_id,
+                        &control,
+                        &snapshot,
+                    )
                     .await;
-                let _ = control
-                    .finalize_session(&engine, &session_id, "cancelled")
-                    .await;
+                } else {
+                    let _ = engine
+                        .append_event(&session_id, "agent.cancelled", serde_json::json!({}))
+                        .await;
+                    let _ = control
+                        .finalize_session(&engine, &session_id, "cancelled")
+                        .await;
+                }
                 if let Ok(mut runs) = runs.lock() {
                     runs.remove(&session_id);
                 }
@@ -8287,6 +8539,100 @@ impl AgentService {
             return true;
         }
         false
+    }
+
+    /// Hard-preempt one active run. This aborts in-flight provider and tool
+    /// work instead of waiting for the next cooperative boundary. It is
+    /// operator-only: no scheduler or agent can call it, and unknown runs fail
+    /// closed without creating a preemption record.
+    pub async fn preempt(
+        &self,
+        session_id: &str,
+        reason: Option<&str>,
+    ) -> Result<SessionPreemptResult> {
+        let reason = reason
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+            .map(|reason| reason.chars().take(500).collect::<String>())
+            .unwrap_or_else(|| "operator requested preemption".to_string());
+        let control = self
+            .runs
+            .lock()
+            .map_err(|_| anyhow!("agent run mutex poisoned"))?
+            .get(session_id)
+            .cloned();
+        let Some(control) = control else {
+            return Ok(SessionPreemptResult {
+                session_id: session_id.to_string(),
+                preempted: false,
+                reason: String::new(),
+                detail: "no active run holds a preempt token".to_string(),
+            });
+        };
+        if !control.cancellable {
+            return Ok(SessionPreemptResult {
+                session_id: session_id.to_string(),
+                preempted: false,
+                reason: String::new(),
+                detail: "this operation is not preemptible".to_string(),
+            });
+        }
+        if control.is_cancelled() {
+            return Ok(SessionPreemptResult {
+                session_id: session_id.to_string(),
+                preempted: false,
+                reason: String::new(),
+                detail: "the run is already cancelling".to_string(),
+            });
+        }
+        if control.is_preempted() {
+            return Ok(SessionPreemptResult {
+                session_id: session_id.to_string(),
+                preempted: false,
+                reason: control
+                    .preempt_report()
+                    .map(|snapshot| snapshot.reason.as_str().to_string())
+                    .unwrap_or_default(),
+                detail: "the run is already preempted".to_string(),
+            });
+        }
+        self.engine
+            .append_event(
+                session_id,
+                "session.preempt_requested",
+                serde_json::json!({
+                    "reason": reason,
+                    "phase": control.preempt.phase().as_str(),
+                }),
+            )
+            .await?;
+        let snapshot = control.request_preempt();
+        Ok(SessionPreemptResult {
+            session_id: session_id.to_string(),
+            preempted: true,
+            reason: snapshot.reason.as_str().to_string(),
+            detail: format!(
+                "preemption signalled during {}; the run will stop after bounded cleanup",
+                snapshot.phase.as_str()
+            ),
+        })
+    }
+
+    /// Session-scoped preemption history plus the live in-memory state. The
+    /// history is derived from events; `active` is the only volatile part.
+    pub async fn preemption(
+        &self,
+        session_id: &str,
+        limit: u32,
+    ) -> Result<SessionPreemptionResult> {
+        let mut result = self.engine.session_preemption(session_id, limit).await?;
+        result.active = self
+            .runs
+            .lock()
+            .ok()
+            .and_then(|runs| runs.get(session_id).cloned())
+            .is_some_and(|control| control.is_preempted());
+        Ok(result)
     }
 
     pub async fn pause(&self, session_id: &str) -> Result<bool> {
@@ -8418,6 +8764,10 @@ async fn run_plan_resume(
         config.max_workers,
         config.max_labour,
     ));
+    control.arm_preemption_deadline(
+        budget.wall_clock_deadline(),
+        engine.get_preemption_policy(&session.project_id).await?,
+    );
     if budget.exhausted() {
         emit(
             &engine,
@@ -8497,17 +8847,42 @@ async fn run_plan_resume(
             if let Some(agent_id) = &leader_id {
                 engine.update_agent_status(agent_id, "cancelled").await?;
             }
-            emit(
-                &engine,
-                session_id,
-                &spec,
-                "agent.cancelled",
-                serde_json::json!({"resumed_plan": true}),
-            )
-            .await?;
-            control
-                .finalize_session(&engine, session_id, "cancelled")
+            if let Some(snapshot) = control.preempt_report() {
+                emit(
+                    &engine,
+                    session_id,
+                    &spec,
+                    "agent.cancelled",
+                    serde_json::json!({
+                        "resumed_plan": true,
+                        "preempted": true,
+                        "reason": snapshot.reason.as_str(),
+                        "phase": snapshot.phase.as_str(),
+                    }),
+                )
                 .await?;
+                record_terminal_preemption(
+                    &engine,
+                    session_id,
+                    &project.id,
+                    &spec,
+                    &control,
+                    &snapshot,
+                )
+                .await?;
+            } else {
+                emit(
+                    &engine,
+                    session_id,
+                    &spec,
+                    "agent.cancelled",
+                    serde_json::json!({"resumed_plan": true}),
+                )
+                .await?;
+                control
+                    .finalize_session(&engine, session_id, "cancelled")
+                    .await?;
+            }
         }
         PlanRunResult::BudgetExceeded(stop) => {
             if let Some(agent_id) = &leader_id {
@@ -8526,6 +8901,145 @@ async fn run_plan_resume(
                 .await?;
         }
     }
+    Ok(())
+}
+
+/// Record the terminal preemption after the session is quiescent. The caller
+/// must finalize the session status first: checkpoint creation refuses a
+/// running/paused session. A checkpoint failure is logged and never changes the
+/// cancelled status, never merges incomplete work, and never hides the event.
+async fn record_terminal_preemption(
+    engine: &Engine,
+    session_id: &str,
+    project_id: &str,
+    spec: &AgentSpec,
+    control: &RunControl,
+    snapshot: &crate::preemption::Snapshot,
+) -> Result<()> {
+    let policy = control.preemption_policy();
+    let mut checkpoint_id = None;
+    if policy.checkpoint_on_preempt {
+        let label = format!(
+            "preempted: {} during {}",
+            snapshot.reason.as_str(),
+            snapshot.phase.as_str()
+        );
+        match timeout(
+            Duration::from_secs(60),
+            engine.checkpoint_session_at_preemption(session_id, Some(label)),
+        )
+        .await
+        {
+            Ok(Ok(checkpoint)) => checkpoint_id = Some(checkpoint.id),
+            Ok(Err(error)) => {
+                tracing::warn!(%error, session_id, "preemption checkpoint was not created");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    session_id,
+                    "preemption checkpoint exceeded its 60s bound and was skipped"
+                );
+            }
+        }
+    }
+    let attribution = crate::preemption::PreemptAttribution {
+        session_id,
+        project_id,
+        agent_id: &spec.id,
+        agent_name: &spec.name,
+        agent_role: spec.role.as_str(),
+        task_id: spec.task_id.as_deref(),
+        department: spec.department.as_deref(),
+    };
+    let mut task_checkpoint_commit = None;
+    if let Some(task_id) = spec.task_id.as_deref()
+        && matches!(spec.role, AgentRole::Worker | AgentRole::Labour)
+    {
+        let label = format!(
+            "preempted: {} during {}",
+            snapshot.reason.as_str(),
+            snapshot.phase.as_str()
+        );
+        match timeout(
+            Duration::from_secs(30),
+            engine.snapshot_preempted_task_worktree(session_id, task_id, &spec.worktree, &label),
+        )
+        .await
+        {
+            Ok(Ok(commit)) => task_checkpoint_commit = Some(commit),
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    %error,
+                    session_id,
+                    task_id,
+                    "preempted task worktree snapshot was not created"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    session_id,
+                    task_id,
+                    "preempted task worktree snapshot exceeded its 30s bound and was skipped"
+                );
+            }
+        }
+    }
+    engine
+        .append_event(
+            session_id,
+            "session.preempted",
+            serde_json::to_value(crate::preemption::record(
+                &attribution,
+                snapshot,
+                true,
+                checkpoint_id,
+                task_checkpoint_commit,
+                None,
+            ))?,
+        )
+        .await?;
+    control
+        .finalize_session(engine, session_id, "cancelled")
+        .await?;
+    Ok(())
+}
+
+/// Record a preemption that happened before the run loop started (queued for
+/// admission or a global slot). No worktree changes exist yet, so this records
+/// the terminal event without a checkpoint.
+async fn record_queued_preemption(
+    engine: &Engine,
+    session_id: &str,
+    project_id: &str,
+    control: &RunControl,
+    snapshot: &crate::preemption::Snapshot,
+) -> Result<()> {
+    let attribution = crate::preemption::PreemptAttribution {
+        session_id,
+        project_id,
+        agent_id: "leader",
+        agent_name: "Leader",
+        agent_role: "leader",
+        task_id: None,
+        department: None,
+    };
+    engine
+        .append_event(
+            session_id,
+            "session.preempted",
+            serde_json::to_value(crate::preemption::record(
+                &attribution,
+                snapshot,
+                true,
+                None,
+                None,
+                Some("run preempted while waiting for admission".to_string()),
+            ))?,
+        )
+        .await?;
+    control
+        .finalize_session(engine, session_id, "cancelled")
+        .await?;
     Ok(())
 }
 
@@ -8592,6 +9106,10 @@ async fn run_agent(
         config.max_workers,
         config.max_labour,
     ));
+    control.arm_preemption_deadline(
+        budget.wall_clock_deadline(),
+        engine.get_preemption_policy(&session.project_id).await?,
+    );
     let load_from_events = resume_journal.is_some();
     let journal = match resume_journal {
         Some(journal) => journal,
@@ -8783,12 +9301,36 @@ async fn run_agent(
             if let Some(agent_id) = &leader_id {
                 engine.update_agent_status(agent_id, "cancelled").await?;
             }
-            engine
-                .append_event(session_id, "agent.cancelled", serde_json::json!({}))
+            if let Some(snapshot) = control.preempt_report() {
+                emit(
+                    &engine,
+                    session_id,
+                    &spec,
+                    "agent.cancelled",
+                    serde_json::json!({
+                        "preempted": true,
+                        "reason": snapshot.reason.as_str(),
+                        "phase": snapshot.phase.as_str(),
+                    }),
+                )
                 .await?;
-            control
-                .finalize_session(&engine, session_id, "cancelled")
+                record_terminal_preemption(
+                    &engine,
+                    session_id,
+                    &project.id,
+                    &spec,
+                    &control,
+                    &snapshot,
+                )
                 .await?;
+            } else {
+                engine
+                    .append_event(session_id, "agent.cancelled", serde_json::json!({}))
+                    .await?;
+                control
+                    .finalize_session(&engine, session_id, "cancelled")
+                    .await?;
+            }
         }
         LoopOutcome::BudgetExceeded(stop) => {
             if let Some(agent_id) = &leader_id {
@@ -10509,6 +11051,7 @@ impl acp::AcpHost for AcpWorkerHost {
         };
         match wait_for_approval_with(
             self.cancel.clone(),
+            None,
             receiver,
             Duration::from_secs(self.approval_timeout_secs),
         )
@@ -10664,6 +11207,7 @@ async fn delegate_acp(
                 };
                 match wait_for_approval_with(
                     control.subscribe(),
+                    Some(control.preempt.clone()),
                     receiver,
                     Duration::from_secs(config.approval_timeout_secs),
                 )
@@ -11805,6 +12349,10 @@ struct StreamTurn {
     /// stream produced neither.
     first_token_ms: u64,
     cancelled: bool,
+    /// Set when a hard preemption token fired during setup or between chunks.
+    /// The partial text/usage are persisted; the stream is never resumed or
+    /// replayed.
+    preempted: Option<crate::preemption::Snapshot>,
     error: Option<anyhow::Error>,
 }
 
@@ -11845,9 +12393,10 @@ fn stream_error_retryable(error: &ProviderError) -> bool {
         ProviderError::Api { status, .. } => {
             matches!(status, 408 | 409 | 425 | 429 | 500 | 502 | 503 | 504)
         }
-        ProviderError::MissingApiKey | ProviderError::Parse(_) | ProviderError::Unsupported(_) => {
-            false
-        }
+        ProviderError::MissingApiKey
+        | ProviderError::Parse(_)
+        | ProviderError::Unsupported(_)
+        | ProviderError::Preempted { .. } => false,
     }
 }
 
@@ -11875,14 +12424,56 @@ async fn emit_stream_retry(
 }
 
 async fn stream_retry_delay(control: &RunControl, attempt: u32) -> bool {
-    if control.is_cancelled() {
+    if control.is_cancelled() || control.is_preempted() {
         return false;
     }
     let delay = STREAM_RETRY_BASE.saturating_mul(attempt.max(1));
     let mut cancel_rx = control.subscribe();
     tokio::select! {
-        _ = tokio::time::sleep(delay) => !control.is_cancelled(),
+        _ = tokio::time::sleep(delay) => !control.is_cancelled() && !control.is_preempted(),
         _ = cancel_rx.changed() => false,
+        _ = control.preempt.cancelled() => false,
+    }
+}
+
+/// After a preemption, give the provider at most `grace` to deliver one final
+/// usage event. Text/tool chunks are discarded: they are not appended to the
+/// partial turn, persisted as a completed message, or replayed. This keeps
+/// partial-usage accounting honest without extending generation arbitrarily.
+async fn drain_provider_grace(
+    stream: &mut vp_providers::EventStream,
+    grace: Duration,
+    turn: &mut StreamTurn,
+) {
+    if grace.is_zero() {
+        return;
+    }
+    let timer = tokio::time::sleep(grace);
+    tokio::pin!(timer);
+    loop {
+        tokio::select! {
+            _ = &mut timer => return,
+            item = stream.next() => match item {
+                Some(Ok(StreamEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                })) => {
+                    turn.usage.add(
+                        input_tokens,
+                        output_tokens,
+                        cache_read_tokens,
+                        cache_write_tokens,
+                    );
+                }
+                Some(Ok(StreamEvent::Done)) | None => return,
+                // The first non-usage chunk means the provider is still
+                // generating. Stop instead of draining its output.
+                Some(Ok(StreamEvent::TextDelta(_) | StreamEvent::ToolCall(_))) => return,
+                Some(Err(_)) => return,
+            },
+        }
     }
 }
 
@@ -11903,8 +12494,14 @@ async fn consume_stream(
     let mut turn = StreamTurn::default();
     let started = Instant::now();
     let mut attempt = 0;
+    let preempt = control.preempt.clone();
+    preempt.set_phase(crate::preemption::Phase::Provider, None);
     'streams: loop {
         attempt += 1;
+        if let Some(snapshot) = preempt.snapshot() {
+            turn.preempted = Some(snapshot);
+            break 'streams;
+        }
         let mut setup_cancel = control.subscribe();
         let setup = tokio::select! {
             changed = setup_cancel.changed() => {
@@ -11914,13 +12511,24 @@ async fn consume_stream(
                 }
                 continue;
             }
-            result = tokio::time::timeout(idle_timeout, provider.stream_chat(request.clone())) => result,
+            _ = preempt.cancelled() => {
+                turn.preempted = preempt.snapshot();
+                break 'streams;
+            }
+            result = tokio::time::timeout(
+                idle_timeout,
+                provider.stream_chat_preemptible(request.clone(), Some(preempt.clone())),
+            ) => result,
         };
         let mut stream = match setup {
             Ok(Ok(stream)) => stream,
             Ok(Err(error)) => {
                 // The provider's own send path already retries transient
                 // startup failures; do not multiply those attempts here.
+                if error.is_preempted() {
+                    turn.preempted = preempt.snapshot();
+                    break;
+                }
                 turn.error = Some(anyhow!(error).context("starting provider stream"));
                 break;
             }
@@ -11939,6 +12547,16 @@ async fn consume_stream(
                 turn.cancelled = true;
                 break 'streams;
             }
+            if preempt.is_preempted() {
+                drain_provider_grace(
+                    &mut stream,
+                    control.preemption_policy().provider_grace(),
+                    &mut turn,
+                )
+                .await;
+                turn.preempted = preempt.snapshot();
+                break 'streams;
+            }
             let item = tokio::select! {
                 changed = cancel_rx.changed() => {
                     if changed.is_err() || *cancel_rx.borrow() {
@@ -11946,6 +12564,16 @@ async fn consume_stream(
                         break 'streams;
                     }
                     continue;
+                }
+                _ = preempt.cancelled() => {
+                    drain_provider_grace(
+                        &mut stream,
+                        control.preemption_policy().provider_grace(),
+                        &mut turn,
+                    )
+                    .await;
+                    turn.preempted = preempt.snapshot();
+                    break 'streams;
                 }
                 item = tokio::time::timeout(idle_timeout, stream.next()) => match item {
                     Ok(item) => item,
@@ -11958,6 +12586,7 @@ async fn consume_stream(
                             && turn.usage.is_empty()
                             && attempt < STREAM_ATTEMPTS
                             && !control.is_cancelled()
+                            && !preempt.is_preempted()
                         {
                             emit_stream_retry(
                                 engine,
@@ -11969,7 +12598,11 @@ async fn consume_stream(
                             )
                             .await?;
                             if !stream_retry_delay(control, attempt).await {
-                                turn.cancelled = true;
+                                if preempt.is_preempted() {
+                                    turn.preempted = preempt.snapshot();
+                                } else {
+                                    turn.cancelled = true;
+                                }
                                 break 'streams;
                             }
                             continue 'streams;
@@ -12022,11 +12655,16 @@ async fn consume_stream(
                 }
                 Ok(StreamEvent::Done) => {}
                 Err(error) => {
+                    if error.is_preempted() {
+                        turn.preempted = preempt.snapshot();
+                        break 'streams;
+                    }
                     if !produced
                         && turn.usage.is_empty()
                         && stream_error_retryable(&error)
                         && attempt < STREAM_ATTEMPTS
                         && !control.is_cancelled()
+                        && !preempt.is_preempted()
                     {
                         emit_stream_retry(
                             engine,
@@ -12038,7 +12676,11 @@ async fn consume_stream(
                         )
                         .await?;
                         if !stream_retry_delay(control, attempt).await {
-                            turn.cancelled = true;
+                            if preempt.is_preempted() {
+                                turn.preempted = preempt.snapshot();
+                            } else {
+                                turn.cancelled = true;
+                            }
                             break 'streams;
                         }
                         continue 'streams;
@@ -13453,13 +14095,23 @@ async fn run_loop(
             journal.finish_completed(engine).await
         }
         Ok(LoopOutcome::Cancelled) => {
-            journal
-                .finish_interrupted(
-                    engine,
-                    "cancelled",
-                    "the run was cancelled before it completed",
-                )
-                .await
+            if control.is_preempted() {
+                journal
+                    .finish_interrupted(
+                        engine,
+                        "preempted",
+                        "the run was hard-preempted before it completed",
+                    )
+                    .await
+            } else {
+                journal
+                    .finish_interrupted(
+                        engine,
+                        "cancelled",
+                        "the run was cancelled before it completed",
+                    )
+                    .await
+            }
         }
         Ok(LoopOutcome::BudgetExceeded(stop)) => {
             journal
@@ -13553,6 +14205,9 @@ async fn run_loop_body(
                 )
                 .await?;
                 engine.update_agent_status(&spec.id, "queued").await?;
+                control
+                    .preempt
+                    .set_phase(crate::preemption::Phase::Queue, None);
                 let permit = match config
                     .capacity
                     .acquire(spec.role, &session.id, capacity_priority, control)
@@ -13580,6 +14235,9 @@ async fn run_loop_body(
         None
     };
     let _scope_guard = if matches!(spec.role, AgentRole::Worker | AgentRole::Labour) {
+        control
+            .preempt
+            .set_phase(crate::preemption::Phase::Queue, None);
         match config
             .scope_locks
             .acquire(
@@ -14278,6 +14936,35 @@ async fn run_loop_body(
                 .is_some_and(|reservation| reservation.settle(actual_usage))
                 || cost_exceeded;
         }
+        if let Some(preempted) = stream_turn.preempted {
+            let output_bytes = stream_turn.text.len() as u64;
+            control
+                .preempt
+                .annotate_usage(input_tokens, output_tokens, output_bytes, estimated);
+            let snapshot = control.preempt.snapshot().unwrap_or(preempted);
+            Box::pin(emit_provider_preempted(
+                engine,
+                session,
+                project,
+                spec,
+                &snapshot,
+                &stream_turn.text,
+                &stream_turn.tool_calls,
+            ))
+            .await?;
+            journal
+                .model_failed(
+                    engine,
+                    &model_step,
+                    &format!(
+                        "provider stream preempted during {} ({})",
+                        snapshot.phase.as_str(),
+                        snapshot.reason.as_str()
+                    ),
+                )
+                .await?;
+            return Ok(LoopOutcome::Cancelled);
+        }
         if stream_turn.cancelled {
             journal
                 .model_failed(
@@ -14523,6 +15210,12 @@ async fn run_loop_body(
                     .await?;
                 }
                 let mut cancel_rx = control.subscribe();
+                // Parallel tools are a short read-only batch. A per-tool
+                // deadline is enforced on sequential tools; the batch observes
+                // the run token so one slow read cannot leave siblings running
+                // after an operator/wall-clock preemption.
+                let batch_token = crate::preemption::Token::tool_child(&control.preempt, None);
+                batch_token.set_phase(crate::preemption::Phase::Tool, None);
                 let mut pending = prepared.into_iter();
                 let mut set = tokio::task::JoinSet::new();
                 for _ in 0..4 {
@@ -14532,10 +15225,16 @@ async fn run_loop_body(
                     let context = tool_context.clone();
                     let engine = engine.clone();
                     let session = session.clone();
+                    let tool_token = batch_token.clone();
                     set.spawn(async move {
                         let started = Instant::now();
                         let mut output = match tool {
-                            Some(tool) => match tool.execute(&context, input).await {
+                            Some(tool) => match tool_token
+                                .scoped(Box::pin(
+                                    async move { tool.execute(&context, input).await },
+                                ))
+                                .await
+                            {
                                 Ok(output) => output,
                                 Err(error) => ToolOutput::from_tool_error(&name, &error),
                             },
@@ -14557,6 +15256,18 @@ async fn run_loop_body(
                             set.abort_all();
                             return Ok(LoopOutcome::Cancelled);
                         }
+                        _ = batch_token.cancelled() => {
+                            set.abort_all();
+                            if let Some(snapshot) = batch_token.snapshot() {
+                                let mut snapshot = snapshot;
+                                snapshot.detail = Some("parallel_batch_aborted".to_string());
+                                Box::pin(emit_tool_preempted(
+                                    engine, session, project, spec, &snapshot,
+                                ))
+                                .await?;
+                            }
+                            return Ok(LoopOutcome::Cancelled);
+                        }
                         joined = set.join_next() => {
                             match joined {
                                 Some(Ok(item)) => results.push(item),
@@ -14569,10 +15280,16 @@ async fn run_loop_body(
                                 let context = tool_context.clone();
                                 let engine = engine.clone();
                                 let session = session.clone();
+                                let tool_token = batch_token.clone();
                                 set.spawn(async move {
                                     let started = Instant::now();
                                     let mut output = match tool {
-                                        Some(tool) => match tool.execute(&context, input).await {
+                                        Some(tool) => match tool_token
+                                            .scoped(Box::pin(async move {
+                                                tool.execute(&context, input).await
+                                            }))
+                                            .await
+                                        {
                                             Ok(output) => output,
                                             Err(error) => {
                                                 ToolOutput::from_tool_error(&name, &error)
@@ -14674,12 +15391,13 @@ async fn run_loop_body(
             if !wait_for_task_resume(engine, &session.id, spec, control).await? {
                 return Ok(LoopOutcome::Cancelled);
             }
-            if control.is_cancelled() {
+            if control.is_cancelled() || control.is_preempted() {
                 return Ok(LoopOutcome::Cancelled);
             }
             if budget.exhausted() {
                 return Ok(LoopOutcome::BudgetExceeded(BudgetStop::session(budget)));
             }
+            let mut imposed_preempt: Option<crate::preemption::Snapshot> = None;
             if let Err(error) = engine
                 .touch_task_progress(
                     &session.id,
@@ -14843,6 +15561,9 @@ async fn run_loop_body(
                     }
                 }
                 ApprovalDecision::Ask { risk, reason } => {
+                    control
+                        .preempt
+                        .set_phase(crate::preemption::Phase::Queue, None);
                     let mut context = serde_json::json!({});
                     agent_fields(&mut context, spec);
                     let (approval, receiver) = Box::pin(engine.request_approval_with_risk(
@@ -14902,6 +15623,9 @@ async fn run_loop_body(
                     journal
                         .approval_completed(engine, &approval_step, outcome)
                         .await?;
+                    control
+                        .preempt
+                        .set_phase(crate::preemption::Phase::Tool, Some(&call.name));
                     approval_wait_ms =
                         Some(wait_started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
                 }
@@ -14927,6 +15651,12 @@ async fn run_loop_body(
             let skill_denied = active_skill
                 .as_ref()
                 .filter(|skill| !skill_allows_tool(skill, &call.name));
+            control
+                .preempt
+                .set_phase(crate::preemption::Phase::Tool, Some(&call.name));
+            let tool_deadline = crate::preemption::tool_deadline(&control.preemption_policy());
+            let tool_token = crate::preemption::Token::tool_child(&control.preempt, tool_deadline);
+            tool_token.set_phase(crate::preemption::Phase::Tool, Some(&call.name));
             let tool_started = Instant::now();
             let output = if let Some(output) = duplicate {
                 output
@@ -15192,14 +15922,14 @@ async fn run_loop_body(
                     }),
                 )
                 .await?;
-                match engine
-                    .browser_action(
+                match tool_token
+                    .scoped(engine.browser_action(
                         &session.id,
                         &spec.worktree,
                         &spec.id,
                         &spec.name,
                         input.clone(),
-                    )
+                    ))
                     .await
                 {
                     Ok(output) => output,
@@ -15218,15 +15948,15 @@ async fn run_loop_body(
                     }),
                 )
                 .await?;
-                match engine
-                    .computer_action(
+                match tool_token
+                    .scoped(engine.computer_action(
                         &session.id,
                         &spec.worktree,
                         &spec.id,
                         &spec.name,
                         spec.task_id.as_deref(),
                         input.clone(),
-                    )
+                    ))
                     .await
                 {
                     Ok(output) => output,
@@ -15262,12 +15992,15 @@ async fn run_loop_body(
                     }),
                 )
                 .await?;
-                match engine
-                    .mcp_call(&binding.server_id, &binding.tool_name, input.clone())
+                match tool_token
+                    .scoped(engine.mcp_call(&binding.server_id, &binding.tool_name, input.clone()))
                     .await
                 {
                     Ok(result) => ToolOutput::ok(format_mcp_tool_result(&result.result)),
-                    Err(error) => ToolOutput::from_tool_error("mcp", &error),
+                    Err(error) => tool_token
+                        .snapshot()
+                        .map(|snapshot| crate::preemption::tool_output("mcp", &snapshot))
+                        .unwrap_or_else(|| ToolOutput::from_tool_error("mcp", &error)),
                 }
             } else if is_mcp_tool {
                 emit(
@@ -15282,9 +16015,15 @@ async fn run_loop_body(
                     }),
                 )
                 .await?;
-                match run_mcp_tool(engine, spec.role, input.clone()).await {
+                match tool_token
+                    .scoped(run_mcp_tool(engine, spec.role, input.clone()))
+                    .await
+                {
                     Ok(output) => output,
-                    Err(error) => ToolOutput::from_tool_error("mcp", &error),
+                    Err(error) => tool_token
+                        .snapshot()
+                        .map(|snapshot| crate::preemption::tool_output("mcp", &snapshot))
+                        .unwrap_or_else(|| ToolOutput::from_tool_error("mcp", &error)),
                 }
             } else if is_question_tool {
                 emit(
@@ -15893,14 +16632,38 @@ async fn run_loop_body(
                 if control.is_cancelled() {
                     return Ok(LoopOutcome::Cancelled);
                 }
-                tokio::select! {
-                    _ = cancel_rx.changed() => {
-                        return Ok(LoopOutcome::Cancelled);
+                let observes_token = crate::preemption::tool_observes_token(&call.name);
+                let result = if observes_token {
+                    let name = call.name.clone();
+                    let context = tool_context.clone();
+                    tool_token
+                        .scoped(Box::pin(async move { tool.execute(&context, input).await }))
+                        .await
+                        .map_err(|error| (name, error))
+                } else {
+                    let context = tool_context.clone();
+                    tokio::select! {
+                        _ = cancel_rx.changed() => {
+                            return Ok(LoopOutcome::Cancelled);
+                        }
+                        _ = tool_token.cancelled() => {
+                            let snapshot = tool_token.snapshot().unwrap_or_else(|| {
+                                crate::preemption::fallback_snapshot(
+                                    crate::preemption::Phase::Tool,
+                                    Some(&call.name),
+                                )
+                            });
+                            imposed_preempt = Some(snapshot.clone());
+                            Ok(crate::preemption::tool_output(&call.name, &snapshot))
+                        }
+                        result = tool_token.scoped(Box::pin(async move {
+                            tool.execute(&context, input).await
+                        })) => result.map_err(|error| (call.name.clone(), error)),
                     }
-                    result = tool.execute(&tool_context, input.clone()) => match result {
-                        Ok(output) => output,
-                        Err(error) => ToolOutput::error(format!("tool error: {error}")),
-                    },
+                };
+                match result {
+                    Ok(output) => output,
+                    Err((_name, error)) => ToolOutput::error(format!("tool error: {error}")),
                 }
             } else {
                 ToolOutput::error_coded(
@@ -15915,6 +16678,25 @@ async fn run_loop_body(
             };
             let mut output = output;
             output.normalize_failure(&call.name);
+            let output_preempt = imposed_preempt
+                .take()
+                .or_else(|| crate::preemption::output_snapshot(&output));
+            let terminal_preempt = output_preempt
+                .as_ref()
+                .filter(|snapshot| {
+                    snapshot.reason != crate::preemption::Reason::ToolDeadline
+                        || !tool_token.is_own_preempted()
+                })
+                .cloned();
+            if let Some(snapshot) = &output_preempt {
+                if snapshot.side_effects_unknown {
+                    control.preempt.mark_side_effects_unknown();
+                }
+                Box::pin(emit_tool_preempted(
+                    engine, session, project, spec, snapshot,
+                ))
+                .await?;
+            }
             let tool_duration_ms =
                 tool_started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
 
@@ -15967,6 +16749,9 @@ async fn run_loop_body(
                 conversation_ids.push(Some(stored.id));
             }
             conversation.push(ChatMessage::tool(call_id, output.content));
+            if terminal_preempt.is_some() {
+                return Ok(LoopOutcome::Cancelled);
+            }
         }
         emit(
             engine,
@@ -22299,12 +23084,13 @@ async fn wait_for_question(
     control: &RunControl,
     timeout_secs: u64,
 ) -> QuestionOutcome {
-    if control.is_cancelled() {
+    if control.is_cancelled() || control.is_preempted() {
         return QuestionOutcome::Cancelled;
     }
     let mut cancel_rx = control.subscribe();
     tokio::select! {
         _ = cancel_rx.changed() => QuestionOutcome::Cancelled,
+        _ = control.preempt.cancelled() => QuestionOutcome::Cancelled,
         result = timeout(Duration::from_secs(timeout_secs), receiver) => match result {
             Ok(Ok(answer)) => QuestionOutcome::Answered(answer),
             Ok(Err(_)) => QuestionOutcome::TimedOut,
@@ -22318,19 +23104,34 @@ async fn wait_for_approval(
     control: &RunControl,
     timeout_duration: Duration,
 ) -> ApprovalOutcome {
-    wait_for_approval_with(control.subscribe(), receiver, timeout_duration).await
+    wait_for_approval_with(
+        control.subscribe(),
+        Some(control.preempt.clone()),
+        receiver,
+        timeout_duration,
+    )
+    .await
 }
 
 async fn wait_for_approval_with(
     mut cancel_rx: watch::Receiver<bool>,
+    preempt: Option<crate::preemption::Token>,
     receiver: oneshot::Receiver<bool>,
     timeout_duration: Duration,
 ) -> ApprovalOutcome {
     if *cancel_rx.borrow() {
         return ApprovalOutcome::Cancelled;
     }
+    let preempted = async {
+        match preempt {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(preempted);
     tokio::select! {
         _ = cancel_rx.changed() => ApprovalOutcome::Cancelled,
+        _ = &mut preempted => ApprovalOutcome::Cancelled,
         result = timeout(timeout_duration, receiver) => match result {
             Ok(Ok(true)) => ApprovalOutcome::Approved,
             Ok(Ok(false)) | Ok(Err(_)) => ApprovalOutcome::Denied,

@@ -6466,6 +6466,273 @@ struct SessionPauseResult: Codable, Sendable {
     }
 }
 
+// MARK: - Hard preemption and deadlines
+
+struct PreemptionPolicy: Codable, Sendable, Equatable {
+    var enabled: Bool = true
+    var providerGraceMs: UInt64 = 2000
+    var toolGraceMs: UInt64 = 5000
+    var killEscalationMs: UInt64 = 2000
+    var toolDeadlineSecs: UInt64?
+    var checkpointOnPreempt: Bool = true
+
+    enum CodingKeys: String, CodingKey {
+        case enabled
+        case providerGraceMs = "provider_grace_ms"
+        case toolGraceMs = "tool_grace_ms"
+        case killEscalationMs = "kill_escalation_ms"
+        case toolDeadlineSecs = "tool_deadline_secs"
+        case checkpointOnPreempt = "checkpoint_on_preempt"
+    }
+
+    init(
+        enabled: Bool = true,
+        providerGraceMs: UInt64 = 2000,
+        toolGraceMs: UInt64 = 5000,
+        killEscalationMs: UInt64 = 2000,
+        toolDeadlineSecs: UInt64? = nil,
+        checkpointOnPreempt: Bool = true
+    ) {
+        self.enabled = enabled
+        self.providerGraceMs = providerGraceMs
+        self.toolGraceMs = toolGraceMs
+        self.killEscalationMs = killEscalationMs
+        self.toolDeadlineSecs = toolDeadlineSecs
+        self.checkpointOnPreempt = checkpointOnPreempt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        providerGraceMs = try container.decodeIfPresent(UInt64.self, forKey: .providerGraceMs) ?? 2000
+        toolGraceMs = try container.decodeIfPresent(UInt64.self, forKey: .toolGraceMs) ?? 5000
+        killEscalationMs = try container.decodeIfPresent(UInt64.self, forKey: .killEscalationMs) ?? 2000
+        toolDeadlineSecs = try container.decodeIfPresent(UInt64.self, forKey: .toolDeadlineSecs)
+        checkpointOnPreempt = try container.decodeIfPresent(Bool.self, forKey: .checkpointOnPreempt) ?? true
+    }
+}
+
+struct PreemptionPolicyResult: Codable, Sendable {
+    let projectId: String
+    let policy: PreemptionPolicy
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case policy
+    }
+}
+
+struct PreemptionRecord: Codable, Identifiable, Hashable, Sendable {
+    let sessionId: String
+    let projectId: String
+    let agentId: String
+    let agentName: String
+    let agentRole: String
+    let taskId: String?
+    let department: String?
+    let reason: String
+    let phase: String
+    let tool: String?
+    let elapsedMs: UInt64
+    let sideEffectsUnknown: Bool
+    let partialInputTokens: UInt64
+    let partialOutputTokens: UInt64
+    let partialOutputBytes: UInt64
+    let usageEstimated: Bool
+    let checkpointId: String?
+    let taskCheckpointCommit: String?
+    let detail: String?
+    let terminal: Bool
+    let createdAt: String
+
+    var id: String {
+        "\(sessionId)/\(createdAt)/\(phase)/\(terminal)"
+    }
+
+    var summary: String {
+        var text = "\(reason) preempted during \(phase) after \(elapsedMs)ms"
+        if let tool, !tool.isEmpty {
+            text += " (\(tool))"
+        }
+        if sideEffectsUnknown {
+            text += " · side effects unknown"
+        }
+        return text
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case projectId = "project_id"
+        case agentId = "agent_id"
+        case agentName = "agent_name"
+        case agentRole = "agent_role"
+        case taskId = "task_id"
+        case department
+        case reason
+        case phase
+        case tool
+        case elapsedMs = "elapsed_ms"
+        case sideEffectsUnknown = "side_effects_unknown"
+        case partialInputTokens = "partial_input_tokens"
+        case partialOutputTokens = "partial_output_tokens"
+        case partialOutputBytes = "partial_output_bytes"
+        case usageEstimated = "usage_estimated"
+        case checkpointId = "checkpoint_id"
+        case taskCheckpointCommit = "task_checkpoint_commit"
+        case detail
+        case terminal
+        case createdAt = "created_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionId = try container.decodeIfPresent(String.self, forKey: .sessionId) ?? ""
+        projectId = try container.decodeIfPresent(String.self, forKey: .projectId) ?? ""
+        agentId = try container.decodeIfPresent(String.self, forKey: .agentId) ?? ""
+        agentName = try container.decodeIfPresent(String.self, forKey: .agentName) ?? ""
+        agentRole = try container.decodeIfPresent(String.self, forKey: .agentRole) ?? ""
+        taskId = try container.decodeIfPresent(String.self, forKey: .taskId)
+        department = try container.decodeIfPresent(String.self, forKey: .department)
+        reason = try container.decodeIfPresent(String.self, forKey: .reason) ?? "explicit"
+        phase = try container.decodeIfPresent(String.self, forKey: .phase) ?? "provider"
+        tool = try container.decodeIfPresent(String.self, forKey: .tool)
+        elapsedMs = try container.decodeIfPresent(UInt64.self, forKey: .elapsedMs) ?? 0
+        sideEffectsUnknown = try container.decodeIfPresent(Bool.self, forKey: .sideEffectsUnknown) ?? false
+        partialInputTokens = try container.decodeIfPresent(UInt64.self, forKey: .partialInputTokens) ?? 0
+        partialOutputTokens = try container.decodeIfPresent(UInt64.self, forKey: .partialOutputTokens) ?? 0
+        partialOutputBytes = try container.decodeIfPresent(UInt64.self, forKey: .partialOutputBytes) ?? 0
+        usageEstimated = try container.decodeIfPresent(Bool.self, forKey: .usageEstimated) ?? false
+        checkpointId = try container.decodeIfPresent(String.self, forKey: .checkpointId)
+        taskCheckpointCommit = try container.decodeIfPresent(String.self, forKey: .taskCheckpointCommit)
+        detail = try container.decodeIfPresent(String.self, forKey: .detail)
+        terminal = try container.decodeIfPresent(Bool.self, forKey: .terminal) ?? false
+        createdAt = try container.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
+    }
+}
+
+struct SessionPreemptResult: Codable, Sendable {
+    let sessionId: String
+    let preempted: Bool
+    let reason: String
+    let detail: String
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case preempted
+        case reason
+        case detail
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionId = try container.decodeIfPresent(String.self, forKey: .sessionId) ?? ""
+        preempted = try container.decodeIfPresent(Bool.self, forKey: .preempted) ?? false
+        reason = try container.decodeIfPresent(String.self, forKey: .reason) ?? ""
+        detail = try container.decodeIfPresent(String.self, forKey: .detail) ?? ""
+    }
+}
+
+struct PreemptionCount: Codable, Hashable, Sendable {
+    let key: String
+    let count: UInt64
+}
+
+struct PreemptionSessionSummary: Codable, Identifiable, Hashable, Sendable {
+    let sessionId: String
+    let goal: String
+    let status: String
+    let terminalCount: UInt64
+    let lastReason: String
+    let lastPhase: String
+    let lastTool: String?
+    let lastAt: String
+
+    var id: String {
+        sessionId
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case goal
+        case status
+        case terminalCount = "terminal_count"
+        case lastReason = "last_reason"
+        case lastPhase = "last_phase"
+        case lastTool = "last_tool"
+        case lastAt = "last_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionId = try container.decode(String.self, forKey: .sessionId)
+        goal = try container.decodeIfPresent(String.self, forKey: .goal) ?? ""
+        status = try container.decodeIfPresent(String.self, forKey: .status) ?? ""
+        terminalCount = try container.decodeIfPresent(UInt64.self, forKey: .terminalCount) ?? 0
+        lastReason = try container.decodeIfPresent(String.self, forKey: .lastReason) ?? ""
+        lastPhase = try container.decodeIfPresent(String.self, forKey: .lastPhase) ?? ""
+        lastTool = try container.decodeIfPresent(String.self, forKey: .lastTool)
+        lastAt = try container.decodeIfPresent(String.self, forKey: .lastAt) ?? ""
+    }
+}
+
+struct PreemptionOverviewResult: Codable, Sendable {
+    let projectId: String
+    let policy: PreemptionPolicy
+    let total: UInt64
+    let sessions: [PreemptionSessionSummary]
+    let byPhase: [PreemptionCount]
+    let byReason: [PreemptionCount]
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case policy
+        case total
+        case sessions
+        case byPhase = "by_phase"
+        case byReason = "by_reason"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        projectId = try container.decode(String.self, forKey: .projectId)
+        policy = try container.decodeIfPresent(PreemptionPolicy.self, forKey: .policy) ?? PreemptionPolicy()
+        total = try container.decodeIfPresent(UInt64.self, forKey: .total) ?? 0
+        sessions = try container.decodeIfPresent([PreemptionSessionSummary].self, forKey: .sessions) ?? []
+        byPhase = try container.decodeIfPresent([PreemptionCount].self, forKey: .byPhase) ?? []
+        byReason = try container.decodeIfPresent([PreemptionCount].self, forKey: .byReason) ?? []
+    }
+}
+
+struct SessionPreemptionResult: Codable, Sendable { let sessionId: String
+    let policy: PreemptionPolicy
+    let active: Bool
+    let preempted: Bool
+    let records: [PreemptionRecord]
+    let byPhase: [PreemptionCount]
+    let byReason: [PreemptionCount]
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case policy
+        case active
+        case preempted
+        case records
+        case byPhase = "by_phase"
+        case byReason = "by_reason"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionId = try container.decode(String.self, forKey: .sessionId)
+        policy = try container.decodeIfPresent(PreemptionPolicy.self, forKey: .policy) ?? PreemptionPolicy()
+        active = try container.decodeIfPresent(Bool.self, forKey: .active) ?? false
+        preempted = try container.decodeIfPresent(Bool.self, forKey: .preempted) ?? false
+        records = try container.decodeIfPresent([PreemptionRecord].self, forKey: .records) ?? []
+        byPhase = try container.decodeIfPresent([PreemptionCount].self, forKey: .byPhase) ?? []
+        byReason = try container.decodeIfPresent([PreemptionCount].self, forKey: .byReason) ?? []
+    }
+}
+
 struct SessionResumeResult: Codable, Sendable {
     let sessionId: String
     let resumed: Bool

@@ -321,6 +321,8 @@ tool_error_codes! {
     BUDGET_PATH_TOO_LARGE => "BUDGET_PATH_TOO_LARGE", false, "general", "Split the plan or reduce dependency edges; the governor bounds DAG size.";
     CAPACITY_EXCEEDED => "CAPACITY_EXCEEDED", true, "general", "Wait for an active worker slot to free, or reduce parallel delegation.";
     CANCELLED => "CANCELLED", false, "general", "Do not retry; the run was deliberately cancelled.";
+    PREEMPTED => "PREEMPTED", false, "general", "Do not retry automatically. An operator preemption or the session wall-clock budget stopped the run; inspect the worktree and any unknown side effects before resuming.";
+    DEADLINE_EXCEEDED => "DEADLINE_EXCEEDED", false, "general", "The tool exceeded its per-tool deadline. Reduce the scope or raise the project preemption policy tool_deadline_secs; verify side effects before retrying.";
     TIMEOUT => "TIMEOUT", true, "general", "Retry with a smaller scope or a longer explicit timeout.";
     INTERNAL_ERROR => "INTERNAL_ERROR", false, "general", "Report the failure with evidence; do not loop on an internal error.";
     UNSUPPORTED_OPERATION => "UNSUPPORTED_OPERATION", false, "general", "Use a supported action from the tool schema.";

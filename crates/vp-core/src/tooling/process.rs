@@ -58,6 +58,11 @@ impl AgentTool for ProcessTool {
     }
 
     async fn execute(&self, context: &ToolContext, input: Value) -> Result<ToolOutput> {
+        if let Some(snapshot) =
+            crate::preemption::current_token().and_then(|token| token.snapshot())
+        {
+            return Ok(crate::preemption::tool_output("process", &snapshot));
+        }
         let action = input
             .get("action")
             .and_then(Value::as_str)
@@ -405,9 +410,30 @@ async fn wait_process(
             Regex::new(pattern).map_err(|error| anyhow!("invalid wait pattern: {error}"))
         })
         .transpose()?;
-    let outcome = supervisor
-        .wait(session_id, id, timeout_secs, pattern.as_ref())
-        .await?;
+    let outcome = match crate::preemption::current_token() {
+        Some(token) => {
+            tokio::select! {
+                _ = token.cancelled() => {
+                    let mut snapshot = token.snapshot().unwrap_or_else(|| {
+                        crate::preemption::fallback_snapshot(
+                            crate::preemption::Phase::Tool,
+                            Some("process"),
+                        )
+                    });
+                    // Waiting for a process cannot mutate it; only the start
+                    // and stop actions have side effects.
+                    snapshot.side_effects_unknown = false;
+                    return Ok(crate::preemption::tool_output("process", &snapshot));
+                }
+                outcome = supervisor.wait(session_id, id, timeout_secs, pattern.as_ref()) => outcome?,
+            }
+        }
+        None => {
+            supervisor
+                .wait(session_id, id, timeout_secs, pattern.as_ref())
+                .await?
+        }
+    };
     if outcome.matched {
         return Ok(ToolOutput::ok_structured(
             format!("pattern matched after {}ms", outcome.elapsed_ms),
@@ -832,5 +858,64 @@ mod tests {
             )
             .await;
         assert!(unknown.is_err());
+    }
+
+    #[tokio::test]
+    async fn preemption_aborts_a_process_wait_without_mutating_the_process() {
+        let dir = TempDir::new().unwrap();
+        let (data, store, session_id) = store_with_session(dir.path());
+        let context = context_for(dir.path(), data.path(), &store, &session_id);
+        let started = ProcessTool
+            .execute(
+                &context,
+                json!({"action": "start", "command": "printf 'ready\\n'; sleep 30"}),
+            )
+            .await
+            .unwrap();
+        assert!(!started.is_error, "{}", started.content);
+        let id = started.structured.unwrap()["process_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let token = crate::preemption::Token::disabled();
+        let trigger = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            trigger.trigger(
+                crate::preemption::Reason::Explicit,
+                crate::preemption::Phase::Tool,
+                false,
+            );
+        });
+        let started_at = std::time::Instant::now();
+        let waited = crate::preemption::scope_token(
+            token,
+            ProcessTool.execute(
+                &context,
+                json!({
+                    "action": "wait",
+                    "process_id": id,
+                    "pattern": "never-matches",
+                    "timeout_secs": 60
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(waited.is_error, "{}", waited.content);
+        assert!(started_at.elapsed() < std::time::Duration::from_secs(3));
+        let snapshot = crate::preemption::output_snapshot(&waited).expect("typed preemption");
+        assert!(!snapshot.side_effects_unknown, "waiting is read-only");
+        let status = ProcessTool
+            .execute(&context, json!({"action": "status", "process_id": id}))
+            .await
+            .unwrap();
+        assert!(!status.is_error, "{}", status.content);
+        assert!(status.content.contains("running") || status.content.contains("ready"));
+        let stopped = ProcessTool
+            .execute(&context, json!({"action": "stop", "process_id": id}))
+            .await
+            .unwrap();
+        assert!(!stopped.is_error, "{}", stopped.content);
     }
 }
