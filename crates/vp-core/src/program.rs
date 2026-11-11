@@ -652,10 +652,21 @@ impl ProgramController {
         last_program: Option<&str>,
         limit: usize,
     ) -> Result<Vec<ProgramCandidate>> {
+        self.ready_candidates_in_project(None, last_program, limit)
+    }
+
+    /// Ready candidates restricted to one project. A project-scoped tick must
+    /// not be starved by higher-priority candidates from other projects.
+    pub fn ready_candidates_in_project(
+        &self,
+        project_id: Option<&str>,
+        last_program: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ProgramCandidate>> {
         let now = OffsetDateTime::now_utc();
-        let programs = self
-            .store
-            .list_programs(None, Some(ProgramStatus::Active), Some(10_000))?;
+        let programs =
+            self.store
+                .list_programs(project_id, Some(ProgramStatus::Active), Some(10_000))?;
         let mut candidates = Vec::new();
         for program in programs {
             if program.archived || !program.policy.auto_dispatch {
@@ -829,15 +840,11 @@ impl ProgramController {
 /// public so tests and future import tooling can inspect exactly what the
 /// launcher will submit.
 pub fn milestone_plan(program: &Program, milestone: &ProgramMilestone) -> TeamPlan {
-    let department = match milestone.profile.as_str() {
-        "research" => "research",
-        "verification" => "verification",
-        _ => "delivery",
-    };
-    let manager_title = match department {
-        "research" => "Research Manager",
-        "verification" => "Verification Manager",
-        _ => "Delivery Manager",
+    let (department, manager_title, kind) = match milestone.profile.as_str() {
+        "research" => ("research", "Research Manager", "research"),
+        "verification" => ("verification", "Verification Manager", "review"),
+        "generic" => ("delivery", "Delivery Manager", "task"),
+        _ => ("delivery", "Delivery Manager", "coding"),
     };
     let token_budget = milestone.token_budget.or(program.policy.token_budget);
     let cost_budget_usd = milestone.cost_budget_usd.or(program.policy.cost_budget_usd);
@@ -872,7 +879,7 @@ pub fn milestone_plan(program: &Program, milestone: &ProgramMilestone) -> TeamPl
             id: "T1".to_string(),
             department: department.to_string(),
             title: milestone.title.clone(),
-            kind: "coding".to_string(),
+            kind: kind.to_string(),
             priority: milestone.priority,
             profile: Some(milestone.profile.clone()),
             deps: Vec::new(),
@@ -2052,6 +2059,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_scoped_candidates_are_not_starved_by_other_projects() {
+        let (_dir, engine, first_project) = setup();
+        let other_repo = TempDir::new().unwrap();
+        let second_project = engine
+            .store()
+            .add_project(other_repo.path().to_str().unwrap(), Some("other"))
+            .unwrap();
+
+        let first_program = create_program(&engine, &first_project).await;
+        let first_milestone = add_milestone(&engine, &first_program, "First", Vec::new()).await;
+        let second_program = create_program(&engine, &second_project).await;
+        let second_milestone = engine
+            .create_program_milestone(ProgramMilestoneCreateParams {
+                program_id: second_program.id.clone(),
+                key: None,
+                title: "High priority".into(),
+                objective: "win the global scan".into(),
+                acceptance: vec!["done".into()],
+                deps: Vec::new(),
+                priority: Some(100),
+                max_attempts: Some(2),
+                profile: Some("coding".into()),
+                write_scope: vec!["src".into()],
+                token_budget: None,
+                cost_budget_usd: None,
+            })
+            .await
+            .unwrap();
+
+        let controller = ProgramController::new(engine.store().clone());
+        controller.reconcile(None).await.unwrap();
+
+        let scoped = controller
+            .ready_candidates_in_project(Some(&first_project.id), None, 1)
+            .unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].milestone.id, first_milestone.id);
+        let scoped_second = controller
+            .ready_candidates_in_project(Some(&second_project.id), None, 1)
+            .unwrap();
+        assert_eq!(scoped_second.len(), 1);
+        assert_eq!(scoped_second[0].milestone.id, second_milestone.id);
+        let global = controller.ready_candidates(None, 10).unwrap();
+        assert!(
+            global
+                .iter()
+                .any(|candidate| candidate.milestone.id == first_milestone.id)
+        );
+        assert!(
+            global
+                .iter()
+                .any(|candidate| candidate.milestone.id == second_milestone.id)
+        );
+    }
+
+    #[tokio::test]
     async fn validation_rejects_bad_bounds_duplicate_keys_and_cycles() {
         let (_dir, engine, project) = setup();
         let mut bad = policy();
@@ -3052,6 +3115,10 @@ mod bundle_tests {
             .set_team_plan(&session.id, &milestone_plan(&program, &claimed))
             .await
             .unwrap();
+        engine
+            .store()
+            .add_session_usage(&session.id, 40, 2)
+            .unwrap();
 
         let bundle = engine.export_session(&session.id).await.unwrap();
         assert_eq!(bundle.programs.len(), 1);
@@ -3072,10 +3139,12 @@ mod bundle_tests {
                 .len(),
             1
         );
+        let imported_usage = imported_store.program_usage(&program.id).unwrap();
         let replay = ProgramController::new(imported_store)
             .replay(&program.id, false)
             .unwrap();
         assert!(replay.consistent, "{:?}", replay.mismatches);
+        assert_eq!(imported_usage.token_spent, 42);
     }
 }
 
@@ -3223,5 +3292,121 @@ mod bundle_overwrite_tests {
                 .len(),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    fn program(profile_budget: Option<u64>, budget_usd: Option<f64>) -> Program {
+        Program {
+            id: "program-1".into(),
+            project_id: "project-1".into(),
+            goal: "Ship the milestone".into(),
+            status: ProgramStatus::Active,
+            policy: ProgramPolicy {
+                auto_dispatch: true,
+                max_attempts: 2,
+                retry_backoff_secs: 30,
+                dependency_failure: DependencyFailurePolicy::Block,
+                token_budget: profile_budget,
+                cost_budget_usd: budget_usd,
+                max_parallel_milestones: 2,
+            },
+            token_budget: None,
+            cost_budget_usd: None,
+            reason: None,
+            archived: false,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            completed_at: None,
+        }
+    }
+
+    fn milestone(profile: &str) -> ProgramMilestone {
+        ProgramMilestone {
+            id: "milestone-1".into(),
+            program_id: "program-1".into(),
+            key: "1".into(),
+            title: "Milestone title".into(),
+            objective: "Do the milestone work".into(),
+            acceptance: vec!["the work is complete".into()],
+            deps: Vec::new(),
+            priority: 5,
+            status: ProgramMilestoneStatus::Pending,
+            session_id: None,
+            plan_revision: None,
+            attempts: 0,
+            max_attempts: 2,
+            next_attempt_at: None,
+            result: None,
+            last_error: None,
+            profile: profile.into(),
+            write_scope: Vec::new(),
+            token_budget: None,
+            cost_budget_usd: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            completed_at: None,
+        }
+    }
+
+    #[test]
+    fn every_supported_profile_produces_a_valid_plan() {
+        for (profile, department, kind) in [
+            ("coding", "delivery", "coding"),
+            ("research", "research", "research"),
+            ("verification", "verification", "review"),
+            ("generic", "delivery", "task"),
+        ] {
+            let plan = milestone_plan(&program(None, None), &milestone(profile));
+            crate::agent::validate_team_plan(&plan, 5)
+                .unwrap_or_else(|error| panic!("{profile} plan must validate: {error:#}"));
+            assert_eq!(plan.departments.len(), 1);
+            assert_eq!(plan.departments[0].name, department);
+            assert_eq!(plan.departments[0].profile, profile);
+            assert_eq!(plan.tasks.len(), 1);
+            assert_eq!(plan.tasks[0].kind, kind);
+            assert_eq!(plan.tasks[0].profile.as_deref(), Some(profile));
+            assert!(plan.tasks[0].deps.is_empty());
+        }
+    }
+
+    #[test]
+    fn write_scope_on_a_read_only_profile_is_rejected_by_plan_validation() {
+        let mut milestone = milestone("verification");
+        milestone.write_scope = vec!["src".into()];
+        let plan = milestone_plan(&program(None, None), &milestone);
+        let error = crate::agent::validate_team_plan(&plan, 5).unwrap_err();
+        assert!(
+            error.to_string().contains("writable profile"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn plans_inherit_program_budgets_and_default_acceptance() {
+        let mut milestone = milestone("coding");
+        milestone.acceptance.clear();
+        let plan = milestone_plan(&program(Some(90_000), Some(4.5)), &milestone);
+        assert_eq!(plan.departments[0].token_budget, Some(90_000));
+        assert_eq!(plan.departments[0].cost_budget_usd, Some(4.5));
+        assert_eq!(plan.tasks[0].token_budget, Some(90_000));
+        assert_eq!(plan.tasks[0].cost_budget_usd, Some(4.5));
+        assert_eq!(plan.tasks[0].acceptance.len(), 1);
+        assert!(!plan.tasks[0].acceptance[0].is_empty());
+        crate::agent::validate_team_plan(&plan, 5).unwrap();
+    }
+
+    #[test]
+    fn milestone_budgets_take_precedence_over_program_defaults() {
+        let mut milestone = milestone("coding");
+        milestone.token_budget = Some(1_000);
+        milestone.cost_budget_usd = Some(0.5);
+        let plan = milestone_plan(&program(Some(90_000), Some(4.5)), &milestone);
+        assert_eq!(plan.departments[0].token_budget, Some(1_000));
+        assert_eq!(plan.departments[0].cost_budget_usd, Some(0.5));
+        crate::agent::validate_team_plan(&plan, 5).unwrap();
     }
 }

@@ -1481,7 +1481,7 @@ impl Engine {
         let controller = self.programs();
         let result = controller.reconcile(params.project_id.as_deref()).await?;
         let ready = controller
-            .ready_candidates(None, 50)
+            .ready_candidates_in_project(params.project_id.as_deref(), None, 50)
             .unwrap_or_default()
             .into_iter()
             .map(|candidate| candidate.milestone)

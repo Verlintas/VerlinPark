@@ -116,6 +116,9 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
             for event in &snapshot.program_events {
                 store.insert_program_event_snapshot(event)?;
             }
+            for program in &snapshot.programs {
+                store.rebuild_program_session_links(&program.id)?;
+            }
         }
         let engine = Engine::new(store);
         match engine.restore_sources_from_disk().await {

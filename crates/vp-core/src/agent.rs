@@ -3007,10 +3007,6 @@ impl AgentService {
         });
     }
 
-    /// Opt-in global task-DAG resume scheduler. Every tick it picks one
-    /// idle/failed/cancelled session with retryable tasks, ordered by effective
-    /// priority and session round-robin, then resumes its stored plan. This is
-    /// intentionally not default-on: resuming a plan spends the session budget.
     /// Deterministic project-program controller. This reconciles completed,
     /// failed, retrying, and dependency-blocked milestones even when no
     /// provider is configured, then launches at most one ready milestone per
@@ -3020,11 +3016,8 @@ impl AgentService {
         let result = controller.reconcile(project_id).await?;
         let mut started = 0usize;
         if self.info().configured {
-            let candidates = controller.ready_candidates(None, 10)?;
+            let candidates = controller.ready_candidates_in_project(project_id, None, 10)?;
             for candidate in candidates {
-                if project_id.is_some_and(|id| candidate.program.project_id != id) {
-                    continue;
-                }
                 if !candidate.program.policy.auto_dispatch {
                     continue;
                 }
@@ -4138,6 +4131,10 @@ impl AgentService {
         Ok(started)
     }
 
+    /// Opt-in global task-DAG resume scheduler. Every tick it picks one
+    /// idle/failed/cancelled session with retryable tasks, ordered by effective
+    /// priority and session round-robin, then resumes its stored plan. This is
+    /// intentionally not default-on: resuming a plan spends the session budget.
     pub fn start_task_scheduler(&self) {
         if self.task_scheduler_started.swap(true, Ordering::SeqCst) {
             return;

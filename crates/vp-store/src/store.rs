@@ -1562,6 +1562,25 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_program_events_project
                 ON program_events(project_id, created_at);
 
+            -- Append-only accounting ledger for every milestone dispatch.
+            -- `program_milestones.session_id` only points at the current
+            -- attempt; retries clear it. Program budgets must still count the
+            -- spend of every earlier attempt, so links are never deleted on
+            -- retry and are rebuilt from `program.milestone.updated` events.
+            CREATE TABLE IF NOT EXISTS program_milestone_sessions (
+                program_id    TEXT NOT NULL REFERENCES programs(id) ON DELETE CASCADE,
+                milestone_id  TEXT NOT NULL REFERENCES program_milestones(id) ON DELETE CASCADE,
+                session_id    TEXT NOT NULL,
+                attempt       INTEGER NOT NULL,
+                dispatched_at TEXT NOT NULL,
+                PRIMARY KEY (milestone_id, session_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_program_milestone_sessions_program
+                ON program_milestone_sessions(program_id, session_id);
+            CREATE INDEX IF NOT EXISTS idx_program_milestone_sessions_session
+                ON program_milestone_sessions(session_id);
+
             CREATE TABLE IF NOT EXISTS project_orchestration_policies (
                 project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
                 policy     TEXT NOT NULL,
@@ -3576,6 +3595,21 @@ impl Store {
              WHERE id = ?1",
             params![id, session_id, plan_revision as i64, milestone.updated_at],
         )?;
+        // The link ledger is written in the same transaction as the event and
+        // projection. It survives retries, so program budgets keep counting
+        // every attempt instead of only the current session.
+        tx.execute(
+            "INSERT OR IGNORE INTO program_milestone_sessions
+             (program_id, milestone_id, session_id, attempt, dispatched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                milestone.program_id,
+                id,
+                session_id,
+                milestone.attempts as i64,
+                milestone.updated_at,
+            ],
+        )?;
         tx.commit()?;
         Ok(Some((milestone, event)))
     }
@@ -3906,6 +3940,10 @@ impl Store {
              FROM programs p
              JOIN program_milestones m ON m.program_id = p.id
              WHERE m.session_id = ?1
+                OR EXISTS (
+                    SELECT 1 FROM program_milestone_sessions l
+                    WHERE l.milestone_id = m.id AND l.session_id = ?1
+                )
              ORDER BY p.created_at ASC, p.id ASC",
             PROGRAM_COLUMNS
                 .split(", ")
@@ -3976,6 +4014,8 @@ impl Store {
                     COALESCE(SUM(s.cost_spent_usd), 0.0)
              FROM sessions s
              WHERE s.id IN (
+                 SELECT session_id FROM program_milestone_sessions WHERE program_id = ?1
+                 UNION
                  SELECT session_id FROM program_milestones
                  WHERE program_id = ?1 AND session_id IS NOT NULL
              )",
@@ -3986,6 +4026,80 @@ impl Store {
             token_spent: tokens,
             cost_spent_usd: cost,
         })
+    }
+
+    /// Rebuild the append-only dispatch ledger from program events. This is
+    /// idempotent and is used by bundle import and `db-rebuild`; live attaches
+    /// write the same rows transactionally. `program.milestone.updated` is the
+    /// attach event and carries the full milestone row.
+    pub fn rebuild_program_session_links(&self, program_id: &str) -> Result<usize> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let inserted = Self::rebuild_program_session_links_tx(&tx, program_id)?;
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    fn rebuild_program_session_links_tx(tx: &Transaction<'_>, program_id: &str) -> Result<usize> {
+        let mut inserted = 0usize;
+        {
+            let mut stmt = tx.prepare(
+                "SELECT created_at, payload FROM program_events
+                 WHERE program_id = ?1 AND kind = 'program.milestone.updated'
+                 ORDER BY seq ASC",
+            )?;
+            let rows = stmt.query_map(params![program_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (created_at, payload) = row?;
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) else {
+                    continue;
+                };
+                let Some(session_id) = value.get("session_id").and_then(|value| value.as_str())
+                else {
+                    continue;
+                };
+                let Some(milestone_id) = value.get("id").and_then(|value| value.as_str()) else {
+                    continue;
+                };
+                let attempt = value
+                    .get("attempts")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+                    .min(i64::MAX as u64) as i64;
+                inserted += tx.execute(
+                    "INSERT OR IGNORE INTO program_milestone_sessions
+                     (program_id, milestone_id, session_id, attempt, dispatched_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![program_id, milestone_id, session_id, attempt, created_at],
+                )?;
+            }
+        }
+        {
+            let mut stmt = tx.prepare(
+                "SELECT id, session_id, attempts, updated_at FROM program_milestones
+                 WHERE program_id = ?1 AND session_id IS NOT NULL",
+            )?;
+            let rows = stmt.query_map(params![program_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (milestone_id, session_id, attempt, updated_at) = row?;
+                inserted += tx.execute(
+                    "INSERT OR IGNORE INTO program_milestone_sessions
+                     (program_id, milestone_id, session_id, attempt, dispatched_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![program_id, milestone_id, session_id, attempt, updated_at],
+                )?;
+            }
+        }
+        Ok(inserted)
     }
 
     pub fn count_active_program_milestones(&self, program_id: &str) -> Result<u32> {
@@ -14300,6 +14414,10 @@ impl Store {
                     &payload,
                 )?;
             }
+            // Archive rows carry the full event history. Rebuild the dispatch
+            // accounting ledger so imported programs keep their historical
+            // spend even though imported sessions are read-only archives.
+            Self::rebuild_program_session_links_tx(&tx, &archived.id)?;
         }
         let status_event = insert_event_tx(
             &tx,

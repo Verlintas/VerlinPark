@@ -4939,6 +4939,70 @@ fn program_usage_counts_each_linked_session_once() {
 }
 
 #[test]
+fn program_usage_keeps_retried_attempts_in_the_budget() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("retry-usage"))
+        .unwrap();
+    let (program, _) = store
+        .create_program(&program_input(&project.id, ProgramStatus::Active))
+        .unwrap();
+    let (milestone, _) = store
+        .create_program_milestone(&milestone_input(&program.id, "1", Vec::new()))
+        .unwrap();
+
+    let (claimed, _) = store
+        .claim_program_milestone_start(&milestone.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.attempts, 1);
+    let first = store.create_session(&project.id, "attempt one").unwrap();
+    store
+        .attach_program_milestone_session(&milestone.id, &first.id, 1)
+        .unwrap();
+    store.add_session_usage(&first.id, 100, 50).unwrap();
+    store.add_session_cost_with_event(&first.id, 0.75).unwrap();
+
+    // A retry clears the current session pointer. The accounting ledger must
+    // still remember the first attempt or every retry would reset the program
+    // budget.
+    store
+        .fail_program_milestone(&milestone.id, "attempt failed", None)
+        .unwrap();
+    store.retry_program_milestone(&milestone.id).unwrap();
+    let reset = store.get_program_milestone(&milestone.id).unwrap().unwrap();
+    assert!(reset.session_id.is_none());
+    assert_eq!(reset.attempts, 0);
+
+    let (claimed, _) = store
+        .claim_program_milestone_start(&milestone.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.attempts, 1);
+    let second = store.create_session(&project.id, "attempt two").unwrap();
+    store
+        .attach_program_milestone_session(&milestone.id, &second.id, 1)
+        .unwrap();
+    store.add_session_usage(&second.id, 200, 25).unwrap();
+    store.add_session_cost_with_event(&second.id, 0.5).unwrap();
+
+    let usage = store.program_usage(&program.id).unwrap();
+    assert_eq!(usage.token_spent, 375);
+    assert!((usage.cost_spent_usd - 1.25).abs() < 1e-9);
+
+    // Historical sessions still resolve to their program once the milestone
+    // moved on to another session.
+    let linked = store.list_programs_for_session(&first.id).unwrap();
+    assert_eq!(linked.len(), 1);
+    assert_eq!(linked[0].id, program.id);
+
+    // Rebuilding from events is idempotent and reproduces the same ledger.
+    assert_eq!(store.rebuild_program_session_links(&program.id).unwrap(), 0);
+    let rebuilt = store.program_usage(&program.id).unwrap();
+    assert_eq!(rebuilt.token_spent, 375);
+}
+
+#[test]
 fn project_manifest_round_trips_program_rows_policy_and_events() {
     let (_data, store, repo) = test_store();
     let project = store
