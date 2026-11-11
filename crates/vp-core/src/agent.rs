@@ -340,7 +340,11 @@ impl FairCapacity {
 }
 
 impl CapacityController {
-    fn new(workers: usize, labour: usize) -> Self {
+    /// Construct a daemon-wide Worker/Labour admission controller. Embedders
+    /// (including the deterministic benchmark harness) must provide the same
+    /// explicit limits as the daemon; the controller never widens a session's
+    /// configured caps.
+    pub fn new(workers: usize, labour: usize) -> Self {
         Self::new_with_aging(workers, labour, priority_aging())
     }
 

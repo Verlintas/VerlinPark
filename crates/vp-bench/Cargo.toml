@@ -1,0 +1,32 @@
+[package]
+name = "vp-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deterministic cost-per-solved-task benchmark harness for VerlinPark"
+
+[lib]
+name = "vp_bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vp-bench"
+path = "src/bin/vp-bench.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+clap = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tempfile = "3"
+time = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+vp-core = { path = "../vp-core" }
+vp-protocol = { path = "../vp-protocol" }
+vp-providers = { path = "../vp-providers" }
+vp-store = { path = "../vp-store" }

@@ -17,6 +17,7 @@ fs2 = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+vp-bench = { path = "../vp-bench" }
 vp-core = { path = "../vp-core" }
 vp-protocol = { path = "../vp-protocol" }
 vp-store = { path = "../vp-store" }

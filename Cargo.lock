@@ -3273,6 +3273,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "vp-bench"
+version = "0.1.0-dev"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "time",
+ "tokio",
+ "uuid",
+ "vp-core",
+ "vp-protocol",
+ "vp-providers",
+ "vp-store",
+]
+
+[[package]]
 name = "vp-cli"
 version = "0.1.0-dev"
 dependencies = [
@@ -3283,6 +3304,7 @@ dependencies = [
  "reqwest",
  "serde_json",
  "tokio",
+ "vp-bench",
  "vp-core",
  "vp-protocol",
  "vp-store",

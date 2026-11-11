@@ -54,6 +54,11 @@ enum Command {
         #[arg(long)]
         prometheus: bool,
     },
+    /// Run deterministic cost-per-solved-task benchmarks (no daemon required).
+    Bench {
+        #[command(subcommand)]
+        command: vp_bench::cli::BenchCommand,
+    },
     /// List configured external ACP agents.
     AcpAgents,
     /// Add an external Agent Client Protocol (ACP) agent.
@@ -1382,6 +1387,24 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Command::Bench { command } = &cli.command {
+        match vp_bench::cli::execute(command.clone(), cli.json).await {
+            Ok(outcome) => {
+                if cli.json {
+                    if let Some(value) = outcome.json {
+                        print_json(&value)?;
+                    }
+                } else {
+                    print!("{}", outcome.human);
+                }
+                std::process::exit(outcome.exit_code);
+            }
+            Err(error) => {
+                eprintln!("vp bench: {error:#}");
+                std::process::exit(2);
+            }
+        };
+    }
     if let Command::DbRebuild { dry_run, force } = &cli.command {
         let data_dir = cli.data_dir.clone().unwrap_or_else(paths::data_dir);
         if data_dir.join("run/daemon.json").exists() && !force {
@@ -1445,6 +1468,7 @@ async fn main() -> Result<()> {
         Command::DbRebuild { .. } => unreachable!("db rebuild is handled before discovery"),
         Command::Backup { .. } => unreachable!("backup is handled before discovery"),
         Command::Restore { .. } => unreachable!("restore is handled before discovery"),
+        Command::Bench { .. } => unreachable!("bench is handled before discovery"),
         Command::Ping => {
             let result = rpc(&discovery, "ping", json!({})).await?;
             if cli.json {
@@ -6521,6 +6545,36 @@ mod tests {
                 match cli.command {
                     Command::Metrics { prometheus } => assert!(prometheus),
                     other => panic!("expected metrics command, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn bench_command_parses_without_daemon_discovery() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "bench",
+                    "run",
+                    "--scenario",
+                    "baseline-single-session",
+                    "--repetitions",
+                    "2",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::Bench {
+                        command: vp_bench::cli::BenchCommand::Run(args),
+                    } => {
+                        assert_eq!(args.scenarios, vec!["baseline-single-session"]);
+                        assert_eq!(args.repetitions, 2);
+                    }
+                    other => panic!("expected bench run command, got {other:?}"),
                 }
             })
             .unwrap()

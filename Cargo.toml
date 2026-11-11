@@ -9,6 +9,7 @@ members = [
     "crates/vp-core",
     "crates/vp-daemon",
     "crates/vp-cli",
+    "crates/vp-bench",
 ]
 
 [workspace.package]
