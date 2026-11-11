@@ -846,6 +846,7 @@ private struct CollabNodeCard: View {
         case .leader: VPTheme.accent
         case .manager: VPTheme.plan
         case .worker: VPTheme.info
+        case .scout: VPTheme.accentDeep
         case .verifier: VPTheme.success
         case .labour: VPTheme.warning
         case .group: VPTheme.textSecondary
@@ -858,6 +859,7 @@ private struct CollabNodeCard: View {
         case .leader: "crown"
         case .manager: "person.crop.rectangle.stack"
         case .worker: "person.3"
+        case .scout: "magnifyingglass"
         case .verifier: "checkmark.shield"
         case .labour: "hammer"
         case .group: "rectangle.3.group"
@@ -959,7 +961,7 @@ private struct CollabNodeCard: View {
             managerBody
         case .worker:
             workerBody
-        case .verifier, .labour:
+        case .scout, .verifier, .labour:
             compactBody
         case .group:
             groupBody
@@ -1312,6 +1314,7 @@ private struct CollabNodeInspector: View {
         case .leader: VPTheme.accent
         case .manager: VPTheme.plan
         case .worker: VPTheme.info
+        case .scout: VPTheme.accentDeep
         case .verifier: VPTheme.success
         case .labour: VPTheme.warning
         case .group, .plannedTask: VPTheme.textSecondary

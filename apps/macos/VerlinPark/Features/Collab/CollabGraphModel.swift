@@ -57,6 +57,7 @@ struct CollabGraphNode: Identifiable, Equatable {
         case leader
         case manager
         case worker
+        case scout
         case verifier
         case labour
         case group
@@ -71,10 +72,11 @@ struct CollabGraphNode: Identifiable, Equatable {
             case .leader: 0
             case .manager: 1
             case .worker: 2
-            case .verifier: 3
-            case .labour: 4
-            case .group: 5
-            case .plannedTask: 6
+            case .scout: 3
+            case .verifier: 4
+            case .labour: 5
+            case .group: 6
+            case .plannedTask: 7
             }
         }
     }
@@ -255,7 +257,7 @@ enum CollabGraphBuilder {
         )
 
         let realAgents = agents.filter {
-            ["leader", "manager", "worker", "verifier", "labour"].contains($0.role)
+            ["leader", "manager", "worker", "scout", "verifier", "labour"].contains($0.role)
         }
         let agentByID = Dictionary(uniqueKeysWithValues: realAgents.map { ($0.id, $0) })
 
@@ -686,6 +688,7 @@ enum CollabGraphBuilder {
         let kind: CollabGraphNode.Kind = switch agent.role {
         case "leader": .leader
         case "manager": .manager
+        case "scout": .scout
         case "verifier": .verifier
         case "labour": .labour
         default: .worker
@@ -741,6 +744,7 @@ enum CollabGraphBuilder {
         case .leader: CGSize(width: 238, height: 82)
         case .manager: CGSize(width: 204, height: 72)
         case .worker: CGSize(width: 184, height: 70)
+        case .scout: CGSize(width: 158, height: 58)
         case .verifier: CGSize(width: 160, height: 58)
         case .labour: CGSize(width: 154, height: 54)
         case .group: CGSize(width: 168, height: 58)
