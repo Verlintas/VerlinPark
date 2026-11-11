@@ -127,6 +127,7 @@ struct MemoryPolicyCard: View {
     @Environment(AppModel.self) private var model
     let project: Project
     @State private var showAdvanced = false
+    @State private var showEmbedding = false
 
     var body: some View {
         @Bindable var model = model
@@ -202,6 +203,118 @@ struct MemoryPolicyCard: View {
                     )
                     .font(.system(size: 8, design: .monospaced))
                     .foregroundStyle(.tertiary)
+                }
+                .padding(.top, 6)
+            }
+            .font(.system(size: 9, design: .monospaced))
+            DisclosureGroup("Semantic retrieval (optional)", isExpanded: $showEmbedding) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Toggle("Enable hybrid recall", isOn: $model.memoryEmbeddingEnabled)
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                    HStack(spacing: 8) {
+                        TextField("embedding endpoint", text: $model.memoryEmbeddingEndpoint)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 9, design: .monospaced))
+                        TextField("model", text: $model.memoryEmbeddingModel)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 9, design: .monospaced))
+                            .frame(width: 150)
+                    }
+                    HStack(spacing: 8) {
+                        TextField("dimensions", text: $model.memoryEmbeddingDimensions)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 9, design: .monospaced))
+                            .frame(width: 86)
+                        TextField("batch", text: $model.memoryEmbeddingBatchSize)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 9, design: .monospaced))
+                            .frame(width: 60)
+                        TextField("timeout s", text: $model.memoryEmbeddingTimeoutSecs)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 9, design: .monospaced))
+                            .frame(width: 72)
+                        TextField("candidates", text: $model.memoryEmbeddingMaxCandidates)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 9, design: .monospaced))
+                            .frame(width: 74)
+                        TextField("min similarity", text: $model.memoryEmbeddingMinSimilarity)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 9, design: .monospaced))
+                            .frame(width: 92)
+                    }
+                    TextField(
+                        "API key environment variable (name only)",
+                        text: $model.memoryEmbeddingAPIKeyEnv
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 9, design: .monospaced))
+                    HStack(spacing: 8) {
+                        Button("Test endpoint") {
+                            Task { await model.testMemoryEmbeddings() }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(model.memoryEmbeddingBusy || model.memoryPolicyBusy)
+                        Button("Rebuild index") {
+                            Task { await model.rebuildMemoryEmbeddings() }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(model.memoryEmbeddingBusy || model.memoryPolicyBusy)
+                        if model.memoryEmbeddingBusy {
+                            ProgressView().controlSize(.small)
+                        }
+                    }
+                    Text(
+                        "Off by default. When enabled, memory titles, bodies, and tags are sent to the configured endpoint. The daemon never selects a model, stores a key, or returns vectors. Disabled mode makes zero embedding calls and recall stays lexical. Save before testing; a failed index never fails a memory write."
+                    )
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    if let embedding = model.memoryEmbeddingsStatus {
+                        HStack(spacing: 10) {
+                            Text(verbatim: "status \(embedding.healthLabel)")
+                            Text(verbatim: "coverage \(embedding.coverageLabel)")
+                            Text(verbatim: "\(embedding.indexed)/\(embedding.indexable) indexed")
+                            if embedding.pending > 0 {
+                                Text(verbatim: "\(embedding.pending) pending")
+                            }
+                            if embedding.failed > 0 {
+                                Text(verbatim: "\(embedding.failed) failed")
+                                    .foregroundStyle(VPTheme.warning)
+                            }
+                            if embedding.invalid > 0 {
+                                Text(verbatim: "\(embedding.invalid) invalid vectors")
+                                    .foregroundStyle(VPTheme.warning)
+                            }
+                            if embedding.usage.calls > 0 {
+                                Text(verbatim: "\(embedding.usage.calls) calls")
+                            }
+                        }
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        if let error = embedding.lastError {
+                            Text(error)
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(VPTheme.warning)
+                                .lineLimit(3)
+                        }
+                    }
+                    if let result = model.memoryEmbeddingTestResult {
+                        Text(
+                            verbatim: result.ok
+                                ? "probe ok · \(result.model ?? "model") · \(result.dimensions)d · \(result.latencyMs)ms"
+                                : "probe failed · \(result.error ?? "unknown error")"
+                        )
+                        .font(.system(size: 8, design: .monospaced))
+                        .foregroundStyle(result.ok ? VPTheme.success : VPTheme.warning)
+                        .lineLimit(3)
+                    }
+                    if let message = model.memoryEmbeddingStatusMessage {
+                        Text(message)
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                    }
                 }
                 .padding(.top, 6)
             }

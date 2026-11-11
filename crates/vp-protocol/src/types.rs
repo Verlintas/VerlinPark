@@ -1423,11 +1423,45 @@ pub struct MemoryItem {
 }
 
 /// A ranked memory plus the deterministic reasons it surfaced.
+///
+/// The score fields are additive: lexical-only clients can ignore them, and
+/// they are absent in responses produced before hybrid recall existed. Raw
+/// vectors are never part of this type.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MemoryMatch {
     pub memory: MemoryItem,
     pub score: f64,
     pub reasons: Vec<String>,
+    /// Clamped lexical relevance in `0..=1` used for this match.
+    #[serde(default)]
+    pub lexical_score: Option<f64>,
+    /// Cosine similarity in `0..=1` when a current embedding matched.
+    #[serde(default)]
+    pub semantic_score: Option<f64>,
+    /// `lexical`, `semantic`, `hybrid`, or `structural`.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Populated for every returned row when hybrid recall fell back to the
+    /// lexical lane. Never contains endpoint credentials.
+    #[serde(default)]
+    pub semantic_unavailable: Option<String>,
+}
+
+/// Result-level hybrid recall status. `fallback` is set when semantic recall
+/// was requested but could not run (disabled, unhealthy, timeout, bad
+/// response); ranking then stays lexical and the reason is also copied onto
+/// each match.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemorySemanticSummary {
+    pub enabled: bool,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub lexical_candidates: u32,
+    #[serde(default)]
+    pub semantic_candidates: u32,
+    #[serde(default)]
+    pub fallback: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1476,11 +1510,18 @@ pub struct MemorySearchParams {
     /// dropped instead of returning more text than requested.
     #[serde(default)]
     pub max_chars: Option<u32>,
+    /// Force the lexical lane for this request even when the project has an
+    /// enabled embedding policy. Performs no embedding request.
+    #[serde(default)]
+    pub lexical_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MemorySearchResult {
     pub memories: Vec<MemoryMatch>,
+    /// Hybrid recall status. Absent on older daemons.
+    #[serde(default)]
+    pub semantic: Option<MemorySemanticSummary>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1722,6 +1763,90 @@ pub struct MemoryPruneResult {
     pub dry_run: bool,
 }
 
+/// Opt-in semantic lane for project memory.
+///
+/// The endpoint is an explicit OpenAI-compatible `/embeddings` base URL. The
+/// API key is *never* stored: `api_key_env` names a daemon environment
+/// variable that is read at call time. Disabled (the default) performs no
+/// network calls and leaves lexical recall byte-for-byte unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryEmbeddingPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Base URL or full embeddings URL. When it does not end in `/embeddings`
+    /// the runtime appends it. Query strings and userinfo are rejected.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default = "default_embedding_dimensions")]
+    pub dimensions: u32,
+    #[serde(default = "default_embedding_batch_size")]
+    pub batch_size: u32,
+    #[serde(default = "default_embedding_timeout_secs")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_embedding_max_candidates")]
+    pub max_candidates: u32,
+    /// Minimum cosine similarity required to contribute a semantic signal.
+    #[serde(default = "default_embedding_min_similarity")]
+    pub min_similarity: f32,
+    /// Environment variable name only; the value is read in the daemon and
+    /// never persisted, returned by status, or logged.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+}
+
+fn default_embedding_dimensions() -> u32 {
+    1536
+}
+
+fn default_embedding_batch_size() -> u32 {
+    16
+}
+
+fn default_embedding_timeout_secs() -> u64 {
+    30
+}
+
+fn default_embedding_max_candidates() -> u32 {
+    64
+}
+
+fn default_embedding_min_similarity() -> f32 {
+    0.20
+}
+
+impl Default for MemoryEmbeddingPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: None,
+            model: None,
+            dimensions: default_embedding_dimensions(),
+            batch_size: default_embedding_batch_size(),
+            timeout_secs: default_embedding_timeout_secs(),
+            max_candidates: default_embedding_max_candidates(),
+            min_similarity: default_embedding_min_similarity(),
+            api_key_env: None,
+        }
+    }
+}
+
+impl MemoryEmbeddingPolicy {
+    /// Configured means endpoint and model are both non-empty. A policy object
+    /// may be configured but disabled; it then still performs no automatic
+    /// work and no recall calls.
+    pub fn is_configured(&self) -> bool {
+        self.endpoint
+            .as_deref()
+            .is_some_and(|endpoint| !endpoint.trim().is_empty())
+            && self
+                .model
+                .as_deref()
+                .is_some_and(|model| !model.trim().is_empty())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MemoryPolicy {
     /// Auto-prune retention toggle. Staleness sweeping is `sweep_stale`.
@@ -1747,6 +1872,10 @@ pub struct MemoryPolicy {
     /// Opt-in daemon sweep that marks expired memories stale. Never deletes.
     #[serde(default)]
     pub sweep_stale: bool,
+    /// Optional hybrid retrieval lane. Absent means lexical-only with zero
+    /// embedding network calls.
+    #[serde(default)]
+    pub embedding: Option<MemoryEmbeddingPolicy>,
 }
 
 impl Default for MemoryPolicy {
@@ -1760,6 +1889,7 @@ impl Default for MemoryPolicy {
             auto_supersede: true,
             brief_max_chars: Some(4000),
             sweep_stale: false,
+            embedding: None,
         }
     }
 }
@@ -1779,6 +1909,125 @@ pub struct SetMemoryPolicyParams {
 pub struct MemoryPolicyResult {
     pub project_id: String,
     pub policy: MemoryPolicy,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryEmbeddingsStatusParams {
+    pub project_id: String,
+}
+
+/// Bounded operational state for one embedding job. Contains no vectors.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryEmbeddingJobStatus {
+    pub memory_id: String,
+    pub title: String,
+    /// `pending`, `indexed`, `failed`, or `skipped`.
+    pub status: String,
+    pub attempts: u32,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub next_attempt_at: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct MemoryEmbeddingUsage {
+    /// Number of `/embeddings` HTTP call batches.
+    pub calls: u64,
+    /// Tokens reported by the endpoint, or estimated when absent.
+    pub input_tokens: u64,
+    /// Portion of `input_tokens` that is a bytes/4 estimate.
+    pub estimated_tokens: u64,
+    /// Exact UTF-8 bytes sent as embedding text.
+    pub bytes: u64,
+    /// Calls where the endpoint reported a token count.
+    pub provider_reported_calls: u64,
+}
+
+/// Health and coverage snapshot. Deliberately excludes vectors, request
+/// bodies, endpoint query strings, and credentials.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryEmbeddingsStatusResult {
+    pub project_id: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub configured: bool,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default = "default_embedding_dimensions")]
+    pub dimensions: u32,
+    /// Memories eligible for semantic retrieval (active and stale).
+    #[serde(default)]
+    pub indexable: u32,
+    /// Eligible memories with a current, structurally valid model/dimension
+    /// embedding row.
+    #[serde(default)]
+    pub indexed: u32,
+    /// Current-model rows whose vector blob fails the header/length checks.
+    /// They are not counted as indexed and are re-queued by the reconciler.
+    #[serde(default)]
+    pub invalid: u32,
+    /// Jobs waiting for the next reconciler tick.
+    #[serde(default)]
+    pub pending: u32,
+    /// Jobs whose retry budget is exhausted or whose last call failed.
+    #[serde(default)]
+    pub failed: u32,
+    /// Memories intentionally not indexed (archived/superseded or unchanged).
+    #[serde(default)]
+    pub skipped: u32,
+    /// `indexed / indexable`, or 0 when there is nothing to index.
+    #[serde(default)]
+    pub coverage: f64,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub usage: MemoryEmbeddingUsage,
+    /// At most 20 recent job rows, newest first.
+    #[serde(default)]
+    pub recent_jobs: Vec<MemoryEmbeddingJobStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryEmbeddingsRebuildParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryEmbeddingsRebuildResult {
+    pub project_id: String,
+    pub enabled: bool,
+    pub model: Option<String>,
+    pub dimensions: u32,
+    /// Existing derived rows removed for the project.
+    pub cleared: u32,
+    /// Eligible memories queued for re-indexing.
+    pub enqueued: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryEmbeddingsTestParams {
+    pub project_id: String,
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryEmbeddingsTestResult {
+    pub project_id: String,
+    pub ok: bool,
+    pub model: Option<String>,
+    pub dimensions: u32,
+    pub latency_ms: u64,
+    pub input_tokens: u64,
+    pub estimated_tokens: u64,
+    /// True when the endpoint reported `usage`.
+    pub provider_reported: bool,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -6128,6 +6377,10 @@ mod tests {
             memory: current,
             score: 1.25,
             reasons: vec!["fts".to_string(), "task:T3".to_string()],
+            lexical_score: Some(0.5),
+            semantic_score: Some(0.75),
+            source: Some("hybrid".to_string()),
+            semantic_unavailable: None,
         };
         let encoded = serde_json::to_value(&matched).unwrap();
         let decoded: MemoryMatch = serde_json::from_value(encoded).unwrap();
@@ -7035,5 +7288,204 @@ mod program_wire_tests {
         assert_eq!(value["delivery_attempt"], 2);
         assert_eq!(value["lease_owner"], "instance:42:nonce");
         assert!(value.get("lease_token").is_none());
+    }
+
+    #[test]
+    fn hybrid_memory_fields_decode_additively_and_default_safely() {
+        let legacy_match: MemoryMatch = serde_json::from_value(json!({
+            "memory": {
+                "id": "mem-1",
+                "session_id": "ses-1",
+                "project_id": "prj-1",
+                "agent_id": "agent-1",
+                "agent_name": "Leader",
+                "kind": "fact",
+                "title": "Legacy",
+                "body": "body",
+                "created_at": "2026-11-11T00:00:00Z"
+            },
+            "score": 0.5,
+            "reasons": ["fts"]
+        }))
+        .unwrap();
+        assert!(legacy_match.lexical_score.is_none());
+        assert!(legacy_match.semantic_score.is_none());
+        assert!(legacy_match.source.is_none());
+        assert!(legacy_match.semantic_unavailable.is_none());
+
+        let legacy_policy: MemoryPolicy = serde_json::from_value(json!({
+            "enabled": false
+        }))
+        .unwrap();
+        assert!(legacy_policy.embedding.is_none());
+
+        let embedding: MemoryEmbeddingPolicy = serde_json::from_value(json!({
+            "enabled": true,
+            "endpoint": "https://example.com/v1",
+            "model": "embed-test"
+        }))
+        .unwrap();
+        assert_eq!(embedding.dimensions, 1536);
+        assert_eq!(embedding.batch_size, 16);
+        assert_eq!(embedding.timeout_secs, 30);
+        assert_eq!(embedding.max_candidates, 64);
+        assert!((embedding.min_similarity - 0.20).abs() < f32::EPSILON);
+        assert!(embedding.is_configured());
+        assert!(!MemoryEmbeddingPolicy::default().enabled);
+        assert!(!MemoryEmbeddingPolicy::default().is_configured());
+
+        let policy = MemoryPolicy {
+            embedding: Some(embedding),
+            ..MemoryPolicy::default()
+        };
+        let encoded = serde_json::to_value(&policy).unwrap();
+        assert_eq!(encoded["embedding"]["model"], "embed-test");
+        let decoded: MemoryPolicy = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, policy);
+
+        let summary: MemorySemanticSummary = serde_json::from_value(json!({
+            "enabled": true,
+            "model": "embed-test",
+            "lexical_candidates": 4,
+            "semantic_candidates": 2,
+            "fallback": null
+        }))
+        .unwrap();
+        assert!(summary.enabled);
+        assert_eq!(summary.semantic_candidates, 2);
+        assert!(summary.fallback.is_none());
+
+        let status: MemoryEmbeddingsStatusResult = serde_json::from_value(json!({
+            "project_id": "prj-1",
+            "enabled": true,
+            "configured": true,
+            "model": "embed-test",
+            "dimensions": 8,
+            "indexable": 2,
+            "indexed": 1,
+            "pending": 1,
+            "failed": 0,
+            "skipped": 0,
+            "coverage": 0.5,
+            "usage": {
+                "calls": 2,
+                "input_tokens": 12,
+                "estimated_tokens": 3,
+                "bytes": 48,
+                "provider_reported_calls": 1
+            },
+            "recent_jobs": []
+        }))
+        .unwrap();
+        assert_eq!(status.indexed, 1);
+        assert_eq!(status.invalid, 0);
+        assert_eq!(status.usage.calls, 2);
+        assert!(status.last_error.is_none());
+
+        let probe: MemoryEmbeddingsTestResult = serde_json::from_value(json!({
+            "project_id": "prj-1",
+            "ok": true,
+            "model": "embed-test",
+            "dimensions": 8,
+            "latency_ms": 3,
+            "input_tokens": 2,
+            "estimated_tokens": 0,
+            "provider_reported": true
+        }))
+        .unwrap();
+        assert!(probe.ok);
+        assert!(probe.error.is_none());
+
+        let params: MemorySearchParams =
+            serde_json::from_value(json!({"project_id": "prj-1", "query": "q"})).unwrap();
+        assert!(!params.lexical_only);
+        let forced: MemorySearchParams = serde_json::from_value(
+            json!({"project_id": "prj-1", "query": "q", "lexical_only": true}),
+        )
+        .unwrap();
+        assert!(forced.lexical_only);
+    }
+
+    #[test]
+    fn hybrid_embedding_rpc_types_decode_defaults_and_round_trip() {
+        let status: MemoryEmbeddingsStatusResult = serde_json::from_value(json!({
+            "project_id": "prj-1",
+            "indexable": 3,
+            "indexed": 2
+        }))
+        .unwrap();
+        assert!(!status.enabled);
+        assert!(!status.configured);
+        assert!(status.model.is_none());
+        assert_eq!(status.dimensions, 1536);
+        assert_eq!(status.invalid, 0);
+        assert_eq!(status.pending, 0);
+        assert_eq!(status.failed, 0);
+        assert_eq!(status.skipped, 0);
+        assert_eq!(status.coverage, 0.0);
+        assert_eq!(status.usage, MemoryEmbeddingUsage::default());
+        assert!(status.recent_jobs.is_empty());
+        assert!(status.last_error.is_none());
+
+        let rebuild: MemoryEmbeddingsRebuildParams =
+            serde_json::from_value(json!({"project_id": "prj-1"})).unwrap();
+        assert_eq!(rebuild.project_id, "prj-1");
+        let result = MemoryEmbeddingsRebuildResult {
+            project_id: "prj-1".to_string(),
+            enabled: false,
+            model: None,
+            dimensions: 1536,
+            cleared: 3,
+            enqueued: 0,
+        };
+        let decoded: MemoryEmbeddingsRebuildResult =
+            serde_json::from_value(serde_json::to_value(&result).unwrap()).unwrap();
+        assert_eq!(decoded, result);
+
+        let params: MemoryEmbeddingsTestParams =
+            serde_json::from_value(json!({"project_id": "prj-1"})).unwrap();
+        assert!(params.text.is_none());
+        let params: MemoryEmbeddingsTestParams =
+            serde_json::from_value(json!({"project_id": "prj-1", "text": "probe"})).unwrap();
+        assert_eq!(params.text.as_deref(), Some("probe"));
+
+        let matched = MemoryMatch {
+            memory: serde_json::from_value(json!({
+                "id": "mem-1",
+                "session_id": "ses-1",
+                "project_id": "prj-1",
+                "agent_id": "agent-1",
+                "agent_name": "Leader",
+                "kind": "fact",
+                "title": "Title",
+                "body": "Body",
+                "created_at": "2026-11-11T00:00:00Z"
+            }))
+            .unwrap(),
+            score: 0.9,
+            reasons: vec!["semantic".to_string(), "hybrid".to_string()],
+            lexical_score: Some(0.2),
+            semantic_score: Some(0.8),
+            source: Some("hybrid".to_string()),
+            semantic_unavailable: None,
+        };
+        let encoded = serde_json::to_value(&matched).unwrap();
+        assert_eq!(encoded["lexical_score"], 0.2);
+        assert_eq!(encoded["semantic_score"], 0.8);
+        assert_eq!(encoded["source"], "hybrid");
+        assert!(encoded["semantic_unavailable"].is_null());
+        let decoded: MemoryMatch = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, matched);
+
+        let summary = MemorySemanticSummary {
+            enabled: true,
+            model: Some("embed".to_string()),
+            lexical_candidates: 3,
+            semantic_candidates: 2,
+            fallback: Some("endpoint unavailable".to_string()),
+        };
+        let decoded: MemorySemanticSummary =
+            serde_json::from_value(serde_json::to_value(&summary).unwrap()).unwrap();
+        assert_eq!(decoded, summary);
     }
 }

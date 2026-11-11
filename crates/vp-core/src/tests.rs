@@ -8795,6 +8795,7 @@ async fn evidence_backed_memory_ranks_briefs_verifies_and_sweeps() {
             limit: Some(5),
             include_stale: false,
             max_chars: None,
+            lexical_only: false,
         })
         .await
         .unwrap();
@@ -8833,6 +8834,7 @@ async fn evidence_backed_memory_ranks_briefs_verifies_and_sweeps() {
             limit: Some(5),
             include_stale: false,
             max_chars: None,
+            lexical_only: false,
         })
         .await
         .unwrap();

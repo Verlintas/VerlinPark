@@ -47,7 +47,8 @@ use vp_protocol::types::{
     MailboxPolicyResult, MarkMessageReadParams, McpCallParams, McpGetPromptParams, McpProbeParams,
     McpReadResourceParams, McpServerIdParams, MemoryBriefParams, MemoryConflictResolveParams,
     MemoryConflictScanParams, MemoryConflictsParams, MemoryCreateParams, MemoryCreateResult,
-    MemoryDeleteParams, MemoryHealthParams, MemoryListParams, MemoryPolicyParams,
+    MemoryDeleteParams, MemoryEmbeddingsRebuildParams, MemoryEmbeddingsStatusParams,
+    MemoryEmbeddingsTestParams, MemoryHealthParams, MemoryListParams, MemoryPolicyParams,
     MemoryPruneParams, MemorySearchParams, MemoryStatsParams, MemorySweepParams,
     MemoryUpdateParams, MemoryVerifyParams, MergeQueueListParams, MergeQueueListResult,
     OpenPullRequestParams, PingResult, ProjectBudgetParams, ProjectForkForestParams,
@@ -191,6 +192,7 @@ async fn main() -> Result<()> {
     spawn_memory_sweeper(state.engine.clone());
     spawn_memory_stale_sweeper(state.engine.clone());
     spawn_memory_conflict_scanner(state.engine.clone());
+    spawn_memory_embedding_reconciler(state.engine.clone());
     spawn_terminal_sweeper(state.engine.clone());
     spawn_browser_sweeper(state.engine.clone());
     spawn_computer_sweeper(state.engine.clone());
@@ -2848,6 +2850,45 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             },
             Err(response) => response_with_id(id, response),
         },
+        "memory.embeddings.status" => {
+            match parse_params::<MemoryEmbeddingsStatusParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .memory_embedding_status(&params.project_id)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "memory.embeddings.rebuild" => {
+            match parse_params::<MemoryEmbeddingsRebuildParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .memory_embedding_rebuild(&params.project_id)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "memory.embeddings.test" => {
+            match parse_params::<MemoryEmbeddingsTestParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .memory_embedding_test(&params.project_id, params.text.as_deref())
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "memory.create" => match parse_params::<MemoryCreateParams>(request.params) {
             Ok(params) => match state
                 .engine
@@ -3537,6 +3578,42 @@ fn spawn_memory_stale_sweeper(engine: Engine) {
                 Ok(_) => {}
                 Err(error) => {
                     tracing::warn!(%error, "automatic memory staleness sweep failed");
+                }
+            }
+        }
+    });
+}
+
+/// Bounded semantic indexing. One batch per enabled project per tick; the
+/// reconciler performs no request when no project has an enabled embedding
+/// policy and never touches session budgets.
+fn spawn_memory_embedding_reconciler(engine: Engine) {
+    let seconds = std::env::var("VERLINPARK_MEMORY_EMBEDDING_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(30);
+    if seconds == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(seconds));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match engine.reconcile_memory_embeddings().await {
+                Ok((_projects, indexed, failed, skipped))
+                    if indexed > 0 || failed > 0 || skipped > 0 =>
+                {
+                    tracing::info!(
+                        indexed,
+                        failed,
+                        skipped,
+                        "memory embedding reconciler processed a batch"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "memory embedding reconciler failed");
                 }
             }
         }

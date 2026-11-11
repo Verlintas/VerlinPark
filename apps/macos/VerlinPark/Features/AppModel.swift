@@ -208,6 +208,20 @@ final class AppModel {
     var memoryPolicySweepStale = false
     var memoryPolicyBusy = false
     var memoryPolicyStatus: String?
+    var memoryEmbeddingEnabled = false
+    var memoryEmbeddingEndpoint = ""
+    var memoryEmbeddingModel = ""
+    var memoryEmbeddingDimensions = "1536"
+    var memoryEmbeddingBatchSize = "16"
+    var memoryEmbeddingTimeoutSecs = "30"
+    var memoryEmbeddingMaxCandidates = "64"
+    var memoryEmbeddingMinSimilarity = "0.20"
+    var memoryEmbeddingAPIKeyEnv = ""
+    var memoryEmbeddingsStatus: MemoryEmbeddingsStatusResult?
+    var memoryEmbeddingBusy = false
+    var memoryEmbeddingStatusMessage: String?
+    var memoryEmbeddingTestResult: MemoryEmbeddingsTestResult?
+    var memoryEmbeddingRebuildResult: MemoryEmbeddingsRebuildResult?
     var memoryNewKind = "note"
     var memoryNewTitle = ""
     var memoryNewBody = ""
@@ -1894,6 +1908,19 @@ final class AppModel {
             memoryPolicyBriefMaxChars = "4000"
             memoryPolicySweepStale = false
             memoryPolicyStatus = nil
+            memoryEmbeddingEnabled = false
+            memoryEmbeddingEndpoint = ""
+            memoryEmbeddingModel = ""
+            memoryEmbeddingDimensions = "1536"
+            memoryEmbeddingBatchSize = "16"
+            memoryEmbeddingTimeoutSecs = "30"
+            memoryEmbeddingMaxCandidates = "64"
+            memoryEmbeddingMinSimilarity = "0.20"
+            memoryEmbeddingAPIKeyEnv = ""
+            memoryEmbeddingsStatus = nil
+            memoryEmbeddingStatusMessage = nil
+            memoryEmbeddingTestResult = nil
+            memoryEmbeddingRebuildResult = nil
             return
         }
         memoryPolicyBusy = true
@@ -1949,6 +1976,66 @@ final class AppModel {
             memoryPolicyStatus = "Enable requires a max item count or max age."
             return
         }
+        let endpoint = memoryEmbeddingEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        let model = memoryEmbeddingModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        let apiKeyEnv = memoryEmbeddingAPIKeyEnv
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let dimensions = Int(
+            memoryEmbeddingDimensions.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        let batchSize = Int(
+            memoryEmbeddingBatchSize.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        let timeoutSecs = Int(
+            memoryEmbeddingTimeoutSecs.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        let maxCandidates = Int(
+            memoryEmbeddingMaxCandidates.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        let minSimilarity = Double(
+            memoryEmbeddingMinSimilarity.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        if memoryEmbeddingEnabled || !endpoint.isEmpty || !model.isEmpty {
+            guard !endpoint.isEmpty, !model.isEmpty else {
+                memoryPolicyStatus = "Embedding endpoint and model are both required."
+                return
+            }
+            guard let dimensions, (8 ... 8192).contains(dimensions) else {
+                memoryPolicyStatus = "Embedding dimensions must be between 8 and 8192."
+                return
+            }
+            guard let batchSize, (1 ... 64).contains(batchSize) else {
+                memoryPolicyStatus = "Embedding batch size must be between 1 and 64."
+                return
+            }
+            guard let timeoutSecs, (1 ... 300).contains(timeoutSecs) else {
+                memoryPolicyStatus = "Embedding timeout must be between 1 and 300 seconds."
+                return
+            }
+            guard let maxCandidates, (1 ... 256).contains(maxCandidates) else {
+                memoryPolicyStatus = "Embedding candidates must be between 1 and 256."
+                return
+            }
+            guard let minSimilarity, minSimilarity.isFinite, (0 ... 1).contains(minSimilarity) else {
+                memoryPolicyStatus = "Minimum similarity must be between 0 and 1."
+                return
+            }
+        }
+        let embedding: MemoryEmbeddingPolicy? = if endpoint.isEmpty, model.isEmpty {
+            nil
+        } else {
+            MemoryEmbeddingPolicy(
+                enabled: memoryEmbeddingEnabled,
+                endpoint: endpoint,
+                model: model,
+                dimensions: dimensions ?? 1536,
+                batchSize: batchSize ?? 16,
+                timeoutSecs: timeoutSecs ?? 30,
+                maxCandidates: maxCandidates ?? 64,
+                minSimilarity: minSimilarity ?? 0.20,
+                apiKeyEnv: apiKeyEnv.isEmpty ? nil : apiKeyEnv
+            )
+        }
         memoryPolicyBusy = true
         defer { memoryPolicyBusy = false }
         do {
@@ -1962,11 +2049,13 @@ final class AppModel {
                     defaultVerifyDays: defaultVerifyDays,
                     autoSupersede: memoryPolicyAutoSupersede,
                     briefMaxChars: briefMaxChars,
-                    sweepStale: memoryPolicySweepStale
+                    sweepStale: memoryPolicySweepStale,
+                    embedding: embedding
                 )
             )
             applyMemoryPolicy(policy)
             memoryPolicyStatus = "Memory policy saved."
+            await loadMemoryEmbeddingStatus()
         } catch {
             memoryPolicyStatus = error.localizedDescription
             handle(error)
@@ -1982,6 +2071,75 @@ final class AppModel {
         memoryPolicyAutoSupersede = policy.autoSupersede ?? true
         memoryPolicyBriefMaxChars = policy.briefMaxChars.map(String.init) ?? "4000"
         memoryPolicySweepStale = policy.sweepStale ?? false
+        let embedding = policy.embedding ?? MemoryEmbeddingPolicy.defaults
+        memoryEmbeddingEnabled = embedding.enabled
+        memoryEmbeddingEndpoint = embedding.endpoint ?? ""
+        memoryEmbeddingModel = embedding.model ?? ""
+        memoryEmbeddingDimensions = String(embedding.dimensions)
+        memoryEmbeddingBatchSize = String(embedding.batchSize)
+        memoryEmbeddingTimeoutSecs = String(embedding.timeoutSecs)
+        memoryEmbeddingMaxCandidates = String(embedding.maxCandidates)
+        memoryEmbeddingMinSimilarity = String(format: "%.2f", embedding.minSimilarity)
+        memoryEmbeddingAPIKeyEnv = embedding.apiKeyEnv ?? ""
+    }
+
+    func loadMemoryEmbeddingStatus() async {
+        guard let projectID = selectedProjectID else {
+            memoryEmbeddingsStatus = nil
+            return
+        }
+        do {
+            let status = try await core.memoryEmbeddingsStatus(projectID: projectID)
+            guard projectID == selectedProjectID else { return }
+            memoryEmbeddingsStatus = status
+            memoryEmbeddingStatusMessage = nil
+        } catch {
+            guard projectID == selectedProjectID else { return }
+            memoryEmbeddingStatusMessage = error.localizedDescription
+        }
+    }
+
+    func testMemoryEmbeddings() async {
+        guard let projectID = selectedProjectID else {
+            memoryEmbeddingStatusMessage = "Select a project first."
+            return
+        }
+        guard !memoryEmbeddingBusy else { return }
+        memoryEmbeddingBusy = true
+        defer { memoryEmbeddingBusy = false }
+        do {
+            let result = try await core.testMemoryEmbeddings(projectID: projectID, text: nil)
+            guard projectID == selectedProjectID else { return }
+            memoryEmbeddingTestResult = result
+            memoryEmbeddingStatusMessage = result.ok
+                ? "Embedding endpoint responded in \(result.latencyMs) ms."
+                : (result.error ?? "Embedding endpoint probe failed.")
+            await loadMemoryEmbeddingStatus()
+        } catch {
+            memoryEmbeddingStatusMessage = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func rebuildMemoryEmbeddings() async {
+        guard let projectID = selectedProjectID else {
+            memoryEmbeddingStatusMessage = "Select a project first."
+            return
+        }
+        guard !memoryEmbeddingBusy else { return }
+        memoryEmbeddingBusy = true
+        defer { memoryEmbeddingBusy = false }
+        do {
+            let result = try await core.rebuildMemoryEmbeddings(projectID: projectID)
+            guard projectID == selectedProjectID else { return }
+            memoryEmbeddingRebuildResult = result
+            memoryEmbeddingStatusMessage =
+                "Queued \(result.enqueued) memories and cleared \(result.cleared) derived rows."
+            await loadMemoryEmbeddingStatus()
+        } catch {
+            memoryEmbeddingStatusMessage = error.localizedDescription
+            handle(error)
+        }
     }
 
     func loadGitHistory() async {
@@ -2612,6 +2770,7 @@ final class AppModel {
             let health = try await core.memoryHealth(projectID: projectID)
             guard projectID == selectedProjectID else { return }
             memoryHealth = health
+            await loadMemoryEmbeddingStatus()
         } catch {
             memoryConflictStatus = error.localizedDescription
         }

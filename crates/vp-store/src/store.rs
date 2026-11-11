@@ -16,15 +16,17 @@ use vp_protocol::types::{
     AcpAgent, AgentMessage, AgentRecord, Approval, ApprovalGrant, Artifact, ArtifactPolicy,
     ArtifactVersion, CheckpointRetentionPolicy, ContinuationOutcome, Event, IntakeTask,
     IntegrationPolicy, MailboxPolicy, McpServer, McpServerConfig, McpTransport, MemoryConflict,
-    MemoryEvidence, MemoryHealthResult, MemoryItem, MemoryPolicy, MemoryStatCount, MergeQueueEntry,
-    MetricCount, ModelPreset, OrchestrationDecision, OrchestrationNote, OrchestrationPolicy,
-    OrchestrationRecovery, PlanTaskProgress, Program, ProgramEvent, ProgramMilestone,
-    ProgramMilestoneStatus, ProgramPolicy, ProgramStatus, ProgramUsage, Project, ProjectBudget,
-    ProjectUsageSession, Question, RunBudgetSnapshot, RunCheckpoint, RunStep, RunToolCall,
-    ScheduledTask, SearchHit, Session, SessionBundle, SessionContinuation, SessionRun,
-    SessionRunPolicy, ShellPolicy, Skill, Source, SourceChunk, SourceCollection, SourceSearchHit,
-    SourceStats, SteeringMessage, StoredMessage, TaskSchedulerPolicy, TaskStall, TeamPlan,
-    TodoItem, UsageEntry, WorktreeRetentionPolicy, WriteLease, cache_hit_ratio,
+    MemoryEmbeddingJobStatus, MemoryEmbeddingPolicy, MemoryEmbeddingUsage,
+    MemoryEmbeddingsStatusResult, MemoryEvidence, MemoryHealthResult, MemoryItem, MemoryPolicy,
+    MemoryStatCount, MergeQueueEntry, MetricCount, ModelPreset, OrchestrationDecision,
+    OrchestrationNote, OrchestrationPolicy, OrchestrationRecovery, PlanTaskProgress, Program,
+    ProgramEvent, ProgramMilestone, ProgramMilestoneStatus, ProgramPolicy, ProgramStatus,
+    ProgramUsage, Project, ProjectBudget, ProjectUsageSession, Question, RunBudgetSnapshot,
+    RunCheckpoint, RunStep, RunToolCall, ScheduledTask, SearchHit, Session, SessionBundle,
+    SessionContinuation, SessionRun, SessionRunPolicy, ShellPolicy, Skill, Source, SourceChunk,
+    SourceCollection, SourceSearchHit, SourceStats, SteeringMessage, StoredMessage,
+    TaskSchedulerPolicy, TaskStall, TeamPlan, TodoItem, UsageEntry, WorktreeRetentionPolicy,
+    WriteLease, cache_hit_ratio,
 };
 
 use vp_protocol::remote::ExecutionHost;
@@ -518,6 +520,35 @@ pub struct MemoryCandidate {
     pub lexical: f64,
     /// True when the candidate came from FTS5 rather than LIKE.
     pub fts: bool,
+    /// Cosine similarity in 0..=1 from a current embedding, when present.
+    pub semantic: Option<f64>,
+}
+
+/// One memory that may need an embedding. The embedded columns describe the
+/// existing row, if any; the job columns describe the derived queue row. None
+/// of these values are exposed through tool or RPC output.
+#[derive(Debug, Clone)]
+pub struct MemoryEmbeddingIndexCandidate {
+    pub memory: MemoryItem,
+    pub embedded_model: Option<String>,
+    pub embedded_dimensions: Option<u32>,
+    pub embedded_content_hash: Option<String>,
+    pub job_status: Option<String>,
+    pub job_model: Option<String>,
+    pub job_attempts: u32,
+    pub job_updated_at: Option<String>,
+}
+
+/// A bounded semantic candidate: full memory plus the encoded vector BLOB.
+/// Decoding and cosine math happen in `vp-core::memory`, never in the SQL
+/// projection or protocol layer.
+#[derive(Debug, Clone)]
+pub struct MemorySemanticCandidate {
+    pub memory: MemoryItem,
+    pub model: String,
+    pub dimensions: u32,
+    pub content_hash: String,
+    pub vector: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1269,6 +1300,47 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_memory_conflicts_project_status
                 ON memory_conflicts(project_id, status, detected_at);
 
+            CREATE TABLE IF NOT EXISTS memory_embeddings (
+                memory_id    TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+                model        TEXT NOT NULL,
+                dimensions   INTEGER NOT NULL,
+                content_hash TEXT NOT NULL,
+                vector       BLOB NOT NULL,
+                created_at   TEXT NOT NULL,
+                updated_at   TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memory_embeddings_model
+                ON memory_embeddings(model, dimensions);
+
+            CREATE TABLE IF NOT EXISTS memory_embedding_jobs (
+                memory_id       TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+                model           TEXT NOT NULL,
+                status          TEXT NOT NULL,
+                attempts        INTEGER NOT NULL DEFAULT 0,
+                last_error      TEXT,
+                next_attempt_at TEXT,
+                updated_at      TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memory_embedding_jobs_status
+                ON memory_embedding_jobs(status, next_attempt_at, updated_at);
+
+            CREATE TABLE IF NOT EXISTS memory_embedding_usage (
+                id                 TEXT PRIMARY KEY,
+                project_id         TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                model              TEXT NOT NULL,
+                calls              INTEGER NOT NULL,
+                input_tokens       INTEGER NOT NULL,
+                estimated_tokens   INTEGER NOT NULL,
+                bytes              INTEGER NOT NULL,
+                provider_reported  INTEGER NOT NULL,
+                created_at         TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memory_embedding_usage_project
+                ON memory_embedding_usage(project_id, model, created_at);
+
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
                 title,
                 body,
@@ -1481,11 +1553,12 @@ impl Store {
             );
 
             CREATE TABLE IF NOT EXISTS project_memory_policies (
-                project_id   TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
-                enabled      INTEGER NOT NULL,
-                max_items    INTEGER,
-                max_age_days INTEGER,
-                updated_at   TEXT NOT NULL
+                project_id     TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                enabled        INTEGER NOT NULL,
+                max_items      INTEGER,
+                max_age_days   INTEGER,
+                embedding_json TEXT,
+                updated_at     TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS project_worktree_policies (
@@ -2294,7 +2367,42 @@ impl Store {
                  note             TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_memory_conflicts_project_status
-                 ON memory_conflicts(project_id, status, detected_at);",
+                 ON memory_conflicts(project_id, status, detected_at);
+             CREATE TABLE IF NOT EXISTS memory_embeddings (
+                 memory_id    TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+                 model        TEXT NOT NULL,
+                 dimensions   INTEGER NOT NULL,
+                 content_hash TEXT NOT NULL,
+                 vector       BLOB NOT NULL,
+                 created_at   TEXT NOT NULL,
+                 updated_at   TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_memory_embeddings_model
+                 ON memory_embeddings(model, dimensions);
+             CREATE TABLE IF NOT EXISTS memory_embedding_jobs (
+                 memory_id       TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+                 model           TEXT NOT NULL,
+                 status          TEXT NOT NULL,
+                 attempts        INTEGER NOT NULL DEFAULT 0,
+                 last_error      TEXT,
+                 next_attempt_at TEXT,
+                 updated_at      TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_memory_embedding_jobs_status
+                 ON memory_embedding_jobs(status, next_attempt_at, updated_at);
+             CREATE TABLE IF NOT EXISTS memory_embedding_usage (
+                 id                 TEXT PRIMARY KEY,
+                 project_id         TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                 model              TEXT NOT NULL,
+                 calls              INTEGER NOT NULL,
+                 input_tokens       INTEGER NOT NULL,
+                 estimated_tokens   INTEGER NOT NULL,
+                 bytes              INTEGER NOT NULL,
+                 provider_reported  INTEGER NOT NULL,
+                 created_at         TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_memory_embedding_usage_project
+                 ON memory_embedding_usage(project_id, model, created_at);",
         )?;
         ensure_column(
             &conn,
@@ -2326,6 +2434,7 @@ impl Store {
             "sweep_stale",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        ensure_column(&conn, "project_memory_policies", "embedding_json", "TEXT")?;
         ensure_column(&conn, "merge_queue", "pre_merge_commit", "TEXT")?;
         ensure_column(&conn, "plan_tasks", "next_attempt_at", "TEXT")?;
         ensure_column(&conn, "approvals", "approval_risk", "TEXT")?;
@@ -7468,6 +7577,7 @@ impl Store {
                         relevance / (1.0 + relevance)
                     },
                     fts: true,
+                    semantic: None,
                 })
             },
         )?;
@@ -7510,6 +7620,7 @@ impl Store {
                     lexical: like_memory_lexical(&memory, query),
                     memory,
                     fts: false,
+                    semantic: None,
                 })
             },
         )?;
@@ -7625,6 +7736,16 @@ impl Store {
                 "DELETE FROM memory_conflicts WHERE memory_a_id = ?1 OR memory_b_id = ?1",
                 params![id],
             )?;
+            // Explicit cleanup keeps behavior correct even for databases opened
+            // without foreign-key enforcement.
+            tx.execute(
+                "DELETE FROM memory_embeddings WHERE memory_id = ?1",
+                params![id],
+            )?;
+            tx.execute(
+                "DELETE FROM memory_embedding_jobs WHERE memory_id = ?1",
+                params![id],
+            )?;
             tx.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
             let event = insert_event_tx(
                 &tx,
@@ -7658,6 +7779,7 @@ impl Store {
         let Some(mut memory) = get_memory_tx(&tx, id)? else {
             return Ok(None);
         };
+        let previous_status = memory.status.clone();
         if let Some(status) = status {
             memory.status = status.to_string();
             if status == "stale" {
@@ -7675,6 +7797,11 @@ impl Store {
             memory.tags = tags.to_vec();
         }
         update_memory_projection_tx(&tx, &memory)?;
+        let reactivated = memory.status == "active"
+            && matches!(previous_status.as_str(), "archived" | "superseded");
+        if tags.is_some() || reactivated {
+            enqueue_memory_embedding_job_tx(&tx, &memory)?;
+        }
         let event = insert_event_tx(
             &tx,
             &memory.session_id,
@@ -8135,6 +8262,595 @@ impl Store {
         Ok(health)
     }
 
+    /// Projects with a configured embedding policy. Disabled-but-configured
+    /// rows are returned so `memory.embeddings.status` can explain the state;
+    /// the daemon reconciler skips them without any network call.
+    pub fn list_memory_embedding_policies(&self) -> Result<Vec<(String, MemoryEmbeddingPolicy)>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT project_id, embedding_json FROM project_memory_policies
+             WHERE embedding_json IS NOT NULL ORDER BY project_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        let mut policies = Vec::new();
+        for row in rows {
+            let (project_id, raw) = row?;
+            if let Some(policy) = decode_memory_embedding_policy(raw)
+                && policy.is_configured()
+            {
+                policies.push((project_id, policy));
+            }
+        }
+        Ok(policies)
+    }
+
+    /// Bounded candidate window for the embedding reconciler. Includes rows
+    /// whose embedding is missing or belongs to another model/dimension, rows
+    /// with a pending content-update job, and due failed retries. The caller
+    /// compares content hashes and skips unchanged rows before any network
+    /// call.
+    pub fn memory_embedding_index_candidates(
+        &self,
+        project_id: &str,
+        model: &str,
+        dimensions: u32,
+        max_attempts: u32,
+        limit: u32,
+    ) -> Result<Vec<MemoryEmbeddingIndexCandidate>> {
+        let now = now_rfc3339();
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.session_id, m.project_id, m.agent_id, m.agent_name, m.kind,
+                    m.title, m.body, m.tags, m.created_at, m.status, m.source, m.evidence,
+                    m.supersedes, m.superseded_by, m.pinned, m.use_count, m.last_used_at,
+                    m.last_verified_at, m.verify_after, m.stale_reason,
+                    e.model, e.dimensions, e.content_hash,
+                    j.status, j.model, j.attempts, j.updated_at
+             FROM memories m
+             LEFT JOIN memory_embeddings e ON e.memory_id = m.id
+             LEFT JOIN memory_embedding_jobs j ON j.memory_id = m.id
+             WHERE m.project_id = ?1
+               AND m.status IN ('active', 'stale')
+               AND (
+                   (
+                       e.memory_id IS NULL
+                       AND (
+                           j.memory_id IS NULL
+                           OR j.status != 'failed'
+                           OR j.model != ?2
+                           OR (
+                               j.attempts < ?4
+                               AND j.next_attempt_at IS NOT NULL
+                               AND j.next_attempt_at <= ?5
+                           )
+                       )
+                   )
+                   OR e.model != ?2
+                   OR e.dimensions != ?3
+                   OR substr(e.vector, 1, 4) != x'5650454d'
+                   OR substr(e.vector, 5, 1) != x'01'
+                   OR length(e.vector) != 9 + 4 * ?3
+                   OR j.status = 'pending'
+                   OR (
+                       j.status = 'failed'
+                       AND j.attempts < ?4
+                       AND j.next_attempt_at IS NOT NULL
+                       AND j.next_attempt_at <= ?5
+                   )
+               )
+             ORDER BY COALESCE(j.updated_at, m.created_at) ASC, m.id ASC
+             LIMIT ?6",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                project_id,
+                model,
+                i64::from(dimensions),
+                i64::from(max_attempts),
+                now,
+                i64::from(limit.clamp(1, 512))
+            ],
+            |row| {
+                Ok(MemoryEmbeddingIndexCandidate {
+                    memory: map_memory_row(row)?,
+                    embedded_model: row.get(21)?,
+                    embedded_dimensions: row
+                        .get::<_, Option<i64>>(22)?
+                        .and_then(|value| u32::try_from(value).ok()),
+                    embedded_content_hash: row.get(23)?,
+                    job_status: row.get(24)?,
+                    job_model: row.get(25)?,
+                    job_attempts: row
+                        .get::<_, Option<i64>>(26)?
+                        .and_then(|value| u32::try_from(value).ok())
+                        .unwrap_or(0),
+                    job_updated_at: row.get(27)?,
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Active/stale memories with a current-model embedding row. `limit` is
+    /// clamped to 256; vector bytes are returned as-is and decoded by the
+    /// caller under the documented versioned encoding.
+    #[allow(clippy::too_many_arguments)]
+    pub fn memory_semantic_candidates(
+        &self,
+        project_id: &str,
+        model: &str,
+        dimensions: u32,
+        include_stale: bool,
+        limit: u32,
+    ) -> Result<Vec<MemorySemanticCandidate>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.session_id, m.project_id, m.agent_id, m.agent_name, m.kind,
+                    m.title, m.body, m.tags, m.created_at, m.status, m.source, m.evidence,
+                    m.supersedes, m.superseded_by, m.pinned, m.use_count, m.last_used_at,
+                    m.last_verified_at, m.verify_after, m.stale_reason,
+                    e.model, e.dimensions, e.content_hash, e.vector
+             FROM memories m
+             JOIN memory_embeddings e ON e.memory_id = m.id
+             WHERE m.project_id = ?1
+               AND e.model = ?2
+               AND e.dimensions = ?3
+               AND (
+                   m.status = 'active'
+                   OR (?4 = 1 AND m.status = 'stale')
+               )
+             ORDER BY m.created_at DESC, m.id ASC
+             LIMIT ?5",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                project_id,
+                model,
+                i64::from(dimensions),
+                if include_stale { 1 } else { 0 },
+                i64::from(limit.clamp(1, 256))
+            ],
+            |row| {
+                Ok(MemorySemanticCandidate {
+                    memory: map_memory_row(row)?,
+                    model: row.get(21)?,
+                    dimensions: u32::try_from(row.get::<_, i64>(22)?).unwrap_or(u32::MAX),
+                    content_hash: row.get(23)?,
+                    vector: row.get(24)?,
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Increment the attempt counter before a network call. If the row was
+    /// selected because its embedding was missing, this creates the job row.
+    pub fn mark_memory_embedding_attempted(
+        &self,
+        memory_id: &str,
+        model: &str,
+        reset_attempts: bool,
+    ) -> Result<u32> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let now = now_rfc3339();
+        tx.execute(
+            "INSERT INTO memory_embedding_jobs
+             (memory_id, model, status, attempts, last_error, next_attempt_at, updated_at)
+             VALUES (?1, ?2, 'pending', 1, NULL, NULL, ?4)
+             ON CONFLICT(memory_id) DO UPDATE SET
+                model = excluded.model,
+                status = 'pending',
+                attempts = CASE WHEN ?3 = 1
+                    THEN 1
+                    ELSE memory_embedding_jobs.attempts + 1
+                END,
+                last_error = NULL,
+                next_attempt_at = NULL,
+                updated_at = excluded.updated_at",
+            params![memory_id, model, if reset_attempts { 1 } else { 0 }, now],
+        )?;
+        let attempts: i64 = tx.query_row(
+            "SELECT attempts FROM memory_embedding_jobs WHERE memory_id = ?1",
+            params![memory_id],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(u32::try_from(attempts).unwrap_or(u32::MAX))
+    }
+
+    /// Persist one successful vector plus its job transition and audit event.
+    /// `vector` must already be validated and encoded by `vp-core`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_memory_embedding_success(
+        &self,
+        memory_id: &str,
+        model: &str,
+        dimensions: u32,
+        content_hash: &str,
+        vector: &[u8],
+    ) -> Result<Option<Event>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let Some(memory) = get_memory_tx(&tx, memory_id)? else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let now = now_rfc3339();
+        tx.execute(
+            "INSERT INTO memory_embeddings
+             (memory_id, model, dimensions, content_hash, vector, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+             ON CONFLICT(memory_id) DO UPDATE SET
+                model = excluded.model,
+                dimensions = excluded.dimensions,
+                content_hash = excluded.content_hash,
+                vector = excluded.vector,
+                updated_at = excluded.updated_at",
+            params![
+                memory_id,
+                model,
+                i64::from(dimensions),
+                content_hash,
+                vector,
+                now
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO memory_embedding_jobs
+             (memory_id, model, status, attempts, last_error, next_attempt_at, updated_at)
+             VALUES (?1, ?2, 'indexed', 0, NULL, NULL, ?3)
+             ON CONFLICT(memory_id) DO UPDATE SET
+                model = excluded.model,
+                status = 'indexed',
+                attempts = 0,
+                last_error = NULL,
+                next_attempt_at = NULL,
+                updated_at = excluded.updated_at",
+            params![memory_id, model, now],
+        )?;
+        let event = insert_event_tx(
+            &tx,
+            &memory.session_id,
+            "memory.embedding.indexed",
+            serde_json::json!({
+                "memory_id": memory.id,
+                "project_id": memory.project_id,
+                "model": model,
+                "dimensions": dimensions,
+                "content_hash": content_hash,
+            }),
+        )?;
+        tx.commit()?;
+        drop(conn);
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some(event))
+    }
+
+    /// Record a failed attempt. `next_attempt_at = None` marks the retry budget
+    /// exhausted; the row stays visible as `failed` until an explicit rebuild.
+    pub fn record_memory_embedding_failure(
+        &self,
+        memory_id: &str,
+        model: &str,
+        attempts: u32,
+        error: &str,
+        next_attempt_at: Option<&str>,
+    ) -> Result<Option<Event>> {
+        let error = truncate_chars(error.trim(), 2_000);
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let Some(memory) = get_memory_tx(&tx, memory_id)? else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let now = now_rfc3339();
+        tx.execute(
+            "INSERT INTO memory_embedding_jobs
+             (memory_id, model, status, attempts, last_error, next_attempt_at, updated_at)
+             VALUES (?1, ?2, 'failed', ?3, ?4, ?5, ?6)
+             ON CONFLICT(memory_id) DO UPDATE SET
+                model = excluded.model,
+                status = 'failed',
+                attempts = excluded.attempts,
+                last_error = excluded.last_error,
+                next_attempt_at = excluded.next_attempt_at,
+                updated_at = excluded.updated_at",
+            params![
+                memory_id,
+                model,
+                i64::from(attempts),
+                error,
+                next_attempt_at,
+                now
+            ],
+        )?;
+        let event = insert_event_tx(
+            &tx,
+            &memory.session_id,
+            "memory.embedding.failed",
+            serde_json::json!({
+                "memory_id": memory.id,
+                "project_id": memory.project_id,
+                "model": model,
+                "attempts": attempts,
+                "error": error,
+                "next_attempt_at": next_attempt_at,
+            }),
+        )?;
+        tx.commit()?;
+        drop(conn);
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some(event))
+    }
+
+    /// Mark a job skipped without a network call: unchanged content,
+    /// archived/superseded memory, or an explicitly disabled lane.
+    pub fn record_memory_embedding_skip(
+        &self,
+        memory_id: &str,
+        model: &str,
+        reason: &str,
+    ) -> Result<Option<Event>> {
+        let reason = truncate_chars(reason.trim(), 500);
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let Some(memory) = get_memory_tx(&tx, memory_id)? else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let now = now_rfc3339();
+        tx.execute(
+            "INSERT INTO memory_embedding_jobs
+             (memory_id, model, status, attempts, last_error, next_attempt_at, updated_at)
+             VALUES (?1, ?2, 'skipped', 0, NULL, NULL, ?3)
+             ON CONFLICT(memory_id) DO UPDATE SET
+                model = excluded.model,
+                status = 'skipped',
+                attempts = 0,
+                last_error = NULL,
+                next_attempt_at = NULL,
+                updated_at = excluded.updated_at",
+            params![memory_id, model, now],
+        )?;
+        let event = insert_event_tx(
+            &tx,
+            &memory.session_id,
+            "memory.embedding.skipped",
+            serde_json::json!({
+                "memory_id": memory.id,
+                "project_id": memory.project_id,
+                "model": model,
+                "reason": reason,
+            }),
+        )?;
+        tx.commit()?;
+        drop(conn);
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some(event))
+    }
+
+    /// Aggregate call/token accounting. This table is intentionally separate
+    /// from `usage_ledger`: embedding calls are project infrastructure, not a
+    /// session's task spend, and are never charged to a session budget.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_memory_embedding_usage(
+        &self,
+        project_id: &str,
+        model: &str,
+        calls: u64,
+        input_tokens: u64,
+        estimated_tokens: u64,
+        bytes: u64,
+        provider_reported: bool,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO memory_embedding_usage
+             (id, project_id, model, calls, input_tokens, estimated_tokens, bytes,
+              provider_reported, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                Uuid::now_v7().to_string(),
+                project_id,
+                model,
+                i64::try_from(calls).unwrap_or(i64::MAX),
+                i64::try_from(input_tokens).unwrap_or(i64::MAX),
+                i64::try_from(estimated_tokens).unwrap_or(i64::MAX),
+                i64::try_from(bytes).unwrap_or(i64::MAX),
+                if provider_reported { 1 } else { 0 },
+                now_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Health snapshot for the semantic lane. Counts are bounded SQL
+    /// aggregates; recent jobs are capped at 20, and no vector or credential
+    /// is included.
+    pub fn memory_embedding_status(
+        &self,
+        project_id: &str,
+        policy: Option<&MemoryEmbeddingPolicy>,
+    ) -> Result<MemoryEmbeddingsStatusResult> {
+        let enabled = policy.is_some_and(|policy| policy.enabled);
+        let configured = policy.is_some_and(MemoryEmbeddingPolicy::is_configured);
+        let model = policy.and_then(|policy| policy.model.clone());
+        let dimensions = policy.map_or(1536, |policy| policy.dimensions);
+        let conn = self.lock()?;
+        let indexable: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memories
+             WHERE project_id = ?1 AND status IN ('active', 'stale')",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+        let (indexed, invalid): (i64, i64) = match model.as_deref() {
+            Some(model) => conn.query_row(
+                "SELECT
+                     COALESCE(SUM(CASE WHEN
+                         substr(e.vector, 1, 4) = x'5650454d'
+                         AND substr(e.vector, 5, 1) = x'01'
+                         AND length(e.vector) = 9 + 4 * ?3
+                     THEN 1 ELSE 0 END), 0),
+                     COALESCE(SUM(CASE WHEN
+                         substr(e.vector, 1, 4) != x'5650454d'
+                         OR substr(e.vector, 5, 1) != x'01'
+                         OR length(e.vector) != 9 + 4 * ?3
+                     THEN 1 ELSE 0 END), 0)
+                 FROM memories m
+                 JOIN memory_embeddings e ON e.memory_id = m.id
+                 LEFT JOIN memory_embedding_jobs j ON j.memory_id = m.id
+                 WHERE m.project_id = ?1
+                   AND m.status IN ('active', 'stale')
+                   AND e.model = ?2 AND e.dimensions = ?3
+                   AND (j.status IS NULL OR j.status NOT IN ('pending', 'failed'))",
+                params![project_id, model, i64::from(dimensions)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?,
+            None => (0, 0),
+        };
+        let count_jobs = |status: &str| -> Result<u32> {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM memory_embedding_jobs j
+                 JOIN memories m ON m.id = j.memory_id
+                 WHERE m.project_id = ?1 AND j.status = ?2
+                   AND (?3 IS NULL OR j.model = ?3)",
+                params![project_id, status, model.as_deref()],
+                |row| row.get(0),
+            )?;
+            Ok(u32::try_from(count).unwrap_or(u32::MAX))
+        };
+        let pending = count_jobs("pending")?;
+        let failed = count_jobs("failed")?;
+        let skipped = count_jobs("skipped")?;
+        let last_error: Option<String> = conn
+            .query_row(
+                "SELECT j.last_error FROM memory_embedding_jobs j
+                 JOIN memories m ON m.id = j.memory_id
+                 WHERE m.project_id = ?1 AND j.status = 'failed' AND j.last_error IS NOT NULL
+                   AND (?2 IS NULL OR j.model = ?2)
+                 ORDER BY j.updated_at DESC, j.memory_id ASC LIMIT 1",
+                params![project_id, model.as_deref()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let usage = conn.query_row(
+            "SELECT COALESCE(SUM(calls), 0), COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(estimated_tokens), 0), COALESCE(SUM(bytes), 0),
+                    COALESCE(SUM(provider_reported), 0)
+             FROM memory_embedding_usage WHERE project_id = ?1",
+            params![project_id],
+            |row| {
+                Ok(MemoryEmbeddingUsage {
+                    calls: u64::try_from(row.get::<_, i64>(0)?).unwrap_or(u64::MAX),
+                    input_tokens: u64::try_from(row.get::<_, i64>(1)?).unwrap_or(u64::MAX),
+                    estimated_tokens: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(u64::MAX),
+                    bytes: u64::try_from(row.get::<_, i64>(3)?).unwrap_or(u64::MAX),
+                    provider_reported_calls: u64::try_from(row.get::<_, i64>(4)?)
+                        .unwrap_or(u64::MAX),
+                })
+            },
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.title, j.status, j.attempts, j.last_error, j.next_attempt_at,
+                    j.updated_at
+             FROM memory_embedding_jobs j
+             JOIN memories m ON m.id = j.memory_id
+             WHERE m.project_id = ?1
+               AND (?2 IS NULL OR j.model = ?2)
+             ORDER BY j.updated_at DESC, m.id ASC
+             LIMIT 20",
+        )?;
+        let recent = stmt
+            .query_map(params![project_id, model.as_deref()], |row| {
+                Ok(MemoryEmbeddingJobStatus {
+                    memory_id: row.get(0)?,
+                    title: row.get(1)?,
+                    status: row.get(2)?,
+                    attempts: u32::try_from(row.get::<_, i64>(3)?).unwrap_or(u32::MAX),
+                    last_error: row.get(4)?,
+                    next_attempt_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let indexable = u32::try_from(indexable).unwrap_or(u32::MAX);
+        let indexed = u32::try_from(indexed).unwrap_or(u32::MAX);
+        let invalid = u32::try_from(invalid).unwrap_or(u32::MAX);
+        Ok(MemoryEmbeddingsStatusResult {
+            project_id: project_id.to_string(),
+            enabled,
+            configured,
+            model,
+            dimensions,
+            indexable,
+            indexed,
+            invalid,
+            pending,
+            failed,
+            skipped,
+            coverage: if indexable == 0 {
+                0.0
+            } else {
+                f64::from(indexed) / f64::from(indexable)
+            },
+            last_error: last_error.map(|error| truncate_chars(&error, 2_000)),
+            usage,
+            recent_jobs: recent,
+        })
+    }
+
+    /// Remove every derived embedding and job row for a project. Usage history
+    /// is accounting, not derived content, and is intentionally retained.
+    pub fn clear_memory_embeddings(&self, project_id: &str) -> Result<u32> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let embeddings = tx.execute(
+            "DELETE FROM memory_embeddings
+             WHERE memory_id IN (SELECT id FROM memories WHERE project_id = ?1)",
+            params![project_id],
+        )?;
+        let jobs = tx.execute(
+            "DELETE FROM memory_embedding_jobs
+             WHERE memory_id IN (SELECT id FROM memories WHERE project_id = ?1)",
+            params![project_id],
+        )?;
+        tx.commit()?;
+        Ok(u32::try_from(embeddings.saturating_add(jobs)).unwrap_or(u32::MAX))
+    }
+
+    /// Queue every active/stale memory for indexing. Existing jobs are reset
+    /// so an explicit rebuild clears exhausted retry budgets.
+    pub fn enqueue_memory_embedding_backlog(&self, project_id: &str, model: &str) -> Result<u32> {
+        let conn = self.lock()?;
+        let now = now_rfc3339();
+        let changed = conn.execute(
+            "INSERT INTO memory_embedding_jobs
+             (memory_id, model, status, attempts, last_error, next_attempt_at, updated_at)
+             SELECT id, ?2, 'pending', 0, NULL, NULL, ?3
+             FROM memories
+             WHERE project_id = ?1 AND status IN ('active', 'stale') AND true
+             ON CONFLICT(memory_id) DO UPDATE SET
+                model = excluded.model,
+                status = 'pending',
+                attempts = 0,
+                last_error = NULL,
+                next_attempt_at = NULL,
+                updated_at = excluded.updated_at",
+            params![project_id, model, now],
+        )?;
+        Ok(u32::try_from(changed).unwrap_or(u32::MAX))
+    }
+
     pub fn plan_task_exists(&self, project_id: &str, task_id: &str) -> Result<bool> {
         let conn = self.lock()?;
         let count = conn.query_row(
@@ -8217,7 +8933,8 @@ impl Store {
         let stored = conn
             .query_row(
                 "SELECT enabled, max_items, max_age_days, task_result_verify_days,
-                        default_verify_days, auto_supersede, brief_max_chars, sweep_stale
+                        default_verify_days, auto_supersede, brief_max_chars, sweep_stale,
+                        embedding_json
                  FROM project_memory_policies WHERE project_id = ?1",
                 params![project_id],
                 map_memory_policy_row,
@@ -8228,11 +8945,16 @@ impl Store {
 
     pub fn set_memory_policy(&self, project_id: &str, policy: &MemoryPolicy) -> Result<()> {
         let conn = self.lock()?;
+        let embedding_json = match &policy.embedding {
+            Some(embedding) => Some(serde_json::to_string(embedding)?),
+            None => None,
+        };
         conn.execute(
             "INSERT INTO project_memory_policies
              (project_id, enabled, max_items, max_age_days, task_result_verify_days,
-              default_verify_days, auto_supersede, brief_max_chars, sweep_stale, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+              default_verify_days, auto_supersede, brief_max_chars, sweep_stale,
+              embedding_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(project_id) DO UPDATE SET
                 enabled = excluded.enabled,
                 max_items = excluded.max_items,
@@ -8242,6 +8964,7 @@ impl Store {
                 auto_supersede = excluded.auto_supersede,
                 brief_max_chars = excluded.brief_max_chars,
                 sweep_stale = excluded.sweep_stale,
+                embedding_json = excluded.embedding_json,
                 updated_at = excluded.updated_at",
             params![
                 project_id,
@@ -8253,6 +8976,7 @@ impl Store {
                 if policy.auto_supersede { 1 } else { 0 },
                 optional_count_to_db(policy.brief_max_chars),
                 if policy.sweep_stale { 1 } else { 0 },
+                embedding_json,
                 now_rfc3339()
             ],
         )?;
@@ -8263,7 +8987,8 @@ impl Store {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT project_id, enabled, max_items, max_age_days, task_result_verify_days,
-                    default_verify_days, auto_supersede, brief_max_chars, sweep_stale
+                    default_verify_days, auto_supersede, brief_max_chars, sweep_stale,
+                    embedding_json
              FROM project_memory_policies WHERE enabled = 1",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -8282,6 +9007,7 @@ impl Store {
                     auto_supersede: row.get::<_, i64>(6)? != 0,
                     brief_max_chars: optional_count_from_db(row.get::<_, i64>(7)?),
                     sweep_stale: row.get::<_, i64>(8)? != 0,
+                    embedding: decode_memory_embedding_policy(row.get::<_, Option<String>>(9)?),
                 },
             ))
         })?;
@@ -8294,7 +9020,8 @@ impl Store {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT project_id, enabled, max_items, max_age_days, task_result_verify_days,
-                    default_verify_days, auto_supersede, brief_max_chars, sweep_stale
+                    default_verify_days, auto_supersede, brief_max_chars, sweep_stale,
+                    embedding_json
              FROM project_memory_policies WHERE sweep_stale = 1",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -8315,6 +9042,7 @@ impl Store {
                     auto_supersede: row.get::<_, i64>(6)? != 0,
                     brief_max_chars: optional_count_from_db(row.get::<_, i64>(7)?),
                     sweep_stale: row.get::<_, i64>(8)? != 0,
+                    embedding: decode_memory_embedding_policy(row.get::<_, Option<String>>(9)?),
                 },
             ))
         })?;
@@ -16939,7 +17667,77 @@ fn map_memory_policy_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryPoli
         auto_supersede: row.get::<_, i64>(5)? != 0,
         brief_max_chars: optional_count_from_db(row.get::<_, i64>(6)?),
         sweep_stale: row.get::<_, i64>(7)? != 0,
+        embedding: decode_memory_embedding_policy(row.get::<_, Option<String>>(8)?),
     })
+}
+
+fn decode_memory_embedding_policy(value: Option<String>) -> Option<MemoryEmbeddingPolicy> {
+    let value = value?;
+    match serde_json::from_str::<MemoryEmbeddingPolicy>(&value) {
+        Ok(policy) => Some(policy),
+        Err(error) => {
+            // A malformed policy must not silently enable network access. The
+            // daemon rejects invalid policies at set time; this is defense in
+            // depth for hand-edited databases.
+            tracing::warn!(%error, "ignoring malformed project embedding policy");
+            None
+        }
+    }
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut truncated = value
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
+fn configured_embedding_model_tx(tx: &Transaction<'_>, project_id: &str) -> Result<Option<String>> {
+    let raw: Option<Option<String>> = tx
+        .query_row(
+            "SELECT embedding_json FROM project_memory_policies WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(Some(raw)) = raw else {
+        return Ok(None);
+    };
+    let Ok(policy) = serde_json::from_str::<MemoryEmbeddingPolicy>(&raw) else {
+        return Ok(None);
+    };
+    if !policy.is_configured() {
+        return Ok(None);
+    }
+    Ok(policy.model.filter(|model| !model.trim().is_empty()))
+}
+
+fn enqueue_memory_embedding_job_tx(tx: &Transaction<'_>, memory: &MemoryItem) -> Result<()> {
+    if !matches!(memory.status.as_str(), "active" | "stale") {
+        return Ok(());
+    }
+    let Some(model) = configured_embedding_model_tx(tx, &memory.project_id)? else {
+        return Ok(());
+    };
+    tx.execute(
+        "INSERT INTO memory_embedding_jobs
+         (memory_id, model, status, attempts, last_error, next_attempt_at, updated_at)
+         VALUES (?1, ?2, 'pending', 0, NULL, NULL, ?3)
+         ON CONFLICT(memory_id) DO UPDATE SET
+            model = excluded.model,
+            status = 'pending',
+            attempts = 0,
+            last_error = NULL,
+            next_attempt_at = NULL,
+            updated_at = excluded.updated_at",
+        params![memory.id, model, now_rfc3339()],
+    )?;
+    Ok(())
 }
 
 fn optional_count_to_db(value: Option<u32>) -> i64 {
@@ -16990,6 +17788,11 @@ fn insert_memory_tx(tx: &Transaction<'_>, memory: &MemoryItem) -> Result<()> {
             &memory.stale_reason
         ],
     )?;
+    // Derived indexing is queued in the same transaction as the memory write.
+    // A failure to enqueue is a real local error; the memory write rolls back
+    // rather than silently missing its job. Embedding *calls* are never made
+    // here and therefore can never fail the write.
+    enqueue_memory_embedding_job_tx(tx, memory)?;
     Ok(())
 }
 
@@ -17025,6 +17828,16 @@ fn update_memory_projection_tx(tx: &Transaction<'_>, memory: &MemoryItem) -> Res
             &memory.stale_reason
         ],
     )?;
+    if matches!(memory.status.as_str(), "archived" | "superseded") {
+        tx.execute(
+            "DELETE FROM memory_embeddings WHERE memory_id = ?1",
+            params![&memory.id],
+        )?;
+        tx.execute(
+            "DELETE FROM memory_embedding_jobs WHERE memory_id = ?1",
+            params![&memory.id],
+        )?;
+    }
     Ok(())
 }
 

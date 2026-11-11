@@ -2395,6 +2395,36 @@ actor CoreClient {
         .decode(MemoryHealthResult.self)
     }
 
+    func memoryEmbeddingsStatus(projectID: String) async throws -> MemoryEmbeddingsStatusResult {
+        try await request(
+            method: "memory.embeddings.status",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(MemoryEmbeddingsStatusResult.self)
+    }
+
+    func rebuildMemoryEmbeddings(projectID: String) async throws -> MemoryEmbeddingsRebuildResult {
+        try await request(
+            method: "memory.embeddings.rebuild",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(MemoryEmbeddingsRebuildResult.self)
+    }
+
+    func testMemoryEmbeddings(
+        projectID: String,
+        text: String?
+    ) async throws -> MemoryEmbeddingsTestResult {
+        try await request(
+            method: "memory.embeddings.test",
+            params: [
+                "project_id": .string(projectID),
+                "text": text.map(JSONValue.string) ?? .null,
+            ]
+        )
+        .decode(MemoryEmbeddingsTestResult.self)
+    }
+
     func createMemory(
         sessionID: String,
         kind: String,
@@ -2441,6 +2471,7 @@ actor CoreClient {
             "auto_supersede": .bool(policy.autoSupersede ?? true),
             "brief_max_chars": policy.briefMaxChars.map { .number(Double($0)) } ?? .number(4000),
             "sweep_stale": .bool(policy.sweepStale ?? false),
+            "embedding": policy.embedding.map { .object($0.jsonObject()) } ?? .null,
         ]
         let params: [String: JSONValue] = [
             "project_id": .string(projectID),

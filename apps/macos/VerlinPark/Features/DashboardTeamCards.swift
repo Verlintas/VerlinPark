@@ -405,6 +405,48 @@ struct MemoryCard: View {
     }
 }
 
+private struct MemoryEmbeddingHealthStrip: View {
+    let status: MemoryEmbeddingsStatusResult
+
+    private var indexedLabel: String {
+        "\(status.indexed)/\(status.indexable) indexed · \(status.pending) pending"
+    }
+
+    private var usageLabel: String {
+        "\(status.usage.calls) embedding calls · \(status.usage.inputTokens) tokens"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 10) {
+                Text(verbatim: "semantic \(status.healthLabel)")
+                    .foregroundStyle(status.failed > 0 ? VPTheme.warning : VPTheme.accent)
+                Text(verbatim: "coverage \(status.coverageLabel)")
+                Text(verbatim: indexedLabel)
+                if status.failed > 0 {
+                    Text(verbatim: "\(status.failed) failed")
+                        .foregroundStyle(VPTheme.warning)
+                }
+                if status.invalid > 0 {
+                    Text(verbatim: "\(status.invalid) invalid")
+                        .foregroundStyle(VPTheme.warning)
+                }
+                if status.usage.calls > 0 {
+                    Text(verbatim: usageLabel)
+                }
+            }
+            .font(.system(size: 8, design: .monospaced))
+            .foregroundStyle(.secondary)
+            if let error = status.lastError {
+                Text(verbatim: error)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(VPTheme.warning)
+                    .lineLimit(2)
+            }
+        }
+    }
+}
+
 struct MemoryHealthCard: View {
     @Environment(AppModel.self) private var model
     let project: Project
@@ -511,6 +553,9 @@ struct MemoryHealthCard: View {
                 }
                 .font(.system(size: 8, design: .monospaced))
                 .foregroundStyle(.tertiary)
+                if let embedding = model.memoryEmbeddingsStatus {
+                    MemoryEmbeddingHealthStrip(status: embedding)
+                }
             } else if let status = model.memoryConflictStatus {
                 Text(status)
                     .font(.system(size: 9, design: .monospaced))

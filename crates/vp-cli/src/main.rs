@@ -1194,6 +1194,10 @@ enum Command {
         limit: u32,
         #[arg(long = "include-stale")]
         include_stale: bool,
+        /// Force lexical-only ranking for this request, even when the project
+        /// has an enabled semantic lane. Performs no embedding request.
+        #[arg(long = "lexical-only")]
+        lexical_only: bool,
     },
     /// Print the exact memory brief that would be injected for a session.
     MemoryBrief {
@@ -1246,6 +1250,17 @@ enum Command {
     },
     /// Show memory health metrics for a project.
     MemoryHealth { project: String },
+    /// Show semantic embedding coverage and the last indexing error.
+    MemoryEmbeddings { project: String },
+    /// Clear derived embeddings. When the lane is enabled, also queue every
+    /// active memory for re-indexing.
+    MemoryEmbeddingsRebuild { project: String },
+    /// Probe the configured embedding endpoint with one request.
+    MemoryEmbeddingsTest {
+        project: String,
+        #[arg(long)]
+        text: Option<String>,
+    },
     /// Add a project memory tied to a session.
     Remember {
         session: String,
@@ -1286,6 +1301,41 @@ enum Command {
         /// Disable the policy and clear both limits.
         #[arg(long)]
         clear: bool,
+        /// Enable the optional semantic lane. Endpoint and model must already
+        /// be set or supplied in this command.
+        #[arg(long = "embedding-enable")]
+        embedding_enable: bool,
+        /// Disable the semantic lane without clearing its configuration.
+        #[arg(long = "embedding-disable")]
+        embedding_disable: bool,
+        /// OpenAI-compatible embeddings base URL (or full /embeddings URL).
+        #[arg(long = "embedding-endpoint")]
+        embedding_endpoint: Option<String>,
+        /// Embedding model name. There is no hidden model selection.
+        #[arg(long = "embedding-model")]
+        embedding_model: Option<String>,
+        /// Vector dimensions expected from the endpoint.
+        #[arg(long = "embedding-dimensions")]
+        embedding_dimensions: Option<u32>,
+        /// Maximum texts per indexing request (1-64).
+        #[arg(long = "embedding-batch-size")]
+        embedding_batch_size: Option<u32>,
+        /// Per-request timeout in seconds (1-300).
+        #[arg(long = "embedding-timeout-secs")]
+        embedding_timeout_secs: Option<u64>,
+        /// Maximum semantic candidates scored per recall (1-256).
+        #[arg(long = "embedding-max-candidates")]
+        embedding_max_candidates: Option<u32>,
+        /// Minimum cosine similarity to contribute (0-1).
+        #[arg(long = "embedding-min-similarity")]
+        embedding_min_similarity: Option<f32>,
+        /// Environment variable name holding the API key. The value is never
+        /// stored or printed.
+        #[arg(long = "embedding-api-key-env")]
+        embedding_api_key_env: Option<String>,
+        /// Remove the entire embedding policy object.
+        #[arg(long = "embedding-clear")]
+        embedding_clear: bool,
     },
     /// Show the project artifact retention policy.
     ArtifactPolicy { project: String },
@@ -3679,6 +3729,7 @@ async fn main() -> Result<()> {
             kinds,
             limit,
             include_stale,
+            lexical_only,
         } => {
             rpc(
                 &discovery,
@@ -3691,7 +3742,8 @@ async fn main() -> Result<()> {
                     "paths": paths,
                     "kinds": kinds,
                     "limit": limit,
-                    "include_stale": include_stale
+                    "include_stale": include_stale,
+                    "lexical_only": lexical_only
                 }),
             )
             .await?
@@ -3823,7 +3875,35 @@ async fn main() -> Result<()> {
             max_items,
             max_age_days,
             clear,
+            embedding_enable,
+            embedding_disable,
+            embedding_endpoint,
+            embedding_model,
+            embedding_dimensions,
+            embedding_batch_size,
+            embedding_timeout_secs,
+            embedding_max_candidates,
+            embedding_min_similarity,
+            embedding_api_key_env,
+            embedding_clear,
         } => {
+            if embedding_enable && embedding_disable {
+                bail!("--embedding-enable and --embedding-disable cannot be combined");
+            }
+            if embedding_clear
+                && (embedding_enable
+                    || embedding_disable
+                    || embedding_endpoint.is_some()
+                    || embedding_model.is_some()
+                    || embedding_dimensions.is_some()
+                    || embedding_batch_size.is_some()
+                    || embedding_timeout_secs.is_some()
+                    || embedding_max_candidates.is_some()
+                    || embedding_min_similarity.is_some()
+                    || embedding_api_key_env.is_some())
+            {
+                bail!("--embedding-clear cannot be combined with other embedding flags");
+            }
             let (max_items, max_age_days) = if clear {
                 (None, None)
             } else if max_items.is_none() && max_age_days.is_none() {
@@ -3839,6 +3919,77 @@ async fn main() -> Result<()> {
             )
             .await?;
             let policy = current.get("policy").cloned().unwrap_or_default();
+            let current_embedding = policy.get("embedding").cloned().unwrap_or(Value::Null);
+            let embedding_flags = embedding_enable
+                || embedding_disable
+                || embedding_endpoint.is_some()
+                || embedding_model.is_some()
+                || embedding_dimensions.is_some()
+                || embedding_batch_size.is_some()
+                || embedding_timeout_secs.is_some()
+                || embedding_max_candidates.is_some()
+                || embedding_min_similarity.is_some()
+                || embedding_api_key_env.is_some();
+            let embedding = if embedding_clear {
+                Value::Null
+            } else if !embedding_flags {
+                current_embedding
+            } else {
+                let mut object = if current_embedding.is_object() {
+                    current_embedding
+                } else {
+                    json!({})
+                };
+                if object.get("enabled").is_none() {
+                    object["enabled"] = json!(false);
+                }
+                if object.get("dimensions").is_none() {
+                    object["dimensions"] = json!(1536);
+                }
+                if object.get("batch_size").is_none() {
+                    object["batch_size"] = json!(16);
+                }
+                if object.get("timeout_secs").is_none() {
+                    object["timeout_secs"] = json!(30);
+                }
+                if object.get("max_candidates").is_none() {
+                    object["max_candidates"] = json!(64);
+                }
+                if object.get("min_similarity").is_none() {
+                    object["min_similarity"] = json!(0.20);
+                }
+                if embedding_enable {
+                    object["enabled"] = json!(true);
+                }
+                if embedding_disable {
+                    object["enabled"] = json!(false);
+                }
+                if let Some(endpoint) = embedding_endpoint {
+                    object["endpoint"] = json!(endpoint);
+                }
+                if let Some(model) = embedding_model {
+                    object["model"] = json!(model);
+                }
+                if let Some(dimensions) = embedding_dimensions {
+                    object["dimensions"] = json!(dimensions);
+                }
+                if let Some(batch_size) = embedding_batch_size {
+                    object["batch_size"] = json!(batch_size);
+                }
+                if let Some(timeout_secs) = embedding_timeout_secs {
+                    object["timeout_secs"] = json!(timeout_secs);
+                }
+                if let Some(max_candidates) = embedding_max_candidates {
+                    object["max_candidates"] = json!(max_candidates);
+                }
+                if let Some(min_similarity) = embedding_min_similarity {
+                    object["min_similarity"] = json!(min_similarity);
+                }
+                if let Some(env_name) = embedding_api_key_env {
+                    object["api_key_env"] = json!(env_name);
+                }
+                object
+            };
             rpc(
                 &discovery,
                 "memory.policy.set",
@@ -3852,9 +4003,34 @@ async fn main() -> Result<()> {
                         "default_verify_days": policy.get("default_verify_days").cloned().unwrap_or(json!(365)),
                         "auto_supersede": policy.get("auto_supersede").cloned().unwrap_or(json!(true)),
                         "brief_max_chars": policy.get("brief_max_chars").cloned().unwrap_or(json!(4000)),
-                        "sweep_stale": policy.get("sweep_stale").cloned().unwrap_or(json!(false))
+                        "sweep_stale": policy.get("sweep_stale").cloned().unwrap_or(json!(false)),
+                        "embedding": embedding
                     }
                 }),
+            )
+            .await?
+        }
+        Command::MemoryEmbeddings { project } => {
+            rpc(
+                &discovery,
+                "memory.embeddings.status",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::MemoryEmbeddingsRebuild { project } => {
+            rpc(
+                &discovery,
+                "memory.embeddings.rebuild",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::MemoryEmbeddingsTest { project, text } => {
+            rpc(
+                &discovery,
+                "memory.embeddings.test",
+                json!({"project_id": project, "text": text}),
             )
             .await?
         }
@@ -5694,14 +5870,26 @@ fn print_human(value: &Value) {
                 })
                 .unwrap_or_default();
             println!(
-                "{:>8.3} [{}·{}] {} · {}",
+                "{:>8.3} [{}·{}] {} · {} source={}{}{}",
                 matched["score"].as_f64().unwrap_or(0.0),
                 memory["kind"].as_str().unwrap_or("note"),
                 memory["source"].as_str().unwrap_or("agent"),
                 memory["title"].as_str().unwrap_or("?"),
-                memory["id"].as_str().unwrap_or("?")
+                memory["id"].as_str().unwrap_or("?"),
+                matched["source"].as_str().unwrap_or("lexical"),
+                matched["lexical_score"]
+                    .as_f64()
+                    .map(|score| format!(" lexical={score:.3}"))
+                    .unwrap_or_default(),
+                matched["semantic_score"]
+                    .as_f64()
+                    .map(|score| format!(" semantic={score:.3}"))
+                    .unwrap_or_default()
             );
             println!("  reasons: {reasons}");
+            if let Some(reason) = matched["semantic_unavailable"].as_str() {
+                println!("  semantic_unavailable: {reason}");
+            }
             println!("  {}", memory["body"].as_str().unwrap_or(""));
         }
         return;
@@ -5787,6 +5975,80 @@ fn print_human(value: &Value) {
                     memory["id"].as_str().unwrap_or("?")
                 );
             }
+        }
+        return;
+    }
+    if value.get("indexable").is_some() && value.get("coverage").is_some() {
+        println!(
+            "memory embeddings: enabled={} configured={} model={} dimensions={}",
+            value["enabled"].as_bool().unwrap_or(false),
+            value["configured"].as_bool().unwrap_or(false),
+            value["model"].as_str().unwrap_or("none"),
+            value["dimensions"].as_u64().unwrap_or(0)
+        );
+        println!(
+            "  coverage={:.1}% indexed={}/{} pending={} failed={} skipped={}",
+            value["coverage"].as_f64().unwrap_or(0.0) * 100.0,
+            value["indexed"].as_u64().unwrap_or(0),
+            value["indexable"].as_u64().unwrap_or(0),
+            value["pending"].as_u64().unwrap_or(0),
+            value["failed"].as_u64().unwrap_or(0),
+            value["skipped"].as_u64().unwrap_or(0)
+        );
+        if let Some(error) = value["last_error"].as_str() {
+            println!("  last_error: {error}");
+        }
+        if let Some(usage) = value.get("usage") {
+            println!(
+                "  embedding_calls={} input_tokens={} estimated_tokens={} bytes={} provider_reported_calls={}",
+                usage["calls"].as_u64().unwrap_or(0),
+                usage["input_tokens"].as_u64().unwrap_or(0),
+                usage["estimated_tokens"].as_u64().unwrap_or(0),
+                usage["bytes"].as_u64().unwrap_or(0),
+                usage["provider_reported_calls"].as_u64().unwrap_or(0)
+            );
+        }
+        if let Some(jobs) = value.get("recent_jobs").and_then(Value::as_array) {
+            for job in jobs.iter().take(10) {
+                println!(
+                    "  {} {} attempts={} updated={}{}",
+                    job["status"].as_str().unwrap_or("?"),
+                    job["title"].as_str().unwrap_or("?"),
+                    job["attempts"].as_u64().unwrap_or(0),
+                    job["updated_at"].as_str().unwrap_or("?"),
+                    job["last_error"]
+                        .as_str()
+                        .map(|error| format!(" · {error}"))
+                        .unwrap_or_default()
+                );
+            }
+        }
+        return;
+    }
+    if value.get("cleared").is_some() && value.get("enqueued").is_some() {
+        println!(
+            "memory embeddings rebuild: cleared={} enqueued={} model={} dimensions={} enabled={}",
+            value["cleared"].as_u64().unwrap_or(0),
+            value["enqueued"].as_u64().unwrap_or(0),
+            value["model"].as_str().unwrap_or("none"),
+            value["dimensions"].as_u64().unwrap_or(0),
+            value["enabled"].as_bool().unwrap_or(false)
+        );
+        return;
+    }
+    if value.get("ok").is_some() && value.get("latency_ms").is_some() {
+        println!(
+            "memory embeddings test: ok={} model={} dimensions={} latency_ms={} input_tokens={} estimated_tokens={} provider_reported={}",
+            value["ok"].as_bool().unwrap_or(false),
+            value["model"].as_str().unwrap_or("none"),
+            value["dimensions"].as_u64().unwrap_or(0),
+            value["latency_ms"].as_u64().unwrap_or(0),
+            value["input_tokens"].as_u64().unwrap_or(0),
+            value["estimated_tokens"].as_u64().unwrap_or(0),
+            value["provider_reported"].as_bool().unwrap_or(false)
+        );
+        if let Some(error) = value["error"].as_str() {
+            println!("  error: {error}");
         }
         return;
     }
@@ -6734,6 +6996,132 @@ mod durable_run_cli_tests {
                         assert_eq!(operation_id.as_deref(), Some("op-resume"));
                     }
                     other => panic!("expected run-resume, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod hybrid_memory_cli_tests {
+    use super::*;
+
+    #[test]
+    fn hybrid_memory_commands_and_policy_flags_parse() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from(["vp", "memory-embeddings", "proj-1"]).unwrap();
+                match cli.command {
+                    Command::MemoryEmbeddings { project } => assert_eq!(project, "proj-1"),
+                    other => panic!("expected memory-embeddings, got {other:?}"),
+                }
+
+                let cli =
+                    Cli::try_parse_from(["vp", "memory-embeddings-rebuild", "proj-1"]).unwrap();
+                match cli.command {
+                    Command::MemoryEmbeddingsRebuild { project } => {
+                        assert_eq!(project, "proj-1")
+                    }
+                    other => panic!("expected memory-embeddings-rebuild, got {other:?}"),
+                }
+
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "memory-embeddings-test",
+                    "proj-1",
+                    "--text",
+                    "probe text",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::MemoryEmbeddingsTest { project, text } => {
+                        assert_eq!(project, "proj-1");
+                        assert_eq!(text.as_deref(), Some("probe text"));
+                    }
+                    other => panic!("expected memory-embeddings-test, got {other:?}"),
+                }
+
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "memory-search",
+                    "proj-1",
+                    "deployment release",
+                    "--lexical-only",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::MemorySearch {
+                        project,
+                        query,
+                        lexical_only,
+                        ..
+                    } => {
+                        assert_eq!(project, "proj-1");
+                        assert_eq!(query, "deployment release");
+                        assert!(lexical_only);
+                    }
+                    other => panic!("expected memory-search, got {other:?}"),
+                }
+
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "memory-policy-set",
+                    "proj-1",
+                    "--embedding-enable",
+                    "--embedding-endpoint",
+                    "http://127.0.0.1:8080/v1",
+                    "--embedding-model",
+                    "embed-small",
+                    "--embedding-dimensions",
+                    "512",
+                    "--embedding-batch-size",
+                    "8",
+                    "--embedding-timeout-secs",
+                    "12",
+                    "--embedding-max-candidates",
+                    "32",
+                    "--embedding-min-similarity",
+                    "0.35",
+                    "--embedding-api-key-env",
+                    "EMBED_API_KEY",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::MemoryPolicySet {
+                        project,
+                        embedding_enable,
+                        embedding_disable,
+                        embedding_endpoint,
+                        embedding_model,
+                        embedding_dimensions,
+                        embedding_batch_size,
+                        embedding_timeout_secs,
+                        embedding_max_candidates,
+                        embedding_min_similarity,
+                        embedding_api_key_env,
+                        embedding_clear,
+                        ..
+                    } => {
+                        assert_eq!(project, "proj-1");
+                        assert!(embedding_enable);
+                        assert!(!embedding_disable);
+                        assert_eq!(
+                            embedding_endpoint.as_deref(),
+                            Some("http://127.0.0.1:8080/v1")
+                        );
+                        assert_eq!(embedding_model.as_deref(), Some("embed-small"));
+                        assert_eq!(embedding_dimensions, Some(512));
+                        assert_eq!(embedding_batch_size, Some(8));
+                        assert_eq!(embedding_timeout_secs, Some(12));
+                        assert_eq!(embedding_max_candidates, Some(32));
+                        assert_eq!(embedding_min_similarity, Some(0.35));
+                        assert_eq!(embedding_api_key_env.as_deref(), Some("EMBED_API_KEY"));
+                        assert!(!embedding_clear);
+                    }
+                    other => panic!("expected memory-policy-set, got {other:?}"),
                 }
             })
             .unwrap()

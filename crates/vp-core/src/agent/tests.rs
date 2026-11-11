@@ -11149,6 +11149,7 @@ async fn unrelated_verification_does_not_outrank_a_same_task_result() {
             limit: Some(10),
             include_stale: false,
             max_chars: None,
+            lexical_only: false,
         })
         .await
         .unwrap();

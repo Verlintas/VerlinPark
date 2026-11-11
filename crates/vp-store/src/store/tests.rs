@@ -917,6 +917,7 @@ fn round_trips_memory_retention_policy() {
         auto_supersede: false,
         brief_max_chars: Some(2048),
         sweep_stale: true,
+        embedding: None,
     };
     store.set_memory_policy(&project.id, &policy).unwrap();
     assert_eq!(store.get_memory_policy(&project.id).unwrap(), policy);
@@ -7934,4 +7935,1132 @@ fn runtime_lease_owner_keeps_expired_rows_visible_for_operators() {
             .unwrap()
             .is_none()
     );
+}
+
+fn embedding_policy(model: &str) -> MemoryPolicy {
+    MemoryPolicy {
+        enabled: true,
+        max_items: Some(100),
+        max_age_days: Some(180),
+        task_result_verify_days: Some(90),
+        default_verify_days: Some(365),
+        auto_supersede: true,
+        brief_max_chars: Some(4000),
+        sweep_stale: false,
+        embedding: Some(MemoryEmbeddingPolicy {
+            enabled: true,
+            endpoint: Some("http://127.0.0.1:9/v1".to_string()),
+            model: Some(model.to_string()),
+            dimensions: 8,
+            batch_size: 4,
+            timeout_secs: 5,
+            max_candidates: 8,
+            min_similarity: 0.3,
+            api_key_env: None,
+        }),
+    }
+}
+
+fn tiny_vector(seed: u8) -> Vec<u8> {
+    let mut bytes = b"VPEM".to_vec();
+    bytes.push(1);
+    bytes.extend_from_slice(&8u32.to_le_bytes());
+    for index in 0..8 {
+        bytes.extend_from_slice(&(seed as f32 + index as f32 * 0.01).to_le_bytes());
+    }
+    bytes
+}
+
+fn create_embedding_memory(
+    store: &Store,
+    project: &Project,
+    session: &Session,
+    title: &str,
+) -> MemoryItem {
+    store
+        .create_memory_with_event(
+            &session.id,
+            &project.id,
+            "agent-1",
+            "Leader",
+            "fact",
+            title,
+            &format!("body for {title}"),
+            &[],
+        )
+        .unwrap()
+        .0
+}
+
+#[test]
+fn memory_embedding_policy_round_trips_and_queues_writes() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "embedding").unwrap();
+    let policy = embedding_policy("embed-small");
+    store.set_memory_policy(&project.id, &policy).unwrap();
+    assert_eq!(store.get_memory_policy(&project.id).unwrap(), policy);
+    let configured = store.list_memory_embedding_policies().unwrap();
+    assert_eq!(configured.len(), 1);
+    assert_eq!(configured[0].0, project.id);
+    assert_eq!(configured[0].1, policy.embedding.clone().unwrap());
+    assert_eq!(
+        store.list_enabled_memory_policies().unwrap()[0].1,
+        policy,
+        "retention decoding must preserve the embedding object"
+    );
+
+    let memory = create_embedding_memory(&store, &project, &session, "Release handoff");
+    let candidates = store
+        .memory_embedding_index_candidates(&project.id, "embed-small", 8, 5, 10)
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].memory.id, memory.id);
+    assert!(candidates[0].embedded_model.is_none());
+    assert_eq!(candidates[0].job_status.as_deref(), Some("pending"));
+
+    assert_eq!(
+        store
+            .mark_memory_embedding_attempted(&memory.id, "embed-small", false)
+            .unwrap(),
+        1
+    );
+    let vector = tiny_vector(1);
+    let event = store
+        .record_memory_embedding_success(&memory.id, "embed-small", 8, "hash-1", &vector)
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.kind, "memory.embedding.indexed");
+    let payload = event.payload.to_string();
+    assert!(!payload.contains("VPEM"));
+    assert!(!payload.contains("body for"));
+    let stored: Vec<u8> = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT vector FROM memory_embeddings WHERE memory_id = ?1",
+            params![memory.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, vector);
+
+    let status = store
+        .memory_embedding_status(&project.id, policy.embedding.as_ref())
+        .unwrap();
+    assert!(status.enabled);
+    assert!(status.configured);
+    assert_eq!(status.model.as_deref(), Some("embed-small"));
+    assert_eq!(status.dimensions, 8);
+    assert_eq!(status.indexable, 1);
+    assert_eq!(status.indexed, 1);
+    assert_eq!(status.pending, 0);
+    assert_eq!(status.coverage, 1.0);
+    assert_eq!(status.recent_jobs.len(), 1);
+    assert_eq!(status.recent_jobs[0].status, "indexed");
+    assert_eq!(status.usage.calls, 0);
+
+    store
+        .record_memory_embedding_usage(&project.id, "embed-small", 1, 12, 0, 48, true)
+        .unwrap();
+    store
+        .record_memory_embedding_usage(&project.id, "embed-small", 1, 9, 9, 36, false)
+        .unwrap();
+    let status = store
+        .memory_embedding_status(&project.id, policy.embedding.as_ref())
+        .unwrap();
+    assert_eq!(status.usage.calls, 2);
+    assert_eq!(status.usage.input_tokens, 21);
+    assert_eq!(status.usage.estimated_tokens, 9);
+    assert_eq!(status.usage.bytes, 84);
+    assert_eq!(status.usage.provider_reported_calls, 1);
+    assert_eq!(status.recent_jobs[0].title, "Release handoff");
+    assert!(!serde_json::to_string(&status).unwrap().contains("VPEM"));
+
+    // A tag update changes the documented content composition and queues a
+    // re-index without deleting the previous vector or failing the write.
+    store
+        .update_memory_with_event(&memory.id, None, None, Some(&["release".to_string()]))
+        .unwrap();
+    let candidates = store
+        .memory_embedding_index_candidates(&project.id, "embed-small", 8, 5, 10)
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].job_status.as_deref(), Some("pending"));
+    assert_eq!(
+        candidates[0].embedded_content_hash.as_deref(),
+        Some("hash-1")
+    );
+    let status = store
+        .memory_embedding_status(&project.id, policy.embedding.as_ref())
+        .unwrap();
+    assert_eq!(status.indexed, 0, "pending job is not current coverage");
+    assert_eq!(status.pending, 1);
+    store
+        .mark_memory_embedding_attempted(&memory.id, "embed-small", false)
+        .unwrap();
+    store
+        .record_memory_embedding_success(&memory.id, "embed-small", 8, "hash-2", &tiny_vector(2))
+        .unwrap();
+    let candidates = store
+        .memory_embedding_index_candidates(&project.id, "embed-small", 8, 5, 10)
+        .unwrap();
+    assert!(candidates.is_empty());
+}
+
+#[test]
+fn memory_embedding_model_change_resets_coverage_and_rebuild_queues_backlog() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store
+        .create_session(&project.id, "embedding model")
+        .unwrap();
+    let policy = embedding_policy("embed-a");
+    store.set_memory_policy(&project.id, &policy).unwrap();
+    let first = create_embedding_memory(&store, &project, &session, "First");
+    let second = create_embedding_memory(&store, &project, &session, "Second");
+    for memory in [&first, &second] {
+        store
+            .mark_memory_embedding_attempted(&memory.id, "embed-a", false)
+            .unwrap();
+        store
+            .record_memory_embedding_success(&memory.id, "embed-a", 8, "hash-a", &tiny_vector(3))
+            .unwrap();
+    }
+    let status = store
+        .memory_embedding_status(&project.id, policy.embedding.as_ref())
+        .unwrap();
+    assert_eq!(status.coverage, 1.0);
+
+    let changed = embedding_policy("embed-b");
+    store.set_memory_policy(&project.id, &changed).unwrap();
+    let status = store
+        .memory_embedding_status(&project.id, changed.embedding.as_ref())
+        .unwrap();
+    assert_eq!(status.model.as_deref(), Some("embed-b"));
+    assert_eq!(status.indexable, 2);
+    assert_eq!(status.indexed, 0);
+    assert_eq!(status.coverage, 0.0);
+    let candidates = store
+        .memory_embedding_index_candidates(&project.id, "embed-b", 8, 5, 10)
+        .unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert!(
+        candidates
+            .iter()
+            .all(|candidate| { candidate.embedded_model.as_deref() == Some("embed-a") })
+    );
+
+    let cleared = store.clear_memory_embeddings(&project.id).unwrap();
+    assert_eq!(cleared, 4);
+    assert!(
+        store
+            .memory_embedding_index_candidates(&project.id, "embed-b", 8, 5, 10)
+            .unwrap()
+            .len()
+            == 2
+    );
+    let enqueued = store
+        .enqueue_memory_embedding_backlog(&project.id, "embed-b")
+        .unwrap();
+    assert_eq!(enqueued, 2);
+    let status = store
+        .memory_embedding_status(&project.id, changed.embedding.as_ref())
+        .unwrap();
+    assert_eq!(status.pending, 2);
+    assert_eq!(status.indexed, 0);
+    assert_eq!(status.coverage, 0.0);
+}
+
+#[test]
+fn memory_embedding_failure_retry_and_attempt_cap_are_visible() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store
+        .create_session(&project.id, "embedding retry")
+        .unwrap();
+    let policy = embedding_policy("embed-retry");
+    store.set_memory_policy(&project.id, &policy).unwrap();
+    let memory = create_embedding_memory(&store, &project, &session, "Retry me");
+    assert_eq!(
+        store
+            .mark_memory_embedding_attempted(&memory.id, "embed-retry", false)
+            .unwrap(),
+        1
+    );
+    let event = store
+        .record_memory_embedding_failure(
+            &memory.id,
+            "embed-retry",
+            1,
+            "HTTP 503: busy",
+            Some("2000-01-01T00:00:00Z"),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.kind, "memory.embedding.failed");
+    let status = store
+        .memory_embedding_status(&project.id, policy.embedding.as_ref())
+        .unwrap();
+    assert_eq!(status.failed, 1);
+    assert_eq!(status.last_error.as_deref(), Some("HTTP 503: busy"));
+    assert_eq!(status.recent_jobs[0].status, "failed");
+    assert_eq!(status.recent_jobs[0].attempts, 1);
+    // Due retries are selected again.
+    assert_eq!(
+        store
+            .memory_embedding_index_candidates(&project.id, "embed-retry", 8, 5, 10)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Keep incrementing through the cap and make the next attempt far future.
+    let attempts = store
+        .mark_memory_embedding_attempted(&memory.id, "embed-retry", false)
+        .unwrap();
+    assert_eq!(attempts, 2);
+    store
+        .record_memory_embedding_failure(&memory.id, "embed-retry", attempts, "still down", None)
+        .unwrap();
+    assert!(
+        store
+            .memory_embedding_index_candidates(&project.id, "embed-retry", 8, 5, 10)
+            .unwrap()
+            .is_empty(),
+        "exhausted failed jobs are not retried automatically"
+    );
+    let status = store
+        .memory_embedding_status(&project.id, policy.embedding.as_ref())
+        .unwrap();
+    assert_eq!(status.failed, 1);
+    assert_eq!(status.last_error.as_deref(), Some("still down"));
+    assert_eq!(status.recent_jobs[0].next_attempt_at, None);
+}
+
+#[test]
+fn memory_embedding_rows_are_garbage_collected_with_delete_and_prune() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "embedding gc").unwrap();
+    let policy = embedding_policy("embed-gc");
+    store.set_memory_policy(&project.id, &policy).unwrap();
+    let first = create_embedding_memory(&store, &project, &session, "Delete me");
+    let second = create_embedding_memory(&store, &project, &session, "Prune me");
+    for memory in [&first, &second] {
+        store
+            .mark_memory_embedding_attempted(&memory.id, "embed-gc", false)
+            .unwrap();
+        store
+            .record_memory_embedding_success(&memory.id, "embed-gc", 8, "hash-gc", &tiny_vector(4))
+            .unwrap();
+    }
+    store
+        .delete_memories_with_events(std::slice::from_ref(&first.id))
+        .unwrap();
+    let remaining_embeddings: i64 = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM memory_embeddings WHERE memory_id = ?1",
+            params![first.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining_embeddings, 0);
+    let remaining_jobs: i64 = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM memory_embedding_jobs WHERE memory_id = ?1",
+            params![first.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining_jobs, 0);
+
+    let prune_ids = store
+        .memory_ids_for_prune(&project.id, None, Some(0))
+        .unwrap();
+    assert_eq!(prune_ids, vec![second.id.clone()]);
+    store.delete_memories_with_events(&prune_ids).unwrap();
+    let total: i64 = store
+        .lock()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM memory_embeddings", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(total, 0);
+    let status = store
+        .memory_embedding_status(&project.id, policy.embedding.as_ref())
+        .unwrap();
+    assert_eq!(status.indexable, 0);
+    assert_eq!(status.indexed, 0);
+    assert_eq!(status.coverage, 0.0);
+}
+
+#[test]
+fn archived_memories_are_not_indexed_and_reactivation_requeues() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store
+        .create_session(&project.id, "embedding status")
+        .unwrap();
+    let policy = embedding_policy("embed-status");
+    store.set_memory_policy(&project.id, &policy).unwrap();
+    let memory = create_embedding_memory(&store, &project, &session, "Lifecycle");
+    store
+        .update_memory_with_event(&memory.id, Some("archived"), None, None)
+        .unwrap();
+    assert!(
+        store
+            .memory_embedding_index_candidates(&project.id, "embed-status", 8, 5, 10)
+            .unwrap()
+            .is_empty()
+    );
+    let status = store
+        .memory_embedding_status(&project.id, policy.embedding.as_ref())
+        .unwrap();
+    assert_eq!(status.indexable, 0);
+
+    store
+        .update_memory_with_event(&memory.id, Some("active"), None, None)
+        .unwrap();
+    let candidates = store
+        .memory_embedding_index_candidates(&project.id, "embed-status", 8, 5, 10)
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].job_status.as_deref(), Some("pending"));
+}
+
+#[test]
+fn disabled_or_absent_embedding_policy_does_not_queue_jobs() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "embedding off").unwrap();
+    let memory = create_embedding_memory(&store, &project, &session, "Lexical only");
+    let jobs: i64 = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM memory_embedding_jobs WHERE memory_id = ?1",
+            params![memory.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(jobs, 0);
+    assert!(store.list_memory_embedding_policies().unwrap().is_empty());
+
+    let mut disabled = embedding_policy("embed-disabled");
+    disabled.embedding.as_mut().unwrap().enabled = false;
+    store.set_memory_policy(&project.id, &disabled).unwrap();
+    assert_eq!(store.list_memory_embedding_policies().unwrap().len(), 1);
+    let second = create_embedding_memory(&store, &project, &session, "Configured but off");
+    let jobs: i64 = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM memory_embedding_jobs WHERE memory_id = ?1",
+            params![second.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        jobs, 1,
+        "configured-disabled writes stay ready for enablement"
+    );
+}
+
+#[test]
+fn corrupted_vectors_are_counted_invalid_and_requeued() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store
+        .create_session(&project.id, "embedding corrupt")
+        .unwrap();
+    let policy = embedding_policy("embed-corrupt");
+    store.set_memory_policy(&project.id, &policy).unwrap();
+    let memory = create_embedding_memory(&store, &project, &session, "Corrupt me");
+    store
+        .mark_memory_embedding_attempted(&memory.id, "embed-corrupt", false)
+        .unwrap();
+    store
+        .record_memory_embedding_success(
+            &memory.id,
+            "embed-corrupt",
+            8,
+            "hash-corrupt",
+            &tiny_vector(5),
+        )
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE memory_embeddings SET vector = x'00' WHERE memory_id = ?1",
+            params![memory.id],
+        )
+        .unwrap();
+    let status = store
+        .memory_embedding_status(&project.id, policy.embedding.as_ref())
+        .unwrap();
+    assert_eq!(status.indexable, 1);
+    assert_eq!(status.indexed, 0);
+    assert_eq!(status.invalid, 1);
+    assert_eq!(status.coverage, 0.0);
+    let candidates = store
+        .memory_embedding_index_candidates(&project.id, "embed-corrupt", 8, 5, 10)
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(
+        candidates[0].embedded_content_hash.as_deref(),
+        Some("hash-corrupt")
+    );
+    store
+        .mark_memory_embedding_attempted(&memory.id, "embed-corrupt", false)
+        .unwrap();
+    store
+        .record_memory_embedding_success(
+            &memory.id,
+            "embed-corrupt",
+            8,
+            "hash-corrupt",
+            &tiny_vector(6),
+        )
+        .unwrap();
+    let status = store
+        .memory_embedding_status(&project.id, policy.embedding.as_ref())
+        .unwrap();
+    assert_eq!(status.indexed, 1);
+    assert_eq!(status.invalid, 0);
+    assert_eq!(status.coverage, 1.0);
+}
+
+#[test]
+fn malformed_embedding_policy_json_is_ignored_defensively() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let policy = embedding_policy("embed-malformed");
+    store.set_memory_policy(&project.id, &policy).unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE project_memory_policies SET embedding_json = ?2 WHERE project_id = ?1",
+            params![project.id, r#"{"enabled":true,"endpoint":42}"#],
+        )
+        .unwrap();
+    let stored = store.get_memory_policy(&project.id).unwrap();
+    assert!(
+        stored.embedding.is_none(),
+        "a malformed row must not enable network access"
+    );
+    assert!(store.list_memory_embedding_policies().unwrap().is_empty());
+    let status = store.memory_embedding_status(&project.id, None).unwrap();
+    assert!(!status.enabled);
+    assert!(!status.configured);
+    assert!(status.last_error.is_none());
+}
+
+#[test]
+fn skip_and_backlog_reset_retry_state() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "embedding skip").unwrap();
+    let policy = embedding_policy("embed-skip");
+    store.set_memory_policy(&project.id, &policy).unwrap();
+    let memory = create_embedding_memory(&store, &project, &session, "Skip me");
+    store
+        .mark_memory_embedding_attempted(&memory.id, "embed-skip", false)
+        .unwrap();
+    store
+        .record_memory_embedding_failure(&memory.id, "embed-skip", 5, "permanent failure", None)
+        .unwrap();
+    let status = store
+        .memory_embedding_status(&project.id, policy.embedding.as_ref())
+        .unwrap();
+    assert_eq!(status.failed, 1);
+
+    let event = store
+        .record_memory_embedding_skip(&memory.id, "embed-skip", "content hash unchanged")
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.kind, "memory.embedding.skipped");
+    assert_eq!(event.payload["reason"], "content hash unchanged");
+    let status = store
+        .memory_embedding_status(&project.id, policy.embedding.as_ref())
+        .unwrap();
+    assert_eq!(status.failed, 0);
+    assert_eq!(status.skipped, 1);
+    assert!(status.last_error.is_none());
+
+    // An explicit backlog reset clears exhausted retry state and last_error.
+    store
+        .mark_memory_embedding_attempted(&memory.id, "embed-skip", false)
+        .unwrap();
+    store
+        .record_memory_embedding_failure(&memory.id, "embed-skip", 5, "again", None)
+        .unwrap();
+    let enqueued = store
+        .enqueue_memory_embedding_backlog(&project.id, "embed-skip")
+        .unwrap();
+    assert_eq!(enqueued, 1);
+    let status = store
+        .memory_embedding_status(&project.id, policy.embedding.as_ref())
+        .unwrap();
+    assert_eq!(status.pending, 1);
+    assert_eq!(status.failed, 0);
+    assert!(status.last_error.is_none());
+    assert_eq!(status.recent_jobs[0].attempts, 0);
+    assert_eq!(status.recent_jobs[0].status, "pending");
+}
+
+#[test]
+fn semantic_candidates_filter_model_dimensions_status_and_limit() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store
+        .create_session(&project.id, "semantic candidates")
+        .unwrap();
+    let policy = embedding_policy("embed-semantic");
+    store.set_memory_policy(&project.id, &policy).unwrap();
+    let active = create_embedding_memory(&store, &project, &session, "Active");
+    let stale = create_embedding_memory(&store, &project, &session, "Stale");
+    let archived = create_embedding_memory(&store, &project, &session, "Archived");
+    store
+        .update_memory_with_event(&stale.id, Some("stale"), None, None)
+        .unwrap();
+    store
+        .update_memory_with_event(&archived.id, Some("archived"), None, None)
+        .unwrap();
+    for memory in [&active, &stale, &archived] {
+        store
+            .mark_memory_embedding_attempted(&memory.id, "embed-semantic", false)
+            .unwrap();
+        store
+            .record_memory_embedding_success(
+                &memory.id,
+                "embed-semantic",
+                8,
+                "hash-semantic",
+                &tiny_vector(7),
+            )
+            .unwrap();
+    }
+    // Archived/superseded update deletes the derived rows, so re-add a valid
+    // archived row directly to prove the candidate query filters status.
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT OR REPLACE INTO memory_embeddings
+             (memory_id, model, dimensions, content_hash, vector, created_at, updated_at)
+             VALUES (?1, 'embed-semantic', 8, 'hash-archived', ?2, ?3, ?3)",
+            params![archived.id, tiny_vector(8), "2026-11-11T00:00:00Z"],
+        )
+        .unwrap();
+
+    let active_only = store
+        .memory_semantic_candidates(&project.id, "embed-semantic", 8, false, 10)
+        .unwrap();
+    assert_eq!(active_only.len(), 1);
+    assert_eq!(active_only[0].memory.id, active.id);
+    let with_stale = store
+        .memory_semantic_candidates(&project.id, "embed-semantic", 8, true, 10)
+        .unwrap();
+    assert_eq!(with_stale.len(), 2);
+    assert!(
+        with_stale
+            .iter()
+            .all(|candidate| candidate.memory.status != "archived")
+    );
+    let wrong_model = store
+        .memory_semantic_candidates(&project.id, "other-model", 8, true, 10)
+        .unwrap();
+    assert!(wrong_model.is_empty());
+    let wrong_dimensions = store
+        .memory_semantic_candidates(&project.id, "embed-semantic", 16, true, 10)
+        .unwrap();
+    assert!(wrong_dimensions.is_empty());
+    let limited = store
+        .memory_semantic_candidates(&project.id, "embed-semantic", 8, true, 1)
+        .unwrap();
+    assert_eq!(limited.len(), 1);
+    assert_eq!(limited[0].vector.len(), 9 + 8 * 4);
+}
+
+#[test]
+fn clear_embeddings_retains_memories_and_usage_history() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store
+        .create_session(&project.id, "embedding clear")
+        .unwrap();
+    let policy = embedding_policy("embed-clear");
+    store.set_memory_policy(&project.id, &policy).unwrap();
+    let memory = create_embedding_memory(&store, &project, &session, "Keep memory");
+    store
+        .mark_memory_embedding_attempted(&memory.id, "embed-clear", false)
+        .unwrap();
+    store
+        .record_memory_embedding_success(
+            &memory.id,
+            "embed-clear",
+            8,
+            "hash-clear",
+            &tiny_vector(9),
+        )
+        .unwrap();
+    store
+        .record_memory_embedding_usage(&project.id, "embed-clear", 2, 40, 0, 160, true)
+        .unwrap();
+    let cleared = store.clear_memory_embeddings(&project.id).unwrap();
+    assert_eq!(cleared, 2);
+    assert!(store.get_memory(&memory.id).unwrap().is_some());
+    let status = store
+        .memory_embedding_status(&project.id, policy.embedding.as_ref())
+        .unwrap();
+    assert_eq!(status.indexable, 1);
+    assert_eq!(status.indexed, 0);
+    assert_eq!(status.pending, 0);
+    assert!(status.recent_jobs.is_empty());
+    assert_eq!(status.usage.calls, 2);
+    assert_eq!(status.usage.input_tokens, 40);
+    assert_eq!(status.usage.bytes, 160);
+    assert_eq!(status.usage.provider_reported_calls, 1);
+}
+
+#[test]
+fn status_bounds_recent_jobs_and_reports_disabled_configured_state() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "embedding jobs").unwrap();
+    let mut policy = embedding_policy("embed-jobs");
+    policy.embedding.as_mut().unwrap().enabled = false;
+    store.set_memory_policy(&project.id, &policy).unwrap();
+    for index in 0..25 {
+        let _ = create_embedding_memory(&store, &project, &session, &format!("Memory {index:02}"));
+    }
+    let status = store
+        .memory_embedding_status(&project.id, policy.embedding.as_ref())
+        .unwrap();
+    assert!(!status.enabled);
+    assert!(status.configured);
+    assert_eq!(status.indexable, 25);
+    assert_eq!(status.pending, 25);
+    assert_eq!(status.recent_jobs.len(), 20, "recent jobs are bounded");
+    assert!(
+        status
+            .recent_jobs
+            .windows(2)
+            .all(|pair| pair[0].updated_at >= pair[1].updated_at),
+        "recent jobs are newest first"
+    );
+    // No embeddings exist, so status does not manufacture coverage.
+    assert_eq!(status.indexed, 0);
+    assert_eq!(status.coverage, 0.0);
+    assert!(status.usage.calls == 0);
+}
+
+#[test]
+fn status_ignores_jobs_from_an_old_embedding_model() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store
+        .create_session(&project.id, "embedding model jobs")
+        .unwrap();
+    let first = embedding_policy("embed-old");
+    store.set_memory_policy(&project.id, &first).unwrap();
+    let memory = create_embedding_memory(&store, &project, &session, "Old model failure");
+    store
+        .mark_memory_embedding_attempted(&memory.id, "embed-old", false)
+        .unwrap();
+    store
+        .record_memory_embedding_failure(&memory.id, "embed-old", 5, "old model down", None)
+        .unwrap();
+    let status = store
+        .memory_embedding_status(&project.id, first.embedding.as_ref())
+        .unwrap();
+    assert_eq!(status.failed, 1);
+    assert_eq!(status.last_error.as_deref(), Some("old model down"));
+
+    let second = embedding_policy("embed-new");
+    store.set_memory_policy(&project.id, &second).unwrap();
+    let status = store
+        .memory_embedding_status(&project.id, second.embedding.as_ref())
+        .unwrap();
+    assert_eq!(
+        status.failed, 0,
+        "old-model failures are not current health"
+    );
+    assert!(status.last_error.is_none());
+    assert!(status.recent_jobs.is_empty());
+    // The old failed job is still selected because the model changed.
+    assert_eq!(
+        store
+            .memory_embedding_index_candidates(&project.id, "embed-new", 8, 5, 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    let attempts = store
+        .mark_memory_embedding_attempted(&memory.id, "embed-new", true)
+        .unwrap();
+    assert_eq!(attempts, 1, "a model change resets the retry budget");
+    store
+        .record_memory_embedding_success(&memory.id, "embed-new", 8, "hash-new", &tiny_vector(10))
+        .unwrap();
+    let status = store
+        .memory_embedding_status(&project.id, second.embedding.as_ref())
+        .unwrap();
+    assert_eq!(status.indexed, 1);
+    assert_eq!(status.failed, 0);
+    assert_eq!(status.recent_jobs[0].status, "indexed");
+}
+
+#[test]
+fn memory_embedding_index_candidates_are_bounded_and_ordered() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store
+        .create_session(&project.id, "embedding order")
+        .unwrap();
+    let policy = embedding_policy("embed-order");
+    store.set_memory_policy(&project.id, &policy).unwrap();
+    let mut memories = Vec::new();
+    for index in 0..6 {
+        memories.push(create_embedding_memory(
+            &store,
+            &project,
+            &session,
+            &format!("Memory {index}"),
+        ));
+    }
+    let candidates = store
+        .memory_embedding_index_candidates(&project.id, "embed-order", 8, 5, 2)
+        .unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert!(
+        candidates
+            .iter()
+            .all(|candidate| candidate.job_status.as_deref() == Some("pending"))
+    );
+    assert!(
+        candidates
+            .iter()
+            .all(|candidate| candidate.job_attempts == 0)
+    );
+    // All rows are pending and have no job updated_at, so ordering falls back
+    // to created_at then id. Repeating the query is stable.
+    let again = store
+        .memory_embedding_index_candidates(&project.id, "embed-order", 8, 5, 2)
+        .unwrap();
+    let ids = candidates
+        .iter()
+        .map(|candidate| candidate.memory.id.as_str())
+        .collect::<Vec<_>>();
+    let again_ids = again
+        .iter()
+        .map(|candidate| candidate.memory.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, again_ids);
+}
+
+#[test]
+fn embedding_usage_and_clear_are_project_scoped() {
+    let (_data, store, repo_a) = test_store();
+    let repo_b = TempDir::new().unwrap();
+    let first = store
+        .add_project(repo_a.path().to_str().unwrap(), Some("first"))
+        .unwrap();
+    let second = store
+        .add_project(repo_b.path().to_str().unwrap(), Some("second"))
+        .unwrap();
+    let session = store.create_session(&first.id, "usage scope").unwrap();
+    let policy = embedding_policy("embed-scope");
+    store.set_memory_policy(&first.id, &policy).unwrap();
+    let memory = create_embedding_memory(&store, &first, &session, "Scoped");
+    store
+        .mark_memory_embedding_attempted(&memory.id, "embed-scope", false)
+        .unwrap();
+    store
+        .record_memory_embedding_success(
+            &memory.id,
+            "embed-scope",
+            8,
+            "hash-scope",
+            &tiny_vector(11),
+        )
+        .unwrap();
+    store
+        .record_memory_embedding_usage(&first.id, "embed-scope", 3, 30, 5, 120, true)
+        .unwrap();
+    let first_status = store
+        .memory_embedding_status(&first.id, policy.embedding.as_ref())
+        .unwrap();
+    assert_eq!(first_status.usage.calls, 3);
+    let second_status = store.memory_embedding_status(&second.id, None).unwrap();
+    assert_eq!(second_status.usage.calls, 0);
+    assert_eq!(second_status.indexable, 0);
+
+    let cleared = store.clear_memory_embeddings(&second.id).unwrap();
+    assert_eq!(cleared, 0);
+    let first_status = store
+        .memory_embedding_status(&first.id, policy.embedding.as_ref())
+        .unwrap();
+    assert_eq!(
+        first_status.indexed, 1,
+        "clearing one project leaves another intact"
+    );
+    assert_eq!(first_status.usage.calls, 3);
+}
+
+#[test]
+fn embedding_job_attempts_increment_and_clear_previous_errors() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "attempt reset").unwrap();
+    let policy = embedding_policy("embed-attempt");
+    store.set_memory_policy(&project.id, &policy).unwrap();
+    let memory = create_embedding_memory(&store, &project, &session, "Attempt");
+    assert_eq!(
+        store
+            .mark_memory_embedding_attempted(&memory.id, "embed-attempt", false)
+            .unwrap(),
+        1
+    );
+    store
+        .record_memory_embedding_failure(
+            &memory.id,
+            "embed-attempt",
+            1,
+            "first failure",
+            Some("2000-01-01T00:00:00Z"),
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .mark_memory_embedding_attempted(&memory.id, "embed-attempt", false)
+            .unwrap(),
+        2
+    );
+    let status = store
+        .memory_embedding_status(&project.id, policy.embedding.as_ref())
+        .unwrap();
+    assert_eq!(status.pending, 1);
+    assert_eq!(status.failed, 0);
+    assert!(status.last_error.is_none());
+    assert_eq!(status.recent_jobs[0].attempts, 2);
+}
+
+#[test]
+fn embedding_failure_errors_are_bounded_when_persisted() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "error bound").unwrap();
+    let policy = embedding_policy("embed-error");
+    store.set_memory_policy(&project.id, &policy).unwrap();
+    let memory = create_embedding_memory(&store, &project, &session, "Error bound");
+    store
+        .mark_memory_embedding_attempted(&memory.id, "embed-error", false)
+        .unwrap();
+    store
+        .record_memory_embedding_failure(
+            &memory.id,
+            "embed-error",
+            1,
+            &"x".repeat(5_000),
+            Some("2000-01-01T00:00:00Z"),
+        )
+        .unwrap();
+    let status = store
+        .memory_embedding_status(&project.id, policy.embedding.as_ref())
+        .unwrap();
+    let error = status.last_error.as_deref().unwrap();
+    assert!(error.chars().count() <= 2_000);
+    assert!(error.ends_with('…'));
+    assert_eq!(status.recent_jobs[0].last_error.as_deref(), Some(error));
+}
+
+#[test]
+fn project_manifest_captures_the_embedding_policy_without_secrets() {
+    let (data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let policy = embedding_policy("embed-manifest");
+    store.set_memory_policy(&project.id, &policy).unwrap();
+    store.record_project_manifest().unwrap();
+    let manifest = read_project_manifest(data.path()).unwrap();
+    assert_eq!(manifest.len(), 1);
+    let stored = manifest[0].memory_policy.embedding.as_ref().unwrap();
+    assert_eq!(stored.model.as_deref(), Some("embed-manifest"));
+    assert_eq!(stored.dimensions, 8);
+    assert_eq!(stored.api_key_env, None);
+    let encoded = serde_json::to_string(&manifest).unwrap();
+    assert!(!encoded.contains("sk-"));
+    assert!(!encoded.contains("api_key\":"));
+}
+
+#[test]
+fn replacing_session_memories_requeues_derived_embeddings() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "replay import").unwrap();
+    let memory = create_embedding_memory(&store, &project, &session, "Imported claim");
+    // No policy existed at creation time, so no job row was queued. (The
+    // candidate query still reports missing embeddings when a model is
+    // supplied; that is the upgrade path.)
+    let jobs: i64 = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM memory_embedding_jobs WHERE memory_id = ?1",
+            params![memory.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(jobs, 0);
+    store
+        .set_memory_policy(&project.id, &embedding_policy("embed-import"))
+        .unwrap();
+    store
+        .replace_session_memories(&session.id, std::slice::from_ref(&memory))
+        .unwrap();
+    let candidates = store
+        .memory_embedding_index_candidates(&project.id, "embed-import", 8, 5, 10)
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].memory.id, memory.id);
+    assert_eq!(candidates[0].job_status.as_deref(), Some("pending"));
+}
+
+#[test]
+fn embedding_outcomes_for_a_deleted_memory_do_not_create_orphans() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "orphan").unwrap();
+    let policy = embedding_policy("embed-orphan");
+    store.set_memory_policy(&project.id, &policy).unwrap();
+    let memory = create_embedding_memory(&store, &project, &session, "Deleted mid-flight");
+    store
+        .mark_memory_embedding_attempted(&memory.id, "embed-orphan", false)
+        .unwrap();
+    store
+        .delete_memories_with_events(std::slice::from_ref(&memory.id))
+        .unwrap();
+    let success = store
+        .record_memory_embedding_success(
+            &memory.id,
+            "embed-orphan",
+            8,
+            "hash-orphan",
+            &tiny_vector(12),
+        )
+        .unwrap();
+    assert!(success.is_none());
+    let failure = store
+        .record_memory_embedding_failure(
+            &memory.id,
+            "embed-orphan",
+            1,
+            "too late",
+            Some("2000-01-01T00:00:00Z"),
+        )
+        .unwrap();
+    assert!(failure.is_none());
+    let skip = store
+        .record_memory_embedding_skip(&memory.id, "embed-orphan", "too late")
+        .unwrap();
+    assert!(skip.is_none());
+    let embeddings: i64 = store
+        .lock()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM memory_embeddings", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let jobs: i64 = store
+        .lock()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM memory_embedding_jobs", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(embeddings, 0);
+    assert_eq!(jobs, 0);
+}
+
+#[test]
+fn clear_embeddings_on_an_empty_project_is_a_noop() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    assert_eq!(store.clear_memory_embeddings(&project.id).unwrap(), 0);
+    assert_eq!(store.clear_memory_embeddings(&project.id).unwrap(), 0);
+    let status = store.memory_embedding_status(&project.id, None).unwrap();
+    assert_eq!(status.indexable, 0);
+    assert_eq!(status.indexed, 0);
+    assert_eq!(status.coverage, 0.0);
+}
+
+#[test]
+fn incomplete_embedding_policy_is_not_considered_configured() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let policy = MemoryPolicy {
+        embedding: Some(MemoryEmbeddingPolicy::default()),
+        ..MemoryPolicy::default()
+    };
+    // The store persists what the validated engine accepts; this shape is a
+    // disabled placeholder, not a configured endpoint.
+    store.set_memory_policy(&project.id, &policy).unwrap();
+    assert!(store.list_memory_embedding_policies().unwrap().is_empty());
+    let status = store
+        .memory_embedding_status(&project.id, policy.embedding.as_ref())
+        .unwrap();
+    assert!(!status.enabled);
+    assert!(!status.configured);
+    assert_eq!(status.dimensions, 1536);
+    assert_eq!(status.indexable, 0);
 }

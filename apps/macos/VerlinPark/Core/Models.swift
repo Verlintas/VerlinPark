@@ -367,6 +367,102 @@ struct McpCallResult: Codable, Sendable {
     }
 }
 
+struct MemoryEmbeddingPolicy: Codable, Equatable, Sendable {
+    var enabled: Bool
+    var endpoint: String?
+    var model: String?
+    var dimensions: Int
+    var batchSize: Int
+    var timeoutSecs: Int
+    var maxCandidates: Int
+    var minSimilarity: Double
+    var apiKeyEnv: String?
+
+    static let defaults = MemoryEmbeddingPolicy(
+        enabled: false,
+        endpoint: nil,
+        model: nil,
+        dimensions: 1536,
+        batchSize: 16,
+        timeoutSecs: 30,
+        maxCandidates: 64,
+        minSimilarity: 0.20,
+        apiKeyEnv: nil
+    )
+
+    enum CodingKeys: String, CodingKey {
+        case enabled
+        case endpoint
+        case model
+        case dimensions
+        case batchSize = "batch_size"
+        case timeoutSecs = "timeout_secs"
+        case maxCandidates = "max_candidates"
+        case minSimilarity = "min_similarity"
+        case apiKeyEnv = "api_key_env"
+    }
+
+    init(
+        enabled: Bool,
+        endpoint: String?,
+        model: String?,
+        dimensions: Int,
+        batchSize: Int,
+        timeoutSecs: Int,
+        maxCandidates: Int,
+        minSimilarity: Double,
+        apiKeyEnv: String?
+    ) {
+        self.enabled = enabled
+        self.endpoint = endpoint
+        self.model = model
+        self.dimensions = dimensions
+        self.batchSize = batchSize
+        self.timeoutSecs = timeoutSecs
+        self.maxCandidates = maxCandidates
+        self.minSimilarity = minSimilarity
+        self.apiKeyEnv = apiKeyEnv
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        endpoint = try container.decodeIfPresent(String.self, forKey: .endpoint)
+        model = try container.decodeIfPresent(String.self, forKey: .model)
+        dimensions = try container.decodeIfPresent(Int.self, forKey: .dimensions) ?? 1536
+        batchSize = try container.decodeIfPresent(Int.self, forKey: .batchSize) ?? 16
+        timeoutSecs = try container.decodeIfPresent(Int.self, forKey: .timeoutSecs) ?? 30
+        maxCandidates = try container.decodeIfPresent(Int.self, forKey: .maxCandidates) ?? 64
+        minSimilarity = try container.decodeIfPresent(Double.self, forKey: .minSimilarity) ?? 0.20
+        apiKeyEnv = try container.decodeIfPresent(String.self, forKey: .apiKeyEnv)
+    }
+
+    var isConfigured: Bool {
+        !(endpoint?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+            && !(model?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+    }
+
+    /// JSON-RPC form. The key environment *name* is sent; no secret is ever
+    /// part of the policy object.
+    func jsonObject() -> [String: JSONValue] {
+        [
+            "enabled": .bool(enabled),
+            "endpoint": endpoint.map(JSONValue.string) ?? .null,
+            "model": model.map(JSONValue.string) ?? .null,
+            "dimensions": .number(Double(dimensions)),
+            "batch_size": .number(Double(batchSize)),
+            "timeout_secs": .number(Double(timeoutSecs)),
+            "max_candidates": .number(Double(maxCandidates)),
+            "min_similarity": .number(minSimilarity),
+            "api_key_env": apiKeyEnv.flatMap { value in
+                value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? nil
+                    : JSONValue.string(value)
+            } ?? .null,
+        ]
+    }
+}
+
 struct MemoryPolicy: Codable, Equatable, Sendable {
     let enabled: Bool
     let maxItems: Int?
@@ -381,6 +477,9 @@ struct MemoryPolicy: Codable, Equatable, Sendable {
     let briefMaxChars: Int?
     /// Opt-in daemon sweep that marks expired memories stale.
     let sweepStale: Bool?
+    /// Optional semantic lane. Absent means lexical-only with zero embedding
+    /// network calls.
+    let embedding: MemoryEmbeddingPolicy?
 
     enum CodingKeys: String, CodingKey {
         case enabled
@@ -391,6 +490,7 @@ struct MemoryPolicy: Codable, Equatable, Sendable {
         case autoSupersede = "auto_supersede"
         case briefMaxChars = "brief_max_chars"
         case sweepStale = "sweep_stale"
+        case embedding
     }
 }
 
@@ -401,6 +501,232 @@ struct MemoryPolicyResult: Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case projectId = "project_id"
         case policy
+    }
+}
+
+struct MemoryEmbeddingUsage: Codable, Sendable {
+    let calls: Int
+    let inputTokens: Int
+    let estimatedTokens: Int
+    let bytes: Int
+    let providerReportedCalls: Int
+
+    enum CodingKeys: String, CodingKey {
+        case calls
+        case inputTokens = "input_tokens"
+        case estimatedTokens = "estimated_tokens"
+        case bytes
+        case providerReportedCalls = "provider_reported_calls"
+    }
+
+    init(
+        calls: Int = 0,
+        inputTokens: Int = 0,
+        estimatedTokens: Int = 0,
+        bytes: Int = 0,
+        providerReportedCalls: Int = 0
+    ) {
+        self.calls = calls
+        self.inputTokens = inputTokens
+        self.estimatedTokens = estimatedTokens
+        self.bytes = bytes
+        self.providerReportedCalls = providerReportedCalls
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        calls = try container.decodeIfPresent(Int.self, forKey: .calls) ?? 0
+        inputTokens = try container.decodeIfPresent(Int.self, forKey: .inputTokens) ?? 0
+        estimatedTokens = try container.decodeIfPresent(Int.self, forKey: .estimatedTokens) ?? 0
+        bytes = try container.decodeIfPresent(Int.self, forKey: .bytes) ?? 0
+        providerReportedCalls = try container.decodeIfPresent(
+            Int.self,
+            forKey: .providerReportedCalls
+        ) ?? 0
+    }
+}
+
+struct MemoryEmbeddingJobStatus: Codable, Identifiable, Hashable, Sendable {
+    let memoryId: String
+    let title: String
+    let status: String
+    let attempts: Int
+    let lastError: String?
+    let nextAttemptAt: String?
+    let updatedAt: String
+
+    var id: String {
+        memoryId
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case memoryId = "memory_id"
+        case title
+        case status
+        case attempts
+        case lastError = "last_error"
+        case nextAttemptAt = "next_attempt_at"
+        case updatedAt = "updated_at"
+    }
+}
+
+struct MemoryEmbeddingsStatusResult: Codable, Sendable {
+    let projectId: String
+    let enabled: Bool
+    let configured: Bool
+    let model: String?
+    let dimensions: Int
+    let indexable: Int
+    let indexed: Int
+    let invalid: Int
+    let pending: Int
+    let failed: Int
+    let skipped: Int
+    let coverage: Double
+    let lastError: String?
+    let usage: MemoryEmbeddingUsage
+    let recentJobs: [MemoryEmbeddingJobStatus]
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case enabled
+        case configured
+        case model
+        case dimensions
+        case indexable
+        case indexed
+        case invalid
+        case pending
+        case failed
+        case skipped
+        case coverage
+        case lastError = "last_error"
+        case usage
+        case recentJobs = "recent_jobs"
+    }
+
+    init(
+        projectId: String,
+        enabled: Bool,
+        configured: Bool,
+        model: String?,
+        dimensions: Int,
+        indexable: Int,
+        indexed: Int,
+        invalid: Int = 0,
+        pending: Int,
+        failed: Int,
+        skipped: Int,
+        coverage: Double,
+        lastError: String?,
+        usage: MemoryEmbeddingUsage,
+        recentJobs: [MemoryEmbeddingJobStatus]
+    ) {
+        self.projectId = projectId
+        self.enabled = enabled
+        self.configured = configured
+        self.model = model
+        self.dimensions = dimensions
+        self.indexable = indexable
+        self.indexed = indexed
+        self.invalid = invalid
+        self.pending = pending
+        self.failed = failed
+        self.skipped = skipped
+        self.coverage = coverage
+        self.lastError = lastError
+        self.usage = usage
+        self.recentJobs = recentJobs
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        projectId = try container.decode(String.self, forKey: .projectId)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        configured = try container.decodeIfPresent(Bool.self, forKey: .configured) ?? false
+        model = try container.decodeIfPresent(String.self, forKey: .model)
+        dimensions = try container.decodeIfPresent(Int.self, forKey: .dimensions) ?? 1536
+        indexable = try container.decodeIfPresent(Int.self, forKey: .indexable) ?? 0
+        indexed = try container.decodeIfPresent(Int.self, forKey: .indexed) ?? 0
+        invalid = try container.decodeIfPresent(Int.self, forKey: .invalid) ?? 0
+        pending = try container.decodeIfPresent(Int.self, forKey: .pending) ?? 0
+        failed = try container.decodeIfPresent(Int.self, forKey: .failed) ?? 0
+        skipped = try container.decodeIfPresent(Int.self, forKey: .skipped) ?? 0
+        coverage = try container.decodeIfPresent(Double.self, forKey: .coverage) ?? 0
+        lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
+        usage = try container.decodeIfPresent(MemoryEmbeddingUsage.self, forKey: .usage)
+            ?? MemoryEmbeddingUsage()
+        recentJobs = try container.decodeIfPresent(
+            [MemoryEmbeddingJobStatus].self,
+            forKey: .recentJobs
+        ) ?? []
+    }
+
+    var coveragePercent: Double {
+        min(max(coverage, 0), 1) * 100
+    }
+
+    var coverageLabel: String {
+        guard indexable > 0 else { return "no memories" }
+        return String(format: "%.1f%%", coveragePercent)
+    }
+
+    var healthLabel: String {
+        if !configured {
+            return "not configured"
+        }
+        if !enabled {
+            return "disabled"
+        }
+        if failed > 0 || invalid > 0 {
+            return "degraded"
+        }
+        if pending > 0 {
+            return "indexing"
+        }
+        return "healthy"
+    }
+}
+
+struct MemoryEmbeddingsRebuildResult: Codable, Sendable {
+    let projectId: String
+    let enabled: Bool
+    let model: String?
+    let dimensions: Int
+    let cleared: Int
+    let enqueued: Int
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case enabled
+        case model
+        case dimensions
+        case cleared
+        case enqueued
+    }
+}
+
+struct MemoryEmbeddingsTestResult: Codable, Sendable {
+    let projectId: String
+    let ok: Bool
+    let model: String?
+    let dimensions: Int
+    let latencyMs: Int
+    let inputTokens: Int
+    let estimatedTokens: Int
+    let providerReported: Bool
+    let error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case ok
+        case model
+        case dimensions
+        case latencyMs = "latency_ms"
+        case inputTokens = "input_tokens"
+        case estimatedTokens = "estimated_tokens"
+        case providerReported = "provider_reported"
+        case error
     }
 }
 
