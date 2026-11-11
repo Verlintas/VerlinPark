@@ -337,6 +337,14 @@ impl RunJournal {
             "tool_call_id": tool.tool_call_id,
             "tool_name": tool.tool_name,
             "is_error": output.is_error,
+            "error_code": output
+                .failure
+                .as_ref()
+                .map(|failure| failure.code.as_str()),
+            "retryable": output
+                .failure
+                .as_ref()
+                .is_some_and(|failure| failure.retryable),
         });
         completed_step.updated_at = now_rfc3339();
         let mut completed_tool = tool.clone();
@@ -1081,6 +1089,14 @@ fn bounded_tool_result(output: &ToolOutput) -> Value {
         "content": truncate_chars(&output.content, MAX_RESULT_CHARS),
         "is_error": output.is_error,
         "truncated": truncated,
+        "error_code": output
+            .failure
+            .as_ref()
+            .map(|failure| failure.code.as_str()),
+        "retryable": output
+            .failure
+            .as_ref()
+            .is_some_and(|failure| failure.retryable),
         "structured": crate::tools::bounded_structured(output.structured.clone()),
     })
 }
@@ -1468,6 +1484,29 @@ mod tests {
             last_event_seq: 0,
             failure: None,
         }
+    }
+
+    #[test]
+    fn bounded_tool_result_keeps_failure_contract_for_resume() {
+        let output = ToolOutput::error_coded(
+            "edit_file",
+            crate::tooling::errors::ToolErrorCode::PATCH_CONFLICT,
+            "old_string was not found",
+        )
+        .with_failure_evidence("path=src/lib.rs");
+        let value = bounded_tool_result(&output);
+        assert_eq!(value["is_error"], true);
+        assert_eq!(value["error_code"], "PATCH_CONFLICT");
+        assert_eq!(value["retryable"], true);
+        assert_eq!(value["structured"]["code"], "PATCH_CONFLICT");
+        assert_eq!(value["structured"]["tool"], "edit_file");
+        assert_eq!(value["structured"]["evidence"], "path=src/lib.rs");
+        assert!(
+            value["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("error[PATCH_CONFLICT]")
+        );
     }
 
     #[test]

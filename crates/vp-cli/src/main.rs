@@ -1136,6 +1136,24 @@ enum Command {
     },
     /// Show plan-task progress and stall observations for a session.
     TaskStalls { session: String },
+    /// Show a bounded per-tool activity timeline (latency, errors, output bytes).
+    ToolActivity {
+        session: String,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        /// Emit CSV instead of the human timeline.
+        #[arg(long)]
+        csv: bool,
+    },
+    /// List the stable tool error-code catalog (no daemon required).
+    ToolCodes {
+        /// Filter by category, such as file, git, shell, remote, or mcp.
+        #[arg(long)]
+        category: Option<String>,
+        /// Only show codes whose retryable flag matches this value.
+        #[arg(long)]
+        retryable: Option<bool>,
+    },
     /// Show automatic stall recovery state for a session.
     Recoveries { session: String },
     /// Create a session for a project.
@@ -1976,7 +1994,35 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
+    if let Command::ToolCodes {
+        category,
+        retryable,
+    } = &cli.command
+    {
+        let entries = filtered_tool_codes(category.as_deref(), *retryable);
+        if cli.json {
+            print_json(&serde_json::to_value(&entries)?)?;
+        } else if entries.is_empty() {
+            println!("No matching tool error codes.");
+        } else {
+            for entry in entries {
+                println!(
+                    "{:<28} {:<10} {:<9} {}",
+                    entry.code.as_str(),
+                    entry.category,
+                    if entry.retryable {
+                        "retryable"
+                    } else {
+                        "terminal"
+                    },
+                    entry.hint
+                );
+            }
+        }
+        return Ok(());
+    }
     let discovery = read_discovery(cli.data_dir.as_deref())?;
+    let want_tool_activity_csv = matches!(&cli.command, Command::ToolActivity { csv: true, .. });
     let value = match cli.command {
         Command::DbRebuild { .. } => unreachable!("db rebuild is handled before discovery"),
         Command::Backup { .. } => unreachable!("backup is handled before discovery"),
@@ -1984,6 +2030,7 @@ async fn main() -> Result<()> {
         Command::BackupList { .. } => unreachable!("backup-list is handled before discovery"),
         Command::BackupPrune { .. } => unreachable!("backup-prune is handled before discovery"),
         Command::Bench { .. } => unreachable!("bench is handled before discovery"),
+        Command::ToolCodes { .. } => unreachable!("tool-codes is handled before discovery"),
         Command::Ping => {
             let result = rpc(&discovery, "ping", json!({})).await?;
             if cli.json {
@@ -3741,6 +3788,18 @@ async fn main() -> Result<()> {
         Command::TaskStalls { session } => {
             rpc(&discovery, "session.stalls", json!({"session_id": session})).await?
         }
+        Command::ToolActivity {
+            session,
+            limit,
+            csv: _,
+        } => {
+            rpc(
+                &discovery,
+                "session.tool_activity",
+                json!({"session_id": session, "limit": limit}),
+            )
+            .await?
+        }
         Command::Recoveries { session } => {
             rpc(
                 &discovery,
@@ -5168,6 +5227,10 @@ async fn main() -> Result<()> {
         }
     };
 
+    if want_tool_activity_csv {
+        print!("{}", tool_activity_csv(&value));
+        return Ok(());
+    }
     if cli.json {
         print_json(&value)?;
     } else {
@@ -5531,6 +5594,158 @@ fn print_program_line(program: &Value) {
 
 /// Human rendering for the durable context checkpoint surface. Returns
 /// `None` for every other RPC shape so the generic printer owns them.
+fn tool_activity_csv(value: &Value) -> String {
+    const COLUMNS: &[&str] = &[
+        "seq",
+        "created_at",
+        "tool_call_id",
+        "name",
+        "status",
+        "error_code",
+        "retryable",
+        "duration_ms",
+        "output_bytes",
+        "truncated",
+        "approval_risk",
+        "approval_mode",
+        "approval_wait_ms",
+        "hint",
+    ];
+    let mut output = COLUMNS.join(",");
+    output.push('\n');
+    let Some(entries) = value.get("entries").and_then(Value::as_array) else {
+        return output;
+    };
+    for entry in entries {
+        let status = if entry["is_error"].as_bool().unwrap_or(false) {
+            entry["error_code"].as_str().unwrap_or("TOOL_FAILED")
+        } else {
+            "ok"
+        };
+        let row = [
+            entry["seq"].as_u64().unwrap_or(0).to_string(),
+            entry["created_at"].as_str().unwrap_or("").to_string(),
+            entry["tool_call_id"].as_str().unwrap_or("").to_string(),
+            entry["name"].as_str().unwrap_or("").to_string(),
+            status.to_string(),
+            entry["error_code"].as_str().unwrap_or("").to_string(),
+            entry["retryable"].as_bool().unwrap_or(false).to_string(),
+            entry["duration_ms"].as_u64().unwrap_or(0).to_string(),
+            entry["output_bytes"].as_u64().unwrap_or(0).to_string(),
+            entry["truncated"].as_bool().unwrap_or(false).to_string(),
+            entry["approval_risk"].as_str().unwrap_or("").to_string(),
+            entry["approval_mode"].as_str().unwrap_or("").to_string(),
+            entry["approval_wait_ms"]
+                .as_u64()
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            entry["hint"].as_str().unwrap_or("").to_string(),
+        ];
+        output.push_str(
+            &row.iter()
+                .map(|cell| csv_cell(cell))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        output.push('\n');
+    }
+    output
+}
+
+fn csv_cell(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+fn filtered_tool_codes(
+    category: Option<&str>,
+    retryable: Option<bool>,
+) -> Vec<vp_core::tooling::errors::ToolErrorCatalogEntry> {
+    let mut entries = vp_core::tooling::errors::catalog();
+    if let Some(category) = category {
+        let category = category.trim().to_ascii_lowercase();
+        entries.retain(|entry| entry.category == category);
+    }
+    if let Some(retryable) = retryable {
+        entries.retain(|entry| entry.retryable == retryable);
+    }
+    entries.sort_by(|left, right| {
+        left.category
+            .cmp(right.category)
+            .then_with(|| left.code.as_str().cmp(right.code.as_str()))
+    });
+    entries
+}
+
+fn tool_activity_lines(value: &Value) -> Option<Vec<String>> {
+    let entries = value.get("entries")?.as_array()?;
+    let summary = value.get("summary")?;
+    let calls = summary.get("calls")?.as_u64()?;
+    value.get("total").and_then(Value::as_u64)?;
+    if !entries
+        .iter()
+        .all(|entry| entry.get("duration_ms").is_some())
+    {
+        return None;
+    }
+    let mut lines = vec![format!(
+        "{} tool call(s) · {} error(s) · {} retryable · avg {} ms · max {} ms · {} output bytes{}",
+        calls,
+        summary["errors"].as_u64().unwrap_or(0),
+        summary["retryable_errors"].as_u64().unwrap_or(0),
+        summary["average_duration_ms"].as_u64().unwrap_or(0),
+        summary["max_duration_ms"].as_u64().unwrap_or(0),
+        summary["output_bytes"].as_u64().unwrap_or(0),
+        if value["truncated"].as_bool().unwrap_or(false) {
+            " · older events omitted"
+        } else {
+            ""
+        }
+    )];
+    if entries.is_empty() {
+        lines.push("No tool activity recorded for this session.".to_string());
+        return Some(lines);
+    }
+    for entry in entries {
+        let status = if entry["is_error"].as_bool().unwrap_or(false) {
+            entry["error_code"].as_str().unwrap_or("ERROR")
+        } else {
+            "ok"
+        };
+        let retry = if entry["is_error"].as_bool().unwrap_or(false) {
+            if entry["retryable"].as_bool().unwrap_or(false) {
+                " · retryable"
+            } else {
+                ""
+            }
+        } else {
+            ""
+        };
+        let truncated = if entry["truncated"].as_bool().unwrap_or(false) {
+            " · truncated"
+        } else {
+            ""
+        };
+        lines.push(format!(
+            "{}  {:<18} {:<9} {:>6} ms  {:>8} bytes{}{}",
+            entry["created_at"].as_str().unwrap_or("?"),
+            entry["name"].as_str().unwrap_or("unknown"),
+            status,
+            entry["duration_ms"].as_u64().unwrap_or(0),
+            entry["output_bytes"].as_u64().unwrap_or(0),
+            truncated,
+            retry
+        ));
+        if let Some(hint) = entry["hint"].as_str().filter(|hint| !hint.is_empty()) {
+            lines.push(format!("    hint: {hint}"));
+        }
+    }
+    Some(lines)
+}
+
 fn context_checkpoint_lines(value: &Value) -> Option<Vec<String>> {
     if let Some(checkpoints) = value.get("checkpoints").and_then(Value::as_array)
         && value.get("latest_id").is_some()
@@ -5730,6 +5945,12 @@ fn lsp_status_lines(value: &Value) -> Option<Vec<String>> {
 
 fn print_human(value: &Value) {
     if let Some(lines) = lsp_status_lines(value) {
+        for line in lines {
+            println!("{line}");
+        }
+        return;
+    }
+    if let Some(lines) = tool_activity_lines(value) {
         for line in lines {
             println!("{line}");
         }
@@ -9221,5 +9442,186 @@ mod context_checkpoint_preview_tests {
         assert!(checkpoint_line.ends_with('…'), "{checkpoint_line}");
         assert!(checkpoint_line.chars().count() < 180);
         assert!(lines[1].contains("sweep on"));
+    }
+}
+
+#[cfg(test)]
+mod tool_activity_cli_tests {
+    use super::*;
+
+    fn activity(entries: Value, truncated: bool) -> Value {
+        json!({
+            "session_id": "ses-1",
+            "entries": entries,
+            "total": 12,
+            "limit": 50,
+            "truncated": truncated,
+            "summary": {
+                "calls": 2,
+                "errors": 1,
+                "retryable_errors": 1,
+                "truncated_results": 1,
+                "total_duration_ms": 140,
+                "max_duration_ms": 100,
+                "average_duration_ms": 70,
+                "output_bytes": 2048,
+                "by_tool": []
+            }
+        })
+    }
+
+    #[test]
+    fn empty_activity_prints_a_clear_summary() {
+        let lines = tool_activity_lines(&activity(json!([]), false)).unwrap();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("2 tool call(s)"));
+        assert!(lines[0].contains("1 error(s)"));
+        assert!(lines[0].contains("avg 70 ms"));
+        assert!(lines[1].contains("No tool activity"));
+    }
+
+    #[test]
+    fn rows_show_code_hint_and_retryability_without_content() {
+        let value = activity(
+            json!([
+                {
+                    "tool_call_id": "call-1",
+                    "name": "edit_file",
+                    "seq": 7,
+                    "is_error": true,
+                    "error_code": "PATCH_CONFLICT",
+                    "retryable": true,
+                    "hint": "Re-read the file and regenerate the patch.",
+                    "duration_ms": 100,
+                    "output_bytes": 512,
+                    "truncated": true,
+                    "approval_risk": "workspace_write",
+                    "approval_mode": "smart",
+                    "approval_wait_ms": 40,
+                    "created_at": "2026-11-11T00:00:00Z"
+                },
+                {
+                    "tool_call_id": "call-2",
+                    "name": "read_file",
+                    "seq": 8,
+                    "is_error": false,
+                    "duration_ms": 40,
+                    "output_bytes": 1536,
+                    "truncated": false,
+                    "created_at": "2026-11-11T00:00:01Z"
+                }
+            ]),
+            true,
+        );
+        let lines = tool_activity_lines(&value).unwrap();
+        assert!(lines[0].contains("older events omitted"));
+        assert!(lines.iter().any(|line| line.contains("PATCH_CONFLICT")));
+        assert!(lines.iter().any(|line| line.contains("retryable")));
+        assert!(lines.iter().any(|line| line.contains("truncated")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Re-read the file and regenerate"))
+        );
+        assert!(lines.iter().any(|line| line.contains("read_file")));
+        let rendered = lines.join("\n");
+        assert!(!rendered.contains("provider output"));
+    }
+
+    #[test]
+    fn tool_code_catalog_filters_are_stable() {
+        let all = filtered_tool_codes(None, None);
+        assert!(all.len() >= 100);
+        assert!(all.windows(2).all(|pair| {
+            pair[0]
+                .category
+                .cmp(pair[1].category)
+                .then_with(|| pair[0].code.as_str().cmp(pair[1].code.as_str()))
+                .is_le()
+        }));
+        let file = filtered_tool_codes(Some(" FILE "), None);
+        assert!(!file.is_empty());
+        assert!(file.iter().all(|entry| entry.category == "file"));
+        assert!(
+            file.iter()
+                .any(|entry| entry.code.as_str() == "PATCH_CONFLICT")
+        );
+        let retryable = filtered_tool_codes(None, Some(true));
+        assert!(!retryable.is_empty());
+        assert!(retryable.iter().all(|entry| entry.retryable));
+        assert!(
+            retryable
+                .iter()
+                .any(|entry| entry.code.as_str() == "WAIT_TIMEOUT")
+        );
+        let terminal = filtered_tool_codes(Some("shell"), Some(false));
+        assert!(!terminal.is_empty());
+        assert!(terminal.iter().all(|entry| !entry.retryable));
+        assert!(filtered_tool_codes(Some("not-a-category"), None).is_empty());
+        assert!(
+            filtered_tool_codes(Some("file"), Some(true)).len()
+                < filtered_tool_codes(Some("file"), None).len()
+        );
+    }
+
+    #[test]
+    fn csv_export_is_stable_and_escaped() {
+        let csv = tool_activity_csv(&activity(
+            json!([
+                {
+                    "tool_call_id": "call,one",
+                    "name": "shell",
+                    "seq": 4,
+                    "is_error": true,
+                    "error_code": "COMMAND_FAILED",
+                    "retryable": false,
+                    "hint": "line one\nline \"two\"",
+                    "duration_ms": 12,
+                    "output_bytes": 34,
+                    "truncated": false,
+                    "approval_risk": "host_state",
+                    "approval_mode": "strict",
+                    "approval_wait_ms": 56,
+                    "created_at": "2026-11-11T00:00:00Z"
+                }
+            ]),
+            false,
+        ));
+        assert!(csv.starts_with("seq,created_at,tool_call_id,name,status,error_code,retryable,duration_ms,output_bytes,truncated,approval_risk,approval_mode,approval_wait_ms,hint\n"));
+        assert!(csv.contains("\"call,one\""));
+        assert!(csv.contains("COMMAND_FAILED"));
+        assert!(csv.contains("\"line one\nline \"\"two\"\"\""));
+        assert!(csv.contains(",strict,56,"));
+        // The embedded newline is quoted, so the raw newline count is three:
+        // header, the quoted hint line break, and the record terminator.
+        assert_eq!(csv.matches('\n').count(), 3);
+    }
+
+    #[test]
+    fn csv_export_handles_missing_entries() {
+        let csv = tool_activity_csv(&json!({"session_id": "ses-1"}));
+        assert_eq!(csv.lines().count(), 1);
+        assert!(csv.ends_with('\n'));
+        assert!(csv.starts_with("seq,"));
+    }
+
+    #[test]
+    fn legacy_and_unrelated_payloads_are_not_misformatted() {
+        let legacy = json!({
+            "session_id": "ses-1",
+            "entries": [{"name": "shell"}],
+            "total": 1,
+            "summary": {"calls": 1}
+        });
+        assert!(tool_activity_lines(&legacy).is_none());
+        assert!(tool_activity_lines(&json!({"events": []})).is_none());
+        assert!(
+            tool_activity_lines(&json!({
+                "session_id": "ses-1",
+                "entries": [],
+                "summary": {"calls": 0}
+            }))
+            .is_none()
+        );
     }
 }

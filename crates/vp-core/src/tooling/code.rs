@@ -3464,7 +3464,16 @@ mod tests {
         assert_eq!(structured["source"], "build");
         assert_eq!(structured["status"], "unavailable");
         assert_eq!(structured["fallback_reason"], "lsp_unsupported_language");
-        assert!(output.content.contains("no language server"));
+        assert!(
+            output.content.contains("DIAGNOSTICS_UNAVAILABLE"),
+            "provider text must carry the stable error code: {}",
+            output.content
+        );
+        assert!(
+            output
+                .content
+                .contains("no check or lint command was detected")
+        );
     }
 
     #[tokio::test]

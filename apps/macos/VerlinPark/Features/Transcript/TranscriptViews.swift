@@ -35,6 +35,15 @@ struct ToolTraceRow: View {
                         .foregroundStyle(VPTheme.textPrimary)
                         .lineLimit(1)
 
+                    if entry.isError, let code = entry.errorCode {
+                        Text(code)
+                            .font(VPTheme.mono(7, weight: .semibold))
+                            .foregroundStyle(VPTheme.danger)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(VPTheme.danger.opacity(0.10), in: Capsule())
+                    }
+
                     if !entry.summary.isEmpty {
                         Text(entry.summary)
                             .font(VPTheme.mono(9))
@@ -95,10 +104,23 @@ struct ToolTraceRow: View {
                     .textSelection(.enabled)
                     .padding(.leading, 19)
                     .padding(.bottom, 3)
+                if let hint = entry.errorHint, !hint.isEmpty {
+                    Text(hint)
+                        .font(VPTheme.mono(8))
+                        .foregroundStyle(VPTheme.textTertiary)
+                        .lineLimit(2)
+                        .padding(.leading, 19)
+                        .padding(.bottom, 3)
+                }
             }
 
             if expanded {
                 VStack(alignment: .leading, spacing: 6) {
+                    if let details = toolDetails {
+                        Text(details)
+                            .font(VPTheme.mono(8))
+                            .foregroundStyle(VPTheme.textTertiary)
+                    }
                     if entry.input != .null {
                         detailLabel("INPUT")
                         Text(entry.input.prettyString())
@@ -124,6 +146,26 @@ struct ToolTraceRow: View {
             VPMotion.resolved(VPMotion.snap, reduceMotion: reduceMotion),
             value: expanded
         )
+    }
+
+    private var toolDetails: String? {
+        var parts: [String] = []
+        if let duration = entry.durationMs {
+            parts.append(ToolActivityMetrics.durationLabel(duration))
+        }
+        if let bytes = entry.outputBytes {
+            parts.append("output \(ToolActivityMetrics.byteLabel(bytes))")
+        }
+        if entry.truncated {
+            parts.append("truncated")
+        }
+        if entry.isError, entry.retryable {
+            parts.append("retryable")
+        }
+        if let code = entry.errorCode, entry.isError {
+            parts.append(code)
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
     private func detailLabel(_ text: String) -> some View {

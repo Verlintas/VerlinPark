@@ -85,12 +85,12 @@ use vp_protocol::types::{
     SourceListParams, SourceSearchParams, SubscribeParams, TaskActionParams, TaskActionResult,
     TaskDispatchParams, TaskDispatchResult, TaskQueueParams, TaskSchedulerPolicyParams,
     TeamPlanParams, TeamPlanResult, TerminalCloseParams, TerminalOpenParams, TerminalReadParams,
-    TerminalResizeParams, TerminalWriteParams, ToolOutputAuditParams, ToolOutputListParams,
-    ToolOutputPolicyParams, ToolOutputPolicyResult, ToolOutputPruneParams, ToolOutputStatusParams,
-    UpdateAcpAgentParams, UpdateCheckParams, UpdateDownloadParams, UpdateMcpServerParams,
-    UpdateModelPresetParams, UpdateSourceMetadataParams, UsageLedgerParams, WorkspaceFileParams,
-    WorkspaceGrepParams, WorkspaceListParams, WorkspaceSearchParams, WorkspaceTreeParams,
-    WorkspaceWriteParams, WorktreePolicyParams,
+    TerminalResizeParams, TerminalWriteParams, ToolActivityParams, ToolOutputAuditParams,
+    ToolOutputListParams, ToolOutputPolicyParams, ToolOutputPolicyResult, ToolOutputPruneParams,
+    ToolOutputStatusParams, UpdateAcpAgentParams, UpdateCheckParams, UpdateDownloadParams,
+    UpdateMcpServerParams, UpdateModelPresetParams, UpdateSourceMetadataParams, UsageLedgerParams,
+    WorkspaceFileParams, WorkspaceGrepParams, WorkspaceListParams, WorkspaceSearchParams,
+    WorkspaceTreeParams, WorkspaceWriteParams, WorktreePolicyParams,
 };
 use vp_protocol::types::{
     ComputerLeaseInfo, ComputerLeaseListResult, ComputerLeaseReleaseParams,
@@ -2631,6 +2631,17 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "session.restore_log" => match parse_params::<SessionLogParams>(request.params) {
             Ok(params) => match state.engine.restore_session_log(&params.session_id).await {
                 Ok(status) => RpcResponse::success(id, status),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.tool_activity" => match parse_params::<ToolActivityParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .session_tool_activity(&params.session_id, params.limit.unwrap_or(50))
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),

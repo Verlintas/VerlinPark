@@ -142,6 +142,28 @@ fn test_service_with_provider_cap(
     (engine, service, project)
 }
 
+fn help_spec(role: AgentRole, profile: AgentProfile) -> AgentSpec {
+    AgentSpec {
+        id: format!("help-{}", role.as_str()),
+        role,
+        name: format!("Help {}", role.default_name()),
+        depth: 1,
+        parent_name: None,
+        title: None,
+        task_id: None,
+        department: None,
+        profile,
+        allow_delegation: false,
+        auto_approve: false,
+        worktree: PathBuf::from("/tmp/help-worktree"),
+        branch: "help".to_string(),
+        session_worktree: PathBuf::from("/tmp/help-worktree"),
+        session_branch: "help".to_string(),
+        write_scope: Vec::new(),
+        base_commit: "0".repeat(40),
+    }
+}
+
 fn set_approval_mode(service: &AgentService, mode: ApprovalMode) {
     let mut config = service
         .config
@@ -1030,7 +1052,8 @@ async fn writes_a_persisted_plan() {
         .await
         .unwrap();
     service.start(&session.id, "plan the work").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let finished = wait_until_idle(&engine, &session).await;
+    assert_eq!(finished.status, "idle");
     let todos = engine.list_todos(&session.id).await.unwrap();
     assert_eq!(todos.len(), 2);
     assert_eq!(todos[1].status, "in_progress");
@@ -7854,6 +7877,86 @@ async fn agent_shaping_uses_the_project_tool_output_policy() {
 }
 
 #[tokio::test]
+async fn error_failure_contract_survives_output_spill_shaping() {
+    let dir = TempDir::new().unwrap();
+    let (engine, _service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id.clone(), "error shaping".into(), None)
+        .await
+        .unwrap();
+    let spec = AgentSpec {
+        id: "leader".into(),
+        role: AgentRole::Leader,
+        name: "Leader".into(),
+        depth: 0,
+        parent_name: None,
+        title: None,
+        task_id: None,
+        department: None,
+        profile: AgentProfile::Generic,
+        allow_delegation: true,
+        auto_approve: false,
+        worktree: PathBuf::from("."),
+        branch: "test".into(),
+        session_worktree: PathBuf::from("."),
+        session_branch: "test".into(),
+        write_scope: Vec::new(),
+        base_commit: String::new(),
+    };
+    let policy = vp_protocol::types::ToolOutputPolicy {
+        spill_threshold_bytes: 256,
+        preview_bytes: 128,
+        max_total_bytes_per_turn: 500_000,
+        ..vp_protocol::types::ToolOutputPolicy::default()
+    };
+    engine
+        .set_tool_output_policy(&project.id, policy)
+        .await
+        .unwrap();
+    let mut output = ToolOutput::error_coded(
+        "shell",
+        crate::tooling::errors::ToolErrorCode::COMMAND_FAILED,
+        "command failed with a long diagnostic body",
+    )
+    .with_failure_evidence("exit_code=2");
+    output
+        .content
+        .push_str(&format!("\n{}", "diagnostic ".repeat(2_000)));
+    output.total_bytes = output.content.len() as u64;
+    output.preview_bytes = output.total_bytes;
+    let pending = crate::tool_output::PendingToolOutput {
+        tool_call_id: "call_error_spill".into(),
+        tool_name: "shell".into(),
+        output,
+    };
+    let (mut shaped, _) =
+        shape_tool_output_batch(&engine, &session, &spec, &project, 0, vec![pending])
+            .await
+            .unwrap();
+    let output = &mut shaped[0].output;
+    assert!(output.is_error);
+    assert!(output.output_ref.is_some());
+    assert!(output.truncated);
+    assert!(output.content.len() < output.total_bytes as usize);
+    assert!(output.content.starts_with("error[COMMAND_FAILED]"));
+    let failure = output.failure.as_ref().expect("failure contract");
+    assert_eq!(
+        failure.code,
+        crate::tooling::errors::ToolErrorCode::COMMAND_FAILED
+    );
+    assert!(!failure.retryable);
+    let structured = output.structured.as_ref().unwrap();
+    assert_eq!(structured["code"], "COMMAND_FAILED");
+    assert_eq!(structured["retryable"], false);
+    assert_eq!(structured["evidence"], "exit_code=2");
+    output.annotate_shape_metadata();
+    let annotated = output.structured.as_ref().unwrap();
+    assert_eq!(annotated["code"], "COMMAND_FAILED");
+    assert_eq!(annotated["truncated"], true);
+    assert!(annotated["output_ref"].as_str().is_some());
+}
+
+#[tokio::test]
 async fn read_tool_output_is_advertised_to_every_read_only_role() {
     let dir = TempDir::new().unwrap();
     let (_engine, service, _project) = test_service(&dir);
@@ -10818,6 +10921,441 @@ async fn executes_parallel_reads_and_structured_patch_tools() {
             event.kind == "agent.turn_finished" && event.payload["parallel"] == true
         })
     );
+}
+
+#[tokio::test]
+async fn stable_prompt_includes_bounded_role_filtered_recipes() {
+    let dir = TempDir::new().unwrap();
+    let (engine, _service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id.clone(), "recipes".into(), None)
+        .await
+        .unwrap();
+    let worker = help_spec(AgentRole::Worker, AgentProfile::Coding);
+    let first = role_system_prompt(
+        AgentRole::Worker,
+        &project,
+        &session,
+        &worker,
+        "implement the change",
+    );
+    let second = role_system_prompt(
+        AgentRole::Worker,
+        &project,
+        &session,
+        &worker,
+        "implement the change",
+    );
+    assert_eq!(first.stable_prefix, second.stable_prefix);
+    assert_eq!(first.run_context, second.run_context);
+    assert!(first.stable_prefix.contains("Tool recipes"));
+    assert!(first.stable_prefix.contains("safe_edit"));
+    assert!(!first.stable_prefix.contains("read_tool_output (retryable)"));
+    assert!(
+        first.stable_prefix.chars().count() < 12_000,
+        "stable prefix unexpectedly large: {}",
+        first.stable_prefix.chars().count()
+    );
+
+    let verifier = help_spec(AgentRole::Verifier, AgentProfile::Verification);
+    let verifier_prompt = role_system_prompt(
+        AgentRole::Verifier,
+        &project,
+        &session,
+        &verifier,
+        "verify the change",
+    );
+    assert!(verifier_prompt.stable_prefix.contains("test_and_check"));
+    assert!(!verifier_prompt.stable_prefix.contains("safe_edit:"));
+    assert!(!verifier_prompt.stable_prefix.contains("gui_verification:"));
+
+    let leader = help_spec(AgentRole::Leader, AgentProfile::Generic);
+    let leader_prompt =
+        role_system_prompt(AgentRole::Leader, &project, &session, &leader, "coordinate");
+    assert!(leader_prompt.stable_prefix.contains("remote_operation"));
+    assert!(leader_prompt.stable_prefix.contains("gui_verification"));
+}
+
+#[test]
+fn tool_help_is_read_only_role_filtered_and_bounded() {
+    let config_dir = TempDir::new().unwrap();
+    let leader = help_spec(AgentRole::Leader, AgentProfile::Generic);
+    let output = run_tool_help(&leader, &json!({}));
+    assert!(!output.is_error);
+    assert!(output.content.contains("read_many_files"));
+    assert!(output.content.contains("safe_edit"));
+    assert!(output.content.chars().count() <= crate::tooling::recipes::MAX_HELP_RENDER_CHARS);
+    let structured = output.structured.unwrap();
+    assert_eq!(structured["executed_tool"], false);
+    assert_eq!(structured["role"], "leader");
+    assert_eq!(
+        structured["catalog_hash"],
+        crate::tooling::recipes::catalog_hash()
+    );
+    assert!(structured["recipes"].as_array().unwrap().len() >= 8);
+
+    let verifier = help_spec(AgentRole::Verifier, AgentProfile::Verification);
+    let output = run_tool_help(&verifier, &json!({"recipe": "safe_edit"}));
+    assert!(output.is_error);
+    assert_eq!(output.structured.unwrap()["code"], "INVALID_ARGUMENT");
+    assert!(output.content.contains("No recipe 'safe_edit' applies"));
+
+    let worker = help_spec(AgentRole::Worker, AgentProfile::Coding);
+    let output = run_tool_help(&worker, &json!({"recipe": "safe_edit", "max_chars": 1000}));
+    assert!(!output.is_error);
+    assert!(output.content.contains("expected_sha256"));
+    assert!(output.content.chars().count() <= 1000);
+
+    // Repeated calls are byte-identical for the same role/profile.
+    let first = run_tool_help(&worker, &json!({"recipe": "test_and_check"}));
+    let second = run_tool_help(&worker, &json!({"recipe": "test_and_check"}));
+    assert_eq!(first.content, second.content);
+    assert_eq!(first.structured, second.structured);
+
+    let code = run_tool_help(&worker, &json!({"error_code": "PATCH_CONFLICT"}));
+    assert!(!code.is_error);
+    assert!(code.content.contains("PATCH_CONFLICT"));
+    assert!(code.content.contains("retryable: yes"));
+    let structured = code.structured.unwrap();
+    assert_eq!(structured["error_code"]["code"], "PATCH_CONFLICT");
+    assert_eq!(structured["error_code"]["retryable"], true);
+
+    let unknown = run_tool_help(&worker, &json!({"error_code": "NOT_A_CODE"}));
+    assert!(unknown.is_error);
+    assert_eq!(unknown.structured.unwrap()["code"], "INVALID_ARGUMENT");
+    assert!(unknown.content.contains("include_error_codes"));
+
+    let catalog = run_tool_help(
+        &worker,
+        &json!({"include_error_codes": true, "max_chars": 4000}),
+    );
+    assert!(!catalog.is_error);
+    assert!(catalog.content.contains("[file]"));
+    assert!(catalog.content.contains("PATCH_CONFLICT"));
+    assert!(catalog.content.chars().count() <= 4000);
+
+    // The catalog is guidance, not a schema mutation: the advertised bundle is
+    // byte-identical before and after a help call for every role.
+    let schemas_before = tool_schemas(
+        &leader_config(&config_dir),
+        AgentRole::Worker,
+        AgentProfile::Coding,
+        false,
+    );
+    let _ = run_tool_help(&worker, &json!({"recipe": "safe_edit"}));
+    let schemas_after = tool_schemas(
+        &leader_config(&config_dir),
+        AgentRole::Worker,
+        AgentProfile::Coding,
+        false,
+    );
+    assert_eq!(
+        serde_json::to_value(&schemas_before).unwrap(),
+        serde_json::to_value(&schemas_after).unwrap()
+    );
+    let help = schemas_before
+        .iter()
+        .find(|schema| schema.name == "tool_help")
+        .expect("tool_help schema");
+    assert!(!help.parameters["properties"]["error_code"].is_null());
+    assert!(!help.parameters["properties"]["include_error_codes"].is_null());
+    assert!(!help.parameters["properties"]["recipe"].is_null());
+}
+
+fn leader_config(dir: &TempDir) -> AgentConfig {
+    AgentConfig {
+        provider: Arc::new(QueueProvider {
+            responses: Mutex::new(VecDeque::new()),
+        }),
+        provider_name: "queue".into(),
+        model: "test".into(),
+        role_models: RoleModels::default(),
+        base_url: None,
+        max_turns: 1,
+        max_tokens: Some(128),
+        max_managers: 1,
+        max_workers: 1,
+        max_labour: 1,
+        auto_expand_workers: false,
+        integration_command: None,
+        tools: ToolRegistry::default_tools(),
+        max_active_sessions: 1,
+        scope_locks: Arc::new(ScopeLocks::with_store(Store::open(dir.path()).unwrap())),
+        capacity: Arc::new(CapacityController::new(1, 1)),
+        provider_idle_timeout_secs: 10,
+        question_timeout_secs: 10,
+        approval_mode: ApprovalMode::default(),
+        approval_timeout_secs: 10,
+        compact_after_tokens: 0,
+        compact_keep_messages: 4,
+        compact_keep_tokens: 1_000,
+        compact_prepare_ratio: 0.6,
+        context_window: 0,
+    }
+}
+
+#[tokio::test]
+async fn tool_finished_events_include_metrics_and_failure_contract() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "missing".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"does-not-exist.txt"}"#.into(),
+                }),
+                StreamEvent::ToolCall(ToolCall {
+                    id: "ok".into(),
+                    name: "find_files".into(),
+                    arguments: r#"{"pattern":"*.md"}"#.into(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![StreamEvent::TextDelta("done".into()), StreamEvent::Done],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "tool metrics".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service.start(&session.id, "check metrics").await.unwrap();
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "idle");
+
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    let missing = events
+        .iter()
+        .find(|event| event.kind == "tool.finished" && event.payload["tool_call_id"] == "missing")
+        .expect("missing read result");
+    assert_eq!(missing.payload["is_error"], true);
+    assert_eq!(missing.payload["error_code"], "FILE_NOT_FOUND");
+    assert_eq!(missing.payload["retryable"], false);
+    assert_eq!(missing.payload["approval_mode"], "smart");
+    assert!(missing.payload["duration_ms"].as_u64().is_some());
+    assert!(missing.payload["output_bytes"].as_u64().is_some());
+    assert!(missing.payload["approval_risk"].as_str().is_some());
+    assert!(
+        missing.payload["error_hint"]
+            .as_str()
+            .unwrap()
+            .contains("find_files")
+    );
+    assert!(
+        missing.payload["output"]
+            .as_str()
+            .unwrap()
+            .starts_with("error[FILE_NOT_FOUND]")
+    );
+
+    let ok = events
+        .iter()
+        .find(|event| event.kind == "tool.finished" && event.payload["tool_call_id"] == "ok")
+        .expect("find result");
+    assert_eq!(ok.payload["is_error"], false);
+    assert!(ok.payload["error_code"].is_null());
+    assert_eq!(ok.payload["retryable"], false);
+    assert!(ok.payload["duration_ms"].as_u64().is_some());
+    assert!(ok.payload["output_bytes"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn parallel_tool_events_carry_independent_metrics() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "read".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"README.md"}"#.into(),
+                }),
+                StreamEvent::ToolCall(ToolCall {
+                    id: "find".into(),
+                    name: "find_files".into(),
+                    arguments: r#"{"pattern":"*.md"}"#.into(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("parallel done".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "parallel metrics".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service
+        .start(&session.id, "read in parallel")
+        .await
+        .unwrap();
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "idle");
+
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "agent.turn_finished" && event.payload["parallel"] == true)
+    );
+    for call_id in ["read", "find"] {
+        let event = events
+            .iter()
+            .find(|event| event.kind == "tool.finished" && event.payload["tool_call_id"] == call_id)
+            .unwrap_or_else(|| panic!("missing tool.finished for {call_id}"));
+        assert_eq!(event.payload["is_error"], false);
+        assert!(event.payload["duration_ms"].as_u64().is_some());
+        assert!(event.payload["output_bytes"].as_u64().unwrap() > 0);
+        assert_eq!(event.payload["approval_mode"], "smart");
+        assert_eq!(event.payload["approval_risk"], "read_only");
+        assert!(event.payload["error_code"].is_null());
+        assert_eq!(event.payload["retryable"], false);
+    }
+}
+
+#[tokio::test]
+async fn session_tool_activity_is_bounded_and_projects_legacy_events() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let engine = Engine::new(store);
+    let project_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    std::fs::write(project_dir.join("README.md"), "activity\n").unwrap();
+    init_repo(&project_dir);
+    let project = engine
+        .store()
+        .add_project(project_dir.to_str().unwrap(), Some("repo"))
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "tool activity".into(), None)
+        .await
+        .unwrap();
+    engine
+        .append_event(
+            &session.id,
+            "tool.finished",
+            json!({
+                "tool_call_id": "old",
+                "name": "read_file",
+                "output": "failed",
+                "is_error": true,
+                "structured": {"code": "FILE_NOT_FOUND"}
+            }),
+        )
+        .await
+        .unwrap();
+    engine
+        .append_event(
+            &session.id,
+            "tool.finished",
+            json!({
+                "tool_call_id": "new",
+                "name": "find_files",
+                "output": "ok",
+                "is_error": false,
+                "duration_ms": 42,
+                "output_bytes": 120,
+                "truncated": true,
+                "approval_risk": "read_only",
+                "approval_mode": "strict",
+                "approval_wait_ms": 25
+            }),
+        )
+        .await
+        .unwrap();
+    let activity = engine.session_tool_activity(&session.id, 1).await.unwrap();
+    assert_eq!(activity.limit, 1);
+    assert_eq!(activity.total, 2);
+    assert!(activity.truncated);
+    assert_eq!(activity.entries.len(), 1);
+    assert_eq!(activity.entries[0].tool_call_id, "new");
+    assert_eq!(activity.entries[0].duration_ms, 42);
+    assert_eq!(activity.entries[0].output_bytes, 120);
+    assert!(activity.entries[0].truncated);
+    assert_eq!(activity.entries[0].approval_mode.as_deref(), Some("strict"));
+    assert_eq!(activity.summary.calls, 1);
+    assert_eq!(activity.summary.max_duration_ms, 42);
+    assert_eq!(activity.summary.approval_waits, 1);
+    assert_eq!(activity.summary.max_approval_wait_ms, 25);
+    assert!(activity.summary.error_codes.is_empty());
+
+    let activity = engine.session_tool_activity(&session.id, 50).await.unwrap();
+    assert!(!activity.truncated);
+    let legacy = activity
+        .entries
+        .iter()
+        .find(|entry| entry.tool_call_id == "old")
+        .expect("legacy entry");
+    assert!(legacy.is_error);
+    assert_eq!(legacy.error_code.as_deref(), Some("FILE_NOT_FOUND"));
+    assert!(!legacy.retryable);
+    assert_eq!(legacy.duration_ms, 0);
+    assert!(legacy.hint.as_deref().unwrap().contains("find_files"));
+    assert_eq!(activity.summary.errors, 1);
+    assert_eq!(activity.summary.error_codes[0].code, "FILE_NOT_FOUND");
+}
+
+#[tokio::test]
+async fn tool_activity_projection_caps_names_hints_and_counts() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let engine = Engine::new(store);
+    let project_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    std::fs::write(project_dir.join("README.md"), "activity\n").unwrap();
+    init_repo(&project_dir);
+    let project = engine
+        .store()
+        .add_project(project_dir.to_str().unwrap(), Some("repo"))
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "tool bounds".into(), None)
+        .await
+        .unwrap();
+    engine
+        .append_event(
+            &session.id,
+            "tool.finished",
+            json!({
+                "tool_call_id": "x".repeat(500),
+                "name": "n".repeat(500),
+                "is_error": true,
+                "error_code": "UNKNOWN_LEGACY_CODE",
+                "error_hint": "h".repeat(10_000),
+                "duration_ms": u64::MAX,
+                "output_bytes": 7,
+                "approval_wait_ms": u64::MAX,
+            }),
+        )
+        .await
+        .unwrap();
+    let activity = engine.session_tool_activity(&session.id, 50).await.unwrap();
+    let entry = &activity.entries[0];
+    assert_eq!(entry.tool_call_id.chars().count(), 200);
+    assert_eq!(entry.name.chars().count(), 120);
+    assert_eq!(entry.error_code.as_deref(), Some("TOOL_FAILED"));
+    assert_eq!(entry.hint.as_ref().unwrap().chars().count(), 600);
+    assert_eq!(entry.duration_ms, 86_400_000);
+    assert_eq!(entry.approval_wait_ms, Some(86_400_000));
+    assert_eq!(activity.summary.error_codes[0].code, "TOOL_FAILED");
 }
 
 #[tokio::test]

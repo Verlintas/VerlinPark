@@ -46,6 +46,7 @@ private struct ProjectStageView: View {
     @Binding var inspectorVisible: Bool
     @State private var draft = ""
     @State private var showingContext = false
+    @State private var showingToolActivity = false
     @State private var showingFork = false
     @State private var showingSteer = false
     @State private var showingDefer = false
@@ -74,6 +75,10 @@ private struct ProjectStageView: View {
             if model.selectedProjectID != nil {
                 await model.loadSkills(silent: true)
             }
+        }
+        .sheet(isPresented: $showingToolActivity) {
+            ToolActivitySheet()
+                .environment(model)
         }
         .sheet(isPresented: $showingFork) {
             if let session = model.selectedSession {
@@ -104,6 +109,14 @@ private struct ProjectStageView: View {
 
     private func contextLabel(_ usage: ContextUsage) -> String {
         "ctx \(contextTokenLabel(usage.estimatedTokens))/\(contextTokenLabel(usage.thresholdTokens))"
+    }
+
+    private var toolActivityLabel: String {
+        guard let activity = model.toolActivity else { return "tools" }
+        if activity.summary.errors > 0 {
+            return "tools \(activity.summary.calls) · \(activity.summary.errors) err"
+        }
+        return "tools \(activity.summary.calls)"
     }
 
     private func contextHelp(_ usage: ContextUsage) -> String {
@@ -186,6 +199,19 @@ private struct ProjectStageView: View {
                                     .environment(model)
                             }
                         }
+                        Button {
+                            showingToolActivity = true
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "wrench.and.screwdriver")
+                                    .font(.system(size: 8, weight: .semibold))
+                                Text(toolActivityLabel)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .help(
+                            "Per-tool latency, stable error codes, retryability, output bytes, and truncation"
+                        )
                         if model.hasLongTaskAttention {
                             longTaskAttentionPill
                         }

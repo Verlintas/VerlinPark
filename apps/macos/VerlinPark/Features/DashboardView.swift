@@ -418,6 +418,7 @@ struct DashboardView: View {
         case .usage:
             if let project = model.selectedProject {
                 EfficiencyCard(project: project)
+                ToolActivityCard()
                 ProjectUsageCard(project: project)
                 ProjectBudgetCard(project: project)
             } else {

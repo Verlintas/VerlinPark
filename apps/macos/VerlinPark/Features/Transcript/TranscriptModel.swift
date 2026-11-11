@@ -40,6 +40,13 @@ struct TranscriptToolEntry: Identifiable, Equatable {
     let agent: String?
     let startedAt: String
     let finishedAt: String?
+    /// Additive `tool.finished` observability. Legacy events decode to nil/0.
+    let errorCode: String?
+    let retryable: Bool
+    let errorHint: String?
+    let durationMs: Int?
+    let outputBytes: Int?
+    let truncated: Bool
 
     var id: String {
         "tool-\(toolCallID)"
@@ -50,6 +57,9 @@ struct TranscriptToolEntry: Identifiable, Equatable {
     }
 
     var duration: TimeInterval? {
+        if let durationMs, durationMs >= 0 {
+            return TimeInterval(durationMs) / 1000
+        }
         guard let finishedAt,
               let start = TranscriptProjection.date(startedAt),
               let end = TranscriptProjection.date(finishedAt)
@@ -109,7 +119,7 @@ enum TranscriptProjection {
             "repo_map", "find_symbol", "find_references", "dependency_graph",
             "build_context", "affected_tests", "code_diagnostics",
             "lsp_query", "read_pdf", "read_image", "read_document", "data_query",
-            "budget_status", "task_detail", "tool_search",
+            "budget_status", "task_detail", "tool_search", "tool_help",
             "todo_write", "fetch_url", "remember", "recall", "coordinate",
             "team_status", "send_message", "read_mailbox", "list_artifacts",
             "read_artifact", "publish_artifact", "search_sources", "read_source",
@@ -240,7 +250,13 @@ enum TranscriptProjection {
                 intelligenceSource: nil,
                 agent: TranscriptProjection.agentLabel(event),
                 startedAt: event.createdAt,
-                finishedAt: nil
+                finishedAt: nil,
+                errorCode: nil,
+                retryable: false,
+                errorHint: nil,
+                durationMs: nil,
+                outputBytes: nil,
+                truncated: false
             )
             if let index = toolIndices[toolCallID] {
                 entries[index] = .tool(entry)
@@ -256,26 +272,37 @@ enum TranscriptProjection {
             else {
                 return
             }
-            let output = event.payload.objectValue?["output"]?.stringValue ?? ""
-            let isError = event.payload.objectValue?["is_error"]?.boolValue ?? false
-            let intelligenceSource = ToolTrace.intelligenceSource(
-                event.payload.objectValue?["structured"]
-            )
+            let payload = event.payload.objectValue
+            let output = payload?["output"]?.stringValue ?? ""
+            let isError = payload?["is_error"]?.boolValue ?? false
+            let intelligenceSource = ToolTrace.intelligenceSource(payload?["structured"])
             if TranscriptProjection.isRoutineTool(name), !isError,
                toolIndices[toolCallID] == nil
             {
                 return
             }
+            let errorCode = payload?["error_code"]?.stringValue
+            let retryable = payload?["retryable"]?.boolValue ?? false
+            let errorHint = payload?["error_hint"]?.stringValue
+            let durationMs = payload?["duration_ms"]?.intValue
+            let outputBytes = payload?["output_bytes"]?.intValue
+            let truncated = payload?["truncated"]?.boolValue ?? false
             let entry = TranscriptToolEntry(
                 toolCallID: toolCallID,
                 name: name,
-                input: event.payload.objectValue?["input"] ?? .null,
+                input: payload?["input"] ?? .null,
                 output: output,
                 isError: isError,
                 intelligenceSource: intelligenceSource,
                 agent: TranscriptProjection.agentLabel(event),
                 startedAt: event.createdAt,
-                finishedAt: event.createdAt
+                finishedAt: event.createdAt,
+                errorCode: errorCode,
+                retryable: retryable,
+                errorHint: errorHint,
+                durationMs: durationMs,
+                outputBytes: outputBytes,
+                truncated: truncated
             )
             if let index = toolIndices[toolCallID],
                case let .tool(existing) = entries[index]
@@ -290,7 +317,13 @@ enum TranscriptProjection {
                         intelligenceSource: intelligenceSource,
                         agent: existing.agent,
                         startedAt: existing.startedAt,
-                        finishedAt: event.createdAt
+                        finishedAt: event.createdAt,
+                        errorCode: errorCode,
+                        retryable: retryable,
+                        errorHint: errorHint,
+                        durationMs: durationMs,
+                        outputBytes: outputBytes,
+                        truncated: truncated
                     )
                 )
             } else {

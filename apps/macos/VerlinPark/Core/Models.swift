@@ -235,6 +235,195 @@ struct ToolOutputStatus: Codable, Sendable {
     }
 }
 
+/// Bounded per-tool activity from `session.tool_activity`. Rows are derived
+/// from `tool.finished` events and never contain provider content.
+struct ToolActivityResult: Codable, Sendable, Equatable {
+    let sessionID: String
+    let entries: [ToolActivityEntry]
+    let total: Int
+    let limit: Int
+    let truncated: Bool
+    let summary: ToolActivitySummary
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case entries
+        case total
+        case limit
+        case truncated
+        case summary
+    }
+}
+
+struct ToolActivityEntry: Codable, Sendable, Equatable, Identifiable {
+    let toolCallID: String
+    let name: String
+    let seq: Int
+    let isError: Bool
+    let errorCode: String?
+    let retryable: Bool
+    let hint: String?
+    let durationMs: Int
+    let outputBytes: Int
+    let truncated: Bool
+    let approvalRisk: String?
+    let approvalMode: String?
+    let approvalWaitMs: Int?
+    let createdAt: String
+
+    var id: String {
+        seq > 0 ? "\(seq)-\(toolCallID)" : toolCallID
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case toolCallID = "tool_call_id"
+        case name
+        case seq
+        case isError = "is_error"
+        case errorCode = "error_code"
+        case retryable
+        case hint
+        case durationMs = "duration_ms"
+        case outputBytes = "output_bytes"
+        case truncated
+        case approvalRisk = "approval_risk"
+        case approvalMode = "approval_mode"
+        case approvalWaitMs = "approval_wait_ms"
+        case createdAt = "created_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        toolCallID = try container.decodeIfPresent(String.self, forKey: .toolCallID) ?? ""
+        name = try container.decodeIfPresent(String.self, forKey: .name) ?? "unknown"
+        seq = try container.decodeIfPresent(Int.self, forKey: .seq) ?? 0
+        isError = try container.decodeIfPresent(Bool.self, forKey: .isError) ?? false
+        errorCode = try container.decodeIfPresent(String.self, forKey: .errorCode)
+        retryable = try container.decodeIfPresent(Bool.self, forKey: .retryable) ?? false
+        hint = try container.decodeIfPresent(String.self, forKey: .hint)
+        durationMs = try container.decodeIfPresent(Int.self, forKey: .durationMs) ?? 0
+        outputBytes = try container.decodeIfPresent(Int.self, forKey: .outputBytes) ?? 0
+        truncated = try container.decodeIfPresent(Bool.self, forKey: .truncated) ?? false
+        approvalRisk = try container.decodeIfPresent(String.self, forKey: .approvalRisk)
+        approvalMode = try container.decodeIfPresent(String.self, forKey: .approvalMode)
+        approvalWaitMs = try container.decodeIfPresent(Int.self, forKey: .approvalWaitMs)
+        createdAt = try container.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
+    }
+}
+
+struct ToolActivitySummary: Codable, Sendable, Equatable {
+    let calls: Int
+    let errors: Int
+    let retryableErrors: Int
+    let truncatedResults: Int
+    let totalDurationMs: Int
+    let maxDurationMs: Int
+    let averageDurationMs: Int
+    let outputBytes: Int
+    let approvalWaits: Int
+    let totalApprovalWaitMs: Int
+    let maxApprovalWaitMs: Int
+    let byTool: [ToolActivityToolStat]
+    let errorCodes: [ToolActivityCodeStat]
+
+    enum CodingKeys: String, CodingKey {
+        case calls
+        case errors
+        case retryableErrors = "retryable_errors"
+        case truncatedResults = "truncated_results"
+        case totalDurationMs = "total_duration_ms"
+        case maxDurationMs = "max_duration_ms"
+        case averageDurationMs = "average_duration_ms"
+        case outputBytes = "output_bytes"
+        case approvalWaits = "approval_waits"
+        case totalApprovalWaitMs = "total_approval_wait_ms"
+        case maxApprovalWaitMs = "max_approval_wait_ms"
+        case byTool = "by_tool"
+        case errorCodes = "error_codes"
+    }
+
+    init(
+        calls: Int,
+        errors: Int,
+        retryableErrors: Int,
+        truncatedResults: Int,
+        totalDurationMs: Int,
+        maxDurationMs: Int,
+        averageDurationMs: Int,
+        outputBytes: Int,
+        approvalWaits: Int = 0,
+        totalApprovalWaitMs: Int = 0,
+        maxApprovalWaitMs: Int = 0,
+        byTool: [ToolActivityToolStat],
+        errorCodes: [ToolActivityCodeStat] = []
+    ) {
+        self.calls = calls
+        self.errors = errors
+        self.retryableErrors = retryableErrors
+        self.truncatedResults = truncatedResults
+        self.totalDurationMs = totalDurationMs
+        self.maxDurationMs = maxDurationMs
+        self.averageDurationMs = averageDurationMs
+        self.outputBytes = outputBytes
+        self.approvalWaits = approvalWaits
+        self.totalApprovalWaitMs = totalApprovalWaitMs
+        self.maxApprovalWaitMs = maxApprovalWaitMs
+        self.byTool = byTool
+        self.errorCodes = errorCodes
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        calls = try container.decodeIfPresent(Int.self, forKey: .calls) ?? 0
+        errors = try container.decodeIfPresent(Int.self, forKey: .errors) ?? 0
+        retryableErrors = try container.decodeIfPresent(Int.self, forKey: .retryableErrors) ?? 0
+        truncatedResults = try container.decodeIfPresent(Int.self, forKey: .truncatedResults) ?? 0
+        totalDurationMs = try container.decodeIfPresent(Int.self, forKey: .totalDurationMs) ?? 0
+        maxDurationMs = try container.decodeIfPresent(Int.self, forKey: .maxDurationMs) ?? 0
+        averageDurationMs = try container.decodeIfPresent(Int.self, forKey: .averageDurationMs) ?? 0
+        outputBytes = try container.decodeIfPresent(Int.self, forKey: .outputBytes) ?? 0
+        approvalWaits = try container.decodeIfPresent(Int.self, forKey: .approvalWaits) ?? 0
+        totalApprovalWaitMs = try container.decodeIfPresent(Int.self, forKey: .totalApprovalWaitMs) ?? 0
+        maxApprovalWaitMs = try container.decodeIfPresent(Int.self, forKey: .maxApprovalWaitMs) ?? 0
+        byTool = try container.decodeIfPresent([ToolActivityToolStat].self, forKey: .byTool) ?? []
+        errorCodes = try container.decodeIfPresent([ToolActivityCodeStat].self, forKey: .errorCodes) ?? []
+    }
+}
+
+struct ToolActivityCodeStat: Codable, Sendable, Equatable, Identifiable {
+    let code: String
+    let calls: Int
+
+    var id: String {
+        code
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case code
+        case calls
+    }
+}
+
+struct ToolActivityToolStat: Codable, Sendable, Equatable, Identifiable {
+    let name: String
+    let calls: Int
+    let errors: Int
+    let totalDurationMs: Int
+    let outputBytes: Int
+
+    var id: String {
+        name
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case calls
+        case errors
+        case totalDurationMs = "total_duration_ms"
+        case outputBytes = "output_bytes"
+    }
+}
+
 struct ProjectUsageSession: Codable, Identifiable, Sendable {
     let sessionId: String
     let goal: String

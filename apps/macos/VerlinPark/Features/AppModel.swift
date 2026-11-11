@@ -328,6 +328,7 @@ final class AppModel {
     private var orchestrationRefreshTask: Task<Void, Never>?
     private var longTaskRefreshTask: Task<Void, Never>?
     private var efficiencyRefreshTask: Task<Void, Never>?
+    private var toolActivityRefreshTask: Task<Void, Never>?
     var taskActionBusyID: String?
     var taskActionStatus: String?
     var taskSchedulerPolicy = TaskSchedulerPolicy.disabled
@@ -414,6 +415,9 @@ final class AppModel {
     var programMilestoneDraftDeps: Set<String> = []
     var contextStatus: SessionContextStatus?
     var toolOutputStatus: ToolOutputStatus?
+    var toolActivity: ToolActivityResult?
+    var toolActivityStatus: String?
+    var toolActivityBusy = false
     var compactBusy = false
     var compactNotice: String?
     var contextCheckpoints: [ContextCheckpoint] = []
@@ -652,8 +656,12 @@ final class AppModel {
 
     private func resetEfficiencyState() {
         efficiencyRefreshTask?.cancel()
+        toolActivityRefreshTask?.cancel()
         sessionCacheStatus = nil
         toolOutputStatus = nil
+        toolActivity = nil
+        toolActivityStatus = nil
+        toolActivityBusy = false
         efficiencyBusy = false
         efficiencyStatus = nil
     }
@@ -3253,6 +3261,8 @@ final class AppModel {
             usageStatus = nil
             contextStatus = nil
             sessionCacheStatus = nil
+            toolActivity = nil
+            toolActivityStatus = nil
             return
         }
 
@@ -3299,6 +3309,45 @@ final class AppModel {
                 efficiencyStatus =
                     "session.cache is unavailable; cache values are derived from session.usage."
             }
+        }
+
+        await loadToolActivity()
+    }
+
+    /// Load the bounded newest-first tool activity window. Older daemons do not
+    /// implement `session.tool_activity`; the dashboard then keeps the current
+    /// snapshot and shows a diagnostic status instead of failing the whole
+    /// efficiency surface.
+    func loadToolActivity() async {
+        guard let sessionID = selectedSessionID else {
+            toolActivity = nil
+            toolActivityStatus = nil
+            return
+        }
+        let generation = selectionGeneration
+        toolActivityBusy = true
+        defer {
+            if generation == selectionGeneration {
+                toolActivityBusy = false
+            }
+        }
+        do {
+            let activity = try await core.toolActivity(sessionID: sessionID, limit: 50)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            toolActivity = activity
+            toolActivityStatus = nil
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            toolActivityStatus = error.localizedDescription
+        }
+    }
+
+    private func refreshToolActivitySoon() {
+        toolActivityRefreshTask?.cancel()
+        toolActivityRefreshTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled else { return }
+            await self?.loadToolActivity()
         }
     }
 
@@ -7658,6 +7707,10 @@ final class AppModel {
            ["tool.finished", "agent.turn_finished", "session.worktree"].contains(event.type)
         {
             Task { await self.loadDiff() }
+        }
+
+        if event.sessionId == selectedSessionID, event.type == "tool.finished" {
+            refreshToolActivitySoon()
         }
 
         recordNotice(for: event)

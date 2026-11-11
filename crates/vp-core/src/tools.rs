@@ -18,7 +18,7 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use vp_providers::ToolSchema;
 
-const MAX_TOOL_OUTPUT: usize = 40_000;
+pub(crate) const MAX_TOOL_OUTPUT: usize = 40_000;
 /// Files above this size are not loaded into memory by read_file. The agent can
 /// use shell tools (head/sed/grep) for targeted reads instead.
 const MAX_READ_FILE_BYTES: u64 = 4 * 1024 * 1024;
@@ -65,6 +65,9 @@ pub struct ToolOutput {
     /// provider still receives `content`; tools must keep that rendering
     /// concise and actionable.
     pub structured: Option<Value>,
+    /// Uniform failure contract. Present for every `is_error` output; unknown
+    /// errors are normalized to `TOOL_FAILED` at dispatch time.
+    pub failure: Option<crate::tooling::errors::ToolFailure>,
     /// Daemon-owned handle created when the full output was spilled. It is
     /// never a workspace path and is only resolvable through the store.
     pub output_ref: Option<String>,
@@ -87,8 +90,14 @@ impl ToolOutput {
         Self::new(content, false, None)
     }
 
+    /// Legacy error constructor. It now emits a uniform `TOOL_FAILED` failure:
+    /// unknown errors are not silently retryable and the provider sees the same
+    /// stable prefix as coded failures.
     pub fn error(content: impl Into<String>) -> Self {
-        Self::new(content, true, None)
+        Self::from_failure(crate::tooling::errors::ToolFailure::new(
+            crate::tooling::errors::ToolErrorCode::TOOL_FAILED,
+            content,
+        ))
     }
 
     pub fn ok_structured(content: impl Into<String>, structured: Value) -> Self {
@@ -96,7 +105,185 @@ impl ToolOutput {
     }
 
     pub fn error_structured(content: impl Into<String>, structured: Value) -> Self {
-        Self::new(content, true, Some(structured))
+        let failure =
+            crate::tooling::errors::ToolFailure::from_structured(content.into(), &structured, None);
+        let enriched = failure.enrich_structured(&structured);
+        Self::from_failure_with_structured(failure, enriched)
+    }
+
+    /// Construct a failure from the stable catalog. The provider text is
+    /// rendered from the same object that enters `structured`.
+    pub fn error_coded(
+        tool: &str,
+        code: crate::tooling::errors::ToolErrorCode,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::from_failure(crate::tooling::errors::ToolFailure::new(code, message).with_tool(tool))
+    }
+
+    /// Construct a failure from a fully populated contract object.
+    pub fn error_failure(failure: crate::tooling::errors::ToolFailure) -> Self {
+        Self::from_failure(failure)
+    }
+
+    pub fn with_failure_hint(mut self, hint: impl Into<String>) -> Self {
+        if let Some(failure) = self.failure.take() {
+            let rendered_only = self.content == failure.render();
+            self.apply_failure_update(rendered_only, failure.with_hint(hint));
+        }
+        self
+    }
+
+    pub fn with_failure_retryable(mut self, retryable: bool) -> Self {
+        if let Some(failure) = self.failure.take() {
+            let rendered_only = self.content == failure.render();
+            self.apply_failure_update(rendered_only, failure.with_retryable(retryable));
+        }
+        self
+    }
+
+    pub fn with_failure_evidence(mut self, evidence: impl Into<String>) -> Self {
+        if let Some(failure) = self.failure.take() {
+            let rendered_only = self.content == failure.render();
+            self.apply_failure_update(rendered_only, failure.with_evidence(evidence));
+        }
+        self
+    }
+
+    pub fn with_failure_action(mut self, action: impl Into<String>) -> Self {
+        if let Some(failure) = self.failure.take() {
+            let rendered_only = self.content == failure.render();
+            self.apply_failure_update(rendered_only, failure.with_action(action));
+        }
+        self
+    }
+
+    /// Mark an already-built non-zero/result-style output as a failure while
+    /// preserving its body (for example a failed command's stdout/stderr). The
+    /// provider body gets the stable failure prefix; the structured object is
+    /// sanitized and enriched with the failure contract.
+    pub fn mark_failure(
+        mut self,
+        tool: &str,
+        code: crate::tooling::errors::ToolErrorCode,
+        message: impl Into<String>,
+    ) -> Self {
+        let previous = self.structured.take().unwrap_or(Value::Null);
+        let failure = crate::tooling::errors::ToolFailure::new(code, message).with_tool(tool);
+        let structured = failure.enrich_structured(&previous);
+        let prefix = failure.render();
+        if !self.content.starts_with("error[") {
+            self.content = if self.content.is_empty() {
+                prefix
+            } else {
+                format!("{prefix}\n{}", self.content)
+            };
+        }
+        self.is_error = true;
+        self.failure = Some(failure);
+        self.structured = Some(structured);
+        self.total_bytes = self
+            .full_content
+            .as_ref()
+            .map_or(self.content.len() as u64, |full| full.len() as u64);
+        self.preview_bytes = self.content.len() as u64;
+        self.lines =
+            crate::tool_output::line_count(self.full_content.as_deref().unwrap_or(&self.content));
+        self
+    }
+
+    fn apply_failure_update(
+        &mut self,
+        replace_content: bool,
+        failure: crate::tooling::errors::ToolFailure,
+    ) {
+        let previous = self.structured.take();
+        let structured = previous
+            .as_ref()
+            .map(|value| failure.enrich_structured(value))
+            .unwrap_or_else(|| failure.to_structured());
+        self.failure = Some(failure);
+        self.structured = Some(structured);
+        if replace_content {
+            self.refresh_failure_text();
+        } else {
+            // Keep the original provider body; only the structured metadata
+            // changed. This matters for command results whose body carries the
+            // captured stdout/stderr but whose failure evidence must stay safe.
+            self.preview_bytes = self.content.len() as u64;
+        }
+    }
+
+    fn from_failure(failure: crate::tooling::errors::ToolFailure) -> Self {
+        Self::from_failure_with_structured(failure.clone(), failure.to_structured())
+    }
+
+    fn from_failure_with_structured(
+        failure: crate::tooling::errors::ToolFailure,
+        structured: Value,
+    ) -> Self {
+        let content = failure.render();
+        let mut output = Self::new(content, true, Some(structured));
+        output.failure = Some(failure);
+        output
+    }
+
+    fn refresh_failure_text(&mut self) {
+        if let Some(failure) = &self.failure {
+            self.content = failure.render();
+            self.total_bytes = self.content.len() as u64;
+            self.preview_bytes = self.total_bytes;
+            self.lines = crate::tool_output::line_count(&self.content);
+        }
+    }
+
+    /// Attach the concrete tool name and enforce the failure contract before
+    /// shaping and event emission. This is the dispatch-time backstop for tools
+    /// that returned a bare error or an unstructured error result.
+    pub fn normalize_failure(&mut self, tool: &str) {
+        if !self.is_error {
+            return;
+        }
+        match self.failure.take() {
+            Some(mut failure) => {
+                if failure.tool.is_none() {
+                    failure.tool = Some(tool.to_string());
+                }
+                if failure.code.as_str() == "TOOL_FAILED" && failure.hint.is_empty() {
+                    failure.hint = failure.code.default_hint().to_string();
+                }
+                let failure = failure.sanitize();
+                let structured = self
+                    .structured
+                    .as_ref()
+                    .map(|value| failure.enrich_structured(value))
+                    .unwrap_or_else(|| failure.to_structured());
+                self.failure = Some(failure);
+                self.structured = Some(structured);
+                self.refresh_failure_text();
+            }
+            None => {
+                let failure = crate::tooling::errors::ToolFailure::new(
+                    crate::tooling::errors::ToolErrorCode::for_tool_fallback(tool),
+                    self.content.clone(),
+                )
+                .with_tool(tool);
+                let structured = self
+                    .structured
+                    .as_ref()
+                    .map(|value| failure.enrich_structured(value))
+                    .unwrap_or_else(|| failure.to_structured());
+                self.failure = Some(failure);
+                self.structured = Some(structured);
+                self.refresh_failure_text();
+            }
+        }
+    }
+
+    /// Build a coded output from a dispatch error. A `ToolFailure` downcast
+    /// keeps its specific code; every other error gets a conservative fallback.
+    pub fn from_tool_error(tool: &str, error: &anyhow::Error) -> Self {
+        Self::from_failure(crate::tooling::errors::failure_from_anyhow(tool, error))
     }
 
     fn new(content: impl Into<String>, is_error: bool, structured: Option<Value>) -> Self {
@@ -107,6 +294,7 @@ impl ToolOutput {
             content,
             is_error,
             structured,
+            failure: None,
             output_ref: None,
             truncated: false,
             total_bytes,
@@ -117,7 +305,10 @@ impl ToolOutput {
     }
 
     pub fn with_structured(mut self, structured: Value) -> Self {
-        self.structured = Some(structured);
+        self.structured = Some(match &self.failure {
+            Some(failure) if self.is_error => failure.enrich_structured(&structured),
+            _ => structured,
+        });
         self
     }
 
@@ -126,11 +317,12 @@ impl ToolOutput {
     /// truncate before returning use this instead of `truncate`.
     pub fn ok_structured_preserving(full: String, structured: Value, is_error: bool) -> Self {
         let content = truncate(full.clone());
-        let mut output = if is_error {
-            Self::error_structured(content, structured)
-        } else {
-            Self::ok_structured(content, structured)
-        };
+        // `is_error` here means "the operation result is a failure" (a command
+        // exited non-zero), not necessarily "the tool call violated its
+        // contract". Keep the command result structured data; call sites that
+        // represent a failure normalize it with `normalize_failure` at
+        // dispatch, which attaches the stable code without duplicating output.
+        let mut output = Self::new(content, is_error, Some(structured));
         if full.len() as u64 > output.total_bytes {
             output.full_content = Some(full);
             output.total_bytes = output
@@ -335,6 +527,23 @@ pub(crate) const SHELL_ENV_PASSTHROUGH: &[&str] = &[
     "LDFLAGS",
     "PKG_CONFIG_PATH",
 ];
+
+/// Evidence-safe URL: scheme, host, and path only. Query strings and
+/// fragments frequently carry tokens and are never copied into an event.
+fn sanitize_evidence_url(raw: &str) -> String {
+    let without_fragment = raw.split('#').next().unwrap_or(raw);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
+    match without_query.split_once("://") {
+        Some((scheme, rest)) => {
+            let host_path = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+            format!("{scheme}://{host_path}")
+        }
+        None => without_query.chars().take(300).collect(),
+    }
+}
 
 fn is_blocked_host(host: &str) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
@@ -683,10 +892,24 @@ impl AgentTool for FetchUrl {
                     false,
                 ))
             }
-            Err(error) => Ok(ToolOutput::error_structured(
-                error.to_string(),
-                json!({"code": "FETCH_ERROR", "url": raw_url}),
-            )),
+            Err(error) => {
+                let message = error.to_string();
+                let lower = message.to_ascii_lowercase();
+                let code = if lower.contains("timed out") {
+                    crate::tooling::errors::ToolErrorCode::FETCH_TIMEOUT
+                } else if lower.contains("private or local")
+                    || lower.contains("local hosts are blocked")
+                    || lower.contains("credentials are not allowed")
+                    || lower.contains("invalid url")
+                    || lower.contains("unsupported url scheme")
+                {
+                    crate::tooling::errors::ToolErrorCode::FETCH_BLOCKED
+                } else {
+                    crate::tooling::errors::ToolErrorCode::FETCH_FAILED
+                };
+                Ok(ToolOutput::error_coded("fetch_url", code, message)
+                    .with_failure_evidence(format!("url={}", sanitize_evidence_url(raw_url))))
+            }
         }
     }
 }
@@ -737,7 +960,20 @@ impl AgentTool for ReadFile {
                 }),
             ));
         }
-        let content = tokio::fs::read_to_string(&path).await?;
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                return Ok(ToolOutput::error_coded(
+                    "read_file",
+                    crate::tooling::errors::ToolErrorCode::FILE_NOT_TEXT,
+                    "file is not valid UTF-8 text",
+                )
+                .with_failure_evidence(format!("path={}", path.display())));
+            }
+            Err(error) => {
+                return Err(error.into());
+            }
+        };
         let total_lines = content.lines().count();
         let lines = content
             .lines()
@@ -1540,7 +1776,9 @@ impl AgentTool for Shell {
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("command is required"))?;
         if !Path::new(SANDBOX_EXEC).is_file() {
-            return Ok(ToolOutput::error(
+            return Ok(ToolOutput::error_coded(
+                "shell",
+                crate::tooling::errors::ToolErrorCode::SHELL_SANDBOX_FAILED,
                 "shell sandbox is unavailable on this platform; refusing to run unsandboxed shell",
             ));
         }
@@ -1556,18 +1794,16 @@ impl AgentTool for Shell {
             {
                 Ok(captured) => captured,
                 Err(error) => {
-                    return Ok(ToolOutput::error_structured(
-                        error.to_string(),
-                        json!({
-                            "code": if error.to_string().contains("timed out") {
-                                "COMMAND_TIMEOUT"
-                            } else {
-                                "COMMAND_FAILED"
-                            },
-                            "command": command,
-                            "elapsed_ms": started.elapsed().as_millis() as u64,
-                        }),
-                    ));
+                    let code = if error.to_string().contains("timed out") {
+                        crate::tooling::errors::ToolErrorCode::COMMAND_TIMEOUT
+                    } else {
+                        crate::tooling::errors::ToolErrorCode::COMMAND_FAILED
+                    };
+                    return Ok(ToolOutput::error_coded("shell", code, error.to_string())
+                        .with_failure_evidence(format!(
+                            "elapsed_ms={}",
+                            started.elapsed().as_millis() as u64
+                        )));
                 }
             };
         crate::tooling::code::invalidate_index(&context.root);
@@ -1606,11 +1842,19 @@ impl AgentTool for Shell {
             "elapsed_ms": captured.duration_ms,
             "warnings": warnings,
         });
-        Ok(ToolOutput::ok_structured_preserving(
-            text,
-            structured,
-            captured.exit_code != 0,
-        ))
+        let output = ToolOutput::ok_structured_preserving(text, structured, false);
+        if captured.exit_code != 0 {
+            Ok(output.mark_failure(
+                "shell",
+                crate::tooling::errors::ToolErrorCode::COMMAND_FAILED,
+                format!(
+                    "command exited with status {}; inspect stdout/stderr, fix the first real error, then rerun the smallest check",
+                    captured.exit_code
+                ),
+            ))
+        } else {
+            Ok(output)
+        }
     }
 }
 
@@ -1861,27 +2105,69 @@ pub(crate) fn build_globset(pattern: &str) -> Result<GlobSet> {
     Ok(builder.build()?)
 }
 
-pub(crate) fn safe_existing_path(root: &Path, relative: &str) -> Result<PathBuf> {
-    let root = root.canonicalize()?;
+#[allow(clippy::result_large_err)] // the typed failure carries the stable contract
+pub(crate) fn safe_existing_path(
+    root: &Path,
+    relative: &str,
+) -> std::result::Result<PathBuf, crate::tooling::errors::ToolFailure> {
+    use crate::tooling::errors::{ToolErrorCode, ToolFailure};
+    let root = root.canonicalize().map_err(|error| {
+        ToolFailure::new(
+            ToolErrorCode::READ_FAILED,
+            format!("cannot resolve worktree root: {error}"),
+        )
+    })?;
     let path = Path::new(relative);
     if path.is_absolute() {
-        return Err(anyhow!("absolute paths are not allowed"));
+        return Err(ToolFailure::new(
+            ToolErrorCode::PATH_ESCAPE,
+            "absolute paths are not allowed",
+        ));
     }
     let path = root
         .join(path)
         .canonicalize()
-        .context("path does not exist")?;
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => ToolFailure::new(
+                ToolErrorCode::FILE_NOT_FOUND,
+                format!("path does not exist: {relative}"),
+            ),
+            std::io::ErrorKind::PermissionDenied => ToolFailure::new(
+                ToolErrorCode::PERMISSION_DENIED,
+                format!("permission denied while resolving: {relative}"),
+            ),
+            _ => ToolFailure::new(
+                ToolErrorCode::READ_FAILED,
+                format!("cannot resolve path: {relative}"),
+            ),
+        })?;
     if !path.starts_with(&root) {
-        return Err(anyhow!("path escapes the project root"));
+        return Err(ToolFailure::new(
+            ToolErrorCode::PATH_ESCAPE,
+            "path escapes the project root",
+        ));
     }
     Ok(path)
 }
 
-pub(crate) fn safe_write_path(root: &Path, relative: &str) -> Result<PathBuf> {
-    let root = root.canonicalize()?;
+#[allow(clippy::result_large_err)] // the typed failure carries the stable contract
+pub(crate) fn safe_write_path(
+    root: &Path,
+    relative: &str,
+) -> std::result::Result<PathBuf, crate::tooling::errors::ToolFailure> {
+    use crate::tooling::errors::{ToolErrorCode, ToolFailure};
+    let root = root.canonicalize().map_err(|error| {
+        ToolFailure::new(
+            ToolErrorCode::WRITE_FAILED,
+            format!("cannot resolve worktree root: {error}"),
+        )
+    })?;
     let path = Path::new(relative);
     if path.is_absolute() {
-        return Err(anyhow!("absolute paths are not allowed"));
+        return Err(ToolFailure::new(
+            ToolErrorCode::PATH_ESCAPE,
+            "absolute paths are not allowed",
+        ));
     }
     if path.components().any(|component| {
         !matches!(
@@ -1889,10 +2175,16 @@ pub(crate) fn safe_write_path(root: &Path, relative: &str) -> Result<PathBuf> {
             std::path::Component::Normal(_) | std::path::Component::CurDir
         )
     }) {
-        return Err(anyhow!("path must stay inside the project root"));
+        return Err(ToolFailure::new(
+            ToolErrorCode::PATH_ESCAPE,
+            "path must stay inside the project root",
+        ));
     }
     if path.file_name().is_none() {
-        return Err(anyhow!("file name is required"));
+        return Err(ToolFailure::new(
+            ToolErrorCode::INVALID_ARGUMENT,
+            "file name is required",
+        ));
     }
     if path.components().any(|component| {
         component
@@ -1900,30 +2192,49 @@ pub(crate) fn safe_write_path(root: &Path, relative: &str) -> Result<PathBuf> {
             .to_string_lossy()
             .eq_ignore_ascii_case(".git")
     }) {
-        return Err(anyhow!(
-            "refusing to write Git metadata through a file tool"
+        return Err(ToolFailure::new(
+            ToolErrorCode::PATH_ESCAPE,
+            "refusing to write Git metadata through a file tool",
         ));
     }
     let target = root.join(path);
     let mut ancestor = target
         .parent()
-        .ok_or_else(|| anyhow!("parent directory is required"))?
+        .ok_or_else(|| {
+            ToolFailure::new(
+                ToolErrorCode::INVALID_ARGUMENT,
+                "parent directory is required",
+            )
+        })?
         .to_path_buf();
     while !ancestor.exists() {
         ancestor = ancestor
             .parent()
-            .ok_or_else(|| anyhow!("no existing ancestor for path"))?
+            .ok_or_else(|| {
+                ToolFailure::new(ToolErrorCode::PATH_ESCAPE, "no existing ancestor for path")
+            })?
             .to_path_buf();
     }
-    let canonical_ancestor = ancestor.canonicalize()?;
+    let canonical_ancestor = ancestor.canonicalize().map_err(|error| {
+        ToolFailure::new(
+            ToolErrorCode::WRITE_FAILED,
+            format!("cannot resolve parent directory: {error}"),
+        )
+    })?;
     if !canonical_ancestor.starts_with(&root) {
-        return Err(anyhow!("path escapes the project root"));
+        return Err(ToolFailure::new(
+            ToolErrorCode::PATH_ESCAPE,
+            "path escapes the project root",
+        ));
     }
     if target
         .symlink_metadata()
         .is_ok_and(|meta| meta.file_type().is_symlink())
     {
-        return Err(anyhow!("refusing to write through a symlink"));
+        return Err(ToolFailure::new(
+            ToolErrorCode::SYMLINK_REFUSED,
+            "refusing to write through a symlink",
+        ));
     }
     Ok(target)
 }
@@ -2583,6 +2894,239 @@ mod tests {
             .unwrap();
         assert!(output.is_error, "{}", output.content);
         assert!(!target.join("file").exists());
+    }
+
+    #[tokio::test]
+    async fn missing_read_path_returns_a_coded_failure() {
+        let (_dir, context) = ctx();
+        let error = ReadFile
+            .execute(&context, json!({"path": "does-not-exist.txt"}))
+            .await
+            .expect_err("missing file must fail");
+        let failure = error
+            .downcast_ref::<crate::tooling::errors::ToolFailure>()
+            .expect("safe_existing_path returns a coded failure");
+        assert_eq!(
+            failure.code,
+            crate::tooling::errors::ToolErrorCode::FILE_NOT_FOUND
+        );
+        assert!(!failure.retryable);
+    }
+
+    #[tokio::test]
+    async fn core_tool_failures_map_to_stable_codes() {
+        use crate::tooling::errors::{ToolErrorCode, failure_from_anyhow};
+
+        let (_dir, context) = ctx();
+
+        let error = ReadFile
+            .execute(&context, json!({"path": "missing.txt"}))
+            .await
+            .expect_err("missing read");
+        assert_eq!(
+            error
+                .downcast_ref::<crate::tooling::errors::ToolFailure>()
+                .expect("typed failure")
+                .code,
+            ToolErrorCode::FILE_NOT_FOUND
+        );
+
+        let error = WriteFile
+            .execute(&context, json!({"path": "../escape.txt", "content": "x"}))
+            .await
+            .expect_err("path escape");
+        assert_eq!(
+            error
+                .downcast_ref::<crate::tooling::errors::ToolFailure>()
+                .expect("typed failure")
+                .code,
+            ToolErrorCode::PATH_ESCAPE
+        );
+
+        let edit = EditFile
+            .execute(
+                &context,
+                json!({"path": "hello.txt", "old_string": "", "new_string": "x"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(edit.structured.unwrap()["code"], "INVALID_ARGUMENT");
+
+        let patch = crate::tooling::files::ApplyPatch
+            .execute(&context, json!({"patch": "not a patch"}))
+            .await
+            .unwrap();
+        assert!(patch.is_error);
+        let patch_code = patch.structured.unwrap()["code"].clone();
+        assert!(
+            patch_code == "PATCH_CONFLICT" || patch_code == "INVALID_ARGUMENT",
+            "unexpected patch code: {patch_code}"
+        );
+
+        let git = crate::tooling::git::GitQuery
+            .execute(&context, json!({"action": "not-an-action"}))
+            .await
+            .unwrap();
+        assert_eq!(git.structured.unwrap()["code"], "INVALID_ARGUMENT");
+
+        let error = Shell
+            .execute(&context, json!({}))
+            .await
+            .expect_err("missing command");
+        let failure = failure_from_anyhow("shell", &error);
+        assert_eq!(failure.code, ToolErrorCode::INVALID_ARGUMENT);
+
+        let error = crate::tooling::process::ProcessTool
+            .execute(
+                &context,
+                json!({"action": "read", "process_id": "proc-missing"}),
+            )
+            .await
+            .expect_err("unknown process");
+        let failure = failure_from_anyhow("process", &error);
+        assert_eq!(failure.code, ToolErrorCode::PROCESS_NOT_FOUND);
+
+        let remote = crate::tooling::remote::RemoteRead
+            .execute(&context, json!({"path": "README.md"}))
+            .await
+            .expect_err("remote not configured");
+        let failure = failure_from_anyhow("remote_read", &remote);
+        assert_eq!(failure.code, ToolErrorCode::REMOTE_NOT_CONFIGURED);
+
+        let fetch = FetchUrl
+            .execute(&context, json!({"url": "http://127.0.0.1:1/secret"}))
+            .await
+            .unwrap();
+        assert!(fetch.is_error);
+        assert_eq!(fetch.structured.unwrap()["code"], "FETCH_BLOCKED");
+    }
+
+    #[test]
+    fn registry_schemas_are_deterministic_and_well_formed() {
+        let registry = ToolRegistry::default_tools();
+        let first = serde_json::to_string(&registry.schemas()).unwrap();
+        let second = serde_json::to_string(&registry.schemas()).unwrap();
+        assert_eq!(first, second);
+        let schemas = registry.schemas();
+        assert!(schemas.len() >= 30);
+        let mut names = std::collections::HashSet::new();
+        for schema in &schemas {
+            assert!(!schema.name.is_empty());
+            assert!(!schema.description.is_empty());
+            assert_eq!(schema.parameters["type"], "object", "{}", schema.name);
+            assert!(
+                names.insert(schema.name.clone()),
+                "duplicate {}",
+                schema.name
+            );
+        }
+        for required in [
+            "read_file",
+            "write_file",
+            "edit_file",
+            "apply_patch",
+            "git",
+            "shell",
+            "process",
+            "wait_for",
+            "lsp_query",
+            "fetch_url",
+            "remote_read",
+            "remote_exec",
+        ] {
+            assert!(names.contains(required), "missing {required}");
+        }
+        assert!(registry.get("tool_help").is_none());
+    }
+
+    #[test]
+    fn error_structured_enriches_every_legacy_code_shape() {
+        for code in [
+            "INVALID_ARGUMENT",
+            "PATCH_CONFLICT",
+            "HASH_MISMATCH",
+            "PATH_ESCAPE",
+            "FILE_TOO_LARGE",
+            "PROCESS_EXITED",
+            "WAIT_TIMEOUT",
+            "LSP_UNAVAILABLE",
+            "STALE_REF",
+            "MCP_FAILED",
+            "REMOTE_FAILED",
+            "TOOL_OUTPUT_INVALID",
+        ] {
+            let output = ToolOutput::error_structured(
+                "legacy failure",
+                json!({"code": code, "path": "src/lib.rs", "exit_code": 2}),
+            );
+            assert!(output.content.starts_with(&format!("error[{code}]")));
+            let structured = output.structured.unwrap();
+            assert_eq!(structured["code"], code);
+            assert_eq!(structured["tool"], serde_json::Value::Null);
+            assert!(structured["retryable"].is_boolean());
+            assert!(structured["hint"].as_str().is_some());
+            assert_eq!(structured["path"], "src/lib.rs");
+            assert_eq!(structured["exit_code"], 2);
+        }
+    }
+
+    #[test]
+    fn bare_error_outputs_normalize_to_safe_tool_specific_codes() {
+        for (tool, expected) in [
+            ("read_file", "READ_FAILED"),
+            ("write_file", "WRITE_FAILED"),
+            ("git", "GIT_FAILED"),
+            ("shell", "COMMAND_FAILED"),
+            ("process", "PROCESS_FAILED"),
+            ("lsp_query", "LSP_ERROR"),
+            ("browser", "BROWSER_ERROR"),
+            ("computer", "COMPUTER_ERROR"),
+            ("mcp", "MCP_FAILED"),
+            ("fetch_url", "FETCH_FAILED"),
+            ("read_tool_output", "TOOL_OUTPUT_FAILED"),
+            ("remote_exec", "REMOTE_FAILED"),
+            ("future_tool", "TOOL_FAILED"),
+        ] {
+            let mut output = ToolOutput::ok_structured(
+                "failed body",
+                json!({"detail": "safe detail", "command": "not allowed"}),
+            );
+            output.is_error = true;
+            output.normalize_failure(tool);
+            assert!(output.is_error);
+            assert!(output.content.starts_with(&format!("error[{expected}]")));
+            let structured = output.structured.unwrap();
+            assert_eq!(structured["code"], expected);
+            assert_eq!(structured["tool"], tool);
+            assert_eq!(structured["retryable"], false);
+            assert_eq!(structured["detail"], "safe detail");
+            assert!(structured.get("command").is_none());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn failed_shell_keeps_body_but_structured_failure_is_safe() {
+        let (_dir, context) = ctx();
+        let output = Shell
+            .execute(
+                &context,
+                json!({"command": "echo visible-output && printf 'secret-token=abc123' >&2 && exit 3"}),
+            )
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        assert!(output.content.starts_with("error[COMMAND_FAILED]"));
+        assert!(output.content.contains("visible-output"));
+        let structured = output.structured.unwrap();
+        assert_eq!(structured["code"], "COMMAND_FAILED");
+        assert_eq!(structured["exit_code"], 3);
+        assert_eq!(structured["retryable"], false);
+        assert!(structured.get("command").is_none());
+        assert!(structured.get("stdout").is_none());
+        assert!(structured.get("stderr").is_none());
+        let rendered = serde_json::to_string(&structured).unwrap();
+        assert!(!rendered.contains("secret-token=abc123"));
     }
 
     #[test]

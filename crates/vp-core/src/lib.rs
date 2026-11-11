@@ -66,7 +66,8 @@ use vp_protocol::types::{
     SourceReindexResult, SourceSearchResult, SourceStats, SteeringMessage, StoredMessage,
     TaskQueueResult, TaskSchedulerPolicy, TaskSchedulerPolicyResult, TaskStall, TeamPlan,
     TerminalCloseResult, TerminalOpenResult, TerminalReadResult, TerminalResizeResult,
-    TerminalWriteResult, TodoItem, ToolOutputAuditParams, ToolOutputAuditResult,
+    TerminalWriteResult, TodoItem, ToolActivityCodeStat, ToolActivityEntry, ToolActivityResult,
+    ToolActivitySummary, ToolActivityToolStat, ToolOutputAuditParams, ToolOutputAuditResult,
     ToolOutputListParams, ToolOutputListResult, ToolOutputPolicy, ToolOutputPolicyResult,
     ToolOutputPruneParams, ToolOutputPruneResult, ToolOutputStatus, ToolOutputStatusParams,
     UpdateModelPresetParams, UpdateSourceMetadataParams, UsageBucket, UsageCsvResult, UsageEntry,
@@ -10783,6 +10784,45 @@ impl Engine {
             .await?
     }
 
+    /// Read-only, bounded tool-activity projection. It reads `tool.finished`
+    /// events only; provider content and raw structured payloads are not
+    /// copied into the response. Legacy events without the additive metrics
+    /// fields decode with zeroes and a derived `TOOL_FAILED` code.
+    pub async fn session_tool_activity(
+        &self,
+        session_id: &str,
+        limit: u32,
+    ) -> Result<ToolActivityResult> {
+        let limit = limit.clamp(1, 200);
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let (events, total) = tokio::task::spawn_blocking(move || -> Result<(Vec<Event>, u64)> {
+            if store.get_session(&id)?.is_none() {
+                anyhow::bail!("session not found: {id}");
+            }
+            let events = store.list_recent_events_by_kind(&id, "tool.finished", limit + 1)?;
+            let total = store.event_count_by_kind(&id, "tool.finished")?;
+            Ok((events, total))
+        })
+        .await??;
+        let truncated = events.len() > limit as usize;
+        let mut entries = events
+            .into_iter()
+            .take(limit as usize)
+            .map(tool_activity_entry)
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.seq));
+        let summary = tool_activity_summary(&entries);
+        Ok(ToolActivityResult {
+            session_id: session_id.to_string(),
+            entries,
+            total,
+            limit,
+            truncated,
+            summary,
+        })
+    }
+
     async fn load_replay_data(&self, session_id: &str) -> Result<ReplayData> {
         let store = self.store.clone();
         let id = session_id.to_string();
@@ -15966,6 +16006,195 @@ pub(crate) fn checkpoint_from_event(event: &Event) -> Option<SessionCheckpoint> 
             .unwrap_or(&event.created_at)
             .to_string(),
     })
+}
+
+fn tool_activity_entry(event: Event) -> ToolActivityEntry {
+    let payload = &event.payload;
+    let is_error = payload
+        .get("is_error")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let structured = payload.get("structured");
+    let error_code = payload
+        .get("error_code")
+        .and_then(serde_json::Value::as_str)
+        .map(|code| {
+            crate::tooling::errors::ToolErrorCode::from_code_or_failed(code)
+                .as_str()
+                .to_string()
+        })
+        .or_else(|| {
+            if !is_error {
+                return None;
+            }
+            structured
+                .and_then(|value| value.get("code"))
+                .and_then(serde_json::Value::as_str)
+                .map(|code| {
+                    crate::tooling::errors::ToolErrorCode::from_code_or_failed(code)
+                        .as_str()
+                        .to_string()
+                })
+                .or_else(|| Some("TOOL_FAILED".to_string()))
+        });
+    let hint = payload
+        .get("error_hint")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            structured
+                .and_then(|value| value.get("hint"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            error_code.as_deref().map(|code| {
+                crate::tooling::errors::ToolErrorCode::from_code_or_failed(code)
+                    .default_hint()
+                    .to_string()
+            })
+        })
+        .map(|hint| hint.chars().take(600).collect());
+    let retryable = payload
+        .get("retryable")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let duration_ms = payload
+        .get("duration_ms")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        .min(86_400_000);
+    let output_bytes = payload
+        .get("output_bytes")
+        .or_else(|| payload.get("total_bytes"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    ToolActivityEntry {
+        tool_call_id: payload
+            .get("tool_call_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .chars()
+            .take(200)
+            .collect(),
+        name: payload
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .chars()
+            .take(120)
+            .collect(),
+        seq: event.seq,
+        is_error,
+        error_code,
+        retryable,
+        hint,
+        duration_ms,
+        output_bytes,
+        truncated: payload
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        approval_risk: payload
+            .get("approval_risk")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        approval_mode: payload
+            .get("approval_mode")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        approval_wait_ms: payload
+            .get("approval_wait_ms")
+            .and_then(serde_json::Value::as_u64)
+            .map(|wait| wait.min(86_400_000)),
+        created_at: event.created_at,
+    }
+}
+
+fn tool_activity_summary(entries: &[ToolActivityEntry]) -> ToolActivitySummary {
+    let calls = entries.len() as u64;
+    let errors = entries.iter().filter(|entry| entry.is_error).count() as u64;
+    let retryable_errors = entries
+        .iter()
+        .filter(|entry| entry.is_error && entry.retryable)
+        .count() as u64;
+    let total_duration_ms = entries
+        .iter()
+        .fold(0u64, |total, entry| total.saturating_add(entry.duration_ms));
+    let max_duration_ms = entries
+        .iter()
+        .map(|entry| entry.duration_ms)
+        .max()
+        .unwrap_or(0);
+    let output_bytes = entries.iter().fold(0u64, |total, entry| {
+        total.saturating_add(entry.output_bytes)
+    });
+    let truncated_results = entries.iter().filter(|entry| entry.truncated).count() as u64;
+    let average_duration_ms = total_duration_ms.checked_div(calls).unwrap_or(0);
+    let mut by_tool: std::collections::BTreeMap<String, ToolActivityToolStat> =
+        std::collections::BTreeMap::new();
+    let mut by_code: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut approval_waits = 0u64;
+    let mut total_approval_wait_ms = 0u64;
+    let mut max_approval_wait_ms = 0u64;
+    for entry in entries {
+        let stat = by_tool
+            .entry(entry.name.clone())
+            .or_insert_with(|| ToolActivityToolStat {
+                name: entry.name.clone(),
+                ..ToolActivityToolStat::default()
+            });
+        stat.calls = stat.calls.saturating_add(1);
+        stat.errors = stat.errors.saturating_add(u64::from(entry.is_error));
+        stat.total_duration_ms = stat.total_duration_ms.saturating_add(entry.duration_ms);
+        stat.output_bytes = stat.output_bytes.saturating_add(entry.output_bytes);
+        if let Some(code) = &entry.error_code {
+            *by_code.entry(code.clone()).or_default() = by_code
+                .get(code)
+                .copied()
+                .unwrap_or_default()
+                .saturating_add(1);
+        }
+        if let Some(wait) = entry.approval_wait_ms {
+            approval_waits = approval_waits.saturating_add(1);
+            total_approval_wait_ms = total_approval_wait_ms.saturating_add(wait);
+            max_approval_wait_ms = max_approval_wait_ms.max(wait);
+        }
+    }
+    let mut by_tool = by_tool.into_values().collect::<Vec<_>>();
+    by_tool.sort_by(|left, right| {
+        right
+            .calls
+            .cmp(&left.calls)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    by_tool.truncate(12);
+    let mut error_codes = by_code
+        .into_iter()
+        .map(|(code, calls)| ToolActivityCodeStat { code, calls })
+        .collect::<Vec<_>>();
+    error_codes.sort_by(|left, right| {
+        right
+            .calls
+            .cmp(&left.calls)
+            .then_with(|| left.code.cmp(&right.code))
+    });
+    error_codes.truncate(8);
+    ToolActivitySummary {
+        calls,
+        errors,
+        retryable_errors,
+        truncated_results,
+        total_duration_ms,
+        max_duration_ms,
+        average_duration_ms,
+        output_bytes,
+        approval_waits,
+        total_approval_wait_ms,
+        max_approval_wait_ms,
+        by_tool,
+        error_codes,
+    }
 }
 
 #[cfg(test)]

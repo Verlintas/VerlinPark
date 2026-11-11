@@ -325,22 +325,20 @@ impl AgentTool for RunProjectTask {
         {
             Ok(captured) => captured,
             Err(error) => {
-                return Ok(ToolOutput::error_structured(
-                    format!("{summary}\n{}", error),
-                    json!({
-                        "code": if error.to_string().contains("timed out") {
-                            "COMMAND_TIMEOUT"
-                        } else {
-                            "COMMAND_FAILED"
-                        },
-                        "kind": kind,
-                        "command": resolved.command,
-                        "timeout_secs": timeout_secs,
-                        "changed_paths": changed_paths,
-                        "affected_tests": affected,
-                        "warnings": warnings,
-                    }),
-                ));
+                let code = if error.to_string().contains("timed out") {
+                    crate::tooling::errors::ToolErrorCode::COMMAND_TIMEOUT
+                } else {
+                    crate::tooling::errors::ToolErrorCode::COMMAND_FAILED
+                };
+                return Ok(ToolOutput::error_coded(
+                    "run_project_task",
+                    code,
+                    format!("{summary}\n{error}"),
+                )
+                .with_failure_evidence(format!(
+                    "kind={kind}; timeout_secs={timeout_secs}; affected_tests={}",
+                    affected.len()
+                )));
             }
         };
         let combined = if captured.stderr.is_empty() {
@@ -444,7 +442,19 @@ impl AgentTool for RunProjectTask {
             "affected_tests": affected,
             "next_actions": next_actions,
         });
-        Ok(ToolOutput::ok_structured_preserving(text, structured, !ok))
+        let output = ToolOutput::ok_structured_preserving(text, structured, false);
+        if ok {
+            Ok(output)
+        } else {
+            Ok(output.mark_failure(
+                "run_project_task",
+                crate::tooling::errors::ToolErrorCode::TEST_FAILED,
+                format!(
+                    "{} task failed with exit code {}; fix the first reported failure and rerun the focused check",
+                    kind, captured.exit_code
+                ),
+            ))
+        }
     }
 }
 

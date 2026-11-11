@@ -11924,3 +11924,42 @@ fn importing_a_projection_only_bundle_synthesizes_checkpoint_events() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].id, "ctx-projection-only");
 }
+
+#[test]
+fn recent_events_by_kind_is_bounded_and_newest_first() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "activity").unwrap();
+    for index in 0..6 {
+        store
+            .append_event(
+                &session.id,
+                "tool.finished",
+                serde_json::json!({"tool_call_id": format!("call-{index}")}),
+            )
+            .unwrap();
+    }
+    store
+        .append_event(&session.id, "other", serde_json::json!({}))
+        .unwrap();
+    let events = store
+        .list_recent_events_by_kind(&session.id, "tool.finished", 3)
+        .unwrap();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].seq, 6);
+    assert_eq!(events[1].seq, 5);
+    assert_eq!(events[2].seq, 4);
+    assert!(events.iter().all(|event| event.kind == "tool.finished"));
+    let all = store
+        .list_recent_events_by_kind(&session.id, "tool.finished", 100)
+        .unwrap();
+    assert_eq!(all.len(), 6);
+    assert_eq!(all[0].seq, 6);
+    assert_eq!(all[5].seq, 1);
+    let clamped = store
+        .list_recent_events_by_kind(&session.id, "tool.finished", 0)
+        .unwrap();
+    assert_eq!(clamped.len(), 1);
+}

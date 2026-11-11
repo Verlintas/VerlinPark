@@ -952,6 +952,20 @@ actor CoreClient {
         .decode(SessionCacheStatus.self)
     }
 
+    func toolActivity(
+        sessionID: String,
+        limit: Int = 50
+    ) async throws -> ToolActivityResult {
+        try await request(
+            method: "session.tool_activity",
+            params: [
+                "session_id": .string(sessionID),
+                "limit": .number(Double(limit)),
+            ]
+        )
+        .decode(ToolActivityResult.self)
+    }
+
     func toolOutputPolicy(projectID: String) async throws -> ToolOutputPolicy {
         let params: [String: JSONValue] = ["project_id": .string(projectID)]
         return try await request(method: "tool_output.policy.get", params: params)

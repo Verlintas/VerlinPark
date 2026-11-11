@@ -12054,6 +12054,36 @@ impl Store {
         Ok(events)
     }
 
+    /// Newest-first bounded window of one event kind. Used by the read-only
+    /// tool-activity projection; callers never load an unbounded session log.
+    pub fn list_recent_events_by_kind(
+        &self,
+        session_id: &str,
+        kind: &str,
+        limit: u32,
+    ) -> Result<Vec<Event>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT session_id, seq, type, payload, created_at
+             FROM events WHERE session_id = ?1 AND type = ?2
+             ORDER BY seq DESC LIMIT ?3",
+        )?;
+        let rows =
+            statement.query_map(params![session_id, kind, limit.clamp(1, 1_000)], |row| {
+                let payload: String = row.get(3)?;
+                Ok(Event {
+                    session_id: row.get(0)?,
+                    seq: row.get::<_, i64>(1)? as u64,
+                    kind: row.get(2)?,
+                    payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
+                    created_at: row.get(4)?,
+                })
+            })?;
+        let mut events = rows.collect::<Result<Vec<_>, _>>()?;
+        events.sort_by_key(|event| std::cmp::Reverse(event.seq));
+        Ok(events)
+    }
+
     pub fn event_count_by_kind(&self, session_id: &str, kind: &str) -> Result<u64> {
         let conn = self.lock()?;
         let count = conn.query_row(

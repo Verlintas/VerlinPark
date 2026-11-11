@@ -3749,6 +3749,120 @@ pub struct SessionCacheParams {
     pub session_id: String,
 }
 
+/// Bounded per-tool activity rows derived from the append-only
+/// `tool.finished` event stream. No provider content, command text, or
+/// structured payload is copied here; only operational metrics and the stable
+/// failure contract.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ToolActivityEntry {
+    #[serde(default)]
+    pub tool_call_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(default)]
+    pub is_error: bool,
+    #[serde(default)]
+    pub error_code: Option<String>,
+    #[serde(default)]
+    pub retryable: bool,
+    #[serde(default)]
+    pub hint: Option<String>,
+    #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub output_bytes: u64,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub approval_risk: Option<String>,
+    #[serde(default)]
+    pub approval_mode: Option<String>,
+    #[serde(default)]
+    pub approval_wait_ms: Option<u64>,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ToolActivityToolStat {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub calls: u64,
+    #[serde(default)]
+    pub errors: u64,
+    #[serde(default)]
+    pub total_duration_ms: u64,
+    #[serde(default)]
+    pub output_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ToolActivityCodeStat {
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub calls: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ToolActivitySummary {
+    #[serde(default)]
+    pub calls: u64,
+    #[serde(default)]
+    pub errors: u64,
+    #[serde(default)]
+    pub retryable_errors: u64,
+    #[serde(default)]
+    pub truncated_results: u64,
+    #[serde(default)]
+    pub total_duration_ms: u64,
+    #[serde(default)]
+    pub max_duration_ms: u64,
+    #[serde(default)]
+    pub average_duration_ms: u64,
+    #[serde(default)]
+    pub output_bytes: u64,
+    #[serde(default)]
+    pub approval_waits: u64,
+    #[serde(default)]
+    pub total_approval_wait_ms: u64,
+    #[serde(default)]
+    pub max_approval_wait_ms: u64,
+    #[serde(default)]
+    pub by_tool: Vec<ToolActivityToolStat>,
+    #[serde(default)]
+    pub error_codes: Vec<ToolActivityCodeStat>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ToolActivityResult {
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub entries: Vec<ToolActivityEntry>,
+    /// Total `tool.finished` events in this session, independent of the
+    /// returned window.
+    #[serde(default)]
+    pub total: u64,
+    #[serde(default)]
+    pub limit: u32,
+    /// True when older events exist outside the returned newest-first window.
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub summary: ToolActivitySummary,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolActivityParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionCompactResult {
     pub session_id: String,
@@ -7654,6 +7768,89 @@ mod tests {
         assert_eq!(legacy.config.command, "npx");
         assert!(legacy.config.enabled);
         assert!(legacy.config.url.is_none());
+    }
+
+    #[test]
+    fn tool_activity_decodes_legacy_entries_with_defaults() {
+        let result: ToolActivityResult = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "entries": [{
+                "tool_call_id": "call-1",
+                "name": "read_file",
+                "seq": 7,
+                "is_error": true
+            }],
+            "total": 1,
+            "limit": 50
+        }))
+        .unwrap();
+        assert_eq!(result.entries.len(), 1);
+        let entry = &result.entries[0];
+        assert_eq!(entry.duration_ms, 0);
+        assert_eq!(entry.output_bytes, 0);
+        assert!(!entry.truncated);
+        assert!(!entry.retryable);
+        assert!(entry.error_code.is_none());
+        assert!(entry.approval_risk.is_none());
+        assert!(!result.truncated);
+        assert_eq!(result.summary.calls, 0);
+
+        let params: ToolActivityParams =
+            serde_json::from_value(json!({"session_id": "ses-1"})).unwrap();
+        assert!(params.limit.is_none());
+
+        let encoded = serde_json::to_value(ToolActivityResult {
+            session_id: "ses-1".to_string(),
+            limit: 50,
+            ..ToolActivityResult::default()
+        })
+        .unwrap();
+        assert_eq!(encoded["entries"], json!([]));
+        assert_eq!(encoded["summary"]["calls"], 0);
+    }
+
+    #[test]
+    fn tool_activity_summary_backfills_new_buckets() {
+        let summary: ToolActivitySummary = serde_json::from_value(json!({
+            "calls": 3,
+            "errors": 1,
+            "retryable_errors": 0,
+            "truncated_results": 0,
+            "total_duration_ms": 30,
+            "max_duration_ms": 20,
+            "average_duration_ms": 10,
+            "output_bytes": 400,
+            "by_tool": []
+        }))
+        .unwrap();
+        assert_eq!(summary.approval_waits, 0);
+        assert_eq!(summary.total_approval_wait_ms, 0);
+        assert_eq!(summary.max_approval_wait_ms, 0);
+        assert!(summary.error_codes.is_empty());
+        let encoded = serde_json::to_value(&summary).unwrap();
+        assert_eq!(encoded["approval_waits"], 0);
+        assert_eq!(encoded["error_codes"], json!([]));
+
+        let full: ToolActivitySummary = serde_json::from_value(json!({
+            "calls": 3,
+            "errors": 1,
+            "retryable_errors": 1,
+            "truncated_results": 1,
+            "total_duration_ms": 30,
+            "max_duration_ms": 20,
+            "average_duration_ms": 10,
+            "output_bytes": 400,
+            "approval_waits": 2,
+            "total_approval_wait_ms": 700,
+            "max_approval_wait_ms": 500,
+            "by_tool": [{"name": "shell", "calls": 1, "errors": 1, "total_duration_ms": 20, "output_bytes": 300}],
+            "error_codes": [{"code": "COMMAND_FAILED", "calls": 1}]
+        }))
+        .unwrap();
+        assert_eq!(full.approval_waits, 2);
+        assert_eq!(full.max_approval_wait_ms, 500);
+        assert_eq!(full.by_tool[0].name, "shell");
+        assert_eq!(full.error_codes[0].code, "COMMAND_FAILED");
     }
 
     #[test]
