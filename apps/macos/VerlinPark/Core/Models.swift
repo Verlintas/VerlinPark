@@ -3118,9 +3118,24 @@ struct SessionCacheStatus: Codable, Sendable {
     let cacheReadTokens: Int?
     let cacheWriteTokens: Int?
     let cacheHitRatio: Double?
+    let cacheReadRatio: Double?
+    let cacheWriteRatio: Double?
+    let estimatedSavingsUSD: Double?
+    let cacheCalls: Int?
     let lastCallAt: String?
     let promptPrefixHash: String?
+    let cacheGeneration: String?
+    let coreHash: String?
+    let projectHash: String?
+    let toolsHash: String?
+    let volatileHash: String?
     let preambleTokensEstimate: Int?
+    let lastBreakpoints: Int?
+    let lastCacheTTL: String?
+    let lastMissReason: String?
+    let lastFirstTokenMS: Int?
+    let recentCalls: [SessionCacheCall]
+    let policy: SessionCachePolicy?
 
     /// `session.cache` may report either total provider input (which already
     /// includes cache reads/writes) or an explicit uncached count. Prefer the
@@ -3142,9 +3157,24 @@ struct SessionCacheStatus: Codable, Sendable {
         case cacheReadTokens = "cache_read_tokens"
         case cacheWriteTokens = "cache_write_tokens"
         case cacheHitRatio = "cache_hit_ratio"
+        case cacheReadRatio = "cache_read_ratio"
+        case cacheWriteRatio = "cache_write_ratio"
+        case estimatedSavingsUSD = "estimated_savings_usd"
+        case cacheCalls = "cache_calls"
         case lastCallAt = "last_call_at"
         case promptPrefixHash = "prompt_prefix_hash"
+        case cacheGeneration = "cache_generation"
+        case coreHash = "core_hash"
+        case projectHash = "project_hash"
+        case toolsHash = "tools_hash"
+        case volatileHash = "volatile_hash"
         case preambleTokensEstimate = "preamble_tokens_estimate"
+        case lastBreakpoints = "last_breakpoints"
+        case lastCacheTTL = "last_cache_ttl"
+        case lastMissReason = "last_miss_reason"
+        case lastFirstTokenMS = "last_first_token_ms"
+        case recentCalls = "recent_calls"
+        case policy
     }
 
     private struct CacheKey: CodingKey {
@@ -3210,9 +3240,275 @@ struct SessionCacheStatus: Codable, Sendable {
         cacheReadTokens = int("cache_read_tokens")
         cacheWriteTokens = int("cache_write_tokens")
         cacheHitRatio = double("cache_hit_ratio")
+        cacheReadRatio = double("cache_read_ratio")
+        cacheWriteRatio = double("cache_write_ratio")
+        estimatedSavingsUSD = double("estimated_savings_usd")
+        cacheCalls = int("cache_calls")
         lastCallAt = string("last_call_at", "last_call")
         promptPrefixHash = string("prompt_prefix_hash", "prefix_hash", "cache_generation")
+        cacheGeneration = string("cache_generation", "prompt_prefix_hash")
+        coreHash = string("core_hash")
+        projectHash = string("project_hash")
+        toolsHash = string("tools_hash")
+        volatileHash = string("volatile_hash")
         preambleTokensEstimate = int("preamble_tokens_estimate", "estimated_preamble_tokens")
+        lastBreakpoints = int("last_breakpoints", "cache_breakpoints")
+        lastCacheTTL = string("last_cache_ttl", "cache_ttl")
+        lastMissReason = string("last_miss_reason", "miss_reason")
+        lastFirstTokenMS = int("last_first_token_ms", "first_token_ms")
+        recentCalls = (try? container.decode([SessionCacheCall].self, forKey: CacheKey("recent_calls"))) ?? []
+        policy = try? container.decode(SessionCachePolicy.self, forKey: CacheKey("policy"))
+    }
+}
+
+/// One bounded per-call cache observation from `session.cache`.
+struct SessionCacheCall: Codable, Sendable, Identifiable, Equatable {
+    var id: String {
+        "\(at)-\(agentName ?? "")-\(inputTokens)"
+    }
+
+    let at: String
+    let agentName: String?
+    let role: String?
+    let model: String?
+    let inputTokens: Int
+    let outputTokens: Int
+    let cacheReadTokens: Int
+    let cacheWriteTokens: Int
+    let cacheHitRatio: Double
+    let cacheBreakpoints: Int
+    let cacheTTL: String?
+    let firstTokenMS: Int?
+    let coreHash: String?
+    let projectHash: String?
+    let toolsHash: String?
+    let volatileHash: String?
+    let promptPrefixHash: String?
+    let estimatedSavingsUSD: Double
+    let missReason: String?
+    let warm: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case at
+        case agentName = "agent_name"
+        case role
+        case model
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case cacheReadTokens = "cache_read_tokens"
+        case cacheWriteTokens = "cache_write_tokens"
+        case cacheHitRatio = "cache_hit_ratio"
+        case cacheBreakpoints = "cache_breakpoints"
+        case cacheTTL = "cache_ttl"
+        case firstTokenMS = "first_token_ms"
+        case coreHash = "core_hash"
+        case projectHash = "project_hash"
+        case toolsHash = "tools_hash"
+        case volatileHash = "volatile_hash"
+        case promptPrefixHash = "prompt_prefix_hash"
+        case estimatedSavingsUSD = "estimated_savings_usd"
+        case missReason = "miss_reason"
+        case warm
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        at = (try? container.decode(String.self, forKey: .at)) ?? ""
+        agentName = try? container.decode(String.self, forKey: .agentName)
+        role = try? container.decode(String.self, forKey: .role)
+        model = try? container.decode(String.self, forKey: .model)
+        inputTokens = (try? container.decode(Int.self, forKey: .inputTokens)) ?? 0
+        outputTokens = (try? container.decode(Int.self, forKey: .outputTokens)) ?? 0
+        cacheReadTokens = (try? container.decode(Int.self, forKey: .cacheReadTokens)) ?? 0
+        cacheWriteTokens = (try? container.decode(Int.self, forKey: .cacheWriteTokens)) ?? 0
+        cacheHitRatio = (try? container.decode(Double.self, forKey: .cacheHitRatio)) ?? 0
+        cacheBreakpoints = (try? container.decode(Int.self, forKey: .cacheBreakpoints)) ?? 0
+        cacheTTL = try? container.decode(String.self, forKey: .cacheTTL)
+        firstTokenMS = try? container.decode(Int.self, forKey: .firstTokenMS)
+        coreHash = try? container.decode(String.self, forKey: .coreHash)
+        projectHash = try? container.decode(String.self, forKey: .projectHash)
+        toolsHash = try? container.decode(String.self, forKey: .toolsHash)
+        volatileHash = try? container.decode(String.self, forKey: .volatileHash)
+        promptPrefixHash = try? container.decode(String.self, forKey: .promptPrefixHash)
+        estimatedSavingsUSD = (try? container.decode(Double.self, forKey: .estimatedSavingsUSD)) ?? 0
+        missReason = try? container.decode(String.self, forKey: .missReason)
+        warm = (try? container.decode(Bool.self, forKey: .warm)) ?? false
+    }
+}
+
+/// Result of an explicit `session.cache.warm` call. Every field is reported by
+/// the daemon; the UI never invents a warm success.
+struct SessionCacheWarmResult: Codable, Sendable {
+    let sessionID: String
+    let warmed: Bool
+    let provider: String
+    let model: String
+    let role: String?
+    let source: String?
+    let cacheBreakpoints: Int?
+    let cacheTTL: String?
+    let automatic: Bool?
+    let inputTokens: Int?
+    let outputTokens: Int?
+    let cacheReadTokens: Int?
+    let cacheWriteTokens: Int?
+    let estimated: Bool?
+    let costUSD: Double?
+    let latencyMS: Int?
+    let firstTokenMS: Int?
+    let message: String?
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case warmed
+        case provider
+        case model
+        case role
+        case source
+        case cacheBreakpoints = "cache_breakpoints"
+        case cacheTTL = "cache_ttl"
+        case automatic
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case cacheReadTokens = "cache_read_tokens"
+        case cacheWriteTokens = "cache_write_tokens"
+        case estimated
+        case costUSD = "cost_usd"
+        case latencyMS = "latency_ms"
+        case firstTokenMS = "first_token_ms"
+        case message
+    }
+}
+
+struct ProjectCachePolicyResult: Codable, Sendable {
+    let projectID: String
+    let policy: SessionCachePolicy
+
+    enum CodingKeys: String, CodingKey {
+        case projectID = "project_id"
+        case policy
+    }
+}
+
+struct SessionCacheAuditFinding: Codable, Sendable, Identifiable {
+    var id: String {
+        "\(severity)-\(code)"
+    }
+
+    let code: String
+    let severity: String
+    let message: String
+    let evidence: [String: JSONValue]
+}
+
+struct SessionCacheAuditResult: Codable, Sendable {
+    let sessionID: String
+    let provider: String?
+    let callsChecked: Int
+    let warmCallsChecked: Int
+    let compactionsChecked: Int
+    let hitRatio: Double
+    let cacheReadTokens: Int
+    let cacheWriteTokens: Int
+    let findings: [SessionCacheAuditFinding]
+    let clean: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case provider
+        case callsChecked = "calls_checked"
+        case warmCallsChecked = "warm_calls_checked"
+        case compactionsChecked = "compactions_checked"
+        case hitRatio = "hit_ratio"
+        case cacheReadTokens = "cache_read_tokens"
+        case cacheWriteTokens = "cache_write_tokens"
+        case findings
+        case clean
+    }
+}
+
+struct SessionCachePlanRole: Codable, Sendable, Identifiable {
+    var id: String {
+        role
+    }
+
+    let role: String
+    let provider: String
+    let model: String
+    let cacheBreakpoints: Int
+    let cacheTTL: String
+    let ttlExplicit: Bool
+    let automatic: Bool
+    let tailMessage: Bool
+    let toolBreakpoint: Bool
+    let coreBreakpoint: Bool
+    let projectBreakpoint: Bool
+    let coreHash: String
+    let projectHash: String
+    let toolsHash: String
+    let volatileHash: String
+    let prefixHash: String
+    let coreChars: Int
+    let projectChars: Int
+    let stablePrefixChars: Int
+    let toolCount: Int
+    let systemTokensEstimate: Int
+    let toolTokensEstimate: Int
+
+    enum CodingKeys: String, CodingKey {
+        case role
+        case provider
+        case model
+        case cacheBreakpoints = "cache_breakpoints"
+        case cacheTTL = "cache_ttl"
+        case ttlExplicit = "ttl_explicit"
+        case automatic
+        case tailMessage = "tail_message"
+        case toolBreakpoint = "tool_breakpoint"
+        case coreBreakpoint = "core_breakpoint"
+        case projectBreakpoint = "project_breakpoint"
+        case coreHash = "core_hash"
+        case projectHash = "project_hash"
+        case toolsHash = "tools_hash"
+        case volatileHash = "volatile_hash"
+        case prefixHash = "prefix_hash"
+        case coreChars = "core_chars"
+        case projectChars = "project_chars"
+        case stablePrefixChars = "stable_prefix_chars"
+        case toolCount = "tool_count"
+        case systemTokensEstimate = "system_tokens_estimate"
+        case toolTokensEstimate = "tool_tokens_estimate"
+    }
+}
+
+struct SessionCachePlanResult: Codable, Sendable {
+    let sessionID: String
+    let provider: String
+    let policy: SessionCachePolicy?
+    let roles: [SessionCachePlanRole]
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case provider
+        case policy
+        case roles
+    }
+}
+
+/// Project cache policy as reported by `session.cache`.
+struct SessionCachePolicy: Codable, Sendable {
+    let enabled: Bool
+    let ttl: String
+    let automaticCaching: Bool
+    let warmOnResume: Bool
+    let compactAware: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case enabled
+        case ttl
+        case automaticCaching = "automatic_caching"
+        case warmOnResume = "warm_on_resume"
+        case compactAware = "compact_aware"
     }
 }
 

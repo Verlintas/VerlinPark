@@ -14,20 +14,21 @@ use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
     AcpAgent, AcpAgentConfig, AcpTransport, AgentMessage, AgentRecord, Approval, ApprovalGrant,
-    Artifact, ArtifactPolicy, ArtifactVersion, CheckpointRetentionPolicy, ContextCheckpoint,
-    ContextCheckpointPolicy, ContinuationOutcome, Event, GuiActionInfo, GuiPolicy, IntakeTask,
-    IntegrationPolicy, MailboxPolicy, McpServer, McpServerConfig, McpTransport, MemoryConflict,
-    MemoryEmbeddingJobStatus, MemoryEmbeddingPolicy, MemoryEmbeddingUsage,
-    MemoryEmbeddingsStatusResult, MemoryEvidence, MemoryHealthResult, MemoryItem, MemoryPolicy,
-    MemoryStatCount, MergeQueueEntry, MetricCount, ModelPreset, OrchestrationDecision,
-    OrchestrationNote, OrchestrationPolicy, OrchestrationRecovery, PlanTaskProgress, Program,
-    ProgramEvent, ProgramMilestone, ProgramMilestoneStatus, ProgramPolicy, ProgramStatus,
-    ProgramUsage, Project, ProjectBudget, ProjectUsageSession, Question, RunBudgetSnapshot,
-    RunCheckpoint, RunStep, RunToolCall, ScheduledTask, SearchHit, Session, SessionBundle,
-    SessionContinuation, SessionRun, SessionRunPolicy, ShellPolicy, Skill, Source, SourceChunk,
-    SourceCollection, SourceSearchHit, SourceStats, SteeringMessage, StoredMessage,
-    TaskSchedulerPolicy, TaskStall, TeamPlan, TodoItem, ToolOutputAuditResult, ToolOutputPolicy,
-    ToolOutputToolStat, UsageEntry, WorktreeRetentionPolicy, WriteLease, cache_hit_ratio,
+    Artifact, ArtifactPolicy, ArtifactVersion, CachePolicy, CheckpointRetentionPolicy,
+    ContextCheckpoint, ContextCheckpointPolicy, ContinuationOutcome, Event, GuiActionInfo,
+    GuiPolicy, IntakeTask, IntegrationPolicy, MailboxPolicy, McpServer, McpServerConfig,
+    McpTransport, MemoryConflict, MemoryEmbeddingJobStatus, MemoryEmbeddingPolicy,
+    MemoryEmbeddingUsage, MemoryEmbeddingsStatusResult, MemoryEvidence, MemoryHealthResult,
+    MemoryItem, MemoryPolicy, MemoryStatCount, MergeQueueEntry, MetricCount, ModelPreset,
+    OrchestrationDecision, OrchestrationNote, OrchestrationPolicy, OrchestrationRecovery,
+    PlanTaskProgress, Program, ProgramEvent, ProgramMilestone, ProgramMilestoneStatus,
+    ProgramPolicy, ProgramStatus, ProgramUsage, Project, ProjectBudget, ProjectUsageSession,
+    Question, RunBudgetSnapshot, RunCheckpoint, RunStep, RunToolCall, ScheduledTask, SearchHit,
+    Session, SessionBundle, SessionContinuation, SessionRun, SessionRunPolicy, ShellPolicy, Skill,
+    Source, SourceChunk, SourceCollection, SourceSearchHit, SourceStats, SteeringMessage,
+    StoredMessage, TaskSchedulerPolicy, TaskStall, TeamPlan, TodoItem, ToolOutputAuditResult,
+    ToolOutputPolicy, ToolOutputToolStat, UsageEntry, WorktreeRetentionPolicy, WriteLease,
+    cache_hit_ratio,
 };
 
 use vp_protocol::remote::ExecutionHost;
@@ -763,6 +764,10 @@ pub struct ProjectManifestSnapshot {
     pub recorded_at: String,
     pub project: Project,
     pub shell_policy: ShellPolicy,
+    /// Prompt-cache policy. Older manifests decode as the enabled, 5m,
+    /// automatic, compact-aware default.
+    #[serde(default)]
+    pub cache_policy: CachePolicy,
     pub integration_policy: IntegrationPolicy,
     /// Unified browser/computer GUI lease, grace, wait, and sensitive-target
     /// policy. Older manifests decode as the bounded default.
@@ -1174,6 +1179,12 @@ impl Store {
                 read_deny       TEXT NOT NULL,
                 restrict_home   INTEGER NOT NULL DEFAULT 0,
                 read_jail       INTEGER NOT NULL DEFAULT 0,
+                updated_at      TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS project_cache_policies (
+                project_id      TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                policy          TEXT NOT NULL,
                 updated_at      TEXT NOT NULL
             );
 
@@ -2908,6 +2919,7 @@ impl Store {
                 version: 1,
                 recorded_at: now_rfc3339(),
                 shell_policy: self.get_shell_policy(&project.id)?,
+                cache_policy: self.get_cache_policy(&project.id)?,
                 execution_host: self.get_execution_host(&project.id)?,
                 integration_policy: self.get_integration_policy(&project.id)?,
                 gui_policy: self.get_gui_policy(&project.id)?,
@@ -3041,6 +3053,37 @@ impl Store {
                 if policy.read_jail { 1 } else { 0 },
                 now_rfc3339()
             ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_cache_policy(&self, project_id: &str) -> Result<CachePolicy> {
+        let conn = self.lock()?;
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT policy FROM project_cache_policies WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match stored {
+            Some(encoded) => {
+                serde_json::from_str(&encoded).context("parsing stored project cache policy")
+            }
+            None => Ok(CachePolicy::default()),
+        }
+    }
+
+    pub fn set_cache_policy(&self, project_id: &str, policy: &CachePolicy) -> Result<()> {
+        let encoded = serde_json::to_string(policy).context("serializing project cache policy")?;
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO project_cache_policies (project_id, policy, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(project_id) DO UPDATE SET
+                policy = excluded.policy,
+                updated_at = excluded.updated_at",
+            params![project_id, encoded, now_rfc3339()],
         )?;
         Ok(())
     }
@@ -12141,6 +12184,36 @@ impl Store {
         }
         actions.reverse();
         Ok(actions)
+    }
+
+    /// Newest events of one kind, oldest-first in the returned vector. Used by
+    /// bounded cache telemetry, where the latest call is what matters.
+    pub fn recent_events_by_kind(
+        &self,
+        session_id: &str,
+        kind: &str,
+        limit: u32,
+    ) -> Result<Vec<Event>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT session_id, seq, type, payload, created_at
+             FROM events WHERE session_id = ?1 AND type = ?2
+             ORDER BY seq DESC LIMIT ?3",
+        )?;
+        let rows =
+            statement.query_map(params![session_id, kind, limit.clamp(1, 10_000)], |row| {
+                let payload: String = row.get(3)?;
+                Ok(Event {
+                    session_id: row.get(0)?,
+                    seq: row.get::<_, i64>(1)? as u64,
+                    kind: row.get(2)?,
+                    payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
+                    created_at: row.get(4)?,
+                })
+            })?;
+        let mut events = rows.collect::<Result<Vec<_>, _>>()?;
+        events.reverse();
+        Ok(events)
     }
 
     pub fn list_events_by_kind(

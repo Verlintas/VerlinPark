@@ -709,6 +709,14 @@ async fn cache_status_is_empty_then_populated_and_survives_replay() {
     assert!(empty.prompt_prefix.is_none());
     assert!(empty.preamble_tokens_estimate.is_none());
     assert!(empty.last_call_at.is_none());
+    assert_eq!(empty.cache_calls, 0);
+    assert!(empty.recent_calls.is_empty());
+    assert!(empty.miss_reason_counts.is_empty());
+    assert!(empty.ttl_counts.is_empty());
+    assert!(empty.breakpoint_counts.is_empty());
+    assert!(empty.savings_by_role.is_empty());
+    assert_eq!(empty.compaction_resets, 0);
+    assert!(empty.policy.is_some());
 
     engine
         .record_agent_usage_with_cache(
@@ -763,6 +771,81 @@ async fn cache_status_is_empty_then_populated_and_survives_replay() {
     let derived = engine.usage_ledger(&session.id).await.unwrap();
     assert!((derived.totals.cache_hit_ratio - 0.6).abs() < 1e-9);
     assert!((derived.totals.by_role[0].cache_hit_ratio - 0.6).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn cache_audit_reports_breakpoint_and_churn_findings_without_a_provider_call() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("cache audit".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "audit cache".into(), None)
+        .await
+        .unwrap();
+    engine
+        .append_event(
+            &session.id,
+            "context.prompt_prefix",
+            serde_json::json!({
+                "cache_plan": {
+                    "provider": "anthropic",
+                    "breakpoints": 4
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    for (index, read) in [0_u64, 0_u64, 0_u64, 0_u64, 0_u64].iter().enumerate() {
+        engine
+            .append_event(
+                &session.id,
+                "context.cache",
+                serde_json::json!({
+                    "input_tokens": 1_000,
+                    "cache_read_tokens": read,
+                    "cache_write_tokens": 500,
+                    "cache_breakpoints": 5,
+                    "cache_ttl": "1h",
+                    "core_hash": "core",
+                    "project_hash": format!("project-{index}"),
+                    "tools_hash": "tools",
+                    "prompt_prefix_hash": "prefix"
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    let audit = engine.session_cache_audit(&session.id).await.unwrap();
+    assert_eq!(audit.session_id, session.id);
+    assert_eq!(audit.provider.as_deref(), Some("anthropic"));
+    assert_eq!(audit.calls_checked, 5);
+    assert!(!audit.clean);
+    let codes = audit
+        .findings
+        .iter()
+        .map(|finding| finding.code.as_str())
+        .collect::<Vec<_>>();
+    assert!(codes.contains(&"breakpoint_limit_exceeded"));
+    assert!(codes.contains(&"cache_writes_without_reads"));
+    assert!(codes.contains(&"low_cache_hit_ratio"));
+    assert!(codes.contains(&"project_prefix_churn"));
+    assert!(codes.contains(&"one_hour_ttl_without_reads"));
+    assert!(codes.contains(&"breakpoint_plan_mismatch"));
+    let critical = audit
+        .findings
+        .iter()
+        .find(|finding| finding.code == "breakpoint_limit_exceeded")
+        .expect("critical finding");
+    assert_eq!(critical.severity, "critical");
+    assert_eq!(critical.evidence["breakpoints"].as_u64(), Some(5));
 }
 
 #[tokio::test]
@@ -11217,6 +11300,18 @@ async fn database_rebuild_preserves_context_checkpoint_policy() {
             )
             .await
             .unwrap();
+        engine
+            .set_cache_policy(
+                &project.id,
+                vp_protocol::types::CachePolicy {
+                    ttl: "1h".into(),
+                    automatic_caching: false,
+                    warm_on_resume: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         let checkpoint =
             durable_context_checkpoint(&session, &project.id, "ctx-policy-rebuild", None);
         engine.record_context_checkpoint(checkpoint).await.unwrap();
@@ -11236,6 +11331,10 @@ async fn database_rebuild_preserves_context_checkpoint_policy() {
     assert!(policy.enabled);
     assert_eq!(policy.max_checkpoints, 9);
     assert_eq!(policy.max_age_days, 14);
+    let cache = store.get_cache_policy(&projects[0].id).unwrap();
+    assert_eq!(cache.ttl, "1h");
+    assert!(!cache.automatic_caching);
+    assert!(cache.warm_on_resume);
     assert_eq!(
         store
             .list_context_checkpoints(&session_id, 10)

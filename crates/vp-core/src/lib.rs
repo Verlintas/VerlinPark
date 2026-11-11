@@ -21,8 +21,8 @@ use vp_protocol::types::{
     AcpAgent, AcpAgentConfig, AcpAgentListResult, AcpProbeResult, AcpTransport, AgentMessage,
     AgentRecord, Approval, ApprovalGrant, Artifact, ArtifactBackfillResult, ArtifactDiffParams,
     ArtifactDiffResult, ArtifactGcResult, ArtifactMaterialization, ArtifactPolicy,
-    ArtifactVersionsResult, CheckpointPolicyResult, CheckpointRetentionPolicy, CitationAudit,
-    CitationAuditMessage, ConsoleCloseResult, ConsoleOpenResult, ConsoleReadResult,
+    ArtifactVersionsResult, CachePolicy, CheckpointPolicyResult, CheckpointRetentionPolicy,
+    CitationAudit, CitationAuditMessage, ConsoleCloseResult, ConsoleOpenResult, ConsoleReadResult,
     ConsoleSignalResult, ConsoleWriteResult, ContextCompactionSummary, ContextMeasurement,
     ContextUsage, ContinuationOutcome, CreateModelPresetParams, DoctorCheck, Event, GitLogResult,
     GitShowResult, IntakeCreateParams, IntakeListResult, IntakeTask, IntakeUpdateParams,
@@ -89,6 +89,7 @@ pub mod agent;
 pub mod backup;
 pub mod browser;
 pub mod budget;
+pub mod cache_audit;
 pub mod computer;
 pub mod console;
 pub mod context;
@@ -104,6 +105,7 @@ mod operation;
 pub mod orchestration;
 pub mod permissions;
 pub mod program;
+pub mod prompt_cache;
 pub mod rebuild;
 pub mod remote;
 pub mod run_journal;
@@ -1433,6 +1435,40 @@ impl Engine {
     pub async fn list_projects(&self) -> Result<Vec<Project>> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.list_projects()).await?
+    }
+
+    pub async fn get_cache_policy(&self, project_id: &str) -> Result<CachePolicy> {
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        // One bounded lookup on the hot prompt-construction path. A missing row
+        // decodes as the default policy; `set_cache_policy` still validates the
+        // project and the values before writing.
+        let policy =
+            tokio::task::spawn_blocking(move || store.get_cache_policy(&project_id)).await??;
+        Ok(policy.normalized().unwrap_or_default())
+    }
+
+    pub async fn set_cache_policy(
+        &self,
+        project_id: &str,
+        policy: CachePolicy,
+    ) -> Result<CachePolicy> {
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        tokio::task::spawn_blocking({
+            let store = store.clone();
+            let project_id = project_id.clone();
+            move || store.get_project(&project_id)
+        })
+        .await??
+        .ok_or_else(|| anyhow::anyhow!("project not found: {project_id}"))?;
+        let policy = policy
+            .normalized()
+            .map_err(|error| anyhow::anyhow!("invalid cache policy: {error}"))?;
+        let policy_for_store = policy.clone();
+        tokio::task::spawn_blocking(move || store.set_cache_policy(&project_id, &policy_for_store))
+            .await??;
+        Ok(policy)
     }
 
     pub async fn get_shell_policy(&self, project_id: &str) -> Result<ShellPolicy> {
@@ -6143,6 +6179,18 @@ impl Engine {
         tokio::task::spawn_blocking(move || store.recent_events(&id, limit)).await?
     }
 
+    pub async fn recent_events_of_kind(
+        &self,
+        session_id: &str,
+        kind: &str,
+        limit: u32,
+    ) -> Result<Vec<Event>> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let kind = kind.to_string();
+        tokio::task::spawn_blocking(move || store.recent_events_by_kind(&id, &kind, limit)).await?
+    }
+
     pub async fn task_queue(
         &self,
         project_id: Option<String>,
@@ -8112,8 +8160,11 @@ impl Engine {
     }
 
     /// Bounded cache telemetry derived from the usage ledger and the latest
-    /// context prompt-prefix/measurement events. Never returns prompt text.
+    /// context prompt-prefix/measurement/cache events. Never returns prompt
+    /// text or provider secrets.
     pub async fn session_cache_status(&self, session_id: &str) -> Result<SessionCacheStatus> {
+        const CACHE_CALL_SCAN_LIMIT: u32 = 2_000;
+        const RECENT_CALLS: usize = 20;
         let ledger = self.usage_ledger(session_id).await?;
         let prefix_event = self
             .latest_event_of_kind(session_id, "context.prompt_prefix")
@@ -8121,6 +8172,14 @@ impl Engine {
         let measured_event = self
             .latest_event_of_kind(session_id, "context.measured")
             .await?;
+        let cache_events = self
+            .recent_events_of_kind(session_id, "context.cache", CACHE_CALL_SCAN_LIMIT)
+            .await?;
+        let compaction_events = self
+            .recent_events_of_kind(session_id, "context.compaction", CACHE_CALL_SCAN_LIMIT)
+            .await?;
+        let aggregate =
+            crate::prompt_cache::aggregate_cache_events(&cache_events, &compaction_events);
 
         let prompt_prefix = prefix_event
             .as_ref()
@@ -8128,12 +8187,26 @@ impl Engine {
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
             .or_else(|| {
+                cache_events
+                    .last()
+                    .and_then(|event| event.payload.get("prompt_prefix_hash"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .or_else(|| {
                 measured_event
                     .as_ref()
                     .and_then(|event| event.payload.get("prompt_prefix_hash"))
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string)
             });
+        let hash = |key: &str| {
+            prefix_event
+                .as_ref()
+                .and_then(|event| event.payload.get(key))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
         let preamble_tokens_estimate = prefix_event.as_ref().and_then(|event| {
             event
                 .payload
@@ -8147,11 +8220,63 @@ impl Engine {
                         .map(|chars| chars / 4)
                 })
         });
+        let estimated_savings_usd = crate::prompt_cache::round_usd(
+            cache_events
+                .iter()
+                .filter_map(|event| {
+                    event
+                        .payload
+                        .get("estimated_savings_usd")
+                        .and_then(serde_json::Value::as_f64)
+                })
+                .sum::<f64>(),
+        );
+        let last_recorded = cache_events.last();
+        // Warm calls are real provider calls and count in totals, but "last
+        // miss" should describe the latest ordinary agent call so a warm does
+        // not hide the most recent production miss.
+        let last_cache = cache_events
+            .iter()
+            .rev()
+            .find(|event| {
+                event
+                    .payload
+                    .get("warm")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+            })
+            .or(last_recorded);
         let last_call_at = ledger
             .entries
             .last()
             .map(|entry| entry.created_at.clone())
+            .or_else(|| last_recorded.map(|event| event.created_at.clone()))
             .or_else(|| measured_event.map(|event| event.created_at));
+        let cache_calls = cache_events
+            .iter()
+            .filter(|event| {
+                event
+                    .payload
+                    .get("warm")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+            })
+            .count() as u64;
+        let recent_calls = cache_events
+            .iter()
+            .rev()
+            .take(RECENT_CALLS)
+            .map(|event| crate::prompt_cache::cache_call_record(&event.payload, &event.created_at))
+            .collect::<Vec<_>>();
+        let session_store = self.store.clone();
+        let lookup_id = session_id.to_string();
+        let project_id = tokio::task::spawn_blocking(move || session_store.get_session(&lookup_id))
+            .await??
+            .map(|session| session.project_id);
+        let policy = match project_id {
+            Some(project_id) => self.get_cache_policy(&project_id).await.ok(),
+            None => None,
+        };
 
         Ok(SessionCacheStatus {
             session_id: session_id.to_string(),
@@ -8160,10 +8285,106 @@ impl Engine {
             cache_write_tokens: ledger.totals.cache_write_tokens,
             output_tokens: ledger.totals.output_tokens,
             cache_hit_ratio: ledger.totals.cache_hit_ratio,
+            cache_read_ratio: if ledger.totals.input_tokens == 0 {
+                0.0
+            } else {
+                (ledger.totals.cache_read_tokens as f64 / ledger.totals.input_tokens as f64)
+                    .clamp(0.0, 1.0)
+            },
+            cache_write_ratio: if ledger.totals.input_tokens == 0 {
+                0.0
+            } else {
+                (ledger.totals.cache_write_tokens as f64 / ledger.totals.input_tokens as f64)
+                    .clamp(0.0, 1.0)
+            },
+            estimated_savings_usd,
+            cache_calls,
             prompt_prefix,
+            cache_generation: last_cache
+                .and_then(|event| event.payload.get("cache_generation"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .or_else(|| hash("cache_generation")),
+            core_hash: hash("core_hash"),
+            project_hash: hash("project_hash"),
+            tools_hash: hash("tools_hash"),
+            volatile_hash: hash("volatile_hash"),
             preamble_tokens_estimate,
             last_call_at,
+            last_breakpoints: last_cache
+                .and_then(|event| event.payload.get("cache_breakpoints"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as u32,
+            last_cache_ttl: last_cache
+                .and_then(|event| event.payload.get("cache_ttl"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .or_else(|| policy.as_ref().map(|policy| policy.ttl.clone())),
+            last_miss_reason: last_cache
+                .and_then(|event| event.payload.get("miss_reason"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            last_first_token_ms: last_cache
+                .and_then(|event| event.payload.get("first_token_ms"))
+                .and_then(serde_json::Value::as_u64),
+            recent_calls,
+            miss_reason_counts: aggregate.miss_reason_counts,
+            ttl_counts: aggregate.ttl_counts,
+            breakpoint_counts: aggregate.breakpoint_counts,
+            savings_by_role: aggregate.savings_by_role,
+            first_token_p50_ms: aggregate.first_token_p50_ms,
+            first_token_p95_ms: aggregate.first_token_p95_ms,
+            compaction_resets: aggregate.compaction_resets,
+            compaction_invalidation_tokens: aggregate.compaction_invalidation_tokens,
+            compaction_invalidation_estimated_usd: aggregate.compaction_invalidation_estimated_usd,
+            policy,
         })
+    }
+
+    /// Deterministic cache audit over persisted events. No provider call and
+    /// no TTL inference; findings are derived only from recorded telemetry.
+    pub async fn session_cache_audit(
+        &self,
+        session_id: &str,
+    ) -> Result<vp_protocol::types::SessionCacheAuditResult> {
+        const LIMIT: u32 = 2_000;
+        let cache_events = self
+            .recent_events_of_kind(session_id, "context.cache", LIMIT)
+            .await?;
+        let prefix_events = self
+            .recent_events_of_kind(session_id, "context.prompt_prefix", 50)
+            .await?;
+        let compaction_events = self
+            .recent_events_of_kind(session_id, "context.compaction", LIMIT)
+            .await?;
+        let session_store = self.store.clone();
+        let lookup_id = session_id.to_string();
+        let project_id = tokio::task::spawn_blocking(move || session_store.get_session(&lookup_id))
+            .await??
+            .map(|session| session.project_id);
+        let policy = match project_id {
+            Some(project_id) => self.get_cache_policy(&project_id).await.ok(),
+            None => None,
+        };
+        let provider = prefix_events
+            .iter()
+            .rev()
+            .find_map(|event| {
+                event
+                    .payload
+                    .get("cache_plan")
+                    .and_then(|plan| plan.get("provider"))
+                    .and_then(serde_json::Value::as_str)
+            })
+            .map(str::to_string);
+        Ok(crate::cache_audit::audit_cache_events(
+            session_id,
+            provider.as_deref(),
+            policy.as_ref(),
+            &cache_events,
+            &prefix_events,
+            &compaction_events,
+        ))
     }
 
     pub async fn usage_spent(

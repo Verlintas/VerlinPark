@@ -1017,6 +1017,49 @@ actor CoreClient {
         .decode(ToolActivityResult.self)
     }
 
+    /// Explicit, operator-triggered warm of the stable prompt prefix. This
+    /// makes one provider call and is never invoked by a refresh path.
+    func warmSessionCache(sessionID: String, role: String? = nil) async throws
+        -> SessionCacheWarmResult
+    {
+        var params: [String: JSONValue] = ["session_id": .string(sessionID)]
+        if let role {
+            params["role"] = .string(role)
+        }
+        return try await request(method: "session.cache.warm", params: params)
+            .decode(SessionCacheWarmResult.self)
+    }
+
+    func cachePolicy(projectID: String) async throws -> SessionCachePolicy {
+        try await request(
+            method: "project.cache_policy.get",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(ProjectCachePolicyResult.self)
+        .policy
+    }
+
+    func cachePlan(sessionID: String, roles: [String] = []) async throws
+        -> SessionCachePlanResult
+    {
+        try await request(
+            method: "session.cache.plan",
+            params: [
+                "session_id": .string(sessionID),
+                "roles": .array(roles.map(JSONValue.string)),
+            ]
+        )
+        .decode(SessionCachePlanResult.self)
+    }
+
+    func cacheAudit(sessionID: String) async throws -> SessionCacheAuditResult {
+        try await request(
+            method: "session.cache.audit",
+            params: ["session_id": .string(sessionID)]
+        )
+        .decode(SessionCacheAuditResult.self)
+    }
+
     func toolOutputPolicy(projectID: String) async throws -> ToolOutputPolicy {
         let params: [String: JSONValue] = ["project_id": .string(projectID)]
         return try await request(method: "tool_output.policy.get", params: params)

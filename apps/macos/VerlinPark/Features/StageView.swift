@@ -771,6 +771,26 @@ private struct ContextPopoverView: View {
                         if let ratio = snapshot.cacheHitRatio {
                             CacheHitPill(ratio: ratio)
                         }
+                        if let ttl = snapshot.lastCacheTTL {
+                            Text("ttl \(ttl)")
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                        }
+                        if let breakpoints = snapshot.lastBreakpoints {
+                            Text("\(breakpoints) breakpoints")
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                        }
+                        if let savings = snapshot.estimatedSavingsUSD {
+                            Text("saved \(EfficiencyMetrics.usd(savings))")
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundStyle(savings < 0 ? VPTheme.warning : .secondary)
+                        }
+                        if let miss = snapshot.lastMissReason {
+                            Text("miss \(EfficiencyMetrics.missReasonLabel(miss))")
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                        }
                         if let prefix = EfficiencyMetrics.shortHash(snapshot.promptPrefixHash) {
                             Text("prefix \(prefix)…")
                                 .font(.system(size: 9, design: .monospaced))

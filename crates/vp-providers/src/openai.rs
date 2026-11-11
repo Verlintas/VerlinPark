@@ -60,9 +60,27 @@ impl Provider for OpenAiCompatibleProvider {
     }
 
     async fn stream_chat(&self, request: ChatRequest) -> Result<EventStream, ProviderError> {
-        let mut messages = Vec::with_capacity(request.messages.len() + 2);
-        if let Some(system) = request.system {
-            messages.push(json!({"role": "system", "content": system}));
+        let mut messages = Vec::with_capacity(request.messages.len() + 4);
+        if !request
+            .system_sections
+            .iter()
+            .any(crate::SystemSection::has_text)
+        {
+            if let Some(system) = request.system {
+                messages.push(json!({"role": "system", "content": system}));
+            }
+        } else {
+            // Stable content comes first and keeps its exact section boundary.
+            // The volatile run context and memory brief are later system
+            // messages so an OpenAI-compatible server's automatic prefix
+            // cache can reuse the stable prefix across turns.
+            for section in request
+                .system_sections
+                .iter()
+                .filter(|section| section.has_text())
+            {
+                messages.push(json!({"role": "system", "content": section.text}));
+            }
         }
         messages.extend(request.messages.iter().map(openai_message));
 
@@ -79,9 +97,13 @@ impl Provider for OpenAiCompatibleProvider {
             body["temperature"] = json!(temperature);
         }
         if !request.tools.is_empty() {
+            // Tool definitions are part of the prefix. Sort by name so a
+            // registry iteration-order change cannot silently move the cache
+            // boundary or make equivalent runs non-comparable.
+            let mut tools = request.tools.iter().collect::<Vec<_>>();
+            tools.sort_by(|left, right| left.name.cmp(&right.name));
             body["tools"] = json!(
-                request
-                    .tools
+                tools
                     .iter()
                     .map(|tool| json!({
                         "type": "function",
@@ -636,6 +658,131 @@ mod tests {
             Err(error) => error,
         };
         assert!(matches!(error, ProviderError::Api { status: 401, .. }));
+    }
+
+    async fn capture_openai_body(request: ChatRequest) -> (MockServer, Value) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                        "data: {\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":7}}}\n\n",
+                        "data: [DONE]\n\n"
+                    )),
+            )
+            .mount(&server)
+            .await;
+        let provider = OpenAiCompatibleProvider::local("test", format!("{}/v1", server.uri()));
+        let _ = provider.stream_chat(request).await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let body = serde_json::from_slice(&requests[0].body).unwrap();
+        (server, body)
+    }
+
+    #[tokio::test]
+    async fn stable_sections_precede_volatile_and_tools_are_sorted() {
+        let mut request =
+            ChatRequest::new("test-model", vec![ChatMessage::user("inspect the repo")]);
+        request.system_sections = vec![
+            crate::SystemSection::new("core", "CORE CHARTER"),
+            crate::SystemSection::new("project", "PROJECT SOURCES"),
+            crate::SystemSection::new("volatile", "VOLATILE RUN CONTEXT"),
+        ];
+        request.system =
+            Some("CORE CHARTER\n\nPROJECT SOURCES\n\nVOLATILE RUN CONTEXT".to_string());
+        request.cache = Some(crate::PromptCacheConfig::new(
+            true,
+            crate::CacheTtl::FiveMinutes,
+            true,
+        ));
+        request.tools = vec![
+            crate::ToolSchema {
+                name: "write_file".to_string(),
+                description: "Write".to_string(),
+                parameters: json!({"type": "object"}),
+            },
+            crate::ToolSchema {
+                name: "apply_patch".to_string(),
+                description: "Patch".to_string(),
+                parameters: json!({"type": "object"}),
+            },
+            crate::ToolSchema {
+                name: "read_file".to_string(),
+                description: "Read".to_string(),
+                parameters: json!({"type": "object"}),
+            },
+        ];
+        let (_server, body) = capture_openai_body(request).await;
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], json!("system"));
+        assert_eq!(messages[0]["content"], json!("CORE CHARTER"));
+        assert_eq!(messages[1]["role"], json!("system"));
+        assert_eq!(messages[1]["content"], json!("PROJECT SOURCES"));
+        assert_eq!(messages[2]["role"], json!("system"));
+        assert_eq!(messages[2]["content"], json!("VOLATILE RUN CONTEXT"));
+        assert_eq!(messages[3]["role"], json!("user"));
+        assert_eq!(messages[3]["content"], json!("inspect the repo"));
+        let names = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["apply_patch", "read_file", "write_file"]);
+        // OpenAI-compatible endpoints use provider-managed prefix caching.
+        // The adapter must not invent Anthropic-style markers.
+        assert!(body.get("cache_control").is_none());
+        assert!(!body.to_string().contains("cache_control"));
+        assert!(!body.to_string().contains("\"ttl\""));
+    }
+
+    #[tokio::test]
+    async fn volatile_follows_core_when_the_project_section_is_empty() {
+        let mut request = ChatRequest::new("test-model", vec![ChatMessage::user("hello")]);
+        request.system_sections = vec![
+            crate::SystemSection::new("core", "CORE"),
+            crate::SystemSection::new("project", ""),
+            crate::SystemSection::new("volatile", "VOLATILE"),
+        ];
+        request.system = Some("CORE\n\nVOLATILE".to_string());
+        let (_server, body) = capture_openai_body(request).await;
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["content"], json!("CORE"));
+        assert_eq!(messages[1]["content"], json!("VOLATILE"));
+        assert_eq!(messages[2]["role"], json!("user"));
+    }
+
+    #[tokio::test]
+    async fn empty_sections_fall_back_to_the_legacy_system_message() {
+        let mut request = ChatRequest::new("test-model", vec![ChatMessage::user("hello")]);
+        request.system = Some("LEGACY SYSTEM".to_string());
+        request.system_sections = vec![
+            crate::SystemSection::new("core", ""),
+            crate::SystemSection::new("project", ""),
+        ];
+        let (_server, body) = capture_openai_body(request).await;
+        let messages = body["messages"].as_array().unwrap();
+        // Empty sections are not sent as blank system messages; the legacy
+        // combined system message is preserved instead.
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], json!("system"));
+        assert_eq!(messages[0]["content"], json!("LEGACY SYSTEM"));
+        assert_eq!(messages[1]["role"], json!("user"));
+    }
+
+    #[tokio::test]
+    async fn system_section_usage_still_streams_usage_and_completion() {
+        let mut request = ChatRequest::new("test-model", vec![ChatMessage::user("hello")]);
+        request.system_sections = vec![crate::SystemSection::new("core", "CORE")];
+        request.system = Some("CORE".to_string());
+        let (_server, body) = capture_openai_body(request).await;
+        assert_eq!(body["stream"], json!(true));
+        assert_eq!(body["stream_options"]["include_usage"], json!(true));
+        assert_eq!(body["messages"][0]["content"], json!("CORE"));
     }
 
     #[tokio::test]

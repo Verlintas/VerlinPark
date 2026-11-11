@@ -7,6 +7,7 @@
 //! Tool calling and multimodal content are deliberately deferred to M1.
 
 pub mod anthropic;
+pub mod cache;
 pub mod openai;
 
 use std::pin::Pin;
@@ -18,6 +19,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use anthropic::AnthropicProvider;
+pub use cache::{
+    CacheBreakpointPlan, CacheTtl, PromptCacheConfig, SystemSection,
+    looks_like_cache_ttl_rejection, plan_cache_breakpoints,
+};
 pub use openai::OpenAiCompatibleProvider;
 
 static TOOL_CALL_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -100,6 +105,12 @@ pub struct ChatRequest {
     /// an exact prefix of `system`, the adapter may place a cache breakpoint
     /// after it. It never adds or removes prompt content.
     pub system_stable_prefix: Option<String>,
+    /// Deterministic prompt sections in stable-first order. Adapters that
+    /// support cache breakpoints use these exact boundaries; providers without
+    /// explicit caching still receive the same combined `system` text.
+    pub system_sections: Vec<SystemSection>,
+    /// Per-request cache policy. `None` preserves the legacy adapter behavior.
+    pub cache: Option<PromptCacheConfig>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub tools: Vec<ToolSchema>,
@@ -112,6 +123,8 @@ impl ChatRequest {
             messages,
             system: None,
             system_stable_prefix: None,
+            system_sections: Vec::new(),
+            cache: None,
             max_tokens: None,
             temperature: None,
             tools: Vec::new(),

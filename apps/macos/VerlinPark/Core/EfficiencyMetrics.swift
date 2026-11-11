@@ -14,6 +14,15 @@ struct EfficiencySnapshot: Equatable, Sendable {
     let cacheReadTokens: Int?
     let cacheWriteTokens: Int?
     let uncachedInputTokens: Int?
+    let cacheReadRatio: Double?
+    let cacheWriteRatio: Double?
+    let estimatedSavingsUSD: Double?
+    let cacheCalls: Int?
+    let lastMissReason: String?
+    let lastCacheTTL: String?
+    let lastBreakpoints: Int?
+    let lastFirstTokenMS: Int?
+    let recentCacheCalls: [SessionCacheCall]
     let outputTokens: Int?
     let totalCostUsd: Double?
     let sessionCount: Int?
@@ -123,6 +132,21 @@ enum EfficiencyMetrics {
         return ratio < lowCacheHitRatio
     }
 
+    /// Stable operator-facing labels for the daemon's derived miss reasons.
+    /// Unknown values stay visible instead of being mapped to a false cause.
+    static func missReasonLabel(_ reason: String) -> String {
+        switch reason {
+        case "first_call": "first call"
+        case "prefix_changed": "prefix changed"
+        case "tools_changed": "tools changed"
+        case "project_changed": "project changed"
+        case "ttl_or_provider_miss": "TTL or provider miss"
+        case "compaction_reset": "compaction reset"
+        case "unknown": "unknown"
+        default: reason
+        }
+    }
+
     // MARK: - Snapshot assembly
 
     static func makeSnapshot(
@@ -180,6 +204,15 @@ enum EfficiencyMetrics {
             cacheReadTokens: cacheReadTokens,
             cacheWriteTokens: cacheWriteTokens,
             uncachedInputTokens: uncachedInputTokens,
+            cacheReadRatio: cache?.cacheReadRatio,
+            cacheWriteRatio: cache?.cacheWriteRatio,
+            estimatedSavingsUSD: cache?.estimatedSavingsUSD,
+            cacheCalls: cache?.cacheCalls,
+            lastMissReason: cache?.lastMissReason,
+            lastCacheTTL: cache?.lastCacheTTL,
+            lastBreakpoints: cache?.lastBreakpoints,
+            lastFirstTokenMS: cache?.lastFirstTokenMS,
+            recentCacheCalls: cache?.recentCalls ?? [],
             outputTokens: totals?.outputTokens,
             totalCostUsd: totals?.costUsd,
             sessionCount: usage != nil ? 1 : projectUsage?.sessions.count,

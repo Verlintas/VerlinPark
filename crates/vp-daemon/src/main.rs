@@ -35,20 +35,20 @@ use vp_protocol::types::{
     ApprovalGrantListResult, ApprovalListResult, ArtifactBackfillParams, ArtifactDiffParams,
     ArtifactGcParams, ArtifactGetParams, ArtifactListParams, ArtifactListResult,
     ArtifactMaterializeParams, ArtifactPolicyParams, ArtifactPolicyResult, ArtifactRestoreParams,
-    ArtifactResult, ArtifactVersionsParams, AuthParams, AuthResult, CancelSessionParams,
-    CancelSessionResult, CheckpointPolicyParams, CleanupWorktreesParams, CommitSessionParams,
-    ConfigureAgentParams, ConsoleCloseParams, ConsoleOpenParams, ConsoleReadParams,
-    ConsoleSignalParams, ConsoleWriteParams, ContextCheckpointCreateParams,
-    ContextCheckpointDeleteParams, ContextCheckpointDetailParams, ContextCheckpointListParams,
-    ContextCheckpointPolicyParams, ContextCheckpointPruneParams, ContextRestoreParams,
-    CreateModelPresetParams, CreateSessionParams, DaemonMetrics, DaemonMetricsResult,
-    DashboardParams, DeleteModelPresetParams, DiscardSessionParams, DoctorCheck, DoctorReport,
-    EventListResult, ForkAuditParams, ForkRepairParams, GitLogParams, GitShowParams,
-    IntakeCreateParams, IntakeDeleteResult, IntakeListParams, IntakeTaskParams, IntakeUpdateParams,
-    IntegrationPolicyParams, IntegrationPolicyResult, LandSessionParams, ListApprovalsParams,
-    ListEventsParams, ListSessionsParams, MailboxGcParams, MailboxListParams, MailboxListResult,
-    MailboxPolicyParams, MailboxPolicyResult, MarkMessageReadParams, McpCallParams,
-    McpGetPromptParams, McpProbeParams, McpReadResourceParams, McpServerIdParams,
+    ArtifactResult, ArtifactVersionsParams, AuthParams, AuthResult, CachePolicyParams,
+    CachePolicyResult, CancelSessionParams, CancelSessionResult, CheckpointPolicyParams,
+    CleanupWorktreesParams, CommitSessionParams, ConfigureAgentParams, ConsoleCloseParams,
+    ConsoleOpenParams, ConsoleReadParams, ConsoleSignalParams, ConsoleWriteParams,
+    ContextCheckpointCreateParams, ContextCheckpointDeleteParams, ContextCheckpointDetailParams,
+    ContextCheckpointListParams, ContextCheckpointPolicyParams, ContextCheckpointPruneParams,
+    ContextRestoreParams, CreateModelPresetParams, CreateSessionParams, DaemonMetrics,
+    DaemonMetricsResult, DashboardParams, DeleteModelPresetParams, DiscardSessionParams,
+    DoctorCheck, DoctorReport, EventListResult, ForkAuditParams, ForkRepairParams, GitLogParams,
+    GitShowParams, IntakeCreateParams, IntakeDeleteResult, IntakeListParams, IntakeTaskParams,
+    IntakeUpdateParams, IntegrationPolicyParams, IntegrationPolicyResult, LandSessionParams,
+    ListApprovalsParams, ListEventsParams, ListSessionsParams, MailboxGcParams, MailboxListParams,
+    MailboxListResult, MailboxPolicyParams, MailboxPolicyResult, MarkMessageReadParams,
+    McpCallParams, McpGetPromptParams, McpProbeParams, McpReadResourceParams, McpServerIdParams,
     MemoryBriefParams, MemoryConflictResolveParams, MemoryConflictScanParams,
     MemoryConflictsParams, MemoryCreateParams, MemoryCreateResult, MemoryDeleteParams,
     MemoryEmbeddingsIndexRebuildParams, MemoryEmbeddingsIndexStatusParams,
@@ -60,7 +60,8 @@ use vp_protocol::types::{
     ProjectUsageParams, PromptParams, PromptResult, QuestionListParams, RehydrateSessionParams,
     ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams,
     ResolveMergeResult, RetryMergeParams, RetryMergeResult, SchedulerStatusParams, SearchParams,
-    ServerInfo, SessionCacheParams, SessionCheckpointDeleteParams, SessionCheckpointDiffParams,
+    ServerInfo, SessionCacheAuditParams, SessionCacheParams, SessionCachePlanParams,
+    SessionCacheWarmParams, SessionCheckpointDeleteParams, SessionCheckpointDiffParams,
     SessionCheckpointListParams, SessionCheckpointParams, SessionCheckpointPruneParams,
     SessionCheckpointRestoreParams, SessionCheckpointStatsParams, SessionCitationAuditParams,
     SessionCitationsParams, SessionCompactParams, SessionCompareParams, SessionContextParams,
@@ -73,24 +74,25 @@ use vp_protocol::types::{
     SessionRunDetailParams, SessionRunPolicyParams, SessionRunResumeParams, SessionRunsParams,
     SessionSkillActivationsParams, SessionStallsParams, SessionSteerParams,
     SessionSteeringCancelParams, SessionSteeringParams, SessionTodosParams, SessionTodosResult,
-    SessionTranscriptParams, SetArtifactPolicyParams, SetCheckpointPolicyParams,
-    SetContextCheckpointPolicyParams, SetIntegrationPolicyParams, SetMailboxPolicyParams,
-    SetMemoryPolicyParams, SetProjectBudgetParams, SetSessionPriorityParams,
-    SetSessionRunPolicyParams, SetSessionUnlimitedParams, SetShellPolicyParams,
-    SetSourceCollectionParams, SetSourceLabelsParams, SetTaskSchedulerPolicyParams,
-    SetToolOutputPolicyParams, SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult,
-    SkillCreateParams, SkillEnabledParams, SkillIdParams, SkillImportParams, SkillListParams,
-    SkillUpdateParams, SourceActionParams, SourceCollectionsParams, SourceCreateFileParams,
-    SourceCreateNoteParams, SourceCreateUrlParams, SourceGetParams, SourceImportParams,
-    SourceListParams, SourceSearchParams, SubscribeParams, TaskActionParams, TaskActionResult,
-    TaskDispatchParams, TaskDispatchResult, TaskQueueParams, TaskSchedulerPolicyParams,
-    TeamPlanParams, TeamPlanResult, TerminalCloseParams, TerminalOpenParams, TerminalReadParams,
-    TerminalResizeParams, TerminalWriteParams, ToolActivityParams, ToolOutputAuditParams,
-    ToolOutputListParams, ToolOutputPolicyParams, ToolOutputPolicyResult, ToolOutputPruneParams,
-    ToolOutputStatusParams, UpdateAcpAgentParams, UpdateCheckParams, UpdateDownloadParams,
-    UpdateMcpServerParams, UpdateModelPresetParams, UpdateSourceMetadataParams, UsageLedgerParams,
-    WorkspaceFileParams, WorkspaceGrepParams, WorkspaceListParams, WorkspaceSearchParams,
-    WorkspaceTreeParams, WorkspaceWriteParams, WorktreePolicyParams,
+    SessionTranscriptParams, SetArtifactPolicyParams, SetCachePolicyParams,
+    SetCheckpointPolicyParams, SetContextCheckpointPolicyParams, SetIntegrationPolicyParams,
+    SetMailboxPolicyParams, SetMemoryPolicyParams, SetProjectBudgetParams,
+    SetSessionPriorityParams, SetSessionRunPolicyParams, SetSessionUnlimitedParams,
+    SetShellPolicyParams, SetSourceCollectionParams, SetSourceLabelsParams,
+    SetTaskSchedulerPolicyParams, SetToolOutputPolicyParams, SetWorktreePolicyParams,
+    ShellPolicyParams, ShellPolicyResult, SkillCreateParams, SkillEnabledParams, SkillIdParams,
+    SkillImportParams, SkillListParams, SkillUpdateParams, SourceActionParams,
+    SourceCollectionsParams, SourceCreateFileParams, SourceCreateNoteParams, SourceCreateUrlParams,
+    SourceGetParams, SourceImportParams, SourceListParams, SourceSearchParams, SubscribeParams,
+    TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult, TaskQueueParams,
+    TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult, TerminalCloseParams,
+    TerminalOpenParams, TerminalReadParams, TerminalResizeParams, TerminalWriteParams,
+    ToolActivityParams, ToolOutputAuditParams, ToolOutputListParams, ToolOutputPolicyParams,
+    ToolOutputPolicyResult, ToolOutputPruneParams, ToolOutputStatusParams, UpdateAcpAgentParams,
+    UpdateCheckParams, UpdateDownloadParams, UpdateMcpServerParams, UpdateModelPresetParams,
+    UpdateSourceMetadataParams, UsageLedgerParams, WorkspaceFileParams, WorkspaceGrepParams,
+    WorkspaceListParams, WorkspaceSearchParams, WorkspaceTreeParams, WorkspaceWriteParams,
+    WorktreePolicyParams,
 };
 use vp_protocol::types::{
     ComputerLeaseInfo, ComputerLeaseListResult, ComputerLeaseReleaseParams,
@@ -1018,6 +1020,36 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 Ok(policy) => RpcResponse::success(
                     id,
                     ShellPolicyResult {
+                        project_id: params.project_id,
+                        policy,
+                    },
+                ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "project.cache_policy.get" => match parse_params::<CachePolicyParams>(request.params) {
+            Ok(params) => match state.engine.get_cache_policy(&params.project_id).await {
+                Ok(policy) => RpcResponse::success(
+                    id,
+                    CachePolicyResult {
+                        project_id: params.project_id,
+                        policy,
+                    },
+                ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "project.cache_policy.set" => match parse_params::<SetCachePolicyParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .set_cache_policy(&params.project_id, params.policy)
+                .await
+            {
+                Ok(policy) => RpcResponse::success(
+                    id,
+                    CachePolicyResult {
                         project_id: params.project_id,
                         policy,
                     },
@@ -2237,6 +2269,35 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         }
         "session.cache" => match parse_params::<SessionCacheParams>(request.params) {
             Ok(params) => match state.engine.session_cache_status(&params.session_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.cache.audit" => match parse_params::<SessionCacheAuditParams>(request.params) {
+            Ok(params) => match state.engine.session_cache_audit(&params.session_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.cache.plan" => match parse_params::<SessionCachePlanParams>(request.params) {
+            Ok(params) => match state
+                .agent
+                .cache_plan_now(&params.session_id, &params.roles)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.cache.warm" => match parse_params::<SessionCacheWarmParams>(request.params) {
+            Ok(params) => match state
+                .agent
+                .warm_cache_now(&params.session_id, params.role.as_deref())
+                .await
+            {
                 Ok(result) => RpcResponse::success(id, result),
                 Err(error) => internal_error(id, error),
             },
@@ -3561,6 +3622,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         method.as_str(),
         "project.add"
             | "project.shell_policy.set"
+            | "project.cache_policy.set"
             | "project.integration_policy.set"
             | "project.budget.set"
             | "project.worktree_policy.set"

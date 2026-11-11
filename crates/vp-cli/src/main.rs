@@ -1399,6 +1399,51 @@ enum Command {
     },
     /// Show session cache-read telemetry and the prompt-prefix generation.
     Cache { session: String },
+    /// Explicitly warm the session's stable prompt prefix and tool bundle.
+    /// Audit cache telemetry for breakpoint, churn, and cost-leak patterns.
+    #[command(name = "cache-audit")]
+    CacheAudit { session: String },
+    /// Preview per-role prompt-cache plans and component hashes without a
+    /// provider call.
+    #[command(name = "cache-plan")]
+    CachePlan {
+        session: String,
+        /// Role to preview. Repeatable; defaults to leader.
+        #[arg(long)]
+        role: Vec<String>,
+    },
+    #[command(name = "cache-warm")]
+    CacheWarm {
+        session: String,
+        /// Role whose stable prompt/tool bundle to warm: leader, manager,
+        /// worker, verifier, labour, or scout. Defaults to leader.
+        #[arg(long)]
+        role: Option<String>,
+    },
+    /// Show the project's prompt-cache policy.
+    CachePolicy { project: String },
+    /// Update the project's prompt-cache policy.
+    CachePolicySet {
+        project: String,
+        /// Disable prompt caching for this project.
+        #[arg(long)]
+        disabled: bool,
+        /// Anthropic-compatible TTL pool: 5m or 1h.
+        #[arg(long, default_value = "5m")]
+        ttl: String,
+        /// Disable the provider-managed moving breakpoint.
+        #[arg(long)]
+        no_automatic: bool,
+        /// Opt into one warm call before resuming a journaled run.
+        #[arg(long)]
+        warm_on_resume: bool,
+        /// Disable compaction cache-generation and invalidation telemetry.
+        #[arg(long)]
+        no_compact_aware: bool,
+        /// Per-role TTL override, for example `worker=1h`. Repeatable.
+        #[arg(long = "role-ttl", value_name = "ROLE=TTL")]
+        role_ttl: Vec<String>,
+    },
     /// Show the validated team plan.
     TeamPlan { session: String },
     /// Print a Markdown transcript of the session's plan and messages.
@@ -1812,9 +1857,22 @@ enum Command {
     Deny { approval: String },
 }
 
+/// Accept both `vp cache warm <session>` and `vp cache-warm <session>`.
+/// The status command keeps its historical `vp cache <session>` shape, so the
+/// two-word warm spelling is normalized before clap parses positional args.
+fn normalize_cache_warm_args(mut args: Vec<String>) -> Vec<String> {
+    if args.get(1).map(String::as_str) == Some("cache")
+        && args.get(2).map(String::as_str) == Some("warm")
+    {
+        args.remove(2);
+        args[1] = "cache-warm".to_string();
+    }
+    args
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(normalize_cache_warm_args(std::env::args().collect()));
     if let Command::Bench { command } = &cli.command {
         match vp_bench::cli::execute(command.clone(), cli.json).await {
             Ok(outcome) => {
@@ -4519,6 +4577,88 @@ async fn main() -> Result<()> {
         Command::Cache { session } => {
             rpc(&discovery, "session.cache", json!({"session_id": session})).await?
         }
+        Command::CacheAudit { session } => {
+            rpc(
+                &discovery,
+                "session.cache.audit",
+                json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::CachePlan { session, role } => {
+            rpc(
+                &discovery,
+                "session.cache.plan",
+                json!({"session_id": session, "roles": role}),
+            )
+            .await?
+        }
+        Command::CacheWarm { session, role } => {
+            rpc(
+                &discovery,
+                "session.cache.warm",
+                json!({"session_id": session, "role": role}),
+            )
+            .await?
+        }
+        Command::CachePolicy { project } => {
+            rpc(
+                &discovery,
+                "project.cache_policy.get",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::CachePolicySet {
+            project,
+            disabled,
+            ttl,
+            no_automatic,
+            warm_on_resume,
+            no_compact_aware,
+            role_ttl,
+        } => {
+            // Read-modify-write preserves role overrides that the operator did
+            // not mention instead of silently clearing them.
+            let existing = rpc(
+                &discovery,
+                "project.cache_policy.get",
+                json!({"project_id": project}),
+            )
+            .await?;
+            let mut roles = existing["policy"]["role_ttl"]
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            for entry in role_ttl {
+                let Some((role, value)) = entry.split_once('=') else {
+                    bail!("--role-ttl must be ROLE=TTL, got '{entry}'");
+                };
+                if role.trim().is_empty() || value.trim().is_empty() {
+                    bail!("--role-ttl must be ROLE=TTL, got '{entry}'");
+                }
+                roles.insert(
+                    role.trim().to_string(),
+                    Value::String(value.trim().to_string()),
+                );
+            }
+            rpc(
+                &discovery,
+                "project.cache_policy.set",
+                json!({
+                    "project_id": project,
+                    "policy": {
+                        "enabled": !disabled,
+                        "ttl": ttl,
+                        "automatic_caching": !no_automatic,
+                        "warm_on_resume": warm_on_resume,
+                        "compact_aware": !no_compact_aware,
+                        "role_ttl": roles,
+                    }
+                }),
+            )
+            .await?
+        }
         Command::Agents { session } => {
             rpc(&discovery, "agent.list", json!({"session_id": session})).await?
         }
@@ -5620,6 +5760,19 @@ fn print_json(value: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Short component-hash display for cache status/plan output. Full hashes stay
+/// available in `--json`; the human view only needs a stable visual prefix.
+fn short_hash(value: &Value) -> String {
+    value
+        .as_str()
+        .map(|hash| hash.chars().take(12).collect::<String>() + "…")
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn compact_json(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
+}
+
 async fn mcp_server_enabled(discovery: &Discovery, server_id: &str) -> Result<bool> {
     let value = rpc(discovery, "mcp.server.list", json!({})).await?;
     value
@@ -6230,6 +6383,143 @@ fn print_human(value: &Value) {
         return;
     }
     if let Some(session_id) = value.get("session_id").and_then(Value::as_str)
+        && value.get("calls_checked").and_then(Value::as_u64).is_some()
+        && value.get("findings").and_then(Value::as_array).is_some()
+    {
+        println!("cache audit  {session_id}");
+        println!(
+            "  calls            {} agent · {} warm · {} compaction resets",
+            value["calls_checked"].as_u64().unwrap_or(0),
+            value["warm_calls_checked"].as_u64().unwrap_or(0),
+            value["compactions_checked"].as_u64().unwrap_or(0)
+        );
+        println!(
+            "  hit ratio        {:.2}% · read {} · write {}",
+            value["hit_ratio"].as_f64().unwrap_or(0.0) * 100.0,
+            value["cache_read_tokens"].as_u64().unwrap_or(0),
+            value["cache_write_tokens"].as_u64().unwrap_or(0)
+        );
+        if value["clean"].as_bool().unwrap_or(false) {
+            println!("  result           clean (no warning or critical findings)");
+        }
+        for finding in value["findings"].as_array().into_iter().flatten() {
+            println!(
+                "  [{:<8}] {:<32} {}",
+                finding["severity"].as_str().unwrap_or("info"),
+                finding["code"].as_str().unwrap_or("?"),
+                finding["message"].as_str().unwrap_or("")
+            );
+            if let Some(evidence) = finding["evidence"].as_object()
+                && !evidence.is_empty()
+            {
+                let rendered = evidence
+                    .iter()
+                    .map(|(key, value)| format!("{key}={}", compact_json(value)))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                println!("             evidence: {rendered}");
+            }
+        }
+        return;
+    }
+    if let Some(session_id) = value.get("session_id").and_then(Value::as_str)
+        && value.get("policy").is_some()
+        && value
+            .get("roles")
+            .and_then(Value::as_array)
+            .is_some_and(|roles| roles.iter().any(|role| role.get("prefix_hash").is_some()))
+    {
+        println!("cache plan  {session_id}");
+        if let Some(provider) = value["provider"].as_str() {
+            println!("  provider         {provider}");
+        }
+        if let Some(policy) = value.get("policy") {
+            println!(
+                "  policy           enabled {} · ttl {} · automatic {} · role overrides {}",
+                policy["enabled"].as_bool().unwrap_or(true),
+                policy["ttl"].as_str().unwrap_or("5m"),
+                policy["automatic_caching"].as_bool().unwrap_or(true),
+                policy["role_ttl"]
+                    .as_object()
+                    .map_or(0, serde_json::Map::len)
+            );
+        }
+        for role in value["roles"].as_array().into_iter().flatten() {
+            println!(
+                "  {:<9} {} · {} breakpoints · ttl {} · tail {}",
+                role["role"].as_str().unwrap_or("?"),
+                role["model"].as_str().unwrap_or("?"),
+                role["cache_breakpoints"].as_u64().unwrap_or(0),
+                role["cache_ttl"].as_str().unwrap_or("5m"),
+                role["tail_message"].as_bool().unwrap_or(false)
+            );
+            println!(
+                "            core {}… project {}… tools {}… prefix {}…",
+                short_hash(&role["core_hash"]),
+                short_hash(&role["project_hash"]),
+                short_hash(&role["tools_hash"]),
+                short_hash(&role["prefix_hash"])
+            );
+            println!(
+                "            sections {} core / {} project chars · {} tools · ~{} + {} tokens",
+                role["core_chars"].as_u64().unwrap_or(0),
+                role["project_chars"].as_u64().unwrap_or(0),
+                role["tool_count"].as_u64().unwrap_or(0),
+                role["system_tokens_estimate"].as_u64().unwrap_or(0),
+                role["tool_tokens_estimate"].as_u64().unwrap_or(0)
+            );
+        }
+        return;
+    }
+    if let Some(session_id) = value.get("session_id").and_then(Value::as_str)
+        && value.get("warmed").and_then(Value::as_bool).is_some()
+        && value.get("source").and_then(Value::as_str).is_some()
+    {
+        println!(
+            "cache warm  {session_id}  [{}]  {}",
+            value["source"].as_str().unwrap_or("manual"),
+            if value["warmed"].as_bool().unwrap_or(false) {
+                "warmed"
+            } else {
+                "not warmed"
+            }
+        );
+        println!(
+            "  provider         {} · {}",
+            value["provider"].as_str().unwrap_or("?"),
+            value["model"].as_str().unwrap_or("?")
+        );
+        println!(
+            "  breakpoints      {} · ttl {} · automatic {}",
+            value["cache_breakpoints"].as_u64().unwrap_or(0),
+            value["cache_ttl"].as_str().unwrap_or("?"),
+            value["automatic"].as_bool().unwrap_or(false)
+        );
+        println!(
+            "  tokens           input {} · cache read {} · cache write {} · output {}",
+            value["input_tokens"].as_u64().unwrap_or(0),
+            value["cache_read_tokens"].as_u64().unwrap_or(0),
+            value["cache_write_tokens"].as_u64().unwrap_or(0),
+            value["output_tokens"].as_u64().unwrap_or(0)
+        );
+        println!(
+            "  cost             ${:.6}{}",
+            value["cost_usd"].as_f64().unwrap_or(0.0),
+            if value["estimated"].as_bool().unwrap_or(false) {
+                " (estimated usage)"
+            } else {
+                ""
+            }
+        );
+        if let Some(message) = value["message"]
+            .as_str()
+            .filter(|message| !message.is_empty())
+        {
+            println!("  message          {message}");
+        }
+        return;
+    }
+    if let Some(session_id) = value.get("session_id").and_then(Value::as_str)
         && value
             .get("cache_hit_ratio")
             .and_then(Value::as_f64)
@@ -6249,6 +6539,25 @@ fn print_human(value: &Value) {
             value["cache_write_tokens"].as_u64().unwrap_or(0),
             value["output_tokens"].as_u64().unwrap_or(0)
         );
+        println!(
+            "  savings          ${:.6} (estimated from configured prices; negative means cache writes cost more than reads saved)",
+            value["estimated_savings_usd"].as_f64().unwrap_or(0.0)
+        );
+        println!(
+            "  calls            {} cache-observed provider calls",
+            value["cache_calls"].as_u64().unwrap_or(0)
+        );
+        println!(
+            "  plan             {} breakpoints · ttl {}",
+            value["last_breakpoints"].as_u64().unwrap_or(0),
+            value["last_cache_ttl"].as_str().unwrap_or("unknown")
+        );
+        println!(
+            "  last miss        {}",
+            value["last_miss_reason"]
+                .as_str()
+                .unwrap_or("none recorded")
+        );
         match value["preamble_tokens_estimate"].as_u64() {
             Some(tokens) => println!("  preamble         ~{tokens} tokens (estimate)"),
             None => println!("  preamble         unknown"),
@@ -6260,6 +6569,16 @@ fn print_human(value: &Value) {
         match value["last_call_at"].as_str() {
             Some(last_call) => println!("  last call        {last_call}"),
             None => println!("  last call        never"),
+        }
+        if let Some(policy) = value.get("policy").filter(|policy| policy.is_object()) {
+            println!(
+                "  policy           enabled {} · ttl {} · automatic {} · warm-on-resume {} · compact-aware {}",
+                policy["enabled"].as_bool().unwrap_or(true),
+                policy["ttl"].as_str().unwrap_or("5m"),
+                policy["automatic_caching"].as_bool().unwrap_or(true),
+                policy["warm_on_resume"].as_bool().unwrap_or(false),
+                policy["compact_aware"].as_bool().unwrap_or(true)
+            );
         }
         return;
     }
@@ -8792,6 +9111,129 @@ mod tests {
                 match cli.command {
                     Command::Cache { session } => assert_eq!(session, "ses-123"),
                     other => panic!("expected cache command, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn cache_audit_parses_a_session() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from(["vp", "cache-audit", "ses-123"]).unwrap();
+                match cli.command {
+                    Command::CacheAudit { session } => assert_eq!(session, "ses-123"),
+                    other => panic!("expected cache-audit command, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn cache_plan_accepts_repeated_roles() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "cache-plan",
+                    "ses-123",
+                    "--role",
+                    "leader",
+                    "--role",
+                    "worker",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::CachePlan { session, role } => {
+                        assert_eq!(session, "ses-123");
+                        assert_eq!(role, vec!["leader".to_string(), "worker".to_string()]);
+                    }
+                    other => panic!("expected cache-plan command, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn cache_warm_accepts_both_spellings() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let direct =
+                    Cli::try_parse_from(["vp", "cache-warm", "ses-123", "--role", "worker"])
+                        .unwrap();
+                match direct.command {
+                    Command::CacheWarm { session, role } => {
+                        assert_eq!(session, "ses-123");
+                        assert_eq!(role.as_deref(), Some("worker"));
+                    }
+                    other => panic!("expected cache-warm command, got {other:?}"),
+                }
+                let normalized = normalize_cache_warm_args(vec![
+                    "vp".into(),
+                    "cache".into(),
+                    "warm".into(),
+                    "ses-123".into(),
+                ]);
+                let cli = Cli::try_parse_from(normalized).unwrap();
+                match cli.command {
+                    Command::CacheWarm { session, role } => {
+                        assert_eq!(session, "ses-123");
+                        assert!(role.is_none());
+                    }
+                    other => panic!("expected normalized cache-warm command, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn cache_policy_set_parses_ttl_and_compaction_flags() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "cache-policy-set",
+                    "prj-1",
+                    "--ttl",
+                    "1h",
+                    "--no-automatic",
+                    "--warm-on-resume",
+                    "--disabled",
+                    "--role-ttl",
+                    "worker=1h",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::CachePolicySet {
+                        project,
+                        disabled,
+                        ttl,
+                        no_automatic,
+                        warm_on_resume,
+                        no_compact_aware,
+                        role_ttl,
+                    } => {
+                        assert_eq!(project, "prj-1");
+                        assert!(disabled);
+                        assert_eq!(ttl, "1h");
+                        assert!(no_automatic);
+                        assert!(warm_on_resume);
+                        assert!(!no_compact_aware);
+                        assert_eq!(role_ttl, vec!["worker=1h".to_string()]);
+                    }
+                    other => panic!("expected cache-policy-set command, got {other:?}"),
                 }
             })
             .unwrap()

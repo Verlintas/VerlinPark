@@ -10709,13 +10709,31 @@ async fn stable_system_prefix_precedes_run_context_and_is_hashed() {
         .iter()
         .find(|event| event.kind == "context.prompt_prefix")
         .expect("prompt prefix event");
-    assert_eq!(prefix.payload["version"], 1);
+    assert_eq!(
+        prefix.payload["version"].as_u64(),
+        Some(u64::from(crate::prompt_cache::PROMPT_SECTION_VERSION))
+    );
     assert_eq!(prefix.payload["model"], "test");
     assert!(
         prefix.payload["tool_bundle_hash"]
             .as_str()
             .is_some_and(|hash| hash.len() == 64)
     );
+    for field in [
+        "core_hash",
+        "project_hash",
+        "tools_hash",
+        "volatile_hash",
+        "prefix_hash",
+        "cache_generation",
+    ] {
+        assert!(
+            prefix.payload[field]
+                .as_str()
+                .is_some_and(|hash| hash.len() == 64),
+            "missing 64-char hash for {field}"
+        );
+    }
     assert_eq!(
         prefix.payload["cache_generation"],
         prefix.payload["prefix_hash"]
@@ -10763,6 +10781,910 @@ async fn stable_prompt_prefix_is_shared_across_sessions() {
     let second_stable = recorded[1].system_stable_prefix.as_deref().unwrap();
     assert_eq!(first_stable, second_stable);
     assert_ne!(recorded[0].system, recorded[1].system);
+}
+
+fn set_leader_prices(
+    service: &AgentService,
+    input: f64,
+    output: f64,
+    cache_read: f64,
+    cache_write: f64,
+) {
+    let mut config = service
+        .config
+        .read()
+        .unwrap()
+        .as_ref()
+        .expect("test service is configured")
+        .clone();
+    config.role_models.leader.input_usd_per_million = Some(input);
+    config.role_models.leader.output_usd_per_million = Some(output);
+    config.role_models.leader.cache_read_usd_per_million = Some(cache_read);
+    config.role_models.leader.cache_write_usd_per_million = Some(cache_write);
+    *service.config.write().unwrap() = Some(config);
+}
+
+fn set_worker_model_and_prices(
+    service: &AgentService,
+    model: &str,
+    input: f64,
+    output: f64,
+    cache_read: f64,
+    cache_write: f64,
+) {
+    let mut config = service
+        .config
+        .read()
+        .unwrap()
+        .as_ref()
+        .expect("test service is configured")
+        .clone();
+    config.role_models.worker.model = Some(model.to_string());
+    config.role_models.worker.input_usd_per_million = Some(input);
+    config.role_models.worker.output_usd_per_million = Some(output);
+    config.role_models.worker.cache_read_usd_per_million = Some(cache_read);
+    config.role_models.worker.cache_write_usd_per_million = Some(cache_write);
+    *service.config.write().unwrap() = Some(config);
+}
+
+#[tokio::test]
+async fn prompt_sections_keep_core_project_and_volatile_boundaries() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("ok".into()),
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    engine
+        .create_skill(vp_protocol::types::SkillCreateParams {
+            project_id: project.id.clone(),
+            name: "Boundary Skill".into(),
+            description: "Exercise the project section.".into(),
+            when_to_use: "When testing cache boundaries.".into(),
+            version: None,
+            instructions: "Keep sections stable.".into(),
+            tool_allow: Vec::new(),
+            tool_deny: Vec::new(),
+            profiles: Vec::new(),
+            roles: vec!["leader".into()],
+        })
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "section boundaries".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_memory(
+            &session.id,
+            "fact",
+            "Boundary fact",
+            "This memory belongs in the volatile section.",
+            vec![],
+        )
+        .await
+        .unwrap();
+    service
+        .start(&session.id, "section boundaries")
+        .await
+        .unwrap();
+    let _ = wait_until_idle(&engine, &session).await;
+
+    {
+        let recorded = requests.lock().unwrap();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "default warm_on_resume must not add a call"
+        );
+        let request = &recorded[0];
+        let sections = &request.system_sections;
+        assert_eq!(sections.len(), 3);
+        assert_eq!(sections[0].kind, "core");
+        assert_eq!(sections[1].kind, "project");
+        assert_eq!(sections[2].kind, "volatile");
+        assert!(sections[0].text.contains("Role charter:"));
+        assert!(!sections[0].text.contains("Session goal:"));
+        assert!(!sections[0].text.contains("Worktree:"));
+        assert!(!sections[0].text.contains("Run memory"));
+        assert!(sections[1].text.contains("Boundary Skill"));
+        assert!(!sections[1].text.contains("Session goal:"));
+        assert!(sections[2].text.contains("Session goal:"));
+        assert!(sections[2].text.contains("Worktree:"));
+        let stable = request.system_stable_prefix.as_deref().unwrap();
+        assert!(stable.starts_with(&sections[0].text));
+        assert!(stable.contains(&sections[1].text));
+        assert!(!stable.contains("Session goal:"));
+        assert!(!stable.contains("Worktree:"));
+        let combined = request.system.as_deref().unwrap();
+        assert!(combined.starts_with(&sections[0].text));
+        assert!(combined.ends_with(&sections[2].text));
+        assert!(
+            combined.find("Role charter:").unwrap() < combined.find("Session goal:").unwrap(),
+            "stable core must precede volatile run context"
+        );
+        let cache = request.cache.expect("cache policy is enabled by default");
+        assert!(cache.enabled);
+        assert_eq!(cache.ttl.as_str(), "5m");
+        assert!(cache.automatic);
+    }
+    let events = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    let prefix = events
+        .iter()
+        .find(|event| event.kind == "context.prompt_prefix")
+        .expect("prompt prefix");
+    assert!(prefix.payload["core_hash"].as_str().is_some());
+    assert!(prefix.payload["project_hash"].as_str().is_some());
+    assert!(prefix.payload["tools_hash"].as_str().is_some());
+    assert!(prefix.payload["volatile_hash"].as_str().is_some());
+    assert_eq!(prefix.payload["cache_policy"]["ttl"], "5m");
+    assert_eq!(prefix.payload["cache_plan"]["provider"], "queue");
+    assert_eq!(prefix.payload["cache_plan"]["breakpoints"], 0);
+    let cache_event = events
+        .iter()
+        .find(|event| event.kind == "context.cache")
+        .expect("cache telemetry");
+    assert_eq!(cache_event.payload["miss_reason"], "first_call");
+    assert_eq!(cache_event.payload["cache_ttl"], "5m");
+    assert_eq!(cache_event.payload["cache_breakpoints"], 0);
+    assert_eq!(cache_event.payload["warm"], false);
+    assert!(cache_event.payload["core_hash"].as_str().is_some());
+    assert!(cache_event.payload["prompt_prefix_hash"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn cache_telemetry_prices_billed_reads_and_derives_first_call() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("priced".into()),
+            StreamEvent::Usage {
+                input_tokens: 1_000,
+                output_tokens: 10,
+                cache_read_tokens: 0,
+                cache_write_tokens: 100,
+            },
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    set_leader_prices(&service, 3.0, 15.0, 0.3, 3.75);
+    let session = engine
+        .create_session(project.id, "price the cache".into(), None)
+        .await
+        .unwrap();
+    service.start(&session.id, "price the cache").await.unwrap();
+    let _ = wait_until_idle(&engine, &session).await;
+
+    let events = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    let cache_event = events
+        .iter()
+        .find(|event| event.kind == "context.cache")
+        .expect("cache telemetry");
+    assert_eq!(cache_event.payload["input_tokens"], 1_000);
+    assert_eq!(cache_event.payload["cache_read_tokens"], 0);
+    assert_eq!(cache_event.payload["cache_write_tokens"], 100);
+    assert_eq!(cache_event.payload["miss_reason"], "first_call");
+    assert_eq!(cache_event.payload["cache_write_ratio"], 0.1);
+    let savings = cache_event.payload["estimated_savings_usd"]
+        .as_f64()
+        .expect("savings");
+    assert!(savings < 0.0, "cache writes can outweigh reads: {savings}");
+    assert!((savings + 0.000_075).abs() < 1e-9, "{savings}");
+
+    let status = engine.session_cache_status(&session.id).await.unwrap();
+    assert_eq!(status.input_tokens, 1_000);
+    assert_eq!(status.cache_write_tokens, 100);
+    assert_eq!(status.cache_calls, 1);
+    assert_eq!(status.recent_calls.len(), 1);
+    assert_eq!(status.last_miss_reason.as_deref(), Some("first_call"));
+    assert_eq!(status.last_breakpoints, 0);
+    assert_eq!(status.last_cache_ttl.as_deref(), Some("5m"));
+    assert!((status.estimated_savings_usd - savings).abs() < 1e-9);
+    assert!((status.cache_write_ratio - 0.1).abs() < 1e-9);
+    assert!(status.policy.as_ref().is_some_and(|policy| policy.enabled));
+    assert_eq!(
+        status.recent_calls[0].prompt_prefix_hash.as_deref(),
+        cache_event.payload["prompt_prefix_hash"].as_str()
+    );
+    assert_eq!(status.miss_reason_counts.len(), 1);
+    assert_eq!(status.miss_reason_counts[0].key, "first_call");
+    assert_eq!(status.miss_reason_counts[0].calls, 1);
+    assert_eq!(status.ttl_counts.len(), 1);
+    assert_eq!(status.ttl_counts[0].key, "5m");
+    assert_eq!(status.breakpoint_counts.len(), 1);
+    assert_eq!(status.breakpoint_counts[0].key, "0");
+    assert_eq!(status.savings_by_role.len(), 1);
+    assert_eq!(status.savings_by_role[0].role, "leader");
+    assert!((status.savings_by_role[0].estimated_savings_usd - savings).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn session_cache_status_keeps_the_last_agent_miss_after_a_warm() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::TextDelta("run".into()),
+                StreamEvent::Usage {
+                    input_tokens: 1_000,
+                    output_tokens: 2,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 100,
+                },
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("OK".into()),
+                StreamEvent::Usage {
+                    input_tokens: 500,
+                    output_tokens: 1,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 400,
+                },
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "warm hides miss".into(), None)
+        .await
+        .unwrap();
+    service.start(&session.id, "warm hides miss").await.unwrap();
+    let _ = wait_until_idle(&engine, &session).await;
+    let before = engine.session_cache_status(&session.id).await.unwrap();
+    assert_eq!(before.last_miss_reason.as_deref(), Some("first_call"));
+    service.warm_cache_now(&session.id, None).await.unwrap();
+    let after = engine.session_cache_status(&session.id).await.unwrap();
+    assert_eq!(after.last_miss_reason.as_deref(), Some("first_call"));
+    assert_eq!(after.recent_calls.first().map(|call| call.warm), Some(true));
+    assert_eq!(after.cache_calls, 1);
+    assert_eq!(
+        after.recent_calls.iter().filter(|call| call.warm).count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn session_cache_status_bounds_recent_calls() {
+    let dir = TempDir::new().unwrap();
+    let (engine, _service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "bounded calls".into(), None)
+        .await
+        .unwrap();
+    for index in 0..30 {
+        engine
+            .append_event(
+                &session.id,
+                "context.cache",
+                serde_json::json!({
+                    "input_tokens": 100 + index,
+                    "cache_read_tokens": index,
+                    "cache_breakpoints": 4,
+                    "cache_ttl": "5m",
+                    "prompt_prefix_hash": format!("prefix-{index}")
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    let status = engine.session_cache_status(&session.id).await.unwrap();
+    assert_eq!(status.cache_calls, 30);
+    assert_eq!(status.recent_calls.len(), 20);
+    assert_eq!(
+        status.recent_calls[0].prompt_prefix_hash.as_deref(),
+        Some("prefix-29")
+    );
+    assert_eq!(
+        status.recent_calls[19].prompt_prefix_hash.as_deref(),
+        Some("prefix-10")
+    );
+}
+
+#[tokio::test]
+async fn project_content_changes_invalidate_only_the_project_component() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![StreamEvent::TextDelta("first".into()), StreamEvent::Done],
+            vec![StreamEvent::TextDelta("second".into()), StreamEvent::Done],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let first = engine
+        .create_session(project.id.clone(), "before skill".into(), None)
+        .await
+        .unwrap();
+    service.start(&first.id, "before skill").await.unwrap();
+    let _ = wait_until_idle(&engine, &first).await;
+
+    engine
+        .create_skill(vp_protocol::types::SkillCreateParams {
+            project_id: project.id.clone(),
+            name: "Invalidation Skill".into(),
+            description: "Changes the project section.".into(),
+            when_to_use: "When testing invalidation scope.".into(),
+            version: None,
+            instructions: "Do not change core.".into(),
+            tool_allow: Vec::new(),
+            tool_deny: Vec::new(),
+            profiles: Vec::new(),
+            roles: vec!["leader".into()],
+        })
+        .await
+        .unwrap();
+    let second = engine
+        .create_session(project.id.clone(), "after skill".into(), None)
+        .await
+        .unwrap();
+    service.start(&second.id, "after skill").await.unwrap();
+    let _ = wait_until_idle(&engine, &second).await;
+
+    let hashes = |events: Vec<vp_protocol::types::Event>| {
+        let prefix = events
+            .into_iter()
+            .find(|event| event.kind == "context.prompt_prefix")
+            .expect("prompt prefix");
+        (
+            prefix.payload["core_hash"].as_str().unwrap().to_string(),
+            prefix.payload["project_hash"].as_str().unwrap().to_string(),
+            prefix.payload["tools_hash"].as_str().unwrap().to_string(),
+            prefix.payload["prefix_hash"].as_str().unwrap().to_string(),
+        )
+    };
+    let before = hashes(engine.list_events(first.id, 0, 100).await.unwrap());
+    let after = hashes(engine.list_events(second.id, 0, 100).await.unwrap());
+    assert_eq!(before.0, after.0, "core must stay stable");
+    assert_eq!(before.2, after.2, "tool bundle must stay stable");
+    assert_ne!(before.1, after.1, "skill catalog must move project hash");
+    assert_ne!(before.3, after.3, "project change must move the prefix");
+}
+
+#[tokio::test]
+async fn manual_compaction_records_cache_generation_and_invalidation_estimate() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("cache-aware summary".into()),
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    set_compaction(&service, 0, 3);
+    set_leader_prices(&service, 3.0, 15.0, 0.3, 3.75);
+    let session = engine
+        .create_session(project.id.clone(), "cache aware compaction".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    for index in 0..14 {
+        engine
+            .append_message(
+                &session.id,
+                if index % 2 == 0 { "user" } else { "assistant" },
+                &format!("message {index}: compaction cache generation {index}"),
+                serde_json::json!([]),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let result = service.compact_now(&session.id).await.unwrap();
+    assert!(result.compacted);
+    let summary = result.compaction.expect("compaction summary");
+    assert!(summary.cache_compact_aware);
+    assert_eq!(summary.cache_reset_reason.as_deref(), Some("compaction"));
+    assert!(
+        summary
+            .cache_generation_before
+            .as_deref()
+            .is_some_and(|hash| hash.len() == 64)
+    );
+    assert!(
+        summary
+            .cache_generation_after
+            .as_deref()
+            .is_some_and(|hash| hash.len() == 64)
+    );
+    assert_ne!(
+        summary.cache_generation_before,
+        summary.cache_generation_after
+    );
+    assert!(summary.cache_invalidation_tokens > 0);
+    assert!(summary.cache_invalidation_estimated_usd >= 0.0);
+    let status = engine.session_context_status(&session.id).await.unwrap();
+    let last = status
+        .last_compaction
+        .expect("persisted compaction summary");
+    assert_eq!(
+        last.cache_generation_before,
+        summary.cache_generation_before
+    );
+    assert_eq!(last.cache_reset_reason.as_deref(), Some("compaction"));
+    assert!(last.cache_compact_aware);
+    let event = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|event| event.kind == "context.compaction")
+        .expect("context.compaction");
+    assert!(event.payload.get("summary").is_none());
+    assert_eq!(event.payload["cache_reset_reason"], "compaction");
+    assert!(event.payload["cache_invalidation_tokens"].as_u64().unwrap() > 0);
+
+    // compact_aware=false still compacts, but it does not claim an
+    // invalidation estimate or a reset reason.
+    engine
+        .set_cache_policy(
+            &project.id,
+            vp_protocol::types::CachePolicy {
+                compact_aware: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    for index in 14..24 {
+        engine
+            .append_message(
+                &session.id,
+                if index % 2 == 0 { "user" } else { "assistant" },
+                &format!("message {index}: second cache-aware window"),
+                serde_json::json!([]),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let second = service.compact_now(&session.id).await.unwrap();
+    assert!(second.compacted);
+    let second = second.compaction.expect("second compaction summary");
+    assert!(!second.cache_compact_aware);
+    assert!(second.cache_reset_reason.is_none());
+    assert_eq!(second.cache_invalidation_tokens, 0);
+    assert_eq!(second.cache_invalidation_estimated_usd, 0.0);
+    assert_ne!(
+        second.cache_generation_before,
+        second.cache_generation_after
+    );
+}
+
+#[tokio::test]
+async fn cache_warm_makes_one_explicit_stable_section_call_and_records_usage() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("OK".into()),
+            StreamEvent::Usage {
+                input_tokens: 2_000,
+                output_tokens: 2,
+                cache_read_tokens: 0,
+                cache_write_tokens: 1_800,
+            },
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    set_leader_prices(&service, 3.0, 15.0, 0.3, 3.75);
+    let session = engine
+        .create_session(project.id.clone(), "warm the cache".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let before_status = engine
+        .store()
+        .get_session(&session.id)
+        .unwrap()
+        .unwrap()
+        .status;
+    let result = service.warm_cache_now(&session.id, None).await.unwrap();
+    assert!(result.warmed);
+    assert_eq!(result.role, "leader");
+    assert_eq!(result.source, "manual");
+    assert_eq!(result.provider, "queue");
+    assert_eq!(result.cache_ttl, "5m");
+    assert_eq!(result.input_tokens, 2_000);
+    assert_eq!(result.cache_write_tokens, 1_800);
+    assert!(result.cost_usd > 0.0);
+    assert!(result.message.contains("OK"));
+
+    {
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        let request = &recorded[0];
+        // The project section is omitted when the project has no sources or
+        // skills; core is always present and volatile is always absent.
+        assert!((1..=2).contains(&request.system_sections.len()));
+        assert_eq!(request.system_sections[0].kind, "core");
+        assert!(
+            !request
+                .system_sections
+                .iter()
+                .any(|section| section.kind == "volatile")
+        );
+        assert!(
+            !request
+                .system
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Session goal:")
+        );
+        assert!(request.cache.is_some());
+    }
+
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "agent.message" || event.kind == "agent.queued"),
+        "warming must not start a prompt/run"
+    );
+    let warm_event = events
+        .iter()
+        .find(|event| event.kind == "context.cache_warm")
+        .expect("cache warm event");
+    assert_eq!(warm_event.payload["warmed"], true);
+    assert_eq!(warm_event.payload["source"], "manual");
+    let cache_event = events
+        .iter()
+        .find(|event| event.kind == "context.cache" && event.payload["warm"] == true)
+        .expect("warm cache usage event");
+    assert_eq!(cache_event.payload["warm"], true);
+    assert_eq!(cache_event.payload["cache_read_tokens"], 0);
+    assert_eq!(cache_event.payload["cache_write_tokens"], 1_800);
+    let usage = engine.usage_ledger(&session.id).await.unwrap();
+    assert!(
+        usage
+            .entries
+            .iter()
+            .any(|entry| entry.role == "cache_warm" && entry.input_tokens == 2_000)
+    );
+    assert_eq!(
+        engine
+            .store()
+            .get_session(&session.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        before_status
+    );
+
+    // A disabled policy is an explicit no-op: no hidden provider call.
+    let policy = vp_protocol::types::CachePolicy {
+        enabled: false,
+        ..Default::default()
+    };
+    engine.set_cache_policy(&project.id, policy).await.unwrap();
+    let disabled_session = engine
+        .create_session(project.id, "disabled warm".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&disabled_session.id, "test")
+        .await
+        .unwrap();
+    let disabled = service
+        .warm_cache_now(&disabled_session.id, None)
+        .await
+        .unwrap();
+    assert!(!disabled.warmed);
+    assert!(disabled.message.contains("disabled"));
+    assert_eq!(requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn warm_on_resume_is_opt_in_and_adds_one_stable_section_call() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::TextDelta("OK".into()),
+                StreamEvent::Usage {
+                    input_tokens: 1_000,
+                    output_tokens: 1,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 800,
+                },
+                StreamEvent::Done,
+            ],
+            vec![StreamEvent::TextDelta("resumed".into()), StreamEvent::Done],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let config = service.config.read().unwrap().as_ref().unwrap().clone();
+    let session = engine
+        .create_session(project.id.clone(), "resume warm".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    engine
+        .set_cache_policy(
+            &project.id,
+            vp_protocol::types::CachePolicy {
+                warm_on_resume: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let session_record = engine.store().get_session(&session.id).unwrap().unwrap();
+    let project_record = engine.store().get_project(&project.id).unwrap().unwrap();
+    let worktree = PathBuf::from(&project_record.root);
+    let spec = AgentSpec {
+        id: "leader".into(),
+        role: AgentRole::Leader,
+        name: "Leader".into(),
+        depth: 0,
+        parent_name: None,
+        title: None,
+        task_id: None,
+        department: None,
+        profile: AgentProfile::Generic,
+        allow_delegation: true,
+        auto_approve: false,
+        worktree: worktree.clone(),
+        branch: "main".into(),
+        session_worktree: worktree.clone(),
+        session_branch: "main".into(),
+        write_scope: Vec::new(),
+        base_commit: String::new(),
+    };
+    let budget = SessionBudget::new(
+        None,
+        0,
+        AgentCaps {
+            managers: 1,
+            workers: 1,
+            labour: 1,
+        },
+    )
+    .with_unlimited_flag(engine.unlimited_flag(&session.id, false));
+    let control = RunControl::new();
+    let journal = crate::run_journal::RunJournal::begin(
+        &engine,
+        &session_record,
+        &project.id,
+        "leader",
+        "Leader",
+        "leader",
+        None,
+        None,
+        "resume warm",
+        "queue",
+        "test",
+        &worktree,
+        RunBudgetSnapshot::default(),
+        true,
+    )
+    .await
+    .unwrap();
+    let mut conversation = Vec::new();
+    let mut ids = Vec::new();
+    let outcome = run_loop(
+        &engine,
+        &config,
+        &session_record,
+        &project_record,
+        &control,
+        &budget,
+        &spec,
+        "resume warm",
+        &mut conversation,
+        Some(&mut ids),
+        true,
+        Some(journal),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, LoopOutcome::Final(_)));
+    {
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert!(
+            !recorded[0]
+                .system_sections
+                .iter()
+                .any(|section| section.kind == "volatile"),
+            "warm request must contain only stable sections"
+        );
+        assert!(
+            recorded[1]
+                .system_sections
+                .iter()
+                .any(|section| section.kind == "volatile"),
+            "the resumed turn still carries run context"
+        );
+    }
+    let events = engine
+        .list_events(session.id.clone(), 0, 500)
+        .await
+        .unwrap();
+    let warm = events
+        .iter()
+        .find(|event| event.kind == "context.cache_warm")
+        .expect("resume warm event");
+    assert_eq!(warm.payload["source"], "resume");
+    assert_eq!(warm.payload["warmed"].as_bool(), Some(true));
+    assert!(events.iter().any(|event| event.kind == "agent.message"));
+}
+
+#[tokio::test]
+async fn cache_plan_previews_roles_without_a_provider_call() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::new()),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    set_worker_model_and_prices(&service, "worker-model", 1.0, 2.0, 0.1, 1.5);
+    engine
+        .set_cache_policy(
+            &project.id,
+            vp_protocol::types::CachePolicy {
+                ttl: "1h".into(),
+                role_ttl: std::collections::BTreeMap::from([(
+                    "worker".to_string(),
+                    "5m".to_string(),
+                )]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "plan preview".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let plan = service
+        .cache_plan_now(&session.id, &["leader".to_string(), "worker".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(plan.session_id, session.id);
+    assert_eq!(plan.provider, "queue");
+    assert_eq!(plan.roles.len(), 2);
+    assert_eq!(plan.roles[0].role, "leader");
+    assert_eq!(plan.roles[0].cache_ttl, "1h");
+    assert_eq!(plan.roles[1].role, "worker");
+    assert_eq!(plan.roles[1].model, "worker-model");
+    assert_eq!(plan.roles[1].cache_ttl, "5m");
+    assert_eq!(plan.roles[1].cache_breakpoints, 0);
+    assert!(plan.roles[0].prefix_hash.len() == 64);
+    assert!(plan.roles[0].core_hash.len() == 64);
+    assert!(plan.roles[0].tool_count > 0);
+    assert!(
+        plan.policy
+            .as_ref()
+            .is_some_and(|policy| policy.ttl == "1h")
+    );
+    assert!(requests.lock().unwrap().is_empty());
+    assert_eq!(
+        service
+            .cache_plan_now(&session.id, &["intern".to_string()])
+            .await
+            .unwrap_err()
+            .to_string(),
+        "unknown cache-plan role: intern"
+    );
+}
+
+#[tokio::test]
+async fn cache_warm_honors_a_role_model_override_and_role_ttl() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("OK".into()),
+            StreamEvent::Usage {
+                input_tokens: 500,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_write_tokens: 400,
+            },
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    set_worker_model_and_prices(&service, "worker-model", 1.0, 2.0, 0.1, 1.5);
+    engine
+        .set_cache_policy(
+            &project.id,
+            vp_protocol::types::CachePolicy {
+                role_ttl: std::collections::BTreeMap::from([(
+                    "worker".to_string(),
+                    "1h".to_string(),
+                )]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "role warm".into(), None)
+        .await
+        .unwrap();
+    let leader_id = engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    engine
+        .create_agent(
+            &session.id,
+            "worker",
+            "Worker",
+            Some("Cache Worker".into()),
+            Some(leader_id),
+            "worker-model",
+        )
+        .await
+        .unwrap();
+    let result = service
+        .warm_cache_now(&session.id, Some("worker"))
+        .await
+        .unwrap();
+    assert!(result.warmed);
+    assert_eq!(result.role, "worker");
+    assert_eq!(result.model, "worker-model");
+    assert_eq!(result.cache_ttl, "1h");
+    assert!(result.cost_usd > 0.0);
+    {
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].model, "worker-model");
+        let cache = recorded[0]
+            .cache
+            .expect("warm request carries cache policy");
+        assert_eq!(cache.ttl.as_str(), "1h");
+        assert!(cache.enabled);
+    }
+    assert_eq!(
+        service
+            .warm_cache_now(&session.id, Some("intern"))
+            .await
+            .unwrap_err()
+            .to_string(),
+        "unknown cache-warm role: intern"
+    );
 }
 
 #[test]
@@ -10946,15 +11868,15 @@ async fn stable_prompt_includes_bounded_role_filtered_recipes() {
         &worker,
         "implement the change",
     );
-    assert_eq!(first.stable_prefix, second.stable_prefix);
+    assert_eq!(first.core, second.core);
     assert_eq!(first.run_context, second.run_context);
-    assert!(first.stable_prefix.contains("Tool recipes"));
-    assert!(first.stable_prefix.contains("safe_edit"));
-    assert!(!first.stable_prefix.contains("read_tool_output (retryable)"));
+    assert!(first.core.contains("Tool recipes"));
+    assert!(first.core.contains("safe_edit"));
+    assert!(!first.core.contains("read_tool_output (retryable)"));
     assert!(
-        first.stable_prefix.chars().count() < 12_000,
+        first.core.chars().count() < 12_000,
         "stable prefix unexpectedly large: {}",
-        first.stable_prefix.chars().count()
+        first.core.chars().count()
     );
 
     let verifier = help_spec(AgentRole::Verifier, AgentProfile::Verification);
@@ -10965,15 +11887,15 @@ async fn stable_prompt_includes_bounded_role_filtered_recipes() {
         &verifier,
         "verify the change",
     );
-    assert!(verifier_prompt.stable_prefix.contains("test_and_check"));
-    assert!(!verifier_prompt.stable_prefix.contains("safe_edit:"));
-    assert!(!verifier_prompt.stable_prefix.contains("gui_verification:"));
+    assert!(verifier_prompt.core.contains("test_and_check"));
+    assert!(!verifier_prompt.core.contains("safe_edit:"));
+    assert!(!verifier_prompt.core.contains("gui_verification:"));
 
     let leader = help_spec(AgentRole::Leader, AgentProfile::Generic);
     let leader_prompt =
         role_system_prompt(AgentRole::Leader, &project, &session, &leader, "coordinate");
-    assert!(leader_prompt.stable_prefix.contains("remote_operation"));
-    assert!(leader_prompt.stable_prefix.contains("gui_verification"));
+    assert!(leader_prompt.core.contains("remote_operation"));
+    assert!(leader_prompt.core.contains("gui_verification"));
 }
 
 #[test]

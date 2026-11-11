@@ -14,13 +14,14 @@ use serde_json::{Value, json};
 use tokio::sync::{oneshot, watch};
 use tokio::time::timeout;
 use vp_protocol::types::{
-    AgentInfo, AgentProbeResult, ApprovalMode, CapacityInfo, ConfigureAgentParams,
+    AgentInfo, AgentProbeResult, AgentRecord, ApprovalMode, CapacityInfo, ConfigureAgentParams,
     ContextCheckpoint, ContextCheckpointDetailResult, ContextCompactionSummary, ContextMeasurement,
     ContextRestorePreflight, ContextRestoreResult, ContextStructuredState, IntakeDispatchResult,
     IntakeTask, MergeQueueEntry, OrchestrationRecovery, PlanDepartment, PlanRevisionDetailResult,
     PlanTask, Program, ProgramMilestone, ProgramTickResult, Project, ReviseTeamPlanResult,
     RoleModels, RunBudgetSnapshot, ScheduledTask, SchedulerProjectStatus, SchedulerStatusResult,
-    Session, SessionCheckpoint, SessionCheckpointDiffResult, SessionCheckpointRestoreResult,
+    Session, SessionCachePlanResult, SessionCachePlanRole, SessionCacheWarmResult,
+    SessionCheckpoint, SessionCheckpointDiffResult, SessionCheckpointRestoreResult,
     SessionCompactResult, SessionForkResult, SessionMergeForkResult, SessionRunCancelResult,
     SessionRunResumeResult, Skill, SourceCitation, SourceSearchHit, StallRecoveryMode,
     StoredMessage, TeamPlan, TodoItem,
@@ -2189,6 +2190,8 @@ impl AgentService {
             messages: vec![ChatMessage::user("Reply with the single word: OK")],
             system: Some("You are a connection probe. Reply concisely.".to_string()),
             system_stable_prefix: None,
+            system_sections: Vec::new(),
+            cache: None,
             max_tokens: Some(probe_tokens),
             temperature: Some(0.0),
             tools: Vec::new(),
@@ -5997,6 +6000,192 @@ impl AgentService {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Read-only preview of the per-role prompt cache plan and component
+    /// hashes. It never calls a provider, creates a worktree, or starts a run.
+    /// Operators use it to verify that a source/skill edit moves only the
+    /// project component and that a policy TTL/breakpoint plan is what they
+    /// expect before spending tokens on a warm.
+    pub async fn cache_plan_now(
+        &self,
+        session_id: &str,
+        roles: &[String],
+    ) -> Result<SessionCachePlanResult> {
+        let config = self
+            .config
+            .read()
+            .ok()
+            .and_then(|config| config.as_ref().cloned())
+            .ok_or_else(|| anyhow!("agent provider is not configured"))?;
+        let (session, project) =
+            load_session_project(self.engine.store().clone(), session_id).await?;
+        if session.status == "imported" {
+            anyhow::bail!("imported sessions are read-only archives");
+        }
+        let requested = if roles.is_empty() {
+            vec!["leader".to_string()]
+        } else {
+            roles.to_vec()
+        };
+        let agents = self.engine.list_agents(session_id).await?;
+        let policy = self.engine.get_cache_policy(&project.id).await?;
+        let mut plans = Vec::with_capacity(requested.len());
+        for name in requested {
+            let role = AgentRole::parse(name.trim().to_ascii_lowercase().as_str())
+                .ok_or_else(|| anyhow!("unknown cache-plan role: {name}"))?;
+            let agent = agents
+                .iter()
+                .find(|agent| agent.role == role.as_str())
+                .cloned();
+            let spec = stable_agent_spec(&session, agent, role);
+            let sections = build_prompt_sections(
+                &self.engine,
+                &project,
+                &session,
+                &spec,
+                &session.goal,
+                false,
+            )
+            .await;
+            let mut tools = tool_schemas(&config, spec.role, spec.profile, spec.allow_delegation);
+            tools.extend(
+                collect_dynamic_mcp_tools(&self.engine, spec.role)
+                    .await
+                    .iter()
+                    .map(|binding| binding.schema.clone()),
+            );
+            let system = sections.render();
+            let hashes = sections.hashes(&model_for(&config, spec.role), &tools);
+            let plan = crate::prompt_cache::request_cache_plan(
+                &config.provider_name,
+                &sections,
+                tools.len(),
+                1,
+                &policy,
+                spec.role.as_str(),
+            );
+            plans.push(SessionCachePlanRole {
+                role: spec.role.as_str().to_string(),
+                provider: config.provider_name.clone(),
+                model: model_for(&config, spec.role),
+                cache_breakpoints: plan.breakpoints,
+                cache_ttl: plan.ttl.as_str().to_string(),
+                ttl_explicit: plan.ttl_explicit,
+                automatic: plan.automatic,
+                tail_message: plan.tail_message,
+                tool_breakpoint: plan.tool_breakpoint,
+                core_breakpoint: plan.core_breakpoint,
+                project_breakpoint: plan.project_breakpoint,
+                core_hash: hashes.core_hash,
+                project_hash: hashes.project_hash,
+                tools_hash: hashes.tools_hash,
+                volatile_hash: hashes.volatile_hash,
+                prefix_hash: hashes.prefix_hash,
+                core_chars: sections.core.chars().count() as u64,
+                project_chars: sections.project.chars().count() as u64,
+                stable_prefix_chars: sections.stable_prefix().chars().count() as u64,
+                tool_count: tools.len(),
+                system_tokens_estimate: estimate_context_tokens(&system),
+                tool_tokens_estimate: serde_json::to_string(&tools)
+                    .map(|schema| estimate_context_tokens(&schema))
+                    .unwrap_or(0),
+            });
+        }
+        Ok(SessionCachePlanResult {
+            session_id: session.id,
+            provider: config.provider_name,
+            policy: Some(policy),
+            roles: plans,
+        })
+    }
+
+    /// Explicitly warm the stable core/project prompt prefix and tool bundle.
+    /// This is the only operator-triggered cache warm path. It never runs
+    /// automatically unless the project policy sets `warm_on_resume`; it
+    /// records its own usage and cost in the normal ledger.
+    pub async fn warm_cache_now(
+        &self,
+        session_id: &str,
+        role: Option<&str>,
+    ) -> Result<SessionCacheWarmResult> {
+        let config = self
+            .config
+            .read()
+            .ok()
+            .and_then(|config| config.as_ref().cloned())
+            .ok_or_else(|| anyhow!("agent provider is not configured"))?;
+        let role = match role {
+            Some(role) => AgentRole::parse(role.trim().to_ascii_lowercase().as_str())
+                .ok_or_else(|| anyhow!("unknown cache-warm role: {role}"))?,
+            None => AgentRole::Leader,
+        };
+        let (session, project) =
+            load_session_project(self.engine.store().clone(), session_id).await?;
+        if session.status == "imported" {
+            anyhow::bail!("imported sessions are read-only archives");
+        }
+        if matches!(
+            session.status.as_str(),
+            "queued" | "running" | "paused" | "waiting_input"
+        ) {
+            anyhow::bail!(
+                "session must be idle, failed, or cancelled before an explicit cache warm"
+            );
+        }
+        let _control = self.begin_manual_operation(session_id)?;
+        let result = async {
+            let agents = self.engine.list_agents(session_id).await?;
+            let agent = agents.into_iter().find(|agent| agent.role == role.as_str());
+            let spec = stable_agent_spec(&session, agent, role);
+            // Warm only the stable sections. Memory, objective, and
+            // conversation history are deliberately excluded.
+            let sections = build_prompt_sections(
+                &self.engine,
+                &project,
+                &session,
+                &spec,
+                &session.goal,
+                false,
+            )
+            .await;
+            let mut tools = tool_schemas(&config, spec.role, spec.profile, spec.allow_delegation);
+            tools.extend(
+                collect_dynamic_mcp_tools(&self.engine, spec.role)
+                    .await
+                    .iter()
+                    .map(|binding| binding.schema.clone()),
+            );
+            let budget = SessionBudget::new(
+                session.token_budget,
+                session.tokens_in + session.tokens_out,
+                AgentCaps {
+                    managers: config.max_managers,
+                    workers: config.max_workers,
+                    labour: config.max_labour,
+                },
+            )
+            .with_cost(session.cost_budget_usd, session.cost_spent_usd)
+            .with_time(session.time_budget_secs)
+            .with_unlimited_flag(self.engine.unlimited_flag(&session.id, session.unlimited));
+            if budget.exhausted() {
+                anyhow::bail!("session budget is exhausted; cache warm needs provider tokens");
+            }
+            warm_prompt_cache(
+                &self.engine,
+                &config,
+                &session,
+                &spec,
+                &budget,
+                &sections,
+                &tools,
+                "manual",
+            )
+            .await
+        }
+        .await;
+        self.end_operation(session_id);
+        result
     }
 
     /// Force a summary/trim of an idle session's active conversation. This is
@@ -9919,6 +10108,9 @@ struct StreamTurn {
     text: String,
     tool_calls: Vec<ToolCall>,
     usage: TokenUsage,
+    /// Wall-clock latency to the first text or tool-call chunk. Zero means the
+    /// stream produced neither.
+    first_token_ms: u64,
     cancelled: bool,
     error: Option<anyhow::Error>,
 }
@@ -10016,6 +10208,7 @@ async fn consume_stream(
     idle_timeout: Duration,
 ) -> Result<StreamTurn> {
     let mut turn = StreamTurn::default();
+    let started = Instant::now();
     let mut attempt = 0;
     'streams: loop {
         attempt += 1;
@@ -10099,6 +10292,10 @@ async fn consume_stream(
             match item {
                 Ok(StreamEvent::TextDelta(delta)) => {
                     produced = true;
+                    if turn.first_token_ms == 0 && !delta.is_empty() {
+                        turn.first_token_ms =
+                            started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                    }
                     turn.text.push_str(&delta);
                     emit(
                         engine,
@@ -10111,6 +10308,10 @@ async fn consume_stream(
                 }
                 Ok(StreamEvent::ToolCall(call)) => {
                     produced = true;
+                    if turn.first_token_ms == 0 {
+                        turn.first_token_ms =
+                            started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                    }
                     turn.tool_calls.push(call);
                 }
                 Ok(StreamEvent::Usage {
@@ -10673,6 +10874,8 @@ async fn run_compaction_summary(
         messages: vec![ChatMessage::user(transcript)],
         system: Some(COMPACTION_SYSTEM_PROMPT.to_string()),
         system_stable_prefix: Some(COMPACTION_SYSTEM_PROMPT.to_string()),
+        system_sections: Vec::new(),
+        cache: None,
         max_tokens: Some(1024),
         temperature: Some(0.2),
         tools: Vec::new(),
@@ -10756,6 +10959,273 @@ async fn run_compaction_summary(
         output_tokens,
         estimated: estimated_usage,
     }))
+}
+
+/// Explicit or opt-in warm of the stable prompt prefix.
+///
+/// This makes exactly one provider request using only `core` + `project` +
+/// tools. It never includes memory, the objective, or conversation history.
+/// The call is recorded in the normal usage ledger and emits both
+/// `context.cache` (`warm: true`) and `context.cache_warm`, so its cost is
+/// visible and cannot be mistaken for a free background operation.
+#[allow(clippy::too_many_arguments)]
+async fn warm_prompt_cache(
+    engine: &Engine,
+    config: &AgentConfig,
+    session: &Session,
+    spec: &AgentSpec,
+    budget: &SessionBudget,
+    sections: &crate::prompt_cache::PromptSections,
+    tools: &[ToolSchema],
+    source: &str,
+) -> Result<SessionCacheWarmResult> {
+    let model = model_for(config, spec.role);
+    let cache_policy = engine
+        .get_cache_policy(&session.project_id)
+        .await
+        .unwrap_or_default();
+    let cache_config = crate::prompt_cache::prompt_cache_config(&cache_policy, spec.role.as_str());
+    let plan = crate::prompt_cache::request_cache_plan(
+        &config.provider_name,
+        sections,
+        tools.len(),
+        1,
+        &cache_policy,
+        spec.role.as_str(),
+    );
+    let hashes = sections.hashes(&model, tools);
+    if !cache_config.enabled {
+        return Ok(SessionCacheWarmResult {
+            session_id: session.id.clone(),
+            warmed: false,
+            provider: config.provider_name.clone(),
+            model,
+            role: spec.role.as_str().to_string(),
+            source: source.to_string(),
+            cache_breakpoints: 0,
+            cache_ttl: plan.ttl.as_str().to_string(),
+            automatic: false,
+            core_hash: Some(hashes.core_hash),
+            project_hash: Some(hashes.project_hash),
+            tools_hash: Some(hashes.tools_hash),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            estimated: false,
+            cost_usd: 0.0,
+            latency_ms: 0,
+            first_token_ms: 0,
+            message: "project cache policy is disabled; no provider call was made".to_string(),
+        });
+    }
+    let system = sections.render();
+    let request = ChatRequest {
+        model: model.clone(),
+        messages: vec![ChatMessage::user(
+            "Cache warm request. Reply with the single word OK.",
+        )],
+        system: Some(system),
+        system_stable_prefix: Some(sections.stable_prefix()),
+        system_sections: sections.provider_sections(),
+        cache: Some(cache_config),
+        max_tokens: Some(32),
+        temperature: Some(0.0),
+        tools: tools.to_vec(),
+    };
+    let input_estimate = estimate_request_tokens(&request);
+    let reserve = !budget.is_unlimited() && budget.limit.is_some();
+    let reservation = if reserve {
+        budget.reserve_tokens(input_estimate.saturating_add(32))
+    } else {
+        None
+    };
+    if reserve && reservation.is_none() {
+        anyhow::bail!("session budget has no room for an explicit cache warm");
+    }
+    let started = Instant::now();
+    let mut stream = timeout(
+        Duration::from_secs(config.provider_idle_timeout_secs),
+        config.provider.stream_chat(request.clone()),
+    )
+    .await
+    .map_err(|_| anyhow!("cache warm provider request timed out"))?
+    .context("starting cache warm provider stream")?;
+    let mut text = String::new();
+    let mut usage = TokenUsage::default();
+    let mut first_token_ms = 0u64;
+    loop {
+        let item = timeout(
+            Duration::from_secs(config.provider_idle_timeout_secs),
+            stream.next(),
+        )
+        .await
+        .map_err(|_| anyhow!("cache warm provider stream was idle"))?;
+        let Some(item) = item else {
+            break;
+        };
+        match item? {
+            StreamEvent::TextDelta(delta) => {
+                if first_token_ms == 0 && !delta.is_empty() {
+                    first_token_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                }
+                text.push_str(&delta);
+                if text.len() >= 4_096 {
+                    break;
+                }
+            }
+            StreamEvent::Usage {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+            } => usage.add(
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+            ),
+            StreamEvent::ToolCall(_) | StreamEvent::Done => {}
+        }
+    }
+    let has_output = !text.trim().is_empty();
+    if !has_output && usage.is_empty() {
+        anyhow::bail!("cache warm provider returned no text or usage");
+    }
+    let estimated = usage.input == 0 || usage.output == 0;
+    let input_tokens = if usage.input > 0 {
+        usage.input
+    } else {
+        estimate_request_tokens(&request)
+    };
+    let output_tokens = if usage.output > 0 {
+        usage.output
+    } else if has_output {
+        estimate_text_tokens(&text)
+    } else {
+        0
+    };
+    let prices = role_prices(config, spec.role);
+    let cost = usage_cost(
+        input_tokens,
+        output_tokens,
+        usage.cache_read,
+        usage.cache_write,
+        prices,
+    );
+    let latency_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    engine
+        .record_agent_usage_with_cache(
+            &session.id,
+            "cache-warm",
+            "Cache warm",
+            "cache_warm",
+            spec.task_id.clone(),
+            spec.department.clone(),
+            &model,
+            input_tokens,
+            output_tokens,
+            usage.cache_read,
+            usage.cache_write,
+            estimated,
+            cost,
+        )
+        .await?;
+    if let Some(reservation) = reservation {
+        let _ = reservation.settle(input_tokens.saturating_add(output_tokens));
+    }
+    budget.add_cost(cost);
+    let savings = crate::prompt_cache::round_usd(crate::prompt_cache::estimated_cache_savings_usd(
+        input_tokens,
+        output_tokens,
+        usage.cache_read,
+        usage.cache_write,
+        prices.input,
+        prices.output,
+        prices.cache_read,
+        prices.cache_write,
+    ));
+    let hit_ratio =
+        vp_protocol::types::cache_hit_ratio(input_tokens, usage.cache_read, usage.cache_write);
+    if let Err(error) = emit(
+        engine,
+        &session.id,
+        spec,
+        "context.cache",
+        serde_json::json!({
+            "input_tokens": input_tokens,
+            "cache_read_tokens": usage.cache_read,
+            "cache_write_tokens": usage.cache_write,
+            "output_tokens": output_tokens,
+            "cache_hit_ratio": hit_ratio,
+            "cache_read_ratio": if input_tokens == 0 {
+                0.0
+            } else {
+                (usage.cache_read as f64 / input_tokens as f64).clamp(0.0, 1.0)
+            },
+            "cache_write_ratio": if input_tokens == 0 {
+                0.0
+            } else {
+                (usage.cache_write as f64 / input_tokens as f64).clamp(0.0, 1.0)
+            },
+            "cache_breakpoints": plan.breakpoints,
+            "cache_ttl": plan.ttl.as_str(),
+            "cache_ttl_explicit": plan.ttl_explicit,
+            "cache_automatic": plan.automatic,
+            "first_token_ms": first_token_ms,
+            "core_hash": hashes.core_hash,
+            "project_hash": hashes.project_hash,
+            "tools_hash": hashes.tools_hash,
+            "volatile_hash": hashes.volatile_hash,
+            "prompt_prefix_hash": hashes.prefix_hash,
+            "cache_generation": hashes.prefix_hash,
+            "estimated_savings_usd": savings,
+            "miss_reason": serde_json::Value::Null,
+            "estimated": estimated,
+            "warm": true,
+            "warm_source": source,
+            "model": model,
+        }),
+    )
+    .await
+    {
+        tracing::warn!(%error, "could not persist cache warm telemetry");
+    }
+    let result = SessionCacheWarmResult {
+        session_id: session.id.clone(),
+        warmed: true,
+        provider: config.provider_name.clone(),
+        model,
+        role: spec.role.as_str().to_string(),
+        source: source.to_string(),
+        cache_breakpoints: plan.breakpoints,
+        cache_ttl: plan.ttl.as_str().to_string(),
+        automatic: plan.automatic,
+        core_hash: Some(hashes.core_hash),
+        project_hash: Some(hashes.project_hash),
+        tools_hash: Some(hashes.tools_hash),
+        input_tokens,
+        output_tokens,
+        cache_read_tokens: usage.cache_read,
+        cache_write_tokens: usage.cache_write,
+        estimated,
+        cost_usd: crate::prompt_cache::round_usd(cost),
+        latency_ms,
+        first_token_ms,
+        message: truncate_to(text.trim(), 240),
+    };
+    if let Err(error) = emit(
+        engine,
+        &session.id,
+        spec,
+        "context.cache_warm",
+        serde_json::to_value(&result)?,
+    )
+    .await
+    {
+        tracing::warn!(%error, "could not persist cache warm event");
+    }
+    Ok(result)
 }
 
 /// Keep the active context under the model window. The primary strategy is a
@@ -10897,6 +11367,16 @@ async fn compact_context_if_needed(
         return Ok(false);
     }
 
+    // Only a real compaction needs the project cache policy and the
+    // pre-compaction generation. Keeping the lookup here avoids a database
+    // query on every below-threshold turn.
+    let cache_policy = engine
+        .get_cache_policy(&session.project_id)
+        .await
+        .unwrap_or_default();
+    let cache_generation_before =
+        crate::prompt_cache::conversation_generation(prefix_hash, conversation);
+    let conversation_tokens_before_cache = estimate_messages_tokens(conversation);
     let state = load_compaction_structured_state(engine, session, spec).await;
     let mut estimated = estimated_before;
     let mut summarized_messages = 0usize;
@@ -11079,6 +11559,22 @@ async fn compact_context_if_needed(
     let mode = if has_model_summary { "summary" } else { "trim" };
     let kept_messages = conversation.len();
     let latency_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    let cache_generation_after =
+        crate::prompt_cache::conversation_generation(prefix_hash, conversation);
+    let cache_invalidation_tokens = if cache_policy.compact_aware {
+        conversation_tokens_before_cache.saturating_sub(estimate_messages_tokens(conversation))
+    } else {
+        0
+    };
+    let prices = role_prices(config, spec.role);
+    let cache_invalidation_estimated_usd = if cache_policy.compact_aware {
+        crate::prompt_cache::round_usd(
+            cache_invalidation_tokens as f64 * (prices.input - prices.cache_read).max(0.0)
+                / 1_000_000.0,
+        )
+    } else {
+        0.0
+    };
     let compaction_count = engine
         .count_events_of_kind(&session.id, "context.compacted")
         .await?
@@ -11114,6 +11610,16 @@ async fn compact_context_if_needed(
         "compaction_count": compaction_count,
         "structured_state": state,
         "background_prepared": runtime.prepared.is_some(),
+        "cache_generation_before": cache_generation_before,
+        "cache_generation_after": cache_generation_after,
+        "cache_reset_reason": if cache_policy.compact_aware {
+            Some("compaction")
+        } else {
+            None
+        },
+        "cache_invalidation_tokens": cache_invalidation_tokens,
+        "cache_invalidation_estimated_usd": cache_invalidation_estimated_usd,
+        "cache_compact_aware": cache_policy.compact_aware,
     });
     agent_fields(&mut compaction_payload, spec);
     let checkpoint = ContextCheckpoint {
@@ -11165,6 +11671,16 @@ async fn compact_context_if_needed(
             "background_reuse": background_reuse,
             "fallback_to_sync": fallback_to_sync,
             "compaction_count": compaction_count,
+            "cache_generation_before": cache_generation_before,
+            "cache_generation_after": cache_generation_after,
+            "cache_reset_reason": if cache_policy.compact_aware {
+                Some("compaction")
+            } else {
+                None
+            },
+            "cache_invalidation_tokens": cache_invalidation_tokens,
+            "cache_invalidation_estimated_usd": cache_invalidation_estimated_usd,
+            "cache_compact_aware": cache_policy.compact_aware,
         }),
     )
     .await?;
@@ -11187,6 +11703,7 @@ async fn run_loop(
     top_level: bool,
     resume_journal: Option<crate::run_journal::RunJournal>,
 ) -> Result<LoopOutcome> {
+    let resumed = resume_journal.is_some();
     let journal = match resume_journal {
         Some(journal) => journal,
         None => {
@@ -11222,6 +11739,7 @@ async fn run_loop(
         conversation_ids,
         top_level,
         &journal,
+        resumed,
     )
     .await;
     // A run boundary is final for steering: anything still pending was not
@@ -11285,6 +11803,7 @@ async fn run_loop_body(
     conversation_ids: Option<&mut Vec<Option<String>>>,
     top_level: bool,
     journal: &crate::run_journal::RunJournal,
+    resumed: bool,
 ) -> Result<LoopOutcome> {
     let mut empty_ids = Vec::new();
     let conversation_ids: &mut Vec<Option<String>> = match conversation_ids {
@@ -11407,40 +11926,11 @@ async fn run_loop_body(
         git_branch: Some(spec.branch.clone()),
         remote: engine.remote_access(&project.id).await?.map(Arc::new),
     };
-    let prompt = role_system_prompt(spec.role, project, session, spec, objective);
-    let mut stable_prefix = prompt.stable_prefix;
-    let source_brief = engine.source_brief(&project.id).await.unwrap_or_default();
-    if !source_brief.is_empty() {
-        stable_prefix.push_str("\n\nIndexed project sources (use search_sources for content):\n");
-        stable_prefix.push_str(&source_brief);
-    }
-    let skill_catalog = if spec.role == AgentRole::Scout {
-        // Scout has no use_skill tool. Do not advertise skills it cannot
-        // activate, and keep its stable prefix small.
-        String::new()
-    } else {
-        engine
-            .skill_catalog(&project.id, spec.role.as_str(), spec.profile.as_str())
-            .await
-            .unwrap_or_default()
-    };
-    if !skill_catalog.is_empty() {
-        stable_prefix.push_str("\n\nProject skills (call use_skill with the exact name):\n");
-        stable_prefix.push_str(&skill_catalog);
-    }
-    let memory_brief = project_memory_brief(
-        engine,
-        &session.id,
-        spec.task_id.as_deref(),
-        spec.department.as_deref(),
-    )
-    .await
-    .unwrap_or_default();
-    let mut system = format!("{}\n\n{}", stable_prefix, prompt.run_context);
-    if !memory_brief.is_empty() {
-        system.push_str("\n\nRun memory (retrieved for this session):\n");
-        system.push_str(&memory_brief);
-    }
+    let sections = build_prompt_sections(engine, project, session, spec, objective, true).await;
+    let system = sections.render();
+    // Retained for older adapters and the Anthropic legacy fallback. It never
+    // contains volatile run context or memory.
+    let stable_prefix = sections.stable_prefix();
     // The tool bundle is frozen for the run. Skill activation is enforced at
     // execution time, not by filtering schemas mid-run.
     let dynamic_mcp_tools = collect_dynamic_mcp_tools(engine, spec.role).await;
@@ -11465,21 +11955,44 @@ async fn run_loop_body(
         ));
     }
     let model_name = model_for(config, spec.role);
-    let prompt_prefix = prompt_prefix_fingerprint(&model_name, &tools, &stable_prefix);
+    let prompt_hashes = sections.hashes(&model_name, &tools);
+    let prefix_hash = prompt_hashes.prefix_hash.clone();
+    let cache_policy = engine
+        .get_cache_policy(&project.id)
+        .await
+        .unwrap_or_default();
+    let cache_plan = crate::prompt_cache::request_cache_plan(
+        &config.provider_name,
+        &sections,
+        tools.len(),
+        conversation.len(),
+        &cache_policy,
+        spec.role.as_str(),
+    );
+    let cache_config = crate::prompt_cache::prompt_cache_config(&cache_policy, spec.role.as_str());
     emit(
         engine,
         &session.id,
         spec,
         "context.prompt_prefix",
         serde_json::json!({
-            "version": prompt_prefix.version,
-            "model": prompt_prefix.model,
-            "tool_bundle_hash": prompt_prefix.tool_bundle_hash,
-            "stable_system_hash": prompt_prefix.stable_system_hash,
-            "prefix_hash": prompt_prefix.prefix_hash,
-            "cache_generation": prompt_prefix.prefix_hash,
+            "version": crate::prompt_cache::PROMPT_SECTION_VERSION,
+            "model": model_name,
+            "tool_bundle_hash": prompt_hashes.tools_hash,
+            "stable_system_hash": prompt_hashes.stable_system_hash,
+            "core_hash": prompt_hashes.core_hash,
+            "project_hash": prompt_hashes.project_hash,
+            "tools_hash": prompt_hashes.tools_hash,
+            "volatile_hash": prompt_hashes.volatile_hash,
+            "prefix_hash": prefix_hash,
+            "cache_generation": prefix_hash,
             "tool_count": tools.len(),
+            "core_chars": sections.core.chars().count(),
+            "project_chars": sections.project.chars().count(),
+            "volatile_chars": sections.volatile.chars().count(),
             "stable_prefix_chars": stable_prefix.chars().count(),
+            "cache_policy": cache_policy,
+            "cache_plan": cache_plan.payload(),
             // Heuristic estimate of the system-prompt and tool-schema preamble.
             // This is the same estimate already used for context-limit checks,
             // not provider-reported usage.
@@ -11489,6 +12002,74 @@ async fn run_loop_body(
         }),
     )
     .await?;
+    // Seed miss attribution from the latest persisted ordinary agent call.
+    // Warm calls are real provider calls but describe the stable sections only,
+    // so comparing an agent call to a warm would mislabel a role/tool change as
+    // churn. A resumed run can still attribute a tool/project change to the
+    // previous agent generation.
+    let recent_cache_events = engine
+        .recent_events_of_kind(&session.id, "context.cache", 20)
+        .await?;
+    let latest_agent_cache_event = recent_cache_events.iter().rev().find(|event| {
+        event
+            .payload
+            .get("warm")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+    });
+    let mut cache_tracker = crate::prompt_cache::CacheCallTracker::from_event(
+        latest_agent_cache_event.map(|event| &event.payload),
+    );
+    if resumed && cache_policy.warm_on_resume && !budget.exhausted() {
+        // Explicit policy opt-in only. The default is false, so a normal run
+        // still makes exactly one provider call per turn.
+        let warm_sections =
+            build_prompt_sections(engine, project, session, spec, objective, false).await;
+        match warm_prompt_cache(
+            engine,
+            config,
+            session,
+            spec,
+            budget,
+            &warm_sections,
+            &tools,
+            "resume",
+        )
+        .await
+        {
+            Ok(result) => {
+                tracing::info!(
+                    session_id = %session.id,
+                    input_tokens = result.input_tokens,
+                    cache_read_tokens = result.cache_read_tokens,
+                    cost_usd = result.cost_usd,
+                    "warmed the stable prompt prefix before resuming"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(%error, "cache warm on resume failed; continuing the run");
+                if let Err(emit_error) = emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "context.cache_warm",
+                    serde_json::json!({
+                        "session_id": session.id,
+                        "warmed": false,
+                        "source": "resume",
+                        "provider": config.provider_name,
+                        "model": model_name,
+                        "message": truncate(&format!("{error:#}")),
+                    }),
+                )
+                .await
+                {
+                    tracing::warn!(%emit_error, "could not persist failed cache warm event");
+                }
+            }
+        }
+    }
+
     let mut calibration = if top_level {
         load_context_calibration(engine, &session.id, &model_name).await
     } else {
@@ -11542,7 +12123,7 @@ async fn run_loop_body(
             let compaction_before = crate::run_journal::journal_cursors(engine, &session.id)
                 .await?
                 .0;
-            compact_context_if_needed(
+            let compaction_changed = compact_context_if_needed(
                 engine,
                 config,
                 session,
@@ -11556,12 +12137,18 @@ async fn run_loop_body(
                 system_tokens.saturating_add(tool_tokens),
                 calibration.factor,
                 false,
-                &prompt_prefix.prefix_hash,
+                &prefix_hash,
                 config.compact_prepare_ratio,
                 &mut compaction_runtime,
                 context_strategy(spec.role),
             )
             .await?;
+            if compaction_changed {
+                // The stable system/tool prefix is unchanged, but the cached
+                // conversation prefix is not. The next call is attributed to
+                // the reset rather than to a provider TTL guess.
+                cache_tracker.mark_compaction();
+            }
             let compaction_after = crate::run_journal::journal_cursors(engine, &session.id)
                 .await?
                 .0;
@@ -11627,6 +12214,8 @@ async fn run_loop_body(
             messages: conversation.clone(),
             system: Some(system.clone()),
             system_stable_prefix: Some(stable_prefix.clone()),
+            system_sections: sections.provider_sections(),
+            cache: Some(cache_config),
             max_tokens: config.max_tokens,
             temperature: Some(0.2),
             // Keep the full role bundle stable across the run. `active_skill`
@@ -11784,7 +12373,7 @@ async fn run_loop_body(
                     "samples": calibration.samples,
                     "model": request.model.clone(),
                     "messages": request.messages.len(),
-                    "prompt_prefix_hash": prompt_prefix.prefix_hash,
+                    "prompt_prefix_hash": prefix_hash,
                 }),
             )
             .await
@@ -11843,6 +12432,19 @@ async fn run_loop_body(
                 .await?;
             // Operational cache telemetry after settlement. No prompt text or
             // provider secrets; failures must not discard the accounting.
+            let fingerprint = prompt_hashes.fingerprint();
+            let miss_reason = cache_tracker.observe(&fingerprint, cache_read_tokens);
+            let savings =
+                crate::prompt_cache::round_usd(crate::prompt_cache::estimated_cache_savings_usd(
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    prices.input,
+                    prices.output,
+                    prices.cache_read,
+                    prices.cache_write,
+                ));
             if input_tokens > 0
                 && let Err(error) = emit(
                     engine,
@@ -11859,8 +12461,31 @@ async fn run_loop_body(
                             cache_read_tokens,
                             cache_write_tokens,
                         ),
-                        "prompt_prefix_hash": prompt_prefix.prefix_hash,
+                        "cache_read_ratio": if input_tokens == 0 {
+                            0.0
+                        } else {
+                            (cache_read_tokens as f64 / input_tokens as f64).clamp(0.0, 1.0)
+                        },
+                        "cache_write_ratio": if input_tokens == 0 {
+                            0.0
+                        } else {
+                            (cache_write_tokens as f64 / input_tokens as f64).clamp(0.0, 1.0)
+                        },
+                        "cache_breakpoints": cache_plan.breakpoints,
+                        "cache_ttl": cache_plan.ttl.as_str(),
+                        "cache_ttl_explicit": cache_plan.ttl_explicit,
+                        "cache_automatic": cache_plan.automatic,
+                        "first_token_ms": stream_turn.first_token_ms,
+                        "core_hash": prompt_hashes.core_hash,
+                        "project_hash": prompt_hashes.project_hash,
+                        "tools_hash": prompt_hashes.tools_hash,
+                        "volatile_hash": prompt_hashes.volatile_hash,
+                        "prompt_prefix_hash": prefix_hash,
+                        "cache_generation": prefix_hash,
+                        "estimated_savings_usd": savings,
+                        "miss_reason": miss_reason.map(|reason| reason.as_str()),
                         "estimated": estimated,
+                        "warm": false,
                         "model": request.model,
                     }),
                 )
@@ -19252,18 +19877,22 @@ fn parse_verdict(input: &serde_json::Value) -> Result<VerifierVerdict> {
 }
 
 struct RoleSystemPrompt {
-    /// Content that should be identical across agents with the same role,
-    /// profile, and project: role charter, security/output contract, and stable
-    /// project conventions. This is the prefix cached across sessions.
-    stable_prefix: String,
-    /// Per-session/per-agent context. It is stable for the life of one agent
-    /// but intentionally comes last so it does not invalidate the shared prefix.
+    /// `core` section: role charter, security/output contract, and stable
+    /// project conventions. It is identical across agents with the same role,
+    /// profile, and project, and is the shared cache prefix across sessions.
+    core: String,
+    /// Per-session/per-agent context. It becomes the start of the `volatile`
+    /// section and is intentionally last so it cannot invalidate `core` or
+    /// `project`.
     run_context: String,
 }
 
 impl RoleSystemPrompt {
+    /// Legacy combined core+run-context string. The run loop builds the full
+    /// three-section prompt separately; manual compaction and context preflight
+    /// still use this compatibility renderer.
     fn render(&self) -> String {
-        format!("{}\n\n{}", self.stable_prefix, self.run_context)
+        format!("{}\n\n{}", self.core, self.run_context)
     }
 }
 
@@ -19367,7 +19996,7 @@ fn role_system_prompt(
     };
     let recipes =
         crate::tooling::recipes::render_compact_block(role.as_str(), spec.profile.as_str());
-    let stable_prefix = format!(
+    let core = format!(
         "Role charter:\n{charter}\n\n\
          Security and output contract:\n\
          - The project root is read-only; all writes stay inside the worktree.\n\
@@ -19404,13 +20033,114 @@ fn role_system_prompt(
     context.push_str(&format!("Write scope: {scope_note}\n"));
     context.push_str(&format!("Objective: {objective}"));
     RoleSystemPrompt {
-        stable_prefix,
+        core,
         run_context: context,
     }
 }
 
+/// Build the stable synthetic spec used by cache preview/warm. It uses the
+/// recorded agent row when one exists, otherwise the role's default name and a
+/// generic profile. No worktree is created or modified.
+fn stable_agent_spec(session: &Session, agent: Option<AgentRecord>, role: AgentRole) -> AgentSpec {
+    let profile = agent
+        .as_ref()
+        .and_then(|agent| agent.profile.as_deref())
+        .and_then(AgentProfile::parse)
+        .unwrap_or(AgentProfile::Generic);
+    let worktree = PathBuf::from(session.worktree.clone().unwrap_or_default());
+    let branch = session.branch.clone().unwrap_or_default();
+    AgentSpec {
+        id: agent
+            .as_ref()
+            .map(|agent| agent.id.clone())
+            .unwrap_or_else(|| role.as_str().to_string()),
+        role,
+        name: agent
+            .as_ref()
+            .map(|agent| agent.name.clone())
+            .unwrap_or_else(|| role.default_name().to_string()),
+        depth: 0,
+        parent_name: None,
+        title: agent.as_ref().and_then(|agent| agent.title.clone()),
+        task_id: None,
+        department: None,
+        profile,
+        allow_delegation: role.child_role().is_some(),
+        auto_approve: false,
+        worktree: worktree.clone(),
+        branch: branch.clone(),
+        session_worktree: worktree,
+        session_branch: branch,
+        write_scope: Vec::new(),
+        base_commit: session.base_commit.clone().unwrap_or_default(),
+    }
+}
+
+/// Build the exact three-section prompt for one run. `include_memory` is false
+/// only for an explicit cache warm, which must send the stable core/project
+/// sections without volatile memory or objective text.
+async fn build_prompt_sections(
+    engine: &Engine,
+    project: &Project,
+    session: &Session,
+    spec: &AgentSpec,
+    objective: &str,
+    include_memory: bool,
+) -> crate::prompt_cache::PromptSections {
+    let prompt = role_system_prompt(spec.role, project, session, spec, objective);
+    let source_brief = engine.source_brief(&project.id).await.unwrap_or_default();
+    let mut project_section = String::new();
+    if !source_brief.is_empty() {
+        project_section.push_str("Indexed project sources (use search_sources for content):\n");
+        project_section.push_str(&source_brief);
+    }
+    let skill_catalog = if spec.role == AgentRole::Scout {
+        // Scout has no use_skill tool. Do not advertise skills it cannot
+        // activate, and keep its project section small.
+        String::new()
+    } else {
+        engine
+            .skill_catalog(&project.id, spec.role.as_str(), spec.profile.as_str())
+            .await
+            .unwrap_or_default()
+    };
+    if !skill_catalog.is_empty() {
+        if !project_section.is_empty() {
+            project_section.push_str("\n\n");
+        }
+        project_section.push_str("Project skills (call use_skill with the exact name):\n");
+        project_section.push_str(&skill_catalog);
+    }
+    let mut volatile_section = if include_memory {
+        prompt.run_context
+    } else {
+        String::new()
+    };
+    if include_memory {
+        let memory_brief = project_memory_brief(
+            engine,
+            &session.id,
+            spec.task_id.as_deref(),
+            spec.department.as_deref(),
+        )
+        .await
+        .unwrap_or_default();
+        if !memory_brief.is_empty() {
+            volatile_section.push_str("\n\nRun memory (retrieved for this session):\n");
+            volatile_section.push_str(&memory_brief);
+        }
+    }
+    crate::prompt_cache::PromptSections::new(prompt.core, project_section, volatile_section)
+}
+
+/// Legacy fingerprint retained for tests that assert the historical
+/// tool-bundle hash helper. Production prompt hashing lives in
+/// `crate::prompt_cache` so source/skill/volatile hashes are first-class.
+#[cfg(test)]
 const PROMPT_PREFIX_VERSION: u32 = 1;
 
+#[cfg(test)]
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct PromptPrefixFingerprint {
     version: u32,
@@ -19420,6 +20150,7 @@ struct PromptPrefixFingerprint {
     prefix_hash: String,
 }
 
+#[cfg(test)]
 fn prompt_prefix_fingerprint(
     model: &str,
     tools: &[ToolSchema],

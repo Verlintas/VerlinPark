@@ -88,6 +88,205 @@ final class EfficiencyDashboardTests: XCTestCase {
         XCTAssertEqual(EfficiencyMetrics.cacheHitRatio(status) ?? 0, 0.75, accuracy: 0.0001)
     }
 
+    func testSessionCacheStatusDecodesCacheFirstTelemetry() throws {
+        let json = """
+        {
+          "session_id": "session-1",
+          "input_tokens": 1000,
+          "cache_read_tokens": 600,
+          "cache_write_tokens": 100,
+          "cache_hit_ratio": 0.6,
+          "cache_read_ratio": 0.6,
+          "cache_write_ratio": 0.1,
+          "estimated_savings_usd": 0.00155,
+          "cache_calls": 4,
+          "prompt_prefix_hash": "abc123",
+          "cache_generation": "abc123",
+          "core_hash": "core",
+          "project_hash": "project",
+          "tools_hash": "tools",
+          "volatile_hash": "volatile",
+          "last_breakpoints": 4,
+          "last_cache_ttl": "1h",
+          "last_miss_reason": "ttl_or_provider_miss",
+          "last_first_token_ms": 321,
+          "recent_calls": [{
+            "at": "2026-11-11T00:00:00Z",
+            "agent_name": "Leader",
+            "agent_role": "leader",
+            "input_tokens": 100,
+            "cache_read_tokens": 60,
+            "cache_breakpoints": 4,
+            "cache_ttl": "1h",
+            "first_token_ms": 120,
+            "estimated_savings_usd": 0.0002,
+            "miss_reason": "first_call",
+            "warm": false
+          }],
+          "policy": {
+            "enabled": true,
+            "ttl": "1h",
+            "automatic_caching": true,
+            "warm_on_resume": true,
+            "compact_aware": true
+          }
+        }
+        """
+        let status = try JSONDecoder().decode(SessionCacheStatus.self, from: Data(json.utf8))
+        XCTAssertEqual(status.estimatedSavingsUSD ?? 0, 0.00155, accuracy: 0.000001)
+        XCTAssertEqual(status.cacheCalls, 4)
+        XCTAssertEqual(status.cacheReadRatio ?? 0, 0.6, accuracy: 0.0001)
+        XCTAssertEqual(status.cacheWriteRatio ?? 0, 0.1, accuracy: 0.0001)
+        XCTAssertEqual(status.lastBreakpoints, 4)
+        XCTAssertEqual(status.lastCacheTTL, "1h")
+        XCTAssertEqual(status.lastMissReason, "ttl_or_provider_miss")
+        XCTAssertEqual(status.lastFirstTokenMS, 321)
+        XCTAssertEqual(status.recentCalls.count, 1)
+        XCTAssertEqual(status.recentCalls[0].cacheBreakpoints, 4)
+        XCTAssertEqual(status.recentCalls[0].missReason, "first_call")
+        XCTAssertEqual(status.policy?.warmOnResume, true)
+        XCTAssertEqual(status.policy?.compactAware, true)
+    }
+
+    func testCacheWarmResultDecodesOptionalFields() throws {
+        let json = """
+        {
+          "session_id": "session-1",
+          "warmed": true,
+          "provider": "anthropic",
+          "model": "claude",
+          "role": "worker",
+          "source": "manual",
+          "cache_breakpoints": 4,
+          "cache_ttl": "1h",
+          "automatic": true,
+          "input_tokens": 1000,
+          "output_tokens": 2,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 900,
+          "estimated": false,
+          "cost_usd": 0.003,
+          "latency_ms": 240,
+          "first_token_ms": 120,
+          "message": "OK"
+        }
+        """
+        let result = try JSONDecoder().decode(SessionCacheWarmResult.self, from: Data(json.utf8))
+        XCTAssertTrue(result.warmed)
+        XCTAssertEqual(result.role, "worker")
+        XCTAssertEqual(result.cacheBreakpoints, 4)
+        XCTAssertEqual(result.cacheTTL, "1h")
+        XCTAssertEqual(result.costUSD ?? 0, 0.003, accuracy: 0.000001)
+        XCTAssertEqual(result.latencyMS, 240)
+    }
+
+    func testCacheAuditDecodesFindingsAndEvidence() throws {
+        let json = """
+        {
+          "session_id": "session-1",
+          "provider": "anthropic",
+          "calls_checked": 6,
+          "warm_calls_checked": 1,
+          "compactions_checked": 2,
+          "hit_ratio": 0.42,
+          "cache_read_tokens": 600,
+          "cache_write_tokens": 300,
+          "findings": [{
+            "code": "breakpoint_limit_exceeded",
+            "severity": "critical",
+            "message": "five breakpoints",
+            "evidence": {"breakpoints": 5}
+          }],
+          "clean": false
+        }
+        """
+        let audit = try JSONDecoder().decode(SessionCacheAuditResult.self, from: Data(json.utf8))
+        XCTAssertEqual(audit.callsChecked, 6)
+        XCTAssertEqual(audit.findings.count, 1)
+        XCTAssertEqual(audit.findings[0].code, "breakpoint_limit_exceeded")
+        XCTAssertEqual(audit.findings[0].evidence["breakpoints"], .number(5))
+        XCTAssertFalse(audit.clean)
+    }
+
+    func testCachePlanDecodesRoleHashes() throws {
+        let json = """
+        {
+          "session_id": "session-1",
+          "provider": "anthropic",
+          "policy": {"enabled": true, "ttl": "1h", "automatic_caching": true, "warm_on_resume": false, "compact_aware": true},
+          "roles": [{
+            "role": "leader",
+            "provider": "anthropic",
+            "model": "claude",
+            "cache_breakpoints": 4,
+            "cache_ttl": "1h",
+            "ttl_explicit": true,
+            "automatic": true,
+            "tail_message": false,
+            "tool_breakpoint": true,
+            "core_breakpoint": true,
+            "project_breakpoint": true,
+            "core_hash": "core",
+            "project_hash": "project",
+            "tools_hash": "tools",
+            "volatile_hash": "volatile",
+            "prefix_hash": "prefix",
+            "core_chars": 100,
+            "project_chars": 50,
+            "stable_prefix_chars": 150,
+            "tool_count": 20,
+            "system_tokens_estimate": 200,
+            "tool_tokens_estimate": 400
+          }]
+        }
+        """
+        let plan = try JSONDecoder().decode(SessionCachePlanResult.self, from: Data(json.utf8))
+        XCTAssertEqual(plan.provider, "anthropic")
+        XCTAssertEqual(plan.roles.count, 1)
+        XCTAssertEqual(plan.roles[0].role, "leader")
+        XCTAssertEqual(plan.roles[0].cacheBreakpoints, 4)
+        XCTAssertEqual(plan.roles[0].cacheTTL, "1h")
+        XCTAssertEqual(plan.roles[0].prefixHash, "prefix")
+        XCTAssertEqual(plan.policy?.ttl, "1h")
+    }
+
+    func testSessionCacheCallDecodesLegacyEmptyPayload() throws {
+        let call = try JSONDecoder().decode(
+            SessionCacheCall.self,
+            from: Data("{}".utf8)
+        )
+        XCTAssertEqual(call.inputTokens, 0)
+        XCTAssertEqual(call.cacheBreakpoints, 0)
+        XCTAssertFalse(call.warm)
+        XCTAssertNil(call.missReason)
+    }
+
+    func testSnapshotCarriesSavingsTtlBreakpointsAndMissReason() throws {
+        let cache = try JSONDecoder().decode(
+            SessionCacheStatus.self,
+            from: Data(
+                #"{"session_id":"session-1","estimated_savings_usd":-0.000075,"last_cache_ttl":"5m","last_breakpoints":3,"last_miss_reason":"compaction_reset","cache_calls":2}"#
+                    .utf8
+            )
+        )
+        let snapshot = EfficiencyMetrics.makeSnapshot(
+            projectUsage: nil,
+            usage: nil,
+            context: nil,
+            cache: cache,
+            toolOutputs: nil,
+            eventTypes: [],
+            latestPrefixHash: nil
+        )
+        XCTAssertEqual(snapshot?.estimatedSavingsUSD ?? 0, -0.000075, accuracy: 0.0000001)
+        XCTAssertEqual(snapshot?.lastCacheTTL, "5m")
+        XCTAssertEqual(snapshot?.lastBreakpoints, 3)
+        XCTAssertEqual(snapshot?.lastMissReason, "compaction_reset")
+        XCTAssertEqual(snapshot?.cacheCalls, 2)
+        XCTAssertEqual(snapshot?.recentCacheCalls.count, 0)
+        XCTAssertEqual(EfficiencyMetrics.missReasonLabel("compaction_reset"), "compaction reset")
+    }
+
     func testSessionCacheStatusDerivesRatioWhenDaemonOmitsIt() throws {
         let json = """
         {

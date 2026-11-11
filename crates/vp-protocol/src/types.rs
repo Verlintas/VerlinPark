@@ -44,6 +44,133 @@ fn default_shell_network() -> String {
     "allow".to_string()
 }
 
+/// Project-scoped prompt-cache policy. Values are explicit; the runtime never
+/// infers a provider TTL or enables automatic warming silently.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CachePolicy {
+    /// Master switch. Disabled means the adapter sends no cache markers and
+    /// the runtime reports zero breakpoints.
+    #[serde(default = "default_cache_enabled")]
+    pub enabled: bool,
+    /// Default TTL pool for Anthropic-compatible requests: `5m` (default) or
+    /// `1h` (explicit extended pool). OpenAI-compatible endpoints receive no
+    /// TTL field and use provider-managed prefix caching.
+    #[serde(default = "default_cache_ttl")]
+    pub ttl: String,
+    /// Request the provider-managed moving breakpoint (Anthropic top-level
+    /// `cache_control`). When false, the adapter may mark the last cacheable
+    /// message block instead. Default true.
+    #[serde(default = "default_cache_automatic")]
+    pub automatic_caching: bool,
+    /// Opt-in one-shot warm before resuming a journaled run. Default false;
+    /// no provider call is added unless the operator explicitly enables this.
+    #[serde(default)]
+    pub warm_on_resume: bool,
+    /// Record compaction cache generations and an estimated invalidation
+    /// cost. Default true. This never delays or blocks compaction.
+    #[serde(default = "default_cache_compact_aware")]
+    pub compact_aware: bool,
+    /// Optional per-role TTL overrides. Keys are `leader`, `manager`, `worker`,
+    /// `verifier`, `labour`, or `scout`; values are `5m` or `1h`.
+    #[serde(default)]
+    pub role_ttl: BTreeMap<String, String>,
+}
+
+impl Default for CachePolicy {
+    fn default() -> Self {
+        Self {
+            enabled: default_cache_enabled(),
+            ttl: default_cache_ttl(),
+            automatic_caching: default_cache_automatic(),
+            warm_on_resume: false,
+            compact_aware: default_cache_compact_aware(),
+            role_ttl: BTreeMap::new(),
+        }
+    }
+}
+
+fn default_cache_enabled() -> bool {
+    true
+}
+
+fn default_cache_ttl() -> String {
+    "5m".to_string()
+}
+
+fn default_cache_automatic() -> bool {
+    true
+}
+
+fn default_cache_compact_aware() -> bool {
+    true
+}
+
+impl CachePolicy {
+    pub const FIVE_MINUTES: &'static str = "5m";
+    pub const ONE_HOUR: &'static str = "1h";
+
+    /// Validate and normalize the policy. Unknown TTLs and roles are rejected
+    /// so a typo cannot silently change cache cost.
+    pub fn normalized(&self) -> std::result::Result<Self, String> {
+        let mut policy = self.clone();
+        policy.ttl = policy.ttl.trim().to_ascii_lowercase();
+        if !matches!(policy.ttl.as_str(), Self::FIVE_MINUTES | Self::ONE_HOUR) {
+            return Err(format!(
+                "cache ttl must be '5m' or '1h', got '{}'",
+                self.ttl
+            ));
+        }
+        let mut roles = BTreeMap::new();
+        for (role, ttl) in &policy.role_ttl {
+            let role = role.trim().to_ascii_lowercase();
+            if !matches!(
+                role.as_str(),
+                "leader" | "manager" | "worker" | "verifier" | "labour" | "scout"
+            ) {
+                return Err(format!("unknown role in cache role_ttl: '{role}'"));
+            }
+            let ttl = ttl.trim().to_ascii_lowercase();
+            if !matches!(ttl.as_str(), Self::FIVE_MINUTES | Self::ONE_HOUR) {
+                return Err(format!(
+                    "cache role_ttl for '{role}' must be '5m' or '1h', got '{ttl}'"
+                ));
+            }
+            roles.insert(role, ttl);
+        }
+        policy.role_ttl = roles;
+        Ok(policy)
+    }
+
+    /// TTL selected for one role. A missing override uses the project default.
+    pub fn ttl_for(&self, role: &str) -> &str {
+        self.role_ttl
+            .get(role)
+            .map(String::as_str)
+            .unwrap_or(&self.ttl)
+    }
+
+    pub fn ttl_is_one_hour(&self, role: &str) -> bool {
+        self.ttl_for(role) == Self::ONE_HOUR
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CachePolicyParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetCachePolicyParams {
+    pub project_id: String,
+    pub policy: CachePolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CachePolicyResult {
+    pub project_id: String,
+    pub policy: CachePolicy,
+}
+
 /// How the runtime decides whether an elevated tool call needs a human.
 ///
 /// `Smart` is the default: routine workspace writes and ordinary shell
@@ -3921,7 +4048,7 @@ pub struct ContextStructuredState {
     pub generated_at: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ContextCompactionSummary {
     #[serde(default)]
     pub mode: String,
@@ -3953,6 +4080,28 @@ pub struct ContextCompactionSummary {
     pub compaction_count: u64,
     #[serde(default)]
     pub structured_state: Option<ContextStructuredState>,
+    /// Prompt-cache generation before the active conversation was rewritten.
+    /// The stable system/tool prefix may be unchanged; the cached conversation
+    /// prefix is not.
+    #[serde(default)]
+    pub cache_generation_before: Option<String>,
+    /// Prompt-cache generation after compaction completed.
+    #[serde(default)]
+    pub cache_generation_after: Option<String>,
+    /// Why the conversation cache generation changed. Currently
+    /// `compaction`; `None` for legacy events.
+    #[serde(default)]
+    pub cache_reset_reason: Option<String>,
+    /// Estimated conversation tokens whose cached prefix was invalidated.
+    #[serde(default)]
+    pub cache_invalidation_tokens: u64,
+    /// Estimated USD of lost cache-read savings. This is an estimate from the
+    /// configured role prices, not a provider invoice.
+    #[serde(default)]
+    pub cache_invalidation_estimated_usd: f64,
+    /// Whether the project cache policy asked for compaction cache metrics.
+    #[serde(default)]
+    pub cache_compact_aware: bool,
     #[serde(default)]
     pub created_at: String,
 }
@@ -4002,16 +4151,329 @@ pub struct SessionCacheStatus {
     /// Derived cache-read share; see [`cache_hit_ratio`].
     #[serde(default)]
     pub cache_hit_ratio: f64,
+    /// Cache-read share of total provider input, including cache writes.
+    #[serde(default)]
+    pub cache_read_ratio: f64,
+    /// Cache-write share of total provider input.
+    #[serde(default)]
+    pub cache_write_ratio: f64,
+    /// Sum of per-call estimated savings from `context.cache` events. Negative
+    /// values are possible when cache writes cost more than the reused reads.
+    #[serde(default)]
+    pub estimated_savings_usd: f64,
+    /// Number of recorded per-call cache observations.
+    #[serde(default)]
+    pub cache_calls: u64,
     /// Latest prompt-prefix hash emitted by `context.prompt_prefix` (or the
     /// `prompt_prefix_hash` recorded on `context.measured`).
     #[serde(default)]
     pub prompt_prefix: Option<String>,
+    /// Latest cache generation. This equals the stable prompt prefix hash; the
+    /// conversation generation is recorded separately on compaction events.
+    #[serde(default)]
+    pub cache_generation: Option<String>,
+    #[serde(default)]
+    pub core_hash: Option<String>,
+    #[serde(default)]
+    pub project_hash: Option<String>,
+    #[serde(default)]
+    pub tools_hash: Option<String>,
+    #[serde(default)]
+    pub volatile_hash: Option<String>,
     /// Best-effort estimate of the system-prompt and tool-schema preamble.
     /// Heuristic, not provider-reported usage.
     #[serde(default)]
     pub preamble_tokens_estimate: Option<u64>,
     #[serde(default)]
     pub last_call_at: Option<String>,
+    /// Latest breakpoint count the adapter was asked to emit.
+    #[serde(default)]
+    pub last_breakpoints: u32,
+    /// Latest cache TTL pool (`5m` or `1h`).
+    #[serde(default)]
+    pub last_cache_ttl: Option<String>,
+    /// Latest derived miss reason, when the provider reported no cache reads.
+    #[serde(default)]
+    pub last_miss_reason: Option<String>,
+    /// Latest first-token latency for a cache-observed call.
+    #[serde(default)]
+    pub last_first_token_ms: Option<u64>,
+    /// Bounded newest-first list of per-call cache records.
+    #[serde(default)]
+    pub recent_calls: Vec<SessionCacheCall>,
+    /// Counting buckets derived from the bounded observation window.
+    #[serde(default)]
+    pub miss_reason_counts: Vec<CacheCountBucket>,
+    #[serde(default)]
+    pub ttl_counts: Vec<CacheCountBucket>,
+    #[serde(default)]
+    pub breakpoint_counts: Vec<CacheCountBucket>,
+    /// Estimated savings grouped by the role that made the call.
+    #[serde(default)]
+    pub savings_by_role: Vec<CacheSavingsBucket>,
+    /// Nearest-rank first-token latency percentiles over observed calls.
+    #[serde(default)]
+    pub first_token_p50_ms: Option<u64>,
+    #[serde(default)]
+    pub first_token_p95_ms: Option<u64>,
+    /// Number of observed compaction cache resets in the bounded window.
+    #[serde(default)]
+    pub compaction_resets: u64,
+    /// Sum of compaction invalidation token estimates in the same window.
+    #[serde(default)]
+    pub compaction_invalidation_tokens: u64,
+    /// Sum of compaction invalidation USD estimates in the same window.
+    #[serde(default)]
+    pub compaction_invalidation_estimated_usd: f64,
+    /// Project policy that produced the latest request plan.
+    #[serde(default)]
+    pub policy: Option<CachePolicy>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheCountBucket {
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub calls: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CacheSavingsBucket {
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub calls: u64,
+    #[serde(default)]
+    pub estimated_savings_usd: f64,
+}
+
+impl Default for SessionCacheCall {
+    fn default() -> Self {
+        Self {
+            at: String::new(),
+            agent_name: None,
+            role: None,
+            model: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            cache_hit_ratio: 0.0,
+            cache_breakpoints: 0,
+            cache_ttl: None,
+            first_token_ms: None,
+            core_hash: None,
+            project_hash: None,
+            tools_hash: None,
+            volatile_hash: None,
+            prompt_prefix_hash: None,
+            estimated_savings_usd: 0.0,
+            miss_reason: None,
+            warm: false,
+        }
+    }
+}
+
+/// One bounded per-call cache observation. Token fields come from the provider
+/// usage report (or the runtime estimate when the provider omitted usage).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionCacheCall {
+    #[serde(default)]
+    pub at: String,
+    #[serde(default)]
+    pub agent_name: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    #[serde(default)]
+    pub cache_hit_ratio: f64,
+    #[serde(default)]
+    pub cache_breakpoints: u32,
+    #[serde(default)]
+    pub cache_ttl: Option<String>,
+    #[serde(default)]
+    pub first_token_ms: Option<u64>,
+    #[serde(default)]
+    pub core_hash: Option<String>,
+    #[serde(default)]
+    pub project_hash: Option<String>,
+    #[serde(default)]
+    pub tools_hash: Option<String>,
+    #[serde(default)]
+    pub volatile_hash: Option<String>,
+    #[serde(default)]
+    pub prompt_prefix_hash: Option<String>,
+    #[serde(default)]
+    pub estimated_savings_usd: f64,
+    #[serde(default)]
+    pub miss_reason: Option<String>,
+    /// True when this call was an explicit `session.cache.warm` request.
+    #[serde(default)]
+    pub warm: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionCacheWarmParams {
+    pub session_id: String,
+    /// Optional role whose stable prompt/tool bundle to warm. Defaults to the
+    /// Leader. No volatile section or memory is included.
+    #[serde(default)]
+    pub role: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionCacheAuditParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionCacheAuditFinding {
+    pub code: String,
+    pub severity: String,
+    pub message: String,
+    #[serde(default)]
+    pub evidence: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionCacheAuditResult {
+    pub session_id: String,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub calls_checked: u64,
+    #[serde(default)]
+    pub warm_calls_checked: u64,
+    #[serde(default)]
+    pub compactions_checked: u64,
+    #[serde(default)]
+    pub hit_ratio: f64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    #[serde(default)]
+    pub findings: Vec<SessionCacheAuditFinding>,
+    /// True when every finding is informational.
+    #[serde(default)]
+    pub clean: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionCachePlanParams {
+    pub session_id: String,
+    /// Roles to preview. Empty means `leader` only.
+    #[serde(default)]
+    pub roles: Vec<String>,
+}
+
+/// One role's cache plan and component hashes. This is a read-only preview: it
+/// never calls a provider and never creates a worktree or session run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionCachePlanRole {
+    pub role: String,
+    pub provider: String,
+    pub model: String,
+    #[serde(default)]
+    pub cache_breakpoints: u32,
+    #[serde(default = "default_cache_ttl")]
+    pub cache_ttl: String,
+    #[serde(default)]
+    pub ttl_explicit: bool,
+    #[serde(default)]
+    pub automatic: bool,
+    #[serde(default)]
+    pub tail_message: bool,
+    #[serde(default)]
+    pub tool_breakpoint: bool,
+    #[serde(default)]
+    pub core_breakpoint: bool,
+    #[serde(default)]
+    pub project_breakpoint: bool,
+    #[serde(default)]
+    pub core_hash: String,
+    #[serde(default)]
+    pub project_hash: String,
+    #[serde(default)]
+    pub tools_hash: String,
+    #[serde(default)]
+    pub volatile_hash: String,
+    #[serde(default)]
+    pub prefix_hash: String,
+    #[serde(default)]
+    pub core_chars: u64,
+    #[serde(default)]
+    pub project_chars: u64,
+    #[serde(default)]
+    pub stable_prefix_chars: u64,
+    #[serde(default)]
+    pub tool_count: usize,
+    #[serde(default)]
+    pub system_tokens_estimate: u64,
+    #[serde(default)]
+    pub tool_tokens_estimate: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionCachePlanResult {
+    pub session_id: String,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub policy: Option<CachePolicy>,
+    #[serde(default)]
+    pub roles: Vec<SessionCachePlanRole>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionCacheWarmResult {
+    pub session_id: String,
+    pub warmed: bool,
+    pub provider: String,
+    pub model: String,
+    /// Role whose stable prompt/tool bundle was warmed.
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub source: String,
+    pub cache_breakpoints: u32,
+    pub cache_ttl: String,
+    #[serde(default)]
+    pub automatic: bool,
+    #[serde(default)]
+    pub core_hash: Option<String>,
+    #[serde(default)]
+    pub project_hash: Option<String>,
+    #[serde(default)]
+    pub tools_hash: Option<String>,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    #[serde(default)]
+    pub estimated: bool,
+    #[serde(default)]
+    pub cost_usd: f64,
+    #[serde(default)]
+    pub latency_ms: u64,
+    #[serde(default)]
+    pub first_token_ms: u64,
+    #[serde(default)]
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -8235,6 +8697,293 @@ mod tests {
     }
 
     #[test]
+    fn cache_policy_defaults_and_validation_are_explicit() {
+        let legacy: CachePolicy = serde_json::from_value(json!({})).unwrap();
+        assert!(legacy.enabled);
+        assert_eq!(legacy.ttl, "5m");
+        assert!(legacy.automatic_caching);
+        assert!(!legacy.warm_on_resume);
+        assert!(legacy.compact_aware);
+        assert!(legacy.role_ttl.is_empty());
+
+        let one_hour: CachePolicy = serde_json::from_value(json!({
+            "enabled": false,
+            "ttl": "1h",
+            "automatic_caching": false,
+            "warm_on_resume": true,
+            "compact_aware": false,
+            "role_ttl": {"worker": "1h", "leader": "5m"}
+        }))
+        .unwrap();
+        assert!(!one_hour.enabled);
+        assert_eq!(one_hour.ttl_for("worker"), "1h");
+        assert_eq!(one_hour.ttl_for("leader"), "5m");
+        assert_eq!(one_hour.ttl_for("verifier"), "1h");
+        assert!(one_hour.ttl_is_one_hour("verifier"));
+        assert!(one_hour.normalized().is_ok());
+
+        let invalid = CachePolicy {
+            ttl: "30m".into(),
+            ..CachePolicy::default()
+        };
+        assert!(invalid.normalized().is_err());
+        let invalid_role = CachePolicy {
+            role_ttl: BTreeMap::from([("intern".to_string(), "5m".to_string())]),
+            ..CachePolicy::default()
+        };
+        assert!(invalid_role.normalized().is_err());
+        let invalid_role_ttl = CachePolicy {
+            role_ttl: BTreeMap::from([("worker".to_string(), "2h".to_string())]),
+            ..CachePolicy::default()
+        };
+        assert!(invalid_role_ttl.normalized().is_err());
+
+        // Normalization trims and lowercases without inventing a value.
+        let normalized = CachePolicy {
+            ttl: " 1H ".into(),
+            role_ttl: BTreeMap::from([(" Worker ".to_string(), " 5M ".to_string())]),
+            ..CachePolicy::default()
+        }
+        .normalized()
+        .unwrap();
+        assert_eq!(normalized.ttl, "1h");
+        assert_eq!(
+            normalized.role_ttl.get("worker").map(String::as_str),
+            Some("5m")
+        );
+    }
+
+    #[test]
+    fn session_cache_status_decodes_legacy_and_new_payloads() {
+        let legacy: SessionCacheStatus =
+            serde_json::from_value(json!({"session_id": "ses-1"})).unwrap();
+        assert_eq!(legacy.session_id, "ses-1");
+        assert_eq!(legacy.cache_calls, 0);
+        assert!(legacy.recent_calls.is_empty());
+        assert!(legacy.policy.is_none());
+        assert_eq!(legacy.last_breakpoints, 0);
+
+        let current: SessionCacheStatus = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "input_tokens": 1000,
+            "cache_read_tokens": 600,
+            "cache_write_tokens": 100,
+            "output_tokens": 50,
+            "cache_hit_ratio": 0.6,
+            "cache_read_ratio": 0.6,
+            "cache_write_ratio": 0.1,
+            "estimated_savings_usd": 0.42,
+            "cache_calls": 3,
+            "prompt_prefix": "prefix",
+            "cache_generation": "generation",
+            "core_hash": "core",
+            "project_hash": "project",
+            "tools_hash": "tools",
+            "volatile_hash": "volatile",
+            "last_breakpoints": 4,
+            "last_cache_ttl": "1h",
+            "last_miss_reason": "compaction_reset",
+            "last_first_token_ms": 123,
+            "recent_calls": [{
+                "at": "2026-11-11T00:00:00Z",
+                "input_tokens": 100,
+                "cache_read_tokens": 60,
+                "cache_breakpoints": 4,
+                "cache_ttl": "1h",
+                "miss_reason": "ttl_or_provider_miss"
+            }],
+            "miss_reason_counts": [{"key": "first_call", "calls": 2}],
+            "ttl_counts": [{"key": "1h", "calls": 3}],
+            "breakpoint_counts": [{"key": "4", "calls": 3}],
+            "savings_by_role": [{"role": "leader", "calls": 3, "estimated_savings_usd": 0.42}],
+            "first_token_p50_ms": 120,
+            "first_token_p95_ms": 300,
+            "compaction_resets": 1,
+            "compaction_invalidation_tokens": 900,
+            "compaction_invalidation_estimated_usd": 0.0027,
+            "policy": {"ttl": "1h", "warm_on_resume": true}
+        }))
+        .unwrap();
+        assert_eq!(current.cache_calls, 3);
+        assert_eq!(current.last_breakpoints, 4);
+        assert_eq!(current.last_cache_ttl.as_deref(), Some("1h"));
+        assert_eq!(
+            current.last_miss_reason.as_deref(),
+            Some("compaction_reset")
+        );
+        assert_eq!(current.recent_calls.len(), 1);
+        assert_eq!(current.recent_calls[0].input_tokens, 100);
+        assert_eq!(current.miss_reason_counts[0].key, "first_call");
+        assert_eq!(current.ttl_counts[0].calls, 3);
+        assert_eq!(current.breakpoint_counts[0].key, "4");
+        assert_eq!(current.savings_by_role[0].role, "leader");
+        assert_eq!(current.first_token_p50_ms, Some(120));
+        assert_eq!(current.first_token_p95_ms, Some(300));
+        assert_eq!(current.compaction_resets, 1);
+        assert_eq!(current.compaction_invalidation_tokens, 900);
+        assert_eq!(current.policy.as_ref().unwrap().ttl, "1h");
+    }
+
+    #[test]
+    fn session_cache_call_decodes_legacy_empty_payload() {
+        let call: SessionCacheCall = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(call, SessionCacheCall::default());
+        let warm: SessionCacheCall = serde_json::from_value(json!({
+            "at": "now",
+            "warm": true,
+            "estimated_savings_usd": -0.0003
+        }))
+        .unwrap();
+        assert!(warm.warm);
+        assert!(warm.estimated_savings_usd < 0.0);
+    }
+
+    #[test]
+    fn cache_warm_result_round_trips_and_decodes_legacy_defaults() {
+        let result = SessionCacheWarmResult {
+            session_id: "ses-1".into(),
+            warmed: true,
+            provider: "anthropic".into(),
+            model: "claude".into(),
+            role: "leader".into(),
+            source: "manual".into(),
+            cache_breakpoints: 4,
+            cache_ttl: "1h".into(),
+            automatic: true,
+            core_hash: Some("core".into()),
+            project_hash: Some("project".into()),
+            tools_hash: Some("tools".into()),
+            input_tokens: 1_000,
+            output_tokens: 5,
+            cache_read_tokens: 0,
+            cache_write_tokens: 900,
+            estimated: false,
+            cost_usd: 0.003,
+            latency_ms: 250,
+            first_token_ms: 120,
+            message: "OK".into(),
+        };
+        let encoded = serde_json::to_value(&result).unwrap();
+        let decoded: SessionCacheWarmResult = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, result);
+
+        let minimal: SessionCacheWarmResult = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "warmed": false,
+            "provider": "openai-compatible",
+            "model": "gpt",
+            "cache_breakpoints": 0,
+            "cache_ttl": "5m"
+        }))
+        .unwrap();
+        assert!(!minimal.warmed);
+        assert_eq!(minimal.source, "");
+        assert_eq!(minimal.cost_usd, 0.0);
+        assert_eq!(minimal.latency_ms, 0);
+    }
+
+    #[test]
+    fn cache_audit_result_decodes_legacy_minimal_payload() {
+        let audit: SessionCacheAuditResult =
+            serde_json::from_value(json!({"session_id": "ses-1"})).unwrap();
+        assert_eq!(audit.session_id, "ses-1");
+        assert_eq!(audit.calls_checked, 0);
+        assert_eq!(audit.hit_ratio, 0.0);
+        assert!(audit.findings.is_empty());
+        assert!(!audit.clean);
+        let finding: SessionCacheAuditFinding = serde_json::from_value(json!({
+            "code": "x",
+            "severity": "info",
+            "message": "y"
+        }))
+        .unwrap();
+        assert!(finding.evidence.is_empty());
+    }
+
+    #[test]
+    fn cache_plan_result_round_trips_and_defaults_params() {
+        let params: SessionCachePlanParams =
+            serde_json::from_value(json!({"session_id": "ses-1"})).unwrap();
+        assert!(params.roles.is_empty());
+        let result = SessionCachePlanResult {
+            session_id: "ses-1".into(),
+            provider: "anthropic".into(),
+            policy: Some(CachePolicy::default()),
+            roles: vec![SessionCachePlanRole {
+                role: "leader".into(),
+                provider: "anthropic".into(),
+                model: "claude".into(),
+                cache_breakpoints: 4,
+                cache_ttl: "1h".into(),
+                ttl_explicit: true,
+                automatic: true,
+                tail_message: false,
+                tool_breakpoint: true,
+                core_breakpoint: true,
+                project_breakpoint: true,
+                core_hash: "core".into(),
+                project_hash: "project".into(),
+                tools_hash: "tools".into(),
+                volatile_hash: "volatile".into(),
+                prefix_hash: "prefix".into(),
+                core_chars: 100,
+                project_chars: 50,
+                stable_prefix_chars: 151,
+                tool_count: 20,
+                system_tokens_estimate: 200,
+                tool_tokens_estimate: 400,
+            }],
+        };
+        let encoded = serde_json::to_value(&result).unwrap();
+        let decoded: SessionCachePlanResult = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, result);
+        let minimal: SessionCachePlanResult = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "roles": [{"role": "leader", "provider": "x", "model": "y"}]
+        }))
+        .unwrap();
+        assert_eq!(minimal.roles[0].cache_breakpoints, 0);
+        assert_eq!(minimal.roles[0].tool_count, 0);
+        assert!(minimal.policy.is_none());
+    }
+
+    #[test]
+    fn compaction_summary_decodes_legacy_and_cache_fields() {
+        let legacy: ContextCompactionSummary = serde_json::from_value(json!({
+            "mode": "summary",
+            "summarized_messages": 10,
+            "dropped_messages": 0,
+            "kept_messages": 4,
+            "estimated_tokens_before": 1000,
+            "estimated_tokens_after": 300
+        }))
+        .unwrap();
+        assert!(legacy.cache_generation_before.is_none());
+        assert!(legacy.cache_generation_after.is_none());
+        assert!(legacy.cache_reset_reason.is_none());
+        assert_eq!(legacy.cache_invalidation_tokens, 0);
+        assert_eq!(legacy.cache_invalidation_estimated_usd, 0.0);
+        assert!(!legacy.cache_compact_aware);
+
+        let current: ContextCompactionSummary = serde_json::from_value(json!({
+            "mode": "trim",
+            "cache_generation_before": "before",
+            "cache_generation_after": "after",
+            "cache_reset_reason": "compaction",
+            "cache_invalidation_tokens": 700,
+            "cache_invalidation_estimated_usd": 0.0063,
+            "cache_compact_aware": true
+        }))
+        .unwrap();
+        assert_eq!(current.cache_generation_before.as_deref(), Some("before"));
+        assert_eq!(current.cache_generation_after.as_deref(), Some("after"));
+        assert_eq!(current.cache_reset_reason.as_deref(), Some("compaction"));
+        assert_eq!(current.cache_invalidation_tokens, 700);
+        assert!((current.cache_invalidation_estimated_usd - 0.0063).abs() < 1e-12);
+        assert!(current.cache_compact_aware);
+    }
+
+    #[test]
     fn legacy_usage_payloads_decode_derived_cache_fields_as_default() {
         let totals = UsageTotals {
             calls: 1,
@@ -9462,6 +10211,12 @@ mod program_wire_tests {
                 recent_completed_task_ids: vec!["T0".into()],
                 generated_at: "2026-11-11T00:00:00Z".into(),
             }),
+            cache_generation_before: Some("before".into()),
+            cache_generation_after: Some("after".into()),
+            cache_reset_reason: Some("compaction".into()),
+            cache_invalidation_tokens: 6_000,
+            cache_invalidation_estimated_usd: 0.0162,
+            cache_compact_aware: true,
             created_at: "2026-11-11T00:00:00Z".into(),
         };
         let encoded = serde_json::to_string(&summary).unwrap();

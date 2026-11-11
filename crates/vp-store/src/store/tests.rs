@@ -325,6 +325,102 @@ fn records_and_reads_the_latest_project_manifest_snapshot() {
 }
 
 #[test]
+fn persists_cache_policy_and_records_it_in_the_manifest() {
+    let (data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let default = store.get_cache_policy(&project.id).unwrap();
+    assert!(default.enabled);
+    assert_eq!(default.ttl, "5m");
+    assert!(default.automatic_caching);
+    assert!(!default.warm_on_resume);
+    assert!(default.compact_aware);
+
+    let mut policy = CachePolicy {
+        enabled: true,
+        ttl: "1h".into(),
+        automatic_caching: false,
+        warm_on_resume: true,
+        compact_aware: false,
+        role_ttl: std::collections::BTreeMap::from([("worker".to_string(), "5m".to_string())]),
+    };
+    policy = policy.normalized().unwrap();
+    store.set_cache_policy(&project.id, &policy).unwrap();
+    assert_eq!(store.get_cache_policy(&project.id).unwrap(), policy);
+
+    // Replacing the row updates one project-scoped policy; it never appends a
+    // per-call row or duplicates state.
+    let mut updated = policy.clone();
+    updated.ttl = "5m".into();
+    updated.warm_on_resume = false;
+    store.set_cache_policy(&project.id, &updated).unwrap();
+    assert_eq!(store.get_cache_policy(&project.id).unwrap(), updated);
+
+    store.record_project_manifest().unwrap();
+    let snapshots = read_project_manifest(data.path()).unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].cache_policy, updated);
+}
+
+#[test]
+fn cache_policy_survives_reopening_the_database() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let project_id = {
+        let store = Store::open(data.path()).unwrap();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("demo"))
+            .unwrap();
+        let policy = CachePolicy {
+            enabled: false,
+            ttl: "1h".into(),
+            automatic_caching: false,
+            warm_on_resume: true,
+            compact_aware: false,
+            role_ttl: std::collections::BTreeMap::from([("worker".to_string(), "5m".to_string())]),
+        };
+        store.set_cache_policy(&project.id, &policy).unwrap();
+        project.id
+    };
+    let reopened = Store::open(data.path()).unwrap();
+    let policy = reopened.get_cache_policy(&project_id).unwrap();
+    assert!(!policy.enabled);
+    assert_eq!(policy.ttl, "1h");
+    assert!(!policy.automatic_caching);
+    assert!(policy.warm_on_resume);
+    assert!(!policy.compact_aware);
+    assert_eq!(
+        policy.role_ttl.get("worker").map(String::as_str),
+        Some("5m")
+    );
+}
+
+#[test]
+fn legacy_manifest_without_cache_policy_decodes_the_default() {
+    let (data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    store.record_project_manifest().unwrap();
+    let mut snapshots = read_project_manifest(data.path()).unwrap();
+    let snapshot = snapshots.remove(0);
+    let mut value = serde_json::to_value(&snapshot).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("cache_policy")
+        .expect("new manifest field is present");
+    let legacy: ProjectManifestSnapshot = serde_json::from_value(value).unwrap();
+    assert_eq!(legacy.project.id, project.id);
+    assert!(legacy.cache_policy.enabled);
+    assert_eq!(legacy.cache_policy.ttl, "5m");
+    assert!(legacy.cache_policy.automatic_caching);
+    assert!(!legacy.cache_policy.warm_on_resume);
+    assert!(legacy.cache_policy.compact_aware);
+}
+
+#[test]
 fn groups_project_usage_by_session() {
     let (_data, store, repo) = test_store();
     let project = store

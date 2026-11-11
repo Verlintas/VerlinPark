@@ -16,6 +16,8 @@ struct EfficiencyCard: View {
             header
             if let snapshot {
                 ratioRow(snapshot)
+                cachePlanRow(snapshot)
+                recentCacheRows(snapshot)
                 tokenRow(snapshot)
                 costRow(snapshot)
                 contextRow(snapshot)
@@ -105,6 +107,103 @@ struct EfficiencyCard: View {
                         .foregroundStyle(VPTheme.textTertiary)
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private func cachePlanRow(_ snapshot: EfficiencySnapshot) -> some View {
+        if snapshot.estimatedSavingsUSD != nil
+            || snapshot.lastCacheTTL != nil
+            || snapshot.lastBreakpoints != nil
+            || snapshot.lastMissReason != nil
+        {
+            HStack(spacing: 10) {
+                if let savings = snapshot.estimatedSavingsUSD {
+                    metric(
+                        "Estimated savings",
+                        EfficiencyMetrics.usd(savings),
+                        detail: savings < 0
+                            ? "cache writes cost more than reads saved"
+                            : "vs uncached input at configured prices"
+                    )
+                }
+                if let ttl = snapshot.lastCacheTTL {
+                    metric(
+                        "Cache TTL",
+                        ttl.uppercased(),
+                        detail: ttl == "1h" ? "extended pool, higher write cost" : "default ephemeral pool"
+                    )
+                }
+                if let breakpoints = snapshot.lastBreakpoints {
+                    metric(
+                        "Breakpoints",
+                        "\(breakpoints)",
+                        detail: breakpoints > 0 ? "explicit + moving slots" : "provider-managed prefix"
+                    )
+                }
+                if let miss = snapshot.lastMissReason {
+                    metric(
+                        "Last miss",
+                        EfficiencyMetrics.missReasonLabel(miss),
+                        detail: miss == "ttl_or_provider_miss"
+                            ? "prefix unchanged; no provider TTL fact inferred"
+                            : "derived from component hashes"
+                    )
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func recentCacheRows(_ snapshot: EfficiencySnapshot) -> some View {
+        if !snapshot.recentCacheCalls.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("RECENT CACHE CALLS")
+                    .font(VPTheme.mono(8, weight: .semibold))
+                    .foregroundStyle(VPTheme.textTertiary)
+                ForEach(Array(snapshot.recentCacheCalls.prefix(3).enumerated()), id: \.offset) { _, call in
+                    HStack(spacing: 8) {
+                        Text(call.role?.uppercased() ?? "AGENT")
+                            .font(VPTheme.mono(8, weight: .semibold))
+                            .foregroundStyle(VPTheme.textSecondary)
+                            .frame(width: 62, alignment: .leading)
+                        Text("\(EfficiencyMetrics.percent(call.cacheHitRatio)) hit")
+                            .font(VPTheme.mono(8))
+                            .monospacedDigit()
+                            .foregroundStyle(
+                                EfficiencyMetrics.isLowCacheHitRatio(call.cacheHitRatio)
+                                    ? VPTheme.warning
+                                    : VPTheme.success
+                            )
+                        Text("read \(EfficiencyMetrics.tokenLabel(call.cacheReadTokens))")
+                            .font(VPTheme.mono(8))
+                            .foregroundStyle(VPTheme.textTertiary)
+                        if call.warm {
+                            Text("warm")
+                                .font(VPTheme.mono(8, weight: .semibold))
+                                .foregroundStyle(VPTheme.accent)
+                        } else if let miss = call.missReason {
+                            Text("miss \(EfficiencyMetrics.missReasonLabel(miss))")
+                                .font(VPTheme.mono(8))
+                                .foregroundStyle(VPTheme.textTertiary)
+                        }
+                        Spacer(minLength: 0)
+                        if let firstToken = call.firstTokenMS, firstToken > 0 {
+                            Text("\(firstToken) ms")
+                                .font(VPTheme.mono(8))
+                                .monospacedDigit()
+                                .foregroundStyle(VPTheme.textTertiary)
+                        }
+                    }
+                }
+                if snapshot.recentCacheCalls.count > 3 {
+                    Text("+\(snapshot.recentCacheCalls.count - 3) older calls")
+                        .font(VPTheme.mono(7))
+                        .foregroundStyle(VPTheme.textTertiary)
+                }
+            }
+            .padding(8)
+            .background(VPTheme.surfaceRaised.opacity(0.45), in: RoundedRectangle(cornerRadius: 9))
         }
     }
 
