@@ -155,6 +155,11 @@
 | [0143](adr/0143-long-task-operator-console.md) | macOS surfaces for steering, continuations, stall recovery, and task progress, backed only by real RPCs | Accepted | macOS/Runtime |
 | [0144](adr/0144-memory-conflicts-and-health.md) | Deterministic same-scope memory conflict review with explicit resolution and project memory health | Accepted | Runtime/Storage/macOS |
 | [0145](adr/0145-verifier-and-integration-knowledge-capture.md) | Capture Verifier verdicts and successful conflict resolutions as evidence-backed project memories | Accepted | Runtime/Orchestration |
+| [0146](adr/0146-daemon-metrics.md) | Bearer-token Prometheus metrics and a typed daemon metrics RPC with bounded labels | Accepted | Daemon/CLI |
+| [0147](adr/0147-recurring-session-continuations.md) | Delivery-relative interval continuation series with a run cap and fail-closed children | Accepted | Runtime/Scheduler |
+| [0148](adr/0148-gitea-forgejo-pull-requests.md) | Explicit Gitea/Forgejo PR provider through the `tea` CLI | Accepted | Runtime/CLI |
+| [0149](adr/0149-rich-artifact-preview.md) | Local rich artifact previews with PDFKit, AVKit, QuickLook, and paged hex | Accepted | macOS |
+| [0150](adr/0150-data-directory-backup-restore.md) | Checksummed offline data-directory backup and atomic restore | Accepted | Runtime/CLI |
 
 ---
 

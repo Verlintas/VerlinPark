@@ -523,6 +523,30 @@ loop {
 - 不改变任何 approval、sandbox、write scope、Verifier、merge、capacity 或
   budget gate；`remember`/`recall` 仍以 source=agent 工作。
 
+### 7.0.3 Operations & continuity（2026-11-11）
+
+- Daemon 暴露 Bearer-token Prometheus `/metrics` 和 `daemon.metrics` /
+  `vp metrics`：session/plan task/merge queue/intake/continuation/recovery/
+  memory/conflict/lease 状态计数，token/cache/USD 汇总；只使用有界
+  status/kind 标签，不含 session/task/path/model id。
+- `SessionContinuation` 支持可选 interval series：`every_secs` + `max_runs`；
+  第一次仍由 watch/deadline 触发，成功后在同一事务内写
+  `session.continuation.scheduled` 并创建 deadline-only child。它不是 cron，
+  没有 catch-up/jitter/cross-process lease；失败、取消、落地/导入或达到
+  max runs 都不再创建 child。
+- `session.pr` 支持 GitHub/GitLab/Gitea/Forgejo；Gitea 通过 `tea`，显式
+  `VERLINPARK_PR_PROVIDER=gitea|forgejo`，preflight `tea login list`，
+  不读取/存储 forge token。
+- SwiftUI artifact preview 支持 image zoom、PDFKit、AVKit、QuickLook、
+  64KB text、64KB paged hex；只读 daemon 提供的 artifact path 或 inline
+  data，不执行 artifact、不访问网络、不解压 archive。
+- `vp backup` / `vp restore`：SQLite `VACUUM INTO` 快照 + manifest +
+  event mirrors + 可选 artifact blobs；restore 校验路径/checksum 后原子替换，
+  排除 discovery/lock/worktree/scratch/secrets；要求离线或空目标，不自动
+  停止 daemon。
+- `runtime_leases` / `computer_leases` 使用 `julianday()` 比较 RFC3339
+  到期时间，避免 fractional seconds 字符串排序问题。
+
 ### 7.1 Actor 命令
 
 ```rust

@@ -1,10 +1,94 @@
 # VerlinPark 进度
 
 > 最后更新：2026-11-11
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
+
+---
+
+## 2026-11-11 Daemon metrics, recurring continuations, richer previews, and backup
+
+这一轮并行补了五个运维/长任务缺口，全部保持 deterministic Rust / 无隐藏路由。
+
+### Daemon metrics
+
+- `GET /metrics`：Prometheus text，要求与 `/rpc` 相同的
+  `Authorization: Bearer <discovery token>`。
+- `daemon.metrics` RPC 返回结构化快照 + 渲染文本；`vp metrics [--prometheus]`。
+- 指标：
+  - sessions / plan tasks / merge queue / intake / continuations / recoveries /
+    memories / conflicts 按状态
+  - runtime leases 按 kind
+  - tokens input/output、cache read/write、USD total、projects、uptime
+- 无 session id、task id、路径、模型名或密钥标签；每类最多 64 个分组。
+- 不改变 `/health`，也不改任何调度/审批行为。
+
+### Recurring session continuations
+
+- `SessionContinuation` 增加 `series_id`、`parent_continuation_id`、
+  `recurrence_every_secs`、`recurrence_max_runs`、`run_count`。
+- `session.defer` 增加 `every_secs`、`max_runs`；CLI
+  `vp defer ... --every-secs N --max-runs K`。
+- 第一次仍由 watch/deadline 触发；成功后在同一事务内：
+  - 当前 row → `delivered`，`run_count += 1`
+  - 写 `session.continuation.delivered`
+  - 若未达 max runs，创建 child：
+    - 继承 series/body/recurrence
+    - 清空 watch task，只保留 `deadline_at = now + every_secs`
+    - status `pending`
+    - 写 `session.continuation.scheduled`
+- child 不会因为原始 watch task 已 settled 而立刻重跑。
+- `every_secs` 60..=2,592,000；有 interval 时 `max_runs` 默认 10、范围 2..=100；
+  无 interval 时只能 one-shot。
+- 这是 delivery-relative interval，不是 cron；没有 catch-up、jitter、
+  series-wide cancel 或跨进程 lease。
+- 失败/取消/落地/导入/达到 max runs 都不创建 child；`delivering` crash 仍
+  fail closed。
+
+### Gitea / Forgejo PR
+
+- 新增 `PrCli::Gitea`，通过 `tea`：
+  - `VERLINPARK_PR_PROVIDER=gitea|forgejo`
+  - `VERLINPARK_TEA_BIN`（默认 `tea`）
+  - preflight `tea login list`
+  - `tea pr create --head ... --base ... --title ... --description ...`
+- GitHub/GitLab 行为不变；不自动猜测任意 self-hosted hostname。
+- 不读取/存储 forge token；失败不会伪造成功。
+
+### Rich artifact previews
+
+- 分类：image / pdf / video / audio / text / binary / archive / other。
+- Image 支持更大的 zoom/scroll 视图、尺寸、Quick Look。
+- PDF 使用 PDFKit，支持 page count 和前后翻页。
+- Video/audio 使用 AVKit，本地文件播放。
+- Binary 从 1 KB hex 升级为 64 KB 分页 hex（offset + ASCII），
+  只读取 daemon 给出的 artifact path；inline 数据在 app cache 物化。
+- Text 支持 wrap 切换、Save As；统一支持 Reveal in Finder、Copy SHA-256。
+- 不做 archive 解压、媒体转码、远程/云 URL 或 artifact 执行。
+- 临时文件只落在 app cache，dismiss/deinit 清理并做启动 sweeper。
+
+### Backup / restore
+
+- `vp backup --output <zip> [--include-artifacts]`
+- `vp restore --input <zip> --data-dir <dir> [--force]`
+- SQLite 用只读连接 + `VACUUM INTO` 做一致性快照，不复制 WAL/SHM。
+- 归档包含 `backup.json`（版本、时间、大小、SHA-256）、数据库快照、
+  `projects.jsonl`、per-session event mirrors；可选 artifact blobs。
+- 排除 discovery、instance lock、logs、worktrees、scratch、secrets。
+- restore 先校验 manifest/路径/类型/重复/symlink/大小/checksum，再解压到
+  兄弟临时目录并原子替换；失败保留旧数据。
+- 非空目标/已有数据库需要 `--force`；daemon 运行中不自动停止。
+- 没有加密/签名、增量备份、worktree/Git 备份或 live-daemon quiesce。
+
+### 其他
+
+- lease 到期比较改为 SQLite `julianday()`，修复 RFC3339 fractional seconds
+  导致的过期 lease 卡住问题（上一轮已记录，本轮保持）。
+- 测试：Rust **590 passed，4 ignored**；Swift **153 passed**。
+- ADR-0146（metrics）、0147（recurring continuations）、0148（Gitea/Forgejo PR）、
+  0149（rich preview）、0150（backup/restore）已记录。
 
 ---
 
