@@ -1,7 +1,7 @@
 # VerlinPark 进度
 
 > 最后更新：2026-11-12
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark + task contracts/intent authorization/MCP schema pins + effect receipts/postconditions + external gates/durable waits + runtime pinning/controller replay 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark + task contracts/intent authorization/MCP schema pins + effect receipts/postconditions + external gates/durable waits + runtime pinning/controller replay + reliability/OTel 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
@@ -249,6 +249,36 @@ C4 已实现并合入 `f66e485`，ADR-0196。Rust **3,531 passed / 0 failed / 3 
 - `policy_snapshots` 没有 retention/GC。
 - legacy plans 保持 `snapshot_missing` drift，直到显式 migrate。
 - same-host SQLite only，无 cross-host consensus。
+
+---
+
+## 2026-11-12 Contracted execution C5: reliability metrics and OTel GenAI
+
+C5 已实现并合入 `782cb19`，ADR-0197。Rust **3,571 passed / 0 failed / 6 ignored**，Swift **500 passed**（368 app + 132 helper），clippy/swiftformat/xcodebuild 通过。
+
+### Reliability metrics
+
+- `vp bench reliability`：pass@k、pass^k、sample variance、flake rate（adjacent-trial outcome transition；同时有 solved/unsolved 为 flaky）。
+- Lucky-Pass 确定性信号：commit 后无 passing test、retry 无新 evidence hash、同 path edit→previous-hash revert、test-before-implement、verifier-before-implement。
+- Coordination overhead：显式 numerator/denominator/ratio；numerator 为 Leader/Manager/Verifier/Scout/untasked Worker+Labour，denominator 为 task-scoped Worker+Labour。
+- cost per solved task / per solved scenario；per-scenario 输出，不做 universal leaderboard。
+- 现有 `vp bench run` JSON additive `trial_evidence`、`coordination`、`scenario.reliability`；legacy decode 保留。观测-only，无 gate/provider 调用变化。
+
+### OTel GenAI
+
+- `vp-core::otel` 仅从 event log 投影：session root、agent invocation、tool execution、chat usage spans。
+- attributes：conversation/session id、agent id/name/role、provider/model、tool name/duration/status、attempt/retries、input/output/cache-read/cache-write tokens。
+- 不导出 prompts、goals、summaries、tool args/results、file content、raw errors、secrets；bounded attributes/names/spans/events/request size/timeout。
+- `OtelPolicy` 默认 disabled、loopback-only；拒绝 public endpoint、credentials、redirects、proxies。
+- 显式接口：`telemetry.otel.status/export/test`、`project.otel_policy.get/set`；CLI `vp otel-status/export/test/policy*`；Swift Efficiency 只读状态/计数/endpoint + 显式 Export/Test；无后台 exporter。
+
+### 限制
+
+- Lucky-Pass 是 ordering heuristics，不是 semantic correctness proof。
+- Test evidence 只覆盖可识别的 test-runner command metadata。
+- Coordination accounting 是 role/task attribution，不是 work classifier。
+- OTel metadata-only，最多 5,000 events；无 background exporter、remote collector、collector auth、cross-host correlation。
+- Reliability report 是描述性的，不是 leaderboard、significance test 或 merge gate。
 
 ---
 

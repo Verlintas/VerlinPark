@@ -74,6 +74,18 @@ Limits:
 - Legacy plans remain `snapshot_missing` drift until explicitly migrated.
 - Pinning/replay is same-host SQLite only, not cross-host consensus.
 
+## 0.7 2026-11-12 Contracted execution C5
+
+C5 is implemented and merged at `782cb19` (ADR-0197): pass@k/pass^k/variance/flake, deterministic Lucky-Pass ordering signals, coordination overhead, cost per solved, and an explicit loopback-only OTel GenAI projection with no prompts/tool content/secrets and no background exporter. Rust 3,571 passed; Swift 500 passed. This completes Contracted Execution Phase 1 (C1–C5).
+
+Limits:
+
+- Lucky-Pass signals are ordering heuristics, not semantic correctness proof.
+- Test evidence only covers recognized test-runner metadata.
+- Coordination accounting is role/task attribution, not a work classifier.
+- OTel is metadata-only, bounded to 5,000 events; no background exporter, remote collector, collector auth, or cross-host correlation.
+- Reliability reports are descriptive, not a leaderboard, significance test, or merge gate.
+
 ## 0. 2026-10-30 跟进
 
 第一轮硬化已完成（同一 `main` 线，提交见仓库历史）：
