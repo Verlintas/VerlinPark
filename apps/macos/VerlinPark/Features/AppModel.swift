@@ -92,6 +92,7 @@ final class AppModel {
     var sessionCacheCalls: [SessionCacheCall] = []
     var sessionCacheCallsTruncated = false
     var sessionInstructions: SessionInstructionsReport?
+    var sessionContract: SessionContractReport?
     var governorStatus: GovernorSessionStatus?
     var governorStatusMessage: String?
     var efficiencyBusy = false
@@ -808,6 +809,7 @@ final class AppModel {
         sessionCacheCalls = []
         sessionCacheCallsTruncated = false
         sessionInstructions = nil
+        sessionContract = nil
         governorStatus = nil
         governorStatusMessage = nil
         toolOutputStatus = nil
@@ -3758,6 +3760,7 @@ final class AppModel {
             contextStatus = nil
             sessionCacheStatus = nil
             sessionInstructions = nil
+            sessionContract = nil
             governorStatus = nil
             governorStatusMessage = nil
             toolActivity = nil
@@ -3802,6 +3805,15 @@ final class AppModel {
         } catch {
             guard isCurrent(sessionID: sessionID, generation: generation) else { return }
             sessionInstructions = nil
+        }
+
+        do {
+            let contract = try await core.sessionContract(sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            sessionContract = contract
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            sessionContract = nil
         }
 
         do {

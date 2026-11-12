@@ -81,6 +81,14 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
         for snapshot in &snapshots {
             store.insert_project_snapshot(&snapshot.project)?;
             store.set_shell_policy(&snapshot.project.id, &snapshot.shell_policy)?;
+            let contract_policy = snapshot.contract_policy.normalized().map_err(|error| {
+                anyhow::anyhow!(
+                    "contract policy for project {} is invalid: {error}",
+                    snapshot.project.id
+                )
+            })?;
+            store.set_contract_policy(&snapshot.project.id, &contract_policy)?;
+            store.replace_mcp_tool_pins(&snapshot.project.id, &snapshot.mcp_tool_pins)?;
             store.set_cache_policy(&snapshot.project.id, &snapshot.cache_policy)?;
             store.set_execution_host(&snapshot.project.id, &snapshot.execution_host)?;
             store.set_remote_integration_policy(

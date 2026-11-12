@@ -548,11 +548,12 @@ pub fn prefix_hash_v3(model: &str, tools_hash: &str, head_sections: &[PromptSect
 /// prefix hash.
 fn v3_volatile_hash(sections: &PromptSections) -> String {
     let mut material = String::new();
-    for heading in sections
-        .head
-        .iter()
-        .filter(|heading| matches!(heading.key.as_str(), "session/context" | "run/task"))
-    {
+    for heading in sections.head.iter().filter(|heading| {
+        matches!(
+            heading.key.as_str(),
+            "session/context" | "session/contract" | "run/task"
+        )
+    }) {
         material.push_str(&heading.key);
         material.push('\u{1f}');
         material.push_str(&sha256_hex(heading.text.as_bytes()));

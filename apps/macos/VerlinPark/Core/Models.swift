@@ -4233,6 +4233,139 @@ struct SessionInstructionsReport: Codable, Sendable, Equatable {
     }
 }
 
+/// Bounded, text-free task-contract metadata from `session.contract`.
+struct SessionContractMetadata: Codable, Sendable, Equatable {
+    let contractID: String
+    let hash: String
+    let role: String
+    let taskID: String?
+    let planRevision: Int
+    let allowedPathsCount: Int
+    let forbiddenPathsCount: Int
+    let allowedPathsPreview: [String]
+    let egress: String
+    let unrestrictedScope: Bool
+    let acceptanceCount: Int
+    let allowedToolsCount: Int
+    let maxWrites: Int?
+    let maxBytes: Int?
+    let maxCommits: Int?
+    let writesUsed: Int
+    let bytesUsed: Int
+    let commitsUsed: Int
+    let enforcementMode: String
+
+    enum CodingKeys: String, CodingKey {
+        case contractID = "contract_id"
+        case hash
+        case role
+        case taskID = "task_id"
+        case planRevision = "plan_revision"
+        case allowedPathsCount = "allowed_paths_count"
+        case forbiddenPathsCount = "forbidden_paths_count"
+        case allowedPathsPreview = "allowed_paths_preview"
+        case egress
+        case unrestrictedScope = "unrestricted_scope"
+        case acceptanceCount = "acceptance_count"
+        case allowedToolsCount = "allowed_tools_count"
+        case maxWrites = "max_writes"
+        case maxBytes = "max_bytes"
+        case maxCommits = "max_commits"
+        case writesUsed = "writes_used"
+        case bytesUsed = "bytes_used"
+        case commitsUsed = "commits_used"
+        case enforcementMode = "enforcement_mode"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        contractID = try container.decodeIfPresent(String.self, forKey: .contractID) ?? ""
+        hash = try container.decodeIfPresent(String.self, forKey: .hash) ?? ""
+        role = try container.decodeIfPresent(String.self, forKey: .role) ?? ""
+        taskID = try container.decodeIfPresent(String.self, forKey: .taskID)
+        planRevision = try container.decodeIfPresent(Int.self, forKey: .planRevision) ?? 0
+        allowedPathsCount = try container.decodeIfPresent(Int.self, forKey: .allowedPathsCount) ?? 0
+        forbiddenPathsCount = try container.decodeIfPresent(Int.self, forKey: .forbiddenPathsCount) ?? 0
+        allowedPathsPreview = try container.decodeIfPresent([String].self, forKey: .allowedPathsPreview) ?? []
+        egress = try container.decodeIfPresent(String.self, forKey: .egress) ?? "allow"
+        unrestrictedScope = try container.decodeIfPresent(Bool.self, forKey: .unrestrictedScope) ?? false
+        acceptanceCount = try container.decodeIfPresent(Int.self, forKey: .acceptanceCount) ?? 0
+        allowedToolsCount = try container.decodeIfPresent(Int.self, forKey: .allowedToolsCount) ?? 0
+        maxWrites = try container.decodeIfPresent(Int.self, forKey: .maxWrites)
+        maxBytes = try container.decodeIfPresent(Int.self, forKey: .maxBytes)
+        maxCommits = try container.decodeIfPresent(Int.self, forKey: .maxCommits)
+        writesUsed = try container.decodeIfPresent(Int.self, forKey: .writesUsed) ?? 0
+        bytesUsed = try container.decodeIfPresent(Int.self, forKey: .bytesUsed) ?? 0
+        commitsUsed = try container.decodeIfPresent(Int.self, forKey: .commitsUsed) ?? 0
+        enforcementMode = try container.decodeIfPresent(String.self, forKey: .enforcementMode) ?? "enforce"
+    }
+
+    var shortHash: String {
+        String(hash.prefix(12))
+    }
+
+    var scopeLabel: String {
+        if unrestrictedScope {
+            return "unrestricted"
+        }
+        return allowedPathsPreview.prefix(2).joined(separator: ", ")
+    }
+}
+
+struct SessionContractPolicySummary: Codable, Sendable, Equatable {
+    let enabled: Bool
+    let mode: String
+    let enforceShell: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case enabled
+        case mode
+        case enforceShell = "enforce_shell"
+    }
+
+    init() {
+        enabled = true
+        mode = "enforce"
+        enforceShell = false
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        mode = try container.decodeIfPresent(String.self, forKey: .mode) ?? "enforce"
+        enforceShell = try container.decodeIfPresent(Bool.self, forKey: .enforceShell) ?? false
+    }
+}
+
+/// Bounded task-contract view. No contract text, prompt, or argument values.
+struct SessionContractReport: Codable, Sendable, Equatable {
+    let sessionID: String
+    let projectID: String
+    let contract: SessionContractMetadata?
+    let policy: SessionContractPolicySummary
+    let decisionCount: Int
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case projectID = "project_id"
+        case contract
+        case policy
+        case decisionCount = "recent_decisions"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = try container.decodeIfPresent(String.self, forKey: .sessionID) ?? ""
+        projectID = try container.decodeIfPresent(String.self, forKey: .projectID) ?? ""
+        contract = try container.decodeIfPresent(SessionContractMetadata.self, forKey: .contract)
+        policy = try container.decodeIfPresent(
+            SessionContractPolicySummary.self,
+            forKey: .policy
+        ) ?? SessionContractPolicySummary()
+        decisionCount = try container.decodeIfPresent([JSONValue].self, forKey: .decisionCount)?.count ?? 0
+    }
+}
+
 /// One bounded per-call cache observation from `session.cache`.
 struct SessionCacheCall: Codable, Sendable, Identifiable, Equatable {
     var id: String {

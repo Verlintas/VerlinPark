@@ -2286,6 +2286,70 @@ enum Command {
         #[arg(long)]
         include_warm: bool,
     },
+    /// Show the latest trusted task contract metadata for a session. No
+    /// contract text, tool output, or secrets are printed.
+    Contract {
+        session: String,
+        /// Inspect one plan task's contract instead of the session-scoped one.
+        #[arg(long)]
+        task: Option<String>,
+    },
+    /// Show the project task-contract policy.
+    #[command(name = "contract-policy")]
+    ContractPolicy { project: String },
+    /// Set the project task-contract policy. Omitted flags keep the current
+    /// value; list flags replace the list.
+    #[command(name = "contract-policy-set")]
+    ContractPolicySet {
+        project: String,
+        #[arg(long)]
+        enabled: Option<bool>,
+        /// `advisory` or `enforce`.
+        #[arg(long)]
+        mode: Option<String>,
+        #[arg(long)]
+        enforce_shell: Option<bool>,
+        #[arg(long = "forbidden-path")]
+        forbidden_paths: Vec<String>,
+        #[arg(long = "egress-allow")]
+        egress_allowlist: Vec<String>,
+        #[arg(long)]
+        max_writes: Option<u64>,
+        #[arg(long)]
+        max_bytes: Option<u64>,
+        #[arg(long)]
+        max_commits: Option<u64>,
+    },
+    /// List project-scoped MCP tool schema pins and their trust status.
+    #[command(name = "mcp-pins")]
+    McpPins {
+        project: String,
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// Approve the currently observed schema/description of one MCP tool.
+    #[command(name = "mcp-pin-approve")]
+    McpPinApprove {
+        project: String,
+        server: String,
+        tool: String,
+        #[arg(long)]
+        schema_hash: String,
+        #[arg(long)]
+        description_hash: String,
+        #[arg(long)]
+        approved_by: Option<String>,
+    },
+    /// Reject the observed MCP tool pin without overwriting its approved
+    /// hashes.
+    #[command(name = "mcp-pin-reject")]
+    McpPinReject {
+        project: String,
+        server: String,
+        tool: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Show the ordered content-addressed instruction sections and hashes.
     /// Section text is never printed.
     Instructions {
@@ -7439,6 +7503,122 @@ async fn run(cli: Cli) -> Result<()> {
                     "role": role,
                     "miss_reason": miss_reason,
                     "include_warm": include_warm,
+                }),
+            )
+            .await?
+        }
+        Command::Contract { session, task } => {
+            rpc(
+                &discovery,
+                "session.contract",
+                json!({"session_id": session, "task_id": task}),
+            )
+            .await?
+        }
+        Command::ContractPolicy { project } => {
+            rpc(
+                &discovery,
+                "project.contract_policy.get",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::ContractPolicySet {
+            project,
+            enabled,
+            mode,
+            enforce_shell,
+            forbidden_paths,
+            egress_allowlist,
+            max_writes,
+            max_bytes,
+            max_commits,
+        } => {
+            let current = rpc(
+                &discovery,
+                "project.contract_policy.get",
+                json!({"project_id": project}),
+            )
+            .await?;
+            let mut policy = current.get("policy").cloned().unwrap_or_else(|| json!({}));
+            if let Some(enabled) = enabled {
+                policy["enabled"] = json!(enabled);
+            }
+            if let Some(mode) = mode {
+                if vp_protocol::types::ContractMode::parse(&mode).is_none() {
+                    bail!("contract mode must be `advisory` or `enforce`, got {mode}");
+                }
+                policy["mode"] = json!(mode.to_ascii_lowercase());
+            }
+            if let Some(enforce_shell) = enforce_shell {
+                policy["enforce_shell"] = json!(enforce_shell);
+            }
+            if !forbidden_paths.is_empty() {
+                policy["forbidden_paths"] = json!(forbidden_paths);
+            }
+            if !egress_allowlist.is_empty() {
+                policy["egress_allowlist"] = json!(egress_allowlist);
+            }
+            if let Some(max_writes) = max_writes {
+                policy["max_writes"] = json!(max_writes);
+            }
+            if let Some(max_bytes) = max_bytes {
+                policy["max_bytes"] = json!(max_bytes);
+            }
+            if let Some(max_commits) = max_commits {
+                policy["max_commits"] = json!(max_commits);
+            }
+            rpc(
+                &discovery,
+                "project.contract_policy.set",
+                json!({"project_id": project, "policy": policy}),
+            )
+            .await?
+        }
+        Command::McpPins { project, server } => {
+            rpc(
+                &discovery,
+                "project.mcp_pins",
+                json!({"project_id": project, "server_id": server}),
+            )
+            .await?
+        }
+        Command::McpPinApprove {
+            project,
+            server,
+            tool,
+            schema_hash,
+            description_hash,
+            approved_by,
+        } => {
+            rpc(
+                &discovery,
+                "mcp.pin.approve",
+                json!({
+                    "project_id": project,
+                    "server_id": server,
+                    "tool_name": tool,
+                    "expected_schema_hash": schema_hash,
+                    "expected_description_hash": description_hash,
+                    "approved_by": approved_by,
+                }),
+            )
+            .await?
+        }
+        Command::McpPinReject {
+            project,
+            server,
+            tool,
+            reason,
+        } => {
+            rpc(
+                &discovery,
+                "mcp.pin.reject",
+                json!({
+                    "project_id": project,
+                    "server_id": server,
+                    "tool_name": tool,
+                    "reason": reason,
                 }),
             )
             .await?
@@ -13881,6 +14061,128 @@ fn print_human(value: &Value) {
         );
         return;
     }
+    if value.get("recent_decisions").is_some() && value.get("contract").is_some() {
+        let contract = &value["contract"];
+        println!(
+            "session {}  project {}  policy={}",
+            value["session_id"].as_str().unwrap_or("?"),
+            value["project_id"].as_str().unwrap_or("?"),
+            value["policy"]["mode"].as_str().unwrap_or("enforce")
+        );
+        if contract.is_null() {
+            println!("no task contract derived yet");
+        } else {
+            println!(
+                "contract {}  role={}  task={}  revision={}",
+                contract["hash"].as_str().unwrap_or("?"),
+                contract["role"].as_str().unwrap_or("?"),
+                contract["task_id"].as_str().unwrap_or("session"),
+                contract["plan_revision"].as_u64().unwrap_or(0)
+            );
+            println!(
+                "paths={} forbidden={} acceptance={} egress={} tools={} scope={} mode={}",
+                contract["allowed_paths_count"].as_u64().unwrap_or(0),
+                contract["forbidden_paths_count"].as_u64().unwrap_or(0),
+                contract["acceptance_count"].as_u64().unwrap_or(0),
+                contract["egress"].as_str().unwrap_or("?"),
+                contract["allowed_tools_count"].as_u64().unwrap_or(0),
+                if contract["unrestricted_scope"].as_bool().unwrap_or(false) {
+                    "unrestricted"
+                } else {
+                    "declared"
+                },
+                contract["enforcement_mode"].as_str().unwrap_or("?")
+            );
+            if let Some(budget) = contract.get("max_writes").filter(|v| !v.is_null()) {
+                println!(
+                    "mutation used writes={}/{} bytes={}/{} commits={}/{}",
+                    contract["writes_used"].as_u64().unwrap_or(0),
+                    budget.as_u64().unwrap_or(0),
+                    contract["bytes_used"].as_u64().unwrap_or(0),
+                    contract["max_bytes"].as_u64().unwrap_or(0),
+                    contract["commits_used"].as_u64().unwrap_or(0),
+                    contract["max_commits"].as_u64().unwrap_or(0)
+                );
+            }
+        }
+        for decision in value["recent_decisions"].as_array().into_iter().flatten() {
+            println!(
+                "  #{} {}  {}  {}  {}  risk={}",
+                decision["seq"].as_u64().unwrap_or(0),
+                decision["decision"].as_str().unwrap_or("?"),
+                decision["tool"].as_str().unwrap_or("?"),
+                decision["rule"].as_str().unwrap_or("?"),
+                decision["reason"].as_str().unwrap_or(""),
+                decision["risk"].as_str().unwrap_or("?")
+            );
+        }
+        return;
+    }
+    if value.get("policy").is_some() && value["policy"].get("enforce_shell").is_some() {
+        let policy = &value["policy"];
+        println!(
+            "project {}  contract-policy enabled={} mode={} enforce_shell={} max_writes={:?} max_bytes={:?} max_commits={:?}",
+            value["project_id"].as_str().unwrap_or("?"),
+            policy["enabled"].as_bool().unwrap_or(true),
+            policy["mode"].as_str().unwrap_or("enforce"),
+            policy["enforce_shell"].as_bool().unwrap_or(false),
+            policy["max_writes"].as_u64(),
+            policy["max_bytes"].as_u64(),
+            policy["max_commits"].as_u64()
+        );
+        for path in policy["forbidden_paths"].as_array().into_iter().flatten() {
+            println!("  forbidden {}", path.as_str().unwrap_or("?"));
+        }
+        for host in policy["egress_allowlist"].as_array().into_iter().flatten() {
+            println!("  egress {}", host.as_str().unwrap_or("?"));
+        }
+        return;
+    }
+    if value.get("pins").is_some() && value.get("pinned").is_some() {
+        println!(
+            "project {}  pins={} drift={} unverified={} removed={}",
+            value["project_id"].as_str().unwrap_or("?"),
+            value["pinned"].as_u64().unwrap_or(0),
+            value["drift"].as_u64().unwrap_or(0),
+            value["unverified"].as_u64().unwrap_or(0),
+            value["removed"].as_u64().unwrap_or(0)
+        );
+        for pin in value["pins"].as_array().into_iter().flatten() {
+            println!(
+                "  {:<11} {} / {}  schema={} description={}",
+                pin["status"].as_str().unwrap_or("?"),
+                pin["server_name"].as_str().unwrap_or("?"),
+                pin["tool_name"].as_str().unwrap_or("?"),
+                pin["observed_schema_hash"]
+                    .as_str()
+                    .or_else(|| pin["schema_hash"].as_str())
+                    .unwrap_or("?"),
+                pin["observed_description_hash"]
+                    .as_str()
+                    .or_else(|| pin["description_hash"].as_str())
+                    .unwrap_or("?")
+            );
+        }
+        return;
+    }
+    if value.get("pin").is_some() && value.get("message").is_some() {
+        println!(
+            "{}  status={}",
+            value["message"].as_str().unwrap_or("MCP pin action"),
+            value["status"].as_str().unwrap_or("?")
+        );
+        if let Some(pin) = value.get("pin").filter(|pin| !pin.is_null()) {
+            println!(
+                "  {} / {}  schema={} description={} approved_by={}",
+                pin["server_name"].as_str().unwrap_or("?"),
+                pin["tool_name"].as_str().unwrap_or("?"),
+                pin["schema_hash"].as_str().unwrap_or("?"),
+                pin["description_hash"].as_str().unwrap_or("?"),
+                pin["approved_by"].as_str().unwrap_or("-")
+            );
+        }
+        return;
+    }
     if let Some(servers) = value.get("servers").and_then(Value::as_array) {
         for server in servers {
             let transport = server["transport"].as_str().unwrap_or("stdio");
@@ -15484,6 +15786,85 @@ mod tests {
                         assert!(dry_run);
                     }
                     other => panic!("expected cache-epochs-prune command, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn contract_commands_parse_and_validate_surface() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from(["vp", "contract", "ses-1", "--task", "t1"]).unwrap();
+                match cli.command {
+                    Command::Contract { session, task } => {
+                        assert_eq!(session, "ses-1");
+                        assert_eq!(task.as_deref(), Some("t1"));
+                    }
+                    other => panic!("expected contract command, got {other:?}"),
+                }
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "contract-policy-set",
+                    "prj-1",
+                    "--mode",
+                    "advisory",
+                    "--enforce-shell",
+                    "true",
+                    "--forbidden-path",
+                    "secrets",
+                    "--egress-allow",
+                    "example.com",
+                    "--max-writes",
+                    "5",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::ContractPolicySet {
+                        project,
+                        mode,
+                        enforce_shell,
+                        forbidden_paths,
+                        egress_allowlist,
+                        max_writes,
+                        ..
+                    } => {
+                        assert_eq!(project, "prj-1");
+                        assert_eq!(mode.as_deref(), Some("advisory"));
+                        assert_eq!(enforce_shell, Some(true));
+                        assert_eq!(forbidden_paths, vec!["secrets".to_string()]);
+                        assert_eq!(egress_allowlist, vec!["example.com".to_string()]);
+                        assert_eq!(max_writes, Some(5));
+                    }
+                    other => panic!("expected contract-policy-set, got {other:?}"),
+                }
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "mcp-pin-approve",
+                    "prj-1",
+                    "srv-1",
+                    "echo",
+                    "--schema-hash",
+                    "a",
+                    "--description-hash",
+                    "b",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::McpPinApprove {
+                        project,
+                        server,
+                        tool,
+                        ..
+                    } => {
+                        assert_eq!(project, "prj-1");
+                        assert_eq!(server, "srv-1");
+                        assert_eq!(tool, "echo");
+                    }
+                    other => panic!("expected mcp-pin-approve, got {other:?}"),
                 }
             })
             .unwrap()

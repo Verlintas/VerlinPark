@@ -1360,6 +1360,110 @@ fn delegates_through_four_tiers() {
 }
 
 #[tokio::test]
+async fn contract_denies_a_runtime_tool_outside_the_worker_surface() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_manager".into(),
+                    name: "delegate".into(),
+                    arguments: serde_json::json!({
+                        "role": "manager",
+                        "title": "Implementation",
+                        "objective": "deliver the file"
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_worker".into(),
+                    name: "delegate".into(),
+                    arguments: serde_json::json!({
+                        "role": "worker",
+                        "objective": "try a verifier-only tool",
+                        "write_scope": ["worker.txt"]
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_verdict".into(),
+                    name: "submit_verdict".into(),
+                    arguments: serde_json::json!({
+                        "approved": true,
+                        "summary": "a Worker cannot submit a verifier verdict"
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("worker stopped".into()),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("manager done".into()),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("leader done".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "contract denied tool".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service
+        .start(&session.id, "contract denied tool")
+        .await
+        .unwrap();
+    let _ = wait_until_idle(&engine, &session).await;
+    let events = engine
+        .list_events(session.id.clone(), 0, 500)
+        .await
+        .unwrap();
+    let denied = events
+        .iter()
+        .find(|event| {
+            event.kind == "tool.finished"
+                && event.payload["agent_role"] == "worker"
+                && event.payload["name"] == "submit_verdict"
+        })
+        .expect("the Worker's verdict attempt is recorded");
+    assert_eq!(denied.payload["is_error"], true);
+    let output = denied.payload["output"].as_str().unwrap_or_default();
+    assert!(output.contains("CONTRACT_TOOL_DENIED"), "{output}");
+    assert!(
+        events.iter().any(|event| {
+            event.kind == "intent.decision"
+                && event.payload["role"] == "worker"
+                && event.payload["tool"] == "submit_verdict"
+                && event.payload["decision"] == "deny"
+                && event.payload["rule"] == "tool.membership"
+        }),
+        "the contract decision must be event-backed"
+    );
+    assert!(
+        !events.iter().any(|event| {
+            event.kind == "approval.requested" && event.payload["tool"] == "submit_verdict"
+        }),
+        "a contract denial must not ask for approval"
+    );
+}
+
+#[tokio::test]
 async fn integrates_worker_changes_into_the_session_branch() {
     let dir = TempDir::new().unwrap();
     let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
@@ -11980,6 +12084,7 @@ fn dynamic_mcp_tools_sort_deterministically_and_cap_after_sorting() {
             exposed_name: name.to_string(),
             server_id: "server".to_string(),
             tool_name: name.to_string(),
+            pin_trust: crate::contract::McpPinTrust::Trusted,
             schema: ToolSchema {
                 name: name.to_string(),
                 description: String::new(),

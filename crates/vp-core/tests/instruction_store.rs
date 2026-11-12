@@ -156,7 +156,12 @@ async fn leader_run_materializes_ordered_metadata_without_exposing_text() {
         .collect::<Vec<_>>();
     assert_eq!(
         keys,
-        vec!["core/charter", "core/recipes", "session/context",]
+        vec![
+            "core/charter",
+            "core/recipes",
+            "session/context",
+            "session/contract",
+        ]
     );
     assert!(leader.sections.iter().all(|section| !section.tail));
     assert!(leader.sections.iter().all(|section| section.available));
@@ -194,6 +199,13 @@ async fn leader_run_materializes_ordered_metadata_without_exposing_text() {
     assert_ne!(prefix.payload["cache_epoch"], prefix.payload["prefix_hash"]);
     assert_eq!(prefix.payload["cache_epoch"].as_str().unwrap().len(), 64);
     assert_eq!(prefix.payload["cache_epoch_change_reason"], "first");
+    assert_eq!(
+        prefix.payload["contract_hash"].as_str().map(str::len),
+        Some(64)
+    );
+    assert!(prefix.payload["contract_chars"].as_u64().unwrap() > 0);
+    assert_eq!(prefix.payload["contract_capsule"], true);
+    assert_eq!(prefix.payload["contract_policy_enabled"], true);
     assert!(
         prefix.payload["section_chars"]["core/charter"]
             .as_u64()

@@ -905,7 +905,10 @@ private struct ContextPopoverView: View {
                 }
 
                 if let instructions = model.sessionInstructions {
-                    InstructionSectionsView(report: instructions)
+                    InstructionSectionsView(
+                        report: instructions,
+                        contract: model.sessionContract?.contract
+                    )
                 }
 
                 if let governor = model.governorStatus,
@@ -1976,6 +1979,7 @@ struct PreemptionBanner: View {
 /// hashes. Prompt text is never requested or rendered.
 private struct InstructionSectionsView: View {
     let report: SessionInstructionsReport
+    let contract: SessionContractMetadata?
 
     private var leader: SessionInstructionStateReport? {
         report.leaderState
@@ -2002,6 +2006,36 @@ private struct InstructionSectionsView: View {
                         .foregroundStyle(VPTheme.warning)
                 }
                 Spacer(minLength: 0)
+            }
+            if let contract {
+                HStack(spacing: 8) {
+                    Text("CONTRACT")
+                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(VPTheme.accent)
+                    Text(contract.shortHash + "…")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(VPTheme.textTertiary)
+                        .textSelection(.enabled)
+                    Text(contract.role)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(VPTheme.textSecondary)
+                    Text(contract.taskID ?? "session")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(VPTheme.textTertiary)
+                    Text("\(contract.allowedPathsCount) paths · \(contract.acceptanceCount) acceptance")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(VPTheme.textTertiary)
+                    Text(contract.egress)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(VPTheme.textTertiary)
+                    Text(contract.enforcementMode.uppercased())
+                        .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(
+                            contract.enforcementMode == "enforce"
+                                ? VPTheme.accent : VPTheme.warning
+                        )
+                    Spacer(minLength: 0)
+                }
             }
             if let leader, !leader.sections.isEmpty {
                 ForEach(leader.sections) { section in

@@ -56,16 +56,17 @@ use vp_protocol::types::{
     ConsoleCloseParams, ConsoleOpenParams, ConsoleReadParams, ConsoleSignalParams,
     ConsoleWriteParams, ContextCheckpointCreateParams, ContextCheckpointDeleteParams,
     ContextCheckpointDetailParams, ContextCheckpointListParams, ContextCheckpointPolicyParams,
-    ContextCheckpointPruneParams, ContextRestoreParams, CreateModelPresetParams,
-    CreateSessionParams, CriticalPathMode, CriticalPathPolicyParams, CriticalPathPolicyResult,
-    DaemonMetrics, DaemonMetricsResult, DashboardParams, DeleteModelPresetParams,
-    DiscardSessionParams, DoctorCheck, DoctorReport, EventListResult, ForgePreflightParams,
-    ForgeStatusParams, ForkAuditParams, ForkRepairParams, GitLogParams, GitShowParams,
-    GovernorPreviewParams, GovernorStatusParams, IntakeCreateParams, IntakeDeleteResult,
-    IntakeListParams, IntakeTaskParams, IntakeUpdateParams, IntegrationPolicyParams,
-    IntegrationPolicyResult, LandSessionParams, ListApprovalsParams, ListEventsParams,
-    ListSessionsParams, MailboxGcParams, MailboxListParams, MailboxListResult, MailboxPolicyParams,
-    MailboxPolicyResult, MarkMessageReadParams, McpCallParams, McpGetPromptParams, McpProbeParams,
+    ContextCheckpointPruneParams, ContextRestoreParams, ContractPolicyParams, ContractPolicyResult,
+    CreateModelPresetParams, CreateSessionParams, CriticalPathMode, CriticalPathPolicyParams,
+    CriticalPathPolicyResult, DaemonMetrics, DaemonMetricsResult, DashboardParams,
+    DeleteModelPresetParams, DiscardSessionParams, DoctorCheck, DoctorReport, EventListResult,
+    ForgePreflightParams, ForgeStatusParams, ForkAuditParams, ForkRepairParams, GitLogParams,
+    GitShowParams, GovernorPreviewParams, GovernorStatusParams, IntakeCreateParams,
+    IntakeDeleteResult, IntakeListParams, IntakeTaskParams, IntakeUpdateParams,
+    IntegrationPolicyParams, IntegrationPolicyResult, LandSessionParams, ListApprovalsParams,
+    ListEventsParams, ListSessionsParams, MailboxGcParams, MailboxListParams, MailboxListResult,
+    MailboxPolicyParams, MailboxPolicyResult, MarkMessageReadParams, McpCallParams,
+    McpGetPromptParams, McpPinApproveParams, McpPinRejectParams, McpProbeParams,
     McpReadResourceParams, McpServerIdParams, MediaInfoParams, MediaTranscodeParams,
     MemoryBriefParams, MemoryConflictResolveParams, MemoryConflictScanParams,
     MemoryConflictsParams, MemoryCreateParams, MemoryCreateResult, MemoryDeleteParams,
@@ -78,49 +79,50 @@ use vp_protocol::types::{
     ProcessListParams, ProcessLogsParams, ProcessPolicyParams, ProcessPolicyResult,
     ProcessRestartParams, ProcessStopParams, ProjectBudgetParams, ProjectCacheEpochParams,
     ProjectCacheEpochPruneParams, ProjectCacheParams, ProjectForkForestParams, ProjectListResult,
-    ProjectUsageParams, PromptParams, PromptResult, QuestionListParams, RehydrateSessionParams,
-    ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams,
-    ResolveMergeResult, RetryMergeParams, RetryMergeResult, SchedulerStatusParams, SearchParams,
-    ServerInfo, SessionCacheAuditParams, SessionCacheBreaksParams, SessionCacheCallsParams,
-    SessionCacheEpochParams, SessionCacheParams, SessionCachePlanParams, SessionCacheWarmParams,
-    SessionCheckpointDeleteParams, SessionCheckpointDiffParams, SessionCheckpointListParams,
-    SessionCheckpointParams, SessionCheckpointPruneParams, SessionCheckpointRestoreParams,
-    SessionCheckpointStatsParams, SessionCitationAuditParams, SessionCitationsParams,
-    SessionCompactParams, SessionCompareParams, SessionContextParams,
-    SessionContinuationCancelParams, SessionContinuationReclaimParams,
-    SessionContinuationStatusParams, SessionContinuationsParams, SessionDeferParams,
-    SessionDiffParams, SessionExportParams, SessionForkParams, SessionForkTreeParams,
-    SessionImportParams, SessionInstructionsParams, SessionLineageParams, SessionListResult,
-    SessionLogParams, SessionMergeForkParams, SessionPauseParams, SessionPauseResult,
-    SessionPlanResumeParams, SessionPlanResumeResult, SessionPreemptParams,
+    ProjectMcpPinsParams, ProjectUsageParams, PromptParams, PromptResult, QuestionListParams,
+    RehydrateSessionParams, ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult,
+    ResolveMergeParams, ResolveMergeResult, RetryMergeParams, RetryMergeResult,
+    SchedulerStatusParams, SearchParams, ServerInfo, SessionCacheAuditParams,
+    SessionCacheBreaksParams, SessionCacheCallsParams, SessionCacheEpochParams, SessionCacheParams,
+    SessionCachePlanParams, SessionCacheWarmParams, SessionCheckpointDeleteParams,
+    SessionCheckpointDiffParams, SessionCheckpointListParams, SessionCheckpointParams,
+    SessionCheckpointPruneParams, SessionCheckpointRestoreParams, SessionCheckpointStatsParams,
+    SessionCitationAuditParams, SessionCitationsParams, SessionCompactParams, SessionCompareParams,
+    SessionContextParams, SessionContinuationCancelParams, SessionContinuationReclaimParams,
+    SessionContinuationStatusParams, SessionContinuationsParams, SessionContractParams,
+    SessionDeferParams, SessionDiffParams, SessionExportParams, SessionForkParams,
+    SessionForkTreeParams, SessionImportParams, SessionInstructionsParams, SessionLineageParams,
+    SessionListResult, SessionLogParams, SessionMergeForkParams, SessionPauseParams,
+    SessionPauseResult, SessionPlanResumeParams, SessionPlanResumeResult, SessionPreemptParams,
     SessionPreemptionParams, SessionResumeParams, SessionResumeResult, SessionRunCancelParams,
     SessionRunDetailParams, SessionRunPolicyParams, SessionRunResumeParams, SessionRunsParams,
     SessionSkillActivationsParams, SessionStallsParams, SessionSteerParams,
     SessionSteeringCancelParams, SessionSteeringParams, SessionTodosParams, SessionTodosResult,
     SessionTranscriptParams, SetArtifactPolicyParams, SetCachePolicyParams,
-    SetCheckpointPolicyParams, SetContextCheckpointPolicyParams, SetCriticalPathPolicyParams,
-    SetIntegrationPolicyParams, SetMailboxPolicyParams, SetMemoryPolicyParams,
-    SetPreemptionPolicyParams, SetProcessPolicyParams, SetProjectBudgetParams,
-    SetProjectPromptLayoutParams, SetSessionPriorityParams, SetSessionPromptLayoutParams,
-    SetSessionRunPolicyParams, SetSessionUnlimitedParams, SetShellPolicyParams,
-    SetSourceCollectionParams, SetSourceEmbeddingPolicyParams, SetSourceLabelsParams,
-    SetSourceRetrievalPolicyParams, SetTaskSchedulerPolicyParams, SetToolOutputPolicyParams,
-    SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult, SkillCreateParams,
-    SkillEnabledParams, SkillIdParams, SkillImportParams, SkillListParams, SkillUpdateParams,
-    SourceActionParams, SourceCollectionsParams, SourceCreateFileParams, SourceCreateNoteParams,
-    SourceCreateUrlParams, SourceEmbeddingPolicyParams, SourceEmbeddingReindexParams,
-    SourceEmbeddingStatusParams, SourceGetParams, SourceImportParams, SourceIndexRebuildParams,
-    SourceIndexStatusParams, SourceListParams, SourceRetrievalPolicyParams, SourceSearchParams,
-    SubscribeParams, TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult,
-    TaskQueueParams, TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult,
-    TerminalCloseParams, TerminalOpenParams, TerminalReadParams, TerminalResizeParams,
-    TerminalWriteParams, ToolActivityParams, ToolBundleDiffParams, ToolBundleHistoryParams,
-    ToolBundleMatrixParams, ToolBundleParams, ToolOutputAuditParams, ToolOutputListParams,
-    ToolOutputPolicyParams, ToolOutputPolicyResult, ToolOutputPruneParams, ToolOutputStatusParams,
-    UpdateAcpAgentParams, UpdateCheckParams, UpdateDownloadParams, UpdateMcpServerParams,
-    UpdateModelPresetParams, UpdateSourceMetadataParams, UsageLedgerParams, WorkspaceFileParams,
-    WorkspaceGrepParams, WorkspaceListParams, WorkspaceSearchParams, WorkspaceTreeParams,
-    WorkspaceWriteParams, WorktreePolicyParams,
+    SetCheckpointPolicyParams, SetContextCheckpointPolicyParams, SetContractPolicyParams,
+    SetCriticalPathPolicyParams, SetIntegrationPolicyParams, SetMailboxPolicyParams,
+    SetMemoryPolicyParams, SetPreemptionPolicyParams, SetProcessPolicyParams,
+    SetProjectBudgetParams, SetProjectPromptLayoutParams, SetSessionPriorityParams,
+    SetSessionPromptLayoutParams, SetSessionRunPolicyParams, SetSessionUnlimitedParams,
+    SetShellPolicyParams, SetSourceCollectionParams, SetSourceEmbeddingPolicyParams,
+    SetSourceLabelsParams, SetSourceRetrievalPolicyParams, SetTaskSchedulerPolicyParams,
+    SetToolOutputPolicyParams, SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult,
+    SkillCreateParams, SkillEnabledParams, SkillIdParams, SkillImportParams, SkillListParams,
+    SkillUpdateParams, SourceActionParams, SourceCollectionsParams, SourceCreateFileParams,
+    SourceCreateNoteParams, SourceCreateUrlParams, SourceEmbeddingPolicyParams,
+    SourceEmbeddingReindexParams, SourceEmbeddingStatusParams, SourceGetParams, SourceImportParams,
+    SourceIndexRebuildParams, SourceIndexStatusParams, SourceListParams,
+    SourceRetrievalPolicyParams, SourceSearchParams, SubscribeParams, TaskActionParams,
+    TaskActionResult, TaskDispatchParams, TaskDispatchResult, TaskQueueParams,
+    TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult, TerminalCloseParams,
+    TerminalOpenParams, TerminalReadParams, TerminalResizeParams, TerminalWriteParams,
+    ToolActivityParams, ToolBundleDiffParams, ToolBundleHistoryParams, ToolBundleMatrixParams,
+    ToolBundleParams, ToolOutputAuditParams, ToolOutputListParams, ToolOutputPolicyParams,
+    ToolOutputPolicyResult, ToolOutputPruneParams, ToolOutputStatusParams, UpdateAcpAgentParams,
+    UpdateCheckParams, UpdateDownloadParams, UpdateMcpServerParams, UpdateModelPresetParams,
+    UpdateSourceMetadataParams, UsageLedgerParams, WorkspaceFileParams, WorkspaceGrepParams,
+    WorkspaceListParams, WorkspaceSearchParams, WorkspaceTreeParams, WorkspaceWriteParams,
+    WorktreePolicyParams,
 };
 use vp_protocol::types::{
     ComputerLeaseInfo, ComputerLeaseListResult, ComputerLeaseReleaseParams,
@@ -1335,6 +1337,79 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                         policy,
                     },
                 ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "project.contract_policy.get" => {
+            match parse_params::<ContractPolicyParams>(request.params) {
+                Ok(params) => match state.engine.get_contract_policy(&params.project_id).await {
+                    Ok(policy) => RpcResponse::success(
+                        id,
+                        ContractPolicyResult {
+                            project_id: params.project_id,
+                            policy,
+                        },
+                    ),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "project.contract_policy.set" => {
+            match parse_params::<SetContractPolicyParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .set_contract_policy(&params.project_id, params.policy)
+                    .await
+                {
+                    Ok(policy) => RpcResponse::success(
+                        id,
+                        ContractPolicyResult {
+                            project_id: params.project_id,
+                            policy,
+                        },
+                    ),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "session.contract" => match parse_params::<SessionContractParams>(request.params) {
+            Ok(params) => {
+                let task = params.task_id.as_deref();
+                match state
+                    .engine
+                    .session_contract_status(&params.session_id, task)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                }
+            }
+            Err(response) => response_with_id(id, response),
+        },
+        "project.mcp_pins" => match parse_params::<ProjectMcpPinsParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .project_mcp_pins(&params.project_id, params.server_id.as_deref())
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "mcp.pin.approve" => match parse_params::<McpPinApproveParams>(request.params) {
+            Ok(params) => match state.engine.approve_mcp_pin(&params, None).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "mcp.pin.reject" => match parse_params::<McpPinRejectParams>(request.params) {
+            Ok(params) => match state.engine.reject_mcp_pin(&params, None).await {
+                Ok(result) => RpcResponse::success(id, result),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),
@@ -4671,6 +4746,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         method.as_str(),
         "project.add"
             | "project.shell_policy.set"
+            | "project.contract_policy.set"
             | "project.cache_policy.set"
             | "project.integration_policy.set"
             | "project.budget.set"
@@ -4691,6 +4767,8 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             | "artifact.policy.set"
             | "tool_output.policy.set"
             | "session.import"
+            | "mcp.pin.approve"
+            | "mcp.pin.reject"
     ) && let Err(error) = state.engine.record_project_manifest().await
     {
         tracing::warn!(%error, "failed to update project manifest");

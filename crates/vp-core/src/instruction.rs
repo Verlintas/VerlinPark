@@ -80,17 +80,22 @@ pub enum InstructionSectionKey {
     ProjectSources,
     ProjectSkills,
     SessionContext,
+    /// Deterministic task-contract capsule. It is a head section so compaction
+    /// can never drop the authority/scope description; a contract change moves
+    /// the head prefix and is recorded as a priced cache change.
+    SessionContract,
     RunTask,
     TailMemory,
 }
 
 impl InstructionSectionKey {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::CoreCharter,
         Self::CoreRecipes,
         Self::ProjectSources,
         Self::ProjectSkills,
         Self::SessionContext,
+        Self::SessionContract,
         Self::RunTask,
         Self::TailMemory,
     ];
@@ -102,6 +107,7 @@ impl InstructionSectionKey {
             Self::ProjectSources => "project/sources",
             Self::ProjectSkills => "project/skills",
             Self::SessionContext => "session/context",
+            Self::SessionContract => "session/contract",
             Self::RunTask => "run/task",
             Self::TailMemory => "tail/memory",
         }
@@ -114,6 +120,7 @@ impl InstructionSectionKey {
             Self::ProjectSources => 30,
             Self::ProjectSkills => 40,
             Self::SessionContext => 50,
+            Self::SessionContract => 55,
             Self::RunTask => 60,
             Self::TailMemory => 90,
         }
@@ -148,7 +155,7 @@ impl InstructionSectionKey {
     pub fn regenerated(self) -> bool {
         matches!(
             self,
-            Self::ProjectSources | Self::ProjectSkills | Self::TailMemory
+            Self::ProjectSources | Self::ProjectSkills | Self::SessionContract | Self::TailMemory
         )
     }
 
@@ -335,7 +342,9 @@ impl MaterializedInstructions {
         for section in self.head.iter().filter(|section| {
             matches!(
                 section.key,
-                InstructionSectionKey::SessionContext | InstructionSectionKey::RunTask
+                InstructionSectionKey::SessionContext
+                    | InstructionSectionKey::SessionContract
+                    | InstructionSectionKey::RunTask
             )
         }) {
             material.push_str(section.key.key());
@@ -1055,6 +1064,7 @@ mod tests {
             InstructionCandidate::new(InstructionSectionKey::ProjectSources, "sources v1"),
             InstructionCandidate::new(InstructionSectionKey::ProjectSkills, "skills v1"),
             InstructionCandidate::new(InstructionSectionKey::SessionContext, "session context v1"),
+            InstructionCandidate::new(InstructionSectionKey::SessionContract, "contract v1"),
             InstructionCandidate::new(InstructionSectionKey::RunTask, "task objective v1"),
             InstructionCandidate::new(InstructionSectionKey::TailMemory, "memory v1"),
         ]
@@ -1108,6 +1118,8 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(ordinals, sorted, "ordinals must be declared in order");
+        assert_eq!(InstructionSectionKey::SessionContract.ordinal(), 55);
+        assert!(!InstructionSectionKey::SessionContract.tail());
         assert_eq!(InstructionSectionKey::TailMemory.ordinal(), 90);
         assert!(InstructionSectionKey::TailMemory.tail());
         for key in InstructionSectionKey::ALL {
@@ -1352,6 +1364,56 @@ mod tests {
     }
 
     #[test]
+    fn contract_capsule_is_a_head_section_and_survives_compaction_scope() {
+        let (_dir, store) = store();
+        let materialized = materialize(&store, "ses-1", &candidates(), true).unwrap();
+        let contract = materialized
+            .section(InstructionSectionKey::SessionContract)
+            .unwrap();
+        assert!(!contract.tail);
+        assert_eq!(contract.ordinal, 55);
+        // A rolling trim/compaction only changes conversation, never the head
+        // instruction state. A warm that omits tail memory still materializes
+        // the contract head section.
+        let head_only = candidates()
+            .into_iter()
+            .filter(|candidate| !candidate.key.tail())
+            .collect::<Vec<_>>();
+        let warm = materialize(&store, "ses-1", &head_only, false).unwrap();
+        assert!(
+            warm.head
+                .iter()
+                .any(|section| section.key == InstructionSectionKey::SessionContract)
+        );
+        assert!(warm.tail.is_empty());
+    }
+
+    #[test]
+    fn a_contract_change_moves_the_prefix_and_is_recorded_as_a_section_change() {
+        let (_dir, store) = store();
+        let first = materialize(&store, "ses-1", &candidates(), true).unwrap();
+        let mut changed = candidates();
+        changed
+            .iter_mut()
+            .find(|candidate| candidate.key == InstructionSectionKey::SessionContract)
+            .unwrap()
+            .text = "contract v2: narrower scope".to_string();
+        let second = materialize(&store, "ses-1", &changed, true).unwrap();
+        assert_ne!(first.stable_prefix_hash(), second.stable_prefix_hash());
+        assert_ne!(
+            first
+                .section(InstructionSectionKey::SessionContract)
+                .unwrap()
+                .hash,
+            second
+                .section(InstructionSectionKey::SessionContract)
+                .unwrap()
+                .hash
+        );
+        assert!(second.state_changed);
+    }
+
+    #[test]
     fn warm_without_memory_preserves_the_verified_tail_state() {
         let (_dir, store) = store();
         let first = materialize(&store, "ses-1", &candidates(), true).unwrap();
@@ -1391,7 +1453,7 @@ mod tests {
         assert!(instruction_rows_match(&rows, &replay));
         assert_eq!(
             replay.iter().map(|row| row.ordinal).collect::<Vec<_>>(),
-            vec![10, 20, 30, 40, 50, 60, 90]
+            vec![10, 20, 30, 40, 50, 55, 60, 90]
         );
         let mut drifted = event.clone();
         drifted.payload["sections"][0]["ordinal"] = serde_json::json!(99);

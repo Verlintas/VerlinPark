@@ -309,6 +309,365 @@ pub struct TaskSchedulerPolicyResult {
     pub policy: TaskSchedulerPolicy,
 }
 
+/// Whether a `TaskContract` is enforced or only observed.
+///
+/// `advisory` records every `intent.decision` and its rule but never blocks a
+/// call or asks for approval because of the contract. Existing approval,
+/// sandbox, Verifier, and merge gates still apply unchanged. `enforce` is the
+/// default and is deliberately fail-closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ContractMode {
+    Advisory,
+    #[default]
+    Enforce,
+}
+
+impl ContractMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Advisory => "advisory",
+            Self::Enforce => "enforce",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "advisory" | "observe" => Some(Self::Advisory),
+            "enforce" | "enforced" => Some(Self::Enforce),
+            _ => None,
+        }
+    }
+}
+
+/// Project-scoped task-contract policy.
+///
+/// The contract is derived from trusted Leader-authored plan text and this
+/// policy only. It can narrow the existing tool/path/network policy; it can
+/// never widen an approval, sandbox, path-jail, or merge gate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContractPolicy {
+    /// Master switch. Disabled means no contract is derived or enforced.
+    /// Default true for new and upgraded projects.
+    #[serde(default = "default_contract_enabled")]
+    pub enabled: bool,
+    /// `advisory` records decisions only; `enforce` escalates or denies.
+    #[serde(default)]
+    pub mode: ContractMode,
+    /// When false, shell argument mismatches are recorded as advisory even in
+    /// enforce mode. The existing shell risk classifier still prompts for
+    /// host-state/destructive commands. Default false.
+    #[serde(default)]
+    pub enforce_shell: bool,
+    /// Worktree-relative paths that no role may mutate through a contracted
+    /// call. A match is a contract denial, not an approval prompt.
+    #[serde(default)]
+    pub forbidden_paths: Vec<String>,
+    /// Hosts or `*.suffix` entries accepted by the contract egress policy.
+    /// Empty means no host-level allowlist; the project `ShellPolicy.network`
+    /// mode still applies.
+    #[serde(default)]
+    pub egress_allowlist: Vec<String>,
+    /// Optional per-contract mutation caps. Exceeding a cap escalates to a
+    /// human; it is never silently allowed.
+    #[serde(default)]
+    pub max_writes: Option<u64>,
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+    #[serde(default)]
+    pub max_commits: Option<u64>,
+}
+
+impl Default for ContractPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: default_contract_enabled(),
+            mode: ContractMode::Enforce,
+            enforce_shell: false,
+            forbidden_paths: Vec::new(),
+            egress_allowlist: Vec::new(),
+            max_writes: None,
+            max_bytes: None,
+            max_commits: None,
+        }
+    }
+}
+
+fn default_contract_enabled() -> bool {
+    true
+}
+
+impl ContractPolicy {
+    /// Normalize allowlist/path entries and validate bounds. Unknown values are
+    /// rejected rather than silently changing enforcement.
+    pub fn normalized(&self) -> std::result::Result<Self, String> {
+        let mut policy = self.clone();
+        policy.forbidden_paths = policy
+            .forbidden_paths
+            .iter()
+            .map(|path| path.trim().to_string())
+            .filter(|path| !path.is_empty())
+            .collect();
+        for path in &policy.forbidden_paths {
+            if path.starts_with('/') || path.starts_with('~') || path.contains("..") {
+                return Err(format!(
+                    "forbidden path must be worktree-relative without '..': {path}"
+                ));
+            }
+        }
+        policy.egress_allowlist = policy
+            .egress_allowlist
+            .iter()
+            .map(|host| host.trim().to_ascii_lowercase())
+            .filter(|host| !host.is_empty())
+            .collect();
+        for host in &policy.egress_allowlist {
+            if !valid_egress_entry(host) {
+                return Err(format!("invalid egress allowlist entry: {host}"));
+            }
+        }
+        Ok(policy)
+    }
+}
+
+fn valid_egress_entry(entry: &str) -> bool {
+    if entry == "*" {
+        return true;
+    }
+    let value = entry
+        .strip_prefix("*.")
+        .or_else(|| entry.strip_prefix("https://"))
+        .or_else(|| entry.strip_prefix("http://"))
+        .unwrap_or(entry);
+    let host = value.split('/').next().unwrap_or(value);
+    !host.is_empty()
+        && host
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | ':' | '[' | ']'))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContractPolicyParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetContractPolicyParams {
+    pub project_id: String,
+    pub policy: ContractPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ContractPolicyResult {
+    pub project_id: String,
+    pub policy: ContractPolicy,
+}
+
+/// Bounded, text-free contract metadata for RPC/CLI/UI. The canonical
+/// contract body stays in the daemon store and is never rendered as prompt
+/// text through this surface.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskContractMetadata {
+    #[serde(default)]
+    pub contract_id: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub plan_revision: u64,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub hash: String,
+    #[serde(default)]
+    pub source_hash: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub allowed_tools_count: u64,
+    #[serde(default)]
+    pub allowed_paths_count: u64,
+    #[serde(default)]
+    pub forbidden_paths_count: u64,
+    #[serde(default)]
+    pub allowed_paths_preview: Vec<String>,
+    #[serde(default)]
+    pub egress: String,
+    #[serde(default)]
+    pub unrestricted_scope: bool,
+    #[serde(default)]
+    pub acceptance_count: u64,
+    #[serde(default)]
+    pub max_writes: Option<u64>,
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+    #[serde(default)]
+    pub max_commits: Option<u64>,
+    #[serde(default)]
+    pub writes_used: u64,
+    #[serde(default)]
+    pub bytes_used: u64,
+    #[serde(default)]
+    pub commits_used: u64,
+    #[serde(default)]
+    pub enforcement_mode: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SessionContractParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionContractResult {
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub contract: Option<TaskContractMetadata>,
+    #[serde(default)]
+    pub policy: ContractPolicy,
+    #[serde(default)]
+    pub recent_decisions: Vec<IntentDecisionRecord>,
+}
+
+/// One bounded `intent.decision` audit row. It contains no argument values,
+/// prompt text, or secrets; only tool name, rule, decision, and risk.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntentDecisionRecord {
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(default)]
+    pub at: String,
+    #[serde(default)]
+    pub contract_hash: String,
+    #[serde(default)]
+    pub tool: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub rule: String,
+    #[serde(default)]
+    pub decision: String,
+    #[serde(default)]
+    pub risk: String,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpToolPin {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub server_id: String,
+    #[serde(default)]
+    pub server_name: String,
+    #[serde(default)]
+    pub tool_name: String,
+    #[serde(default)]
+    pub server_fingerprint: String,
+    #[serde(default)]
+    pub schema_hash: String,
+    #[serde(default)]
+    pub description_hash: String,
+    /// Last observed hashes, which may diverge from the approved hashes when
+    /// `status` is `drift`. They never overwrite the approved values.
+    #[serde(default)]
+    pub observed_schema_hash: String,
+    #[serde(default)]
+    pub observed_description_hash: String,
+    #[serde(default)]
+    pub observed_server_fingerprint: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub approved_at: Option<String>,
+    #[serde(default)]
+    pub approved_by: Option<String>,
+    #[serde(default)]
+    pub last_seen_at: String,
+    #[serde(default)]
+    pub description_preview: String,
+}
+
+impl McpToolPin {
+    pub fn callable(&self) -> bool {
+        self.status == "pinned"
+    }
+
+    pub fn trust(&self) -> &'static str {
+        match self.status.as_str() {
+            "pinned" => "approved",
+            "drift" => "drift",
+            "unverified" => "unverified",
+            "removed" => "removed",
+            _ => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ProjectMcpPinsParams {
+    pub project_id: String,
+    #[serde(default)]
+    pub server_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectMcpPinsResult {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub pins: Vec<McpToolPin>,
+    #[serde(default)]
+    pub pinned: u64,
+    #[serde(default)]
+    pub drift: u64,
+    #[serde(default)]
+    pub unverified: u64,
+    #[serde(default)]
+    pub removed: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpPinApproveParams {
+    pub project_id: String,
+    pub server_id: String,
+    pub tool_name: String,
+    pub expected_schema_hash: String,
+    pub expected_description_hash: String,
+    #[serde(default)]
+    pub approved_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpPinRejectParams {
+    pub project_id: String,
+    pub server_id: String,
+    pub tool_name: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpPinActionResult {
+    #[serde(default)]
+    pub pin: Option<McpToolPin>,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SchedulerStatusParams {
     #[serde(default)]
@@ -10352,6 +10711,9 @@ pub struct SessionReplayReport {
     /// Event-backed supplemental remote-test evidence projection.
     #[serde(default)]
     pub remote_test_evidence_matches: bool,
+    /// Event-backed task-contract projection (`contract.derived` events).
+    #[serde(default)]
+    pub contracts_match: bool,
     pub consistent: bool,
     #[serde(default)]
     pub repaired: bool,
@@ -18502,5 +18864,68 @@ mod cache_epoch_protocol_tests {
         .unwrap();
         assert!(bundle.prompt_prefix_observations.is_empty());
         assert!(bundle.instructions.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod contract_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn contract_policy_defaults_and_mode_decode() {
+        let policy: ContractPolicy = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(policy.enabled);
+        assert_eq!(policy.mode, ContractMode::Enforce);
+        assert!(!policy.enforce_shell);
+        assert!(policy.max_writes.is_none());
+
+        let policy: ContractPolicy = serde_json::from_value(serde_json::json!({
+            "mode": "advisory",
+            "enforce_shell": true,
+            "forbidden_paths": ["secrets"],
+            "egress_allowlist": ["example.com"],
+            "max_writes": 3
+        }))
+        .unwrap();
+        assert_eq!(policy.mode, ContractMode::Advisory);
+        assert_eq!(policy.normalized().unwrap().max_writes, Some(3));
+    }
+
+    #[test]
+    fn session_contract_result_old_shapes_decode_with_defaults() {
+        let result: SessionContractResult = serde_json::from_value(serde_json::json!({
+            "session_id": "ses-1"
+        }))
+        .unwrap();
+        assert_eq!(result.session_id, "ses-1");
+        assert!(result.contract.is_none());
+        assert!(result.policy.enabled);
+        assert!(result.recent_decisions.is_empty());
+
+        let metadata: TaskContractMetadata = serde_json::from_value(serde_json::json!({
+            "hash": "abc",
+            "role": "worker"
+        }))
+        .unwrap();
+        assert_eq!(metadata.hash, "abc");
+        assert_eq!(metadata.enforcement_mode, "");
+    }
+
+    #[test]
+    fn mcp_tool_pin_status_and_trust_decode() {
+        let pin: McpToolPin = serde_json::from_value(serde_json::json!({
+            "project_id": "prj",
+            "server_id": "srv",
+            "tool_name": "echo",
+            "status": "drift"
+        }))
+        .unwrap();
+        assert_eq!(pin.trust(), "drift");
+        assert!(!pin.callable());
+        let pinned: McpToolPin = serde_json::from_value(serde_json::json!({
+            "status": "pinned"
+        }))
+        .unwrap();
+        assert!(pinned.callable());
     }
 }

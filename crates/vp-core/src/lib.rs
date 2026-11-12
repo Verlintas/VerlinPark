@@ -30,14 +30,15 @@ use vp_protocol::types::{
     CheckpointPolicyResult, CheckpointRetentionPolicy, CitationAudit, CitationAuditMessage,
     ConsoleCloseResult, ConsoleOpenResult, ConsoleReadResult, ConsoleSignalResult,
     ConsoleWriteResult, ContextCompactionSummary, ContextMeasurement, ContextUsage,
-    ContinuationOutcome, CreateModelPresetParams, CriticalPathPolicy, DoctorCheck, Event,
-    ForgeOriginStatus, ForgePreflightResult, ForgeProviderStatus, ForgeStatusResult, GitLogResult,
-    GitShowResult, GovernorSessionStatus, IntakeCreateParams, IntakeListResult, IntakeTask,
-    IntakeUpdateParams, IntegrationPolicy, MailboxGcResult, MailboxPolicy, McpCallResult,
-    McpGetPromptResult, McpProbeResult, McpPromptListResult, McpReadResourceResult,
+    ContinuationOutcome, ContractPolicy, CreateModelPresetParams, CriticalPathPolicy, DoctorCheck,
+    Event, ForgeOriginStatus, ForgePreflightResult, ForgeProviderStatus, ForgeStatusResult,
+    GitLogResult, GitShowResult, GovernorSessionStatus, IntakeCreateParams, IntakeListResult,
+    IntakeTask, IntakeUpdateParams, IntegrationPolicy, IntentDecisionRecord, MailboxGcResult,
+    MailboxPolicy, McpCallResult, McpGetPromptResult, McpPinActionResult, McpPinApproveParams,
+    McpPinRejectParams, McpProbeResult, McpPromptListResult, McpReadResourceResult,
     McpResourceListResult, McpServer, McpServerConfig, McpServerListResult, McpToolListResult,
-    MemoryBriefResult, MemoryConflict, MemoryConflictResolveResult, MemoryConflictScanResult,
-    MemoryConflictsResult, MemoryDeleteResult, MemoryEmbeddingPolicy,
+    McpToolPin, MemoryBriefResult, MemoryConflict, MemoryConflictResolveResult,
+    MemoryConflictScanResult, MemoryConflictsResult, MemoryDeleteResult, MemoryEmbeddingPolicy,
     MemoryEmbeddingsIndexRebuildResult, MemoryEmbeddingsIndexStatusResult,
     MemoryEmbeddingsRebuildResult, MemoryEmbeddingsStatusResult, MemoryEmbeddingsTestResult,
     MemoryEvidence, MemoryHealthResult, MemoryItem, MemoryListResult, MemoryMatch, MemoryPolicy,
@@ -55,20 +56,21 @@ use vp_protocol::types::{
     ProgramMilestoneCreateParams, ProgramMilestoneListResult, ProgramMilestoneUpdateParams,
     ProgramPolicy, ProgramReplayReport, ProgramStatus, ProgramStatusParams, ProgramStatusResult,
     ProgramTickParams, ProgramTickResult, ProgramUpdateParams, Project, ProjectBudget,
-    ProjectBudgetResult, ProjectCacheEpochPruneResult, ProjectCacheEpochResult, ProjectUsageResult,
-    PromptPrefixAggregate, PromptPrefixObservation, PullRequestResult, Question,
-    QuestionListResult, ReviseTeamPlanResult, ScheduledTask, SearchResult, Session, SessionBundle,
-    SessionCacheStatus, SessionCheckpoint, SessionCheckpointDeleteResult,
-    SessionCheckpointDiffResult, SessionCheckpointListResult, SessionCheckpointPruneResult,
-    SessionCheckpointRestoreResult, SessionCheckpointStatsResult, SessionCitationAuditResult,
-    SessionCitationsResult, SessionCommit, SessionCompareFile, SessionCompareResult,
-    SessionContextStatus, SessionContinuation, SessionContinuationCancelResult,
-    SessionContinuationClaimInfo, SessionContinuationReclaimResult,
-    SessionContinuationStatusResult, SessionContinuationsResult, SessionDeferResult, SessionDiff,
-    SessionForkResult, SessionForkTreeNode, SessionForkTreeResult, SessionImportResult,
-    SessionInstructionSection, SessionInstructionStateReport, SessionInstructionsReport,
-    SessionLandResult, SessionLineageEntry, SessionLineageResult, SessionLogStatus,
-    SessionPreemptionResult, SessionPriorityResult, SessionRehydrateResult, SessionReplayReport,
+    ProjectBudgetResult, ProjectCacheEpochPruneResult, ProjectCacheEpochResult,
+    ProjectMcpPinsResult, ProjectUsageResult, PromptPrefixAggregate, PromptPrefixObservation,
+    PullRequestResult, Question, QuestionListResult, ReviseTeamPlanResult, ScheduledTask,
+    SearchResult, Session, SessionBundle, SessionCacheStatus, SessionCheckpoint,
+    SessionCheckpointDeleteResult, SessionCheckpointDiffResult, SessionCheckpointListResult,
+    SessionCheckpointPruneResult, SessionCheckpointRestoreResult, SessionCheckpointStatsResult,
+    SessionCitationAuditResult, SessionCitationsResult, SessionCommit, SessionCompareFile,
+    SessionCompareResult, SessionContextStatus, SessionContinuation,
+    SessionContinuationCancelResult, SessionContinuationClaimInfo,
+    SessionContinuationReclaimResult, SessionContinuationStatusResult, SessionContinuationsResult,
+    SessionContractResult, SessionDeferResult, SessionDiff, SessionForkResult, SessionForkTreeNode,
+    SessionForkTreeResult, SessionImportResult, SessionInstructionSection,
+    SessionInstructionStateReport, SessionInstructionsReport, SessionLandResult,
+    SessionLineageEntry, SessionLineageResult, SessionLogStatus, SessionPreemptionResult,
+    SessionPriorityResult, SessionRehydrateResult, SessionReplayReport,
     SessionSkillActivationsResult, SessionStallsResult, SessionSteerResult,
     SessionSteeringCancelResult, SessionSteeringListResult, SessionTranscriptResult,
     SessionUnlimitedResult, ShellPolicy, Skill, SkillActivation, SkillCreateParams,
@@ -93,10 +95,10 @@ use vp_protocol::types::{
 };
 use vp_store::Store;
 use vp_store::store::{
-    DeliveredSteering, MemoryCandidate, NewIntakeTask, NewMemory, NewSessionContinuation,
-    PromptPrefixCall, PromptPrefixTotals, RuntimeLeaseAcquisition, RuntimeLeaseToken,
-    SessionContinuationAckError, SessionContinuationClaim, SessionRepair, SourceEmbeddingChunkRow,
-    SourceSearchQuery, SourceSnapshot,
+    ContractUsageRow, DeliveredSteering, MemoryCandidate, NewIntakeTask, NewMemory,
+    NewSessionContinuation, PromptPrefixCall, PromptPrefixTotals, RuntimeLeaseAcquisition,
+    RuntimeLeaseToken, SessionContinuationAckError, SessionContinuationClaim, SessionRepair,
+    SourceEmbeddingChunkRow, SourceSearchQuery, SourceSnapshot, StoredContractRow,
 };
 
 use crate::budget::BudgetRegistry;
@@ -116,6 +118,7 @@ pub mod computer;
 pub mod console;
 pub mod context;
 pub mod continuation;
+pub mod contract;
 pub mod conversation;
 pub mod critical_path;
 pub mod daemon_agent;
@@ -125,6 +128,7 @@ pub mod gui;
 pub mod history;
 pub mod instruction;
 pub mod mcp;
+pub mod mcp_pins;
 pub mod memory;
 pub mod memory_embedding;
 pub mod memory_index;
@@ -192,6 +196,8 @@ struct ReplayData {
     test_results: Vec<vp_protocol::test_cache::TestCacheEntry>,
     remote_test_evidence: Vec<RemoteTestEvidence>,
     instructions: Vec<vp_protocol::types::SessionInstructionState>,
+    contracts: Vec<StoredContractRow>,
+    contract_usage: Vec<ContractUsageRow>,
     prompt_prefix_observations: Vec<PromptPrefixObservation>,
     prompt_prefix_aggregates: Vec<PromptPrefixAggregate>,
     prompt_prefix_inconsistent_epochs: Vec<String>,
@@ -226,6 +232,9 @@ pub struct Engine {
     scaling: Arc<scaling::ScalingCoordinator>,
     runtime_id: String,
     continuation_claims: Arc<Mutex<HashMap<String, SessionContinuationClaim>>>,
+    /// Serializes MCP pin discovery so two concurrent agents cannot both
+    /// perform the first TOFU sync and emit duplicate lifecycle events.
+    pin_sync: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// A held cross-process session lease. Dropping without calling `release`
@@ -750,6 +759,7 @@ impl Engine {
             gui: Arc::new(gui::GuiCoordinator::new()),
             runtime_id,
             continuation_claims: Arc::new(Mutex::new(HashMap::new())),
+            pin_sync: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -14016,6 +14026,8 @@ impl Engine {
             )?;
             let remote_test_evidence = store.list_remote_test_evidence_for_session(&id)?;
             let instructions = store.list_instruction_states_for_session(&id)?;
+            let contracts = store.list_contracts_for_session(&id)?;
+            let contract_usage = store.list_contract_usage_for_session(&id)?;
             let prompt_prefix_observations =
                 store.list_prompt_prefix_observations(&session.project_id, &id)?;
             let prompt_prefix_aggregates =
@@ -14056,6 +14068,8 @@ impl Engine {
                 test_results,
                 remote_test_evidence,
                 instructions,
+                contracts,
+                contract_usage,
                 prompt_prefix_observations,
                 prompt_prefix_aggregates,
                 prompt_prefix_inconsistent_epochs,
@@ -15009,6 +15023,76 @@ impl Engine {
             }
         };
 
+        let has_contract_events = data
+            .events
+            .iter()
+            .any(|event| event.kind == "contract.derived");
+        let expected_contracts = crate::contract::contracts_from_events(&data.events);
+        let contracts_projection = data
+            .contracts
+            .iter()
+            .map(|row| {
+                serde_json::from_str::<crate::contract::TaskContract>(&row.contract).map_err(|_| ())
+            })
+            .collect::<std::result::Result<Vec<_>, ()>>();
+        let contracts_match = if !has_contract_events {
+            // Legacy/imported archives may carry rows without a contract event
+            // stream. The projection is preserved rather than treated as drift.
+            true
+        } else {
+            match (&expected_contracts, contracts_projection) {
+                (Some(expected), Ok(projected)) => {
+                    let rows_match = crate::contract::contracts_match(&projected, expected);
+                    if !rows_match {
+                        mismatches.push(format!(
+                            "task contracts: projection={}, replay={}",
+                            data.contracts.len(),
+                            expected.len()
+                        ));
+                    }
+                    let expected_usage =
+                        crate::contract::usage_from_events(&data.events).unwrap_or_default();
+                    let mut usage_delta = false;
+                    if expected_usage.len() != data.contract_usage.len() {
+                        usage_delta = true;
+                    }
+                    for row in &data.contract_usage {
+                        let expected = expected_usage
+                            .get(&row.contract_id)
+                            .copied()
+                            .unwrap_or_default();
+                        if expected.writes != row.writes
+                            || expected.bytes != row.bytes
+                            || expected.commits != row.commits
+                        {
+                            usage_delta = true;
+                        }
+                    }
+                    if usage_delta {
+                        mismatches.push(format!(
+                            "contract usage: projection={}, replay={}",
+                            data.contract_usage.len(),
+                            expected_usage.len()
+                        ));
+                    }
+                    rows_match && !usage_delta
+                }
+                (None, _) if has_contract_events => {
+                    mismatches.push("task contracts: malformed replay event".to_string());
+                    false
+                }
+                (None, _) => {
+                    // Legacy/imported archives may carry no contract event stream.
+                    // Preserve the projection rather than reporting drift.
+                    true
+                }
+                (Some(_), Err(())) => {
+                    mismatches.push("task contracts: malformed projection row".to_string());
+                    false
+                }
+            }
+        };
+
         let expected_prefix_observations = crate::cache_epoch::observations_from_events(
             &data.session.project_id,
             &data.session.id,
@@ -15353,7 +15437,8 @@ impl Engine {
             && run_checkpoints_match
             && context_checkpoints_match
             && processes_match
-            && remote_test_evidence_matches;
+            && remote_test_evidence_matches
+            && contracts_match;
         Ok(SessionReplayReport {
             session_id: data.session.id.clone(),
             event_count: data.events.len(),
@@ -15384,6 +15469,7 @@ impl Engine {
             context_checkpoints_match,
             processes_match,
             remote_test_evidence_matches,
+            contracts_match,
             consistent,
             repaired,
             rebuilt: false,
@@ -15698,6 +15784,62 @@ impl Engine {
                 Some(rows) => Some(rows),
                 None if data.instructions.is_empty() => Some(Vec::new()),
                 None => None,
+            },
+            contracts: if !data
+                .events
+                .iter()
+                .any(|event| event.kind == "contract.derived")
+            {
+                None
+            } else {
+                match crate::contract::contracts_from_events(&data.events) {
+                    Some(contracts) => Some(
+                        contracts
+                            .iter()
+                            .map(|contract| StoredContractRow {
+                                contract_id: contract.contract_id.clone(),
+                                project_id: contract.project_id.clone(),
+                                session_id: contract.session_id.clone(),
+                                task_id: contract.task_id.clone(),
+                                plan_revision: contract.plan_revision,
+                                role: contract.role.clone(),
+                                hash: contract.hash.clone(),
+                                source_hash: contract.source_hash.clone(),
+                                contract: serde_json::to_string(contract).unwrap_or_default(),
+                                created_at: contract.created_at.clone(),
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    None if data.contracts.is_empty() => Some(Vec::new()),
+                    None => None,
+                }
+            },
+            contract_usage: if !data
+                .events
+                .iter()
+                .any(|event| event.kind == "intent.mutation")
+            {
+                None
+            } else {
+                match crate::contract::usage_from_events(&data.events) {
+                    Some(usage) => Some(
+                        usage
+                            .into_iter()
+                            .map(|(contract_id, usage)| ContractUsageRow {
+                                contract_id,
+                                project_id: data.session.project_id.clone(),
+                                session_id: data.session.id.clone(),
+                                task_id: None,
+                                writes: usage.writes,
+                                bytes: usage.bytes,
+                                commits: usage.commits,
+                                updated_at: vp_protocol::now_rfc3339(),
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    None if data.contract_usage.is_empty() => Some(Vec::new()),
+                    None => None,
+                }
             },
             prompt_prefix_observations: match crate::cache_epoch::observations_from_events(
                 &data.session.project_id,
@@ -18763,6 +18905,517 @@ impl Engine {
             skipped,
             entries,
         })
+    }
+
+    // ---------------------------------------------------------------------
+    // Task contracts and intent authorization
+    // ---------------------------------------------------------------------
+
+    pub async fn get_contract_policy(&self, project_id: &str) -> Result<ContractPolicy> {
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        tokio::task::spawn_blocking(move || store.get_contract_policy(&project_id)).await?
+    }
+
+    pub async fn set_contract_policy(
+        &self,
+        project_id: &str,
+        policy: ContractPolicy,
+    ) -> Result<ContractPolicy> {
+        let store = self.store.clone();
+        let project_id_for_check = project_id.to_string();
+        tokio::task::spawn_blocking(move || store.get_project(&project_id_for_check))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("project not found: {project_id}"))?;
+        let policy = policy
+            .normalized()
+            .map_err(|error| anyhow::anyhow!("invalid contract policy: {error}"))?;
+        let for_store = policy.clone();
+        let project_id = project_id.to_string();
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || store.set_contract_policy(&project_id, &for_store))
+            .await??;
+        Ok(policy)
+    }
+
+    /// Derive and persist a contract from trusted inputs. The same inputs
+    /// return the existing row unchanged; a changed plan/policy produces a new
+    /// contract and a new `contract.derived` event.
+    pub async fn derive_task_contract(
+        &self,
+        input: crate::contract::ContractDerivation,
+    ) -> Result<crate::contract::TaskContract> {
+        let mut contract =
+            crate::contract::derive_contract(input).map_err(|error| anyhow::anyhow!("{error}"))?;
+        let store = self.store.clone();
+        let session_id = contract.session_id.clone();
+        let task_id = contract.task_id.clone();
+        let existing = tokio::task::spawn_blocking({
+            let store = store.clone();
+            let session_id = session_id.clone();
+            let task_id = task_id.clone();
+            move || store.latest_contract(&session_id, task_id.as_deref())
+        })
+        .await??;
+        if let Some(row) = existing
+            && let Ok(existing) =
+                serde_json::from_str::<crate::contract::TaskContract>(&row.contract)
+            && existing.hash == contract.hash
+            && existing.verify_hash()
+        {
+            return Ok(existing);
+        }
+        contract.created_at = vp_protocol::now_rfc3339();
+        let encoded = serde_json::to_string(&contract)?;
+        let row = StoredContractRow {
+            contract_id: contract.contract_id.clone(),
+            project_id: contract.project_id.clone(),
+            session_id: contract.session_id.clone(),
+            task_id: contract.task_id.clone(),
+            plan_revision: contract.plan_revision,
+            role: contract.role.clone(),
+            hash: contract.hash.clone(),
+            source_hash: contract.source_hash.clone(),
+            contract: encoded,
+            created_at: contract.created_at.clone(),
+        };
+        // The audit event is written first. Replay/repair recreates the
+        // projection if the process dies between the two writes.
+        self.append_event(
+            &contract.session_id,
+            "contract.derived",
+            serde_json::json!({
+                "contract": contract,
+                "created_at": contract.created_at,
+            }),
+        )
+        .await?;
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || store.insert_contract(&row)).await??;
+        Ok(contract)
+    }
+
+    pub async fn latest_task_contract(
+        &self,
+        session_id: &str,
+        task_id: Option<&str>,
+    ) -> Result<Option<crate::contract::TaskContract>> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let task_id = task_id.map(str::to_string);
+        let row = tokio::task::spawn_blocking(move || {
+            store.latest_contract(&session_id, task_id.as_deref())
+        })
+        .await??;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let contract = serde_json::from_str::<crate::contract::TaskContract>(&row.contract)
+            .context("stored task contract is malformed")?;
+        if !contract.verify_hash() {
+            anyhow::bail!("stored task contract hash does not match its body");
+        }
+        Ok(Some(contract))
+    }
+
+    pub async fn contract_usage(
+        &self,
+        contract_id: &str,
+    ) -> Result<crate::contract::MutationUsage> {
+        let store = self.store.clone();
+        let contract_id = contract_id.to_string();
+        let row =
+            tokio::task::spawn_blocking(move || store.get_contract_usage(&contract_id)).await??;
+        Ok(crate::contract::MutationUsage {
+            writes: row.writes,
+            bytes: row.bytes,
+            commits: row.commits,
+        })
+    }
+
+    /// Append the bounded `intent.decision` audit row. No argument values,
+    /// prompt text, URLs, paths, or secrets are copied into the payload.
+    pub async fn record_intent_decision(
+        &self,
+        contract: &crate::contract::TaskContract,
+        decision: &crate::contract::ContractDecision,
+        spec: &crate::contract::ContractCallSpec<'_>,
+    ) -> Result<()> {
+        let payload = decision.payload(contract, spec);
+        self.append_event(&contract.session_id, "intent.decision", payload)
+            .await?;
+        Ok(())
+    }
+
+    /// Record the post-approval mutation delta and update the usage
+    /// projection. The event is appended before the projection update.
+    pub async fn record_intent_mutation(
+        &self,
+        contract: &crate::contract::TaskContract,
+        delta: crate::contract::MutationDelta,
+    ) -> Result<crate::contract::MutationUsage> {
+        if delta.is_zero() {
+            return self.contract_usage(&contract.contract_id).await;
+        }
+        self.append_event(
+            &contract.session_id,
+            "intent.mutation",
+            serde_json::json!({
+                "contract_id": contract.contract_id,
+                "contract_hash": contract.hash,
+                "task_id": contract.task_id,
+                "writes": delta.writes,
+                "bytes": delta.bytes,
+                "commits": delta.commits,
+            }),
+        )
+        .await?;
+        let store = self.store.clone();
+        let contract_id = contract.contract_id.clone();
+        let project_id = contract.project_id.clone();
+        let session_id = contract.session_id.clone();
+        let task_id = contract.task_id.clone();
+        let row = tokio::task::spawn_blocking(move || {
+            store.add_contract_usage(
+                &contract_id,
+                &project_id,
+                &session_id,
+                task_id.as_deref(),
+                delta.writes,
+                delta.bytes,
+                delta.commits,
+            )
+        })
+        .await??;
+        Ok(crate::contract::MutationUsage {
+            writes: row.writes,
+            bytes: row.bytes,
+            commits: row.commits,
+        })
+    }
+
+    pub async fn session_contract_status(
+        &self,
+        session_id: &str,
+        task_id: Option<&str>,
+    ) -> Result<SessionContractResult> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let session = tokio::task::spawn_blocking(move || store.get_session(&id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+        let policy = self.get_contract_policy(&session.project_id).await?;
+        let contract = self.latest_task_contract(session_id, task_id).await?;
+        let usage = match &contract {
+            Some(contract) => self.contract_usage(&contract.contract_id).await?,
+            None => crate::contract::MutationUsage::default(),
+        };
+        let contract = contract.map(|contract| contract.metadata(policy.mode, usage));
+        let decisions = self
+            .recent_events_of_kind(session_id, "intent.decision", 20)
+            .await?
+            .into_iter()
+            .filter(|event| {
+                task_id.is_none_or(|task| {
+                    event
+                        .payload
+                        .get("task_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(task)
+                })
+            })
+            .map(|event| IntentDecisionRecord {
+                seq: event
+                    .payload
+                    .get("seq")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(event.seq),
+                at: event
+                    .payload
+                    .get("at")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(&event.created_at)
+                    .to_string(),
+                contract_hash: event
+                    .payload
+                    .get("contract_hash")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                tool: event
+                    .payload
+                    .get("tool")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                task_id: event
+                    .payload
+                    .get("task_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                role: event
+                    .payload
+                    .get("role")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                rule: event
+                    .payload
+                    .get("rule")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                decision: event
+                    .payload
+                    .get("decision")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                risk: event
+                    .payload
+                    .get("risk")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                reason: event
+                    .payload
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+            .collect();
+        Ok(SessionContractResult {
+            session_id: session.id,
+            project_id: session.project_id,
+            contract,
+            policy,
+            recent_decisions: decisions,
+        })
+    }
+
+    // ---------------------------------------------------------------------
+    // MCP tool schema pins
+    // ---------------------------------------------------------------------
+
+    pub async fn sync_mcp_pins(
+        &self,
+        session_id: &str,
+        project_id: &str,
+        server: &McpServer,
+        tools: &[vp_protocol::types::McpTool],
+    ) -> Result<Vec<McpToolPin>> {
+        let _pin_guard = self.pin_sync.lock().await;
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let server_id = server.id.clone();
+        let existing = tokio::task::spawn_blocking({
+            let store = store.clone();
+            let project = project.clone();
+            let server_id = server_id.clone();
+            move || store.list_mcp_tool_pins(&project, Some(&server_id))
+        })
+        .await??;
+        let now = vp_protocol::now_rfc3339();
+        let result = crate::mcp_pins::sync_pins(project_id, server, tools, &existing, &now);
+        // Pin lifecycle events are appended before the project rows are
+        // updated. The rows are project configuration, not a session replay
+        // projection, so a crash after the event leaves a stale row that the
+        // next sync repairs and re-emits.
+        for change in &result.changes {
+            let payload = crate::mcp_pins::change_payload(change, result.first_sync);
+            self.append_event(session_id, change.kind.event_kind(), payload)
+                .await?;
+        }
+        for pin in &result.pins {
+            let store = store.clone();
+            let pin = pin.clone();
+            tokio::task::spawn_blocking(move || store.upsert_mcp_tool_pin(&pin)).await??;
+        }
+        Ok(result.pins)
+    }
+
+    pub async fn project_mcp_pins(
+        &self,
+        project_id: &str,
+        server_id: Option<&str>,
+    ) -> Result<ProjectMcpPinsResult> {
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let server = server_id.map(str::to_string);
+        let pins = tokio::task::spawn_blocking(move || {
+            store.list_mcp_tool_pins(&project, server.as_deref())
+        })
+        .await??;
+        let mut result = ProjectMcpPinsResult {
+            project_id: project_id.to_string(),
+            pins,
+            ..ProjectMcpPinsResult::default()
+        };
+        for pin in &result.pins {
+            match pin.status.as_str() {
+                "pinned" => result.pinned += 1,
+                "drift" => result.drift += 1,
+                "unverified" => result.unverified += 1,
+                "removed" => result.removed += 1,
+                _ => {}
+            }
+        }
+        Ok(result)
+    }
+
+    pub async fn approve_mcp_pin(
+        &self,
+        params: &McpPinApproveParams,
+        session_id: Option<&str>,
+    ) -> Result<McpPinActionResult> {
+        let store = self.store.clone();
+        let project = params.project_id.clone();
+        let server = params.server_id.clone();
+        let pins =
+            tokio::task::spawn_blocking(move || store.list_mcp_tool_pins(&project, Some(&server)))
+                .await??;
+        let mut pin = pins
+            .into_iter()
+            .find(|pin| pin.tool_name == params.tool_name)
+            .ok_or_else(|| anyhow::anyhow!("MCP tool pin not found"))?;
+        if pin.observed_schema_hash != params.expected_schema_hash
+            || pin.observed_description_hash != params.expected_description_hash
+        {
+            anyhow::bail!(
+                "expected pin hashes do not match the last observation; rediscover the tool and retry"
+            );
+        }
+        let now = vp_protocol::now_rfc3339();
+        pin.status = "pinned".to_string();
+        pin.schema_hash = params.expected_schema_hash.clone();
+        pin.description_hash = params.expected_description_hash.clone();
+        pin.server_fingerprint = pin.observed_server_fingerprint.clone();
+        pin.approved_at = Some(now.clone());
+        pin.approved_by = Some(
+            params
+                .approved_by
+                .clone()
+                .unwrap_or_else(|| "operator".to_string()),
+        );
+        pin.last_seen_at = now;
+        if let Some(session_id) = self
+            .resolve_pin_audit_session(session_id, &params.project_id)
+            .await?
+        {
+            self.append_event(
+                &session_id,
+                "mcp.tool.approved",
+                serde_json::json!({
+                    "project_id": pin.project_id,
+                    "server_id": pin.server_id,
+                    "server_name": pin.server_name,
+                    "tool_name": pin.tool_name,
+                    "schema_hash": pin.schema_hash,
+                    "description_hash": pin.description_hash,
+                    "approved_by": pin.approved_by,
+                    "approved_at": pin.approved_at,
+                }),
+            )
+            .await?;
+        }
+        let store = self.store.clone();
+        let for_store = pin.clone();
+        tokio::task::spawn_blocking(move || store.upsert_mcp_tool_pin(&for_store)).await??;
+        Ok(McpPinActionResult {
+            pin: Some(pin),
+            status: "pinned".to_string(),
+            message: "MCP tool pin approved".to_string(),
+        })
+    }
+
+    pub async fn reject_mcp_pin(
+        &self,
+        params: &McpPinRejectParams,
+        session_id: Option<&str>,
+    ) -> Result<McpPinActionResult> {
+        let store = self.store.clone();
+        let project = params.project_id.clone();
+        let server = params.server_id.clone();
+        let pins =
+            tokio::task::spawn_blocking(move || store.list_mcp_tool_pins(&project, Some(&server)))
+                .await??;
+        let pin = pins
+            .into_iter()
+            .find(|pin| pin.tool_name == params.tool_name)
+            .ok_or_else(|| anyhow::anyhow!("MCP tool pin not found"))?;
+        if let Some(session_id) = self
+            .resolve_pin_audit_session(session_id, &params.project_id)
+            .await?
+        {
+            self.append_event(
+                &session_id,
+                "mcp.tool.rejected",
+                serde_json::json!({
+                    "project_id": pin.project_id,
+                    "server_id": pin.server_id,
+                    "server_name": pin.server_name,
+                    "tool_name": pin.tool_name,
+                    "status": pin.status,
+                    "schema_hash": pin.schema_hash,
+                    "description_hash": pin.description_hash,
+                    "reason": params.reason.as_deref().unwrap_or("operator rejected the observed pin"),
+                }),
+            )
+            .await?;
+        }
+        Ok(McpPinActionResult {
+            status: pin.status.clone(),
+            message: "MCP tool pin was not approved; the observed status remains visible"
+                .to_string(),
+            pin: Some(pin),
+        })
+    }
+
+    async fn resolve_pin_audit_session(
+        &self,
+        session_id: Option<&str>,
+        project_id: &str,
+    ) -> Result<Option<String>> {
+        if let Some(session_id) = session_id {
+            return Ok(Some(session_id.to_string()));
+        }
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        tokio::task::spawn_blocking(move || store.latest_session_for_project(&project)).await?
+    }
+
+    pub async fn mcp_pin_trust_for_tool(
+        &self,
+        project_id: &str,
+        server_id: &str,
+        tool_name: &str,
+    ) -> Result<crate::contract::McpPinTrust> {
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let server = server_id.to_string();
+        let pins =
+            tokio::task::spawn_blocking(move || store.list_mcp_tool_pins(&project, Some(&server)))
+                .await??;
+        let Some(pin) = pins.into_iter().find(|pin| pin.tool_name == tool_name) else {
+            return Ok(crate::contract::McpPinTrust::Unverified);
+        };
+        Ok(match pin.status.as_str() {
+            "pinned" if crate::mcp_pins::pin_is_callable(&pin) => {
+                crate::contract::McpPinTrust::Trusted
+            }
+            "pinned" => crate::contract::McpPinTrust::Drift,
+            "drift" => crate::contract::McpPinTrust::Drift,
+            "removed" => crate::contract::McpPinTrust::Removed,
+            _ => crate::contract::McpPinTrust::Unverified,
+        })
+    }
+
+    pub async fn find_mcp_server(&self, selector: &str) -> Result<Option<McpServer>> {
+        let servers = self.list_mcp_servers().await?.servers;
+        Ok(servers
+            .into_iter()
+            .find(|server| server.id == selector || server.name == selector))
     }
 
     pub async fn append_event(

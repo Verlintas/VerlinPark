@@ -1157,6 +1157,21 @@ actor CoreClient {
         .decode(SessionInstructionsReport.self)
     }
 
+    func sessionContract(
+        sessionID: String,
+        taskID: String? = nil
+    ) async throws -> SessionContractReport {
+        var params: [String: JSONValue] = ["session_id": .string(sessionID)]
+        if let taskID {
+            params["task_id"] = .string(taskID)
+        }
+        return try await request(
+            method: "session.contract",
+            params: params
+        )
+        .decode(SessionContractReport.self)
+    }
+
     func setSessionPromptLayout(
         sessionID: String,
         layout: Int

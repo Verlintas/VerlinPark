@@ -1065,7 +1065,7 @@ impl AgentRole {
         )
     }
 
-    fn allows_tool(self, profile: AgentProfile, name: &str) -> bool {
+    pub(crate) fn allows_tool(self, profile: AgentProfile, name: &str) -> bool {
         match self {
             Self::Leader => true,
             Self::Manager => {
@@ -1318,6 +1318,100 @@ impl AgentRole {
     }
 }
 
+/// The complete role/profile policy surface, not only the advertised bundle.
+/// Contract derivation uses this list so a tool that is temporarily omitted
+/// from a frozen bundle remains authorized by the role policy and is still
+/// recorded in `allowed_tools`.
+pub(crate) fn role_tool_surface(role: AgentRole, profile: AgentProfile) -> Vec<String> {
+    let mut names = crate::tool_bundle::BUNDLE_TOOL_CATALOG
+        .iter()
+        .map(|entry| entry.name.to_string())
+        .filter(|name| role.allows_tool(profile, name))
+        .collect::<Vec<_>>();
+    if matches!(
+        role,
+        AgentRole::Leader | AgentRole::Worker | AgentRole::Labour
+    ) && !names.iter().any(|name| name == "mcp")
+    {
+        names.push("mcp".to_string());
+    }
+    // Runtime-managed tools that are dispatched outside the registry role
+    // filter. They are part of the effective role surface even when
+    // `allows_tool` only covers registry tools. Scout is deliberately excluded
+    // from every write/delegation/artifact surface.
+    if role != AgentRole::Scout {
+        for name in [
+            "send_message",
+            "read_mailbox",
+            "publish_artifact",
+            "publish_artifact_file",
+            "list_artifacts",
+            "read_artifact",
+            "archive_list",
+            "media_info",
+            "ask_user",
+            "coordinate",
+            "team_status",
+            "use_skill",
+            "tool_help",
+            "tool_search",
+            "task_detail",
+            "budget_status",
+            "read_tool_output",
+            "remember",
+            "recall",
+            "search_sources",
+            "read_source",
+            "list_sources",
+        ] {
+            names.push(name.to_string());
+        }
+    } else {
+        for name in [
+            "read_tool_output",
+            "recall",
+            "team_status",
+            "search_sources",
+            "read_source",
+            "list_sources",
+        ] {
+            names.push(name.to_string());
+        }
+    }
+    match role {
+        AgentRole::Verifier => names.push("submit_verdict".to_string()),
+        AgentRole::Leader => {
+            names.push("todo_write".to_string());
+            names.push("submit_team_plan".to_string());
+            names.push("run_team_plan".to_string());
+            names.push("deliberate_team_plan".to_string());
+        }
+        AgentRole::Manager => {
+            // Managers are read-only for workspace tools but may own
+            // orchestration: delegate to Workers, delegate ACP work, run the
+            // parallel batch, and scout. These are authority operations, not
+            // workspace writes.
+            for name in [
+                "task_control",
+                "delegate",
+                "delegate_many",
+                "delegate_acp",
+                "scout",
+            ] {
+                names.push(name.to_string());
+            }
+        }
+        AgentRole::Worker => {
+            names.push("delegate".to_string());
+            names.push("delegate_acp".to_string());
+        }
+        _ => {}
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AgentProfile {
     Coding,
@@ -1436,6 +1530,10 @@ struct McpToolBinding {
     server_id: String,
     tool_name: String,
     schema: ToolSchema,
+    /// Resolved pin trust at discovery time. Only `Trusted` bindings are
+    /// advertised/executable; unverified/drift rows remain visible through
+    /// `tool_search` with `callable=false`.
+    pin_trust: crate::contract::McpPinTrust,
 }
 
 const MAX_DYNAMIC_MCP_TOOLS: usize = 32;
@@ -7529,12 +7627,14 @@ impl AgentService {
                 &project,
                 &session,
                 &spec,
+                None,
                 &session.goal,
                 false,
                 InstructionBuildMode::Preview,
             )
             .await?;
-            let dynamic_mcp = collect_dynamic_mcp_tools(&self.engine, spec.role).await;
+            let dynamic_mcp =
+                collect_dynamic_mcp_tools(&self.engine, spec.role, &session.project_id, None).await;
             let frozen_bundle = frozen_tool_bundle(&config, &spec, &dynamic_mcp);
             let tools = frozen_bundle.tools.clone();
             let system = sections.render();
@@ -7664,7 +7764,8 @@ impl AgentService {
             });
             let task_kind = explicit_task_kind.clone().or(inferred_kind);
             let spec = stable_agent_spec(&session, agent, role, task_kind);
-            let dynamic_mcp = collect_dynamic_mcp_tools(&self.engine, spec.role).await;
+            let dynamic_mcp =
+                collect_dynamic_mcp_tools(&self.engine, spec.role, &session.project_id, None).await;
             let frozen = frozen_tool_bundle(&config, &spec, &dynamic_mcp);
             let tools = if include_tools {
                 frozen
@@ -8049,12 +8150,14 @@ impl AgentService {
                 &project,
                 &session,
                 &spec,
+                None,
                 &session.goal,
                 false,
                 InstructionBuildMode::Materialize,
             )
             .await?;
-            let dynamic_mcp = collect_dynamic_mcp_tools(&self.engine, spec.role).await;
+            let dynamic_mcp =
+                collect_dynamic_mcp_tools(&self.engine, spec.role, &session.project_id, None).await;
             let frozen_bundle = frozen_tool_bundle(&config, &spec, &dynamic_mcp);
             let tools = frozen_bundle.tools.clone();
             let budget = SessionBudget::new(
@@ -8161,7 +8264,8 @@ impl AgentService {
             };
             let system =
                 role_system_prompt(spec.role, &project, &session, &spec, &session.goal).render();
-            let dynamic_mcp = collect_dynamic_mcp_tools(&self.engine, spec.role).await;
+            let dynamic_mcp =
+                collect_dynamic_mcp_tools(&self.engine, spec.role, &session.project_id, None).await;
             let frozen_bundle = frozen_tool_bundle(&config, &spec, &dynamic_mcp);
             let tools = frozen_bundle.tools.clone();
             let model_name = model_for(&config, spec.role);
@@ -8354,7 +8458,8 @@ impl AgentService {
             base_commit: session.base_commit.clone().unwrap_or_default(),
         };
         let system = role_system_prompt(spec.role, project, session, &spec, &session.goal).render();
-        let dynamic_mcp = collect_dynamic_mcp_tools(&self.engine, spec.role).await;
+        let dynamic_mcp =
+            collect_dynamic_mcp_tools(&self.engine, spec.role, &session.project_id, None).await;
         let frozen_bundle = frozen_tool_bundle(config, &spec, &dynamic_mcp);
         let tools = frozen_bundle.tools.clone();
         let prefix_hash = crate::sha256_hex(
@@ -14547,6 +14652,26 @@ async fn compact_context_if_needed(
     let checkpoint_id = uuid::Uuid::now_v7().to_string();
     let checkpoint_plan_revision = state.plan_revision;
     let checkpoint_structured_state = state.clone();
+    // The contract capsule is a head section, so compaction cannot drop it.
+    // Record its identity on the boundary anyway: a changed contract after a
+    // compaction is a priced prefix change, not silent churn.
+    let compact_contract = engine
+        .latest_task_contract(&session.id, spec.task_id.as_deref())
+        .await
+        .ok()
+        .flatten()
+        .filter(|contract| contract.role == spec.role.as_str());
+    let compact_contract_hash = compact_contract
+        .as_ref()
+        .map(|contract| contract.hash.clone());
+    let compact_contract_chars = compact_contract
+        .as_ref()
+        .map(|contract| contract.capsule().chars().count() as u64);
+    let compact_contract_enabled = engine
+        .get_contract_policy(&session.project_id)
+        .await
+        .map(|policy| policy.enabled)
+        .unwrap_or(false);
     let checkpoint_summary = summary_text.clone();
     let checkpoint_through_id = through_id.clone();
     let checkpoint_mode = if mode == "summary" && checkpoint_summary.is_none() {
@@ -14590,6 +14715,10 @@ async fn compact_context_if_needed(
         "cache_epoch_changed": false,
         "cache_epoch_source": if cache_epoch_recorded { "recorded" } else { "unavailable" },
         "estimated_lost_cache_read_usd": estimated_lost_cache_read_usd,
+        "contract_hash": compact_contract_hash,
+        "contract_chars": compact_contract_chars,
+        "contract_capsule": compact_contract_hash.is_some(),
+        "contract_policy_enabled": compact_contract_enabled,
     });
     agent_fields(&mut compaction_payload, spec);
     let checkpoint = ContextCheckpoint {
@@ -14954,11 +15083,24 @@ async fn run_loop_body(
             project.id.clone(),
         ))),
     };
+    let run_contract = derive_contract_for_run(engine, project, session, spec).await?;
+    let run_contract_policy = engine
+        .get_contract_policy(&project.id)
+        .await
+        .unwrap_or_default();
+    let mut run_contract_usage = match &run_contract {
+        Some(contract) => engine
+            .contract_usage(&contract.contract_id)
+            .await
+            .unwrap_or_default(),
+        None => crate::contract::MutationUsage::default(),
+    };
     let sections = build_prompt_sections(
         engine,
         project,
         session,
         spec,
+        run_contract.as_ref(),
         objective,
         true,
         InstructionBuildMode::Materialize,
@@ -14988,7 +15130,8 @@ async fn run_loop_body(
     // execution time, not by filtering schemas mid-run, and dynamic MCP schemas
     // are sorted and appended exactly once. This is the prefix that every
     // provider call in the run receives unchanged.
-    let dynamic_mcp_tools = collect_dynamic_mcp_tools(engine, spec.role).await;
+    let dynamic_mcp_tools =
+        collect_dynamic_mcp_tools(engine, spec.role, &project.id, Some(&session.id)).await;
     let frozen_bundle = frozen_tool_bundle(config, spec, &dynamic_mcp_tools);
     let tools = frozen_bundle.tools.clone();
     let system_tokens = estimate_context_tokens(&system);
@@ -15010,6 +15153,17 @@ async fn run_loop_body(
     let model_name = model_for(config, spec.role);
     let prompt_hashes = sections.hashes(&model_name, &tools);
     let prefix_hash = prompt_hashes.prefix_hash.clone();
+    let contract_section = prompt_hashes
+        .head_sections
+        .iter()
+        .find(|section| section.key == "session/contract");
+    let contract_hash = contract_section.map(|section| section.hash.clone());
+    let contract_chars = prompt_hashes.section_chars.get("session/contract").copied();
+    let contract_policy_enabled = engine
+        .get_contract_policy(&project.id)
+        .await
+        .map(|policy| policy.enabled)
+        .unwrap_or(false);
     let cache_policy = engine
         .get_cache_policy(&project.id)
         .await
@@ -15093,6 +15247,10 @@ async fn run_loop_body(
         "head_sections": prompt_hashes.head_sections,
         "tail_sections": prompt_hashes.tail_sections,
         "section_chars": prompt_hashes.section_chars,
+        "contract_hash": contract_hash,
+        "contract_chars": contract_chars,
+        "contract_capsule": contract_hash.is_some(),
+        "contract_policy_enabled": contract_policy_enabled,
         "tool_count": tools.len(),
         "core_chars": sections.core.chars().count(),
         "project_chars": sections.project.chars().count(),
@@ -15188,6 +15346,7 @@ async fn run_loop_body(
             project,
             session,
             spec,
+            None,
             objective,
             false,
             InstructionBuildMode::Materialize,
@@ -16123,6 +16282,27 @@ async fn run_loop_body(
                     &spec.worktree,
                     &gui_policy,
                 );
+                // A contract denial/escalation on a read-only parallel call
+                // falls back to the sequential path, which records the intent
+                // decision and takes the normal approval route.
+                if let Some(contract) = &run_contract {
+                    let contract_spec = crate::contract::ContractCallSpec {
+                        tool: &call.name,
+                        contract_tool: None,
+                        input: &input,
+                        risk: assessment.risk,
+                        worktree: &spec.worktree,
+                        usage: run_contract_usage,
+                        mcp_trust: None,
+                        patch_text: None,
+                    };
+                    if !crate::contract::authorize(&contract_spec, contract, &run_contract_policy)
+                        .is_allow()
+                    {
+                        prepared.clear();
+                        break;
+                    }
+                }
                 if !matches!(
                     decide(config.approval_mode, &assessment, spec.auto_approve),
                     ApprovalDecision::Allow { .. }
@@ -16497,7 +16677,87 @@ async fn run_loop_body(
             }
             let scout_blocked =
                 spec.role == AgentRole::Scout && !spec.role.allows_tool(spec.profile, &call.name);
-            let decision = if scout_blocked {
+            // Argument-level intent authorization runs before the approval
+            // broker. A contract can only narrow: Deny never prompts, Escalate
+            // raises the assessment to at least HostState and then takes the
+            // normal approval path. Advisory decisions are recorded but leave
+            // the existing risk/approval behavior untouched.
+            let mut contract_pending_mutation: Option<crate::contract::MutationDelta> = None;
+            let mut contract_denied: Option<(RiskLevel, String)> = None;
+            // A registry tool outside the role policy is rejected by the
+            // existing role check with its historical message. Do not let the
+            // contract replace that denial: the requirement is to preserve
+            // Scout/Verifier role checks, not to bypass them.
+            let role_policy_unavailable = config.tools.get(&call.name).is_some()
+                && !spec.role.allows_tool(spec.profile, &call.name);
+            if !role_policy_unavailable && let Some(contract) = &run_contract {
+                let mcp_trust = if let Some(binding) = dynamic_mcp_tool {
+                    Some(binding.pin_trust)
+                } else if is_mcp_tool && input.get("action").and_then(Value::as_str) == Some("call")
+                {
+                    Some(resolve_mcp_pin_trust(engine, &session.project_id, &input).await)
+                } else {
+                    None
+                };
+                let contract_spec = crate::contract::ContractCallSpec {
+                    tool: &call.name,
+                    contract_tool: dynamic_mcp_tool
+                        .map(|_| "mcp")
+                        .or(is_mcp_tool.then_some("mcp")),
+                    input: &input,
+                    risk: assessment.risk,
+                    worktree: &spec.worktree,
+                    usage: run_contract_usage,
+                    mcp_trust,
+                    patch_text: input
+                        .get("patch")
+                        .and_then(Value::as_str)
+                        .or_else(|| input.get("diff").and_then(Value::as_str)),
+                };
+                let contract_decision =
+                    crate::contract::authorize(&contract_spec, contract, &run_contract_policy);
+                engine
+                    .record_intent_decision(contract, &contract_decision, &contract_spec)
+                    .await?;
+                match contract_decision.outcome {
+                    crate::contract::ContractOutcome::Deny => {
+                        contract_denied = Some((
+                            contract_decision.effective_risk(),
+                            format!(
+                                "intent: {} ({} · {})",
+                                contract_decision.reason,
+                                contract_decision.code,
+                                contract_decision.rule
+                            ),
+                        ));
+                    }
+                    crate::contract::ContractOutcome::Escalate => {
+                        let blocked = assessment.blocked;
+                        assessment = crate::permissions::PermissionAssessment {
+                            risk: assessment.risk.max(contract_decision.effective_risk()),
+                            reason: format!(
+                                "intent: {} ({} · {})",
+                                contract_decision.reason,
+                                contract_decision.code,
+                                contract_decision.rule
+                            ),
+                            blocked,
+                        };
+                    }
+                    crate::contract::ContractOutcome::Allow => {
+                        let delta = crate::contract::mutation_delta(&contract_spec);
+                        if !delta.is_zero() {
+                            contract_pending_mutation = Some(delta);
+                        }
+                    }
+                }
+            }
+            let decision = if let Some((risk, reason)) = &contract_denied {
+                crate::permissions::ApprovalDecision::Deny {
+                    risk: *risk,
+                    reason: reason.clone(),
+                }
+            } else if scout_blocked {
                 // Do not prompt for a tool the Scout can never execute, and do
                 // not route it through the permission broker. The tool is not
                 // in the Scout schema; this is the execution-time backstop.
@@ -16632,6 +16892,18 @@ async fn run_loop_body(
                 }
             }
 
+            // Record a mutation only after the call was allowed (including an
+            // approved escalation) and before execution. A denied call never
+            // consumes budget. The event is persisted before the projection.
+            if denied_reason.is_none()
+                && !scout_blocked
+                && active_skill
+                    .as_ref()
+                    .is_none_or(|skill| skill_allows_tool(skill, &call.name))
+                && let (Some(contract), Some(delta)) = (&run_contract, contract_pending_mutation)
+            {
+                run_contract_usage = engine.record_intent_mutation(contract, delta).await?;
+            }
             let skill_denied = active_skill
                 .as_ref()
                 .filter(|skill| !skill_allows_tool(skill, &call.name));
@@ -16872,7 +17144,16 @@ async fn run_loop_body(
                     }),
                 )
                 .await?;
-                match run_tool_search(config, engine, spec, &frozen_bundle, input.clone()).await {
+                match run_tool_search(
+                    config,
+                    engine,
+                    spec,
+                    &session.project_id,
+                    &frozen_bundle,
+                    input.clone(),
+                )
+                .await
+                {
                     Ok(output) => output,
                     Err(error) => ToolOutput::error(format!("tool search error: {error}")),
                 }
@@ -17779,7 +18060,12 @@ async fn run_loop_body(
     Err(anyhow!("maximum turns reached"))
 }
 
-async fn collect_dynamic_mcp_tools(engine: &Engine, role: AgentRole) -> Vec<McpToolBinding> {
+async fn collect_dynamic_mcp_tools(
+    engine: &Engine,
+    role: AgentRole,
+    project_id: &str,
+    session_id: Option<&str>,
+) -> Vec<McpToolBinding> {
     if !matches!(
         role,
         AgentRole::Leader | AgentRole::Worker | AgentRole::Labour
@@ -17803,7 +18089,46 @@ async fn collect_dynamic_mcp_tools(engine: &Engine, role: AgentRole) -> Vec<McpT
                 continue;
             }
         };
+        let pins = match session_id {
+            Some(session_id) => engine
+                .sync_mcp_pins(session_id, project_id, &server, &tools)
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(%error, server = %server.name, "MCP pin sync failed");
+                    Vec::new()
+                }),
+            None => engine
+                .project_mcp_pins(project_id, Some(&server.id))
+                .await
+                .map(|result| result.pins)
+                .unwrap_or_default(),
+        };
+        let pin_by_tool = pins
+            .into_iter()
+            .map(|pin| (pin.tool_name.clone(), pin))
+            .collect::<HashMap<_, _>>();
+        let tofu_pending = pin_by_tool.is_empty();
         for tool in tools {
+            // A project with no pins for this server is a TOFU-preview path.
+            // The real run syncs pins before advertising, so this fallback is
+            // deterministic with the first sync result.
+            let pin = pin_by_tool.get(&tool.name);
+            let trust = match pin {
+                Some(pin) if crate::mcp_pins::pin_is_callable(pin) => {
+                    crate::contract::McpPinTrust::Trusted
+                }
+                Some(pin) => match pin.status.as_str() {
+                    "drift" => crate::contract::McpPinTrust::Drift,
+                    "removed" => crate::contract::McpPinTrust::Removed,
+                    _ => crate::contract::McpPinTrust::Unverified,
+                },
+                None if tofu_pending => crate::contract::McpPinTrust::Trusted,
+                None => crate::contract::McpPinTrust::Unverified,
+            };
+            // Unapproved tools are intentionally not advertised or executable.
+            if trust != crate::contract::McpPinTrust::Trusted {
+                continue;
+            }
             let exposed_name = dynamic_mcp_tool_name(&server.name, &tool.name);
             if !used.insert(exposed_name.clone()) {
                 continue;
@@ -17830,6 +18155,7 @@ async fn collect_dynamic_mcp_tools(engine: &Engine, role: AgentRole) -> Vec<McpT
                     ),
                     parameters,
                 },
+                pin_trust: trust,
             });
         }
     }
@@ -18605,6 +18931,7 @@ async fn run_tool_search(
     config: &AgentConfig,
     engine: &Engine,
     spec: &AgentSpec,
+    project_id: &str,
     frozen_bundle: &crate::tool_bundle::FrozenToolBundle,
     input: Value,
 ) -> Result<ToolOutput> {
@@ -18663,17 +18990,38 @@ async fn run_tool_search(
         spec.role,
         AgentRole::Leader | AgentRole::Worker | AgentRole::Labour
     );
+    let pin_map = engine
+        .project_mcp_pins(project_id, None)
+        .await
+        .map(|result| {
+            result
+                .pins
+                .into_iter()
+                .map(|pin| ((pin.server_id.clone(), pin.tool_name.clone()), pin))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
     let servers = engine.list_mcp_servers().await?.servers;
     for server in servers.into_iter().filter(|server| server.enabled).take(20) {
         let Ok(tools) = engine.mcp_tools(&server.id).await else {
             continue;
         };
+        let server_has_pins = pin_map.keys().any(|(server_id, _)| *server_id == server.id);
         for tool in tools.tools.into_iter().take(100) {
             let exposed = dynamic_mcp_tool_name(&server.name, &tool.name);
             let score = tool_match_score(&exposed, &tool.description, &query);
             if score <= 0.0 {
                 continue;
             }
+            let pin = pin_map.get(&(server.id.clone(), tool.name.clone()));
+            let trust = match pin {
+                Some(pin) if crate::mcp_pins::pin_is_callable(pin) => pin.trust(),
+                Some(pin) if pin.status == "pinned" => "drift",
+                Some(pin) => pin.trust(),
+                None if !server_has_pins => "approved",
+                None => "unverified",
+            };
+            let pinned = pin.is_none_or(crate::mcp_pins::pin_is_callable);
             let mut value = json!({
                 "name": exposed,
                 "kind": "mcp",
@@ -18681,7 +19029,9 @@ async fn run_tool_search(
                 "server_name": server.name,
                 "tool_name": tool.name,
                 "description": tool.description.chars().take(400).collect::<String>(),
-                "callable": mcp_callable,
+                "callable": mcp_callable && pinned,
+                "trust": trust,
+                "pinned": pinned,
                 "in_bundle": advertised.contains(exposed.as_str()),
                 "bundle": frozen_bundle.selection.kind.as_str(),
                 "category": "mcp",
@@ -19172,6 +19522,29 @@ fn media_info_summary(
         text.push_str(&format!("\nwarning: {warning}"));
     }
     text
+}
+
+/// Resolve the pin trust for a generic `mcp action=call` request. A missing
+/// server/tool is `Unknown` so the contract escalates rather than allowing.
+async fn resolve_mcp_pin_trust(
+    engine: &Engine,
+    project_id: &str,
+    input: &Value,
+) -> crate::contract::McpPinTrust {
+    let Some(selector) = input.get("server").and_then(Value::as_str) else {
+        return crate::contract::McpPinTrust::Unknown;
+    };
+    let Some(tool) = input.get("tool").and_then(Value::as_str) else {
+        return crate::contract::McpPinTrust::Unknown;
+    };
+    let server = match engine.find_mcp_server(selector).await {
+        Ok(Some(server)) => server,
+        Ok(None) | Err(_) => return crate::contract::McpPinTrust::Unknown,
+    };
+    engine
+        .mcp_pin_trust_for_tool(project_id, &server.id, tool)
+        .await
+        .unwrap_or(crate::contract::McpPinTrust::Unknown)
 }
 
 #[allow(clippy::result_large_err)] // the typed failure carries the stable contract
@@ -24398,6 +24771,79 @@ fn cache_event_belongs_to(payload: &Value, spec: &AgentSpec) -> bool {
         .is_some_and(|role| role == spec.role.as_str())
 }
 
+/// Derive the task contract from trusted runtime state immediately before a
+/// run. A task-scoped run whose plan task is missing fails closed: it must not
+/// fall back to a permissive session-wide contract.
+async fn derive_contract_for_run(
+    engine: &Engine,
+    project: &Project,
+    session: &Session,
+    spec: &AgentSpec,
+) -> Result<Option<crate::contract::TaskContract>> {
+    let policy = engine.get_contract_policy(&project.id).await?;
+    if !policy.enabled {
+        return Ok(None);
+    }
+    // Deterministic internal repair/integration runs use the Manager role but
+    // are not user-delegated agents. They are constructed by trusted runtime
+    // code (auto_resolve / remote integrator) and already set `auto_approve`;
+    // they retain the normal sandbox, write-scope, Verifier, and Integrator
+    // gates. Ordinary Managers are not exempt.
+    if spec.auto_approve && spec.role == AgentRole::Manager {
+        return Ok(None);
+    }
+    let shell_policy = engine
+        .get_shell_policy(&project.id)
+        .await
+        .unwrap_or_default();
+    let plan = if spec.task_id.is_some() {
+        engine.get_team_plan(&session.id).await?
+    } else {
+        None
+    };
+    let task = spec.task_id.as_deref().and_then(|task_id| {
+        plan.as_ref()
+            .and_then(|plan| plan.tasks.iter().find(|task| task.id == task_id))
+    });
+    if spec.task_id.is_some() && task.is_none() && spec.write_scope.is_empty() {
+        // Retry/re-verification runs can outlive the stored plan (or predate
+        // it in a unit fixture). There is no trusted write scope to derive
+        // from, so do not invent an unrestricted contract. The existing role
+        // policy, sandbox, worktree, and Verifier gates still apply.
+        tracing::debug!(
+            task_id = spec.task_id.as_deref().unwrap_or_default(),
+            "task contract skipped: plan task is not present and the run has no write scope"
+        );
+        return Ok(None);
+    }
+    let write_scope = task
+        .map(|task| task.write_scope.clone())
+        .unwrap_or_else(|| spec.write_scope.clone());
+    let acceptance = task.map(|task| task.acceptance.clone()).unwrap_or_default();
+    let task_kind = task
+        .and_then(|task| (!task.kind.trim().is_empty()).then(|| task.kind.clone()))
+        .or_else(|| spec.task_kind.clone());
+    let plan_revision = u64::from(engine.current_plan_revision(&session.id).await.unwrap_or(0));
+    let allowed_tools = role_tool_surface(spec.role, spec.profile);
+    let input = crate::contract::ContractDerivation {
+        project_id: project.id.clone(),
+        session_id: session.id.clone(),
+        task_id: spec.task_id.clone(),
+        plan_revision,
+        role: spec.role.as_str().to_string(),
+        profile: spec.profile.as_str().to_string(),
+        goal: session.goal.clone(),
+        task_kind,
+        write_scope,
+        acceptance,
+        allowed_tools,
+        policy,
+        shell_network: shell_policy.network,
+    };
+    let contract = engine.derive_task_contract(input).await?;
+    Ok(Some(contract))
+}
+
 /// Build the exact prompt for one run.
 ///
 /// `include_memory` is false only for an explicit cache warm, which must send
@@ -24412,6 +24858,7 @@ async fn build_prompt_sections(
     project: &Project,
     session: &Session,
     spec: &AgentSpec,
+    contract: Option<&crate::contract::TaskContract>,
     objective: &str,
     include_memory: bool,
     mode: InstructionBuildMode,
@@ -24439,6 +24886,19 @@ async fn build_prompt_sections(
         .unwrap_or_default()
     } else {
         String::new()
+    };
+    // The contract capsule is generated from the typed contract, never from a
+    // summarizer or model prose. A task-scoped agent uses its own contract; a
+    // Leader/Manager session-scoped contract is read-only in path terms.
+    let contract_capsule = match contract {
+        Some(contract) if contract.role == spec.role.as_str() => Some(contract.capsule()),
+        _ => engine
+            .latest_task_contract(&session.id, spec.task_id.as_deref())
+            .await
+            .ok()
+            .flatten()
+            .filter(|contract| contract.role == spec.role.as_str())
+            .map(|contract| contract.capsule()),
     };
     let layout = crate::instruction::normalize_prompt_layout(session.prompt_layout);
     if layout == crate::instruction::PROMPT_LAYOUT_V2 {
@@ -24498,6 +24958,12 @@ async fn build_prompt_sections(
         InstructionSectionKey::SessionContext,
         parts.session_context,
     ));
+    if let Some(capsule) = contract_capsule {
+        candidates.push(InstructionCandidate::new(
+            InstructionSectionKey::SessionContract,
+            capsule,
+        ));
+    }
     if let Some(run_task) = parts.run_task
         && !run_task.trim().is_empty()
     {

@@ -197,6 +197,54 @@ pub fn audit_cache_events(
         ));
     }
 
+    // 8b. A v3 prompt prefix or compaction boundary must carry the contract
+    // capsule identity when task contracts are enabled. Its absence means the
+    // capsule was dropped or a caller bypassed the typed contract; it is never
+    // silently inferred from the summary.
+    let latest_prefix = prefix_events.last();
+    let latest_compaction = compaction_events.last();
+    let prefix_missing = latest_prefix.is_some_and(|event| {
+        event
+            .payload
+            .get("prompt_layout")
+            .and_then(serde_json::Value::as_u64)
+            == Some(3)
+            && event
+                .payload
+                .get("contract_policy_enabled")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            && event
+                .payload
+                .get("contract_hash")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|hash| hash.is_empty())
+    });
+    let compaction_missing = latest_compaction.is_some_and(|event| {
+        event
+            .payload
+            .get("contract_policy_enabled")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+            && event
+                .payload
+                .get("contract_hash")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|hash| hash.is_empty())
+    });
+    if prefix_missing || compaction_missing {
+        findings.push(finding(
+            "contract_capsule_missing",
+            "warning",
+            "the latest v3 prompt prefix or compaction boundary has no contract capsule hash while task contracts are enabled"
+                .to_string(),
+            BTreeMap::from([
+                ("prefix_missing".to_string(), prefix_missing.into()),
+                ("compaction_missing".to_string(), compaction_missing.into()),
+            ]),
+        ));
+    }
+
     // 9. A disabled policy with cache markers would mean the policy was not
     //    applied. This is a real correctness error, not a performance hint.
     if policy.is_some_and(|policy| !policy.enabled)
@@ -871,6 +919,68 @@ mod tests {
         );
         assert!(result.findings.is_empty());
         assert!(result.clean);
+    }
+
+    #[test]
+    fn contract_capsule_missing_is_reported_only_when_contracts_are_enabled() {
+        let prefix = event(
+            "context.prompt_prefix",
+            serde_json::json!({
+                "prompt_layout": 3,
+                "contract_policy_enabled": true,
+                "contract_hash": null,
+                "prefix_hash": "p",
+            }),
+        );
+        let result = audit_cache_events(
+            "ses-1",
+            Some("openai-compatible"),
+            None,
+            &[],
+            std::slice::from_ref(&prefix),
+            &[],
+            &[],
+        );
+        assert!(codes(&result).contains(&"contract_capsule_missing"));
+
+        let with_contract = event(
+            "context.prompt_prefix",
+            serde_json::json!({
+                "prompt_layout": 3,
+                "contract_policy_enabled": true,
+                "contract_hash": "c".repeat(64),
+                "prefix_hash": "p",
+            }),
+        );
+        let result = audit_cache_events(
+            "ses-1",
+            Some("openai-compatible"),
+            None,
+            &[],
+            &[with_contract],
+            &[],
+            &[],
+        );
+        assert!(!codes(&result).contains(&"contract_capsule_missing"));
+
+        let disabled = event(
+            "context.prompt_prefix",
+            serde_json::json!({
+                "prompt_layout": 3,
+                "contract_policy_enabled": false,
+                "prefix_hash": "p",
+            }),
+        );
+        let result = audit_cache_events(
+            "ses-1",
+            Some("openai-compatible"),
+            None,
+            &[],
+            &[disabled],
+            &[],
+            &[],
+        );
+        assert!(!codes(&result).contains(&"contract_capsule_missing"));
     }
 
     #[test]

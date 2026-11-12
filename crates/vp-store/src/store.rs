@@ -17,23 +17,23 @@ use vp_protocol::types::{
     ApprovalAuditEvent, ApprovalGrant, ApprovalTemplate, Artifact, ArtifactPolicy,
     ArtifactProvenance, ArtifactVersion, AttentionPolicy, CacheEpochBundleBucket,
     CacheEpochReuseSession, CachePolicy, CheckpointRetentionPolicy, ContextCheckpoint,
-    ContextCheckpointPolicy, ContinuationOutcome, CriticalPathPolicy, Event, GuiActionInfo,
-    GuiPolicy, InstructionBlob, IntakeTask, IntegrationPolicy, MailboxPolicy, McpServer,
-    McpServerConfig, McpTransport, MemoryConflict, MemoryEmbeddingJobStatus, MemoryEmbeddingPolicy,
-    MemoryEmbeddingUsage, MemoryEmbeddingsStatusResult, MemoryEvidence, MemoryHealthResult,
-    MemoryItem, MemoryPolicy, MemoryStatCount, MergeQueueEntry, MergeQueueSource, MetricCount,
-    ModelPreset, OrchestrationDecision, OrchestrationNote, OrchestrationPolicy,
-    OrchestrationRecovery, PlanTaskProgress, PreemptionPolicy, PreemptionSessionSummary,
-    ProcessPolicy, Program, ProgramEvent, ProgramMilestone, ProgramMilestoneStatus, ProgramPolicy,
-    ProgramStatus, ProgramUsage, Project, ProjectBudget, ProjectUsageSession,
-    PromptPrefixAggregate, PromptPrefixObservation, PromptPrefixRecord, PromptSectionRef, Question,
-    RunBudgetSnapshot, RunCheckpoint, RunStep, RunToolCall, ScheduledTask, SearchHit, Session,
-    SessionBundle, SessionContinuation, SessionInstructionState, SessionRun, SessionRunPolicy,
-    ShellPolicy, Skill, Source, SourceChunk, SourceCollection, SourceEmbeddingIntegrity,
-    SourceEmbeddingJobStatus, SourceEmbeddingPolicy, SourceEmbeddingStatusResult,
-    SourceEmbeddingUsage, SourceRetrievalPolicy, SourceSearchHit, SourceStats, SteeringMessage,
-    StoredMessage, SupervisedProcess, TaskSchedulerPolicy, TaskStall, TeamPlan, TodoItem,
-    ToolOutputAuditResult, ToolOutputPolicy, ToolOutputToolStat, UsageEntry,
+    ContextCheckpointPolicy, ContinuationOutcome, ContractPolicy, CriticalPathPolicy, Event,
+    GuiActionInfo, GuiPolicy, InstructionBlob, IntakeTask, IntegrationPolicy, MailboxPolicy,
+    McpServer, McpServerConfig, McpToolPin, McpTransport, MemoryConflict, MemoryEmbeddingJobStatus,
+    MemoryEmbeddingPolicy, MemoryEmbeddingUsage, MemoryEmbeddingsStatusResult, MemoryEvidence,
+    MemoryHealthResult, MemoryItem, MemoryPolicy, MemoryStatCount, MergeQueueEntry,
+    MergeQueueSource, MetricCount, ModelPreset, OrchestrationDecision, OrchestrationNote,
+    OrchestrationPolicy, OrchestrationRecovery, PlanTaskProgress, PreemptionPolicy,
+    PreemptionSessionSummary, ProcessPolicy, Program, ProgramEvent, ProgramMilestone,
+    ProgramMilestoneStatus, ProgramPolicy, ProgramStatus, ProgramUsage, Project, ProjectBudget,
+    ProjectUsageSession, PromptPrefixAggregate, PromptPrefixObservation, PromptPrefixRecord,
+    PromptSectionRef, Question, RunBudgetSnapshot, RunCheckpoint, RunStep, RunToolCall,
+    ScheduledTask, SearchHit, Session, SessionBundle, SessionContinuation, SessionInstructionState,
+    SessionRun, SessionRunPolicy, ShellPolicy, Skill, Source, SourceChunk, SourceCollection,
+    SourceEmbeddingIntegrity, SourceEmbeddingJobStatus, SourceEmbeddingPolicy,
+    SourceEmbeddingStatusResult, SourceEmbeddingUsage, SourceRetrievalPolicy, SourceSearchHit,
+    SourceStats, SteeringMessage, StoredMessage, SupervisedProcess, TaskSchedulerPolicy, TaskStall,
+    TeamPlan, TodoItem, ToolOutputAuditResult, ToolOutputPolicy, ToolOutputToolStat, UsageEntry,
     WorktreeRetentionPolicy, WriteLease, cache_hit_ratio,
 };
 
@@ -858,6 +858,102 @@ fn expire_approval_tx(
     Ok(Some((approval, event)))
 }
 
+/// One persisted task-contract row. The canonical contract JSON is kept as a
+/// string so the store does not depend on `vp-core`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredContractRow {
+    #[serde(default)]
+    pub contract_id: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub plan_revision: u64,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub hash: String,
+    #[serde(default)]
+    pub source_hash: String,
+    #[serde(default)]
+    pub contract: String,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+/// One persisted `contract_usage` row. Values are projections of
+/// `intent.mutation` events.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContractUsageRow {
+    #[serde(default)]
+    pub contract_id: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub writes: u64,
+    #[serde(default)]
+    pub bytes: u64,
+    #[serde(default)]
+    pub commits: u64,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+fn map_stored_contract(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredContractRow> {
+    Ok(StoredContractRow {
+        contract_id: row.get(0)?,
+        project_id: row.get(1)?,
+        session_id: row.get(2)?,
+        task_id: row.get(3)?,
+        plan_revision: row.get::<_, i64>(4)?.max(0) as u64,
+        role: row.get(5)?,
+        hash: row.get(6)?,
+        source_hash: row.get(7)?,
+        contract: row.get(8)?,
+        created_at: row.get(9)?,
+    })
+}
+
+fn map_contract_usage(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContractUsageRow> {
+    Ok(ContractUsageRow {
+        contract_id: row.get(0)?,
+        project_id: row.get(1)?,
+        session_id: row.get(2)?,
+        task_id: row.get(3)?,
+        writes: row.get::<_, i64>(4)?.max(0) as u64,
+        bytes: row.get::<_, i64>(5)?.max(0) as u64,
+        commits: row.get::<_, i64>(6)?.max(0) as u64,
+        updated_at: row.get(7)?,
+    })
+}
+
+fn map_mcp_tool_pin(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpToolPin> {
+    Ok(McpToolPin {
+        project_id: row.get(0)?,
+        server_id: row.get(1)?,
+        server_name: row.get(2)?,
+        tool_name: row.get(3)?,
+        server_fingerprint: row.get(4)?,
+        schema_hash: row.get(5)?,
+        description_hash: row.get(6)?,
+        observed_schema_hash: row.get(7)?,
+        observed_description_hash: row.get(8)?,
+        observed_server_fingerprint: row.get(9)?,
+        status: row.get(10)?,
+        approved_at: row.get(11)?,
+        approved_by: row.get(12)?,
+        last_seen_at: row.get(13)?,
+        description_preview: row.get(14)?,
+    })
+}
+
 fn map_source_chunk(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceChunk> {
     Ok(SourceChunk {
         id: row.get(0)?,
@@ -925,6 +1021,10 @@ pub struct SessionRepair {
     /// deterministically from the current generator only on the next run, not
     /// during replay repair.
     pub instructions: Option<Vec<SessionInstructionState>>,
+    /// Event-backed task-contract rows (`contract.derived` events).
+    pub contracts: Option<Vec<StoredContractRow>>,
+    /// Event-backed mutation usage rows (`intent.mutation` events).
+    pub contract_usage: Option<Vec<ContractUsageRow>>,
     pub artifact_warnings: Vec<String>,
 }
 
@@ -1211,6 +1311,14 @@ pub struct ProjectManifestSnapshot {
     pub recorded_at: String,
     pub project: Project,
     pub shell_policy: ShellPolicy,
+    /// Project-scoped task-contract policy. Older manifests decode as the
+    /// enabled/enforce default.
+    #[serde(default)]
+    pub contract_policy: ContractPolicy,
+    /// Project-scoped MCP tool schema pins. These are project configuration,
+    /// not session events, so the manifest is their rebuild snapshot.
+    #[serde(default)]
+    pub mcp_tool_pins: Vec<McpToolPin>,
     /// Prompt-cache policy. Older manifests decode as the enabled, 5m,
     /// automatic, compact-aware default.
     #[serde(default)]
@@ -1743,6 +1851,73 @@ impl Store {
                 read_jail       INTEGER NOT NULL DEFAULT 0,
                 updated_at      TEXT NOT NULL
             );
+
+            -- Project-scoped task-contract policy. A missing row means the
+            -- enabled/enforce default; it never means "no policy".
+            CREATE TABLE IF NOT EXISTS project_contract_policies (
+                project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                policy     TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            -- Canonical task contracts. A row is a projection of the matching
+            -- `contract.derived` event; replay/repair/db-rebuild recreate it.
+            CREATE TABLE IF NOT EXISTS contracts (
+                contract_id   TEXT PRIMARY KEY,
+                project_id    TEXT NOT NULL,
+                session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                task_id       TEXT,
+                plan_revision INTEGER NOT NULL,
+                role          TEXT NOT NULL,
+                hash          TEXT NOT NULL,
+                source_hash   TEXT NOT NULL,
+                contract      TEXT NOT NULL,
+                created_at    TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_contracts_session
+                ON contracts(session_id, created_at);
+
+            -- Per-contract mutation usage derived from `intent.mutation`
+            -- events. It is a projection, not an independent authority.
+            CREATE TABLE IF NOT EXISTS contract_usage (
+                contract_id TEXT PRIMARY KEY,
+                project_id  TEXT NOT NULL,
+                session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                task_id     TEXT,
+                writes      INTEGER NOT NULL DEFAULT 0,
+                bytes       INTEGER NOT NULL DEFAULT 0,
+                commits     INTEGER NOT NULL DEFAULT 0,
+                updated_at  TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_contract_usage_session
+                ON contract_usage(session_id);
+
+            -- Project-scoped MCP tool schema pins. Approved hashes are never
+            -- overwritten by discovery; observed hashes record drift.
+            CREATE TABLE IF NOT EXISTS mcp_tool_pins (
+                project_id                 TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                server_id                  TEXT NOT NULL,
+                server_name                TEXT NOT NULL,
+                tool_name                  TEXT NOT NULL,
+                server_fingerprint         TEXT NOT NULL,
+                schema_hash                TEXT NOT NULL,
+                description_hash           TEXT NOT NULL,
+                observed_schema_hash       TEXT NOT NULL,
+                observed_description_hash  TEXT NOT NULL,
+                observed_server_fingerprint TEXT NOT NULL,
+                status                     TEXT NOT NULL,
+                approved_at                TEXT,
+                approved_by                TEXT,
+                last_seen_at               TEXT NOT NULL,
+                description_preview        TEXT NOT NULL,
+                PRIMARY KEY (project_id, server_id, tool_name)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_mcp_tool_pins_server
+                ON mcp_tool_pins(project_id, server_id);
+
 
             CREATE TABLE IF NOT EXISTS project_process_policies (
                 project_id          TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
@@ -4033,6 +4208,8 @@ impl Store {
                 version: 1,
                 recorded_at: now_rfc3339(),
                 shell_policy: self.get_shell_policy(&project.id)?,
+                contract_policy: self.get_contract_policy(&project.id)?,
+                mcp_tool_pins: self.list_mcp_tool_pins(&project.id, None)?,
                 cache_policy: self.get_cache_policy(&project.id)?,
                 execution_host: self.get_execution_host(&project.id)?,
                 remote_integration_policy: self.get_remote_integration_policy(&project.id)?,
@@ -4182,6 +4359,393 @@ impl Store {
                 now_rfc3339()
             ],
         )?;
+        Ok(())
+    }
+
+    pub fn get_contract_policy(&self, project_id: &str) -> Result<ContractPolicy> {
+        let conn = self.lock()?;
+        let stored = conn
+            .query_row(
+                "SELECT policy FROM project_contract_policies WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match stored {
+            Some(policy) => {
+                let policy: ContractPolicy =
+                    serde_json::from_str(&policy).context("parsing stored contract policy")?;
+                policy
+                    .normalized()
+                    .map_err(|error| anyhow!("stored contract policy is invalid: {error}"))
+            }
+            None => Ok(ContractPolicy::default()),
+        }
+    }
+
+    pub fn set_contract_policy(&self, project_id: &str, policy: &ContractPolicy) -> Result<()> {
+        let policy = policy
+            .normalized()
+            .map_err(|error| anyhow!("invalid contract policy: {error}"))?;
+        let encoded = serde_json::to_string(&policy)?;
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO project_contract_policies (project_id, policy, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(project_id) DO UPDATE SET
+                policy = excluded.policy,
+                updated_at = excluded.updated_at",
+            params![project_id, encoded, now_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_contract(&self, row: &StoredContractRow) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO contracts
+             (contract_id, project_id, session_id, task_id, plan_revision, role, hash,
+              source_hash, contract, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(contract_id) DO UPDATE SET
+                contract = excluded.contract,
+                hash = excluded.hash,
+                source_hash = excluded.source_hash",
+            params![
+                row.contract_id,
+                row.project_id,
+                row.session_id,
+                row.task_id,
+                row.plan_revision as i64,
+                row.role,
+                row.hash,
+                row.source_hash,
+                row.contract,
+                row.created_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_contracts_for_session(&self, session_id: &str) -> Result<Vec<StoredContractRow>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT contract_id, project_id, session_id, task_id, plan_revision, role,
+                    hash, source_hash, contract, created_at
+             FROM contracts WHERE session_id = ?1
+             ORDER BY created_at, contract_id",
+        )?;
+        let rows = statement
+            .query_map(params![session_id], map_stored_contract)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn latest_contract(
+        &self,
+        session_id: &str,
+        task_id: Option<&str>,
+    ) -> Result<Option<StoredContractRow>> {
+        let conn = self.lock()?;
+        let row = match task_id {
+            Some(task_id) => conn
+                .query_row(
+                    "SELECT contract_id, project_id, session_id, task_id, plan_revision, role,
+                            hash, source_hash, contract, created_at
+                     FROM contracts WHERE session_id = ?1 AND task_id = ?2
+                     ORDER BY created_at DESC, contract_id DESC LIMIT 1",
+                    params![session_id, task_id],
+                    map_stored_contract,
+                )
+                .optional()?,
+            None => conn
+                .query_row(
+                    "SELECT contract_id, project_id, session_id, task_id, plan_revision, role,
+                            hash, source_hash, contract, created_at
+                     FROM contracts WHERE session_id = ?1 AND task_id IS NULL
+                     ORDER BY created_at DESC, contract_id DESC LIMIT 1",
+                    params![session_id],
+                    map_stored_contract,
+                )
+                .optional()?,
+        };
+        Ok(row)
+    }
+
+    pub fn replace_contracts(&self, session_id: &str, rows: &[StoredContractRow]) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM contracts WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        for row in rows {
+            tx.execute(
+                "INSERT INTO contracts
+                 (contract_id, project_id, session_id, task_id, plan_revision, role, hash,
+                  source_hash, contract, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    row.contract_id,
+                    row.project_id,
+                    row.session_id,
+                    row.task_id,
+                    row.plan_revision as i64,
+                    row.role,
+                    row.hash,
+                    row.source_hash,
+                    row.contract,
+                    row.created_at
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_contract_usage(&self, contract_id: &str) -> Result<ContractUsageRow> {
+        let conn = self.lock()?;
+        let row = conn
+            .query_row(
+                "SELECT contract_id, project_id, session_id, task_id, writes, bytes,
+                        commits, updated_at
+                 FROM contract_usage WHERE contract_id = ?1",
+                params![contract_id],
+                map_contract_usage,
+            )
+            .optional()?;
+        Ok(row.unwrap_or_else(|| ContractUsageRow {
+            contract_id: contract_id.to_string(),
+            ..ContractUsageRow::default()
+        }))
+    }
+
+    pub fn list_contract_usage_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<ContractUsageRow>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT contract_id, project_id, session_id, task_id, writes, bytes, commits,
+                    updated_at
+             FROM contract_usage WHERE session_id = ?1 ORDER BY contract_id",
+        )?;
+        let rows = statement
+            .query_map(params![session_id], map_contract_usage)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn latest_session_for_project(&self, project_id: &str) -> Result<Option<String>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id FROM sessions WHERE project_id = ?1
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+            params![project_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_contract_usage(
+        &self,
+        contract_id: &str,
+        project_id: &str,
+        session_id: &str,
+        task_id: Option<&str>,
+        writes: u64,
+        bytes: u64,
+        commits: u64,
+    ) -> Result<ContractUsageRow> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO contract_usage
+             (contract_id, project_id, session_id, task_id, writes, bytes, commits, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(contract_id) DO UPDATE SET
+                writes = contract_usage.writes + excluded.writes,
+                bytes = contract_usage.bytes + excluded.bytes,
+                commits = contract_usage.commits + excluded.commits,
+                updated_at = excluded.updated_at",
+            params![
+                contract_id,
+                project_id,
+                session_id,
+                task_id,
+                writes as i64,
+                bytes as i64,
+                commits as i64,
+                now_rfc3339()
+            ],
+        )?;
+        let row = conn.query_row(
+            "SELECT contract_id, project_id, session_id, task_id, writes, bytes,
+                    commits, updated_at
+             FROM contract_usage WHERE contract_id = ?1",
+            params![contract_id],
+            map_contract_usage,
+        )?;
+        Ok(row)
+    }
+
+    pub fn replace_contract_usage(
+        &self,
+        session_id: &str,
+        rows: &[ContractUsageRow],
+    ) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM contract_usage WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        for row in rows {
+            tx.execute(
+                "INSERT INTO contract_usage
+                 (contract_id, project_id, session_id, task_id, writes, bytes, commits,
+                  updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    row.contract_id,
+                    row.project_id,
+                    row.session_id,
+                    row.task_id,
+                    row.writes as i64,
+                    row.bytes as i64,
+                    row.commits as i64,
+                    row.updated_at
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_mcp_tool_pins(
+        &self,
+        project_id: &str,
+        server_id: Option<&str>,
+    ) -> Result<Vec<McpToolPin>> {
+        let conn = self.lock()?;
+        let mut rows = Vec::new();
+        match server_id {
+            Some(server_id) => {
+                let mut statement = conn.prepare(
+                    "SELECT project_id, server_id, server_name, tool_name,
+                            server_fingerprint, schema_hash, description_hash,
+                            observed_schema_hash, observed_description_hash,
+                            observed_server_fingerprint, status, approved_at, approved_by,
+                            last_seen_at, description_preview
+                     FROM mcp_tool_pins
+                     WHERE project_id = ?1 AND server_id = ?2
+                     ORDER BY server_id, tool_name",
+                )?;
+                let mapped =
+                    statement.query_map(params![project_id, server_id], map_mcp_tool_pin)?;
+                for row in mapped {
+                    rows.push(row?);
+                }
+            }
+            None => {
+                let mut statement = conn.prepare(
+                    "SELECT project_id, server_id, server_name, tool_name,
+                            server_fingerprint, schema_hash, description_hash,
+                            observed_schema_hash, observed_description_hash,
+                            observed_server_fingerprint, status, approved_at, approved_by,
+                            last_seen_at, description_preview
+                     FROM mcp_tool_pins
+                     WHERE project_id = ?1
+                     ORDER BY server_id, tool_name",
+                )?;
+                let mapped = statement.query_map(params![project_id], map_mcp_tool_pin)?;
+                for row in mapped {
+                    rows.push(row?);
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    pub fn upsert_mcp_tool_pin(&self, pin: &McpToolPin) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO mcp_tool_pins
+             (project_id, server_id, server_name, tool_name, server_fingerprint,
+              schema_hash, description_hash, observed_schema_hash,
+              observed_description_hash, observed_server_fingerprint, status,
+              approved_at, approved_by, last_seen_at, description_preview)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+             ON CONFLICT(project_id, server_id, tool_name) DO UPDATE SET
+                server_name = excluded.server_name,
+                server_fingerprint = excluded.server_fingerprint,
+                schema_hash = excluded.schema_hash,
+                description_hash = excluded.description_hash,
+                observed_schema_hash = excluded.observed_schema_hash,
+                observed_description_hash = excluded.observed_description_hash,
+                observed_server_fingerprint = excluded.observed_server_fingerprint,
+                status = excluded.status,
+                approved_at = excluded.approved_at,
+                approved_by = excluded.approved_by,
+                last_seen_at = excluded.last_seen_at,
+                description_preview = excluded.description_preview",
+            params![
+                pin.project_id,
+                pin.server_id,
+                pin.server_name,
+                pin.tool_name,
+                pin.server_fingerprint,
+                pin.schema_hash,
+                pin.description_hash,
+                pin.observed_schema_hash,
+                pin.observed_description_hash,
+                pin.observed_server_fingerprint,
+                pin.status,
+                pin.approved_at,
+                pin.approved_by,
+                pin.last_seen_at,
+                pin.description_preview
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn replace_mcp_tool_pins(&self, project_id: &str, pins: &[McpToolPin]) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM mcp_tool_pins WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        for pin in pins {
+            tx.execute(
+                "INSERT INTO mcp_tool_pins
+                 (project_id, server_id, server_name, tool_name, server_fingerprint,
+                  schema_hash, description_hash, observed_schema_hash,
+                  observed_description_hash, observed_server_fingerprint, status,
+                  approved_at, approved_by, last_seen_at, description_preview)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![
+                    pin.project_id,
+                    pin.server_id,
+                    pin.server_name,
+                    pin.tool_name,
+                    pin.server_fingerprint,
+                    pin.schema_hash,
+                    pin.description_hash,
+                    pin.observed_schema_hash,
+                    pin.observed_description_hash,
+                    pin.observed_server_fingerprint,
+                    pin.status,
+                    pin.approved_at,
+                    pin.approved_by,
+                    pin.last_seen_at,
+                    pin.description_preview
+                ],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -24709,6 +25273,70 @@ impl Store {
                         row.hash,
                         row.ordinal as i64,
                         if row.tail { 1 } else { 0 },
+                        row.updated_at
+                    ],
+                )?;
+            }
+        }
+        if let Some(contracts) = &repair.contracts {
+            tx.execute(
+                "DELETE FROM contracts WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            for row in contracts {
+                if row.session_id != session_id {
+                    return Err(anyhow!(
+                        "replayed contract {} does not belong to session {}",
+                        row.contract_id,
+                        session_id
+                    ));
+                }
+                tx.execute(
+                    "INSERT INTO contracts
+                     (contract_id, project_id, session_id, task_id, plan_revision, role,
+                      hash, source_hash, contract, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        row.contract_id,
+                        row.project_id,
+                        row.session_id,
+                        row.task_id,
+                        row.plan_revision as i64,
+                        row.role,
+                        row.hash,
+                        row.source_hash,
+                        row.contract,
+                        row.created_at
+                    ],
+                )?;
+            }
+        }
+        if let Some(usage) = &repair.contract_usage {
+            tx.execute(
+                "DELETE FROM contract_usage WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            for row in usage {
+                if row.session_id != session_id {
+                    return Err(anyhow!(
+                        "replayed contract usage {} does not belong to session {}",
+                        row.contract_id,
+                        session_id
+                    ));
+                }
+                tx.execute(
+                    "INSERT INTO contract_usage
+                     (contract_id, project_id, session_id, task_id, writes, bytes,
+                      commits, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        row.contract_id,
+                        row.project_id,
+                        row.session_id,
+                        row.task_id,
+                        row.writes as i64,
+                        row.bytes as i64,
+                        row.commits as i64,
                         row.updated_at
                     ],
                 )?;
