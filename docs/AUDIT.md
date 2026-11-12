@@ -152,6 +152,19 @@ Limits:
 - Legacy project-memory tables/tools are unchanged; explicit `scope=project` is a distinct store.
 - No mutation UI, org chart, hiring/retirement, or team templates (S6–S8).
 
+## 0.13 2026-11-13 Contracted execution C6
+
+C6 is implemented and merged at `feb2a71` (ADR-0198): bounded provenance DAG, earliest-unsupported-claim attribution, handoff hash checks, stale evidence, false consensus, cascade root→target, explicit ledger recording, and read-only diagnosis. Rust 3,805 passed; Swift 513 passed.
+
+Limits:
+
+- Event window default 20k/max 50k; older evidence is omitted with `truncated`.
+- Test evidence only covers `run_project_task`/`test_cache.stored`; raw shell test runs are not parsed because their arguments/output are content.
+- `false_consensus` is evidence linkage, not semantic proof of check validity.
+- Stale detection needs distinct commits; raw test runs are not commit-associated.
+- Historical identity is not inferred from current assignments.
+- Ledger is event-only and recording is explicit; no cross-session/project attribution, retention sweep, GUI graph editor, or automatic remediation.
+
 ## 0. 2026-10-30 跟进
 
 第一轮硬化已完成（同一 `main` 线，提交见仓库历史）：

@@ -1,7 +1,7 @@
 # VerlinPark 进度
 
 > 最后更新：2026-11-12
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark + task contracts/intent authorization/MCP schema pins + effect receipts/postconditions + external gates/durable waits + runtime pinning/controller replay + reliability/OTel + project-scoped identities S1–S5 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark + task contracts/intent authorization/MCP schema pins + effect receipts/postconditions + external gates/durable waits + runtime pinning/controller replay + reliability/OTel + project-scoped identities S1–S5 + failure attribution/cascade 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
@@ -279,6 +279,49 @@ C5 已实现并合入 `782cb19`，ADR-0197。Rust **3,571 passed / 0 failed / 6 
 - Coordination accounting 是 role/task attribution，不是 work classifier。
 - OTel metadata-only，最多 5,000 events；无 background exporter、remote collector、collector auth、cross-host correlation。
 - Reliability report 是描述性的，不是 leaderboard、significance test 或 merge gate。
+
+---
+
+## 2026-11-13 Contracted execution C6: failure attribution and cascade ledger
+
+C6 已实现并合入 `feb2a71`，ADR-0198。Rust **3,805 passed / 0 failed / 6 ignored**，Swift **513 passed**（381 app + 132 helper），clippy/swiftformat/xcodebuild 通过。
+
+### Provenance DAG
+
+- `vp-core::diagnosis` 仅从现有 events 构建 bounded deterministic graph：task、agent、identity（仅事件中存在时）、artifact、commit、tool/test evidence、verification、merge、workspace、effect、contract、failure。
+- edges：`depends_on`、`produced`、`used`、`verified`、`merged`、`failed`。
+- caps：2,000 nodes、4,000 edges、64 dependency levels；bounded evidence/findings/cascade/responsible agents；deterministic digest；`truncated`/`depth_limited`。
+- 不含 prompt text、tool args/results、file content、command text、URLs、secrets、raw summaries。
+
+### Attribution
+
+- 报告 **earliest unsupported claim**，不是最后一个失败点：
+  - `cascade_upstream`：上游 failed/blocked task。
+  - `missing_evidence`：上游 result 没有 commit/artifact hash。
+  - `unsubstantiated_handoff`：Worker 没引用匹配的 upstream hash，也没读过 upstream artifact。
+  - `stale_evidence`：check/verdict 覆盖旧 commit，之后没有覆盖最新 commit 的 evidence。
+  - `false_consensus`：Worker project-task check + Verifier approval 之后 integration 失败，flag 两个 agent。
+  - fallback：`verifier_rejection`、`merge_conflict`、`integration_failure`、`task_failure`。
+- cascade 只报 root→target，不把 sibling failure 都算进去。
+- 只做 advisory：不 retry/cancel/merge/reassign/block/approval/budget/capacity/plan change；无 model/provider call。
+
+### 持久化 / 界面
+
+- `session.diagnosis` 只读；`session.diagnosis.record` 显式记录 bounded ledger snapshot；imported read-only archive 拒绝 recording；`session.attributions` 读 ledger。
+- `vp diagnose <session> [--task] [--limit] [--graph] [--record] [--history]`。
+- Swift：`DiagnosisModels.swift`、Stage `FailureDiagnosisBadge`、Efficiency `FailureDiagnosisSection`、CoreClient/AppModel。
+- Worker `agent.finished` 现在带 bounded `changed_paths`，用于连接 commit/path，不读取 repository content。
+- typed Q3 errors：`DIAGNOSIS_SESSION_NOT_FOUND`、`DIAGNOSIS_INVALID_WINDOW`、`DIAGNOSIS_RECORD_INVALID`。
+
+### 限制
+
+- Event window 默认 20,000 / max 50,000；更老 evidence 被省略并标 `truncated`。
+- Test evidence 只覆盖 `run_project_task` / `test_cache.stored` metadata；raw `shell` test run 不解析（args/output 是 content）。
+- `false_consensus` 是 evidence linkage，不是 semantic proof。
+- Stale detection 需要 distinct commits；raw test run 不与 commit 关联。
+- Historical identity 不从当前 assignment 推断。
+- Ledger 是 event-only（无 projection table）；recording 显式。
+- 无 cross-session/cross-project attribution、retention sweep、GUI graph editor、automatic remediation。
 
 ---
 

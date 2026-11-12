@@ -9,19 +9,34 @@
       "id": "phase-1",
       "title": "Contract & Effects (next round)",
       "status": "planned",
-      "tasks": ["C1", "C2", "C3", "C4", "C5"]
+      "tasks": [
+        "C1",
+        "C2",
+        "C3",
+        "C4",
+        "C5"
+      ]
     },
     {
       "id": "phase-2",
       "title": "Diagnosis & Scale",
       "status": "planned",
-      "tasks": ["C6", "C7", "C8", "C9"]
+      "tasks": [
+        "C6",
+        "C7",
+        "C8",
+        "C9"
+      ]
     },
     {
       "id": "phase-3",
       "title": "Tool Execution v2",
       "status": "planned",
-      "tasks": ["C10", "C11", "C12"]
+      "tasks": [
+        "C10",
+        "C11",
+        "C12"
+      ]
     }
   ],
   "tasks": [
@@ -30,7 +45,7 @@
       "title": "TaskContract, intent authorization, and MCP schema drift",
       "phase": "phase-1",
       "priority": "P0",
-      "status": "planned",
+      "status": "implemented",
       "depends_on": [],
       "files": [
         "crates/vp-core/src/contract.rs",
@@ -73,8 +88,10 @@
       "title": "EffectReceipts and postconditions",
       "phase": "phase-1",
       "priority": "P0",
-      "status": "planned",
-      "depends_on": ["C1"],
+      "status": "implemented",
+      "depends_on": [
+        "C1"
+      ],
       "files": [
         "crates/vp-core/src/effect.rs",
         "crates/vp-core/src/agent.rs",
@@ -109,8 +126,10 @@
       "title": "Durable external gates",
       "phase": "phase-1",
       "priority": "P1",
-      "status": "planned",
-      "depends_on": ["C1"],
+      "status": "implemented",
+      "depends_on": [
+        "C1"
+      ],
       "files": [
         "crates/vp-core/src/gates.rs",
         "crates/vp-core/src/agent.rs",
@@ -143,8 +162,10 @@
       "title": "Version pinning and controller replay",
       "phase": "phase-1",
       "priority": "P1",
-      "status": "planned",
-      "depends_on": ["C1"],
+      "status": "implemented",
+      "depends_on": [
+        "C1"
+      ],
       "files": [
         "crates/vp-core/src/versioning.rs",
         "crates/vp-core/src/agent.rs",
@@ -176,8 +197,11 @@
       "title": "Reliability suite and OTel projection",
       "phase": "phase-1",
       "priority": "P1",
-      "status": "planned",
-      "depends_on": ["C1", "C2"],
+      "status": "implemented",
+      "depends_on": [
+        "C1",
+        "C2"
+      ],
       "files": [
         "crates/vp-bench/src/metrics.rs",
         "crates/vp-bench/src/runner.rs",
@@ -206,8 +230,11 @@
       "title": "Failure attribution and error-cascade ledger",
       "phase": "phase-2",
       "priority": "P1",
-      "status": "planned",
-      "depends_on": ["C2", "C4"],
+      "status": "implemented",
+      "depends_on": [
+        "C2",
+        "C4"
+      ],
       "files": [
         "crates/vp-core/src/attribution.rs",
         "crates/vp-core/src/agent.rs",
@@ -239,7 +266,9 @@
       "phase": "phase-2",
       "priority": "P2",
       "status": "planned",
-      "depends_on": ["C1"],
+      "depends_on": [
+        "C1"
+      ],
       "files": [
         "crates/vp-core/src/fanout.rs",
         "crates/vp-core/src/agent.rs",
@@ -271,7 +300,10 @@
       "phase": "phase-2",
       "priority": "P2",
       "status": "planned",
-      "depends_on": ["C1", "C4"],
+      "depends_on": [
+        "C1",
+        "C4"
+      ],
       "files": [
         "crates/vp-core/src/tool_bundle.rs",
         "crates/vp-core/src/tooling/search.rs",
@@ -301,7 +333,10 @@
       "phase": "phase-2",
       "priority": "P2",
       "status": "planned",
-      "depends_on": ["C2", "C3"],
+      "depends_on": [
+        "C2",
+        "C3"
+      ],
       "files": [
         "crates/vp-core/src/mcp.rs",
         "crates/vp-core/src/mcp/tasks.rs",
@@ -334,7 +369,10 @@
       "phase": "phase-3",
       "priority": "P1",
       "status": "planned",
-      "depends_on": ["C1", "C2"],
+      "depends_on": [
+        "C1",
+        "C2"
+      ],
       "files": [
         "crates/vp-core/src/script.rs",
         "crates/vp-core/src/agent.rs",
@@ -370,7 +408,10 @@
       "phase": "phase-3",
       "priority": "P3",
       "status": "planned",
-      "depends_on": ["C3", "C4"],
+      "depends_on": [
+        "C3",
+        "C4"
+      ],
       "files": [
         "crates/vp-core/src/a2a.rs",
         "crates/vp-daemon/src/main.rs",
@@ -397,7 +438,9 @@
       "phase": "phase-3",
       "priority": "P3",
       "status": "planned",
-      "depends_on": ["C6"],
+      "depends_on": [
+        "C6"
+      ],
       "files": [
         "crates/vp-core/src/orchestration.rs",
         "crates/vp-core/src/agent.rs",
@@ -466,5 +509,57 @@
     "https://invariantlabs.ai/blog/mcp-security-notification-tool-poisoning-attacks",
     "https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/tasks",
     "https://github.com/a2aproject/A2A"
-  ]
+  ],
+  "implementation": {
+    "phase_1_complete": true,
+    "C1": {
+      "commit": "2647e67",
+      "adr": "0193",
+      "tests": {
+        "rust": 3418,
+        "swift": 483
+      }
+    },
+    "C2": {
+      "commit": "d78d253",
+      "adr": "0194",
+      "tests": {
+        "rust": 3458,
+        "swift": 487
+      }
+    },
+    "C3": {
+      "commit": "835cb17",
+      "adr": "0195",
+      "tests": {
+        "rust": 3506,
+        "swift": 491
+      }
+    },
+    "C4": {
+      "commit": "f66e485",
+      "adr": "0196",
+      "tests": {
+        "rust": 3531,
+        "swift": 495
+      }
+    },
+    "C5": {
+      "commit": "782cb19",
+      "adr": "0197",
+      "tests": {
+        "rust": 3571,
+        "swift": 500
+      }
+    },
+    "C6": {
+      "commit": "feb2a71",
+      "adr": "0198",
+      "tests": {
+        "rust": 3805,
+        "swift": 513
+      }
+    },
+    "notes": "C1-C5 are Contracted Execution Phase 1; C6 is Phase 2. Swift counts are combined app+helper."
+  }
 }
