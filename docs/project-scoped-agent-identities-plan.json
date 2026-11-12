@@ -9,22 +9,39 @@
     "leader": {
       "identity_scope": "project",
       "execution": "per_run",
-      "owns": ["project_goal", "portfolio", "budget", "final_plan_approval"]
+      "owns": [
+        "project_goal",
+        "portfolio",
+        "budget",
+        "final_plan_approval"
+      ]
     },
     "manager": {
       "identity_scope": "project_department",
       "execution": "per_run",
-      "owns": ["department_architecture", "interface_contracts", "worker_review"]
+      "owns": [
+        "department_architecture",
+        "interface_contracts",
+        "worker_review"
+      ]
     },
     "worker": {
       "identity_scope": "project_component",
       "execution": "per_run",
-      "owns": ["component_workspace", "labour_tasks", "low_level_design", "review", "integration"]
+      "owns": [
+        "component_workspace",
+        "labour_tasks",
+        "low_level_design",
+        "review",
+        "integration"
+      ]
     },
     "labour": {
       "identity_scope": "task",
       "execution": "per_task",
-      "owns": ["child_task_worktree"],
+      "owns": [
+        "child_task_worktree"
+      ],
       "job": "bulk implementation, tests, commit; no delegation"
     },
     "verifier": {
@@ -86,6 +103,11 @@
       "id": "S7",
       "title": "GUI, CLI, observability",
       "status": "planned"
+    },
+    {
+      "id": "S8",
+      "title": "Portable team templates / team charter",
+      "status": "planned"
     }
   ],
   "tasks": [
@@ -93,7 +115,10 @@
       "id": "S1",
       "title": "Identity schema, lifecycle, policy, and migration",
       "priority": "P0",
-      "depends_on": ["C1", "C4"],
+      "depends_on": [
+        "C1",
+        "C4"
+      ],
       "files": [
         "crates/vp-core/src/identity.rs",
         "crates/vp-core/src/lib.rs",
@@ -124,7 +149,9 @@
       "id": "S2",
       "title": "Session assignment, identity lease, and inbox",
       "priority": "P0",
-      "depends_on": ["S1"],
+      "depends_on": [
+        "S1"
+      ],
       "files": [
         "crates/vp-core/src/identity.rs",
         "crates/vp-core/src/mailbox.rs",
@@ -153,7 +180,10 @@
       "id": "S3",
       "title": "Role contracts, prompts, and cache",
       "priority": "P0",
-      "depends_on": ["S1", "S2"],
+      "depends_on": [
+        "S1",
+        "S2"
+      ],
       "files": [
         "crates/vp-core/src/instruction.rs",
         "crates/vp-core/src/agent.rs",
@@ -185,7 +215,10 @@
       "id": "S4",
       "title": "Worker workspace and two-level integration",
       "priority": "P0",
-      "depends_on": ["S2", "S3"],
+      "depends_on": [
+        "S2",
+        "S3"
+      ],
       "files": [
         "crates/vp-core/src/identity.rs",
         "crates/vp-core/src/worktree.rs",
@@ -219,7 +252,10 @@
       "id": "S5",
       "title": "Identity memory",
       "priority": "P1",
-      "depends_on": ["S1", "S2"],
+      "depends_on": [
+        "S1",
+        "S2"
+      ],
       "files": [
         "crates/vp-core/src/memory.rs",
         "crates/vp-core/src/agent.rs",
@@ -248,7 +284,11 @@
       "id": "S6",
       "title": "Hiring, retirement, and performance",
       "priority": "P1",
-      "depends_on": ["S1", "C2", "C6"],
+      "depends_on": [
+        "S1",
+        "C2",
+        "C6"
+      ],
       "files": [
         "crates/vp-core/src/identity.rs",
         "crates/vp-core/src/attribution.rs",
@@ -280,7 +320,14 @@
       "id": "S7",
       "title": "GUI, CLI, and observability",
       "priority": "P1",
-      "depends_on": ["S1", "S2", "S3", "S4", "S5", "S6"],
+      "depends_on": [
+        "S1",
+        "S2",
+        "S3",
+        "S4",
+        "S5",
+        "S6"
+      ],
       "files": [
         "apps/macos/VerlinPark/Core/Models.swift",
         "apps/macos/VerlinPark/Core/CoreClient.swift",
@@ -304,27 +351,124 @@
         "retired/idle badges"
       ],
       "acceptance": "Operators can see and manage the project org chart through real RPCs."
+    },
+    {
+      "id": "S8",
+      "title": "Portable team templates / team charter",
+      "priority": "P1",
+      "depends_on": [
+        "S1",
+        "S6",
+        "S7"
+      ],
+      "files": [
+        "crates/vp-core/src/team_template.rs",
+        "crates/vp-core/src/identity.rs",
+        "crates/vp-store/src/store.rs",
+        "crates/vp-store/src/store/tests.rs",
+        "crates/vp-protocol/src/types.rs",
+        "crates/vp-daemon/src/main.rs",
+        "crates/vp-cli/src/main.rs",
+        "apps/macos/VerlinPark/Core/Models.swift",
+        "apps/macos/VerlinPark/Core/CoreClient.swift",
+        "apps/macos/VerlinPark/Features/AppModel.swift",
+        "apps/macos/VerlinPark/Features/ManageDashView.swift",
+        "docs/adr/0208-portable-team-templates.md"
+      ],
+      "deliverables": [
+        "TeamTemplate JSON schema with leader/departments/workers/labour defaults/rules/budgets/model bindings/tool policy/skills/conventions",
+        "deterministic TEAM.md rendering and content hash",
+        "export from project roster/policies with context/memory/secrets/IDs/paths redacted",
+        "import preview, validation, dry-run, and approval-classified apply",
+        "team_templates and project_team_templates storage plus manifest/db-rebuild",
+        "optional identity instantiation through S6 hire; never overwrite existing identities",
+        "target project policy wins; no budget/approval/sandbox/MCP/Verifier widening",
+        "RPC/CLI/GUI team template library, diff, org-chart preview, conflict sheet"
+      ],
+      "tests": [
+        "JSON/Markdown round-trip",
+        "no context/memory/secrets/agent IDs/session IDs/absolute paths in export",
+        "invalid tool/model fails closed",
+        "budget widening rejected",
+        "target policy wins over template",
+        "dry-run/apply idempotency and conflict detection",
+        "identity provenance hash recorded on hire",
+        "template diff"
+      ],
+      "acceptance": "A successful project can export a portable team charter, import it into another project, and get the same roles/rules with fresh memory and no context leakage."
     }
   ],
   "dependencies": {
-    "S1": ["C1", "C4"],
-    "S2": ["S1"],
-    "S3": ["S1", "S2"],
-    "S4": ["S2", "S3"],
-    "S5": ["S1", "S2"],
-    "S6": ["S1", "C2", "C6"],
-    "S7": ["S1", "S2", "S3", "S4", "S5", "S6"],
-    "C10_code_mode": ["S3", "S4"],
-    "C6_failure_attribution": ["C2", "C4"],
-    "C7_fanout": ["C1"]
+    "S1": [
+      "C1",
+      "C4"
+    ],
+    "S2": [
+      "S1"
+    ],
+    "S3": [
+      "S1",
+      "S2"
+    ],
+    "S4": [
+      "S2",
+      "S3"
+    ],
+    "S5": [
+      "S1",
+      "S2"
+    ],
+    "S6": [
+      "S1",
+      "C2",
+      "C6"
+    ],
+    "S7": [
+      "S1",
+      "S2",
+      "S3",
+      "S4",
+      "S5",
+      "S6"
+    ],
+    "C10_code_mode": [
+      "S3",
+      "S4"
+    ],
+    "C6_failure_attribution": [
+      "C2",
+      "C4"
+    ],
+    "C7_fanout": [
+      "C1"
+    ],
+    "S8": [
+      "S1",
+      "S6",
+      "S7"
+    ]
   },
   "migration": {
     "default_enabled": false,
     "existing_sessions": "remain run-scoped; no synthetic identities",
     "new_sessions": "create/assign identities only when AgentIdentityPolicy is enabled",
     "rollback": "disable policy; stop new assignments; identities remain readable/retired",
-    "persistence": ["agent_identities", "agent_runs", "session_agent_assignments", "agent_inbox", "agent_memories", "agent_workspaces"],
-    "rebuild": ["replay", "repair", "db-rebuild", "bundle export/import"]
+    "persistence": [
+      "agent_identities",
+      "agent_runs",
+      "session_agent_assignments",
+      "agent_inbox",
+      "agent_memories",
+      "agent_workspaces",
+      "team_templates",
+      "project_team_templates"
+    ],
+    "rebuild": [
+      "replay",
+      "repair",
+      "db-rebuild",
+      "bundle export/import"
+    ]
   },
   "acceptance": [
     "no gate weakening",
@@ -347,7 +491,8 @@
     "infinite identity memory or memory as credential",
     "public A2A identity federation v1",
     "replacement of Verifier/Integrator/deterministic scheduler",
-    "automatic Manager creation"
+    "automatic Manager creation",
+    "exporting context/memory/inbox/worktrees/secrets in a team template"
   ],
   "risks": [
     "big migration; mitigated by additive tables and policy-off default",
@@ -356,14 +501,16 @@
     "stale memory; evidence/TTL/bounded brief",
     "model/role drift; generation + approval",
     "operator overhead; Labour remains automatic",
-    "anthropomorphism; identity is accountability, not personhood"
+    "anthropomorphism; identity is accountability, not personhood",
+    "untrusted template input; validate schema/tool/model/budget/path and require approval"
   ],
   "open_decisions": [
     "Leader concurrency: one active session v1; portfolio later",
     "Worker workspace: per-session worktree from project component branch; identity lease",
     "Manager workspace: none/docs-only",
     "Model change: generation + approval, preserve memory",
-    "Cross-project detachment: later"
+    "Cross-project detachment: later",
+    "auto-apply trusted local templates is off by default"
   ],
   "references": [
     "docs/CONTRACTED_EXECUTION_PLAN.md",

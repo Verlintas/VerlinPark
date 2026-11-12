@@ -361,6 +361,125 @@ each identity has done; all actions call real RPCs and surface errors.
 
 ---
 
+### S8 — Portable Team Templates / Team Charter
+
+A good team should be exportable to another project **without** carrying
+conversation, memory, worktrees, sessions, inbox, performance evidence, MCP
+pins, or secrets. What travels is a versioned, content-addressed **team
+charter**: roles, department structure, delegation/review rules, acceptance
+conventions, budgets, model role bindings, and tool-policy references.
+
+Canonical artifact: `team.json` (machine-readable) plus a deterministic
+`TEAM.md` rendering for humans.
+
+```text
+TeamTemplate {
+  schema_version, template_id, name, version, description, content_hash,
+  leader: RoleSlot,
+  departments: [{ name, objective, manager: RoleSlot, workers: [RoleSlot] }],
+  labour_defaults: { profile, model_role, bundle, max_concurrency },
+  rules: {
+    delegation, review, acceptance, escalation, retirement, handoff, communication
+  },
+  budgets: { defaults, caps },
+  model_bindings: { role -> explicit model reference },
+  tool_policy: { role -> bundle / allow / deny },
+  skills: [{ name, version_hash }],
+  conventions: { coding, commit, test, review_checklist },
+  provenance: { source_project? }
+}
+```
+
+`RoleSlot` contains title, role, department/component, profile, model role,
+charter, decision rights, review duties, and default budget. It contains **no
+agent id**, session id, worktree path, branch, memory, inbox, transcript, or
+performance row.
+
+Include only:
+
+- org structure and role charters;
+- delegation and review rules (Worker decomposes/reviews, Labour implements,
+  Manager owns department, Leader owns plan);
+- definition-of-done and acceptance **conventions** (commands may be
+  placeholders and require confirmation on import);
+- budget defaults/caps (suggestions; target project policy wins);
+- explicit model role bindings (validated against target configuration; never
+  a hidden route or secret);
+- tool bundle/allow/deny references (not raw MCP schemas; target MCP pins stay
+  local);
+- skill references by name/hash (content imported only if present/approved);
+- coding/commit/test/review conventions.
+
+Exclude absolutely:
+
+- agent identities/IDs, sessions, messages, memory, inbox, worktrees, branches,
+  commits, tool outputs, performance evidence, MCP pins/schemas, provider keys,
+  absolute paths, repo URLs, and secrets.
+
+Export:
+
+- `team.template.export` / `vp team-export <project> --name <name> --out <dir>`
+  derives the template from the project roster, policies, and charters; runs a
+  redaction/validation pass; writes `team.json` + `TEAM.md`.
+- The export is deterministic and content-addressed. A template can be
+  committed to a repo or shared as a file; it is not a backup.
+
+Import:
+
+- `team.template.preview` / `team.template.import` / `vp team-import <project>
+  --file team.json [--dry-run] [--apply]`.
+- Validation: schema version, role/profile names, tool names/bundles, model
+  references, budget ranges, no absolute paths/URLs/secrets, no agent/session
+  IDs. Invalid models/tools fail closed; no silent substitution.
+- Dry-run shows the proposed org chart, new/renamed/conflicting identities,
+  budget changes, model/tool gaps, and policy conflicts.
+- Apply requires approval (unless the project explicitly opts into auto-apply
+  for a trusted local template). It creates a `team_templates` record and
+  optionally instantiates identities through S6 hire. It never overwrites
+  existing identities; conflicts require explicit rename/merge/retire.
+- Target project policy wins: a template cannot widen budgets, approvals,
+  sandbox, MCP trust, or Verifier/Integrator rules. Model bindings remain
+  explicit; no hidden routing. Acceptance commands are suggestions until
+  confirmed.
+- New identities get fresh memory/inbox/performance; only the charter and
+  structure travel. The template hash/version is recorded on each identity for
+  provenance.
+
+Storage:
+
+```sql
+team_templates(
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  version TEXT NOT NULL,
+  schema_version INTEGER NOT NULL,
+  content_hash TEXT NOT NULL,
+  json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  source_project_id TEXT
+);
+
+project_team_templates(
+  project_id TEXT NOT NULL,
+  template_id TEXT NOT NULL,
+  applied_at TEXT NOT NULL,
+  applied_by TEXT,
+  PRIMARY KEY (project_id, template_id)
+);
+```
+
+RPC/CLI/GUI: `team.template.export/import/preview/list/diff`,
+`vp team-export`, `vp team-import`, `vp team-templates`; a Team Templates
+library with an org-chart preview, diff, and import conflict sheet.
+
+Tests: JSON/Markdown round-trip; no context/memory/secrets/IDs in export;
+invalid tool/model fails closed; budget widening rejected; target policy wins;
+dry-run/apply idempotency; identity provenance hash; template diff.
+
+**Acceptance:** a successful project can export a portable team charter,
+import it into another project, and get the same roles/rules with fresh
+project memory and no context leakage.
+
 ## 4. Dependencies and ordering
 
 - **S1** depends on C1 (TaskContract) and C4 (version pinning).
@@ -370,6 +489,8 @@ each identity has done; all actions call real RPCs and surface errors.
 - **S5** depends on S1/S2.
 - **S6** depends on S1 + C2 (effect receipts) + C6 (failure attribution).
 - **S7** after S1–S6.
+- **S8** depends on S1/S6 and the S7 UI library; it may run in parallel with S7
+  once hire/retire and the org-chart data model are stable.
 - **C10 Code Mode** should wait until S3/S4 if stable identities are enabled;
   otherwise it can proceed with the current run-scoped model.
 
@@ -377,7 +498,7 @@ Recommended program order:
 
 ```text
 C1 → C2 → C4 (Contracted Execution Phase 1 substrate)
-        └── S1 → S2 → S3 → S4 → S5 → S6 → S7
+        └── S1 → S2 → S3 → S4 → S5 → S6 → S7 / S8
 C3/C5 can proceed in parallel.
 C6/C7/C8/C9 after C2/C4 and S1/S3 where relevant.
 C10 after S3/S4 (if identities enabled) or after C1/C2 (run-scoped mode).
