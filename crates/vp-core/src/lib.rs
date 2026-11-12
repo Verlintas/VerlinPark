@@ -32,34 +32,35 @@ use vp_protocol::types::{
     ConsoleWriteResult, ContextCompactionSummary, ContextMeasurement, ContextUsage,
     ContinuationOutcome, ContractPolicy, CreateModelPresetParams, CriticalPathPolicy, DoctorCheck,
     EffectPolicy, EffectReceipt, EffectReconcileParams, EffectReconcileResult, EffectState, Event,
-    ForgeOriginStatus, ForgePreflightResult, ForgeProviderStatus, ForgeStatusResult, GitLogResult,
-    GitShowResult, GovernorSessionStatus, IntakeCreateParams, IntakeListResult, IntakeTask,
-    IntakeUpdateParams, IntegrationPolicy, IntentDecisionRecord, MailboxGcResult, MailboxPolicy,
-    McpCallResult, McpGetPromptResult, McpPinActionResult, McpPinApproveParams, McpPinRejectParams,
-    McpProbeResult, McpPromptListResult, McpReadResourceResult, McpResourceListResult, McpServer,
-    McpServerConfig, McpServerListResult, McpToolListResult, McpToolPin, MemoryBriefResult,
-    MemoryConflict, MemoryConflictResolveResult, MemoryConflictScanResult, MemoryConflictsResult,
-    MemoryDeleteResult, MemoryEmbeddingPolicy, MemoryEmbeddingsIndexRebuildResult,
-    MemoryEmbeddingsIndexStatusResult, MemoryEmbeddingsRebuildResult, MemoryEmbeddingsStatusResult,
-    MemoryEmbeddingsTestResult, MemoryEvidence, MemoryHealthResult, MemoryItem, MemoryListResult,
-    MemoryMatch, MemoryPolicy, MemoryPolicyResult, MemoryPruneResult, MemorySearchParams,
-    MemorySearchResult, MemorySemanticSummary, MemoryStatsResult, MemorySweepResult,
-    MemoryUpdateResult, MemoryVerificationCheck, MemoryVerifyResult, MergeQueueEntry,
-    MessageCitation, MetricCount, ModelPreset, ModelPresetListResult, OrchestrationDecision,
-    OrchestrationNote, OrchestrationOverviewResult, OrchestrationOverviewTotals,
-    OrchestrationPolicy, OrchestrationPreviewAction, OrchestrationPreviewResult,
-    OrchestrationRecoveriesResult, OrchestrationRecovery, OrchestrationSessionSummary,
-    OrchestrationSnapshot, PlanRevisionDetailResult, PlanRevisionInfo, PreemptionOverviewResult,
-    PreemptionPolicy, PreemptionRecord, ProcessListResult, ProcessLogsResult, ProcessPolicy,
-    ProcessRestartResult, ProcessStopResult, ProcessSupervisorStatus, Program, ProgramActionParams,
-    ProgramCreateParams, ProgramDeleteParams, ProgramListResult, ProgramMilestone,
-    ProgramMilestoneActionParams, ProgramMilestoneCreateParams, ProgramMilestoneListResult,
-    ProgramMilestoneUpdateParams, ProgramPolicy, ProgramReplayReport, ProgramStatus,
-    ProgramStatusParams, ProgramStatusResult, ProgramTickParams, ProgramTickResult,
-    ProgramUpdateParams, Project, ProjectBudget, ProjectBudgetResult, ProjectCacheEpochPruneResult,
-    ProjectCacheEpochResult, ProjectMcpPinsResult, ProjectUsageResult, PromptPrefixAggregate,
-    PromptPrefixObservation, PullRequestResult, Question, QuestionListResult, ReviseTeamPlanResult,
-    ScheduledTask, SearchResult, Session, SessionBundle, SessionCacheStatus, SessionCheckpoint,
+    ForgeOriginStatus, ForgePreflightResult, ForgeProviderStatus, ForgeStatusResult, GateRecord,
+    GitLogResult, GitShowResult, GovernorSessionStatus, IntakeCreateParams, IntakeListResult,
+    IntakeTask, IntakeUpdateParams, IntegrationPolicy, IntentDecisionRecord, MailboxGcResult,
+    MailboxPolicy, McpCallResult, McpGetPromptResult, McpPinActionResult, McpPinApproveParams,
+    McpPinRejectParams, McpProbeResult, McpPromptListResult, McpReadResourceResult,
+    McpResourceListResult, McpServer, McpServerConfig, McpServerListResult, McpToolListResult,
+    McpToolPin, MemoryBriefResult, MemoryConflict, MemoryConflictResolveResult,
+    MemoryConflictScanResult, MemoryConflictsResult, MemoryDeleteResult, MemoryEmbeddingPolicy,
+    MemoryEmbeddingsIndexRebuildResult, MemoryEmbeddingsIndexStatusResult,
+    MemoryEmbeddingsRebuildResult, MemoryEmbeddingsStatusResult, MemoryEmbeddingsTestResult,
+    MemoryEvidence, MemoryHealthResult, MemoryItem, MemoryListResult, MemoryMatch, MemoryPolicy,
+    MemoryPolicyResult, MemoryPruneResult, MemorySearchParams, MemorySearchResult,
+    MemorySemanticSummary, MemoryStatsResult, MemorySweepResult, MemoryUpdateResult,
+    MemoryVerificationCheck, MemoryVerifyResult, MergeQueueEntry, MessageCitation, MetricCount,
+    ModelPreset, ModelPresetListResult, OrchestrationDecision, OrchestrationNote,
+    OrchestrationOverviewResult, OrchestrationOverviewTotals, OrchestrationPolicy,
+    OrchestrationPreviewAction, OrchestrationPreviewResult, OrchestrationRecoveriesResult,
+    OrchestrationRecovery, OrchestrationSessionSummary, OrchestrationSnapshot,
+    PlanRevisionDetailResult, PlanRevisionInfo, PreemptionOverviewResult, PreemptionPolicy,
+    PreemptionRecord, ProcessListResult, ProcessLogsResult, ProcessPolicy, ProcessRestartResult,
+    ProcessStopResult, ProcessSupervisorStatus, Program, ProgramActionParams, ProgramCreateParams,
+    ProgramDeleteParams, ProgramListResult, ProgramMilestone, ProgramMilestoneActionParams,
+    ProgramMilestoneCreateParams, ProgramMilestoneListResult, ProgramMilestoneUpdateParams,
+    ProgramPolicy, ProgramReplayReport, ProgramStatus, ProgramStatusParams, ProgramStatusResult,
+    ProgramTickParams, ProgramTickResult, ProgramUpdateParams, Project, ProjectBudget,
+    ProjectBudgetResult, ProjectCacheEpochPruneResult, ProjectCacheEpochResult,
+    ProjectMcpPinsResult, ProjectUsageResult, PromptPrefixAggregate, PromptPrefixObservation,
+    PullRequestResult, Question, QuestionListResult, ReviseTeamPlanResult, ScheduledTask,
+    SearchResult, Session, SessionBundle, SessionCacheStatus, SessionCheckpoint,
     SessionCheckpointDeleteResult, SessionCheckpointDiffResult, SessionCheckpointListResult,
     SessionCheckpointPruneResult, SessionCheckpointRestoreResult, SessionCheckpointStatsResult,
     SessionCitationAuditResult, SessionCitationsResult, SessionCommit, SessionCompareFile,
@@ -125,6 +126,7 @@ pub mod daemon_agent;
 mod dashboard;
 pub mod effect;
 pub mod forge;
+pub mod gate;
 pub mod gui;
 pub mod history;
 pub mod instruction;
@@ -185,6 +187,7 @@ struct ReplayData {
     tasks: Vec<ScheduledTask>,
     steering: Vec<SteeringMessage>,
     continuations: Vec<SessionContinuation>,
+    gates: Vec<GateRecord>,
     recoveries: Vec<OrchestrationRecovery>,
     notes: Vec<OrchestrationNote>,
     decisions: Vec<OrchestrationDecision>,
@@ -8102,7 +8105,42 @@ impl Engine {
         max_runs: Option<u32>,
         operation_id: Option<&str>,
     ) -> Result<SessionDeferResult> {
-        let payload = serde_json::json!({
+        self.defer_session_watching_gate(
+            session_id,
+            body,
+            watch_task_ids,
+            watch_mode,
+            deadline_at,
+            after_secs,
+            max_attempts,
+            every_secs,
+            max_runs,
+            None,
+            operation_id,
+        )
+        .await
+    }
+
+    /// Defer an operator prompt until watched plan tasks settle, a deadline
+    /// arrives, or an existing external gate resolves, expires, or is
+    /// cancelled. A gate watch is additive; it does not change approvals,
+    /// budgets, write scopes, the Verifier, or the merge queue.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn defer_session_watching_gate(
+        &self,
+        session_id: &str,
+        body: &str,
+        watch_task_ids: Vec<String>,
+        watch_mode: Option<&str>,
+        deadline_at: Option<&str>,
+        after_secs: Option<u64>,
+        max_attempts: Option<u32>,
+        every_secs: Option<u64>,
+        max_runs: Option<u32>,
+        watch_gate_id: Option<&str>,
+        operation_id: Option<&str>,
+    ) -> Result<SessionDeferResult> {
+        let mut payload = serde_json::json!({
             "session_id": session_id,
             "body": body,
             "watch_task_ids": &watch_task_ids,
@@ -8113,6 +8151,9 @@ impl Engine {
             "every_secs": every_secs,
             "max_runs": max_runs,
         });
+        if let Some(watch_gate_id) = watch_gate_id {
+            payload["watch_gate_id"] = serde_json::json!(watch_gate_id);
+        }
         let receipt = match crate::operation::begin(
             self.store(),
             session_id,
@@ -8138,6 +8179,7 @@ impl Engine {
                 max_attempts,
                 every_secs,
                 max_runs,
+                watch_gate_id,
             )
             .await;
         match &result {
@@ -8167,6 +8209,7 @@ impl Engine {
         max_attempts: Option<u32>,
         every_secs: Option<u64>,
         max_runs: Option<u32>,
+        watch_gate_id: Option<&str>,
     ) -> Result<SessionDeferResult> {
         let body = crate::continuation::validate_body(body)?;
         let watch_mode = crate::continuation::normalize_watch_mode(watch_mode)?;
@@ -8199,13 +8242,58 @@ impl Engine {
         for task_id in &watch_task_ids {
             crate::worktree::validate_task_id(task_id)?;
         }
+        let watch_gate_id = watch_gate_id
+            .map(str::trim)
+            .filter(|gate_id| !gate_id.is_empty())
+            .map(str::to_string);
+        if let Some(gate_id) = &watch_gate_id {
+            if gate_id.chars().count() > 200 || gate_id.chars().any(char::is_control) {
+                return Err(crate::gate::gate_error(
+                    crate::gate::codes::GATE_INVALID,
+                    "gate_id is invalid",
+                ));
+            }
+            let store = self.store.clone();
+            let lookup = gate_id.clone();
+            let record = tokio::task::spawn_blocking(move || store.get_gate(&lookup))
+                .await??
+                .ok_or_else(|| {
+                    crate::gate::gate_error(
+                        crate::gate::codes::GATE_NOT_FOUND,
+                        format!("gate {gate_id} does not exist"),
+                    )
+                })?;
+            if record.gate.session_id != session_id {
+                return Err(crate::gate::gate_error(
+                    crate::gate::codes::GATE_NOT_FOUND,
+                    "the gate does not belong to this session",
+                ));
+            }
+            if !record.gate.is_open() {
+                return Err(crate::gate::gate_error(
+                    crate::gate::codes::GATE_INVALID,
+                    format!(
+                        "gate {gate_id} is already {}; read its outcome instead of waiting",
+                        record.gate.state.as_str()
+                    ),
+                ));
+            }
+            let store = self.store.clone();
+            let lookup = gate_id.clone();
+            if tokio::task::spawn_blocking(move || store.has_open_gate_watch(&lookup)).await?? {
+                return Err(crate::gate::gate_error(
+                    crate::gate::codes::GATE_ALREADY_WATCHED,
+                    format!("gate {gate_id} already has an open continuation watch"),
+                ));
+            }
+        }
         let deadline_at = crate::continuation::resolve_deadline(
             after_secs,
             deadline_at,
             time::OffsetDateTime::now_utc(),
         )?;
-        if watch_task_ids.is_empty() && deadline_at.is_none() {
-            anyhow::bail!("a continuation needs at least one watch task or a deadline");
+        if watch_task_ids.is_empty() && deadline_at.is_none() && watch_gate_id.is_none() {
+            anyhow::bail!("a continuation needs a watch task, a deadline, or a gate");
         }
 
         if !watch_task_ids.is_empty() {
@@ -8249,13 +8337,15 @@ impl Engine {
         let session_id = session_id.to_string();
         let project_id = session.project_id.clone();
         let max_attempts = crate::continuation::normalize_max_attempts(max_attempts);
-        let (continuation, event) = tokio::task::spawn_blocking(move || {
+        let gate_for_error = watch_gate_id.clone();
+        let created = tokio::task::spawn_blocking(move || {
             store.create_session_continuation_with_event(&NewSessionContinuation {
                 session_id,
                 project_id,
                 body,
                 watch_task_ids,
                 watch_mode,
+                watch_gate_id,
                 deadline_at,
                 max_attempts,
                 series_id: None,
@@ -8265,7 +8355,21 @@ impl Engine {
                 run_count: 0,
             })
         })
-        .await??;
+        .await?;
+        let (continuation, event) = match created {
+            Ok(created) => created,
+            Err(error) => {
+                if let Some(gate_id) = gate_for_error
+                    && format!("{error:#}").contains("UNIQUE constraint failed")
+                {
+                    return Err(crate::gate::gate_error(
+                        crate::gate::codes::GATE_ALREADY_WATCHED,
+                        format!("gate {gate_id} already has an open continuation watch"),
+                    ));
+                }
+                return Err(error);
+            }
+        };
         let _ = self.events.send(event);
         Ok(SessionDeferResult { continuation })
     }
@@ -14384,6 +14488,7 @@ impl Engine {
             let tasks = store.list_plan_tasks(None, Some(&id))?;
             let steering = store.list_steering(&id, None, Some(2_000))?;
             let continuations = store.list_session_continuations(&id, None, Some(2_000))?;
+            let gates = store.list_gates(&id, None, 500)?;
             let recoveries = store.list_orchestration_recoveries(None, Some(&id))?;
             let notes = store.list_coordination_notes(&id, 2_000)?;
             let decisions = store.list_orchestration_decisions(&id, 2_000)?;
@@ -14435,6 +14540,7 @@ impl Engine {
                 tasks,
                 steering,
                 continuations,
+                gates,
                 recoveries,
                 notes,
                 decisions,
@@ -15297,6 +15403,51 @@ impl Engine {
                 expected_continuation_values.len()
             ));
         }
+        let expected_gates = crate::gate::gates_from_events(&data.events);
+        let has_gate_events = data.events.iter().any(|event| {
+            matches!(
+                event.kind.as_str(),
+                crate::gate::OPENED_EVENT
+                    | crate::gate::RESOLVED_EVENT
+                    | crate::gate::EXPIRED_EVENT
+                    | crate::gate::CANCELLED_EVENT
+            )
+        });
+        let gates_match = if !has_gate_events {
+            // Legacy/imported archives may carry a gate projection without a
+            // gate event stream. Preserve it rather than reporting drift.
+            true
+        } else {
+            match expected_gates {
+                Some(expected) => {
+                    let matches = data.gates.len() == expected.len()
+                        && data.gates.iter().all(|projected| {
+                            expected.iter().any(|candidate| {
+                                candidate.gate.id == projected.gate.id
+                                    && candidate.gate.state == projected.gate.state
+                                    && candidate.gate.outcome == projected.gate.outcome
+                                    && candidate.gate.resolution_note
+                                        == projected.gate.resolution_note
+                                    && candidate.gate.resolved_at == projected.gate.resolved_at
+                                    && candidate.gate.resolved_by == projected.gate.resolved_by
+                                    && candidate.token_hash == projected.token_hash
+                            })
+                        });
+                    if !matches {
+                        mismatches.push(format!(
+                            "external gates: projection={}, replay={}",
+                            data.gates.len(),
+                            expected.len()
+                        ));
+                    }
+                    matches
+                }
+                None => {
+                    mismatches.push("external gates: malformed replay event".to_string());
+                    false
+                }
+            }
+        };
 
         let expected_journal = crate::run_journal::projections_from_events(&data.events);
         let (runs_match, run_steps_match, run_checkpoints_match) = match &expected_journal {
@@ -15845,6 +15996,7 @@ impl Engine {
             && recoveries_match
             && steering_matches
             && continuations_match
+            && gates_match
             && runs_match
             && run_steps_match
             && run_checkpoints_match
@@ -15877,6 +16029,7 @@ impl Engine {
             recoveries_match,
             steering_matches,
             continuations_match,
+            gates_match,
             runs_match,
             run_steps_match,
             run_checkpoints_match,
@@ -16184,6 +16337,30 @@ impl Engine {
             tasks: Self::expected_tasks(data),
             steering: Some(replay_steering(&data.events)),
             continuations: Some(replay_continuations(&data.events)),
+            gates: if !data.events.iter().any(|event| {
+                matches!(
+                    event.kind.as_str(),
+                    crate::gate::OPENED_EVENT
+                        | crate::gate::RESOLVED_EVENT
+                        | crate::gate::EXPIRED_EVENT
+                        | crate::gate::CANCELLED_EVENT
+                )
+            }) {
+                // Legacy/imported archives may carry gate rows without an
+                // event stream. Their projection is preserved rather than
+                // treated as drift.
+                if data.gates.is_empty() {
+                    Some(Vec::new())
+                } else {
+                    None
+                }
+            } else {
+                match crate::gate::gates_from_events(&data.events) {
+                    Some(rows) => Some(rows),
+                    None if data.gates.is_empty() => Some(Vec::new()),
+                    None => None,
+                }
+            },
             recoveries: Some(crate::orchestration::recoveries_from_events(&data.events)),
             runs: journal.as_ref().map(|value| value.0.clone()),
             run_steps: journal.as_ref().map(|value| value.1.clone()),
@@ -16675,6 +16852,7 @@ impl Engine {
             tasks: data.tasks,
             steering: data.steering,
             continuations: data.continuations,
+            gates: data.gates,
             recoveries: data.recoveries,
             programs,
             program_milestones,

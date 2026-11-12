@@ -419,6 +419,7 @@ pub fn assess_tool_call_with_gui(
         | "ask_user"
         | "coordinate"
         | "team_status"
+        | "wait_for_gate"
         | "search_sources"
         | "read_source"
         | "list_sources"

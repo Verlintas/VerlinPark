@@ -36,7 +36,7 @@ use vp_providers::ToolSchema;
 pub const TOOL_BUNDLE_VERSION: u32 = 1;
 
 /// Default Leader cap, down from the previous role-wide list (72 tools).
-pub const LEADER_TOOL_LIMIT: usize = 48;
+pub const LEADER_TOOL_LIMIT: usize = 50;
 /// Default coding Worker/Labour cap, down from the previous list (64 tools).
 pub const CODING_TOOL_LIMIT: usize = 40;
 /// Minimal cap for a trivial one-file task.
@@ -308,6 +308,7 @@ pub const BUNDLE_TOOL_CATALOG: &[BundleToolSpec] = &[
     BundleToolSpec::new("budget_status", ToolCategory::Utility, false, false),
     BundleToolSpec::new("task_detail", ToolCategory::Task, false, false),
     BundleToolSpec::new("task_control", ToolCategory::Task, false, false),
+    BundleToolSpec::new("wait_for_gate", ToolCategory::Orchestration, false, false),
     BundleToolSpec::new("read_tool_output", ToolCategory::Utility, false, false),
     BundleToolSpec::new("tool_help", ToolCategory::Utility, false, false),
     BundleToolSpec::new("tool_search", ToolCategory::Utility, false, false),
@@ -386,6 +387,7 @@ pub const LEADER_TOOLS: &[&str] = &[
     "deliberate_team_plan",
     "scout",
     "task_control",
+    "wait_for_gate",
     "budget_status",
     "read_tool_output",
     "tool_help",
@@ -428,6 +430,7 @@ pub const CODING_TOOLS: &[&str] = &[
     "use_skill",
     "mcp",
     "read_tool_output",
+    "wait_for_gate",
     "tool_help",
     "tool_search",
 ];
@@ -463,6 +466,7 @@ pub const RESEARCH_TOOLS: &[&str] = &[
     "data_query",
     "use_skill",
     "read_tool_output",
+    "wait_for_gate",
     "tool_help",
     "tool_search",
     "team_status",
@@ -501,6 +505,7 @@ pub const VERIFICATION_TOOLS: &[&str] = &[
     "media_info",
     "data_query",
     "read_tool_output",
+    "wait_for_gate",
     "tool_help",
     "tool_search",
     "send_message",
@@ -756,15 +761,26 @@ pub fn bundle_tool_names(kind: ToolBundleKind, role: &str, profile: &str) -> Vec
                 names.push("browser");
                 names.push("computer");
             }
+            if role != ROLE_WORKER {
+                names.retain(|name| *name != "wait_for_gate");
+            }
         }
         ToolBundleKind::Research => {
             // Scout is the only research-family role allowed to inspect
             // compiler diagnostics; a research Worker has no such policy.
             if role == ROLE_SCOUT {
                 names.push("code_diagnostics");
+                names.retain(|name| *name != "wait_for_gate");
+            } else if role != ROLE_WORKER {
+                names.retain(|name| *name != "wait_for_gate");
             }
         }
-        ToolBundleKind::Verification | ToolBundleKind::Minimal | ToolBundleKind::Full => {}
+        ToolBundleKind::Verification => {
+            if role != ROLE_WORKER {
+                names.retain(|name| *name != "wait_for_gate");
+            }
+        }
+        ToolBundleKind::Minimal | ToolBundleKind::Full => {}
     }
     // Read-only roles never even request write, shell, process, or delegation
     // schemas. Role policy remains the enforcement point, but pruning the
@@ -1553,7 +1569,7 @@ mod tests {
     #[test]
     fn leader_bundle_membership_is_exact() {
         let generic = selected_names(ToolBundleKind::Leader, "leader", "generic");
-        assert_eq!(generic.len(), 46);
+        assert_eq!(generic.len(), 47);
         assert_eq!(
             generic,
             vec![
@@ -1601,12 +1617,14 @@ mod tests {
                 "tool_help",
                 "tool_search",
                 "use_skill",
+                "wait_for_gate",
                 "web_search",
                 "write_file",
             ]
         );
         let coding = selected_names(ToolBundleKind::Leader, "leader", "coding");
-        assert_eq!(coding.len(), LEADER_TOOL_LIMIT);
+        assert!(coding.len() <= LEADER_TOOL_LIMIT);
+        assert_eq!(coding.len(), 49);
         assert!(coding.contains(&"browser"));
         assert!(coding.contains(&"computer"));
         let research = selected_names(ToolBundleKind::Leader, "leader", "research");
@@ -1618,7 +1636,7 @@ mod tests {
     fn coding_bundle_membership_is_exact_and_role_conditional() {
         let worker = selected_names(ToolBundleKind::Coding, "worker", "coding");
         assert!(worker.len() <= CODING_TOOL_LIMIT);
-        assert_eq!(worker.len(), 37);
+        assert_eq!(worker.len(), 38);
         assert!(worker.contains(&"delegate"));
         assert!(worker.contains(&"browser"));
         assert!(worker.contains(&"computer"));
@@ -1660,7 +1678,7 @@ mod tests {
     #[test]
     fn research_bundle_is_read_only_and_exact() {
         let names = selected_names(ToolBundleKind::Research, "worker", "research");
-        assert_eq!(names.len(), 33);
+        assert_eq!(names.len(), 34);
         for required in [
             "read_file",
             "grep",
@@ -2198,12 +2216,12 @@ mod tests {
             .iter()
             .find(|entry| entry.kind == ToolBundleKind::Leader)
             .unwrap();
-        assert_eq!(leader.requested_count, 46);
+        assert_eq!(leader.requested_count, 47);
         let coding = entries
             .iter()
             .find(|entry| entry.kind == ToolBundleKind::Coding)
             .unwrap();
-        assert_eq!(coding.requested_count, 37);
+        assert_eq!(coding.requested_count, 38);
         assert_eq!(coding.target_limit, Some(CODING_TOOL_LIMIT));
         let full = entries
             .iter()
@@ -2245,7 +2263,7 @@ mod tests {
 
     #[test]
     fn target_limits_and_mcp_semantics_are_explicit() {
-        assert_eq!(ToolBundleKind::Leader.target_limit(), Some(48));
+        assert_eq!(ToolBundleKind::Leader.target_limit(), Some(50));
         assert_eq!(ToolBundleKind::Coding.target_limit(), Some(40));
         assert_eq!(ToolBundleKind::Minimal.target_limit(), Some(12));
         assert_eq!(ToolBundleKind::Research.target_limit(), None);
@@ -2812,13 +2830,13 @@ mod tests {
         // These are the static request counts before role-policy resolution.
         // Actual runtime counts are asserted by the agent matrix test.
         let expected = [
-            (ToolBundleKind::Leader, "leader", "generic", 46),
-            (ToolBundleKind::Leader, "leader", "coding", 48),
-            (ToolBundleKind::Leader, "manager", "coding", 38),
-            (ToolBundleKind::Coding, "worker", "coding", 37),
+            (ToolBundleKind::Leader, "leader", "generic", 47),
+            (ToolBundleKind::Leader, "leader", "coding", 49),
+            (ToolBundleKind::Leader, "manager", "coding", 39),
+            (ToolBundleKind::Coding, "worker", "coding", 38),
             (ToolBundleKind::Coding, "labour", "coding", 36),
-            (ToolBundleKind::Coding, "worker", "research", 35),
-            (ToolBundleKind::Research, "worker", "research", 33),
+            (ToolBundleKind::Coding, "worker", "research", 36),
+            (ToolBundleKind::Research, "worker", "research", 34),
             (ToolBundleKind::Research, "scout", "research", 33),
             (ToolBundleKind::Verification, "verifier", "verification", 38),
             (ToolBundleKind::Minimal, "worker", "coding", 6),

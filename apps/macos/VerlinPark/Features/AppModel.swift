@@ -94,6 +94,7 @@ final class AppModel {
     var sessionInstructions: SessionInstructionsReport?
     var sessionContract: SessionContractReport?
     var sessionEffects: SessionEffectsReport?
+    var sessionGates: SessionGatesReport?
     var governorStatus: GovernorSessionStatus?
     var governorStatusMessage: String?
     var efficiencyBusy = false
@@ -3763,6 +3764,7 @@ final class AppModel {
             sessionInstructions = nil
             sessionContract = nil
             sessionEffects = nil
+            sessionGates = nil
             governorStatus = nil
             governorStatusMessage = nil
             toolActivity = nil
@@ -3825,6 +3827,15 @@ final class AppModel {
         } catch {
             guard isCurrent(sessionID: sessionID, generation: generation) else { return }
             sessionEffects = nil
+        }
+
+        do {
+            let gates = try await core.sessionGates(sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            sessionGates = gates
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            sessionGates = nil
         }
 
         do {

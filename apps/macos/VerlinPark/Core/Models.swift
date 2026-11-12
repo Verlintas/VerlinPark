@@ -4597,8 +4597,110 @@ struct SessionEffectPolicySummary: Codable, Sendable, Equatable {
     }
 }
 
-struct SessionEffectsReport: Codable, Sendable, Equatable {
+/// Read-only public gate projection. The daemon never sends a token or token
+/// hash to the GUI; the one-time token belongs to the explicit CLI/RPC open
+/// response only.
+struct ExternalGateView: Codable, Sendable, Identifiable, Equatable {
+    let id: String
     let sessionID: String
+    let taskID: String?
+    let kind: String
+    let label: String
+    let state: String
+    let outcome: String?
+    let resolutionNote: String?
+    let createdAt: String
+    let expiresAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case sessionID = "session_id"
+        case taskID = "task_id"
+        case kind
+        case label
+        case state
+        case outcome
+        case resolutionNote = "resolution_note"
+        case createdAt = "created_at"
+        case expiresAt = "expires_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(String.self, forKey: .id) ?? ""
+        sessionID = try container.decodeIfPresent(String.self, forKey: .sessionID) ?? ""
+        taskID = try container.decodeIfPresent(String.self, forKey: .taskID)
+        kind = try container.decodeIfPresent(String.self, forKey: .kind) ?? "custom"
+        label = try container.decodeIfPresent(String.self, forKey: .label) ?? ""
+        state = try container.decodeIfPresent(String.self, forKey: .state) ?? "open"
+        outcome = try container.decodeIfPresent(String.self, forKey: .outcome)
+        resolutionNote = try container.decodeIfPresent(String.self, forKey: .resolutionNote)
+        createdAt = try container.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
+        expiresAt = try container.decodeIfPresent(String.self, forKey: .expiresAt)
+    }
+
+    var isOpen: Bool {
+        state == "open"
+    }
+
+    var stateLabel: String {
+        state.uppercased()
+    }
+}
+
+struct SessionGateCounts: Codable, Sendable, Equatable {
+    let total: Int
+    let open: Int
+    let resolved: Int
+    let expired: Int
+    let cancelled: Int
+
+    init() {
+        total = 0
+        open = 0
+        resolved = 0
+        expired = 0
+        cancelled = 0
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        total = try container.decodeIfPresent(Int.self, forKey: .total) ?? 0
+        open = try container.decodeIfPresent(Int.self, forKey: .open) ?? 0
+        resolved = try container.decodeIfPresent(Int.self, forKey: .resolved) ?? 0
+        expired = try container.decodeIfPresent(Int.self, forKey: .expired) ?? 0
+        cancelled = try container.decodeIfPresent(Int.self, forKey: .cancelled) ?? 0
+    }
+}
+
+struct SessionGatesReport: Codable, Sendable, Equatable {
+    let sessionID: String
+    let gates: [ExternalGateView]
+    let counts: SessionGateCounts
+    let truncated: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case gates
+        case counts
+        case truncated
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = try container.decodeIfPresent(String.self, forKey: .sessionID) ?? ""
+        gates = try container.decodeIfPresent([ExternalGateView].self, forKey: .gates) ?? []
+        counts = try container.decodeIfPresent(SessionGateCounts.self, forKey: .counts)
+            ?? SessionGateCounts()
+        truncated = try container.decodeIfPresent(Bool.self, forKey: .truncated) ?? false
+    }
+
+    var openGates: [ExternalGateView] {
+        gates.filter(\.isOpen)
+    }
+}
+
+struct SessionEffectsReport: Codable, Sendable, Equatable { let sessionID: String
     let receipts: [EffectReceiptView]
     let counts: SessionEffectCounts
     let blocked: Bool

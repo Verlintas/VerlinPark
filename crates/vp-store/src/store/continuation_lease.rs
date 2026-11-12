@@ -208,7 +208,7 @@ fn query_owned_continuation_tx(
             |row| {
                 Ok((
                     super::map_session_continuation(row)?,
-                    row.get::<_, Option<String>>(26)?,
+                    row.get::<_, Option<String>>(27)?,
                 ))
             },
         )
@@ -707,7 +707,7 @@ impl Store {
                 |row| {
                     Ok(OwnedContinuation {
                         continuation: super::map_session_continuation(row)?,
-                        token: row.get::<_, Option<String>>(26)?,
+                        token: row.get::<_, Option<String>>(27)?,
                     })
                 },
             )
@@ -769,6 +769,7 @@ mod tests {
             body: "body".into(),
             watch_task_ids: Vec::new(),
             watch_mode: "all".into(),
+            watch_gate_id: None,
             deadline_at: None,
             status: "ready".into(),
             attempts: 0,

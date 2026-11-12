@@ -8575,7 +8575,11 @@ async fn deferred_continuations_validate_creation_and_replay_repair_bundle() {
         )
         .await
         .unwrap_err();
-    assert!(no_trigger.to_string().contains("watch task or a deadline"));
+    assert!(
+        no_trigger
+            .to_string()
+            .contains("watch task, a deadline, or a gate")
+    );
     let missing = engine
         .defer_session(
             &session.id,

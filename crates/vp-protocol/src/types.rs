@@ -1002,6 +1002,343 @@ pub struct EffectReconcileResult {
     pub changed: bool,
 }
 
+/// Kinds of external gate. The runtime deliberately has no provider-specific
+/// logic: a gate is an opaque, authenticated wait.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateKind {
+    Ci,
+    PrReview,
+    Deploy,
+    Human,
+    #[default]
+    Custom,
+}
+
+impl GateKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ci => "ci",
+            Self::PrReview => "pr_review",
+            Self::Deploy => "deploy",
+            Self::Human => "human",
+            Self::Custom => "custom",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ci" => Some(Self::Ci),
+            "pr_review" | "pr-review" | "review" => Some(Self::PrReview),
+            "deploy" => Some(Self::Deploy),
+            "human" => Some(Self::Human),
+            "custom" => Some(Self::Custom),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateState {
+    #[default]
+    Open,
+    Resolved,
+    Expired,
+    Cancelled,
+}
+
+impl GateState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Resolved => "resolved",
+            Self::Expired => "expired",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "open" => Some(Self::Open),
+            "resolved" => Some(Self::Resolved),
+            "expired" => Some(Self::Expired),
+            "cancelled" | "canceled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        !matches!(self, Self::Open)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateOutcome {
+    Resolved,
+    Rejected,
+    Failed,
+}
+
+impl GateOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Resolved => "resolved",
+            Self::Rejected => "rejected",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "resolved" | "approved" | "passed" => Some(Self::Resolved),
+            "rejected" | "denied" => Some(Self::Rejected),
+            "failed" | "error" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// Public gate projection. It deliberately has no token or token hash: the
+/// one-time token is returned only by `gate.open`, and the hash stays inside
+/// the server-side event/store record.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ExternalGate {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub kind: GateKind,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub state: GateState,
+    #[serde(default)]
+    pub outcome: Option<GateOutcome>,
+    /// Bounded, secret-free caller context (for example a PR number or CI
+    /// workflow label). It is never used for authorization.
+    #[serde(default)]
+    pub payload: Value,
+    #[serde(default)]
+    pub resolution_note: Option<String>,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub resolved_at: Option<String>,
+    #[serde(default)]
+    pub resolved_by: Option<String>,
+}
+
+impl ExternalGate {
+    pub fn is_open(&self) -> bool {
+        self.state == GateState::Open
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        self.state.is_terminal()
+    }
+
+    pub fn kind_label(&self) -> &'static str {
+        self.kind.as_str()
+    }
+}
+
+/// Server-side gate record used by event payloads, SQLite projections, and
+/// bundle/rebuild restore. The hash verifies the one-time token; it is not the
+/// token and is never returned by an RPC or decoded by the Swift client.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GateRecord {
+    #[serde(default)]
+    pub gate: ExternalGate,
+    #[serde(default)]
+    pub token_hash: String,
+}
+
+pub const GATE_OPENED_EVENT: &str = "gate.opened";
+pub const GATE_RESOLVED_EVENT: &str = "gate.resolved";
+pub const GATE_EXPIRED_EVENT: &str = "gate.expired";
+pub const GATE_CANCELLED_EVENT: &str = "gate.cancelled";
+pub const GATE_CONTINUATION_READY_EVENT: &str = "gate.continuation_ready";
+
+/// Project-scoped gate policy. The default is local-only and disables the
+/// optional loopback resolve endpoint. The daemon was already loopback-bound;
+/// this policy is an additional explicit opt-in, not a public listener.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatePolicy {
+    #[serde(default)]
+    pub loopback_resolve: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GatePolicyParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetGatePolicyParams {
+    pub project_id: String,
+    pub policy: GatePolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GatePolicyResult {
+    pub project_id: String,
+    pub policy: GatePolicy,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GateOpenParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub payload: Option<Value>,
+    /// Absolute RFC3339 expiry.
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    /// Relative expiry in seconds. Mutually exclusive with `expires_at`.
+    #[serde(default)]
+    pub after_secs: Option<u64>,
+}
+
+/// Result of opening a gate. `token` is the only occurrence of the one-time
+/// secret; retry/duplicate calls cannot recover it.
+#[derive(Clone, PartialEq, Serialize)]
+pub struct GateOpenResult {
+    pub gate: ExternalGate,
+    pub token: String,
+    /// Non-secret hint for the operator or same-host CI.
+    pub resolve_hint: String,
+    /// True only when the project opted into the loopback resolve endpoint.
+    /// The daemon remains loopback-bound; this is an additional policy gate,
+    /// not a public listener.
+    #[serde(default)]
+    pub loopback_resolve: bool,
+}
+
+impl std::fmt::Debug for GateOpenResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GateOpenResult")
+            .field("gate", &self.gate)
+            .field("token", &"redacted")
+            .field("resolve_hint", &self.resolve_hint)
+            .field("loopback_resolve", &self.loopback_resolve)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GateResolveParams {
+    pub gate_id: String,
+    /// One-time scoped token from `gate.open`. The daemon Bearer token is not
+    /// a substitute and cannot bypass this check.
+    pub token: String,
+    #[serde(default)]
+    pub outcome: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub resolved_by: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GateResolveResult {
+    pub gate: ExternalGate,
+    /// False when the same token/outcome replay observed an already resolved
+    /// gate. A different outcome or token fails closed.
+    pub changed: bool,
+    #[serde(default)]
+    pub continuation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GateCancelParams {
+    pub gate_id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub cancelled_by: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GateCancelResult {
+    pub gate: ExternalGate,
+    pub changed: bool,
+    #[serde(default)]
+    pub continuation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GateListParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateCounts {
+    #[serde(default)]
+    pub total: u64,
+    #[serde(default)]
+    pub open: u64,
+    #[serde(default)]
+    pub resolved: u64,
+    #[serde(default)]
+    pub expired: u64,
+    #[serde(default)]
+    pub cancelled: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GateListResult {
+    pub session_id: String,
+    #[serde(default)]
+    pub gates: Vec<ExternalGate>,
+    #[serde(default)]
+    pub counts: GateCounts,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GateStatusParams {
+    pub gate_id: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GateSweepParams {
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateSweepResult {
+    #[serde(default)]
+    pub expired_gates: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GateStatusResult {
+    pub gate: ExternalGate,
+    #[serde(default)]
+    pub continuation_id: Option<String>,
+    #[serde(default)]
+    pub continuation_status: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionContractResult {
     #[serde(default)]
@@ -10822,6 +11159,11 @@ pub struct SessionBundle {
     /// Deferred continuations. Older bundles decode as an empty list.
     #[serde(default)]
     pub continuations: Vec<SessionContinuation>,
+    /// Event-backed external gates. The event stream remains authoritative;
+    /// this snapshot carries the same non-secret gate records (including the
+    /// verifier hash, never a raw token).
+    #[serde(default)]
+    pub gates: Vec<GateRecord>,
     /// Event-backed stall recovery rows. Older bundles decode as an empty
     /// list; importing the archive replays the recovery events it carries.
     #[serde(default)]
@@ -11178,6 +11520,9 @@ pub struct SessionReplayReport {
     pub steering_matches: bool,
     #[serde(default)]
     pub continuations_match: bool,
+    /// Event-backed external-gate projection (`gate.*` events).
+    #[serde(default)]
+    pub gates_match: bool,
     /// Event-backed durable run status/attempt projections.
     #[serde(default)]
     pub runs_match: bool,
@@ -11503,6 +11848,10 @@ pub struct SessionContinuation {
     pub watch_task_ids: Vec<String>,
     #[serde(default = "default_continuation_watch_mode")]
     pub watch_mode: String,
+    /// External gate this continuation waits on. At most one continuation may
+    /// watch a gate while it is open. The gate token is never stored here.
+    #[serde(default)]
+    pub watch_gate_id: Option<String>,
     #[serde(default)]
     pub deadline_at: Option<String>,
     pub status: String,
@@ -11580,6 +11929,11 @@ pub struct SessionDeferParams {
     pub body: String,
     #[serde(default, alias = "watch")]
     pub watch_task_ids: Vec<String>,
+    /// Watch an existing external gate instead of (or in addition to) plan
+    /// tasks. The continuation wakes when the gate resolves, expires, or is
+    /// cancelled. The operator never needs the gate token to defer.
+    #[serde(default)]
+    pub watch_gate_id: Option<String>,
     #[serde(default)]
     pub watch_mode: Option<String>,
     #[serde(default)]
@@ -16490,6 +16844,7 @@ mod context_checkpoint_bundle_tests {
             tasks: Vec::new(),
             steering: Vec::new(),
             continuations: Vec::new(),
+            gates: Vec::new(),
             recoveries: Vec::new(),
             programs: Vec::new(),
             program_milestones: Vec::new(),
@@ -19499,5 +19854,206 @@ mod contract_protocol_tests {
         };
         let encoded = serde_json::to_value(counts).unwrap();
         assert_eq!(encoded["blocking"], 2);
+    }
+}
+
+#[cfg(test)]
+mod gate_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn gate_kind_state_and_outcome_parse_stably() {
+        assert_eq!(GateKind::parse("CI"), Some(GateKind::Ci));
+        assert_eq!(GateKind::parse("pr-review"), Some(GateKind::PrReview));
+        assert_eq!(GateKind::parse("deploy"), Some(GateKind::Deploy));
+        assert_eq!(GateKind::parse("human"), Some(GateKind::Human));
+        assert_eq!(GateKind::parse("custom"), Some(GateKind::Custom));
+        assert!(GateKind::parse("jenkins").is_none());
+        assert_eq!(GateState::parse("canceled"), Some(GateState::Cancelled));
+        assert!(!GateState::Open.is_terminal());
+        assert!(GateState::Expired.is_terminal());
+        assert_eq!(GateOutcome::parse("approved"), Some(GateOutcome::Resolved));
+        assert_eq!(GateOutcome::parse("denied"), Some(GateOutcome::Rejected));
+        assert_eq!(GateOutcome::parse("error"), Some(GateOutcome::Failed));
+    }
+
+    #[test]
+    fn gate_policy_defaults_to_local_only() {
+        let policy: GatePolicy = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!policy.loopback_resolve);
+        let params: GateOpenParams = serde_json::from_value(serde_json::json!({
+            "session_id": "ses-1"
+        }))
+        .unwrap();
+        assert!(params.kind.is_none());
+        assert!(params.task_id.is_none());
+        assert!(params.payload.is_none());
+        assert!(params.expires_at.is_none());
+        assert!(params.after_secs.is_none());
+    }
+
+    #[test]
+    fn gate_public_projection_has_no_token_hash_field() {
+        let gate = ExternalGate {
+            id: "gate-1".into(),
+            session_id: "ses-1".into(),
+            kind: GateKind::Ci,
+            label: "unit tests".into(),
+            state: GateState::Open,
+            ..ExternalGate::default()
+        };
+        let encoded = serde_json::to_value(&gate).unwrap();
+        assert!(encoded.get("token").is_none());
+        assert!(encoded.get("token_hash").is_none());
+        assert_eq!(encoded["kind"], "ci");
+        assert_eq!(encoded["state"], "open");
+
+        let record = GateRecord {
+            gate,
+            token_hash: "a".repeat(64),
+        };
+        let encoded = serde_json::to_value(&record).unwrap();
+        assert_eq!(encoded["token_hash"], "a".repeat(64));
+    }
+
+    #[test]
+    fn continuation_gate_watch_and_bundle_gates_are_additive() {
+        let continuation: SessionContinuation = serde_json::from_value(serde_json::json!({
+            "id": "cont-1",
+            "session_id": "ses-1",
+            "project_id": "prj-1",
+            "body": "resume",
+            "status": "pending",
+            "created_at": "2026-11-12T00:00:00Z",
+            "updated_at": "2026-11-12T00:00:00Z"
+        }))
+        .unwrap();
+        assert!(continuation.watch_gate_id.is_none());
+        assert!(continuation.watch_task_ids.is_empty());
+
+        let params: SessionDeferParams = serde_json::from_value(serde_json::json!({
+            "session_id": "ses-1",
+            "body": "resume after CI",
+            "watch_gate_id": "gate-1"
+        }))
+        .unwrap();
+        assert_eq!(params.watch_gate_id.as_deref(), Some("gate-1"));
+    }
+
+    #[test]
+    fn gate_kinds_and_outcomes_round_trip_on_the_wire() {
+        for (kind, wire) in [
+            (GateKind::Ci, "ci"),
+            (GateKind::PrReview, "pr_review"),
+            (GateKind::Deploy, "deploy"),
+            (GateKind::Human, "human"),
+            (GateKind::Custom, "custom"),
+        ] {
+            assert_eq!(serde_json::to_value(kind).unwrap(), wire);
+            assert_eq!(GateKind::parse(wire), Some(kind));
+        }
+        for (outcome, wire) in [
+            (GateOutcome::Resolved, "resolved"),
+            (GateOutcome::Rejected, "rejected"),
+            (GateOutcome::Failed, "failed"),
+        ] {
+            assert_eq!(serde_json::to_value(outcome).unwrap(), wire);
+            assert_eq!(GateOutcome::parse(wire), Some(outcome));
+        }
+        for (state, wire) in [
+            (GateState::Open, "open"),
+            (GateState::Resolved, "resolved"),
+            (GateState::Expired, "expired"),
+            (GateState::Cancelled, "cancelled"),
+        ] {
+            assert_eq!(serde_json::to_value(state).unwrap(), wire);
+            assert_eq!(GateState::parse(wire), Some(state));
+        }
+    }
+
+    #[test]
+    fn gate_sweep_result_uses_a_specific_key() {
+        let result = GateSweepResult { expired_gates: 3 };
+        let encoded = serde_json::to_value(result).unwrap();
+        assert_eq!(encoded["expired_gates"], 3);
+        assert!(encoded.get("expired").is_none());
+        let params: GateSweepParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(params.limit.is_none());
+    }
+
+    #[test]
+    fn gate_results_serialize_without_private_hash() {
+        let result = GateResolveResult {
+            gate: ExternalGate {
+                id: "gate-1".into(),
+                session_id: "ses-1".into(),
+                state: GateState::Resolved,
+                outcome: Some(GateOutcome::Resolved),
+                ..ExternalGate::default()
+            },
+            changed: true,
+            continuation_id: Some("cont-1".into()),
+        };
+        let encoded = serde_json::to_value(&result).unwrap();
+        assert!(encoded.get("token").is_none());
+        assert!(encoded.get("token_hash").is_none());
+        assert_eq!(encoded["continuation_id"], "cont-1");
+
+        let open = GateOpenResult {
+            gate: ExternalGate::default(),
+            token: "vpg_once".into(),
+            resolve_hint: "vp gate resolve".into(),
+            loopback_resolve: false,
+        };
+        let encoded = serde_json::to_value(&open).unwrap();
+        assert_eq!(encoded["token"], "vpg_once");
+        assert_eq!(encoded["loopback_resolve"], false);
+        let debug = format!("{open:?}");
+        assert!(!debug.contains("vpg_once"));
+        assert!(debug.contains("redacted"));
+
+        let public_gate = serde_json::to_value(ExternalGate {
+            id: "g1".into(),
+            session_id: "s1".into(),
+            kind: GateKind::Deploy,
+            label: "staging".into(),
+            state: GateState::Cancelled,
+            resolution_note: Some("operator cancelled".into()),
+            ..ExternalGate::default()
+        })
+        .unwrap();
+        assert_eq!(public_gate["kind"], "deploy");
+        assert_eq!(public_gate["state"], "cancelled");
+        assert!(public_gate.get("token_hash").is_none());
+        assert!(public_gate.get("token").is_none());
+    }
+
+    #[test]
+    fn gate_resolve_defaults_outcome_and_operator_label() {
+        let params: GateResolveParams = serde_json::from_value(serde_json::json!({
+            "gate_id": "gate-1",
+            "token": "vpg_secret"
+        }))
+        .unwrap();
+        assert!(params.outcome.is_none());
+        assert!(params.note.is_none());
+        assert!(params.resolved_by.is_none());
+        let status: GateStatusParams = serde_json::from_value(serde_json::json!({
+            "gate_id": "gate-1"
+        }))
+        .unwrap();
+        assert_eq!(status.gate_id, "gate-1");
+        let list: GateListParams = serde_json::from_value(serde_json::json!({
+            "session_id": "ses-1"
+        }))
+        .unwrap();
+        assert!(list.state.is_none());
+        assert!(list.limit.is_none());
+        let cancel: GateCancelParams = serde_json::from_value(serde_json::json!({
+            "gate_id": "gate-1"
+        }))
+        .unwrap();
+        assert!(cancel.reason.is_none());
+        assert!(cancel.cancelled_by.is_none());
     }
 }

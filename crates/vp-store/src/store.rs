@@ -18,24 +18,25 @@ use vp_protocol::types::{
     ArtifactProvenance, ArtifactVersion, AttentionPolicy, CacheEpochBundleBucket,
     CacheEpochReuseSession, CachePolicy, CheckpointRetentionPolicy, ContextCheckpoint,
     ContextCheckpointPolicy, ContinuationOutcome, ContractPolicy, CriticalPathPolicy,
-    EffectEvidence, EffectPolicy, EffectReceipt, EffectState, EffectTarget, Event, GuiActionInfo,
-    GuiPolicy, InstructionBlob, IntakeTask, IntegrationPolicy, MailboxPolicy, McpServer,
-    McpServerConfig, McpToolPin, McpTransport, MemoryConflict, MemoryEmbeddingJobStatus,
-    MemoryEmbeddingPolicy, MemoryEmbeddingUsage, MemoryEmbeddingsStatusResult, MemoryEvidence,
-    MemoryHealthResult, MemoryItem, MemoryPolicy, MemoryStatCount, MergeQueueEntry,
-    MergeQueueSource, MetricCount, ModelPreset, OrchestrationDecision, OrchestrationNote,
-    OrchestrationPolicy, OrchestrationRecovery, PlanTaskProgress, PreemptionPolicy,
-    PreemptionSessionSummary, ProcessPolicy, Program, ProgramEvent, ProgramMilestone,
-    ProgramMilestoneStatus, ProgramPolicy, ProgramStatus, ProgramUsage, Project, ProjectBudget,
-    ProjectUsageSession, PromptPrefixAggregate, PromptPrefixObservation, PromptPrefixRecord,
-    PromptSectionRef, Question, RunBudgetSnapshot, RunCheckpoint, RunStep, RunToolCall,
-    ScheduledTask, SearchHit, Session, SessionBundle, SessionContinuation, SessionInstructionState,
-    SessionRun, SessionRunPolicy, ShellPolicy, Skill, Source, SourceChunk, SourceCollection,
-    SourceEmbeddingIntegrity, SourceEmbeddingJobStatus, SourceEmbeddingPolicy,
-    SourceEmbeddingStatusResult, SourceEmbeddingUsage, SourceRetrievalPolicy, SourceSearchHit,
-    SourceStats, SteeringMessage, StoredMessage, SupervisedProcess, TaskSchedulerPolicy, TaskStall,
-    TeamPlan, TodoItem, ToolOutputAuditResult, ToolOutputPolicy, ToolOutputToolStat, UsageEntry,
-    WorktreeRetentionPolicy, WriteLease, cache_hit_ratio,
+    EffectEvidence, EffectPolicy, EffectReceipt, EffectState, EffectTarget, Event, GatePolicy,
+    GateRecord, GuiActionInfo, GuiPolicy, InstructionBlob, IntakeTask, IntegrationPolicy,
+    MailboxPolicy, McpServer, McpServerConfig, McpToolPin, McpTransport, MemoryConflict,
+    MemoryEmbeddingJobStatus, MemoryEmbeddingPolicy, MemoryEmbeddingUsage,
+    MemoryEmbeddingsStatusResult, MemoryEvidence, MemoryHealthResult, MemoryItem, MemoryPolicy,
+    MemoryStatCount, MergeQueueEntry, MergeQueueSource, MetricCount, ModelPreset,
+    OrchestrationDecision, OrchestrationNote, OrchestrationPolicy, OrchestrationRecovery,
+    PlanTaskProgress, PreemptionPolicy, PreemptionSessionSummary, ProcessPolicy, Program,
+    ProgramEvent, ProgramMilestone, ProgramMilestoneStatus, ProgramPolicy, ProgramStatus,
+    ProgramUsage, Project, ProjectBudget, ProjectUsageSession, PromptPrefixAggregate,
+    PromptPrefixObservation, PromptPrefixRecord, PromptSectionRef, Question, RunBudgetSnapshot,
+    RunCheckpoint, RunStep, RunToolCall, ScheduledTask, SearchHit, Session, SessionBundle,
+    SessionContinuation, SessionInstructionState, SessionRun, SessionRunPolicy, ShellPolicy, Skill,
+    Source, SourceChunk, SourceCollection, SourceEmbeddingIntegrity, SourceEmbeddingJobStatus,
+    SourceEmbeddingPolicy, SourceEmbeddingStatusResult, SourceEmbeddingUsage,
+    SourceRetrievalPolicy, SourceSearchHit, SourceStats, SteeringMessage, StoredMessage,
+    SupervisedProcess, TaskSchedulerPolicy, TaskStall, TeamPlan, TodoItem, ToolOutputAuditResult,
+    ToolOutputPolicy, ToolOutputToolStat, UsageEntry, WorktreeRetentionPolicy, WriteLease,
+    cache_hit_ratio,
 };
 
 use vp_protocol::remote::{
@@ -1006,6 +1007,8 @@ pub struct SessionRepair {
     pub tasks: Option<Vec<ScheduledTask>>,
     pub steering: Option<Vec<SteeringMessage>>,
     pub continuations: Option<Vec<SessionContinuation>>,
+    /// Event-backed external gates. `None` leaves the projection untouched.
+    pub gates: Option<Vec<GateRecord>>,
     pub recoveries: Option<Vec<OrchestrationRecovery>>,
     /// Event-backed durable run rows. `None` leaves the projection untouched.
     pub runs: Option<Vec<SessionRun>>,
@@ -1279,6 +1282,7 @@ pub struct NewSessionContinuation {
     pub body: String,
     pub watch_task_ids: Vec<String>,
     pub watch_mode: String,
+    pub watch_gate_id: Option<String>,
     pub deadline_at: Option<String>,
     pub max_attempts: u32,
     pub series_id: Option<String>,
@@ -1332,6 +1336,10 @@ pub struct ProjectManifestSnapshot {
     /// enabled, unknown-blocks-merge, 120s-grace default.
     #[serde(default)]
     pub effect_policy: EffectPolicy,
+    /// Project-scoped external-gate policy. Older manifests decode as
+    /// local-only with the loopback resolve endpoint disabled.
+    #[serde(default)]
+    pub gate_policy: GatePolicy,
     /// Project-scoped MCP tool schema pins. These are project configuration,
     /// not session events, so the manifest is their rebuild snapshot.
     #[serde(default)]
@@ -1675,6 +1683,10 @@ fn validate_session_bundle(bundle: &SessionBundle) -> Result<()> {
             ));
         }
     }
+    for record in &bundle.gates {
+        ensure_bundle_session("external gate", &record.gate.session_id, &bundle.session.id)?;
+        crate::store::gate::validate_gate_record(record)?;
+    }
     for recovery in &bundle.recoveries {
         ensure_bundle_session("recovery", &recovery.session_id, &bundle.session.id)?;
         if recovery.project_id != bundle.project.id {
@@ -1960,6 +1972,40 @@ impl Store {
                     request_hash
                 )
                 WHERE state IN ('intent', 'done', 'unknown');
+
+            -- Project-scoped external-gate policy. A missing row means
+            -- local-only resolution and the loopback endpoint disabled.
+            CREATE TABLE IF NOT EXISTS project_gate_policies (
+                project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                policy     TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            -- External gates. A row is a projection of the matching `gate.*`
+            -- event. Only the SHA-256 verifier of the one-time token is stored;
+            -- the raw token is returned once by gate.open and never persisted.
+            CREATE TABLE IF NOT EXISTS external_gates (
+                id              TEXT PRIMARY KEY,
+                session_id      TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                task_id         TEXT,
+                kind            TEXT NOT NULL,
+                label           TEXT NOT NULL,
+                token_hash      TEXT NOT NULL,
+                state           TEXT NOT NULL,
+                outcome         TEXT,
+                payload_json    TEXT NOT NULL DEFAULT '{}',
+                resolution_note TEXT,
+                created_at      TEXT NOT NULL,
+                expires_at      TEXT,
+                resolved_at     TEXT,
+                resolved_by     TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_external_gates_session
+                ON external_gates(session_id, state, created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_external_gates_expiry
+                ON external_gates(state, expires_at);
 
             -- Project-scoped MCP tool schema pins. Approved hashes are never
             -- overwritten by discovery; observed hashes record drift.
@@ -3738,6 +3784,13 @@ impl Store {
         ensure_column(&conn, "session_continuations", "lease_owner", "TEXT")?;
         ensure_column(&conn, "session_continuations", "lease_token", "TEXT")?;
         ensure_column(&conn, "session_continuations", "lease_expires_at", "TEXT")?;
+        ensure_column(&conn, "session_continuations", "watch_gate_id", "TEXT")?;
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_session_continuations_gate_watch
+                 ON session_continuations(watch_gate_id)
+                 WHERE watch_gate_id IS NOT NULL
+                   AND status IN ('pending', 'ready', 'delivering');",
+        )?;
         ensure_column(
             &conn,
             "session_continuations",
@@ -4277,6 +4330,7 @@ impl Store {
                 shell_policy: self.get_shell_policy(&project.id)?,
                 contract_policy: self.get_contract_policy(&project.id)?,
                 effect_policy: self.get_effect_policy(&project.id)?,
+                gate_policy: self.get_gate_policy(&project.id)?,
                 mcp_tool_pins: self.list_mcp_tool_pins(&project.id, None)?,
                 cache_policy: self.get_cache_policy(&project.id)?,
                 execution_host: self.get_execution_host(&project.id)?,
@@ -4720,6 +4774,35 @@ impl Store {
         let conn = self.lock()?;
         conn.execute(
             "INSERT INTO project_effect_policies (project_id, policy, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(project_id) DO UPDATE SET
+                policy = excluded.policy,
+                updated_at = excluded.updated_at",
+            params![project_id, encoded, now_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_gate_policy(&self, project_id: &str) -> Result<GatePolicy> {
+        let conn = self.lock()?;
+        let stored = conn
+            .query_row(
+                "SELECT policy FROM project_gate_policies WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match stored {
+            Some(policy) => serde_json::from_str(&policy).context("parsing stored gate policy"),
+            None => Ok(GatePolicy::default()),
+        }
+    }
+
+    pub fn set_gate_policy(&self, project_id: &str, policy: &GatePolicy) -> Result<()> {
+        let encoded = serde_json::to_string(policy)?;
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO project_gate_policies (project_id, policy, updated_at)
              VALUES (?1, ?2, ?3)
              ON CONFLICT(project_id) DO UPDATE SET
                 policy = excluded.policy,
@@ -22274,6 +22357,7 @@ impl Store {
             body: new.body.clone(),
             watch_task_ids: new.watch_task_ids.clone(),
             watch_mode: new.watch_mode.clone(),
+            watch_gate_id: new.watch_gate_id.clone(),
             deadline_at: new.deadline_at.clone(),
             status: "pending".to_string(),
             attempts: 0,
@@ -25832,6 +25916,23 @@ impl Store {
                 insert_session_continuation_tx(&tx, continuation)?;
             }
         }
+        if let Some(gates) = &repair.gates {
+            tx.execute(
+                "DELETE FROM external_gates WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            for record in gates {
+                if record.gate.session_id != session_id {
+                    return Err(anyhow!(
+                        "replayed external gate {} does not belong to session {}",
+                        record.gate.id,
+                        session_id
+                    ));
+                }
+                crate::store::gate::validate_gate_record(record)?;
+                crate::store::gate::insert_gate_tx(&tx, record)?;
+            }
+        }
         if let Some(recoveries) = &repair.recoveries {
             tx.execute(
                 "DELETE FROM orchestration_recoveries WHERE session_id = ?1",
@@ -26320,6 +26421,10 @@ impl Store {
                 ));
             }
             insert_session_continuation_tx(&tx, continuation)?;
+        }
+        for record in &bundle.gates {
+            crate::store::gate::validate_gate_record(record)?;
+            crate::store::gate::insert_gate_tx(&tx, record)?;
         }
         for recovery in &bundle.recoveries {
             upsert_orchestration_recovery(&tx, recovery)?;
@@ -27509,7 +27614,7 @@ const SESSION_CONTINUATION_COLUMNS: &str = "id, session_id, project_id, body, wa
     watch_mode, deadline_at, status, attempts, max_attempts, wake_reason, outcomes,
     last_error, next_attempt_at, created_at, ready_at, delivered_at, updated_at,
     series_id, parent_continuation_id, recurrence_every_secs, recurrence_max_runs, run_count,
-    lease_owner, lease_expires_at, delivery_attempt";
+    watch_gate_id, lease_owner, lease_expires_at, delivery_attempt";
 
 fn map_session_continuation(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionContinuation> {
     let watch_task_ids = row.get::<_, String>(4)?;
@@ -27540,9 +27645,10 @@ fn map_session_continuation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session
             .map(|value| value.max(0) as u64),
         recurrence_max_runs: row.get::<_, i64>(21)?.max(1) as u32,
         run_count: row.get::<_, i64>(22)?.max(0) as u32,
-        lease_owner: row.get(23)?,
-        lease_expires_at: row.get(24)?,
-        delivery_attempt: row.get::<_, i64>(25)?.max(0) as u32,
+        watch_gate_id: row.get(23)?,
+        lease_owner: row.get(24)?,
+        lease_expires_at: row.get(25)?,
+        delivery_attempt: row.get::<_, i64>(26)?.max(0) as u32,
     })
 }
 
@@ -27576,6 +27682,7 @@ fn next_recurring_continuation(
         body: delivered.body.clone(),
         watch_task_ids: Vec::new(),
         watch_mode: "all".to_string(),
+        watch_gate_id: None,
         deadline_at: Some(deadline),
         status: "pending".to_string(),
         attempts: 0,
@@ -27624,9 +27731,9 @@ fn insert_session_continuation_tx(
           status, attempts, max_attempts, wake_reason, outcomes, last_error,
           next_attempt_at, created_at, ready_at, delivered_at, updated_at,
           series_id, parent_continuation_id, recurrence_every_secs, recurrence_max_runs,
-          run_count, lease_owner, lease_expires_at, delivery_attempt)
+          run_count, watch_gate_id, lease_owner, lease_expires_at, delivery_attempt)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
         params![
             continuation.id,
             continuation.session_id,
@@ -27653,6 +27760,7 @@ fn insert_session_continuation_tx(
                 .map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
             i64::from(continuation.recurrence_max_runs),
             i64::from(continuation.run_count),
+            continuation.watch_gate_id,
             continuation.lease_owner,
             continuation.lease_expires_at,
             i64::from(continuation.delivery_attempt)
@@ -30398,12 +30506,14 @@ fn search_snippet(text: &str, query: &str) -> String {
 }
 
 mod continuation_lease;
+mod gate;
 mod lease;
 
 pub use continuation_lease::{
     ContinuationAckLostReason, ContinuationClaimToken, SessionContinuationAckError,
     SessionContinuationClaim, SessionContinuationClaimStatus,
 };
+pub use gate::{GateTransition, gates_from_events};
 pub use lease::{
     DaemonIdentity, LeaseLostReason, MAX_RUNTIME_LEASE_TTL_SECS, RuntimeLeaseAcquisition,
     RuntimeLeaseAuditEntry, RuntimeLeaseError, RuntimeLeaseState, RuntimeLeaseToken,

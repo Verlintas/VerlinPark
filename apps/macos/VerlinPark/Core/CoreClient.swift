@@ -1190,6 +1190,22 @@ actor CoreClient {
             .decode(SessionEffectsReport.self)
     }
 
+    func sessionGates(
+        sessionID: String,
+        state: String? = nil,
+        limit: Int = 100
+    ) async throws -> SessionGatesReport {
+        var params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "limit": .number(Double(limit)),
+        ]
+        if let state {
+            params["state"] = .string(state)
+        }
+        return try await request(method: "gate.list", params: params)
+            .decode(SessionGatesReport.self)
+    }
+
     func reconcileEffect(
         effectID: String,
         sessionID: String? = nil,

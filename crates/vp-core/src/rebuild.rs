@@ -95,6 +95,7 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
                 )
             })?;
             store.set_effect_policy(&snapshot.project.id, &effect_policy)?;
+            store.set_gate_policy(&snapshot.project.id, &snapshot.gate_policy)?;
             store.replace_mcp_tool_pins(&snapshot.project.id, &snapshot.mcp_tool_pins)?;
             store.set_cache_policy(&snapshot.project.id, &snapshot.cache_policy)?;
             store.set_execution_host(&snapshot.project.id, &snapshot.execution_host)?;

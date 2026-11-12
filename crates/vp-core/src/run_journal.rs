@@ -581,6 +581,18 @@ impl RunJournal {
         self.finish(engine, "interrupted", Some(failure)).await
     }
 
+    /// A run that ended by handing off to a durable external-gate wait. This
+    /// is a clean terminal state, not a crash: the continuation scheduler owns
+    /// the next run, and `session.run.resume` deliberately does not replay it
+    /// mid-wait.
+    pub(crate) async fn finish_deferred(&self, engine: &Engine, message: &str) -> Result<()> {
+        let failure = RunFailure {
+            kind: "deferred".to_string(),
+            message: truncate_chars(message, MAX_ERROR_CHARS),
+        };
+        self.finish(engine, "deferred", Some(failure)).await
+    }
+
     async fn finish(
         &self,
         engine: &Engine,

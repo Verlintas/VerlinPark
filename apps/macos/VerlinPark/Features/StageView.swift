@@ -908,6 +908,10 @@ private struct ContextPopoverView: View {
                     EffectBadge(report: effects)
                 }
 
+                if let gates = model.sessionGates, gates.counts.total > 0 {
+                    GateBadge(report: gates)
+                }
+
                 if let instructions = model.sessionInstructions {
                     InstructionSectionsView(
                         report: instructions,

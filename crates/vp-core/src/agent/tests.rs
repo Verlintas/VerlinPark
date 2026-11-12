@@ -20314,7 +20314,7 @@ async fn frozen_tool_bundle_matches_the_role_matrix_and_stays_stable() {
         crate::tool_bundle::ToolBundleKind::Leader
     );
     assert!(leader_bundle.builtin_count() <= crate::tool_bundle::LEADER_TOOL_LIMIT);
-    assert_eq!(leader_bundle.builtin_count(), 48);
+    assert_eq!(leader_bundle.builtin_count(), 49);
     assert!(leader_bundle.contains("submit_team_plan"));
     assert!(leader_bundle.contains("delegate"));
     assert!(leader_bundle.contains("browser"));
@@ -20590,7 +20590,7 @@ async fn tool_bundle_now_reports_minimal_worker_and_catalog_without_a_run() {
         .iter()
         .find(|row| row.bundle == "leader")
         .unwrap();
-    assert_eq!(leader.target_limit, Some(48));
+    assert_eq!(leader.target_limit, Some(50));
 
     let snapshot = service
         .tool_bundle_now(&session.id, &[], None, false)
@@ -20604,7 +20604,7 @@ async fn tool_bundle_now_reports_minimal_worker_and_catalog_without_a_run() {
         .find(|role| role.role == "leader")
         .unwrap();
     assert_eq!(default_leader.bundle, "leader");
-    assert_eq!(default_leader.builtin_count, 46);
+    assert_eq!(default_leader.builtin_count, 47);
 }
 
 #[tokio::test]
@@ -20626,7 +20626,7 @@ async fn cache_plan_reports_the_frozen_bundle_for_each_role() {
     assert_eq!(plan.roles.len(), 1);
     let leader = &plan.roles[0];
     assert_eq!(leader.tool_bundle, "leader");
-    assert_eq!(leader.tool_bundle_tool_count, 46);
+    assert_eq!(leader.tool_bundle_tool_count, 47);
     assert_eq!(leader.tool_bundle_within_target, Some(true));
     assert!(!leader.tool_bundle_fallback);
     assert_eq!(leader.tool_bundle_hash.len(), 64);
@@ -21041,23 +21041,23 @@ async fn tool_bundle_matrix_covers_standard_combinations_without_session_state()
     };
     let leader = find("leader", "generic", None);
     assert_eq!(leader.bundle, "leader");
-    assert_eq!(leader.builtin_count, 46);
+    assert_eq!(leader.builtin_count, 47);
     assert_eq!(leader.within_target, Some(true));
     assert!(!leader.fallback);
     let manager = find("manager", "coding", None);
     assert_eq!(manager.bundle, "leader");
-    assert_eq!(manager.builtin_count, 31);
+    assert_eq!(manager.builtin_count, 32);
     assert_eq!(manager.mcp_count, 0);
     let worker_coding = find("worker", "coding", Some("implementation"));
     assert_eq!(worker_coding.bundle, "coding");
-    assert_eq!(worker_coding.builtin_count, 37);
+    assert_eq!(worker_coding.builtin_count, 38);
     assert_eq!(worker_coding.within_target, Some(true));
     let worker_minimal = find("worker", "coding", Some("trivial"));
     assert_eq!(worker_minimal.bundle, "minimal");
     assert_eq!(worker_minimal.builtin_count, 6);
     let worker_research = find("worker", "research", Some("research"));
     assert_eq!(worker_research.bundle, "research");
-    assert_eq!(worker_research.builtin_count, 33);
+    assert_eq!(worker_research.builtin_count, 34);
     let verifier = find("verifier", "verification", Some("implementation"));
     assert_eq!(verifier.bundle, "verification");
     assert_eq!(verifier.builtin_count, 38);
@@ -21124,7 +21124,7 @@ async fn tool_bundle_history_is_bounded_newest_first_and_role_filtered() {
         assert_eq!(entry.bundle, "leader");
         assert_eq!(entry.bundle_hash.len(), 64);
         assert_eq!(entry.tools_hash.len(), 64);
-        assert_eq!(entry.tool_count, 46);
+        assert_eq!(entry.tool_count, 47);
         assert!(!entry.fallback);
         assert!(!entry.created_at.is_empty());
     }
@@ -21156,11 +21156,11 @@ async fn tool_bundle_diff_is_deterministic_and_bounded() {
         .unwrap();
     assert_eq!(diff.from_bundle, "leader");
     assert_eq!(diff.to_bundle, "minimal");
-    assert_eq!(diff.from_count, 46);
+    assert_eq!(diff.from_count, 47);
     assert_eq!(diff.to_count, 6);
     assert!(diff.changed);
     assert!(diff.added.is_empty());
-    assert_eq!(diff.removed.len(), 40);
+    assert_eq!(diff.removed.len(), 41);
     assert_eq!(diff.shared.len(), 6);
     let mut sorted = diff.removed.clone();
     sorted.sort();
@@ -21302,7 +21302,7 @@ for line in sys.stdin:
                 .all(|name| !name.starts_with("mcp_")),
             "MCP tools are appended once after built-ins"
         );
-        assert_eq!(first_mcp, 46);
+        assert_eq!(first_mcp, 47);
         assert_eq!(&names[first_mcp..], ["mcp_mock_alpha", "mcp_mock_zeta"]);
         assert_eq!(
             recorded[0]
@@ -21329,8 +21329,8 @@ for line in sys.stdin:
         .expect("prompt prefix");
     assert_eq!(prefix.payload["tool_bundle"], "leader");
     assert_eq!(prefix.payload["tool_bundle_mcp_count"], 2);
-    assert_eq!(prefix.payload["tool_bundle_tool_count"], 46);
-    assert_eq!(prefix.payload["tool_count"], 48);
+    assert_eq!(prefix.payload["tool_bundle_tool_count"], 47);
+    assert_eq!(prefix.payload["tool_count"], 49);
     let manifest = events
         .iter()
         .find(|event| event.kind == "context.tool_bundle")
@@ -22846,4 +22846,509 @@ async fn workspace_write_creates_a_done_receipt_and_replays_without_rewriting() 
         effects.counts.total, 1,
         "replay must not create a second row"
     );
+}
+
+#[tokio::test]
+async fn wait_for_gate_tool_defers_and_resumes_through_continuation() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::new()),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider.clone());
+    let session = engine
+        .create_session(project.id, "gate wait".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let gate = engine
+        .open_gate(vp_protocol::types::GateOpenParams {
+            session_id: session.id.clone(),
+            task_id: None,
+            kind: Some("ci".into()),
+            label: Some("unit tests".into()),
+            payload: None,
+            expires_at: None,
+            after_secs: None,
+        })
+        .await
+        .unwrap();
+    provider.responses.lock().unwrap().push_back(vec![
+        StreamEvent::ToolCall(ToolCall {
+            id: "call_gate".into(),
+            name: "wait_for_gate".into(),
+            arguments: serde_json::json!({"gate_id": gate.gate.id}).to_string(),
+        }),
+        StreamEvent::Done,
+    ]);
+    provider.responses.lock().unwrap().push_back(vec![
+        StreamEvent::TextDelta("resumed after the gate".into()),
+        StreamEvent::Done,
+    ]);
+    let config = service
+        .config
+        .read()
+        .unwrap()
+        .as_ref()
+        .expect("test service configured")
+        .clone();
+    let control = Arc::new(RunControl::new());
+    run_agent(
+        engine.clone(),
+        config,
+        &session.id,
+        "wait for CI",
+        control,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(requests.lock().unwrap().len(), 1, "no second provider call");
+    let sessions = engine
+        .list_sessions(Some(session.project_id.clone()))
+        .await
+        .unwrap();
+    let current = sessions
+        .into_iter()
+        .find(|candidate| candidate.id == session.id)
+        .unwrap();
+    assert_eq!(current.status, "idle");
+    let continuations = engine
+        .session_continuations(&session.id, Some("pending"), Some(10))
+        .await
+        .unwrap();
+    assert_eq!(continuations.continuations.len(), 1);
+    assert_eq!(
+        continuations.continuations[0].watch_gate_id.as_deref(),
+        Some(gate.gate.id.as_str())
+    );
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| event.kind == "agent.deferred"));
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.payload.to_string().contains(gate.token.expose()))
+    );
+
+    engine
+        .resolve_gate(
+            &gate.gate.id,
+            gate.token.expose(),
+            Some("resolved"),
+            Some("green"),
+            Some("ci"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(service.reconcile_session_continuations().await.unwrap(), 1);
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "idle");
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    let events = engine
+        .list_events(session.id.clone(), 0, 500)
+        .await
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "session.continuation.delivered")
+    );
+    assert!(events.iter().any(|event| {
+        event.kind == "agent.message"
+            && event.payload["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("resumed after the gate"))
+    }));
+}
+
+#[tokio::test]
+async fn wait_for_gate_rejects_an_unknown_gate_without_creating_a_continuation() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::new()),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider.clone());
+    let session = engine
+        .create_session(project.id, "unknown gate".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    provider.responses.lock().unwrap().push_back(vec![
+        StreamEvent::ToolCall(ToolCall {
+            id: "call_gate".into(),
+            name: "wait_for_gate".into(),
+            arguments: serde_json::json!({"gate_id": "missing-gate"}).to_string(),
+        }),
+        StreamEvent::Done,
+    ]);
+    provider.responses.lock().unwrap().push_back(vec![
+        StreamEvent::TextDelta("continued after the typed error".into()),
+        StreamEvent::Done,
+    ]);
+    let config = service
+        .config
+        .read()
+        .unwrap()
+        .as_ref()
+        .expect("test service configured")
+        .clone();
+    run_agent(
+        engine.clone(),
+        config,
+        &session.id,
+        "try a bad gate",
+        Arc::new(RunControl::new()),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    let continuations = engine
+        .session_continuations(&session.id, None, Some(10))
+        .await
+        .unwrap();
+    assert!(continuations.continuations.is_empty());
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "tool.finished"
+            && event.payload["name"] == "wait_for_gate"
+            && event.payload["error_code"] == "GATE_NOT_FOUND"
+    }));
+}
+
+#[tokio::test]
+async fn worker_wait_for_gate_releases_the_worker_slot() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::new()),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider.clone());
+    let session = engine
+        .create_session(project.id.clone(), "worker gate".into(), None)
+        .await
+        .unwrap();
+    let gate = engine
+        .open_gate(vp_protocol::types::GateOpenParams {
+            session_id: session.id.clone(),
+            task_id: None,
+            kind: Some("deploy".into()),
+            label: Some("staging".into()),
+            payload: None,
+            expires_at: None,
+            after_secs: None,
+        })
+        .await
+        .unwrap();
+    provider.responses.lock().unwrap().push_back(vec![
+        StreamEvent::ToolCall(ToolCall {
+            id: "call_gate".into(),
+            name: "wait_for_gate".into(),
+            arguments: serde_json::json!({"gate_id": gate.gate.id}).to_string(),
+        }),
+        StreamEvent::Done,
+    ]);
+    provider.responses.lock().unwrap().push_back(vec![
+        StreamEvent::TextDelta("unexpected second call".into()),
+        StreamEvent::Done,
+    ]);
+    let session_record = engine.store().get_session(&session.id).unwrap().unwrap();
+    let project_record = engine.store().get_project(&project.id).unwrap().unwrap();
+    let worktree = PathBuf::from(session_record.worktree.clone().unwrap());
+    let spec = AgentSpec {
+        id: "worker-1".into(),
+        role: AgentRole::Worker,
+        name: "Worker".into(),
+        depth: 1,
+        parent_name: Some("Leader".into()),
+        title: None,
+        task_id: None,
+        department: None,
+        profile: AgentProfile::Coding,
+        allow_delegation: false,
+        task_kind: None,
+        auto_approve: false,
+        worktree: worktree.clone(),
+        branch: session_record.branch.clone().unwrap_or_default(),
+        session_worktree: worktree.clone(),
+        session_branch: session_record.branch.clone().unwrap_or_default(),
+        write_scope: Vec::new(),
+        base_commit: session_record.base_commit.clone().unwrap_or_default(),
+    };
+    let config = service
+        .config
+        .read()
+        .unwrap()
+        .as_ref()
+        .expect("test service configured")
+        .clone();
+    let budget = SessionBudget::new(
+        None,
+        0,
+        AgentCaps {
+            managers: 1,
+            workers: 2,
+            labour: 2,
+        },
+    );
+    let control = RunControl::new();
+    let mut conversation = Vec::new();
+    let outcome = run_loop(
+        &engine,
+        &config,
+        &session_record,
+        &project_record,
+        &control,
+        &budget,
+        &spec,
+        "wait for deploy",
+        &mut conversation,
+        None,
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, LoopOutcome::Deferred(_)));
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        budget.state.lock().unwrap().workers,
+        0,
+        "a waiting Worker must not retain its slot"
+    );
+    let continuations = engine
+        .session_continuations(&session.id, Some("pending"), Some(10))
+        .await
+        .unwrap();
+    assert_eq!(continuations.continuations.len(), 1);
+}
+
+#[tokio::test]
+async fn worker_wait_inside_delegation_ends_the_chain_and_keeps_the_session_idle() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::new()),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider.clone());
+    let session = engine
+        .create_session(project.id, "nested gate wait".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let gate = engine
+        .open_gate(vp_protocol::types::GateOpenParams {
+            session_id: session.id.clone(),
+            task_id: None,
+            kind: Some("ci".into()),
+            label: Some("nested tests".into()),
+            payload: None,
+            expires_at: None,
+            after_secs: None,
+        })
+        .await
+        .unwrap();
+    provider.responses.lock().unwrap().push_back(vec![
+        StreamEvent::ToolCall(ToolCall {
+            id: "call_manager".into(),
+            name: "delegate".into(),
+            arguments: serde_json::json!({
+                "role": "manager",
+                "title": "Implementation",
+                "objective": "coordinate the wait"
+            })
+            .to_string(),
+        }),
+        StreamEvent::Done,
+    ]);
+    provider.responses.lock().unwrap().push_back(vec![
+        StreamEvent::ToolCall(ToolCall {
+            id: "call_worker".into(),
+            name: "delegate".into(),
+            arguments: serde_json::json!({
+                "role": "worker",
+                "objective": "wait for the CI gate",
+                "write_scope": []
+            })
+            .to_string(),
+        }),
+        StreamEvent::Done,
+    ]);
+    provider.responses.lock().unwrap().push_back(vec![
+        StreamEvent::ToolCall(ToolCall {
+            id: "call_gate".into(),
+            name: "wait_for_gate".into(),
+            arguments: serde_json::json!({"gate_id": gate.gate.id}).to_string(),
+        }),
+        StreamEvent::Done,
+    ]);
+    provider.responses.lock().unwrap().push_back(vec![
+        StreamEvent::TextDelta("manager saw the wait".into()),
+        StreamEvent::Done,
+    ]);
+    provider.responses.lock().unwrap().push_back(vec![
+        StreamEvent::TextDelta("leader saw the manager".into()),
+        StreamEvent::Done,
+    ]);
+    let config = service
+        .config
+        .read()
+        .unwrap()
+        .as_ref()
+        .expect("test service configured")
+        .clone();
+    run_agent(
+        engine.clone(),
+        config,
+        &session.id,
+        "delegate a gate wait",
+        Arc::new(RunControl::new()),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(requests.lock().unwrap().len(), 5);
+    let current = engine
+        .list_sessions(Some(session.project_id.clone()))
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate.id == session.id)
+        .unwrap();
+    assert_eq!(current.status, "idle");
+    let continuations = engine
+        .session_continuations(&session.id, Some("pending"), Some(10))
+        .await
+        .unwrap();
+    assert_eq!(continuations.continuations.len(), 1);
+    assert_eq!(
+        continuations.continuations[0].watch_gate_id.as_deref(),
+        Some(gate.gate.id.as_str())
+    );
+    let events = engine
+        .list_events(session.id.clone(), 0, 500)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "agent.finished" && event.payload["status"] == "waiting_gate"
+    }));
+    assert!(
+        !events
+            .iter()
+            .any(|event| { event.payload.to_string().contains(gate.token.expose()) })
+    );
+}
+
+#[tokio::test]
+async fn manager_wait_propagates_to_the_top_level_and_stops_the_run() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::new()),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider.clone());
+    let session = engine
+        .create_session(project.id, "manager gate".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let gate = engine
+        .open_gate(vp_protocol::types::GateOpenParams {
+            session_id: session.id.clone(),
+            task_id: None,
+            kind: Some("human".into()),
+            label: Some("design sign-off".into()),
+            payload: None,
+            expires_at: None,
+            after_secs: None,
+        })
+        .await
+        .unwrap();
+    provider.responses.lock().unwrap().push_back(vec![
+        StreamEvent::ToolCall(ToolCall {
+            id: "call_manager".into(),
+            name: "delegate".into(),
+            arguments: serde_json::json!({
+                "role": "manager",
+                "title": "Design",
+                "objective": "wait for sign-off"
+            })
+            .to_string(),
+        }),
+        StreamEvent::Done,
+    ]);
+    provider.responses.lock().unwrap().push_back(vec![
+        StreamEvent::ToolCall(ToolCall {
+            id: "call_gate".into(),
+            name: "wait_for_gate".into(),
+            arguments: serde_json::json!({"gate_id": gate.gate.id}).to_string(),
+        }),
+        StreamEvent::Done,
+    ]);
+    let config = service
+        .config
+        .read()
+        .unwrap()
+        .as_ref()
+        .expect("test service configured")
+        .clone();
+    run_agent(
+        engine.clone(),
+        config,
+        &session.id,
+        "delegate a manager wait",
+        Arc::new(RunControl::new()),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    let current = engine
+        .list_sessions(Some(session.project_id.clone()))
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate.id == session.id)
+        .unwrap();
+    assert_eq!(current.status, "idle");
+    let events = engine
+        .list_events(session.id.clone(), 0, 400)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| event.kind == "agent.deferred"));
+    assert!(events.iter().any(|event| {
+        event.kind == "agent.finished"
+            && event.payload["agent_role"] == "manager"
+            && event.payload["status"] == "waiting_gate"
+    }));
+    let continuations = engine
+        .session_continuations(&session.id, Some("pending"), Some(10))
+        .await
+        .unwrap();
+    assert_eq!(continuations.continuations.len(), 1);
 }

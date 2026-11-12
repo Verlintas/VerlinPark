@@ -353,6 +353,22 @@ pub const RECIPES: &[ToolRecipe] = &[
         caveats: "Processes are durable only when the daemon can verify the full PID/start-time/nonce/command-hash identity after a restart; a process is never restarted automatically, and an unverified pid is marked unknown or lost rather than adopted.",
     },
     ToolRecipe {
+        slug: "external_gate_wait",
+        title: "Wait for CI, review, deploy, or a human without polling",
+        intent: "Use wait_for_gate for an existing gate instead of a shell sleep loop or a long-held Worker slot.",
+        audience: &["leader:*", "manager:*", "worker:*"],
+        tools: &["wait_for_gate"],
+        steps: &[
+            "Use an existing gate id from the operator or gate.list; never invent one and never ask for its token.",
+            "Call wait_for_gate with the gate id and a bounded note describing what should happen on resume.",
+            "The run ends cleanly after the tool result; the scheduler resumes the session through the normal prompt path when the gate resolves, expires, or is cancelled.",
+            "On resume, read the [gate] outcome and continue from the actual state; a gate never approves an approval or merges work.",
+            "If the gate id is unknown or invalid, stop and report GATE_NOT_FOUND/GATE_INVALID instead of polling.",
+        ],
+        example: "wait_for_gate {\"gate_id\":\"gate-1\",\"note\":\"run the verification batch after CI\"}",
+        caveats: "A gate is a local one-shot wait handle. It does not provide provider exactly-once, cannot resolve approvals, and never bypasses the Verifier, Integrator, sandbox, capacity, or budgets.",
+    },
+    ToolRecipe {
         slug: "patch_recovery",
         title: "Recover a failed patch or stale write",
         intent: "Re-read and regenerate instead of forcing a stale replacement.",

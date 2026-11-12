@@ -335,6 +335,17 @@ tool_error_codes! {
     EFFECT_UNKNOWN => "EFFECT_UNKNOWN", false, "effects", "An earlier effect receipt is intent/unknown. Reconcile it with effect.reconcile (or `vp effect-reconcile`) before retrying; do not repeat the external action.";
     EFFECT_REPLAYED => "EFFECT_REPLAYED", false, "effects", "A completed effect receipt was replayed instead of executing again. Use the stored evidence; a different request needs different arguments.";
 
+    // External gates
+    GATE_NOT_FOUND => "GATE_NOT_FOUND", false, "gates", "Open or list gates for this session; wait_for_gate only accepts an existing gate id. Never invent a gate id and never ask the model for a token.";
+    GATE_TOKEN_INVALID => "GATE_TOKEN_INVALID", false, "gates", "Use the one-time token returned by gate.open for exactly that gate; the daemon token cannot substitute.";
+    GATE_EXPIRED => "GATE_EXPIRED", false, "gates", "The gate expiry passed. Read the expired outcome and continue; do not retry the same wait.";
+    GATE_CANCELLED => "GATE_CANCELLED", false, "gates", "An operator cancelled the gate. Continue from the cancelled outcome instead of waiting again.";
+    GATE_INVALID => "GATE_INVALID", false, "gates", "Use an existing open gate from gate.list; read a terminal gate outcome instead of watching it.";
+    GATE_CONFLICT => "GATE_CONFLICT", false, "gates", "The gate already resolved with a different outcome or changed concurrently. Re-read gate.status and do not overwrite the terminal result.";
+    GATE_ALREADY_WATCHED => "GATE_ALREADY_WATCHED", false, "gates", "A gate has one active continuation watch. Let it wake, or cancel the gate before opening another wait.";
+    GATE_ARCHIVED => "GATE_ARCHIVED", false, "gates", "Imported archives and landed sessions are final; gates cannot be opened or resolved there.";
+    GATE_LOOPBACK_DISABLED => "GATE_LOOPBACK_DISABLED", false, "gates", "The project has not enabled the loopback resolve endpoint. Use `vp gate resolve` or the authenticated gate.resolve RPC.";
+
     // File, read, write, edit, patch
     FILE_NOT_FOUND => "FILE_NOT_FOUND", false, "file", "Verify the path relative to the worktree; use find_files or list_dir instead of guessing.";
     FILE_TOO_LARGE => "FILE_TOO_LARGE", false, "file", "Read a bounded line range or search for the relevant region instead of loading the whole file.";

@@ -171,7 +171,28 @@ pub fn evaluate_wake(
     tasks: &[ScheduledTask],
     now: OffsetDateTime,
 ) -> Option<WakeEvaluation> {
+    evaluate_wake_with_gate(watch_task_ids, watch_mode, deadline_at, tasks, false, now)
+}
+
+/// Gate-aware wake evaluation. `gate_terminal` is true for a resolved,
+/// expired, or cancelled gate. A terminal gate wins over a simultaneous task
+/// or deadline because it is the explicit external signal the operator waited
+/// on; the continuation still carries the current task outcomes.
+pub fn evaluate_wake_with_gate(
+    watch_task_ids: &[String],
+    watch_mode: &str,
+    deadline_at: Option<&str>,
+    tasks: &[ScheduledTask],
+    gate_terminal: bool,
+    now: OffsetDateTime,
+) -> Option<WakeEvaluation> {
     let outcomes = snapshot_outcomes(watch_task_ids, tasks);
+    if gate_terminal {
+        return Some(WakeEvaluation {
+            reason: "gate".to_string(),
+            outcomes,
+        });
+    }
     if !outcomes.is_empty() {
         let settled = match watch_mode {
             "any" => outcomes.iter().any(|outcome| {
@@ -242,6 +263,8 @@ pub struct PromptContext<'a> {
     pub body: &'a str,
     pub reason: &'a str,
     pub outcomes: &'a [ContinuationOutcome],
+    /// Optional typed gate summary. It never contains a token or verifier.
+    pub gate: Option<&'a crate::gate::GatePromptSummary>,
 }
 
 /// Render the operator prompt. The recurrence label is bounded like the rest
@@ -261,6 +284,22 @@ pub fn render_prompt(context: &PromptContext<'_>) -> String {
             context.recurrence_max_runs.max(1),
             every_secs
         ));
+    }
+    if let Some(gate) = context.gate {
+        note.push_str(&format!(
+            "[gate] id={} kind={} state={} outcome={} label={}\n",
+            truncate_chars(&gate.id, 80),
+            truncate_chars(&gate.kind, 40),
+            truncate_chars(&gate.state, 40),
+            gate.outcome
+                .as_deref()
+                .map(|outcome| truncate_chars(outcome, 40))
+                .unwrap_or_else(|| "-".to_string()),
+            truncate_chars(&gate.label, 120)
+        ));
+        if let Some(gate_note) = &gate.note {
+            note.push_str(&format!("gate note: {}\n", truncate_chars(gate_note, 500)));
+        }
     }
     if context.outcomes.is_empty() {
         note.push_str("Watched tasks: none\n");
@@ -352,11 +391,87 @@ mod tests {
             body: &body,
             reason: "deadline",
             outcomes: &[],
+            gate: None,
         });
         assert!(prompt.starts_with("[Deferred continuation #cont-2]"));
         assert!(prompt.contains("Recurring series: cont-1 · run 3/10 · every 3600s"));
         assert!(prompt.ends_with(&body));
         let note = prompt.split("\nOperator prompt:\n").next().unwrap();
         assert!(note.chars().count() <= MAX_CONTEXT_NOTE_CHARS);
+    }
+
+    #[test]
+    fn gate_wake_is_terminal_and_prompt_has_no_secret() {
+        let now = OffsetDateTime::parse("2026-11-12T00:00:00Z", &Rfc3339).unwrap();
+        assert!(evaluate_wake_with_gate(&[], "all", None, &[], false, now).is_none());
+        let wake = evaluate_wake_with_gate(&[], "all", None, &[], true, now).unwrap();
+        assert_eq!(wake.reason, "gate");
+        let summary = crate::gate::GatePromptSummary {
+            id: "gate-1".into(),
+            kind: "ci".into(),
+            label: "unit tests".into(),
+            state: "resolved".into(),
+            outcome: Some("resolved".into()),
+            note: Some("green".into()),
+        };
+        let prompt = render_prompt(&PromptContext {
+            id: "cont-1",
+            series_id: "cont-1",
+            run_count: 0,
+            recurrence_every_secs: None,
+            recurrence_max_runs: 1,
+            body: "continue",
+            reason: "gate",
+            outcomes: &[],
+            gate: Some(&summary),
+        });
+        assert!(prompt.contains("[gate] id=gate-1 kind=ci state=resolved outcome=resolved"));
+        assert!(prompt.contains("gate note: green"));
+        assert!(!prompt.contains("token"));
+    }
+
+    #[test]
+    fn terminal_gate_wins_over_a_simultaneous_task_or_deadline() {
+        let now = OffsetDateTime::parse("2026-11-12T00:00:00Z", &Rfc3339).unwrap();
+        let task = ScheduledTask {
+            session_id: "ses".into(),
+            project_id: "prj".into(),
+            plan_seq: 1,
+            task_id: "T1".into(),
+            department: "impl".into(),
+            title: "still running".into(),
+            priority: 0,
+            status: "running".into(),
+            deps: Vec::new(),
+            write_scope: Vec::new(),
+            attempts: 0,
+            enqueued_at: "2026-11-12T00:00:00Z".into(),
+            started_at: None,
+            finished_at: None,
+            last_error: None,
+            next_attempt_at: None,
+        };
+        let wake = evaluate_wake_with_gate(
+            &["T1".to_string()],
+            "all",
+            Some("2026-11-12T01:00:00Z"),
+            std::slice::from_ref(&task),
+            true,
+            now,
+        )
+        .unwrap();
+        assert_eq!(wake.reason, "gate");
+        assert_eq!(wake.outcomes[0].status, "running");
+        assert!(
+            evaluate_wake_with_gate(
+                &["T1".to_string()],
+                "all",
+                Some("2026-11-12T01:00:00Z"),
+                &[task],
+                false,
+                now
+            )
+            .is_none()
+        );
     }
 }

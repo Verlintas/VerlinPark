@@ -1067,6 +1067,9 @@ impl AgentRole {
     }
 
     pub(crate) fn allows_tool(self, profile: AgentProfile, name: &str) -> bool {
+        if name == "wait_for_gate" && self == Self::Labour {
+            return false;
+        }
         match self {
             Self::Leader => true,
             Self::Manager => {
@@ -1094,6 +1097,7 @@ impl AgentRole {
                         | "media_info"
                         | "data_query"
                         | "read_tool_output"
+                        | "wait_for_gate"
                         | "remote_read"
                         | "remote_list"
                         | "remote_git"
@@ -1202,6 +1206,7 @@ impl AgentRole {
                         | "media_transcode"
                         | "data_query"
                         | "read_tool_output"
+                        | "wait_for_gate"
                         | "code_diagnostics"
                         | "process"
                         | "wait_for"
@@ -1243,6 +1248,7 @@ impl AgentRole {
                         | "media_transcode"
                         | "data_query"
                         | "read_tool_output"
+                        | "wait_for_gate"
                         | "web_search"
                         | "local_http"
                         | "remote_read"
@@ -1277,6 +1283,7 @@ impl AgentRole {
                         | "media_info"
                         | "data_query"
                         | "read_tool_output"
+                        | "wait_for_gate"
                         | "code_diagnostics"
                         | "process"
                         | "wait_for"
@@ -1310,6 +1317,7 @@ impl AgentRole {
                         | "media_info"
                         | "data_query"
                         | "read_tool_output"
+                        | "wait_for_gate"
                         | "remote_read"
                         | "remote_list"
                         | "remote_git"
@@ -1407,6 +1415,12 @@ pub(crate) fn role_tool_surface(role: AgentRole, profile: AgentProfile) -> Vec<S
             names.push("delegate_acp".to_string());
         }
         _ => {}
+    }
+    if matches!(
+        role,
+        AgentRole::Leader | AgentRole::Manager | AgentRole::Worker
+    ) {
+        names.push("wait_for_gate".to_string());
     }
     names.sort();
     names.dedup();
@@ -2045,11 +2059,22 @@ pub(crate) struct VerifierVerdict {
     pub(crate) summary: String,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct DeferredWait {
+    pub gate_id: String,
+    pub continuation_id: String,
+    pub summary: String,
+}
+
 enum LoopOutcome {
     Final(String),
     Verdict(VerifierVerdict),
     Cancelled,
     BudgetExceeded(BudgetStop),
+    /// A clean terminal handoff to a durable external-gate wait. The run loop
+    /// stops before another provider call; the continuation scheduler owns the
+    /// next run once the gate settles.
+    Deferred(DeferredWait),
 }
 
 #[derive(Debug, Clone)]
@@ -2384,6 +2409,22 @@ fn annotate_effect_output(output: &mut ToolOutput, receipt: &EffectReceipt) {
             output.structured = Some(json!({"effect": summary}));
         }
     }
+}
+
+fn gate_tool_error(tool: &str, error: &anyhow::Error) -> ToolOutput {
+    use crate::tooling::errors::ToolErrorCode;
+    let code = match crate::gate::gate_error_code(error) {
+        Some(crate::gate::codes::GATE_NOT_FOUND) => ToolErrorCode::GATE_NOT_FOUND,
+        Some(crate::gate::codes::GATE_TOKEN_INVALID) => ToolErrorCode::GATE_TOKEN_INVALID,
+        Some(crate::gate::codes::GATE_EXPIRED) => ToolErrorCode::GATE_EXPIRED,
+        Some(crate::gate::codes::GATE_CANCELLED) => ToolErrorCode::GATE_CANCELLED,
+        Some(crate::gate::codes::GATE_CONFLICT) => ToolErrorCode::GATE_CONFLICT,
+        Some(crate::gate::codes::GATE_ALREADY_WATCHED) => ToolErrorCode::GATE_ALREADY_WATCHED,
+        Some(crate::gate::codes::GATE_ARCHIVED) => ToolErrorCode::GATE_ARCHIVED,
+        Some(crate::gate::codes::GATE_LOOPBACK_DISABLED) => ToolErrorCode::GATE_LOOPBACK_DISABLED,
+        _ => ToolErrorCode::GATE_INVALID,
+    };
+    ToolOutput::error_coded(tool, code, format!("{error:#}"))
 }
 
 fn effect_replay_output(_tool: &str, receipt: &EffectReceipt) -> ToolOutput {
@@ -4350,6 +4391,24 @@ impl AgentService {
         .await;
         let outcome = match result {
             Ok(LoopOutcome::Final(summary)) => summary,
+            Ok(LoopOutcome::Deferred(wait)) => {
+                let wt = worker_worktree.clone();
+                tokio::task::spawn_blocking(move || worktree::abort_rebase(&wt)).await?;
+                self.engine
+                    .update_agent_status(&resolver.id, "failed")
+                    .await?;
+                self.engine
+                    .update_merge_queue_entry(
+                        &entry.id,
+                        "conflict",
+                        Some("auto-resolution cannot wait on an external gate".into()),
+                    )
+                    .await?;
+                return Err(anyhow!(
+                    "auto-resolution cannot defer to gate {}",
+                    wait.gate_id
+                ));
+            }
             Ok(LoopOutcome::Cancelled) => {
                 let wt = worker_worktree.clone();
                 tokio::task::spawn_blocking(move || worktree::abort_rebase(&wt)).await?;
@@ -5723,6 +5782,20 @@ impl AgentService {
                 _ => {}
             }
             let mut continuation = continuation;
+            let gate_record =
+                crate::gate::gate_for_continuation(&self.engine, &continuation).await?;
+            if continuation.watch_gate_id.is_some() && gate_record.is_none() {
+                self.engine
+                    .fail_session_continuation(
+                        &continuation.id,
+                        "the watched external gate no longer exists",
+                    )
+                    .await?;
+                continue;
+            }
+            let gate_terminal = gate_record
+                .as_ref()
+                .is_some_and(|record| record.gate.is_terminal());
             if continuation.status == "pending" {
                 let tasks = if let Some(tasks) = task_cache.get(&continuation.session_id) {
                     tasks.clone()
@@ -5735,11 +5808,12 @@ impl AgentService {
                     task_cache.insert(continuation.session_id.clone(), tasks.clone());
                     tasks
                 };
-                let Some(wake) = crate::continuation::evaluate_wake(
+                let Some(wake) = crate::continuation::evaluate_wake_with_gate(
                     &continuation.watch_task_ids,
                     &continuation.watch_mode,
                     continuation.deadline_at.as_deref(),
                     &tasks,
+                    gate_terminal,
                     now,
                 ) else {
                     continue;
@@ -5799,6 +5873,7 @@ impl AgentService {
                 continue;
             };
             let continuation = claim.continuation.clone();
+            let gate_summary = gate_record.as_ref().map(crate::gate::prompt_summary);
             let reason = continuation.wake_reason.as_deref().unwrap_or("watch");
             let prompt = crate::continuation::render_prompt(&crate::continuation::PromptContext {
                 id: &continuation.id,
@@ -5809,6 +5884,7 @@ impl AgentService {
                 body: &continuation.body,
                 reason,
                 outcomes: &continuation.outcomes,
+                gate: gate_summary.as_ref(),
             });
             // The operation receipt binds this continuation to the normal
             // start path. If the daemon crashed after starting but before the
@@ -9717,6 +9793,28 @@ async fn run_plan_resume(
                     .await?;
             }
         }
+        PlanRunResult::Deferred(wait) => {
+            if let Some(agent_id) = &leader_id {
+                engine.update_agent_status(agent_id, "idle").await?;
+            }
+            emit(
+                &engine,
+                session_id,
+                &spec,
+                "agent.deferred",
+                serde_json::json!({
+                    "gate_id": wait.gate_id,
+                    "continuation_id": wait.continuation_id,
+                    "summary": truncate(&wait.summary),
+                    "reason": "external_gate",
+                    "resumed_plan": true,
+                }),
+            )
+            .await?;
+            control
+                .finalize_session(&engine, session_id, "idle")
+                .await?;
+        }
         PlanRunResult::BudgetExceeded(stop) => {
             if let Some(agent_id) = &leader_id {
                 engine.update_agent_status(agent_id, "failed").await?;
@@ -10127,6 +10225,29 @@ async fn run_agent(
             if let Some(agent_id) = &leader_id {
                 engine.update_agent_status(agent_id, "idle").await?;
             }
+            control
+                .finalize_session(&engine, session_id, "idle")
+                .await?;
+        }
+        LoopOutcome::Deferred(wait) => {
+            if let Some(agent_id) = &leader_id {
+                engine.update_agent_status(agent_id, "idle").await?;
+            }
+            emit(
+                &engine,
+                session_id,
+                &spec,
+                "agent.deferred",
+                serde_json::json!({
+                    "gate_id": wait.gate_id,
+                    "continuation_id": wait.continuation_id,
+                    "summary": truncate(&wait.summary),
+                    "reason": "external_gate",
+                }),
+            )
+            .await?;
+            // The scheduler delivers the continuation through the normal
+            // prompt path when the gate settles. The session is idle meanwhile.
             control
                 .finalize_session(&engine, session_id, "idle")
                 .await?;
@@ -11701,6 +11822,30 @@ async fn verify_worker(
             )
             .await?;
             Ok(VerificationOutcome::Cancelled)
+        }
+        Ok(LoopOutcome::Deferred(wait)) => {
+            engine.update_agent_status(&verifier.id, "failed").await?;
+            let summary = format!(
+                "Verifier cannot wait on external gate {}; a verdict is required",
+                wait.gate_id
+            );
+            emit(
+                engine,
+                &session.id,
+                &verifier_spec,
+                "agent.finished",
+                verification_payload(
+                    serde_json::json!({
+                        "status": "failed",
+                        "approved": false,
+                        "summary": truncate(&summary),
+                        "verified_worker": worker_spec.name,
+                    }),
+                    provenance,
+                ),
+            )
+            .await?;
+            Ok(VerificationOutcome::Error(summary))
         }
         Ok(LoopOutcome::BudgetExceeded(stop)) => {
             engine.update_agent_status(&verifier.id, "failed").await?;
@@ -15211,6 +15356,11 @@ async fn run_loop(
         Ok(LoopOutcome::Final(_) | LoopOutcome::Verdict(_)) => {
             journal.finish_completed(engine).await
         }
+        Ok(LoopOutcome::Deferred(wait)) => {
+            journal
+                .finish_deferred(engine, &format!("waiting for gate {}", wait.gate_id))
+                .await
+        }
         Ok(LoopOutcome::Cancelled) => {
             if control.is_preempted() {
                 journal
@@ -15274,6 +15424,7 @@ async fn run_loop_body(
     };
     let mut citations = CitationRegistry::default();
     let mut active_skill: Option<Skill> = None;
+    let mut deferred_wait: Option<DeferredWait> = None;
     let task_priority = if let Some(task_id) = &spec.task_id {
         engine
             .get_team_plan(&session.id)
@@ -16950,6 +17101,12 @@ async fn run_loop_body(
             );
             let is_skill_tool = call.name == "use_skill";
             let is_question_tool = call.name == "ask_user" && spec.role != AgentRole::Verifier;
+            let is_wait_for_gate = call.name == "wait_for_gate"
+                && matches!(
+                    spec.role,
+                    AgentRole::Leader | AgentRole::Manager | AgentRole::Worker
+                )
+                && !(spec.role == AgentRole::Manager && !spec.allow_delegation);
             let is_mcp_tool = call.name == "mcp";
             let is_coordination_tool = call.name == "coordinate";
             let is_team_status = call.name == "team_status";
@@ -17416,6 +17573,9 @@ async fn run_loop_body(
                     {
                         PlanRunResult::Done(report) => ToolOutput::ok(report),
                         PlanRunResult::Cancelled => return Ok(LoopOutcome::Cancelled),
+                        PlanRunResult::Deferred(wait) => {
+                            return Ok(LoopOutcome::Deferred(wait));
+                        }
                         PlanRunResult::BudgetExceeded(stop) => {
                             return Ok(LoopOutcome::BudgetExceeded(stop));
                         }
@@ -17740,6 +17900,63 @@ async fn run_loop_body(
                         .map(|snapshot| crate::preemption::tool_output("mcp", &snapshot))
                         .unwrap_or_else(|| ToolOutput::from_tool_error("mcp", &error)),
                 }
+            } else if is_wait_for_gate {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                    }),
+                )
+                .await?;
+                let gate_id = input
+                    .get("gate_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|gate_id| !gate_id.is_empty());
+                if let Some(gate_id) = gate_id {
+                    let note = input.get("note").and_then(serde_json::Value::as_str);
+                    match engine.create_gate_wait(&session.id, gate_id, note).await {
+                        Ok((gate, continuation)) => {
+                            let summary = format!(
+                                "Waiting for external gate {} ({}, {}).",
+                                gate.label,
+                                gate.kind.as_str(),
+                                gate.state.as_str()
+                            );
+                            deferred_wait = Some(DeferredWait {
+                                gate_id: gate.id.clone(),
+                                continuation_id: continuation.id.clone(),
+                                summary: summary.clone(),
+                            });
+                            ToolOutput::ok_structured(
+                                format!(
+                                    "{summary} The run will end after this tool result; no Worker slot is held."
+                                ),
+                                serde_json::json!({
+                                    "waiting": true,
+                                    "gate_id": gate.id,
+                                    "kind": gate.kind.as_str(),
+                                    "label": gate.label,
+                                    "state": gate.state.as_str(),
+                                    "continuation_id": continuation.id,
+                                    "status": continuation.status,
+                                }),
+                            )
+                        }
+                        Err(error) => gate_tool_error("wait_for_gate", &error),
+                    }
+                } else {
+                    ToolOutput::error_coded(
+                        "wait_for_gate",
+                        crate::tooling::errors::ToolErrorCode::GATE_INVALID,
+                        "gate_id is required and must name an existing open gate",
+                    )
+                }
             } else if is_question_tool {
                 emit(
                     engine,
@@ -17979,6 +18196,9 @@ async fn run_loop_body(
                     ParallelResult::Cancelled => return Ok(LoopOutcome::Cancelled),
                     ParallelResult::BudgetExceeded(stop) => {
                         return Ok(LoopOutcome::BudgetExceeded(stop));
+                    }
+                    ParallelResult::Deferred(wait) => {
+                        return Ok(LoopOutcome::Deferred(wait));
                     }
                 }
             } else if is_scout {
@@ -18235,6 +18455,45 @@ async fn run_loop_body(
                                             ))
                                         }
                                     }
+                                    Ok(LoopOutcome::Deferred(wait)) => {
+                                        engine.update_agent_status(&child.id, "idle").await?;
+                                        emit(
+                                            engine,
+                                            &session.id,
+                                            &child_spec,
+                                            "agent.finished",
+                                            serde_json::json!({
+                                                "status": "waiting_gate",
+                                                "gate_id": wait.gate_id,
+                                                "continuation_id": wait.continuation_id,
+                                            }),
+                                        )
+                                        .await?;
+                                        match role {
+                                            AgentRole::Manager => {
+                                                // A Manager wait suspends the
+                                                // top-level run so no Manager or
+                                                // Worker slot stays occupied.
+                                                return Ok(LoopOutcome::Deferred(wait));
+                                            }
+                                            AgentRole::Worker => ToolOutput::ok_structured(
+                                                format!(
+                                                    "Worker {} is waiting for external gate {}. Its run ended without a commit; the continuation will resume the session when the gate settles.",
+                                                    child_name, wait.gate_id
+                                                ),
+                                                serde_json::json!({
+                                                    "waiting": true,
+                                                    "gate_id": wait.gate_id,
+                                                    "continuation_id": wait.continuation_id,
+                                                    "worker_id": child.id,
+                                                }),
+                                            ),
+                                            _ => ToolOutput::error(format!(
+                                                "{} cannot wait on an external gate",
+                                                role.default_name()
+                                            )),
+                                        }
+                                    }
                                     Ok(LoopOutcome::Cancelled) => {
                                         engine.update_agent_status(&child.id, "cancelled").await?;
                                         emit(
@@ -18482,6 +18741,11 @@ async fn run_loop_body(
                 conversation_ids.push(Some(stored.id));
             }
             conversation.push(ChatMessage::tool(call_id, output.content));
+            if let Some(wait) = deferred_wait.take() {
+                // A gate wait is a clean handoff: do not execute any remaining
+                // sibling tool calls or make another provider request.
+                return Ok(LoopOutcome::Deferred(wait));
+            }
             if terminal_preempt.is_some() {
                 return Ok(LoopOutcome::Cancelled);
             }
@@ -21781,6 +22045,26 @@ fn tool_schemas(
             "additionalProperties": false
         }),
     });
+    if matches!(
+        role,
+        AgentRole::Leader | AgentRole::Manager | AgentRole::Worker
+    ) && !(role == AgentRole::Manager && !allow_delegation)
+    {
+        tools.push(ToolSchema {
+            name: "wait_for_gate".to_string(),
+            description: "Wait for an existing external gate (CI, PR review, deploy, human, custom) without holding a Worker slot. This ends the current run and creates a durable continuation; the session resumes through the normal prompt path when the gate resolves, expires, or is cancelled. Never invent a gate id or ask for its token."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "gate_id": {"type": "string", "minLength": 1, "maxLength": 200},
+                    "note": {"type": "string", "maxLength": 2000, "description": "Optional context for the resumed run"}
+                },
+                "required": ["gate_id"],
+                "additionalProperties": false
+            }),
+        });
+    }
     if matches!(role, AgentRole::Leader | AgentRole::Manager) {
         tools.push(ToolSchema {
             name: "task_control".to_string(),
@@ -22506,6 +22790,30 @@ async fn run_scout(
                 }),
             )))
         }
+        Ok(LoopOutcome::Deferred(wait)) => {
+            let summary = format!(
+                "Scout cannot wait on external gate {}; it must return a bounded brief",
+                wait.gate_id
+            );
+            engine.update_agent_status(&child.id, "failed").await?;
+            emit(
+                engine,
+                &session.id,
+                &child_spec,
+                "agent.finished",
+                serde_json::json!({"status": "failed", "summary": summary}),
+            )
+            .await?;
+            emit(
+                engine,
+                &session.id,
+                &child_spec,
+                "scout.completed",
+                completed("failed", &summary, serde_json::json!({})),
+            )
+            .await?;
+            Ok(ScoutRunResult::Output(ToolOutput::error(summary)))
+        }
         Ok(LoopOutcome::Cancelled) => {
             engine.update_agent_status(&child.id, "cancelled").await?;
             emit(
@@ -22591,6 +22899,7 @@ enum ParallelResult {
     Output(ToolOutput),
     Cancelled,
     BudgetExceeded(BudgetStop),
+    Deferred(DeferredWait),
 }
 
 fn parse_parallel_tasks(
@@ -22841,6 +23150,7 @@ async fn run_parallel_workers(
 
     let mut reports = Vec::new();
     let mut all_success = true;
+    let mut deferred_wait: Option<DeferredWait> = None;
     for (index, result) in results.into_iter().enumerate() {
         let (child_spec, objective, _) = &prepared[index];
         match result {
@@ -22901,6 +23211,29 @@ async fn run_parallel_workers(
             Ok(LoopOutcome::Verdict(_)) | Ok(LoopOutcome::Cancelled) => {
                 all_success = false;
             }
+            Ok(LoopOutcome::Deferred(wait)) => {
+                all_success = false;
+                engine.update_agent_status(&child_spec.id, "idle").await?;
+                emit(
+                    engine,
+                    &session.id,
+                    child_spec,
+                    "agent.finished",
+                    serde_json::json!({
+                        "status": "waiting_gate",
+                        "gate_id": wait.gate_id,
+                        "continuation_id": wait.continuation_id,
+                    }),
+                )
+                .await?;
+                reports.push(format!(
+                    "{}: waiting for external gate {}",
+                    child_spec.name, wait.gate_id
+                ));
+                if deferred_wait.is_none() {
+                    deferred_wait = Some(wait);
+                }
+            }
             Ok(LoopOutcome::BudgetExceeded(stop)) => {
                 if !stop.is_abortive() {
                     all_success = false;
@@ -22926,6 +23259,9 @@ async fn run_parallel_workers(
         }
     }
     let text = reports.join("\n\n");
+    if let Some(wait) = deferred_wait {
+        return Ok(ParallelResult::Deferred(wait));
+    }
     Ok(ParallelResult::Output(if all_success {
         ToolOutput::ok(text)
     } else {
@@ -23316,6 +23652,26 @@ async fn deliberate_team_plan(
                         position,
                     ));
                 }
+                Ok(LoopOutcome::Deferred(wait)) => {
+                    emit(
+                        engine,
+                        &session.id,
+                        manager,
+                        "manager.roundtable.failed",
+                        serde_json::json!({
+                            "round": round,
+                            "error": format!(
+                                "a roundtable Manager cannot defer to external gate {}",
+                                wait.gate_id
+                            ),
+                        }),
+                    )
+                    .await?;
+                    return Err(anyhow!(
+                        "a roundtable Manager cannot defer to external gate {}",
+                        wait.gate_id
+                    ));
+                }
                 Ok(LoopOutcome::Cancelled) => return Ok(RoundtableResult::Cancelled),
                 Ok(LoopOutcome::BudgetExceeded(stop)) => {
                     return Ok(RoundtableResult::BudgetExceeded(stop));
@@ -23355,11 +23711,13 @@ enum PlanRunResult {
     Done(String),
     Cancelled,
     BudgetExceeded(BudgetStop),
+    Deferred(DeferredWait),
 }
 
 enum PlanAbort {
     Cancelled,
     Budget(BudgetStop),
+    Deferred(DeferredWait),
 }
 
 impl PlanAbort {
@@ -23367,6 +23725,7 @@ impl PlanAbort {
         match self {
             Self::Cancelled => "cancelled",
             Self::Budget(_) => "blocked",
+            Self::Deferred(_) => "blocked",
         }
     }
 
@@ -23374,6 +23733,9 @@ impl PlanAbort {
         match self {
             Self::Cancelled => "session cancelled".to_string(),
             Self::Budget(stop) => stop.summary(),
+            Self::Deferred(wait) => {
+                format!("waiting for external gate {}", wait.gate_id)
+            }
         }
     }
 }
@@ -24609,6 +24971,38 @@ async fn execute_team_plan(
                         }
                     }
                 }
+                Ok(LoopOutcome::Deferred(wait)) => {
+                    engine.update_agent_status(&worker_spec.id, "idle").await?;
+                    statuses.insert(task.id.clone(), "blocked".to_string());
+                    emit(
+                        engine,
+                        &session.id,
+                        worker_spec,
+                        "plan_task.finished",
+                        serde_json::json!({
+                            "task_id": task.id,
+                            "task_status": "blocked",
+                            "gate_id": wait.gate_id,
+                            "continuation_id": wait.continuation_id,
+                            "reason": "waiting for external gate",
+                        }),
+                    )
+                    .await?;
+                    record_scheduled_task_finish(
+                        engine,
+                        &session.id,
+                        plan_seq,
+                        &task.id,
+                        "blocked",
+                        Some("waiting for external gate"),
+                    )
+                    .await?;
+                    reports.push(format!(
+                        "{} [blocked]: waiting for external gate {}",
+                        task.id, wait.gate_id
+                    ));
+                    abort = Some(PlanAbort::Deferred(wait));
+                }
                 Ok(LoopOutcome::Cancelled) => {
                     let task_cancel = !control.is_cancelled()
                         && engine
@@ -24712,6 +25106,7 @@ async fn execute_team_plan(
                 return Ok(match abort {
                     PlanAbort::Cancelled => PlanRunResult::Cancelled,
                     PlanAbort::Budget(stop) => PlanRunResult::BudgetExceeded(stop),
+                    PlanAbort::Deferred(wait) => PlanRunResult::Deferred(wait),
                 });
             }
             let status = abort.task_status();
@@ -24743,6 +25138,7 @@ async fn execute_team_plan(
             return Ok(match abort {
                 PlanAbort::Cancelled => PlanRunResult::Cancelled,
                 PlanAbort::Budget(stop) => PlanRunResult::BudgetExceeded(stop),
+                PlanAbort::Deferred(wait) => PlanRunResult::Deferred(wait),
             });
         }
 

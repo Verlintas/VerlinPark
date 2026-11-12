@@ -122,6 +122,76 @@ enum DaemonAgentAction {
 }
 
 #[derive(Debug, Subcommand)]
+enum GateCommand {
+    /// Open a gate and print its one-time token exactly once.
+    Open {
+        session: String,
+        /// Plan task this gate belongs to, when applicable.
+        #[arg(long)]
+        task: Option<String>,
+        /// ci, pr_review, deploy, human, or custom.
+        #[arg(long, default_value = "custom")]
+        kind: String,
+        #[arg(long)]
+        label: Option<String>,
+        /// Bounded JSON context (PR number, workflow label, etc.). Never put a
+        /// secret or the gate token in this payload.
+        #[arg(long)]
+        payload: Option<String>,
+        /// Relative expiry in seconds.
+        #[arg(long, conflicts_with = "at")]
+        after_secs: Option<u64>,
+        /// Absolute RFC3339 expiry.
+        #[arg(long)]
+        at: Option<String>,
+    },
+    /// Resolve an open gate with its one-time scoped token.
+    Resolve {
+        gate: String,
+        #[arg(long)]
+        token: String,
+        /// resolved (default), rejected, or failed.
+        #[arg(long, default_value = "resolved")]
+        outcome: String,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long)]
+        operator: Option<String>,
+    },
+    /// Cancel an open gate. Cancellation is terminal and wakes the wait.
+    Cancel {
+        gate: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        operator: Option<String>,
+    },
+    /// List gates for a session.
+    List {
+        session: String,
+        #[arg(long)]
+        state: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+    /// Show one gate and its watching continuation.
+    Status { gate: String },
+    /// Expire due open gates and wake their continuations.
+    Sweep {
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+    /// Show the project gate policy.
+    Policy { project: String },
+    /// Enable or disable the optional loopback resolve endpoint.
+    PolicySet {
+        project: String,
+        #[arg(long)]
+        loopback: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum Command {
     /// Check that the daemon is reachable.
     Ping,
@@ -1868,6 +1938,9 @@ enum Command {
         /// Plan task to watch. Repeat for more than one task.
         #[arg(long = "watch")]
         watch: Vec<String>,
+        /// Watch an existing external gate id. The gate must be open.
+        #[arg(long = "gate")]
+        gate: Option<String>,
         /// Wake when all watched tasks settle, or as soon as any one settles.
         #[arg(long, default_value = "all", value_parser = ["all", "any"])]
         watch_mode: String,
@@ -2391,6 +2464,13 @@ enum Command {
     EffectSweep {
         #[arg(long)]
         limit: Option<u32>,
+    },
+    /// Open a durable external gate (ci, pr_review, deploy, human, custom).
+    /// The one-time token is printed once and is never stored in plaintext.
+    #[command(name = "gate")]
+    Gate {
+        #[command(subcommand)]
+        command: GateCommand,
     },
     /// List project-scoped MCP tool schema pins and their trust status.
     #[command(name = "mcp-pins")]
@@ -6614,6 +6694,7 @@ async fn run(cli: Cli) -> Result<()> {
             session,
             prompt,
             watch,
+            gate,
             watch_mode,
             after_secs,
             at,
@@ -6628,6 +6709,7 @@ async fn run(cli: Cli) -> Result<()> {
                     "session_id": session,
                     "body": prompt,
                     "watch_task_ids": watch,
+                    "watch_gate_id": gate,
                     "watch_mode": watch_mode,
                     "after_secs": after_secs,
                     "deadline_at": at,
@@ -7763,6 +7845,106 @@ async fn run(cli: Cli) -> Result<()> {
         Command::EffectSweep { limit } => {
             rpc(&discovery, "effect.sweep", json!({"limit": limit})).await?
         }
+        Command::Gate { command } => match command {
+            GateCommand::Open {
+                session,
+                task,
+                kind,
+                label,
+                payload,
+                after_secs,
+                at,
+            } => {
+                let payload = match payload {
+                    Some(payload) => Some(serde_json::from_str::<Value>(&payload)?),
+                    None => None,
+                };
+                rpc(
+                    &discovery,
+                    "gate.open",
+                    json!({
+                        "session_id": session,
+                        "task_id": task,
+                        "kind": kind,
+                        "label": label,
+                        "payload": payload,
+                        "after_secs": after_secs,
+                        "expires_at": at,
+                    }),
+                )
+                .await?
+            }
+            GateCommand::Resolve {
+                gate,
+                token,
+                outcome,
+                note,
+                operator,
+            } => {
+                rpc(
+                    &discovery,
+                    "gate.resolve",
+                    json!({
+                        "gate_id": gate,
+                        "token": token,
+                        "outcome": outcome,
+                        "note": note,
+                        "resolved_by": operator,
+                    }),
+                )
+                .await?
+            }
+            GateCommand::Cancel {
+                gate,
+                reason,
+                operator,
+            } => {
+                rpc(
+                    &discovery,
+                    "gate.cancel",
+                    json!({
+                        "gate_id": gate,
+                        "reason": reason,
+                        "cancelled_by": operator,
+                    }),
+                )
+                .await?
+            }
+            GateCommand::List {
+                session,
+                state,
+                limit,
+            } => {
+                rpc(
+                    &discovery,
+                    "gate.list",
+                    json!({"session_id": session, "state": state, "limit": limit}),
+                )
+                .await?
+            }
+            GateCommand::Status { gate } => {
+                rpc(&discovery, "gate.status", json!({"gate_id": gate})).await?
+            }
+            GateCommand::Sweep { limit } => {
+                rpc(&discovery, "gate.sweep", json!({"limit": limit})).await?
+            }
+            GateCommand::Policy { project } => {
+                rpc(
+                    &discovery,
+                    "project.gate_policy.get",
+                    json!({"project_id": project}),
+                )
+                .await?
+            }
+            GateCommand::PolicySet { project, loopback } => {
+                rpc(
+                    &discovery,
+                    "project.gate_policy.set",
+                    json!({"project_id": project, "policy": {"loopback_resolve": loopback}}),
+                )
+                .await?
+            }
+        },
         Command::McpPins { project, server } => {
             rpc(
                 &discovery,
@@ -12551,7 +12733,119 @@ fn effect_lines(value: &Value) -> Option<Vec<String>> {
     None
 }
 
+fn gate_lines(value: &Value) -> Option<Vec<String>> {
+    if let Some(gate) = value.get("gate")
+        && gate.is_object()
+    {
+        let mut lines = vec![format!(
+            "gate {}  {}  {}  {}",
+            gate.get("id").and_then(Value::as_str).unwrap_or("?"),
+            gate.get("kind").and_then(Value::as_str).unwrap_or("?"),
+            gate.get("state").and_then(Value::as_str).unwrap_or("?"),
+            gate.get("label").and_then(Value::as_str).unwrap_or("")
+        )];
+        if let Some(outcome) = gate.get("outcome").and_then(Value::as_str) {
+            lines.push(format!("outcome: {outcome}"));
+        }
+        if let Some(task) = gate.get("task_id").and_then(Value::as_str) {
+            lines.push(format!("task: {task}"));
+        }
+        if let Some(expires) = gate.get("expires_at").and_then(Value::as_str) {
+            lines.push(format!("expires: {expires}"));
+        }
+        if let Some(note) = gate.get("resolution_note").and_then(Value::as_str) {
+            lines.push(format!("note: {note}"));
+        }
+        if let Some(changed) = value.get("changed").and_then(Value::as_bool) {
+            lines.push(format!("changed: {changed}"));
+        }
+        if let Some(continuation) = value.get("continuation_id").and_then(Value::as_str) {
+            lines.push(format!("continuation: {continuation}"));
+        }
+        if let Some(status) = value.get("continuation_status").and_then(Value::as_str) {
+            lines.push(format!("continuation status: {status}"));
+        }
+        if let Some(token) = value.get("token").and_then(Value::as_str) {
+            lines.push(String::new());
+            lines.push("ONE-TIME GATE TOKEN (shown once; never stored in plaintext):".to_string());
+            lines.push(token.to_string());
+            if let Some(hint) = value.get("resolve_hint").and_then(Value::as_str) {
+                lines.push(format!("resolve: {hint}"));
+            }
+            if value
+                .get("loopback_resolve")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                lines.push(
+                    "loopback resolve is enabled for this project's same-host CI (scoped token still required)"
+                        .to_string(),
+                );
+            }
+        }
+        return Some(lines);
+    }
+    if let Some(gates) = value.get("gates").and_then(Value::as_array) {
+        let counts = value.get("counts").cloned().unwrap_or_else(|| json!({}));
+        let mut lines = vec![format!(
+            "gates: {} total · {} open · {} resolved · {} expired · {} cancelled{}",
+            counts.get("total").and_then(Value::as_u64).unwrap_or(0),
+            counts.get("open").and_then(Value::as_u64).unwrap_or(0),
+            counts.get("resolved").and_then(Value::as_u64).unwrap_or(0),
+            counts.get("expired").and_then(Value::as_u64).unwrap_or(0),
+            counts.get("cancelled").and_then(Value::as_u64).unwrap_or(0),
+            if value
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                " (truncated)"
+            } else {
+                ""
+            },
+        )];
+        for gate in gates {
+            lines.push(format!(
+                "{}  {}  {}  {}{}",
+                gate.get("id").and_then(Value::as_str).unwrap_or("?"),
+                gate.get("state").and_then(Value::as_str).unwrap_or("?"),
+                gate.get("kind").and_then(Value::as_str).unwrap_or("?"),
+                gate.get("label").and_then(Value::as_str).unwrap_or(""),
+                gate.get("outcome")
+                    .and_then(Value::as_str)
+                    .map(|outcome| format!(" → {outcome}"))
+                    .unwrap_or_default()
+            ));
+        }
+        return Some(lines);
+    }
+    if let Some(expired) = value.get("expired_gates").and_then(Value::as_u64) {
+        return Some(vec![format!(
+            "gate sweep: {expired} open gate(s) expired and their waits woken"
+        )]);
+    }
+    if let Some(policy) = value.get("policy")
+        && policy.get("loopback_resolve").is_some()
+        && let Some(project) = value.get("project_id").and_then(Value::as_str)
+    {
+        return Some(vec![format!(
+            "project {project}  gates loopback_resolve={}",
+            policy
+                .get("loopback_resolve")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        )]);
+    }
+    None
+}
+
 fn print_human(value: &Value) {
+    if let Some(lines) = gate_lines(value) {
+        for line in lines {
+            println!("{line}");
+        }
+        return;
+    }
     if let Some(lines) = effect_lines(value) {
         for line in lines {
             println!("{line}");
@@ -21155,5 +21449,232 @@ mod effect_cli_tests {
         assert!(lines[0].contains("external_only"));
         let sweep = json!({"swept": 2});
         assert!(effect_lines(&sweep).unwrap()[0].contains("2 stale intent"));
+    }
+}
+
+#[cfg(test)]
+mod gate_cli_tests {
+    use super::*;
+
+    #[test]
+    fn gate_commands_parse_with_scoped_token_and_bounded_expiry() {
+        let cli = Cli::try_parse_from([
+            "vp",
+            "gate",
+            "open",
+            "ses-1",
+            "--task",
+            "T1",
+            "--kind",
+            "ci",
+            "--label",
+            "unit tests",
+            "--after-secs",
+            "600",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Gate {
+                command:
+                    GateCommand::Open {
+                        session,
+                        task,
+                        kind,
+                        label,
+                        after_secs,
+                        ..
+                    },
+            } => {
+                assert_eq!(session, "ses-1");
+                assert_eq!(task.as_deref(), Some("T1"));
+                assert_eq!(kind, "ci");
+                assert_eq!(label.as_deref(), Some("unit tests"));
+                assert_eq!(after_secs, Some(600));
+            }
+            other => panic!("expected gate open, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "gate",
+            "resolve",
+            "gate-1",
+            "--token",
+            "vpg_secret",
+            "--outcome",
+            "rejected",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Gate {
+                command:
+                    GateCommand::Resolve {
+                        gate,
+                        token,
+                        outcome,
+                        ..
+                    },
+            } => {
+                assert_eq!(gate, "gate-1");
+                assert_eq!(token, "vpg_secret");
+                assert_eq!(outcome, "rejected");
+            }
+            other => panic!("expected gate resolve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn defer_accepts_a_gate_watch_without_a_task_or_deadline() {
+        let cli =
+            Cli::try_parse_from(["vp", "defer", "ses-1", "review the PR", "--gate", "gate-1"])
+                .unwrap();
+        match cli.command {
+            Command::Defer { gate, watch, .. } => {
+                assert_eq!(gate.as_deref(), Some("gate-1"));
+                assert!(watch.is_empty());
+            }
+            other => panic!("expected defer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gate_lines_show_token_once_and_never_show_a_verifier() {
+        let open = json!({
+            "gate": {
+                "id": "gate-1",
+                "session_id": "ses-1",
+                "kind": "ci",
+                "label": "unit tests",
+                "state": "open",
+                "created_at": "2026-11-12T00:00:00Z"
+            },
+            "token": "vpg_once",
+            "resolve_hint": "vp gate resolve gate-1 --token <one-time-token>",
+            "loopback_resolve": false,
+            "token_hash": "a".repeat(64)
+        });
+        let rendered = gate_lines(&open).unwrap().join("\n");
+        assert!(rendered.contains("ONE-TIME GATE TOKEN"));
+        assert!(rendered.contains("vpg_once"));
+        assert!(!rendered.contains(&"a".repeat(64)));
+
+        let list = json!({
+            "session_id": "ses-1",
+            "counts": {"total": 1, "open": 1, "resolved": 0, "expired": 0, "cancelled": 0},
+            "gates": [{"id": "gate-1", "state": "open", "kind": "ci", "label": "unit tests"}],
+            "truncated": false
+        });
+        let rendered = gate_lines(&list).unwrap().join("\n");
+        assert!(rendered.contains("1 open"));
+        assert!(rendered.contains("gate-1"));
+        assert!(!rendered.contains("vpg_"));
+    }
+
+    #[test]
+    fn gate_cancel_list_status_and_policy_parse() {
+        let cli = Cli::try_parse_from([
+            "vp",
+            "gate",
+            "cancel",
+            "gate-1",
+            "--reason",
+            "superseded",
+            "--operator",
+            "cli",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Gate {
+                command:
+                    GateCommand::Cancel {
+                        gate,
+                        reason,
+                        operator,
+                    },
+            } => {
+                assert_eq!(gate, "gate-1");
+                assert_eq!(reason.as_deref(), Some("superseded"));
+                assert_eq!(operator.as_deref(), Some("cli"));
+            }
+            other => panic!("expected gate cancel, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp", "gate", "list", "ses-1", "--state", "open", "--limit", "25",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Gate {
+                command:
+                    GateCommand::List {
+                        session,
+                        state,
+                        limit,
+                    },
+            } => {
+                assert_eq!(session, "ses-1");
+                assert_eq!(state.as_deref(), Some("open"));
+                assert_eq!(limit, 25);
+            }
+            other => panic!("expected gate list, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["vp", "gate", "policy-set", "prj-1", "--loopback"]).unwrap();
+        match cli.command {
+            Command::Gate {
+                command: GateCommand::PolicySet { project, loopback },
+            } => {
+                assert_eq!(project, "prj-1");
+                assert!(loopback);
+            }
+            other => panic!("expected gate policy-set, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["vp", "gate", "sweep", "--limit", "5"]).unwrap();
+        match cli.command {
+            Command::Gate {
+                command: GateCommand::Sweep { limit },
+            } => assert_eq!(limit, 5),
+            other => panic!("expected gate sweep, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["vp", "gate", "status", "gate-1"]).unwrap();
+        match cli.command {
+            Command::Gate {
+                command: GateCommand::Status { gate },
+            } => assert_eq!(gate, "gate-1"),
+            other => panic!("expected gate status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gate_status_and_policy_render_without_private_fields() {
+        let status = json!({
+            "gate": {
+                "id": "gate-1",
+                "session_id": "ses-1",
+                "kind": "deploy",
+                "label": "staging",
+                "state": "resolved",
+                "outcome": "resolved",
+                "resolution_note": "shipped",
+                "created_at": "2026-11-12T00:00:00Z"
+            },
+            "continuation_id": "cont-1",
+            "continuation_status": "delivered"
+        });
+        let rendered = gate_lines(&status).unwrap().join("\n");
+        assert!(rendered.contains("resolved"));
+        assert!(rendered.contains("shipped"));
+        assert!(rendered.contains("cont-1"));
+        let policy = json!({
+            "project_id": "prj-1",
+            "policy": {"loopback_resolve": true}
+        });
+        let rendered = gate_lines(&policy).unwrap().join("\n");
+        assert!(rendered.contains("loopback_resolve=true"));
+        assert!(!rendered.contains("token"));
+        let sweep = json!({"expired_gates": 3});
+        assert!(gate_lines(&sweep).unwrap()[0].contains("3 open gate"));
     }
 }

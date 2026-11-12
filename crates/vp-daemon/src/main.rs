@@ -61,15 +61,16 @@ use vp_protocol::types::{
     CriticalPathPolicyResult, DaemonMetrics, DaemonMetricsResult, DashboardParams,
     DeleteModelPresetParams, DiscardSessionParams, DoctorCheck, DoctorReport, EffectPolicyParams,
     EffectPolicyResult, EffectReconcileParams, EffectReconcileResult, EventListResult,
-    ForgePreflightParams, ForgeStatusParams, ForkAuditParams, ForkRepairParams, GitLogParams,
-    GitShowParams, GovernorPreviewParams, GovernorStatusParams, IntakeCreateParams,
-    IntakeDeleteResult, IntakeListParams, IntakeTaskParams, IntakeUpdateParams,
-    IntegrationPolicyParams, IntegrationPolicyResult, LandSessionParams, ListApprovalsParams,
-    ListEventsParams, ListSessionsParams, MailboxGcParams, MailboxListParams, MailboxListResult,
-    MailboxPolicyParams, MailboxPolicyResult, MarkMessageReadParams, McpCallParams,
-    McpGetPromptParams, McpPinApproveParams, McpPinRejectParams, McpProbeParams,
-    McpReadResourceParams, McpServerIdParams, MediaInfoParams, MediaTranscodeParams,
-    MemoryBriefParams, MemoryConflictResolveParams, MemoryConflictScanParams,
+    ForgePreflightParams, ForgeStatusParams, ForkAuditParams, ForkRepairParams, GateCancelParams,
+    GateListParams, GateOpenParams, GatePolicyParams, GatePolicyResult, GateResolveParams,
+    GateStatusParams, GateSweepParams, GitLogParams, GitShowParams, GovernorPreviewParams,
+    GovernorStatusParams, IntakeCreateParams, IntakeDeleteResult, IntakeListParams,
+    IntakeTaskParams, IntakeUpdateParams, IntegrationPolicyParams, IntegrationPolicyResult,
+    LandSessionParams, ListApprovalsParams, ListEventsParams, ListSessionsParams, MailboxGcParams,
+    MailboxListParams, MailboxListResult, MailboxPolicyParams, MailboxPolicyResult,
+    MarkMessageReadParams, McpCallParams, McpGetPromptParams, McpPinApproveParams,
+    McpPinRejectParams, McpProbeParams, McpReadResourceParams, McpServerIdParams, MediaInfoParams,
+    MediaTranscodeParams, MemoryBriefParams, MemoryConflictResolveParams, MemoryConflictScanParams,
     MemoryConflictsParams, MemoryCreateParams, MemoryCreateResult, MemoryDeleteParams,
     MemoryEmbeddingsIndexRebuildParams, MemoryEmbeddingsIndexStatusParams,
     MemoryEmbeddingsRebuildParams, MemoryEmbeddingsStatusParams, MemoryEmbeddingsTestParams,
@@ -101,20 +102,20 @@ use vp_protocol::types::{
     SessionSteeringCancelParams, SessionSteeringParams, SessionTodosParams, SessionTodosResult,
     SessionTranscriptParams, SetArtifactPolicyParams, SetCachePolicyParams,
     SetCheckpointPolicyParams, SetContextCheckpointPolicyParams, SetContractPolicyParams,
-    SetCriticalPathPolicyParams, SetIntegrationPolicyParams, SetMailboxPolicyParams,
-    SetMemoryPolicyParams, SetPreemptionPolicyParams, SetProcessPolicyParams,
-    SetProjectBudgetParams, SetProjectPromptLayoutParams, SetSessionPriorityParams,
-    SetSessionPromptLayoutParams, SetSessionRunPolicyParams, SetSessionUnlimitedParams,
-    SetShellPolicyParams, SetSourceCollectionParams, SetSourceEmbeddingPolicyParams,
-    SetSourceLabelsParams, SetSourceRetrievalPolicyParams, SetTaskSchedulerPolicyParams,
-    SetToolOutputPolicyParams, SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult,
-    SkillCreateParams, SkillEnabledParams, SkillIdParams, SkillImportParams, SkillListParams,
-    SkillUpdateParams, SourceActionParams, SourceCollectionsParams, SourceCreateFileParams,
-    SourceCreateNoteParams, SourceCreateUrlParams, SourceEmbeddingPolicyParams,
-    SourceEmbeddingReindexParams, SourceEmbeddingStatusParams, SourceGetParams, SourceImportParams,
-    SourceIndexRebuildParams, SourceIndexStatusParams, SourceListParams,
-    SourceRetrievalPolicyParams, SourceSearchParams, SubscribeParams, TaskActionParams,
-    TaskActionResult, TaskDispatchParams, TaskDispatchResult, TaskQueueParams,
+    SetCriticalPathPolicyParams, SetGatePolicyParams, SetIntegrationPolicyParams,
+    SetMailboxPolicyParams, SetMemoryPolicyParams, SetPreemptionPolicyParams,
+    SetProcessPolicyParams, SetProjectBudgetParams, SetProjectPromptLayoutParams,
+    SetSessionPriorityParams, SetSessionPromptLayoutParams, SetSessionRunPolicyParams,
+    SetSessionUnlimitedParams, SetShellPolicyParams, SetSourceCollectionParams,
+    SetSourceEmbeddingPolicyParams, SetSourceLabelsParams, SetSourceRetrievalPolicyParams,
+    SetTaskSchedulerPolicyParams, SetToolOutputPolicyParams, SetWorktreePolicyParams,
+    ShellPolicyParams, ShellPolicyResult, SkillCreateParams, SkillEnabledParams, SkillIdParams,
+    SkillImportParams, SkillListParams, SkillUpdateParams, SourceActionParams,
+    SourceCollectionsParams, SourceCreateFileParams, SourceCreateNoteParams, SourceCreateUrlParams,
+    SourceEmbeddingPolicyParams, SourceEmbeddingReindexParams, SourceEmbeddingStatusParams,
+    SourceGetParams, SourceImportParams, SourceIndexRebuildParams, SourceIndexStatusParams,
+    SourceListParams, SourceRetrievalPolicyParams, SourceSearchParams, SubscribeParams,
+    TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult, TaskQueueParams,
     TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult, TerminalCloseParams,
     TerminalOpenParams, TerminalReadParams, TerminalResizeParams, TerminalWriteParams,
     ToolActivityParams, ToolBundleDiffParams, ToolBundleHistoryParams, ToolBundleMatrixParams,
@@ -280,6 +281,7 @@ async fn run() -> Result<()> {
     spawn_gui_timeline_retention_sweeper(state.engine.clone());
     spawn_task_stall_sweeper(state.engine.clone());
     spawn_effect_sweeper(state.engine.clone());
+    spawn_gate_sweeper(state.engine.clone());
     spawn_stall_recovery_reconciler(state.agent.clone());
     spawn_process_sweeper(state.engine.clone());
     spawn_approval_sweeper(state.engine.clone());
@@ -305,6 +307,10 @@ async fn run() -> Result<()> {
             post(rpc_http).layer(axum::extract::DefaultBodyLimit::disable()),
         )
         .route("/ws", get(ws_handler))
+        .route(
+            "/gate/resolve",
+            post(gate_resolve_http).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
+        )
         .with_state(state.clone());
 
     info!(
@@ -323,6 +329,76 @@ async fn run() -> Result<()> {
 
 async fn health() -> Json<Value> {
     Json(json!({"ok": true, "version": APP_VERSION, "protocol": PROTOCOL_VERSION}))
+}
+
+/// Optional loopback-only gate resolve endpoint. It is disabled unless the
+/// gate's project sets `loopback_resolve=true`; the scoped gate token is the
+/// only credential. The daemon never binds a public interface, and this route
+/// never resolves approvals, merges work, or exposes the token/verifier.
+#[derive(serde::Deserialize)]
+struct LoopbackGateResolve {
+    gate_id: String,
+    token: String,
+    #[serde(default)]
+    outcome: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+async fn gate_resolve_http(State(state): State<AppState>, request: Request) -> Response {
+    let body = match to_bytes(request.into_body(), 16 * 1024).await {
+        Ok(body) => body,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    json!({"error": {"code": "GATE_INVALID", "message": "request body too large"}}),
+                ),
+            )
+                .into_response();
+        }
+    };
+    let params = match serde_json::from_slice::<LoopbackGateResolve>(&body) {
+        Ok(params) => params,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": {"code": "GATE_INVALID", "message": "invalid request body"}})),
+            )
+                .into_response();
+        }
+    };
+    match state
+        .engine
+        .resolve_gate_loopback(
+            &params.gate_id,
+            &params.token,
+            params.outcome.as_deref(),
+            params.note.as_deref(),
+        )
+        .await
+    {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => {
+            let code = vp_core::gate::gate_error_code(&error).unwrap_or("GATE_INVALID");
+            let status = match code {
+                vp_core::gate::codes::GATE_NOT_FOUND => StatusCode::NOT_FOUND,
+                vp_core::gate::codes::GATE_TOKEN_INVALID => StatusCode::UNAUTHORIZED,
+                vp_core::gate::codes::GATE_LOOPBACK_DISABLED => StatusCode::FORBIDDEN,
+                vp_core::gate::codes::GATE_EXPIRED | vp_core::gate::codes::GATE_CANCELLED => {
+                    StatusCode::GONE
+                }
+                vp_core::gate::codes::GATE_CONFLICT
+                | vp_core::gate::codes::GATE_ALREADY_WATCHED => StatusCode::CONFLICT,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            (
+                status,
+                Json(json!({"error": {"code": code, "message": format!("{error:#}")}})),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Prometheus scrape endpoint. It uses the same loopback Bearer token as
@@ -1476,6 +1552,109 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 Err(response) => response_with_id(id, response),
             }
         }
+        "gate.open" => match parse_params::<GateOpenParams>(request.params) {
+            Ok(params) => match state.engine.open_gate(params).await {
+                Ok(outcome) => RpcResponse::success(id, vp_core::gate::open_result(outcome)),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "gate.resolve" => match parse_params::<GateResolveParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .resolve_gate(
+                    &params.gate_id,
+                    &params.token,
+                    params.outcome.as_deref(),
+                    params.note.as_deref(),
+                    params.resolved_by.as_deref(),
+                )
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "gate.cancel" => match parse_params::<GateCancelParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .cancel_gate(
+                    &params.gate_id,
+                    params.reason.as_deref(),
+                    params.cancelled_by.as_deref(),
+                )
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "gate.list" => match parse_params::<GateListParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .list_gates(&params.session_id, params.state.as_deref(), params.limit)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "gate.status" => match parse_params::<GateStatusParams>(request.params) {
+            Ok(params) => match state.engine.gate_status(&params.gate_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "gate.sweep" => match parse_params::<GateSweepParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .sweep_expired_gates(params.limit.unwrap_or(100))
+                .await
+            {
+                Ok(expired) => RpcResponse::success(
+                    id,
+                    vp_protocol::types::GateSweepResult {
+                        expired_gates: expired as u64,
+                    },
+                ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "project.gate_policy.get" => match parse_params::<GatePolicyParams>(request.params) {
+            Ok(params) => match state.engine.get_gate_policy(&params.project_id).await {
+                Ok(policy) => RpcResponse::success(
+                    id,
+                    GatePolicyResult {
+                        project_id: params.project_id,
+                        policy,
+                    },
+                ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "project.gate_policy.set" => match parse_params::<SetGatePolicyParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .set_gate_policy(&params.project_id, params.policy)
+                .await
+            {
+                Ok(policy) => RpcResponse::success(
+                    id,
+                    GatePolicyResult {
+                        project_id: params.project_id,
+                        policy,
+                    },
+                ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
         "project.mcp_pins" => match parse_params::<ProjectMcpPinsParams>(request.params) {
             Ok(params) => match state
                 .engine
@@ -2871,7 +3050,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "session.defer" => match parse_params::<SessionDeferParams>(request.params) {
             Ok(params) => match state
                 .engine
-                .defer_session(
+                .defer_session_watching_gate(
                     &params.session_id,
                     &params.body,
                     params.watch_task_ids,
@@ -2881,6 +3060,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                     params.max_attempts,
                     params.every_secs,
                     params.max_runs,
+                    params.watch_gate_id.as_deref(),
                     params.operation_id.as_deref(),
                 )
                 .await
@@ -5092,6 +5272,36 @@ fn spawn_effect_sweeper(engine: Engine) {
                     "moved stale effect intents to unknown; reconcile before retrying or merging"
                 ),
                 Err(error) => tracing::warn!(%error, "effect intent sweep failed"),
+            }
+        }
+    });
+}
+
+/// Expire open external gates whose deadline passed. Expiry is terminal and
+/// wakes the watching continuation; it never resolves an approval or retries
+/// an external action. The first tick runs immediately so a restart catches up.
+fn spawn_gate_sweeper(engine: Engine) {
+    let seconds = std::env::var("VERLINPARK_GATE_SWEEP_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(30);
+    if seconds == 0 {
+        return;
+    }
+    let seconds = seconds.clamp(5, 3_600);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(seconds));
+        loop {
+            interval.tick().await;
+            match engine.sweep_expired_gates(100).await {
+                Ok(0) => {}
+                Ok(expired) => {
+                    tracing::info!(
+                        expired,
+                        "expired external gates and woke their continuations"
+                    );
+                }
+                Err(error) => tracing::warn!(%error, "external gate expiry sweep failed"),
             }
         }
     });

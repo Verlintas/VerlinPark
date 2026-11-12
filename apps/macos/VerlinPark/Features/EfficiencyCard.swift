@@ -23,6 +23,9 @@ struct EfficiencyCard: View {
                 if let effects = model.sessionEffects, effects.counts.total > 0 {
                     EffectReceiptsSection(report: effects)
                 }
+                if let gates = model.sessionGates, gates.counts.total > 0 {
+                    GateListSection(report: gates)
+                }
                 CacheCallTable(
                     calls: model.cacheCallRows,
                     truncated: model.sessionCacheCallsTruncated
