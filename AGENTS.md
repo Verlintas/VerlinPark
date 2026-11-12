@@ -63,7 +63,13 @@ just daemon      # run verlinpadd in the foreground
 just cli ping    # run the CLI
 just fmt         # cargo fmt + swiftformat
 just lint        # fmt check + clippy -D warnings + swiftformat lint
+just clean       # remove target/ and apps/macos/build (not worktrees)
 ```
+
+`target/debug` is per-worktree and can exceed 300 GiB after repeated
+full-workspace builds (incremental plus accumulated dependency artifacts). After
+merging a large round, remove the merged worktrees and run `just clean`; do not
+delete a worktree's `target/` while its cargo build is running.
 
 ## Repo conventions
 

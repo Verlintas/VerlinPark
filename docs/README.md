@@ -26,6 +26,7 @@
 | **Current** | [GAP_CLOSURE_PLAN.md](GAP_CLOSURE_PLAN.md) | I1–I6 第七轮计划与实现记录：source ANN/rerank/expansion、archive/media、Bitbucket、backup revocation/rekey、boot persistence/retention、remote bootstrap/test evidence；已完成 +45.3k 行验收，含完整已知缺口清单与非目标 |
 | **Current** | [CACHE_LOSSLESS_PLAN.md](CACHE_LOSSLESS_PLAN.md) | L1–L5 第八轮计划：99.84% DeepSeek cache 目标、instruction store、append-only prefix、tool bundle 分区、cache epoch/compaction、telemetry/benchmark/GUI；含 OpenCode2 实测基线 |
 | **Current** | [cache-lossless-plan.json](cache-lossless-plan.json) | 第八轮机器可读无损计划：任务、依赖、文件、测试、验收、非目标 |
+| **Reference** | [OBSCURA_ASSESSMENT.md](OBSCURA_ASSESSMENT.md) | Obscura（Rust/V8/CDP/MCP headless browser）评估：适用场景、安全约束、三种集成方案、结论为 cache 轮之后再做可选外部网页后端 |
 | **Reference** | [PRIDE_FLAGS.md](PRIDE_FLAGS.md) | Pride flag 资产来源与许可 |
 | **Reference** | [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) | FlagKit 等第三方资产许可 |
 | **Contributing** | [../CONTRIBUTING.md](../CONTRIBUTING.md) | 构建、测试、提交约定 |
