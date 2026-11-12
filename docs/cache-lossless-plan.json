@@ -1,0 +1,259 @@
+{
+  "schema": "verlinpark.cache-lossless-plan/v1",
+  "created": "2026-11-12",
+  "base_commit": "6dc4443",
+  "round": "cache-lossless-99.84",
+  "target": {
+    "long_context_hit_ratio": 0.9984,
+    "working_day_aggregate_hit_ratio": 0.99,
+    "short_session_hit_ratio": 0.95,
+    "measurement": "provider-reported prompt_cache_hit_tokens / prompt_tokens",
+    "notes": "99.84% is a stretch target for stable-prefix, >=200k-token sessions; report honestly when provider/cache state differs. Never game the metric with filler tokens."
+  },
+  "baseline": {
+    "opencode2": {
+      "version": "2.2.7",
+      "database": "~/.local/share/opencode/opencode.db",
+      "sessions_with_cache": 114,
+      "uncached_input_tokens": 79748915,
+      "cache_read_tokens": 8331745024,
+      "aggregate_hit_ratio": 0.99052,
+      "best_large_session_hit_ratio": 0.99506,
+      "best_large_session": "ses_f1755d277ffeIiaGUWBskoSeo3",
+      "instruction_keys": [
+        "core/codemode",
+        "core/skill-guidance",
+        "core/date",
+        "core/environment"
+      ],
+      "instruction_state_initial_equals_current": true,
+      "first_call_cache_read_tokens": 1664
+    },
+    "verlinpark_live": {
+      "simple_session": {
+        "calls": 3,
+        "input_tokens": 49983,
+        "cache_read_tokens": 33024,
+        "hit_ratio": 0.6607
+      },
+      "team_session": {
+        "calls": 20,
+        "input_tokens": 311254,
+        "cache_read_tokens": 278912,
+        "hit_ratio": 0.8961
+      },
+      "team_follow_up": {
+        "calls": 23,
+        "input_tokens": 370340,
+        "cache_read_tokens": 334464,
+        "hit_ratio": 0.9031
+      }
+    }
+  },
+  "invariants": [
+    "append_only_conversation",
+    "byte_identical_stable_prefix",
+    "no_current_prompt_in_system_prefix",
+    "memory_tail_only",
+    "one_epoch_per_stable_change",
+    "compaction_explicit_and_rare",
+    "no_hidden_model_routing",
+    "no_gate_weakening"
+  ],
+  "workstreams": [
+    {
+      "id": "L1",
+      "title": "Instruction store and prompt layout v3",
+      "status": "planned",
+      "adr": "0188",
+      "files": [
+        "crates/vp-core/src/instruction.rs",
+        "crates/vp-core/src/prompt_cache.rs",
+        "crates/vp-core/src/agent.rs",
+        "crates/vp-store/src/store.rs",
+        "crates/vp-store/src/store/tests.rs",
+        "crates/vp-protocol/src/types.rs",
+        "crates/vp-daemon/src/main.rs",
+        "crates/vp-cli/src/main.rs",
+        "apps/macos/VerlinPark/Core/Models.swift",
+        "apps/macos/VerlinPark/Core/CoreClient.swift",
+        "apps/macos/VerlinPark/Features/StageView.swift"
+      ],
+      "deliverables": [
+        "instruction_blobs and session_instruction_state tables",
+        "content-addressed section materialization with sha256 verification",
+        "session/context uses the session goal, never the current prompt",
+        "run/task section for task-scoped agents",
+        "tail/memory section sent after history or as a stable user memory message",
+        "context.prompt_prefix carries ordered keys/hashes and prompt_layout=3",
+        "session.instructions RPC and vp instructions CLI"
+      ],
+      "tests": [
+        "byte identity across two calls and two sessions",
+        "prompt change appears only as a user message",
+        "memory change appears only in the tail",
+        "hash verification and deterministic rebuild",
+        "replay and db-rebuild"
+      ],
+      "acceptance": "No prompt/objective/memory bytes in the head stable prefix; ordered hashes stable; legacy sessions decode."
+    },
+    {
+      "id": "L2",
+      "title": "Append-only conversation and canonical provider serialization",
+      "status": "planned",
+      "adr": "0189",
+      "files": [
+        "crates/vp-providers/src/openai.rs",
+        "crates/vp-providers/src/anthropic.rs",
+        "crates/vp-providers/src/lib.rs",
+        "crates/vp-core/src/agent.rs",
+        "crates/vp-core/src/prompt_cache.rs",
+        "crates/vp-core/src/agent/tests.rs"
+      ],
+      "deliverables": [
+        "canonical message serializer with stable field ordering",
+        "message_prefix_hash/previous_message_prefix_hash/append_only per call",
+        "cache_break event with bounded reasons",
+        "DeepSeek reasoning_content excluded from replayed messages",
+        "mid-history tail memory fallback to user message if provider rejects"
+      ],
+      "tests": [
+        "wiremock body prefix byte identity across turns",
+        "append-only true for normal turns",
+        "edit/reorder detection",
+        "compaction reset reason",
+        "DeepSeek usage parsing and reasoning exclusion"
+      ],
+      "acceptance": "The previous call's canonical messages are an exact prefix of the next call; any break is recorded with a reason."
+    },
+    {
+      "id": "L3",
+      "title": "Tool bundle partition, freeze, and canonical schema",
+      "status": "planned",
+      "adr": "0190",
+      "files": [
+        "crates/vp-core/src/agent.rs",
+        "crates/vp-core/src/tools.rs",
+        "crates/vp-core/src/tooling/mod.rs",
+        "crates/vp-core/src/prompt_cache.rs",
+        "crates/vp-providers/src/openai.rs",
+        "crates/vp-core/src/agent/tests.rs"
+      ],
+      "deliverables": [
+        "named bundles: leader, coding, research, verification, minimal",
+        "task-kind bundle selection, frozen per run",
+        "dynamic MCP tools sorted and frozen",
+        "canonical tool schema JSON and stable tools_hash",
+        "bundle size targets: leader <=48, coding worker <=40, minimal <=12",
+        "full-bundle fallback for unknown task kinds"
+      ],
+      "tests": [
+        "exact bundle sets and role permissions",
+        "stable hash across sessions",
+        "no per-turn schema churn",
+        "minimal bundle for trivial tasks",
+        "MCP determinism"
+      ],
+      "acceptance": "A trivial one-file task uses the minimal bundle; the same bundle produces byte-identical tools_hash across sessions."
+    },
+    {
+      "id": "L4",
+      "title": "Cache epochs, compaction policy, cross-session reuse",
+      "status": "planned",
+      "adr": "0191",
+      "files": [
+        "crates/vp-core/src/agent.rs",
+        "crates/vp-core/src/prompt_cache.rs",
+        "crates/vp-core/src/cache_audit.rs",
+        "crates/vp-core/src/context.rs",
+        "crates/vp-store/src/store.rs",
+        "crates/vp-protocol/src/types.rs",
+        "crates/vp-daemon/src/main.rs",
+        "crates/vp-cli/src/main.rs"
+      ],
+      "deliverables": [
+        "cache_epoch identity and prompt_prefixes table",
+        "cross-session reuse telemetry",
+        "window-derived compaction threshold (90% for 1M DeepSeek)",
+        "compaction epoch/reset/lost-cache accounting",
+        "miss attribution provider_cache_miss vs prefix_changed",
+        "explicit warm path remains opt-in"
+      ],
+      "tests": [
+        "epoch stability across prompt/memory changes",
+        "epoch change on model/tool/project changes",
+        "compaction threshold math",
+        "cross-session reuse counting",
+        "warm cost accounting",
+        "provider cache miss attribution"
+      ],
+      "acceptance": "A new session with the same epoch reports cross-session reuse when the provider reports cache hits; compaction never runs at 75% of a 1M window."
+    },
+    {
+      "id": "L5",
+      "title": "Telemetry, benchmark, and GUI cache panel",
+      "status": "planned",
+      "adr": "0192",
+      "files": [
+        "crates/vp-core/src/prompt_cache.rs",
+        "crates/vp-core/src/cache_audit.rs",
+        "crates/vp-protocol/src/types.rs",
+        "crates/vp-daemon/src/main.rs",
+        "crates/vp-cli/src/main.rs",
+        "crates/vp-bench/src/lib.rs",
+        "apps/macos/VerlinPark/Features/EfficiencyCard.swift",
+        "apps/macos/VerlinPark/Features/StageView.swift",
+        "apps/macos/VerlinPark/Core/Models.swift",
+        "apps/macos/VerlinPark/Core/CoreClient.swift"
+      ],
+      "deliverables": [
+        "per-call input/cache_read/cache_miss/theoretical_max/hit_ratio/miss_reason",
+        "session aggregation and bounded call table",
+        "vp cache-bench deterministic simulator and live DeepSeek opt-in mode",
+        "OpenCode2 baseline extraction script/doc (aggregate only)",
+        "Efficiency card and Stage cache panel",
+        "cache audit findings for system_changed/append_only/epoch"
+      ],
+      "tests": [
+        "metric math and theoretical max",
+        "miss reason mapping",
+        "simulator determinism and 99.5% long-prefix scenario",
+        "live benchmark env gate",
+        "protocol/Swift decode",
+        "GUI model label from agent.info (cache-adjacent fix)"
+      ],
+      "acceptance": "A live DeepSeek long-context benchmark reports provider hit ratio >=99.8%; the GUI shows ratio, miss tokens, epoch, append-only, and top miss reasons."
+    },
+    {
+      "id": "L6",
+      "title": "Optional cache-loss audit and repair guidance",
+      "status": "optional",
+      "adr": "0193",
+      "files": [
+        "crates/vp-core/src/cache_audit.rs",
+        "crates/vp-cli/src/main.rs",
+        "apps/macos/VerlinPark/Features/EfficiencyCard.swift"
+      ],
+      "deliverables": [
+        "flag system_changed cache breaks and show the first differing section key",
+        "suggest stable alternative; never auto-repair"
+      ],
+      "tests": [
+        "first differing key detection",
+        "bounded output",
+        "no auto-repair"
+      ],
+      "acceptance": "An operator can see exactly which instruction key caused a cache break."
+    }
+  ],
+  "integration_order": ["L1", "L3", "L2", "L4", "L5", "L6"],
+  "non_goals": [
+    "fake usage or metric gaming",
+    "hidden model routing",
+    "automatic cache warm by default",
+    "provider TTL inference",
+    "cross-host cache sharing",
+    "gate weakening",
+    "automatic prompt rewriting to recover a cache break"
+  ]
+}
