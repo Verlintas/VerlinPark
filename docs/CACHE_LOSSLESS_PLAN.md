@@ -1,13 +1,35 @@
 # Cache-Lossless Plan: targeting 99.84% DeepSeek cache hits in real development
 
-> **Status:** active implementation plan.
+> **Status:** L1–L5 implemented and merged; live provider validation pending an
+> environment key.
 > **Created:** 2026-11-12
 > **Base:** `6dc4443` (Worker return-prompt fix).
+> **Merged:** `bc64d6f` (L1–L5, 3,363 Rust tests; Swift `xcodebuild test` passed).
 > **Goal:** make long development sessions reuse an exact, append-only prompt
 > prefix so DeepSeek reports ~99.84% cache-hit tokens in real use, without
 > hiding token costs, mutating prior messages, or weakening any gate.
 > **Budget:** one large round, target +36,000 net lines of production code and
 > tests. No filler.
+
+### Implementation results (2026-11-12)
+
+| Scenario | Hit ratio | Notes |
+|---|---:|---|
+| Simulator, 200k context / 50 turns | 99.7081% | first 20k uncached context amortized over 50 turns |
+| Simulator, 200k context / 100 turns | 99.8099% | longer session, same prefix shape |
+| Simulator, 420k context / 100 turns | **99.9077%** | stretch target met; no filler, prefix-size guard |
+| Live DeepSeek | not run | no `DEEPSEEK_API_KEY` / `VERLINPARK_LIVE_API_KEY` in this workspace |
+
+The simulator uses 64-token blocks and deterministic synthetic tokens; it is a
+regression tool, not provider-reported evidence. It rejects stable prefixes
+above 400k to prevent a ratio manufactured solely by prefix size. `99.84%` is
+still a stretch target that depends on context length, turn count, and the
+provider's first-call behavior; cache reads remain billed.
+
+**Delivered:** instruction store/layout v3 (L1), append-only canonical
+serialization (L2), frozen tool bundles (L3), finalized epochs + late
+compaction + cross-session reuse (L4), per-call telemetry + `vp cache-bench` +
+GUI cache surfaces (L5). ADRs 0188–0192.
 
 ---
 

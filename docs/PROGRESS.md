@@ -1,10 +1,60 @@
 # VerlinPark 进度
 
-> 最后更新：2026-11-11
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence 已跑通
+> 最后更新：2026-11-12
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
+
+---
+
+## 2026-11-12 Cache lossless: instruction store, append-only prefix, tool bundles, epochs, benchmark
+
+第八轮按 [CACHE_LOSSLESS_PLAN.md](CACHE_LOSSLESS_PLAN.md) 完成 L1–L5，目标是把长开发会话的 provider-reported cache hit ratio 从 89–90% 提升到 99%+，99.84% 作为长上下文 stretch target。基线 `9450108`，合并后 `bc64d6f`；Rust **3,363 passed / 0 failed / 6 ignored**，`cargo clippy -D warnings`、`swiftformat --lint`、`xcodebuild test` 均通过。
+
+### L1 instruction store / prompt layout v3
+
+- 新增 `instruction_blobs`、`session_instruction_state`，内容寻址并按 `core/charter`(10)、`core/recipes`(20)、`project/sources`(30)、`project/skills`(40)、`session/context`(50)、`run/task`(60)、`tail/memory`(90) 排序。
+- `session/context` 使用 session goal，不包含当前 prompt；Leader follow-up 只改变 user message。`run/task` 只存在于 Worker/Labour/Verifier/Scout。
+- `tail/memory` 只走尾部，并持久化一个 memory anchor；OpenAI-compatible 使用 trailing system，Anthropic 使用 `[memory]` user projection。
+- 缺失/损坏 blob 会确定性重建并发出 `context.instruction.rebuilt`；超限 fail closed。`context.prompt_prefix` v3 记录有序 section hashes、`prompt_layout`、`stable_prefix_hash`、`volatile_hash`、`prefix_hash`，不记录 prompt 文本。
+- 新增 `session.instructions` / `vp instructions`、`session.prompt_layout.set` / `project.prompt_layout.set`；旧 session 保持 layout 2 回滚路径。
+
+### L2 append-only conversation
+
+- 新增 canonical JSON/message 序列化（sorted keys、稳定 tool-call/result 顺序、无时间戳/生成 ID 进入 content），`message_prefix_hash` / `previous_message_prefix_hash` / `append_only` 逐 call 持久化。
+- 非 append-only 转换记录 bounded `context.cache_break`，原因含 `first_call`、`system_changed`、`tool_bundle_changed`、`message_edited`、`message_reordered`、`compaction_reset`、`provider_cache_miss`、`unknown`；不重写历史来“修复”缓存。
+- DeepSeek 不回放 `reasoning_content`；OpenAI-compatible 的 prior messages 在追加 turn 中保持 byte-identical；Anthropic 保持 stable breakpoints 和 tail memory 规则。
+- `session.cache.breaks` / `vp cache-breaks`；首次调用的 `append_only` 为 `null`（未知），不计为 break；`append_only_breaks` 只统计有 previous list 的真实变化。
+
+### L3 frozen tool bundles
+
+- `leader`（Leader/Manager，46–48）、`coding`（Worker/Labour implementation，36–37）、`research`（research/Scout，20–33）、`verification`（Verifier，38）、`minimal`（trivial，6）、`full` fallback。
+- task kind 映射：implementation/coding/edit/fix/refactor/test → coding；verification/review/audit/validate → verification；research/discovery/investigation/analysis → research；trivial/typo/format/rename/one-file → minimal；unknown → full。
+- bundle 每 run 冻结；动态 MCP 按 name 排序、最多 32、只追加一次；canonical `tools_hash` 跨 session 稳定。role permission 仍是执行时的授权门，schema 存在不等于可执行。
+- `session.tool_bundle`、`session.tool_bundle.history`、`tool_bundle.catalog/matrix/diff`、`vp tool-bundle(s)`；`context.prompt_prefix` 和 `session.cache` 带 bundle identity。
+
+### L4 cache epochs / late compaction / cross-session reuse
+
+- `cache_epoch = sha256(scheme/version, model, tools_hash, core_hash, project_hash, ordered core/project refs)`；排除 prompt、session context、run/task、memory、conversation、compaction boundary。
+- `prompt_prefix_observations` + `prompt_prefixes` 聚合；仅在 provider 报告 cache read 时声称 cross-session reuse。`session.cache.epoch` / `project.cache_epochs` / `project.cache_epochs.prune` 与 CLI `vp cache-epoch(s)`。
+- compaction 默认 `min(90% of window, hard limit - output reserve)`：1M → 900,000；1,048,576 → 943,718；128k → 115,200。只在下一请求会超过阈值时触发，不再因为 session 老而压缩。
+- compaction 记录 epoch before/after、reset reason、invalidated tokens、estimated lost cache-read USD；stable epoch 不变，只有 conversation cache generation 重置。
+- miss attribution 区分 model/tools/project/prefix/provider/first/compaction；warm 仍是显式/opt-in，默认不自动 warm。
+
+### L5 telemetry / benchmark / GUI
+
+- `SessionCacheCall` 增加 `cache_miss_tokens`、`theoretical_max_hit_ratio`、append-only hash/count、`cache_epoch/source`、previous input tokens；`SessionCacheStatus` 增加 p50/p95、per-role、top miss reasons、epoch timeline、cross-session reuse、compaction lost USD。
+- `session.cache.calls` / `vp cache-calls`（bounded 1–100，可按 role/miss reason 过滤）；`project.cache` / `vp project-cache`（bounded 50,000 events）。
+- `vp cache-bench`（以及 `vp-bench cache-bench`）：确定性 64-token block simulator、50-turn 长前缀场景、warm/cold/break controls、JSON/Markdown/CSV、mismatch-refusing compare、CI `verify`；live 模式必须 `--live --allow-live` + env key，模型/base URL 不静默默认。
+- `scripts/cache-benchmark/opencode2_baseline.sh` 只读提取 OpenCode2 聚合指标，不导出用户内容。
+- Efficiency card / Stage cache panel 显示 hit ratio、read/miss、theoretical max、append-only、epoch/source、p50/p95、top reasons、per-role、reuse、lost USD、recent calls；Stage/header 的模型标签改为使用 daemon `agent.info`，不再读本地 `providerModel`。
+
+### 实测与限制
+
+- 确定性 simulator：200k 上下文 / 50 turns **99.7081%**；200k / 100 turns **99.8099%**；420k / 100 turns **99.9077%**（stretch 达标）。默认 200k/50 turns 低于 99.84，因为首轮 20k uncached context 被 50 轮摊薄；这不是用 filler 刷分，benchmark 会拒绝 >400k stable prefix 的“prefix-size-driven ratio”。
+- 当前环境没有 `DEEPSEEK_API_KEY` / `VERLINPARK_LIVE_API_KEY`，因此 **live provider benchmark 未运行**；报告中的 provider-reported 数字仍是旧的 89.61%/90.31%，不能当作 L1–L5 后的实测结果。
+- 缓存命中由 provider 管理，epoch/append-only 只证明我们的字节连续性；cache reads 仍计费；simulator 不是 vendor tokenizer；没有跨主机 cache 共享、自动 warm 或 provider TTL 推断。详见 [AUDIT.md](AUDIT.md) 与 ADR-0188–0192。
 
 ---
 

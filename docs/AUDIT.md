@@ -5,6 +5,19 @@
 > 范围：Rust runtime、SwiftUI app、协议/存储、Git 集成、权限与预算、文档与仓库卫生  
 > 结论先行：**M2 的功能闭环已经成立，但仍是一个强原型，不是可靠的多 Agent 平台。** P0 约束、merge queue、确定性 Integrator、queue retry、本地 landing、GitHub PR flow、pause/resume 与 shell 写入沙箱已经补上；下一步是完整 event sourcing、完整 shell 读取/网络隔离与其他 forge PR adapter。
 
+## 0.2 2026-11-12 Cache-lossless round
+
+L1–L5 are implemented and merged at `bc64d6f`: content-addressed instruction store/layout v3, append-only canonical conversation + `cache_break` reasons, frozen tool bundles, finalized cache epochs + late 90% compaction + cross-session reuse, and per-call telemetry/`vp cache-bench`/GUI cache surfaces. Rust tests: 3,363 passed; clippy and Swift tests passed.
+
+Honest limits:
+
+- **No live provider validation yet.** This workspace had no `DEEPSEEK_API_KEY` / `VERLINPARK_LIVE_API_KEY`, so the 99.84% target is not measured against the provider after L1–L5. The simulator is deterministic but not a vendor tokenizer: 99.7081% at 200k/50 turns, 99.8099% at 200k/100 turns, 99.9077% at 420k/100 turns. The 420k result is a stretch-target model, not a provider invoice.
+- **First call is uncached.** `append_only` is `null` on the first observation; a new session/prefix pays the first-call miss. 99.84% only emerges when that miss is small relative to a long, append-only session.
+- **Provider behavior is not ours.** Cache epochs prove byte identity and append-only continuity, not provider TTL, eviction, or a guaranteed hit. Cache reads are still billed; savings use user-configured prices and can be negative.
+- **Compaction breaks the conversation tail.** The stable instruction prefix survives, but a compaction boundary resets the conversation cache generation and records an estimated lost-cache cost. It is explicit and rare, not cache-free.
+- **No cross-host or distributed cache index.** `prompt_prefixes` is local SQLite for one daemon; there is no cross-host cache sharing, automatic warm, or cache-hit exactly-once claim.
+- **Benchmark controls.** Live mode is never default and requires `--live --allow-live` plus an environment key; the simulator rejects >400k stable prefixes to prevent ratio manufacturing. The 99.84% stretch is reported honestly when not met.
+
 ## 0. 2026-10-30 跟进
 
 第一轮硬化已完成（同一 `main` 线，提交见仓库历史）：

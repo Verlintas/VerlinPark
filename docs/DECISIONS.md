@@ -197,6 +197,11 @@
 | [0185](adr/0185-backup-key-revocation-rekey-portable-anchor.md) | Backup key revocation, ciphertext-preserving rekey, and raise-only portable anchor | Accepted | Runtime/Security |
 | [0186](adr/0186-boot-persistence-retention-and-preemption-polish.md) | User LaunchAgent lifecycle, opt-in boot restart, GUI retention, and per-tool deadlines | Accepted | Runtime/Lifecycle |
 | [0187](adr/0187-remote-helper-bootstrap-and-test-evidence.md) | Checksummed remote helper bootstrap and supplemental remote test evidence | Accepted | Runtime/Remote |
+| [0188](adr/0188-content-addressed-instruction-store-and-prompt-layout-v3.md) | Content-addressed instruction store and prompt layout v3 | Accepted | Runtime/Providers |
+| [0189](adr/0189-append-only-conversation-and-canonical-provider-serialization.md) | Append-only conversation and canonical provider serialization | Accepted | Runtime/Providers |
+| [0190](adr/0190-tool-bundle-partition-and-canonical-schemas.md) | Tool bundle partition and canonical schemas | Accepted | Runtime/Tooling |
+| [0191](adr/0191-cache-epochs-compaction-and-cross-session-reuse.md) | Cache epochs, late compaction policy, and cross-session reuse | Accepted | Runtime/Cache |
+| [0192](adr/0192-cache-telemetry-and-deepseek-benchmark.md) | Cache telemetry and DeepSeek benchmark | Accepted | Runtime/Observability |
 
 ---
 

@@ -64,7 +64,7 @@
     {
       "id": "L1",
       "title": "Instruction store and prompt layout v3",
-      "status": "planned",
+      "status": "implemented",
       "adr": "0188",
       "files": [
         "crates/vp-core/src/instruction.rs",
@@ -100,7 +100,7 @@
     {
       "id": "L2",
       "title": "Append-only conversation and canonical provider serialization",
-      "status": "planned",
+      "status": "implemented",
       "adr": "0189",
       "files": [
         "crates/vp-providers/src/openai.rs",
@@ -129,7 +129,7 @@
     {
       "id": "L3",
       "title": "Tool bundle partition, freeze, and canonical schema",
-      "status": "planned",
+      "status": "implemented",
       "adr": "0190",
       "files": [
         "crates/vp-core/src/agent.rs",
@@ -159,7 +159,7 @@
     {
       "id": "L4",
       "title": "Cache epochs, compaction policy, cross-session reuse",
-      "status": "planned",
+      "status": "implemented",
       "adr": "0191",
       "files": [
         "crates/vp-core/src/agent.rs",
@@ -192,7 +192,7 @@
     {
       "id": "L5",
       "title": "Telemetry, benchmark, and GUI cache panel",
-      "status": "planned",
+      "status": "implemented",
       "adr": "0192",
       "files": [
         "crates/vp-core/src/prompt_cache.rs",
@@ -227,7 +227,7 @@
     {
       "id": "L6",
       "title": "Optional cache-loss audit and repair guidance",
-      "status": "optional",
+      "status": "optional_not_started",
       "adr": "0193",
       "files": [
         "crates/vp-core/src/cache_audit.rs",
@@ -246,7 +246,14 @@
       "acceptance": "An operator can see exactly which instruction key caused a cache break."
     }
   ],
-  "integration_order": ["L1", "L3", "L2", "L4", "L5", "L6"],
+  "integration_order": [
+    "L1",
+    "L3",
+    "L2",
+    "L4",
+    "L5",
+    "L6"
+  ],
   "non_goals": [
     "fake usage or metric gaming",
     "hidden model routing",
@@ -255,5 +262,29 @@
     "cross-host cache sharing",
     "gate weakening",
     "automatic prompt rewriting to recover a cache break"
-  ]
+  ],
+  "implementation": {
+    "merged_commit": "bc64d6f",
+    "date": "2026-11-12",
+    "rust_tests": 3363,
+    "rust_failed": 0,
+    "rust_ignored": 6,
+    "swift_tests": "xcodebuild test passed",
+    "simulator": {
+      "200k_50_turns": 0.997081,
+      "200k_100_turns": 0.998099,
+      "420k_100_turns": 0.999077,
+      "stretch_target": 0.9984,
+      "stretch_met_at_420k_100_turns": true,
+      "notes": "Deterministic 64-token-block simulator; not provider-reported; prefixes above 400k are rejected to prevent ratio manufacturing."
+    },
+    "live_provider": "not_run_no_api_key",
+    "limitations": [
+      "cache_epoch proves byte identity, not a provider hit guarantee",
+      "first call is uncached and append_only is null",
+      "compaction resets the conversation cache generation",
+      "no cross-host cache index or automatic warm",
+      "cache reads remain billed"
+    ]
+  }
 }
