@@ -207,6 +207,7 @@
 | [0195](adr/0195-external-gates-and-durable-waits.md) | Durable external gates, one-shot tokens, and continuation-based waits | Accepted | Runtime/Orchestration |
 | [0196](adr/0196-runtime-version-pinning-and-controller-replay.md) | Runtime identity pinning, compatibility/migration, and deterministic controller replay | Accepted | Runtime/Durability |
 | [0197](adr/0197-reliability-metrics-and-otel-genai.md) | Reliability metrics, Lucky-Pass signals, and OTel GenAI projection | Accepted | Runtime/Observability |
+| [0205](adr/0205-project-scoped-agent-identities.md) | Project-scoped Leader/Manager/Worker identity schema, lifecycle, policy, and migration | Accepted | Runtime/Orchestration |
 
 ---
 

@@ -143,7 +143,8 @@
         "policy off falls back cleanly",
         "identity generation persisted"
       ],
-      "acceptance": "Existing sessions keep current behavior; new identities are durable and project-scoped."
+      "acceptance": "Existing sessions keep current behavior; new identities are durable and project-scoped.",
+      "status": "implemented"
     },
     {
       "id": "S2",
@@ -517,5 +518,24 @@
     "docs/adr/0172-deterministic-org-scaling.md",
     "docs/adr/0188-content-addressed-instruction-store-and-prompt-layout-v3.md",
     "docs/adr/0191-cache-epochs-compaction-and-cross-session-reuse.md"
-  ]
+  ],
+  "implementation": {
+    "S1": {
+      "status": "implemented",
+      "commit": "9bf3df9",
+      "adr": "0205",
+      "tests": {
+        "rust": 3607,
+        "swift": 503
+      },
+      "limits": [
+        "no session assignment/identity lease/inbox/workspace/identity memory/prompt/org chart yet",
+        "no automatic hiring/firing/promotion/transfer or cross-project rehome",
+        "imported identities read-only",
+        "no identity budget/performance ledger",
+        "one live Leader is same-database SQLite only",
+        "identity model is metadata; gates unchanged"
+      ]
+    }
+  }
 }

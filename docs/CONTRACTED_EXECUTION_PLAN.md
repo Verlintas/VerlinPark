@@ -494,7 +494,8 @@ should wait until the identity/role contracts and Worker workspace phases
 | C4 Version pinning + controller replay | **implemented** | `f66e485`, ADR-0196, 3,531 Rust / 495 Swift tests |
 | C5 Reliability + OTel | **implemented** | `782cb19`, ADR-0197, 3,571 Rust / 500 Swift tests |
 | **Phase 1 complete** | **C1–C5** | contract/intent/MCP pins, effects, gates, runtime pinning, reliability |
-| S1 Project-scoped identities | planned | next program |
+| S1 Project-scoped identities | **implemented** | `9bf3df9`, ADR-0205, 3,607 Rust / 503 Swift tests |
+| S2 Session assignment + identity lease + inbox | planned | next |
 | C6 Failure attribution | planned | |
 | C7 Bounded fan-out | planned | |
 | C8 Tool search v2 + delta snapshots | planned | |

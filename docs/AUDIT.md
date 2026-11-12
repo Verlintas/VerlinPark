@@ -86,6 +86,19 @@ Limits:
 - OTel is metadata-only, bounded to 5,000 events; no background exporter, remote collector, collector auth, or cross-host correlation.
 - Reliability reports are descriptive, not a leaderboard, significance test, or merge gate.
 
+## 0.8 2026-11-13 Project-scoped identities S1
+
+S1 is implemented and merged at `9bf3df9` (ADR-0205): project-scoped `agent_identities`, append-only identity events, `AgentIdentityPolicy` (default disabled), one live Leader per project, Manager→Leader/Worker→Manager hierarchy, generation bumps, retired-terminal lifecycle, replay/db-rebuild/bundle coverage, and a read-only Manage Dash roster card. Rust 3,607 passed; Swift 503 passed.
+
+Limits:
+
+- No session assignment, identity lease, inbox, Worker workspace, identity memory, identity prompt section, or org-chart GUI; these are S2–S8.
+- No automatic hiring/firing/promotion/transfer and no cross-project identity sharing/rehome.
+- Imported identities are read-only until an explicit future rehome.
+- No identity-scoped budget or performance ledger; `policy_json` is bounded metadata only.
+- One-live-Leader is same-database SQLite, not cross-host consensus.
+- Identity `model` is metadata; role model routing and all approval/sandbox/Verifier/Integrator gates are unchanged.
+
 ## 0. 2026-10-30 跟进
 
 第一轮硬化已完成（同一 `main` 线，提交见仓库历史）：
