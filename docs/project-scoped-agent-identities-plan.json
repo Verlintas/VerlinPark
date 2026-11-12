@@ -1,0 +1,374 @@
+{
+  "schema": "verlinpark.project-scoped-agent-identities-plan/v1",
+  "created": "2026-11-12",
+  "base_commit": "7f805e7",
+  "status": "planned",
+  "relationship": "companion program to docs/CONTRACTED_EXECUTION_PLAN.md; contract/effects C1-C5 is the substrate",
+  "goal": "Give long-lived projects stable project-scoped Leader/Manager/Worker identities with durable memory, inbox, workspaces, accountability, hiring, and retirement; keep Labour task-scoped.",
+  "target_model": {
+    "leader": {
+      "identity_scope": "project",
+      "execution": "per_run",
+      "owns": ["project_goal", "portfolio", "budget", "final_plan_approval"]
+    },
+    "manager": {
+      "identity_scope": "project_department",
+      "execution": "per_run",
+      "owns": ["department_architecture", "interface_contracts", "worker_review"]
+    },
+    "worker": {
+      "identity_scope": "project_component",
+      "execution": "per_run",
+      "owns": ["component_workspace", "labour_tasks", "low_level_design", "review", "integration"]
+    },
+    "labour": {
+      "identity_scope": "task",
+      "execution": "per_task",
+      "owns": ["child_task_worktree"],
+      "job": "bulk implementation, tests, commit; no delegation"
+    },
+    "verifier": {
+      "identity_scope": "session_task",
+      "execution": "per_verification",
+      "note": "no stable identity; independent gate"
+    },
+    "scout": {
+      "identity_scope": "session_task",
+      "execution": "per_run",
+      "note": "no stable identity; read-only exploration"
+    }
+  },
+  "invariants": [
+    "stable_identity_is_not_a_persistent_process",
+    "project_scoped_identity_v1",
+    "labour_remains_task_scoped",
+    "identity_never_bypasses_role_or_gate",
+    "no_automatic_hiring_firing_or_manager_creation",
+    "no_llm_only_performance_judgment",
+    "bounded_identity_memory_only",
+    "retirement_retains_evidence",
+    "one_active_session_per_identity_v1",
+    "worker_component_branch_with_session_worktree",
+    "two_level_integration_preserves_verifier_and_integrator"
+  ],
+  "phases": [
+    {
+      "id": "S1",
+      "title": "Identity schema, lifecycle, policy, migration",
+      "status": "planned"
+    },
+    {
+      "id": "S2",
+      "title": "Session assignment, identity lease, inbox",
+      "status": "planned"
+    },
+    {
+      "id": "S3",
+      "title": "Role contracts, prompts, and cache",
+      "status": "planned"
+    },
+    {
+      "id": "S4",
+      "title": "Worker workspace and two-level integration",
+      "status": "planned"
+    },
+    {
+      "id": "S5",
+      "title": "Identity memory",
+      "status": "planned"
+    },
+    {
+      "id": "S6",
+      "title": "Hiring, retirement, performance",
+      "status": "planned"
+    },
+    {
+      "id": "S7",
+      "title": "GUI, CLI, observability",
+      "status": "planned"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "S1",
+      "title": "Identity schema, lifecycle, policy, and migration",
+      "priority": "P0",
+      "depends_on": ["C1", "C4"],
+      "files": [
+        "crates/vp-core/src/identity.rs",
+        "crates/vp-core/src/lib.rs",
+        "crates/vp-store/src/store.rs",
+        "crates/vp-store/src/store/tests.rs",
+        "crates/vp-protocol/src/types.rs",
+        "crates/vp-daemon/src/main.rs",
+        "crates/vp-cli/src/main.rs",
+        "docs/adr/0205-project-scoped-agent-identities.md"
+      ],
+      "deliverables": [
+        "agent_identities and agent_runs additive tables",
+        "AgentIdentityPolicy project setting, default off",
+        "identity lifecycle events created/updated/paused/resumed/retired",
+        "replay/repair/db-rebuild/bundle coverage",
+        "compatibility agents projection; old sessions remain ephemeral",
+        "agent.identities read API and vp agents"
+      ],
+      "tests": [
+        "old session replay unchanged",
+        "new identity rows project-scoped and event-backed",
+        "policy off falls back cleanly",
+        "identity generation persisted"
+      ],
+      "acceptance": "Existing sessions keep current behavior; new identities are durable and project-scoped."
+    },
+    {
+      "id": "S2",
+      "title": "Session assignment, identity lease, and inbox",
+      "priority": "P0",
+      "depends_on": ["S1"],
+      "files": [
+        "crates/vp-core/src/identity.rs",
+        "crates/vp-core/src/mailbox.rs",
+        "crates/vp-core/src/continuation.rs",
+        "crates/vp-store/src/store.rs",
+        "crates/vp-protocol/src/types.rs",
+        "crates/vp-daemon/src/main.rs",
+        "crates/vp-cli/src/main.rs"
+      ],
+      "deliverables": [
+        "session_agent_assignments with identity lease",
+        "agent_inbox project-scoped, pull-based",
+        "one active session per identity in v1",
+        "assignment can wake a session through continuation path",
+        "Labour only task-scoped inbox"
+      ],
+      "tests": [
+        "same Worker cannot be assigned to two active sessions",
+        "inbox survives daemon restart",
+        "cross-project assignment rejected",
+        "Labour cannot receive project inbox"
+      ],
+      "acceptance": "Identity assignment and inbox are durable, project-scoped, and fenced."
+    },
+    {
+      "id": "S3",
+      "title": "Role contracts, prompts, and cache",
+      "priority": "P0",
+      "depends_on": ["S1", "S2"],
+      "files": [
+        "crates/vp-core/src/instruction.rs",
+        "crates/vp-core/src/agent.rs",
+        "crates/vp-core/src/tool_bundle.rs",
+        "crates/vp-core/src/prompt_cache.rs",
+        "crates/vp-core/src/permissions.rs",
+        "crates/vp-protocol/src/types.rs",
+        "crates/vp-core/src/agent/tests.rs"
+      ],
+      "deliverables": [
+        "agent/identity stable prompt section",
+        "agent/memory tail section",
+        "Worker tech-lead contract: design/decompose/review/integrate; no bulk code",
+        "Labour implementation contract: code/tests/commit; no delegation",
+        "Manager department architect; Leader project/portfolio owner",
+        "Worker delegate_labour; Labour cannot delegate",
+        "identity generation participates in cache epoch"
+      ],
+      "tests": [
+        "Worker decomposes into Labour and reviews commits",
+        "Labour delegation denied",
+        "identity section byte-identical across runs of same generation",
+        "promotion/transfer changes cache epoch",
+        "Labour has no identity section"
+      ],
+      "acceptance": "Stable identity prompts are cache-safe and Worker/Labour responsibilities are enforced by role policy."
+    },
+    {
+      "id": "S4",
+      "title": "Worker workspace and two-level integration",
+      "priority": "P0",
+      "depends_on": ["S2", "S3"],
+      "files": [
+        "crates/vp-core/src/identity.rs",
+        "crates/vp-core/src/worktree.rs",
+        "crates/vp-core/src/agent.rs",
+        "crates/vp-core/src/merge_queue.rs",
+        "crates/vp-core/src/lib.rs",
+        "crates/vp-store/src/store.rs",
+        "crates/vp-protocol/src/types.rs",
+        "crates/vp-cli/src/main.rs",
+        "docs/adr/0206-worker-workspaces-and-two-level-integration.md"
+      ],
+      "deliverables": [
+        "project component branch per Worker identity",
+        "session worker worktree from component branch",
+        "Labour child task worktree from session worker worktree",
+        "Labour -> Worker deterministic merge with diff/path checks",
+        "Worker -> session Verifier/Integrator unchanged",
+        "identity/workspace lease prevents concurrent same-component writes",
+        "workspace archive/land and conflict rollback"
+      ],
+      "tests": [
+        "Labour commit merges into Worker workspace",
+        "Worker commit passes Verifier and session Integrator",
+        "two sessions cannot mutate same component workspace",
+        "conflict rolls back without changing session branch",
+        "workspace survives session end"
+      ],
+      "acceptance": "Two-level integration preserves Verifier/Integrator and component ownership."
+    },
+    {
+      "id": "S5",
+      "title": "Identity memory",
+      "priority": "P1",
+      "depends_on": ["S1", "S2"],
+      "files": [
+        "crates/vp-core/src/memory.rs",
+        "crates/vp-core/src/agent.rs",
+        "crates/vp-core/src/instruction.rs",
+        "crates/vp-store/src/store.rs",
+        "crates/vp-protocol/src/types.rs",
+        "crates/vp-daemon/src/main.rs",
+        "crates/vp-cli/src/main.rs"
+      ],
+      "deliverables": [
+        "agent_memories with agent/department/project scope",
+        "evidence/provenance, TTL/stale/supersede",
+        "bounded memory brief",
+        "remember/recall scoped to identity/department/project",
+        "memory events and tail-only cache invalidation"
+      ],
+      "tests": [
+        "identity memory survives sessions",
+        "bounded brief injection",
+        "stale memory visible",
+        "no unbounded prompt growth"
+      ],
+      "acceptance": "Identity memory is durable, evidence-backed, bounded, and cache-safe."
+    },
+    {
+      "id": "S6",
+      "title": "Hiring, retirement, and performance",
+      "priority": "P1",
+      "depends_on": ["S1", "C2", "C6"],
+      "files": [
+        "crates/vp-core/src/identity.rs",
+        "crates/vp-core/src/attribution.rs",
+        "crates/vp-core/src/orchestration.rs",
+        "crates/vp-store/src/store.rs",
+        "crates/vp-protocol/src/types.rs",
+        "crates/vp-daemon/src/main.rs",
+        "crates/vp-cli/src/main.rs",
+        "docs/adr/0207-agent-hiring-retirement-and-performance.md"
+      ],
+      "deliverables": [
+        "agent.hire/retire/promote/transfer with approval",
+        "project caps for Managers/Workers",
+        "AgentRetirementPolicy evidence-based proposals",
+        "performance ledger from task results/Verifier/attribution/cost/retries",
+        "successor workspace/memory transfer where safe",
+        "retired identity cannot be assigned; no auto-rehire"
+      ],
+      "tests": [
+        "hire requires approval when configured",
+        "retire retains evidence and releases assignments",
+        "retired identity cannot be assigned",
+        "no automatic firing",
+        "caps enforced"
+      ],
+      "acceptance": "Hiring/retirement is explicit, evidence-based, capped, and non-destructive."
+    },
+    {
+      "id": "S7",
+      "title": "GUI, CLI, and observability",
+      "priority": "P1",
+      "depends_on": ["S1", "S2", "S3", "S4", "S5", "S6"],
+      "files": [
+        "apps/macos/VerlinPark/Core/Models.swift",
+        "apps/macos/VerlinPark/Core/CoreClient.swift",
+        "apps/macos/VerlinPark/Features/AppModel.swift",
+        "apps/macos/VerlinPark/Features/ManageDashView.swift",
+        "apps/macos/VerlinPark/Features/StageView.swift",
+        "crates/vp-cli/src/main.rs"
+      ],
+      "deliverables": [
+        "project org chart Leader/Managers/Workers",
+        "identity detail: role, component, generation, assignments, inbox, memory, performance, retirement",
+        "hire/retire sheets",
+        "cross-session roster and workspace status",
+        "CLI agents/agent-hire/agent-retire/agent-inbox/agent-memory",
+        "OTel/event projections include identity id without secrets"
+      ],
+      "tests": [
+        "Swift decode/UI state",
+        "CLI rendering",
+        "no business logic in views",
+        "retired/idle badges"
+      ],
+      "acceptance": "Operators can see and manage the project org chart through real RPCs."
+    }
+  ],
+  "dependencies": {
+    "S1": ["C1", "C4"],
+    "S2": ["S1"],
+    "S3": ["S1", "S2"],
+    "S4": ["S2", "S3"],
+    "S5": ["S1", "S2"],
+    "S6": ["S1", "C2", "C6"],
+    "S7": ["S1", "S2", "S3", "S4", "S5", "S6"],
+    "C10_code_mode": ["S3", "S4"],
+    "C6_failure_attribution": ["C2", "C4"],
+    "C7_fanout": ["C1"]
+  },
+  "migration": {
+    "default_enabled": false,
+    "existing_sessions": "remain run-scoped; no synthetic identities",
+    "new_sessions": "create/assign identities only when AgentIdentityPolicy is enabled",
+    "rollback": "disable policy; stop new assignments; identities remain readable/retired",
+    "persistence": ["agent_identities", "agent_runs", "session_agent_assignments", "agent_inbox", "agent_memories", "agent_workspaces"],
+    "rebuild": ["replay", "repair", "db-rebuild", "bundle export/import"]
+  },
+  "acceptance": [
+    "no gate weakening",
+    "project isolation enforced",
+    "identity/run separation survives crashes",
+    "Labour ephemeral and cannot delegate",
+    "Worker can decompose/review/integrate Labour work",
+    "two-level integration preserves Verifier/Integrator",
+    "identity lease prevents concurrent same-workspace writes",
+    "retirement is evidence-based and non-destructive",
+    "cache identity section stable per generation; memory tail-only",
+    "full Rust/Swift/replay/migration suites"
+  ],
+  "non_goals": [
+    "unkillable long-running process",
+    "cross-project identity sharing v1",
+    "automatic hiring/firing/promotion/department rewrite",
+    "LLM-only performance judgment",
+    "hidden model routing",
+    "infinite identity memory or memory as credential",
+    "public A2A identity federation v1",
+    "replacement of Verifier/Integrator/deterministic scheduler",
+    "automatic Manager creation"
+  ],
+  "risks": [
+    "big migration; mitigated by additive tables and policy-off default",
+    "long-lived component branch conflicts; mitigated by session worker worktree and frequent integration",
+    "identity concurrency; one active session per identity v1",
+    "stale memory; evidence/TTL/bounded brief",
+    "model/role drift; generation + approval",
+    "operator overhead; Labour remains automatic",
+    "anthropomorphism; identity is accountability, not personhood"
+  ],
+  "open_decisions": [
+    "Leader concurrency: one active session v1; portfolio later",
+    "Worker workspace: per-session worktree from project component branch; identity lease",
+    "Manager workspace: none/docs-only",
+    "Model change: generation + approval, preserve memory",
+    "Cross-project detachment: later"
+  ],
+  "references": [
+    "docs/CONTRACTED_EXECUTION_PLAN.md",
+    "docs/adr/0172-deterministic-org-scaling.md",
+    "docs/adr/0188-content-addressed-instruction-store-and-prompt-layout-v3.md",
+    "docs/adr/0191-cache-epochs-compaction-and-cross-session-reuse.md"
+  ]
+}

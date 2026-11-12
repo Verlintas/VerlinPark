@@ -472,7 +472,19 @@ receipt-based retry safety.
 
 ---
 
-## 8. References
+## 8. Companion program: project-scoped agent identities
+
+Stable project-scoped Leader/Manager/Worker identities are a separate, larger
+program documented in
+[PROJECT_SCOPED_AGENT_IDENTITIES_PLAN.md](PROJECT_SCOPED_AGENT_IDENTITIES_PLAN.md).
+It shares C1/C2/C4 as its substrate and must not be bundled into Phase 1.
+Labour remains task-scoped. When identities are enabled, Code Mode (C10)
+should wait until the identity/role contracts and Worker workspace phases
+(S3/S4) are in place.
+
+---
+
+## 9. References
 
 - Anthropic, [Introducing advanced tool use](https://www.anthropic.com/research/advanced-tool-use), 2025-11-24.
 - Anthropic, [Code execution with MCP](https://www.anthropic.com/engineering/code-execution-with-mcp), 2025-11-04.

@@ -28,6 +28,8 @@
 | **Current** | [cache-lossless-plan.json](cache-lossless-plan.json) | 第八轮机器可读无损计划：任务、依赖、文件、测试、验收、非目标 |
 | **Current** | [CONTRACTED_EXECUTION_PLAN.md](CONTRACTED_EXECUTION_PLAN.md) | 第九轮计划：TaskContract/intent、effect receipts、durable gates、version pinning、reliability；Phase 2 加 failure attribution/fan-out/tool search v2/MCP tasks；Phase 3 加 Code Mode/A2A/进度账本 |
 | **Current** | [contracted-execution-plan.json](contracted-execution-plan.json) | 第九轮机器可读计划：C1–C12、依赖、文件、测试、验收、非目标 |
+| **Current** | [PROJECT_SCOPED_AGENT_IDENTITIES_PLAN.md](PROJECT_SCOPED_AGENT_IDENTITIES_PLAN.md) | 并行计划：project-scoped 稳定 Leader/Manager/Worker 身份、session assignment、agent inbox、Worker workspace、身份记忆、招聘/退休/绩效；Labour 仍 task-scoped |
+| **Current** | [project-scoped-agent-identities-plan.json](project-scoped-agent-identities-plan.json) | project-scoped 身份计划 S1–S7、依赖、迁移、测试、验收、非目标 |
 | **Reference** | [OBSCURA_ASSESSMENT.md](OBSCURA_ASSESSMENT.md) | Obscura（Rust/V8/CDP/MCP headless browser）评估：适用场景、安全约束、三种集成方案、结论为 cache 轮之后再做可选外部网页后端 |
 | **Reference** | [PRIDE_FLAGS.md](PRIDE_FLAGS.md) | Pride flag 资产来源与许可 |
 | **Reference** | [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) | FlagKit 等第三方资产许可 |
