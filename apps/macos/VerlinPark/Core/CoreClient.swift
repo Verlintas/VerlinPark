@@ -1788,6 +1788,40 @@ actor CoreClient {
             .identities
     }
 
+    /// Read-only derived performance ledger. No mutation is exposed.
+    func agentPerformanceSummary(projectID: String) async throws
+        -> AgentPerformanceSummaryResult
+    {
+        let params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "limit": .number(100),
+        ]
+        return try await request(method: "agent.performance.summary", params: params)
+            .decode(AgentPerformanceSummaryResult.self)
+    }
+
+    /// Read-only deterministic retirement candidates.
+    func agentRetirementCandidates(projectID: String) async throws
+        -> AgentRetirementCandidatesResult
+    {
+        let params: [String: JSONValue] = ["project_id": .string(projectID)]
+        return try await request(method: "agent.retirement.candidates", params: params)
+            .decode(AgentRetirementCandidatesResult.self)
+    }
+
+    /// Read-only retirement proposal ledger.
+    func agentRetirementProposals(projectID: String) async throws
+        -> [AgentRetirementProposal]
+    {
+        let params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "limit": .number(100),
+        ]
+        return try await request(method: "agent.retirement.proposals", params: params)
+            .decode(AgentRetirementProposalListResult.self)
+            .proposals
+    }
+
     /// Read-only identity/department/project memory. No mutation action is
     /// exposed from the client in S5.
     func agentMemories(projectID: String) async throws -> AgentMemoryListResult {

@@ -322,7 +322,7 @@ const SESSION_WORKSPACE_SELECT: &str = "SELECT id, workspace_id, session_id, ide
         lease_expires_at
      FROM session_worker_workspaces";
 
-fn get_workspace_tx(tx: &Transaction<'_>, id: &str) -> Result<Option<AgentWorkspace>> {
+pub(crate) fn get_workspace_tx(tx: &Transaction<'_>, id: &str) -> Result<Option<AgentWorkspace>> {
     tx.query_row(
         &format!("{WORKSPACE_SELECT} WHERE id = ?1"),
         params![id],
@@ -364,7 +364,7 @@ fn active_workspace_for_identity_tx(
     .map_err(Into::into)
 }
 
-fn insert_workspace_event_tx(
+pub(crate) fn insert_workspace_event_tx(
     tx: &Transaction<'_>,
     project_id: &str,
     kind: &str,
@@ -1861,6 +1861,86 @@ fn map_workspace_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentWorkspa
         payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
         created_at: row.get(5)?,
     })
+}
+
+/// Count active component workspaces and active session bindings for one
+/// identity. S6 uses this to refuse a promotion/transfer/retirement while work
+/// is still live, or to require an explicit `force`.
+pub(crate) fn identity_workspace_activity_tx(
+    tx: &Transaction<'_>,
+    identity_id: &str,
+) -> Result<(u64, u64)> {
+    let active: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM agent_workspaces WHERE identity_id = ?1 AND status = 'active'",
+        params![identity_id],
+        |row| row.get(0),
+    )?;
+    let bound: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM session_worker_workspaces
+         WHERE identity_id = ?1 AND status = 'active'",
+        params![identity_id],
+        |row| row.get(0),
+    )?;
+    Ok((active.max(0) as u64, bound.max(0) as u64))
+}
+
+/// Archive every active component workspace for an identity and archive its
+/// session bindings. Branch/commit evidence is preserved; no worktree is
+/// deleted. Only an explicit S6 `force` path calls this after refusing the
+/// non-forced operation. A workspace lease is cleared because the identity is no
+/// longer allowed to own live work, but the branch remains.
+pub(crate) fn archive_identity_workspaces_tx(
+    tx: &Transaction<'_>,
+    identity_id: &str,
+    now_text: &str,
+    operator: &str,
+    reason: Option<&str>,
+) -> Result<Vec<AgentWorkspaceEvent>> {
+    let workspace_ids = {
+        let mut statement = tx.prepare(
+            "SELECT id FROM agent_workspaces
+             WHERE identity_id = ?1 AND status = 'active'
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        statement
+            .query_map(params![identity_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    tx.execute(
+        "UPDATE session_worker_workspaces
+         SET status = 'archived', lease_token = NULL, lease_expires_at = NULL, updated_at = ?1
+         WHERE identity_id = ?2 AND status IN ('active', 'released')",
+        params![now_text, identity_id],
+    )?;
+    let mut events = Vec::with_capacity(workspace_ids.len());
+    for workspace_id in workspace_ids {
+        tx.execute(
+            "UPDATE agent_workspaces
+             SET status = 'archived', lease_token = NULL, lease_expires_at = NULL,
+                 updated_at = ?1
+             WHERE id = ?2 AND status = 'active'",
+            params![now_text, workspace_id],
+        )?;
+        let workspace = get_workspace_tx(tx, &workspace_id)?
+            .ok_or_else(|| anyhow!("workspace disappeared during identity archive"))?;
+        events.push(insert_workspace_event_tx(
+            tx,
+            &workspace.project_id,
+            vp_protocol::types::AGENT_WORKSPACE_ARCHIVED_EVENT,
+            &workspace,
+            None,
+            Some((
+                "identity_archive",
+                serde_json::json!({
+                    "operator": operator,
+                    "reason": reason,
+                    "forced": true,
+                    "branches_preserved": true,
+                }),
+            )),
+        )?);
+    }
+    Ok(events)
 }
 
 #[cfg(test)]

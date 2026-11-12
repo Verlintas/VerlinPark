@@ -274,6 +274,64 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
                 };
                 store.replace_agent_memory_projection(&snapshot.project.id, &projection)?;
             }
+            vp_store::store::employment::set_retirement_policy(
+                &store,
+                &snapshot.project.id,
+                &snapshot.agent_retirement_policy,
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "retirement policy for project {} is invalid: {error}",
+                    snapshot.project.id
+                )
+            })?;
+            if snapshot.agent_employment_events.is_empty() {
+                // Forward compatibility for a manifest written before S6. No
+                // synthetic employment decisions are invented.
+                for request in &snapshot.agent_hire_requests {
+                    if request.project_id != snapshot.project.id {
+                        anyhow::bail!(
+                            "hire request {} belongs to another project in the manifest",
+                            request.id
+                        );
+                    }
+                    vp_store::store::employment::insert_hire_request_snapshot(&store, request)?;
+                }
+                for proposal in &snapshot.agent_retirement_proposals {
+                    if proposal.project_id != snapshot.project.id {
+                        anyhow::bail!(
+                            "retirement proposal {} belongs to another project in the manifest",
+                            proposal.id
+                        );
+                    }
+                    vp_store::store::employment::insert_retirement_proposal_snapshot(
+                        &store, proposal,
+                    )?;
+                }
+                for row in &snapshot.agent_performance {
+                    if row.project_id != snapshot.project.id {
+                        anyhow::bail!(
+                            "performance row {} belongs to another project in the manifest",
+                            row.identity_id
+                        );
+                    }
+                    vp_store::store::employment::insert_agent_performance_snapshot(&store, row)?;
+                }
+            } else {
+                for event in &snapshot.agent_employment_events {
+                    if event.project_id != snapshot.project.id {
+                        anyhow::bail!(
+                            "employment event {} belongs to another project in the manifest",
+                            event.id
+                        );
+                    }
+                    vp_store::store::employment::insert_employment_event_snapshot(&store, event)?;
+                }
+                vp_store::store::employment::rebuild_employment_projections(
+                    &store,
+                    &snapshot.project.id,
+                )?;
+            }
             let effect_policy = snapshot.effect_policy.normalized().map_err(|error| {
                 anyhow::anyhow!(
                     "effect policy for project {} is invalid: {error}",
@@ -418,6 +476,17 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
             match engine.restore_session_log(&session.id).await {
                 Ok(_) => sessions += 1,
                 Err(error) => skipped.push(format!("{}: rebuild failed: {error}", session.id)),
+            }
+        }
+        // The performance ledger is derived from restored task/usage/Verifier/
+        // diagnosis evidence. Rebuild it after sessions so a manifest snapshot
+        // can never become the source of truth.
+        for project_id in &projects {
+            if let Err(error) = engine
+                .rebuild_agent_performance_projection(project_id)
+                .await
+            {
+                skipped.push(format!("{project_id}: performance rebuild failed: {error}"));
             }
         }
         engine.record_project_manifest().await?;

@@ -48,54 +48,60 @@ use vp_protocol::test_cache::{
 };
 use vp_protocol::types::{
     AcpAgentConfig, AcpAgentIdParams, AcpProbeParams, AddAcpAgentParams, AddMcpServerParams,
-    AddProjectParams, AgentCoordinationReplayParams, AgentIdentityListParams, AgentIdentityParams,
-    AgentIdentityPolicyParams, AgentIdentityPolicyResult, AgentIdentityReplayParams,
-    AgentInboxListParams, AgentInboxMessageParams, AgentInboxSendParams, AgentListParams,
-    AgentListResult, AgentMemoryListParams, AgentMemoryParams, AgentMemoryReplayParams,
-    AgentMessageResult, AgentWorkspaceArchiveParams, AgentWorkspaceEnsureParams,
-    AgentWorkspaceLandParams, AgentWorkspaceListParams, AgentWorkspaceParams,
-    AgentWorkspaceReplayParams, AgentWorkspaceRetireParams, AnswerQuestionParams,
-    AnswerQuestionResult, ApprovalAuditParams, ApprovalBatchResolveParams,
-    ApprovalBatchResolveResult, ApprovalGrantCreateParams, ApprovalGrantCreateResult,
-    ApprovalGrantDeleteParams, ApprovalGrantDeleteResult, ApprovalGrantListParams,
-    ApprovalGrantListResult, ApprovalListResult, ApprovalQueueParams, ApprovalTemplateCreateParams,
-    ApprovalTemplateDeleteParams, ApprovalTemplateFromApprovalParams, ApprovalTemplateListParams,
-    ApprovalTemplateListResult, ApprovalTemplateUpdateParams, ArtifactArchiveExtractParams,
-    ArtifactArchiveListParams, ArtifactBackfillParams, ArtifactDiffParams, ArtifactGcParams,
-    ArtifactGetParams, ArtifactListParams, ArtifactListResult, ArtifactMaterializeParams,
-    ArtifactPolicyParams, ArtifactPolicyResult, ArtifactRestoreParams, ArtifactResult,
-    ArtifactVersionsParams, AttentionPolicyGetParams, AttentionPolicySetParams, AuthParams,
-    AuthResult, CachePolicyParams, CachePolicyResult, CancelSessionParams, CancelSessionResult,
-    CheckpointPolicyParams, CleanupWorktreesParams, CommitSessionParams, ConfigureAgentParams,
-    ConsoleCloseParams, ConsoleOpenParams, ConsoleReadParams, ConsoleSignalParams,
-    ConsoleWriteParams, ContextCheckpointCreateParams, ContextCheckpointDeleteParams,
-    ContextCheckpointDetailParams, ContextCheckpointListParams, ContextCheckpointPolicyParams,
-    ContextCheckpointPruneParams, ContextRestoreParams, ContractPolicyParams, ContractPolicyResult,
-    CreateAgentIdentityParams, CreateAgentMemoryParams, CreateModelPresetParams,
-    CreateSessionParams, CriticalPathMode, CriticalPathPolicyParams, CriticalPathPolicyResult,
-    DaemonMetrics, DaemonMetricsResult, DashboardParams, DeleteModelPresetParams,
-    DiscardSessionParams, DoctorCheck, DoctorReport, EffectPolicyParams, EffectPolicyResult,
-    EffectReconcileParams, EffectReconcileResult, EventListResult, ForgePreflightParams,
-    ForgeStatusParams, ForgetAgentMemoryParams, ForkAuditParams, ForkRepairParams,
-    GateCancelParams, GateListParams, GateOpenParams, GatePolicyParams, GatePolicyResult,
-    GateResolveParams, GateStatusParams, GateSweepParams, GitLogParams, GitShowParams,
-    GovernorPreviewParams, GovernorStatusParams, IntakeCreateParams, IntakeDeleteResult,
-    IntakeListParams, IntakeTaskParams, IntakeUpdateParams, IntegrationPolicyParams,
-    IntegrationPolicyResult, LandSessionParams, ListApprovalsParams, ListEventsParams,
-    ListSessionsParams, MailboxGcParams, MailboxListParams, MailboxListResult, MailboxPolicyParams,
-    MailboxPolicyResult, MarkMessageReadParams, McpCallParams, McpGetPromptParams,
-    McpPinApproveParams, McpPinRejectParams, McpProbeParams, McpReadResourceParams,
-    McpServerIdParams, MediaInfoParams, MediaTranscodeParams, MemoryBriefParams,
-    MemoryConflictResolveParams, MemoryConflictScanParams, MemoryConflictsParams,
-    MemoryCreateParams, MemoryCreateResult, MemoryDeleteParams, MemoryEmbeddingsIndexRebuildParams,
-    MemoryEmbeddingsIndexStatusParams, MemoryEmbeddingsRebuildParams, MemoryEmbeddingsStatusParams,
-    MemoryEmbeddingsTestParams, MemoryHealthParams, MemoryListParams, MemoryPolicyParams,
-    MemoryPruneParams, MemorySearchParams, MemoryStatsParams, MemorySweepParams,
-    MemoryUpdateParams, MemoryVerifyParams, MergeQueueListParams, MergeQueueListResult,
-    OpenPullRequestParams, PauseAgentIdentityParams, PingResult, PreemptionOverviewParams,
-    PreemptionPolicyParams, PreemptionPolicyResult, ProcessListParams, ProcessLogsParams,
-    ProcessPolicyParams, ProcessPolicyResult, ProcessRestartParams, ProcessStopParams,
-    ProjectBudgetParams, ProjectCacheEpochParams, ProjectCacheEpochPruneParams, ProjectCacheParams,
+    AddProjectParams, AgentCoordinationReplayParams, AgentEmploymentReplayParams,
+    AgentHireApproveParams, AgentHireListParams, AgentHireParams, AgentHireRejectParams,
+    AgentIdentityListParams, AgentIdentityParams, AgentIdentityPolicyParams,
+    AgentIdentityPolicyResult, AgentIdentityReplayParams, AgentInboxListParams,
+    AgentInboxMessageParams, AgentInboxSendParams, AgentListParams, AgentListResult,
+    AgentMemoryListParams, AgentMemoryParams, AgentMemoryReplayParams, AgentMessageResult,
+    AgentPerformanceParams, AgentPerformanceReplayParams, AgentPerformanceSummaryParams,
+    AgentPromoteParams, AgentRetireParams, AgentRetirementCandidatesParams,
+    AgentRetirementPolicyParams, AgentRetirementProposalListParams, AgentRetirementProposalParams,
+    AgentRetirementProposeParams, AgentRetirementRejectParams, AgentTransferParams,
+    AgentWorkspaceArchiveParams, AgentWorkspaceEnsureParams, AgentWorkspaceLandParams,
+    AgentWorkspaceListParams, AgentWorkspaceParams, AgentWorkspaceReplayParams,
+    AgentWorkspaceRetireParams, AnswerQuestionParams, AnswerQuestionResult, ApprovalAuditParams,
+    ApprovalBatchResolveParams, ApprovalBatchResolveResult, ApprovalGrantCreateParams,
+    ApprovalGrantCreateResult, ApprovalGrantDeleteParams, ApprovalGrantDeleteResult,
+    ApprovalGrantListParams, ApprovalGrantListResult, ApprovalListResult, ApprovalQueueParams,
+    ApprovalTemplateCreateParams, ApprovalTemplateDeleteParams, ApprovalTemplateFromApprovalParams,
+    ApprovalTemplateListParams, ApprovalTemplateListResult, ApprovalTemplateUpdateParams,
+    ArtifactArchiveExtractParams, ArtifactArchiveListParams, ArtifactBackfillParams,
+    ArtifactDiffParams, ArtifactGcParams, ArtifactGetParams, ArtifactListParams,
+    ArtifactListResult, ArtifactMaterializeParams, ArtifactPolicyParams, ArtifactPolicyResult,
+    ArtifactRestoreParams, ArtifactResult, ArtifactVersionsParams, AttentionPolicyGetParams,
+    AttentionPolicySetParams, AuthParams, AuthResult, CachePolicyParams, CachePolicyResult,
+    CancelSessionParams, CancelSessionResult, CheckpointPolicyParams, CleanupWorktreesParams,
+    CommitSessionParams, ConfigureAgentParams, ConsoleCloseParams, ConsoleOpenParams,
+    ConsoleReadParams, ConsoleSignalParams, ConsoleWriteParams, ContextCheckpointCreateParams,
+    ContextCheckpointDeleteParams, ContextCheckpointDetailParams, ContextCheckpointListParams,
+    ContextCheckpointPolicyParams, ContextCheckpointPruneParams, ContextRestoreParams,
+    ContractPolicyParams, ContractPolicyResult, CreateAgentIdentityParams, CreateAgentMemoryParams,
+    CreateModelPresetParams, CreateSessionParams, CriticalPathMode, CriticalPathPolicyParams,
+    CriticalPathPolicyResult, DaemonMetrics, DaemonMetricsResult, DashboardParams,
+    DeleteModelPresetParams, DiscardSessionParams, DoctorCheck, DoctorReport, EffectPolicyParams,
+    EffectPolicyResult, EffectReconcileParams, EffectReconcileResult, EventListResult,
+    ForgePreflightParams, ForgeStatusParams, ForgetAgentMemoryParams, ForkAuditParams,
+    ForkRepairParams, GateCancelParams, GateListParams, GateOpenParams, GatePolicyParams,
+    GatePolicyResult, GateResolveParams, GateStatusParams, GateSweepParams, GitLogParams,
+    GitShowParams, GovernorPreviewParams, GovernorStatusParams, IntakeCreateParams,
+    IntakeDeleteResult, IntakeListParams, IntakeTaskParams, IntakeUpdateParams,
+    IntegrationPolicyParams, IntegrationPolicyResult, LandSessionParams, ListApprovalsParams,
+    ListEventsParams, ListSessionsParams, MailboxGcParams, MailboxListParams, MailboxListResult,
+    MailboxPolicyParams, MailboxPolicyResult, MarkMessageReadParams, McpCallParams,
+    McpGetPromptParams, McpPinApproveParams, McpPinRejectParams, McpProbeParams,
+    McpReadResourceParams, McpServerIdParams, MediaInfoParams, MediaTranscodeParams,
+    MemoryBriefParams, MemoryConflictResolveParams, MemoryConflictScanParams,
+    MemoryConflictsParams, MemoryCreateParams, MemoryCreateResult, MemoryDeleteParams,
+    MemoryEmbeddingsIndexRebuildParams, MemoryEmbeddingsIndexStatusParams,
+    MemoryEmbeddingsRebuildParams, MemoryEmbeddingsStatusParams, MemoryEmbeddingsTestParams,
+    MemoryHealthParams, MemoryListParams, MemoryPolicyParams, MemoryPruneParams,
+    MemorySearchParams, MemoryStatsParams, MemorySweepParams, MemoryUpdateParams,
+    MemoryVerifyParams, MergeQueueListParams, MergeQueueListResult, OpenPullRequestParams,
+    PauseAgentIdentityParams, PingResult, PreemptionOverviewParams, PreemptionPolicyParams,
+    PreemptionPolicyResult, ProcessListParams, ProcessLogsParams, ProcessPolicyParams,
+    ProcessPolicyResult, ProcessRestartParams, ProcessStopParams, ProjectBudgetParams,
+    ProjectCacheEpochParams, ProjectCacheEpochPruneParams, ProjectCacheParams,
     ProjectForkForestParams, ProjectListResult, ProjectMcpPinsParams, ProjectUsageParams,
     PromptParams, PromptResult, QuestionListParams, RehydrateSessionParams, ReplaySessionParams,
     ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams, ResolveMergeResult,
@@ -4135,19 +4141,56 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         },
         "agent.identity.create" => {
             match parse_params::<CreateAgentIdentityParams>(request.params) {
-                Ok(params) => match state.engine.create_agent_identity(params).await {
-                    Ok(result) => RpcResponse::success(id, result),
-                    Err(error) => identity_error(id, error),
-                },
+                Ok(params) => {
+                    // S6 hires Managers/Workers through the approval-aware
+                    // surface. The Leader bootstrap remains the S1 explicit
+                    // creation path; there is exactly one live Leader.
+                    if !params.role.trim().eq_ignore_ascii_case("leader") {
+                        RpcResponse::error(
+                            id,
+                            RpcError::with_data(
+                                codes::INVALID_PARAMS,
+                                "use agent.hire for Manager/Worker identities; agent.identity.create is the Leader bootstrap path",
+                                json!({"code": vp_protocol::types::agent_identity_codes::HIRE_INVALID}),
+                            ),
+                        )
+                    } else {
+                        match state.engine.create_agent_identity(params).await {
+                            Ok(result) => RpcResponse::success(id, result),
+                            Err(error) => identity_error(id, error),
+                        }
+                    }
+                }
                 Err(response) => response_with_id(id, response),
             }
         }
         "agent.identity.update" => {
             match parse_params::<UpdateAgentIdentityParams>(request.params) {
-                Ok(params) => match state.engine.update_agent_identity(params).await {
-                    Ok(result) => RpcResponse::success(id, result),
-                    Err(error) => identity_error(id, error),
-                },
+                Ok(params) => {
+                    // Role/department/component/parent changes are promotion or
+                    // transfer and must go through their approval-classified
+                    // S6 operations. The S1 update surface remains for bounded
+                    // metadata, profile/model, and successor bookkeeping.
+                    if params.role.is_some()
+                        || params.department.is_some()
+                        || params.component.is_some()
+                        || params.parent_identity_id.is_some()
+                    {
+                        RpcResponse::error(
+                            id,
+                            RpcError::with_data(
+                                codes::INVALID_PARAMS,
+                                "role/department/component/parent changes require agent.promote or agent.transfer approval",
+                                json!({"code": vp_protocol::types::agent_identity_codes::IDENTITY_APPROVAL_REQUIRED}),
+                            ),
+                        )
+                    } else {
+                        match state.engine.update_agent_identity(params).await {
+                            Ok(result) => RpcResponse::success(id, result),
+                            Err(error) => identity_error(id, error),
+                        }
+                    }
+                }
                 Err(response) => response_with_id(id, response),
             }
         }
@@ -4168,17 +4211,189 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             }
         }
         "agent.identity.retire" => {
+            // Legacy alias. It now follows S6 approval policy and fails closed
+            // unless the project has explicitly disabled retirement approval.
             match parse_params::<RetireAgentIdentityParams>(request.params) {
-                Ok(params) => match state.engine.retire_agent_identity(params).await {
-                    Ok(result) => RpcResponse::success(id, result),
-                    Err(error) => identity_error(id, error),
-                },
+                Ok(params) => {
+                    match state
+                        .engine
+                        .retire_agent(AgentRetireParams {
+                            identity_id: params.identity_id,
+                            successor_id: params.successor_id,
+                            approved: false,
+                            ..AgentRetireParams::default()
+                        })
+                        .await
+                    {
+                        Ok(result) => RpcResponse::success(
+                            id,
+                            vp_protocol::types::AgentIdentityResult {
+                                identity: result.identity,
+                                changed: result.changed,
+                            },
+                        ),
+                        Err(error) => identity_error(id, error),
+                    }
+                }
                 Err(response) => response_with_id(id, response),
             }
         }
         "agent.identities.replay" => {
             match parse_params::<AgentIdentityReplayParams>(request.params) {
                 Ok(params) => match state.engine.replay_agent_identities(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => identity_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "agent.hire" => match parse_params::<AgentHireParams>(request.params) {
+            Ok(params) => match state.engine.hire_agent_identity(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => identity_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "agent.hire.approve" => match parse_params::<AgentHireApproveParams>(request.params) {
+            Ok(params) => match state.engine.approve_agent_hire(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => identity_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "agent.hire.reject" => match parse_params::<AgentHireRejectParams>(request.params) {
+            Ok(params) => match state.engine.reject_agent_hire(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => identity_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "agent.hire.list" => match parse_params::<AgentHireListParams>(request.params) {
+            Ok(params) => match state.engine.list_agent_hire_requests(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => identity_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "agent.promote" => match parse_params::<AgentPromoteParams>(request.params) {
+            Ok(params) => match state.engine.promote_agent_identity(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => identity_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "agent.transfer" => match parse_params::<AgentTransferParams>(request.params) {
+            Ok(params) => match state.engine.transfer_agent_identity(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => identity_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "agent.retire" => match parse_params::<AgentRetireParams>(request.params) {
+            Ok(params) => match state.engine.retire_agent(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => identity_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "agent.retirement.propose" => {
+            match parse_params::<AgentRetirementProposeParams>(request.params) {
+                Ok(params) => match state.engine.propose_agent_retirement(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => identity_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "agent.retirement.approve" => {
+            match parse_params::<AgentRetirementProposalParams>(request.params) {
+                Ok(params) => match state.engine.approve_agent_retirement_proposal(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => identity_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "agent.retirement.reject" => {
+            match parse_params::<AgentRetirementRejectParams>(request.params) {
+                Ok(params) => match state.engine.reject_agent_retirement_proposal(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => identity_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "agent.retirement.proposals" => {
+            match parse_params::<AgentRetirementProposalListParams>(request.params) {
+                Ok(params) => match state.engine.agent_retirement_proposals(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => identity_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "agent.retirement.candidates" => {
+            match parse_params::<AgentRetirementCandidatesParams>(request.params) {
+                Ok(params) => match state.engine.agent_retirement_candidates(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => identity_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "agent.performance" => match parse_params::<AgentPerformanceParams>(request.params) {
+            Ok(params) => match state.engine.agent_performance(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => identity_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "agent.performance.summary" => {
+            match parse_params::<AgentPerformanceSummaryParams>(request.params) {
+                Ok(params) => match state.engine.agent_performance_summary(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => identity_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "agent.performance.replay" => {
+            match parse_params::<AgentPerformanceReplayParams>(request.params) {
+                Ok(params) => match state.engine.agent_performance_replay(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => identity_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "agent.employment.replay" => {
+            match parse_params::<AgentEmploymentReplayParams>(request.params) {
+                Ok(params) => match state.engine.replay_agent_employment(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => identity_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "project.retirement_policy.get" => {
+            match parse_params::<AgentRetirementPolicyParams>(request.params) {
+                Ok(params) => {
+                    match state
+                        .engine
+                        .get_agent_retirement_policy(&params.project_id)
+                        .await
+                    {
+                        Ok(result) => RpcResponse::success(id, result),
+                        Err(error) => identity_error(id, error),
+                    }
+                }
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "project.retirement_policy.set" => {
+            match parse_params::<vp_protocol::types::SetAgentRetirementPolicyParams>(request.params)
+            {
+                Ok(params) => match state.engine.set_agent_retirement_policy(params).await {
                     Ok(result) => RpcResponse::success(id, result),
                     Err(error) => identity_error(id, error),
                 },
@@ -5501,6 +5716,18 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             | "agent.identity.pause"
             | "agent.identity.resume"
             | "agent.identity.retire"
+            | "agent.hire"
+            | "agent.hire.approve"
+            | "agent.hire.reject"
+            | "agent.promote"
+            | "agent.transfer"
+            | "agent.retire"
+            | "agent.retirement.propose"
+            | "agent.retirement.approve"
+            | "agent.retirement.reject"
+            | "agent.performance.replay"
+            | "agent.employment.replay"
+            | "project.retirement_policy.set"
             | "agent.identities.replay"
             | "agent.memory.remember"
             | "agent.memory.update"
@@ -5649,7 +5876,20 @@ fn identity_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
         );
     };
     let rpc_code = match typed.code {
-        vp_protocol::types::agent_identity_codes::IDENTITY_NOT_FOUND => codes::NOT_FOUND,
+        vp_protocol::types::agent_identity_codes::IDENTITY_NOT_FOUND
+        | vp_protocol::types::agent_identity_codes::HIRE_NOT_FOUND
+        | vp_protocol::types::agent_identity_codes::RETIREMENT_NOT_FOUND => codes::NOT_FOUND,
+        vp_protocol::types::agent_identity_codes::IDENTITY_BUSY
+        | vp_protocol::types::agent_identity_codes::IDENTITY_RETIRED
+        | vp_protocol::types::agent_identity_codes::IDENTITY_CONFLICT
+        | vp_protocol::types::agent_identity_codes::HIRE_CONFLICT
+        | vp_protocol::types::agent_identity_codes::HIRE_ALREADY_DECIDED
+        | vp_protocol::types::agent_identity_codes::PROMOTION_CONFLICT
+        | vp_protocol::types::agent_identity_codes::TRANSFER_CONFLICT
+        | vp_protocol::types::agent_identity_codes::RETIREMENT_CONFLICT
+        | vp_protocol::types::agent_identity_codes::RETIREMENT_COOLDOWN
+        | vp_protocol::types::agent_identity_codes::RETIREMENT_NOT_QUIESCENT
+        | vp_protocol::types::agent_identity_codes::RETIREMENT_NOT_ELIGIBLE => codes::CONFLICT,
         _ => codes::INVALID_PARAMS,
     };
     RpcResponse::error(
@@ -7539,6 +7779,37 @@ mod agent_identity_rpc_error_tests {
         let error = response.error.expect("error");
         assert_eq!(error.code, codes::INTERNAL_ERROR);
         assert!(error.data.is_none());
+    }
+
+    #[test]
+    fn s6_employment_errors_are_conflicts_and_do_not_leak_evidence_text() {
+        for code in [
+            agent_identity_codes::IDENTITY_BUSY,
+            agent_identity_codes::HIRE_ALREADY_DECIDED,
+            agent_identity_codes::RETIREMENT_NOT_QUIESCENT,
+            agent_identity_codes::RETIREMENT_COOLDOWN,
+        ] {
+            let response = identity_error(
+                Some(json!("4")),
+                anyhow::Error::new(AgentIdentityError::new(code, "identity needs a decision")),
+            );
+            let error = response.error.expect("error");
+            assert_eq!(error.code, codes::CONFLICT);
+            assert_eq!(error.data.expect("data")["code"], code);
+        }
+        for code in [
+            agent_identity_codes::RETIREMENT_APPROVAL_REQUIRED,
+            agent_identity_codes::IDENTITY_APPROVAL_REQUIRED,
+            agent_identity_codes::HIRE_INVALID,
+        ] {
+            let response = identity_error(
+                Some(json!("5")),
+                anyhow::Error::new(AgentIdentityError::new(code, "approval required")),
+            );
+            let error = response.error.expect("error");
+            assert_eq!(error.code, codes::INVALID_PARAMS);
+            assert_eq!(error.data.expect("data")["code"], code);
+        }
     }
 }
 

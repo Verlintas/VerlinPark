@@ -41,13 +41,14 @@ use vp_protocol::types::{
 };
 
 use vp_protocol::types::{
-    AGENT_ASSIGNMENT_STATUSES, AGENT_IDENTITY_EVENT_KINDS, AGENT_IDENTITY_MAX_COMPONENT_CHARS,
-    AGENT_IDENTITY_MAX_DEPARTMENT_CHARS, AGENT_IDENTITY_MAX_ID_CHARS,
-    AGENT_IDENTITY_MAX_MODEL_CHARS, AGENT_IDENTITY_MAX_POLICY_BYTES,
+    AGENT_ASSIGNMENT_STATUSES, AGENT_HIRE_REQUEST_STATUSES, AGENT_IDENTITY_EVENT_KINDS,
+    AGENT_IDENTITY_MAX_COMPONENT_CHARS, AGENT_IDENTITY_MAX_DEPARTMENT_CHARS,
+    AGENT_IDENTITY_MAX_ID_CHARS, AGENT_IDENTITY_MAX_MODEL_CHARS, AGENT_IDENTITY_MAX_POLICY_BYTES,
     AGENT_IDENTITY_MAX_TITLE_CHARS, AGENT_IDENTITY_PROFILE_VALUES, AGENT_IDENTITY_STATUSES,
-    AGENT_INBOX_KINDS, AGENT_INBOX_STATUSES, AGENT_WORKSPACE_EVENT_KINDS, AGENT_WORKSPACE_STATUSES,
-    CreateAgentIdentityParams, RetireAgentIdentityParams, UpdateAgentIdentityParams,
-    agent_identity_codes, agent_identity_role,
+    AGENT_INBOX_KINDS, AGENT_INBOX_STATUSES, AGENT_RETIREMENT_PROPOSAL_STATUSES,
+    AGENT_WORKSPACE_EVENT_KINDS, AGENT_WORKSPACE_STATUSES, CreateAgentIdentityParams,
+    RetireAgentIdentityParams, UpdateAgentIdentityParams, agent_identity_codes,
+    agent_identity_role,
 };
 
 use vp_protocol::otel::OtelPolicy;
@@ -1380,6 +1381,25 @@ pub struct ProjectManifestSnapshot {
     /// Append-only memory stream for this project.
     #[serde(default)]
     pub agent_memory_events: Vec<vp_protocol::types::AgentMemoryEvent>,
+    /// Project-scoped retirement thresholds. Older manifests decode as the
+    /// disabled default, so an upgrade never starts proposing retirements.
+    #[serde(default)]
+    pub agent_retirement_policy: vp_protocol::types::AgentRetirementPolicy,
+    /// Event-derived retirement proposals. The employment stream is
+    /// authoritative; imported proposals never authorize a local retirement.
+    #[serde(default)]
+    pub agent_retirement_proposals: Vec<vp_protocol::types::AgentRetirementProposal>,
+    /// Append-only hire/promote/transfer/retirement decision stream.
+    #[serde(default)]
+    pub agent_employment_events: Vec<vp_protocol::types::AgentEmploymentEvent>,
+    /// Derived per-identity performance rows. Rebuilt from session evidence on
+    /// import and `db-rebuild`; they are descriptive only.
+    #[serde(default)]
+    pub agent_performance: Vec<vp_protocol::types::AgentPerformance>,
+    /// Pending/decided hire requests. Hiring never happens implicitly from a
+    /// request row; approval creates the identity explicitly.
+    #[serde(default)]
+    pub agent_hire_requests: Vec<vp_protocol::types::AgentHireRequest>,
     /// Project-scoped effect-receipt policy. Older manifests decode as the
     /// enabled, unknown-blocks-merge, 120s-grace default.
     #[serde(default)]
@@ -1964,6 +1984,168 @@ fn validate_session_bundle(bundle: &SessionBundle) -> Result<()> {
                 event.id
             )
         })?;
+    }
+    // S6 employment evidence. Performance rows are advisory derived state and
+    // must reference an identity carried by the same archive. Proposals and
+    // hire requests are read-only archive evidence. Employment events are
+    // portable by id and must have a valid kind.
+    for row in &bundle.agent_performance {
+        if row.project_id != bundle.project.id {
+            return Err(anyhow!(
+                "bundle performance {} belongs to a different project",
+                row.identity_id
+            ));
+        }
+        if !identity_ids.contains(row.identity_id.as_str()) {
+            return Err(anyhow!(
+                "bundle performance {} has no identity snapshot",
+                row.identity_id
+            ));
+        }
+        if !(vp_protocol::types::AGENT_RETIREMENT_MIN_LOOKBACK_DAYS
+            ..=vp_protocol::types::AGENT_RETIREMENT_MAX_LOOKBACK_DAYS)
+            .contains(&row.lookback_days)
+        {
+            return Err(anyhow!(
+                "bundle performance {} has an invalid lookback",
+                row.identity_id
+            ));
+        }
+        if row.evidence.len() > vp_protocol::types::AGENT_PERFORMANCE_MAX_EVIDENCE
+            || row.reason_counts.len() > vp_protocol::types::AGENT_PERFORMANCE_MAX_REASON_COUNTS
+        {
+            return Err(anyhow!(
+                "bundle performance {} exceeds the bounded evidence cap",
+                row.identity_id
+            ));
+        }
+        for evidence in &row.evidence {
+            if evidence.kind.chars().count() > 40
+                || evidence.reference.chars().count() > 200
+                || evidence
+                    .at
+                    .as_deref()
+                    .is_some_and(|value| value.chars().count() > 40)
+                || evidence
+                    .note
+                    .as_deref()
+                    .is_some_and(|value| value.chars().count() > 200)
+            {
+                return Err(anyhow!(
+                    "bundle performance {} has an oversized evidence pointer",
+                    row.identity_id
+                ));
+            }
+        }
+    }
+    let mut proposal_ids = std::collections::HashSet::new();
+    for proposal in &bundle.agent_retirement_proposals {
+        if proposal.project_id != bundle.project.id {
+            return Err(anyhow!(
+                "bundle retirement proposal {} belongs to a different project",
+                proposal.id
+            ));
+        }
+        if !identity_ids.contains(proposal.identity_id.as_str()) {
+            return Err(anyhow!(
+                "bundle retirement proposal {} has no identity snapshot",
+                proposal.id
+            ));
+        }
+        if !AGENT_RETIREMENT_PROPOSAL_STATUSES.contains(&proposal.status.as_str()) {
+            return Err(anyhow!(
+                "bundle retirement proposal {} has an invalid status",
+                proposal.id
+            ));
+        }
+        if !proposal_ids.insert(proposal.id.clone()) {
+            return Err(anyhow!(
+                "bundle retirement proposal {} is duplicated",
+                proposal.id
+            ));
+        }
+        if proposal.evidence.len() > vp_protocol::types::AGENT_EMPLOYMENT_MAX_EVIDENCE
+            || proposal.reasons.len() > 4
+            || proposal.performance.evidence.len()
+                > vp_protocol::types::AGENT_PERFORMANCE_MAX_EVIDENCE
+        {
+            return Err(anyhow!(
+                "bundle retirement proposal {} exceeds the bounded evidence cap",
+                proposal.id
+            ));
+        }
+        for evidence in &proposal.evidence {
+            if evidence.kind.chars().count() > 40
+                || evidence.reference.chars().count() > 200
+                || evidence
+                    .at
+                    .as_deref()
+                    .is_some_and(|value| value.chars().count() > 40)
+                || evidence
+                    .note
+                    .as_deref()
+                    .is_some_and(|value| value.chars().count() > 200)
+            {
+                return Err(anyhow!(
+                    "bundle retirement proposal {} has an oversized evidence pointer",
+                    proposal.id
+                ));
+            }
+        }
+    }
+    let mut hire_request_ids = std::collections::HashSet::new();
+    for request in &bundle.agent_hire_requests {
+        if request.project_id != bundle.project.id {
+            return Err(anyhow!(
+                "bundle hire request {} belongs to a different project",
+                request.id
+            ));
+        }
+        if !AGENT_HIRE_REQUEST_STATUSES.contains(&request.status.as_str()) {
+            return Err(anyhow!(
+                "bundle hire request {} has an invalid status",
+                request.id
+            ));
+        }
+        if !hire_request_ids.insert(request.id.clone()) {
+            return Err(anyhow!("bundle hire request {} is duplicated", request.id));
+        }
+        if request.status == "approved" && !identity_ids.contains(request.identity_id.as_str()) {
+            return Err(anyhow!(
+                "bundle approved hire request {} has no identity snapshot",
+                request.id
+            ));
+        }
+    }
+    let mut employment_event_ids = std::collections::HashSet::new();
+    let mut employment_event_seqs = std::collections::HashSet::new();
+    for event in &bundle.agent_employment_events {
+        if event.project_id != bundle.project.id {
+            return Err(anyhow!(
+                "bundle employment event {} belongs to a different project",
+                event.id
+            ));
+        }
+        if event.id.trim().is_empty() || event.seq == 0 || event.identity_id.trim().is_empty() {
+            return Err(anyhow!(
+                "bundle employment event has an empty id, seq, or identity"
+            ));
+        }
+        if !employment_event_ids.insert(event.id.clone()) {
+            return Err(anyhow!(
+                "bundle employment event {} is duplicated",
+                event.id
+            ));
+        }
+        if !employment_event_seqs.insert(event.seq) {
+            return Err(anyhow!("bundle employment events repeat seq {}", event.seq));
+        }
+        if !vp_protocol::types::AGENT_EMPLOYMENT_EVENT_KINDS.contains(&event.kind.as_str()) {
+            return Err(anyhow!(
+                "bundle employment event {} has an unknown kind",
+                event.id
+            ));
+        }
     }
     for message in &bundle.messages {
         ensure_bundle_session("message", &message.session_id, &bundle.session.id)?;
@@ -2857,6 +3039,127 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_agent_memory_events_project
                 ON agent_memory_events(project_id, seq);
+
+            -- Project-scoped retirement thresholds (S6). Default is disabled;
+            -- this row never fires an identity by itself.
+            CREATE TABLE IF NOT EXISTS project_agent_retirement_policies (
+                project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                policy     TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            -- Explicit hire requests. A pending row reserves an identity id but
+            -- creates no identity, session, assignment, workspace, or memory.
+            -- Approval is the only path from pending to a created identity.
+            CREATE TABLE IF NOT EXISTS agent_hire_requests (
+                id                 TEXT PRIMARY KEY,
+                project_id         TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                identity_id        TEXT NOT NULL,
+                role               TEXT NOT NULL,
+                department         TEXT,
+                component          TEXT,
+                title              TEXT,
+                profile            TEXT,
+                model              TEXT,
+                parent_identity_id TEXT,
+                policy_json        TEXT NOT NULL DEFAULT '{}',
+                status             TEXT NOT NULL,
+                requested_at       TEXT NOT NULL,
+                requested_by       TEXT NOT NULL,
+                approval_risk      TEXT NOT NULL,
+                decided_at         TEXT,
+                decided_by         TEXT,
+                reason             TEXT,
+                origin             TEXT NOT NULL DEFAULT 'local'
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_agent_hire_requests_project
+                ON agent_hire_requests(project_id, status, requested_at);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_hire_requests_one_pending_identity
+                ON agent_hire_requests(identity_id)
+                WHERE status = 'pending';
+
+            -- Event-derived retirement proposals. A proposal is an evidence
+            -- bundle plus a decision, never an automatic action.
+            CREATE TABLE IF NOT EXISTS agent_retirement_proposals (
+                id               TEXT PRIMARY KEY,
+                project_id       TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                identity_id      TEXT NOT NULL REFERENCES agent_identities(id) ON DELETE CASCADE,
+                status           TEXT NOT NULL,
+                reason_code      TEXT NOT NULL,
+                reasons_json     TEXT NOT NULL DEFAULT '[]',
+                evidence_json    TEXT NOT NULL DEFAULT '[]',
+                performance_json TEXT NOT NULL,
+                proposed_at      TEXT NOT NULL,
+                proposed_by      TEXT NOT NULL,
+                decided_at       TEXT,
+                decided_by       TEXT,
+                decision_reason  TEXT,
+                successor_id     TEXT,
+                executed_at      TEXT,
+                origin           TEXT NOT NULL DEFAULT 'local'
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_agent_retirement_proposals_project
+                ON agent_retirement_proposals(project_id, status, proposed_at);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_retirement_one_pending
+                ON agent_retirement_proposals(identity_id)
+                WHERE status = 'pending';
+
+            -- Append-only employment stream. `identity_id` deliberately has no
+            -- foreign key: a hire request can precede the identity row.
+            CREATE TABLE IF NOT EXISTS agent_employment_events (
+                id          TEXT PRIMARY KEY,
+                project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                seq         INTEGER NOT NULL,
+                identity_id TEXT NOT NULL,
+                kind        TEXT NOT NULL,
+                payload     TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                UNIQUE (project_id, seq)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_agent_employment_events_project
+                ON agent_employment_events(project_id, seq);
+
+            -- Deterministic per-identity performance ledger. This is derived
+            -- read-only state: it can be rebuilt from task/usage/Verifier/
+            -- diagnosis evidence and never authorizes a mutation.
+            CREATE TABLE IF NOT EXISTS agent_performance (
+                project_id          TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                identity_id         TEXT NOT NULL REFERENCES agent_identities(id) ON DELETE CASCADE,
+                role                TEXT NOT NULL,
+                status              TEXT NOT NULL,
+                lookback_days       INTEGER NOT NULL,
+                completed_tasks     INTEGER NOT NULL DEFAULT 0,
+                failed_tasks        INTEGER NOT NULL DEFAULT 0,
+                cancelled_tasks     INTEGER NOT NULL DEFAULT 0,
+                blocked_tasks       INTEGER NOT NULL DEFAULT 0,
+                skipped_tasks       INTEGER NOT NULL DEFAULT 0,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                retries             INTEGER NOT NULL DEFAULT 0,
+                verifier_approvals  INTEGER NOT NULL DEFAULT 0,
+                verifier_rejections INTEGER NOT NULL DEFAULT 0,
+                unsubstantiated_handoffs INTEGER NOT NULL DEFAULT 0,
+                false_consensus     INTEGER NOT NULL DEFAULT 0,
+                diagnosis_findings  INTEGER NOT NULL DEFAULT 0,
+                assignment_count    INTEGER NOT NULL DEFAULT 0,
+                session_count       INTEGER NOT NULL DEFAULT 0,
+                input_tokens        INTEGER NOT NULL DEFAULT 0,
+                output_tokens       INTEGER NOT NULL DEFAULT 0,
+                cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
+                estimated_usage_calls INTEGER NOT NULL DEFAULT 0,
+                cost_usd            REAL NOT NULL DEFAULT 0,
+                first_active_at     TEXT,
+                last_active_at      TEXT,
+                reason_counts_json  TEXT NOT NULL DEFAULT '[]',
+                evidence_json       TEXT NOT NULL DEFAULT '[]',
+                computed_at         TEXT NOT NULL,
+                PRIMARY KEY (project_id, identity_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_agent_performance_project
+                ON agent_performance(project_id, completed_tasks, failed_tasks);
 
             CREATE TABLE IF NOT EXISTS messages (
                 id           TEXT PRIMARY KEY,
@@ -5003,6 +5306,17 @@ impl Store {
             .map_err(|_| anyhow!("project manifest mutex poisoned"))?;
         let mut line_buffer = Vec::new();
         for project in projects {
+            let retirement_policy =
+                crate::store::employment::get_retirement_policy(self, &project.id)?.policy;
+            // The performance projection is derived. Refresh it before
+            // recording the manifest so the snapshot is evidence-current rather
+            // than a stale read of the last explicit replay.
+            crate::store::employment::rebuild_agent_performance(
+                self,
+                &project.id,
+                retirement_policy.lookback_days,
+                OffsetDateTime::now_utc(),
+            )?;
             let snapshot = ProjectManifestSnapshot {
                 version: 1,
                 recorded_at: now_rfc3339(),
@@ -5030,6 +5344,26 @@ impl Store {
                         &project.id,
                         None,
                     )?,
+                agent_retirement_policy: retirement_policy,
+                agent_retirement_proposals:
+                    crate::store::employment::list_retirement_proposals_for_replay(
+                        self,
+                        &project.id,
+                    )?,
+                agent_employment_events: crate::store::employment::list_employment_events(
+                    self,
+                    &project.id,
+                    Some(100_000),
+                )?,
+                agent_performance: crate::store::employment::list_agent_performance(
+                    self,
+                    &project.id,
+                    None,
+                )?,
+                agent_hire_requests: crate::store::employment::list_hire_requests_for_replay(
+                    self,
+                    &project.id,
+                )?,
                 effect_policy: self.get_effect_policy(&project.id)?,
                 gate_policy: self.get_gate_policy(&project.id)?,
                 otel_policy: self.get_otel_policy(&project.id)?,
@@ -28179,6 +28513,153 @@ impl Store {
             }
         }
 
+        // S6 employment evidence. Derived performance rows are advisory and
+        // never overwrite a local row; proposals/hire requests are imported
+        // read-only evidence; employment events are portable by id.
+        for row in &bundle.agent_performance {
+            tx.execute(
+                "INSERT OR IGNORE INTO agent_performance
+                 (project_id, identity_id, role, status, lookback_days, completed_tasks,
+                  failed_tasks, cancelled_tasks, blocked_tasks, skipped_tasks,
+                  consecutive_failures, retries, verifier_approvals, verifier_rejections,
+                  unsubstantiated_handoffs, false_consensus, diagnosis_findings,
+                  assignment_count, session_count, input_tokens, output_tokens,
+                  cache_read_tokens, estimated_usage_calls, cost_usd, first_active_at,
+                  last_active_at, reason_counts_json, evidence_json, computed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                         ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
+                params![
+                    row.project_id,
+                    row.identity_id,
+                    row.role,
+                    row.status,
+                    row.lookback_days as i64,
+                    row.completed_tasks as i64,
+                    row.failed_tasks as i64,
+                    row.cancelled_tasks as i64,
+                    row.blocked_tasks as i64,
+                    row.skipped_tasks as i64,
+                    row.consecutive_failures as i64,
+                    row.retries as i64,
+                    row.verifier_approvals as i64,
+                    row.verifier_rejections as i64,
+                    row.unsubstantiated_handoffs as i64,
+                    row.false_consensus as i64,
+                    row.diagnosis_findings as i64,
+                    row.assignment_count as i64,
+                    row.session_count as i64,
+                    row.input_tokens as i64,
+                    row.output_tokens as i64,
+                    row.cache_read_tokens as i64,
+                    row.estimated_usage_calls as i64,
+                    row.cost_usd,
+                    row.first_active_at,
+                    row.last_active_at,
+                    serde_json::to_string(&row.reason_counts)?,
+                    serde_json::to_string(&row.evidence)?,
+                    row.computed_at
+                ],
+            )?;
+        }
+        for proposal in &bundle.agent_retirement_proposals {
+            let mut imported = proposal.clone();
+            imported.origin = "imported".to_string();
+            match crate::store::employment::get_retirement_proposal_for_import(&tx, &proposal.id)? {
+                Some(existing) if existing == imported => {}
+                Some(_) => {
+                    return Err(anyhow!(
+                        "bundle retirement proposal {} conflicts with the local projection",
+                        proposal.id
+                    ));
+                }
+                None => {
+                    crate::store::employment::insert_retirement_proposal_for_import(
+                        &tx, &imported,
+                    )?;
+                }
+            }
+        }
+        for request in &bundle.agent_hire_requests {
+            let mut imported = request.clone();
+            imported.origin = "imported".to_string();
+            match crate::store::employment::get_hire_request_for_import(&tx, &request.id)? {
+                Some(existing) if existing == imported => {}
+                Some(_) => {
+                    return Err(anyhow!(
+                        "bundle hire request {} conflicts with the local projection",
+                        request.id
+                    ));
+                }
+                None => {
+                    crate::store::employment::insert_hire_request_for_import(&tx, &imported)?;
+                }
+            }
+        }
+        for event in &bundle.agent_employment_events {
+            let expected_payload = serde_json::to_string(&event.payload)?;
+            match tx
+                .query_row(
+                    "SELECT seq, kind, payload, created_at FROM agent_employment_events WHERE id = ?1",
+                    params![event.id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .optional()?
+            {
+                Some((seq, kind, payload, created_at)) => {
+                    if seq != event.seq as i64
+                        || kind != event.kind
+                        || payload != expected_payload
+                        || created_at != event.created_at
+                    {
+                        return Err(anyhow!(
+                            "bundle employment event {} conflicts with the local event stream",
+                            event.id
+                        ));
+                    }
+                }
+                None => {
+                    let seq_owner: Option<String> = tx
+                        .query_row(
+                            "SELECT id FROM agent_employment_events
+                             WHERE project_id = ?1 AND seq = ?2",
+                            params![bundle.project.id, event.seq as i64],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if let Some(owner) = seq_owner
+                        && owner != event.id
+                    {
+                        return Err(anyhow!(
+                            "bundle employment event {} conflicts with local seq {}",
+                            event.id,
+                            event.seq
+                        ));
+                    }
+                    tx.execute(
+                        "INSERT INTO agent_employment_events
+                         (id, project_id, seq, identity_id, kind, payload, created_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![
+                            event.id,
+                            event.project_id,
+                            event.seq as i64,
+                            event.identity_id,
+                            event.kind,
+                            expected_payload,
+                            event.created_at
+                        ],
+                    )?;
+                }
+            }
+        }
+
         let session_exists: bool = tx
             .query_row(
                 "SELECT 1 FROM sessions WHERE id = ?1",
@@ -29498,6 +29979,16 @@ fn create_agent_identity_tx(
     tx: &Transaction<'_>,
     params: &CreateAgentIdentityParams,
 ) -> Result<AgentIdentity> {
+    create_agent_identity_with_id_tx(tx, params, None)
+}
+
+/// Shared identity creation. S6 hire approval passes the id reserved by the
+/// pending request so approval cannot silently create a different employee.
+pub(crate) fn create_agent_identity_with_id_tx(
+    tx: &Transaction<'_>,
+    params: &CreateAgentIdentityParams,
+    reserved_id: Option<&str>,
+) -> Result<AgentIdentity> {
     let project_id = params.project_id.trim();
     let exists: bool = tx
         .query_row(
@@ -29568,7 +30059,9 @@ fn create_agent_identity_tx(
     let policy = normalize_identity_policy(params.policy.as_ref().unwrap_or(&empty_policy))?;
     let now = now_rfc3339();
     let identity = AgentIdentity {
-        id: Uuid::now_v7().to_string(),
+        id: reserved_id
+            .map(str::to_string)
+            .unwrap_or_else(|| Uuid::now_v7().to_string()),
         project_id: project_id.to_string(),
         role: role.to_string(),
         department,
@@ -33244,6 +33737,7 @@ fn search_snippet(text: &str, query: &str) -> String {
 
 mod continuation_lease;
 mod coordination;
+pub mod employment;
 mod gate;
 pub mod identity_memory;
 mod lease;

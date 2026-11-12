@@ -75,6 +75,11 @@ final class AppModel {
     var agentIdentities: [AgentIdentity] = []
     var agentIdentitiesStatus: String?
     var agentIdentitiesBusy = false
+    var agentPerformanceSummary: AgentPerformanceSummaryResult?
+    var agentRetirementCandidates: [AgentRetirementCandidate] = []
+    var agentRetirementProposals: [AgentRetirementProposal] = []
+    var agentRetirementStatus: String?
+    var agentRetirementBusy = false
     var agentMemories: [AgentMemory] = []
     var agentMemoriesStatus: String?
     var agentMemoriesBusy = false
@@ -8188,6 +8193,40 @@ final class AppModel {
         } catch {
             if projectID == selectedProjectID {
                 agentIdentitiesStatus = error.localizedDescription
+            }
+        }
+    }
+
+    /// Read-only performance and retirement evidence. No hire/retire mutation is
+    /// exposed from this client; those remain explicit CLI/RPC actions.
+    func loadAgentEmployment() async {
+        guard let projectID = selectedProjectID else {
+            agentPerformanceSummary = nil
+            agentRetirementCandidates = []
+            agentRetirementProposals = []
+            agentRetirementStatus = nil
+            return
+        }
+        agentRetirementBusy = true
+        defer { agentRetirementBusy = false }
+        do {
+            async let performance = core.agentPerformanceSummary(projectID: projectID)
+            async let candidates = core.agentRetirementCandidates(projectID: projectID)
+            async let proposals = core.agentRetirementProposals(projectID: projectID)
+            let (summary, candidateResult, proposalRows) = try await (
+                performance, candidates, proposals
+            )
+            if projectID == selectedProjectID {
+                agentPerformanceSummary = summary
+                agentRetirementCandidates = candidateResult.candidates
+                agentRetirementProposals = proposalRows
+                agentRetirementStatus = candidateResult.policyEnabled
+                    ? "\(candidateResult.candidates.count) candidates · \(proposalRows.count) proposals"
+                    : "Retirement policy disabled."
+            }
+        } catch {
+            if projectID == selectedProjectID {
+                agentRetirementStatus = error.localizedDescription
             }
         }
     }

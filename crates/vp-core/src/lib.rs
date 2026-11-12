@@ -141,6 +141,7 @@ pub mod daemon_agent;
 mod dashboard;
 pub mod diagnosis;
 pub mod effect;
+pub mod employment;
 pub mod forge;
 pub mod gate;
 pub mod gui;
@@ -17095,6 +17096,40 @@ impl Engine {
             ))
         })
         .await??;
+        let employment_store = store.clone();
+        let employment_project = project.id.clone();
+        // Materialize the derived ledger so an export always carries the
+        // evidence-current rows rather than a stale explicit replay.
+        self.rebuild_agent_performance_projection(&employment_project)
+            .await?;
+        let (
+            agent_performance,
+            agent_retirement_proposals,
+            agent_employment_events,
+            agent_hire_requests,
+        ) = tokio::task::spawn_blocking(move || {
+            Ok::<_, anyhow::Error>((
+                vp_store::store::employment::list_agent_performance(
+                    &employment_store,
+                    &employment_project,
+                    None,
+                )?,
+                vp_store::store::employment::list_retirement_proposals_for_replay(
+                    &employment_store,
+                    &employment_project,
+                )?,
+                vp_store::store::employment::list_employment_events(
+                    &employment_store,
+                    &employment_project,
+                    Some(100_000),
+                )?,
+                vp_store::store::employment::list_hire_requests_for_replay(
+                    &employment_store,
+                    &employment_project,
+                )?,
+            ))
+        })
+        .await??;
         Ok(SessionBundle {
             version: 1,
             exported_at: vp_protocol::now_rfc3339(),
@@ -17142,6 +17177,10 @@ impl Engine {
             agent_workspace_events,
             agent_memories,
             agent_memory_events,
+            agent_performance,
+            agent_retirement_proposals,
+            agent_employment_events,
+            agent_hire_requests,
         })
     }
 

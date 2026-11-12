@@ -11311,6 +11311,24 @@ pub struct SessionBundle {
     /// must be byte-identical on import.
     #[serde(default)]
     pub agent_memory_events: Vec<AgentMemoryEvent>,
+    /// Derived per-identity performance ledger. Older bundles decode as an
+    /// empty list; imported rows are advisory evidence and can always be
+    /// rebuilt from the archived task/usage/Verifier/diagnosis events.
+    #[serde(default)]
+    pub agent_performance: Vec<AgentPerformance>,
+    /// Event-derived retirement proposals. Older bundles decode as an empty
+    /// list. Imported proposals are evidence and never authorize a local
+    /// retirement.
+    #[serde(default)]
+    pub agent_retirement_proposals: Vec<AgentRetirementProposal>,
+    /// Append-only employment decisions (hire/promote/transfer/retirement).
+    /// Portable by event id; a same-id event must be byte-identical on import.
+    #[serde(default)]
+    pub agent_employment_events: Vec<AgentEmploymentEvent>,
+    /// Pending/decided hire requests. Imported requests are read-only evidence
+    /// and can never be approved locally.
+    #[serde(default)]
+    pub agent_hire_requests: Vec<AgentHireRequest>,
 }
 
 /// Project policy for automatic crash resume. Manual `session.run.resume`
@@ -11763,6 +11781,31 @@ pub mod agent_identity_codes {
     pub const IDENTITY_CAP_EXCEEDED: &str = "IDENTITY_CAP_EXCEEDED";
     pub const IDENTITY_IMPORTED_READONLY: &str = "IDENTITY_IMPORTED_READONLY";
     pub const IDENTITY_POLICY_INVALID: &str = "IDENTITY_POLICY_INVALID";
+    // S6 hiring, promotion, transfer, retirement, and performance.
+    pub const IDENTITY_APPROVAL_REQUIRED: &str = "IDENTITY_APPROVAL_REQUIRED";
+    pub const IDENTITY_APPROVAL_REJECTED: &str = "IDENTITY_APPROVAL_REJECTED";
+    pub const IDENTITY_BUSY: &str = "IDENTITY_BUSY";
+    pub const HIRE_NOT_FOUND: &str = "HIRE_NOT_FOUND";
+    pub const HIRE_INVALID: &str = "HIRE_INVALID";
+    pub const HIRE_CONFLICT: &str = "HIRE_CONFLICT";
+    pub const HIRE_ALREADY_DECIDED: &str = "HIRE_ALREADY_DECIDED";
+    pub const HIRE_CAP_EXCEEDED: &str = "HIRE_CAP_EXCEEDED";
+    pub const PROMOTION_INVALID: &str = "PROMOTION_INVALID";
+    pub const PROMOTION_CONFLICT: &str = "PROMOTION_CONFLICT";
+    pub const TRANSFER_INVALID: &str = "TRANSFER_INVALID";
+    pub const TRANSFER_CONFLICT: &str = "TRANSFER_CONFLICT";
+    pub const RETIREMENT_POLICY_DISABLED: &str = "RETIREMENT_POLICY_DISABLED";
+    pub const RETIREMENT_POLICY_INVALID: &str = "RETIREMENT_POLICY_INVALID";
+    pub const RETIREMENT_APPROVAL_REQUIRED: &str = "RETIREMENT_APPROVAL_REQUIRED";
+    pub const RETIREMENT_NOT_FOUND: &str = "RETIREMENT_NOT_FOUND";
+    pub const RETIREMENT_CONFLICT: &str = "RETIREMENT_CONFLICT";
+    pub const RETIREMENT_NOT_ELIGIBLE: &str = "RETIREMENT_NOT_ELIGIBLE";
+    pub const RETIREMENT_COOLDOWN: &str = "RETIREMENT_COOLDOWN";
+    pub const RETIREMENT_NOT_QUIESCENT: &str = "RETIREMENT_NOT_QUIESCENT";
+    pub const SUCCESSOR_INVALID: &str = "SUCCESSOR_INVALID";
+    pub const PERFORMANCE_INVALID: &str = "PERFORMANCE_INVALID";
+    pub const PERFORMANCE_REPLAY_INVALID: &str = "PERFORMANCE_REPLAY_INVALID";
+    pub const EMPLOYMENT_CONFIRMATION_REQUIRED: &str = "EMPLOYMENT_CONFIRMATION_REQUIRED";
 }
 
 /// Typed identity failure. It carries only a stable code and a bounded message;
@@ -13770,6 +13813,884 @@ pub fn validate_agent_memory_scope_shape(
         _ => {}
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Hiring, promotion, transfer, retirement, and the performance ledger (S6)
+// ---------------------------------------------------------------------------
+
+/// Employment event kinds are project-scoped and append-only. A hire request is
+/// recorded before an identity exists, so `identity_id` on the event is a
+/// proposed/reserved id and the stream deliberately has no foreign key. No event
+/// in this stream authorizes execution, assignment, merge, or budget changes.
+pub const AGENT_HIRE_REQUESTED_EVENT: &str = "agent.hire.requested";
+pub const AGENT_HIRE_APPROVED_EVENT: &str = "agent.hire.approved";
+pub const AGENT_HIRE_REJECTED_EVENT: &str = "agent.hire.rejected";
+pub const AGENT_PROMOTE_APPROVED_EVENT: &str = "agent.promote.approved";
+pub const AGENT_TRANSFER_APPROVED_EVENT: &str = "agent.transfer.approved";
+pub const AGENT_RETIREMENT_PROPOSED_EVENT: &str = "agent.retirement.proposed";
+pub const AGENT_RETIREMENT_APPROVED_EVENT: &str = "agent.retirement.approved";
+pub const AGENT_RETIREMENT_REJECTED_EVENT: &str = "agent.retirement.rejected";
+pub const AGENT_RETIREMENT_EXECUTED_EVENT: &str = "agent.retirement.executed";
+
+pub const AGENT_EMPLOYMENT_EVENT_KINDS: [&str; 9] = [
+    AGENT_HIRE_REQUESTED_EVENT,
+    AGENT_HIRE_APPROVED_EVENT,
+    AGENT_HIRE_REJECTED_EVENT,
+    AGENT_PROMOTE_APPROVED_EVENT,
+    AGENT_TRANSFER_APPROVED_EVENT,
+    AGENT_RETIREMENT_PROPOSED_EVENT,
+    AGENT_RETIREMENT_APPROVED_EVENT,
+    AGENT_RETIREMENT_REJECTED_EVENT,
+    AGENT_RETIREMENT_EXECUTED_EVENT,
+];
+
+/// Hire request states. `approved` means an identity was created with this id;
+/// `rejected` is terminal; `pending` is the only state that can be approved.
+pub const AGENT_HIRE_REQUEST_STATUSES: [&str; 3] = ["pending", "approved", "rejected"];
+
+/// Retirement proposal states. `executed` is set only by an explicit
+/// `agent.retire`; approving a proposal records a decision and never fires the
+/// identity by itself.
+pub const AGENT_RETIREMENT_PROPOSAL_STATUSES: [&str; 5] =
+    ["pending", "approved", "rejected", "executed", "expired"];
+
+/// Roles an operator may hire. The Leader is initialized by the project and is
+/// promoted to, never hired through this surface.
+pub const AGENT_HIRE_ROLES: [&str; 2] = ["manager", "worker"];
+
+/// Only these role transitions are legal. A Leader is terminal; a Manager may
+/// become Leader only when no live Leader exists.
+pub const AGENT_PROMOTION_TARGETS: [&str; 2] = ["manager", "leader"];
+
+/// Bounded employment payload and evidence sizes. Nothing here carries prompt,
+/// tool output, file content, or credentials.
+pub const AGENT_EMPLOYMENT_MAX_REASON_CHARS: usize = 500;
+pub const AGENT_EMPLOYMENT_MAX_OPERATOR_CHARS: usize = 120;
+pub const AGENT_EMPLOYMENT_MAX_EVIDENCE: usize = 16;
+pub const AGENT_EMPLOYMENT_MAX_LIST: u32 = 500;
+pub const AGENT_PERFORMANCE_MAX_EVIDENCE: usize = 32;
+pub const AGENT_PERFORMANCE_MAX_REASON_COUNTS: usize = 16;
+
+/// Retirement policy bounds. `0` disables an individual failing threshold;
+/// `min_completed_tasks` is an eligibility floor and must be positive.
+pub const AGENT_RETIREMENT_DEFAULT_LOOKBACK_DAYS: u32 = 30;
+pub const AGENT_RETIREMENT_MIN_LOOKBACK_DAYS: u32 = 1;
+pub const AGENT_RETIREMENT_MAX_LOOKBACK_DAYS: u32 = 365;
+pub const AGENT_RETIREMENT_DEFAULT_MIN_COMPLETED_TASKS: u32 = 3;
+pub const AGENT_RETIREMENT_MAX_MIN_COMPLETED_TASKS: u32 = 1_000;
+pub const AGENT_RETIREMENT_DEFAULT_MAX_CONSECUTIVE_FAILURES: u32 = 3;
+pub const AGENT_RETIREMENT_DEFAULT_MAX_VERIFIER_REJECTIONS: u32 = 2;
+pub const AGENT_RETIREMENT_DEFAULT_MAX_UNSUBSTANTIATED_HANDOFFS: u32 = 2;
+pub const AGENT_RETIREMENT_DEFAULT_MAX_FALSE_CONSENSUS: u32 = 2;
+pub const AGENT_RETIREMENT_MAX_THRESHOLD: u32 = 100;
+pub const AGENT_RETIREMENT_DEFAULT_COOLDOWN_SECS: u64 = 86_400;
+pub const AGENT_RETIREMENT_MIN_COOLDOWN_SECS: u64 = 60;
+pub const AGENT_RETIREMENT_MAX_COOLDOWN_SECS: u64 = 30 * 24 * 60 * 60;
+/// A policy can never produce an unbounded candidate list.
+pub const AGENT_RETIREMENT_MAX_CANDIDATES: u32 = 25;
+
+/// Stable reason codes for retirement candidates. These are deliberately
+/// evidence counts, not model judgments or a global ranking.
+pub mod agent_retirement_reasons {
+    pub const CONSECUTIVE_FAILURES: &str = "consecutive_failures";
+    pub const VERIFIER_REJECTIONS: &str = "verifier_rejections";
+    pub const UNSUBSTANTIATED_HANDOFFS: &str = "unsubstantiated_handoffs";
+    pub const FALSE_CONSENSUS: &str = "false_consensus";
+}
+
+/// Stable reason codes for one performance evidence pointer. They let a
+/// candidate retain only the evidence for the thresholds it breached.
+pub mod agent_performance_evidence_reasons {
+    pub const TASK_COMPLETED: &str = "task_completed";
+    pub const TASK_FAILED: &str = "task_failed";
+    pub const VERIFIER_APPROVAL: &str = "verifier_approval";
+    pub const VERIFIER_REJECTION: &str = "verifier_rejection";
+    pub const DIAGNOSIS: &str = "diagnosis";
+    pub const ASSIGNMENT: &str = "assignment";
+    pub const USAGE: &str = "usage";
+}
+
+fn default_retirement_policy_enabled() -> bool {
+    false
+}
+
+fn default_retirement_lookback_days() -> u32 {
+    AGENT_RETIREMENT_DEFAULT_LOOKBACK_DAYS
+}
+
+fn default_retirement_min_completed_tasks() -> u32 {
+    AGENT_RETIREMENT_DEFAULT_MIN_COMPLETED_TASKS
+}
+
+fn default_retirement_max_consecutive_failures() -> u32 {
+    AGENT_RETIREMENT_DEFAULT_MAX_CONSECUTIVE_FAILURES
+}
+
+fn default_retirement_max_verifier_rejections() -> u32 {
+    AGENT_RETIREMENT_DEFAULT_MAX_VERIFIER_REJECTIONS
+}
+
+fn default_retirement_max_unsubstantiated_handoffs() -> u32 {
+    AGENT_RETIREMENT_DEFAULT_MAX_UNSUBSTANTIATED_HANDOFFS
+}
+
+fn default_retirement_max_false_consensus() -> u32 {
+    AGENT_RETIREMENT_DEFAULT_MAX_FALSE_CONSENSUS
+}
+
+fn default_retirement_cooldown_secs() -> u64 {
+    AGENT_RETIREMENT_DEFAULT_COOLDOWN_SECS
+}
+
+fn default_retirement_requires_approval() -> bool {
+    true
+}
+
+/// Project-scoped evidence thresholds used to *propose* retirement. The
+/// default is disabled. The controller never retires an identity; an operator
+/// approves the proposal and explicitly retires it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRetirementPolicy {
+    #[serde(default = "default_retirement_policy_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_retirement_lookback_days")]
+    pub lookback_days: u32,
+    #[serde(default = "default_retirement_min_completed_tasks")]
+    pub min_completed_tasks: u32,
+    #[serde(default = "default_retirement_max_consecutive_failures")]
+    pub max_consecutive_failures: u32,
+    #[serde(default = "default_retirement_max_verifier_rejections")]
+    pub max_verifier_rejections: u32,
+    #[serde(default = "default_retirement_max_unsubstantiated_handoffs")]
+    pub max_unsubstantiated_handoffs: u32,
+    #[serde(default = "default_retirement_max_false_consensus")]
+    pub max_false_consensus: u32,
+    #[serde(default = "default_retirement_cooldown_secs")]
+    pub cooldown_secs: u64,
+    #[serde(default = "default_retirement_requires_approval")]
+    pub require_approval: bool,
+}
+
+impl Default for AgentRetirementPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            lookback_days: default_retirement_lookback_days(),
+            min_completed_tasks: default_retirement_min_completed_tasks(),
+            max_consecutive_failures: default_retirement_max_consecutive_failures(),
+            max_verifier_rejections: default_retirement_max_verifier_rejections(),
+            max_unsubstantiated_handoffs: default_retirement_max_unsubstantiated_handoffs(),
+            max_false_consensus: default_retirement_max_false_consensus(),
+            cooldown_secs: default_retirement_cooldown_secs(),
+            require_approval: default_retirement_requires_approval(),
+        }
+    }
+}
+
+impl AgentRetirementPolicy {
+    /// Return a bounded copy or fail closed. A bad cap is never silently
+    /// clamped or enabled.
+    pub fn normalized(&self) -> std::result::Result<Self, String> {
+        if !(AGENT_RETIREMENT_MIN_LOOKBACK_DAYS..=AGENT_RETIREMENT_MAX_LOOKBACK_DAYS)
+            .contains(&self.lookback_days)
+        {
+            return Err(format!(
+                "lookback_days must be {}..={}",
+                AGENT_RETIREMENT_MIN_LOOKBACK_DAYS, AGENT_RETIREMENT_MAX_LOOKBACK_DAYS
+            ));
+        }
+        if !(1..=AGENT_RETIREMENT_MAX_MIN_COMPLETED_TASKS).contains(&self.min_completed_tasks) {
+            return Err(format!(
+                "min_completed_tasks must be 1..={AGENT_RETIREMENT_MAX_MIN_COMPLETED_TASKS}"
+            ));
+        }
+        for (name, value) in [
+            ("max_consecutive_failures", self.max_consecutive_failures),
+            ("max_verifier_rejections", self.max_verifier_rejections),
+            (
+                "max_unsubstantiated_handoffs",
+                self.max_unsubstantiated_handoffs,
+            ),
+            ("max_false_consensus", self.max_false_consensus),
+        ] {
+            if value > AGENT_RETIREMENT_MAX_THRESHOLD {
+                return Err(format!(
+                    "{name} must be 0..={AGENT_RETIREMENT_MAX_THRESHOLD}"
+                ));
+            }
+        }
+        if !(AGENT_RETIREMENT_MIN_COOLDOWN_SECS..=AGENT_RETIREMENT_MAX_COOLDOWN_SECS)
+            .contains(&self.cooldown_secs)
+        {
+            return Err(format!(
+                "cooldown_secs must be {}..={}",
+                AGENT_RETIREMENT_MIN_COOLDOWN_SECS, AGENT_RETIREMENT_MAX_COOLDOWN_SECS
+            ));
+        }
+        Ok(self.clone())
+    }
+
+    /// True when any failing threshold can produce a proposal. A policy that is
+    /// enabled but has every threshold disabled is not an error; it simply has
+    /// no candidates.
+    pub fn has_enabled_threshold(&self) -> bool {
+        self.max_consecutive_failures > 0
+            || self.max_verifier_rejections > 0
+            || self.max_unsubstantiated_handoffs > 0
+            || self.max_false_consensus > 0
+    }
+}
+
+/// One bounded, non-secret evidence pointer attached to performance or a
+/// retirement proposal. It never carries file content, prompt text, command
+/// text, or tool output.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentPerformanceEvidence {
+    /// task, merge, attribution, session, usage, assignment, or commit.
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub reference: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub at: Option<String>,
+    #[serde(default)]
+    pub hash: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// One deterministic reason count in the performance ledger.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentPerformanceReasonCount {
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub count: u64,
+}
+
+/// Read-only per-identity performance ledger. Every value is derived from
+/// existing task, usage, Verifier, assignment, and failure-attribution
+/// evidence; there is no LLM score, hidden ranking, or mutation authority.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentPerformance {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub identity_id: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default = "default_retirement_lookback_days")]
+    pub lookback_days: u32,
+    #[serde(default)]
+    pub completed_tasks: u64,
+    #[serde(default)]
+    pub failed_tasks: u64,
+    #[serde(default)]
+    pub cancelled_tasks: u64,
+    #[serde(default)]
+    pub blocked_tasks: u64,
+    #[serde(default)]
+    pub skipped_tasks: u64,
+    #[serde(default)]
+    pub consecutive_failures: u64,
+    #[serde(default)]
+    pub retries: u64,
+    #[serde(default)]
+    pub verifier_approvals: u64,
+    #[serde(default)]
+    pub verifier_rejections: u64,
+    #[serde(default)]
+    pub unsubstantiated_handoffs: u64,
+    #[serde(default)]
+    pub false_consensus: u64,
+    #[serde(default)]
+    pub diagnosis_findings: u64,
+    #[serde(default)]
+    pub assignment_count: u64,
+    #[serde(default)]
+    pub session_count: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub estimated_usage_calls: u64,
+    #[serde(default)]
+    pub cost_usd: f64,
+    #[serde(default)]
+    pub first_active_at: Option<String>,
+    #[serde(default)]
+    pub last_active_at: Option<String>,
+    #[serde(default)]
+    pub computed_at: String,
+    #[serde(default)]
+    pub reason_counts: Vec<AgentPerformanceReasonCount>,
+    #[serde(default)]
+    pub evidence: Vec<AgentPerformanceEvidence>,
+}
+
+/// Aggregate totals for a project performance summary. This is descriptive,
+/// not a ranking or a scheduler input.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentPerformanceTotals {
+    #[serde(default)]
+    pub identities: u64,
+    #[serde(default)]
+    pub completed_tasks: u64,
+    #[serde(default)]
+    pub failed_tasks: u64,
+    #[serde(default)]
+    pub verifier_approvals: u64,
+    #[serde(default)]
+    pub verifier_rejections: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cost_usd: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentPerformanceParams {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub identity_id: String,
+    /// Override the policy lookback for this read; bounded 1..=365.
+    #[serde(default)]
+    pub lookback_days: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentPerformanceSummaryParams {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub lookback_days: Option<u32>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentPerformanceSummaryResult {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub computed_at: String,
+    #[serde(default)]
+    pub lookback_days: u32,
+    #[serde(default)]
+    pub retirement_policy_enabled: bool,
+    #[serde(default)]
+    pub identities: Vec<AgentPerformance>,
+    #[serde(default)]
+    pub totals: AgentPerformanceTotals,
+}
+
+/// One threshold breach, with the observed count and the policy threshold that
+/// made it a candidate. No score is used to make a governance decision.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRetirementReason {
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub count: u64,
+    #[serde(default)]
+    pub threshold: u32,
+}
+
+/// Read-only retirement candidate. It is a proposal input, not a verdict and
+/// not an action.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentRetirementCandidate {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub identity_id: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub department: Option<String>,
+    #[serde(default)]
+    pub component: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub generation: u64,
+    /// Deterministic ordering key: reason count first, then excess evidence.
+    #[serde(default)]
+    pub severity: u64,
+    #[serde(default)]
+    pub reasons: Vec<AgentRetirementReason>,
+    #[serde(default)]
+    pub performance: AgentPerformance,
+    #[serde(default)]
+    pub evidence: Vec<AgentPerformanceEvidence>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentRetirementCandidatesParams {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub lookback_days: Option<u32>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentRetirementCandidatesResult {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub generated_at: String,
+    #[serde(default)]
+    pub policy_enabled: bool,
+    #[serde(default)]
+    pub policy: AgentRetirementPolicy,
+    #[serde(default)]
+    pub evaluated: u64,
+    #[serde(default)]
+    pub candidates: Vec<AgentRetirementCandidate>,
+    #[serde(default)]
+    pub limited: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentHireRequest {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub project_id: String,
+    /// The identity id reserved by this request. It is reused on approval and
+    /// never handed to a different request after a rejection.
+    #[serde(default)]
+    pub identity_id: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub department: Option<String>,
+    #[serde(default)]
+    pub component: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub parent_identity_id: Option<String>,
+    #[serde(default = "default_identity_policy_json")]
+    pub policy: Value,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub requested_at: String,
+    #[serde(default)]
+    pub requested_by: String,
+    #[serde(default)]
+    pub approval_risk: String,
+    #[serde(default)]
+    pub decided_at: Option<String>,
+    #[serde(default)]
+    pub decided_by: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// `local` or `imported`. Imported requests are archive evidence and can
+    /// never be approved locally.
+    #[serde(default = "default_identity_origin")]
+    pub origin: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentHireParams {
+    #[serde(default)]
+    pub project_id: String,
+    /// manager or worker. A Leader is never hired through this RPC.
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub department: Option<String>,
+    #[serde(default)]
+    pub component: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub parent_identity_id: Option<String>,
+    #[serde(default)]
+    pub policy: Option<Value>,
+    /// Explicit operator confirmation. Omitted/`false` creates a pending request
+    /// when policy requires approval; it never auto-hires.
+    #[serde(default)]
+    pub approved: bool,
+    #[serde(default)]
+    pub operator: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentHireResult {
+    #[serde(default)]
+    pub request: AgentHireRequest,
+    #[serde(default)]
+    pub identity: Option<AgentIdentity>,
+    /// `approved`, `pending`, or `rejected`.
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentHireApproveParams {
+    #[serde(default)]
+    pub request_id: String,
+    #[serde(default)]
+    pub operator: Option<String>,
+    /// Bounded approval classification; defaults to `host_state`.
+    #[serde(default)]
+    pub approval_risk: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentHireRejectParams {
+    #[serde(default)]
+    pub request_id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub operator: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentHireListParams {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentHireListResult {
+    #[serde(default)]
+    pub requests: Vec<AgentHireRequest>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentPromoteParams {
+    #[serde(default)]
+    pub identity_id: String,
+    /// manager or leader.
+    #[serde(default)]
+    pub target_role: String,
+    /// Required for Worker→Manager (a Leader parent). Omit for Leader.
+    #[serde(default)]
+    pub parent_identity_id: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub approved: bool,
+    /// Release active assignments/workspaces after preserving evidence.
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default)]
+    pub operator: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentPromoteResult {
+    #[serde(default)]
+    pub identity: AgentIdentity,
+    #[serde(default)]
+    pub previous_role: String,
+    #[serde(default)]
+    pub changed: bool,
+    #[serde(default)]
+    pub released_assignments: u64,
+    #[serde(default)]
+    pub archived_workspaces: u64,
+    #[serde(default)]
+    pub employment_event_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentTransferParams {
+    #[serde(default)]
+    pub identity_id: String,
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    pub department: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    pub component: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    pub title: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    pub parent_identity_id: Option<Option<String>>,
+    #[serde(default)]
+    pub approved: bool,
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default)]
+    pub operator: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentTransferResult {
+    #[serde(default)]
+    pub identity: AgentIdentity,
+    #[serde(default)]
+    pub changed: bool,
+    #[serde(default)]
+    pub released_assignments: u64,
+    #[serde(default)]
+    pub archived_workspaces: u64,
+    #[serde(default)]
+    pub employment_event_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentRetireParams {
+    #[serde(default)]
+    pub identity_id: String,
+    #[serde(default)]
+    pub successor_id: Option<String>,
+    /// Optional approved retirement proposal. An approved proposal satisfies
+    /// the approval requirement; a pending proposal does not.
+    #[serde(default)]
+    pub proposal_id: Option<String>,
+    /// Explicit operator/Leader confirmation. Required when policy requires it.
+    #[serde(default)]
+    pub approved: bool,
+    /// Release active coordination/workspace state. It never interrupts an
+    /// in-flight provider stream and never deletes evidence.
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub operator: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentRetireResult {
+    #[serde(default)]
+    pub identity: AgentIdentity,
+    #[serde(default)]
+    pub changed: bool,
+    #[serde(default)]
+    pub proposal_id: Option<String>,
+    #[serde(default)]
+    pub released_assignments: u64,
+    #[serde(default)]
+    pub archived_workspaces: u64,
+    #[serde(default)]
+    pub employment_event_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentRetirementProposal {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub identity_id: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub reason_code: String,
+    #[serde(default)]
+    pub reasons: Vec<AgentRetirementReason>,
+    #[serde(default)]
+    pub evidence: Vec<AgentPerformanceEvidence>,
+    #[serde(default)]
+    pub performance: AgentPerformance,
+    #[serde(default)]
+    pub proposed_at: String,
+    #[serde(default)]
+    pub proposed_by: String,
+    #[serde(default)]
+    pub decided_at: Option<String>,
+    #[serde(default)]
+    pub decided_by: Option<String>,
+    #[serde(default)]
+    pub decision_reason: Option<String>,
+    #[serde(default)]
+    pub successor_id: Option<String>,
+    #[serde(default)]
+    pub executed_at: Option<String>,
+    #[serde(default = "default_identity_origin")]
+    pub origin: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentRetirementProposeParams {
+    #[serde(default)]
+    pub identity_id: String,
+    #[serde(default)]
+    pub operator: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentRetirementProposeResult {
+    #[serde(default)]
+    pub proposal: AgentRetirementProposal,
+    #[serde(default)]
+    pub candidate: AgentRetirementCandidate,
+    #[serde(default)]
+    pub already_pending: bool,
+    #[serde(default)]
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentRetirementProposalParams {
+    #[serde(default)]
+    pub proposal_id: String,
+    #[serde(default)]
+    pub operator: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentRetirementRejectParams {
+    #[serde(default)]
+    pub proposal_id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub operator: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentRetirementDecisionResult {
+    #[serde(default)]
+    pub proposal: AgentRetirementProposal,
+    #[serde(default)]
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentRetirementProposalListParams {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub identity_id: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentRetirementProposalListResult {
+    #[serde(default)]
+    pub proposals: Vec<AgentRetirementProposal>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentPerformanceReplayParams {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub repair: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentPerformanceReplayReport {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub rows: u64,
+    #[serde(default)]
+    pub consistent: bool,
+    #[serde(default)]
+    pub repaired: bool,
+    #[serde(default)]
+    pub mismatches: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentRetirementPolicyParams {
+    #[serde(default)]
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SetAgentRetirementPolicyParams {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub policy: AgentRetirementPolicy,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentRetirementPolicyResult {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub policy: AgentRetirementPolicy,
+}
+
+/// One append-only project-scoped employment event. `seq` orders replay within
+/// a project; `id` is portable across databases for idempotent archive import.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentEmploymentEvent {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub seq: u64,
+    /// The subject identity. For `agent.hire.requested`/`.rejected` this is the
+    /// reserved id; no identity row exists yet.
+    #[serde(default)]
+    pub identity_id: String,
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub payload: Value,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentEmploymentReplayParams {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub repair: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentEmploymentReplayReport {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub hire_requests: u64,
+    #[serde(default)]
+    pub proposals: u64,
+    #[serde(default)]
+    pub events: u64,
+    #[serde(default)]
+    pub consistent: bool,
+    #[serde(default)]
+    pub repaired: bool,
+    #[serde(default)]
+    pub mismatches: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -19156,6 +20077,10 @@ mod context_checkpoint_bundle_tests {
             agent_workspace_events: Vec::new(),
             agent_memories: Vec::new(),
             agent_memory_events: Vec::new(),
+            agent_performance: Vec::new(),
+            agent_retirement_proposals: Vec::new(),
+            agent_employment_events: Vec::new(),
+            agent_hire_requests: Vec::new(),
         };
         let encoded = serde_json::to_string(&bundle).unwrap();
         let decoded: SessionBundle = serde_json::from_str(&encoded).unwrap();
@@ -22886,5 +23811,125 @@ mod memory_protocol_tests {
         assert!(!encoded.contains("secret memory content"));
         let decoded: IdentityMemoryTelemetry = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, telemetry);
+    }
+
+    #[test]
+    fn retirement_policy_defaults_are_disabled_and_bounded() {
+        let policy: AgentRetirementPolicy = serde_json::from_value(json!({})).unwrap();
+        assert!(!policy.enabled);
+        assert_eq!(policy.lookback_days, 30);
+        assert_eq!(policy.min_completed_tasks, 3);
+        assert!(policy.require_approval);
+        assert!(policy.normalized().is_ok());
+        let mut invalid = policy.clone();
+        invalid.lookback_days = 0;
+        assert!(invalid.normalized().is_err());
+        invalid.lookback_days = 30;
+        invalid.min_completed_tasks = 0;
+        assert!(invalid.normalized().is_err());
+        invalid.min_completed_tasks = 3;
+        invalid.max_false_consensus = AGENT_RETIREMENT_MAX_THRESHOLD + 1;
+        assert!(invalid.normalized().is_err());
+        invalid.max_false_consensus = 2;
+        invalid.cooldown_secs = 0;
+        assert!(invalid.normalized().is_err());
+        assert!(AgentRetirementPolicy::default().has_enabled_threshold());
+    }
+
+    #[test]
+    fn hire_request_defaults_are_local_and_pending_semantics_are_wire_stable() {
+        let request: AgentHireRequest = serde_json::from_value(json!({
+            "id": "hire-1",
+            "project_id": "prj-1",
+            "identity_id": "id-1",
+            "role": "worker",
+            "status": "pending",
+            "requested_at": "2026-11-13T00:00:00Z",
+            "requested_by": "operator",
+            "approval_risk": "host_state"
+        }))
+        .unwrap();
+        assert_eq!(request.origin, "local");
+        assert_eq!(request.policy, json!({}));
+        assert_eq!(request.status, "pending");
+        assert!(AGENT_HIRE_REQUEST_STATUSES.contains(&request.status.as_str()));
+        assert_eq!(AGENT_HIRE_ROLES, ["manager", "worker"]);
+    }
+
+    #[test]
+    fn performance_and_proposal_payloads_have_serde_defaults_and_no_prompt_fields() {
+        let performance: AgentPerformance = serde_json::from_value(json!({
+            "project_id": "prj-1",
+            "identity_id": "id-1",
+            "role": "worker",
+            "status": "active",
+            "lookback_days": 30
+        }))
+        .unwrap();
+        assert_eq!(performance.completed_tasks, 0);
+        assert!(performance.evidence.is_empty());
+        assert!(performance.first_active_at.is_none());
+        let encoded = serde_json::to_string(&performance).unwrap();
+        assert!(!encoded.contains("prompt"));
+        assert!(!encoded.contains("goal"));
+        let proposal: AgentRetirementProposal = serde_json::from_value(json!({
+            "id": "proposal-1",
+            "project_id": "prj-1",
+            "identity_id": "id-1",
+            "status": "pending",
+            "reason_code": "consecutive_failures",
+            "proposed_at": "2026-11-13T00:00:00Z",
+            "proposed_by": "operator"
+        }))
+        .unwrap();
+        assert_eq!(proposal.origin, "local");
+        assert!(proposal.reasons.is_empty());
+        assert!(!AGENT_RETIREMENT_PROPOSAL_STATUSES.contains(&"unknown"));
+        assert!(AGENT_RETIREMENT_PROPOSAL_STATUSES.contains(&"executed"));
+    }
+
+    #[test]
+    fn employment_event_kinds_and_error_codes_are_stable_wire_values() {
+        assert!(AGENT_EMPLOYMENT_EVENT_KINDS.contains(&AGENT_HIRE_REQUESTED_EVENT));
+        assert!(AGENT_EMPLOYMENT_EVENT_KINDS.contains(&AGENT_HIRE_APPROVED_EVENT));
+        assert!(AGENT_EMPLOYMENT_EVENT_KINDS.contains(&AGENT_RETIREMENT_EXECUTED_EVENT));
+        assert_eq!(
+            agent_identity_codes::RETIREMENT_APPROVAL_REQUIRED,
+            "RETIREMENT_APPROVAL_REQUIRED"
+        );
+        assert_eq!(
+            agent_identity_codes::IDENTITY_APPROVAL_REQUIRED,
+            "IDENTITY_APPROVAL_REQUIRED"
+        );
+        assert_eq!(agent_retirement_reasons::FALSE_CONSENSUS, "false_consensus");
+        let candidate: AgentRetirementCandidate = serde_json::from_value(json!({
+            "project_id": "prj-1",
+            "identity_id": "id-1",
+            "role": "worker",
+            "status": "active"
+        }))
+        .unwrap();
+        assert_eq!(candidate.generation, 0);
+        assert!(candidate.reasons.is_empty());
+    }
+
+    #[test]
+    fn session_bundle_decodes_s6_fields_as_empty_by_default() {
+        let bundle: SessionBundle = serde_json::from_value(json!({
+            "version": 1,
+            "exported_at": "2026-11-13T00:00:00Z",
+            "project": {"id": "prj-1", "name": "p", "root": "/tmp/p", "default_branch": "main", "created_at": "2026-11-13T00:00:00Z"},
+            "session": {"id": "ses-1", "project_id": "prj-1", "goal": "g", "status": "idle", "created_at": "2026-11-13T00:00:00Z"},
+            "events": [],
+            "agents": [],
+            "messages": [],
+            "todos": [],
+            "merge_queue": []
+        }))
+        .unwrap();
+        assert!(bundle.agent_performance.is_empty());
+        assert!(bundle.agent_retirement_proposals.is_empty());
+        assert!(bundle.agent_employment_events.is_empty());
+        assert!(bundle.agent_hire_requests.is_empty());
     }
 }

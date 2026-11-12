@@ -2426,6 +2426,201 @@ struct ProjectIdentitiesCard: View {
     }
 }
 
+struct ProjectAgentPerformanceCard: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Agent performance")
+                    Text(model.selectedProject?.name ?? "No project selected")
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                        .lineLimit(1)
+                }
+                Spacer()
+                if model.agentRetirementBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Refresh") {
+                    Task { await model.loadAgentEmployment() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.selectedProjectID == nil || model.agentRetirementBusy)
+            }
+            if let summary = model.agentPerformanceSummary {
+                HStack(spacing: 12) {
+                    metric("Completed", "\(summary.totals.completedTasks)")
+                    metric("Failed", "\(summary.totals.failedTasks)")
+                    metric(
+                        "Verifier",
+                        "\(summary.totals.verifierApprovals)/\(summary.totals.verifierRejections)"
+                    )
+                    metric("Tokens", "\(summary.totals.inputTokens)/\(summary.totals.outputTokens)")
+                    metric("Cost", String(format: "$%.3f", summary.totals.costUsd))
+                }
+                if summary.identities.isEmpty {
+                    Text("No performance evidence yet.")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                } else {
+                    VStack(spacing: 6) {
+                        ForEach(summary.identities.prefix(12)) { row in
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack(spacing: 6) {
+                                    Text(shortID(row.identityId))
+                                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                                    Text(row.role)
+                                        .font(.system(size: 8, design: .monospaced))
+                                        .foregroundStyle(.secondary)
+                                    Spacer()
+                                    Text("\(row.completedTasks)✓ \(row.failedTasks)×")
+                                        .font(.system(size: 9, design: .monospaced))
+                                        .foregroundStyle(row.failedTasks > 0 ? .orange : .secondary)
+                                }
+                                Text(
+                                    "consecutive \(row.consecutiveFailures) · retries \(row.retries) · verifier \(row.verifierApprovals)/\(row.verifierRejections) · evidence \(row.evidenceCount)"
+                                )
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                            }
+                            .padding(8)
+                            .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 8))
+                        }
+                    }
+                }
+            } else if model.selectedProjectID == nil {
+                Text("Select a project to inspect the derived performance ledger.")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            } else {
+                Text(model.agentRetirementStatus ?? "No performance summary.")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 0)
+    }
+
+    private func metric(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(label.uppercased())
+                .font(.system(size: 7, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.tertiary)
+            Text(value)
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+        }
+    }
+
+    private func shortID(_ value: String) -> String {
+        value.count > 12 ? String(value.prefix(12)) + "…" : value
+    }
+}
+
+struct ProjectRetirementCandidatesCard: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Retirement evidence")
+                    Text(model.selectedProject?.name ?? "No project selected")
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                        .lineLimit(1)
+                }
+                Spacer()
+                if !model.agentRetirementCandidates.isEmpty {
+                    Text("\(model.agentRetirementCandidates.count)")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.orange)
+                }
+                Button("Refresh") {
+                    Task { await model.loadAgentEmployment() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.selectedProjectID == nil || model.agentRetirementBusy)
+            }
+            if model.selectedProjectID == nil {
+                Text("Select a project to inspect deterministic retirement candidates.")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            } else if model.agentRetirementCandidates.isEmpty {
+                Text(model.agentRetirementStatus ?? "No retirement candidates.")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            } else {
+                VStack(spacing: 6) {
+                    ForEach(model.agentRetirementCandidates.prefix(10)) { candidate in
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "exclamationmark.triangle")
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(.orange)
+                                Text(candidate.title ?? candidate.identityId)
+                                    .font(.system(size: 9, weight: .medium, design: .monospaced))
+                                    .lineLimit(1)
+                                Spacer()
+                                Text("severity \(candidate.severity)")
+                                    .font(.system(size: 8, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                            }
+                            Text(candidate.reasonSummary)
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                            Text(
+                                "advisory only · explicit operator approval and `vp agent-retire` are required"
+                            )
+                            .font(.system(size: 7, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                        }
+                        .padding(8)
+                        .background(.orange.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+                    }
+                }
+                if !model.agentRetirementProposals.isEmpty {
+                    Divider().opacity(0.3)
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(model.agentRetirementProposals.prefix(6)) { proposal in
+                            HStack(spacing: 6) {
+                                Text(proposal.status)
+                                    .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                                    .foregroundStyle(proposal.status == "pending" ? .orange : .secondary)
+                                Text(proposal.reasonCode)
+                                    .font(.system(size: 8, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                Text(String(proposal.id.prefix(10)))
+                                    .font(.system(size: 7, design: .monospaced))
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 0)
+        .task { await model.loadAgentEmployment() }
+    }
+}
+
 struct ProjectAgentMemoriesCard: View {
     @Environment(AppModel.self) private var model
 

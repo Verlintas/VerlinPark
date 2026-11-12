@@ -153,4 +153,167 @@ final class AgentIdentityTests: XCTestCase {
         XCTAssertFalse(imported.isActive)
         XCTAssertEqual(imported.statusDetail, "forgotten")
     }
+
+    func testAgentPerformanceSummaryDecodesReadOnlyEvidence() throws {
+        let json = try XCTUnwrap("""
+        {
+          "project_id": "prj-1",
+          "computed_at": "2026-11-13T00:00:00Z",
+          "lookback_days": 30,
+          "retirement_policy_enabled": true,
+          "identities": [{
+            "project_id": "prj-1",
+            "identity_id": "identity-1",
+            "role": "worker",
+            "status": "active",
+            "lookback_days": 30,
+            "completed_tasks": 3,
+            "failed_tasks": 2,
+            "cancelled_tasks": 1,
+            "consecutive_failures": 1,
+            "retries": 2,
+            "verifier_approvals": 2,
+            "verifier_rejections": 1,
+            "unsubstantiated_handoffs": 1,
+            "false_consensus": 0,
+            "diagnosis_findings": 1,
+            "assignment_count": 2,
+            "session_count": 1,
+            "input_tokens": 1200,
+            "output_tokens": 300,
+            "cost_usd": 0.42,
+            "last_active_at": "2026-11-13T00:00:00Z",
+            "computed_at": "2026-11-13T00:00:00Z",
+            "reason_counts": [{"code": "false_consensus", "count": 1}],
+            "evidence": [{"kind": "task", "reference": "T1", "reason": "task_failed", "at": "2026-11-13T00:00:00Z", "note": "status failed"}]
+          }],
+          "totals": {
+            "identities": 1,
+            "completed_tasks": 3,
+            "failed_tasks": 2,
+            "verifier_approvals": 2,
+            "verifier_rejections": 1,
+            "input_tokens": 1200,
+            "output_tokens": 300,
+            "cost_usd": 0.42
+          }
+        }
+        """.data(using: .utf8))
+        let summary = try decoder.decode(AgentPerformanceSummaryResult.self, from: json)
+        XCTAssertTrue(summary.retirementPolicyEnabled)
+        XCTAssertEqual(summary.totals.completedTasks, 3)
+        XCTAssertEqual(summary.identities.count, 1)
+        XCTAssertEqual(summary.identities[0].completedTasks, 3)
+        XCTAssertEqual(summary.identities[0].evidenceCount, 1)
+        XCTAssertEqual(summary.identities[0].reasonCounts?.first?.code, "false_consensus")
+        XCTAssertFalse(String(describing: summary).contains("prompt"))
+    }
+
+    func testRetirementCandidatesAndProposalsDecodeWithoutMutationAuthority() throws {
+        let candidatesJSON = try XCTUnwrap("""
+        {
+          "project_id": "prj-1",
+          "generated_at": "2026-11-13T00:00:00Z",
+          "policy_enabled": true,
+          "evaluated": 2,
+          "candidates": [{
+            "project_id": "prj-1",
+            "identity_id": "identity-1",
+            "role": "worker",
+            "title": "Auth Worker",
+            "status": "active",
+            "generation": 2,
+            "severity": 1001,
+            "reasons": [{"code": "consecutive_failures", "count": 3, "threshold": 2}],
+            "evidence": [{"kind": "task", "reference": "T1", "reason": "task_failed", "at": null, "note": null}]
+          }],
+          "limited": false
+        }
+        """.data(using: .utf8))
+        let candidates = try decoder.decode(AgentRetirementCandidatesResult.self, from: candidatesJSON)
+        XCTAssertTrue(candidates.policyEnabled)
+        XCTAssertEqual(candidates.candidates.count, 1)
+        XCTAssertEqual(candidates.candidates[0].reasonSummary, "consecutive_failures 3/2")
+        XCTAssertEqual(candidates.candidates[0].severity, 1001)
+
+        let proposalsJSON = try XCTUnwrap("""
+        {
+          "proposals": [{
+            "id": "proposal-1",
+            "project_id": "prj-1",
+            "identity_id": "identity-1",
+            "status": "pending",
+            "reason_code": "consecutive_failures",
+            "reasons": [{"code": "consecutive_failures", "count": 3, "threshold": 2}],
+            "proposed_at": "2026-11-13T00:00:00Z",
+            "proposed_by": "operator",
+            "origin": "local"
+          }]
+        }
+        """.data(using: .utf8))
+        let proposals = try decoder.decode(AgentRetirementProposalListResult.self, from: proposalsJSON)
+        XCTAssertEqual(proposals.proposals.first?.status, "pending")
+        XCTAssertEqual(proposals.proposals.first?.reasonCode, "consecutive_failures")
+        XCTAssertNil(proposals.proposals.first?.successorId)
+    }
+
+    func testHireAndRetireResultsDecodeForS7Consumption() throws {
+        let hireJSON = try XCTUnwrap("""
+        {
+          "request": {
+            "id": "hire-1",
+            "project_id": "prj-1",
+            "identity_id": "identity-1",
+            "role": "worker",
+            "status": "approved",
+            "requested_at": "2026-11-13T00:00:00Z",
+            "requested_by": "operator",
+            "approval_risk": "host_state",
+            "origin": "local"
+          },
+          "identity": {
+            "id": "identity-1",
+            "project_id": "prj-1",
+            "role": "worker",
+            "status": "active",
+            "generation": 1,
+            "created_at": "2026-11-13T00:00:00Z",
+            "updated_at": "2026-11-13T00:00:00Z",
+            "origin": "local"
+          },
+          "state": "approved",
+          "changed": true
+        }
+        """.data(using: .utf8))
+        let hire = try decoder.decode(AgentHireResult.self, from: hireJSON)
+        XCTAssertEqual(hire.state, "approved")
+        XCTAssertEqual(hire.request.approvalRisk, "host_state")
+        XCTAssertEqual(hire.identity?.role, "worker")
+
+        let retireJSON = try XCTUnwrap("""
+        {
+          "identity": {
+            "id": "identity-1",
+            "project_id": "prj-1",
+            "role": "worker",
+            "status": "retired",
+            "generation": 2,
+            "created_at": "2026-11-13T00:00:00Z",
+            "updated_at": "2026-11-13T00:00:00Z",
+            "successor_id": "identity-2",
+            "origin": "local"
+          },
+          "changed": true,
+          "proposal_id": "proposal-1",
+          "released_assignments": 1,
+          "archived_workspaces": 1,
+          "employment_event_id": "event-1"
+        }
+        """.data(using: .utf8))
+        let retire = try decoder.decode(AgentRetireResult.self, from: retireJSON)
+        XCTAssertEqual(retire.identity.status, "retired")
+        XCTAssertEqual(retire.proposalId, "proposal-1")
+        XCTAssertEqual(retire.releasedAssignments, 1)
+        XCTAssertEqual(retire.archivedWorkspaces, 1)
+    }
 }

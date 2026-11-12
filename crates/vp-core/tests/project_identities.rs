@@ -792,3 +792,391 @@ async fn replay_repair_is_scoped_to_one_project() {
         .unwrap();
     assert!(replay_b.consistent);
 }
+
+#[tokio::test]
+async fn s6_engine_hires_measures_proposes_and_retires_with_evidence() {
+    use vp_protocol::types::{
+        AgentEmploymentReplayParams, AgentHireParams, AgentPerformanceParams,
+        AgentPerformanceSummaryParams, AgentRetireParams, AgentRetirementCandidatesParams,
+        AgentRetirementPolicy, AgentRetirementProposalParams, AgentRetirementProposeParams,
+        SessionAssignParams, SetAgentRetirementPolicyParams,
+    };
+
+    let (data, _repo, engine, project) = harness("s6-engine");
+    let leader = engine
+        .create_agent_identity(params(&project.id, "leader", None))
+        .await
+        .unwrap()
+        .identity;
+    let manager = engine
+        .create_agent_identity(params(&project.id, "manager", Some(&leader.id)))
+        .await
+        .unwrap()
+        .identity;
+    engine
+        .set_agent_identity_policy(
+            &project.id,
+            AgentIdentityPolicy {
+                enabled: true,
+                max_managers: 2,
+                max_workers: 2,
+                hire_requires_approval: true,
+                retirement_requires_approval: true,
+            },
+        )
+        .await
+        .unwrap();
+    engine
+        .set_agent_retirement_policy(SetAgentRetirementPolicyParams {
+            project_id: project.id.clone(),
+            policy: AgentRetirementPolicy {
+                enabled: true,
+                lookback_days: 30,
+                min_completed_tasks: 1,
+                max_consecutive_failures: 2,
+                max_verifier_rejections: 0,
+                max_unsubstantiated_handoffs: 0,
+                max_false_consensus: 0,
+                cooldown_secs: 60,
+                require_approval: true,
+            },
+        })
+        .await
+        .unwrap();
+    let hired = engine
+        .hire_agent_identity(AgentHireParams {
+            project_id: project.id.clone(),
+            role: "worker".into(),
+            department: Some("platform".into()),
+            component: Some("auth".into()),
+            title: Some("Auth Worker".into()),
+            profile: Some("coding".into()),
+            model: Some("explicit-model".into()),
+            parent_identity_id: Some(manager.id.clone()),
+            policy: None,
+            approved: true,
+            operator: Some("ops".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(hired.state, "approved");
+    let worker = hired.identity.unwrap();
+    let session = engine
+        .store()
+        .create_session(&project.id, "s6 engine")
+        .unwrap();
+    engine
+        .assign_session_identity(SessionAssignParams {
+            session_id: session.id.clone(),
+            identity_id: worker.id.clone(),
+            role: Some("worker".into()),
+            lease_secs: Some(600),
+            wake_session: false,
+            operator: Some("test".into()),
+        })
+        .await
+        .unwrap();
+    for (task, status) in [("t1", "completed"), ("t2", "failed"), ("t3", "failed")] {
+        engine
+            .store()
+            .append_event(
+                &session.id,
+                "plan_task.finished",
+                serde_json::json!({
+                    "task_id": task,
+                    "task_status": status,
+                    "agent_role": "worker",
+                    "identity_id": worker.id,
+                }),
+            )
+            .unwrap();
+    }
+    let performance = engine
+        .agent_performance(AgentPerformanceParams {
+            project_id: project.id.clone(),
+            identity_id: worker.id.clone(),
+            lookback_days: Some(30),
+        })
+        .await
+        .unwrap();
+    assert_eq!(performance.completed_tasks, 1);
+    assert_eq!(performance.failed_tasks, 2);
+    assert_eq!(performance.consecutive_failures, 2);
+    let summary = engine
+        .agent_performance_summary(AgentPerformanceSummaryParams {
+            project_id: project.id.clone(),
+            lookback_days: Some(30),
+            limit: Some(10),
+        })
+        .await
+        .unwrap();
+    assert_eq!(summary.totals.completed_tasks, 1);
+    assert!(summary.retirement_policy_enabled);
+    let candidates = engine
+        .agent_retirement_candidates(AgentRetirementCandidatesParams {
+            project_id: project.id.clone(),
+            lookback_days: Some(30),
+            limit: Some(10),
+        })
+        .await
+        .unwrap();
+    assert!(
+        candidates
+            .candidates
+            .iter()
+            .any(|candidate| candidate.identity_id == worker.id)
+    );
+    let proposed = engine
+        .propose_agent_retirement(AgentRetirementProposeParams {
+            identity_id: worker.id.clone(),
+            operator: Some("ops".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(proposed.proposal.status, "pending");
+    assert!(proposed.changed);
+    let refused = engine
+        .retire_agent(AgentRetireParams {
+            identity_id: worker.id.clone(),
+            proposal_id: Some(proposed.proposal.id.clone()),
+            approved: false,
+            force: true,
+            ..AgentRetireParams::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        typed_code(&refused),
+        agent_identity_codes::RETIREMENT_APPROVAL_REQUIRED
+    );
+    engine
+        .approve_agent_retirement_proposal(AgentRetirementProposalParams {
+            proposal_id: proposed.proposal.id.clone(),
+            operator: Some("ops".into()),
+        })
+        .await
+        .unwrap();
+    let retired = engine
+        .retire_agent(AgentRetireParams {
+            identity_id: worker.id.clone(),
+            proposal_id: Some(proposed.proposal.id),
+            approved: true,
+            force: true,
+            reason: Some("threshold evidence".into()),
+            operator: Some("ops".into()),
+            ..AgentRetireParams::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(retired.identity.status, "retired");
+    assert_eq!(retired.identity.id, worker.id);
+    assert_eq!(retired.released_assignments, 1);
+    let replay = engine
+        .replay_agent_employment(AgentEmploymentReplayParams {
+            project_id: project.id.clone(),
+            repair: false,
+        })
+        .await
+        .unwrap();
+    assert!(replay.consistent, "{replay:?}");
+    assert!(replay.proposals >= 1);
+    let reassign = engine
+        .assign_session_identity(SessionAssignParams {
+            session_id: session.id,
+            identity_id: worker.id,
+            role: Some("worker".into()),
+            lease_secs: Some(600),
+            wake_session: false,
+            operator: Some("test".into()),
+        })
+        .await
+        .unwrap_err();
+    let reassign_code = reassign
+        .downcast_ref::<vp_protocol::types::AgentCoordinationError>()
+        .map(|typed| typed.code)
+        .unwrap_or("UNTYPED");
+    assert_eq!(
+        reassign_code,
+        vp_protocol::types::agent_coordination_codes::ASSIGNMENT_IDENTITY_RETIRED
+    );
+
+    engine.record_project_manifest().await.unwrap();
+    let snapshots = vp_store::read_project_manifest(data.path()).unwrap();
+    let snapshot = snapshots
+        .into_iter()
+        .find(|snapshot| snapshot.project.id == project.id)
+        .unwrap();
+    assert!(snapshot.agent_retirement_policy.enabled);
+    assert!(!snapshot.agent_retirement_proposals.is_empty());
+    assert!(!snapshot.agent_employment_events.is_empty());
+    assert!(!snapshot.agent_performance.is_empty());
+    assert!(!snapshot.agent_hire_requests.is_empty());
+    assert!(
+        !snapshot.agent_performance[0]
+            .evidence
+            .iter()
+            .any(|evidence| evidence.reference.contains("prompt"))
+    );
+}
+
+#[tokio::test]
+async fn manifest_rebuild_recomputes_s6_performance_and_employment_evidence() {
+    use vp_protocol::types::{
+        AgentHireParams, AgentRetirementPolicy, AgentRetirementProposeParams, SessionAssignParams,
+        SetAgentRetirementPolicyParams,
+    };
+
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let project_id;
+    let worker_id;
+    {
+        let store = Store::open(data.path()).unwrap();
+        let engine = Engine::new(store);
+        let project = engine
+            .store()
+            .add_project(repo.path().to_str().unwrap(), Some("s6-rebuild"))
+            .unwrap();
+        project_id = project.id.clone();
+        engine
+            .set_agent_identity_policy(
+                &project.id,
+                AgentIdentityPolicy {
+                    enabled: true,
+                    max_managers: 2,
+                    max_workers: 2,
+                    hire_requires_approval: true,
+                    retirement_requires_approval: true,
+                },
+            )
+            .await
+            .unwrap();
+        engine
+            .set_agent_retirement_policy(SetAgentRetirementPolicyParams {
+                project_id: project.id.clone(),
+                policy: AgentRetirementPolicy {
+                    enabled: true,
+                    lookback_days: 30,
+                    min_completed_tasks: 1,
+                    max_consecutive_failures: 2,
+                    max_verifier_rejections: 0,
+                    max_unsubstantiated_handoffs: 0,
+                    max_false_consensus: 0,
+                    cooldown_secs: 60,
+                    require_approval: true,
+                },
+            })
+            .await
+            .unwrap();
+        let leader = engine
+            .create_agent_identity(params(&project.id, "leader", None))
+            .await
+            .unwrap()
+            .identity;
+        let manager = engine
+            .create_agent_identity(params(&project.id, "manager", Some(&leader.id)))
+            .await
+            .unwrap()
+            .identity;
+        worker_id = engine
+            .hire_agent_identity(AgentHireParams {
+                project_id: project.id.clone(),
+                role: "worker".into(),
+                department: Some("platform".into()),
+                component: Some("auth".into()),
+                title: Some("Auth Worker".into()),
+                profile: Some("coding".into()),
+                model: None,
+                parent_identity_id: Some(manager.id),
+                policy: None,
+                approved: true,
+                operator: Some("ops".into()),
+            })
+            .await
+            .unwrap()
+            .identity
+            .unwrap()
+            .id;
+        let session = engine
+            .store()
+            .create_session(&project.id, "s6 rebuild")
+            .unwrap();
+        engine
+            .store()
+            .append_event(
+                &session.id,
+                "session.created",
+                serde_json::json!({
+                    "project_id": project.id,
+                    "goal": session.goal,
+                    "created_at": session.created_at,
+                    "prompt_layout": session.prompt_layout,
+                }),
+            )
+            .unwrap();
+        engine
+            .assign_session_identity(SessionAssignParams {
+                session_id: session.id.clone(),
+                identity_id: worker_id.clone(),
+                role: Some("worker".into()),
+                lease_secs: Some(600),
+                wake_session: false,
+                operator: Some("test".into()),
+            })
+            .await
+            .unwrap();
+        for (task, status) in [("t1", "completed"), ("t2", "failed"), ("t3", "failed")] {
+            engine
+                .store()
+                .append_event(
+                    &session.id,
+                    "plan_task.finished",
+                    serde_json::json!({
+                        "task_id": task,
+                        "task_status": status,
+                        "agent_role": "worker",
+                        "identity_id": worker_id,
+                    }),
+                )
+                .unwrap();
+        }
+        engine
+            .propose_agent_retirement(AgentRetirementProposeParams {
+                identity_id: worker_id.clone(),
+                operator: Some("ops".into()),
+            })
+            .await
+            .unwrap();
+        engine.record_project_manifest().await.unwrap();
+    }
+
+    let report = rebuild_database(data.path(), false).await.unwrap();
+    assert_eq!(report.projects, 1);
+    let store = Store::open(data.path()).unwrap();
+    let policy = store.get_agent_identity_policy(&project_id).unwrap();
+    assert!(policy.enabled);
+    let retirement = vp_store::store::employment::get_retirement_policy(&store, &project_id)
+        .unwrap()
+        .policy;
+    assert!(retirement.enabled);
+    let performance =
+        vp_store::store::employment::list_agent_performance(&store, &project_id, None).unwrap();
+    let worker = performance
+        .iter()
+        .find(|row| row.identity_id == worker_id)
+        .expect("worker performance row");
+    assert_eq!(worker.completed_tasks, 1);
+    assert_eq!(worker.failed_tasks, 2);
+    assert_eq!(worker.consecutive_failures, 2);
+    assert!(
+        vp_store::store::employment::list_retirement_proposals_for_replay(&store, &project_id,)
+            .unwrap()
+            .iter()
+            .any(|proposal| proposal.identity_id == worker_id)
+    );
+    assert!(
+        !vp_store::store::employment::list_employment_events(&store, &project_id, None,)
+            .unwrap()
+            .is_empty()
+    );
+}

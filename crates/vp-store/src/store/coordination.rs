@@ -169,7 +169,7 @@ fn ensure_identity_assignable(identity: &IdentityRow) -> Result<&'static str> {
     }
 }
 
-fn map_assignment(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentAssignment> {
+pub(crate) fn map_assignment(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentAssignment> {
     let status: String = row.get(4)?;
     let lease_expires_at: Option<String> = row.get(8)?;
     let now = OffsetDateTime::now_utc();
@@ -192,7 +192,7 @@ fn map_assignment(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentAssignment> 
     })
 }
 
-const ASSIGNMENT_SELECT: &str =
+pub(crate) const ASSIGNMENT_SELECT: &str =
     "SELECT a.session_id, s.project_id, a.identity_id, a.role, a.status, a.assigned_at,
             a.released_at, a.heartbeat_at, a.lease_expires_at
      FROM session_agent_assignments a
@@ -212,7 +212,7 @@ fn get_assignment_conn(
     .map_err(Into::into)
 }
 
-fn get_assignment_tx(
+pub(crate) fn get_assignment_tx(
     tx: &Transaction<'_>,
     session_id: &str,
     identity_id: &str,
@@ -226,7 +226,7 @@ fn get_assignment_tx(
     .map_err(Into::into)
 }
 
-fn insert_assignment_event_tx(
+pub(crate) fn insert_assignment_event_tx(
     tx: &Transaction<'_>,
     project_id: &str,
     kind: &str,
@@ -1636,6 +1636,69 @@ fn validate_coordination_event(event: &AgentCoordinationEvent) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Release every active assignment for one identity inside an existing
+/// transaction. Used by S6 promotion, transfer, and retirement so a role change
+/// or terminal state is never persisted while a session still holds the
+/// identity. Each release appends its normal coordination event.
+pub(crate) fn release_identity_assignments_tx(
+    tx: &Transaction<'_>,
+    identity_id: &str,
+    operator: &str,
+    reason: Option<&str>,
+    now_text: &str,
+) -> Result<Vec<AgentCoordinationEvent>> {
+    let rows = {
+        let mut statement = tx.prepare(
+            "SELECT a.session_id, a.identity_id, s.project_id
+             FROM session_agent_assignments a
+             JOIN sessions s ON s.id = a.session_id
+             WHERE a.identity_id = ?1 AND a.status = 'active'
+             ORDER BY a.assigned_at ASC, a.session_id ASC",
+        )?;
+        statement
+            .query_map(params![identity_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut events = Vec::with_capacity(rows.len());
+    for (session_id, identity, project_id) in rows {
+        tx.execute(
+            "UPDATE session_agent_assignments
+             SET status = 'released', released_at = ?1, lease_token = NULL,
+                 lease_expires_at = NULL
+             WHERE session_id = ?2 AND identity_id = ?3 AND status = 'active'",
+            params![now_text, session_id, identity],
+        )?;
+        let assignment = get_assignment_tx(tx, &session_id, &identity)?.ok_or_else(|| {
+            coordination_error(
+                agent_coordination_codes::ASSIGNMENT_NOT_FOUND,
+                "assignment disappeared during forced release",
+            )
+        })?;
+        events.push(insert_assignment_event_tx(
+            tx,
+            &project_id,
+            vp_protocol::types::AGENT_ASSIGNMENT_RELEASED_EVENT,
+            &assignment,
+            Some((
+                "operator",
+                serde_json::json!({
+                    "operator": true,
+                    "label": operator,
+                    "reason": reason,
+                    "forced": true,
+                }),
+            )),
+        )?);
+    }
+    Ok(events)
 }
 
 #[cfg(test)]

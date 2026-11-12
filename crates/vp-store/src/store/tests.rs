@@ -12072,6 +12072,10 @@ fn context_checkpoint_bundle_validation_checks_session_and_project() {
         agent_workspace_events: Vec::new(),
         agent_memories: Vec::new(),
         agent_memory_events: Vec::new(),
+        agent_performance: Vec::new(),
+        agent_retirement_proposals: Vec::new(),
+        agent_employment_events: Vec::new(),
+        agent_hire_requests: Vec::new(),
     };
     validate_session_bundle(&bundle).unwrap();
     bundle.context_checkpoints[0].project_id = "other-project".into();
@@ -12343,6 +12347,10 @@ fn importing_a_projection_only_bundle_synthesizes_checkpoint_events() {
         agent_workspace_events: Vec::new(),
         agent_memories: Vec::new(),
         agent_memory_events: Vec::new(),
+        agent_performance: Vec::new(),
+        agent_retirement_proposals: Vec::new(),
+        agent_employment_events: Vec::new(),
+        agent_hire_requests: Vec::new(),
     };
     let imported = Store::open(data.path().join("imported")).unwrap();
     imported.import_session_bundle(&bundle).unwrap();
@@ -14215,6 +14223,10 @@ fn bundle_import_preserves_supervised_process_lifecycle_rows() {
         agent_workspace_events: Vec::new(),
         agent_memories: Vec::new(),
         agent_memory_events: Vec::new(),
+        agent_performance: Vec::new(),
+        agent_retirement_proposals: Vec::new(),
+        agent_employment_events: Vec::new(),
+        agent_hire_requests: Vec::new(),
     };
     validate_session_bundle(&bundle).unwrap();
     let data = TempDir::new().unwrap();
@@ -14297,6 +14309,10 @@ fn supervised_process_bundle_validation_rejects_wrong_session() {
         agent_workspace_events: Vec::new(),
         agent_memories: Vec::new(),
         agent_memory_events: Vec::new(),
+        agent_performance: Vec::new(),
+        agent_retirement_proposals: Vec::new(),
+        agent_employment_events: Vec::new(),
+        agent_hire_requests: Vec::new(),
     };
     let error = validate_session_bundle(&bundle).unwrap_err();
     assert!(error.to_string().contains("belongs to session"), "{error}");
@@ -16534,6 +16550,10 @@ fn bundle_import_preserves_instruction_state_and_rejects_missing_blobs() {
         agent_workspace_events: Vec::new(),
         agent_memories: Vec::new(),
         agent_memory_events: Vec::new(),
+        agent_performance: Vec::new(),
+        agent_retirement_proposals: Vec::new(),
+        agent_employment_events: Vec::new(),
+        agent_hire_requests: Vec::new(),
     };
     store.import_session_bundle(&bundle).unwrap();
     assert_eq!(
@@ -16615,6 +16635,10 @@ fn bundle_import_rejects_a_corrupt_instruction_blob() {
         agent_workspace_events: Vec::new(),
         agent_memories: Vec::new(),
         agent_memory_events: Vec::new(),
+        agent_performance: Vec::new(),
+        agent_retirement_proposals: Vec::new(),
+        agent_employment_events: Vec::new(),
+        agent_hire_requests: Vec::new(),
     };
     assert!(store.import_session_bundle(&bundle).is_err());
 }

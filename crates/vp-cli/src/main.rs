@@ -2512,6 +2512,10 @@ enum Command {
         /// Bounded non-secret metadata as a JSON object. Defaults to `{}`.
         #[arg(long = "policy-json")]
         policy: Option<String>,
+        /// Explicit operator confirmation for a Manager/Worker hire. Leader
+        /// bootstrap ignores it.
+        #[arg(long)]
+        approved: bool,
     },
     /// Update an identity. Omitted fields keep their current value.
     AgentUpdate {
@@ -2550,6 +2554,100 @@ enum Command {
         #[arg(long = "policy-json")]
         policy: Option<String>,
     },
+    /// Hire a Manager or Worker through the S6 approval-aware surface. The
+    /// Leader is bootstrapped through `agent-create --role leader`.
+    AgentHire {
+        project: String,
+        /// manager or worker.
+        #[arg(long)]
+        role: String,
+        #[arg(long)]
+        department: Option<String>,
+        #[arg(long)]
+        component: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        /// coding, research, verification, or generic.
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long = "policy-json")]
+        policy: Option<String>,
+        /// Explicit operator confirmation. Without it, policy may create a
+        /// pending request that still requires `agent-hire-approve`.
+        #[arg(long)]
+        approved: bool,
+        #[arg(long)]
+        operator: Option<String>,
+    },
+    /// List pending/decided hire requests.
+    AgentHires {
+        project: String,
+        /// pending, approved, or rejected.
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+    /// Approve a pending hire request and create its reserved identity.
+    AgentHireApprove {
+        request: String,
+        #[arg(long)]
+        operator: Option<String>,
+    },
+    /// Reject a pending hire request. No identity is created.
+    AgentHireReject {
+        request: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        operator: Option<String>,
+    },
+    /// Promote a Worker to Manager or a Manager to Leader. Always explicit.
+    AgentPromote {
+        identity: String,
+        /// manager or leader.
+        #[arg(long)]
+        role: String,
+        /// Required for Worker→Manager unless exactly one live Leader exists.
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        /// Release active assignments/workspaces after preserving evidence.
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        operator: Option<String>,
+    },
+    /// Transfer department/component/title/parent. Role changes are promotion.
+    AgentTransfer {
+        identity: String,
+        #[arg(long)]
+        department: Option<String>,
+        #[arg(long = "clear-department")]
+        clear_department: bool,
+        #[arg(long)]
+        component: Option<String>,
+        #[arg(long = "clear-component")]
+        clear_component: bool,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long = "clear-title")]
+        clear_title: bool,
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long = "clear-parent")]
+        clear_parent: bool,
+        /// Release active assignments/workspaces after preserving evidence.
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        operator: Option<String>,
+    },
     /// Pause an active identity. Pausing an already paused identity is a no-op.
     AgentPause { identity: String },
     /// Resume a paused identity.
@@ -2557,9 +2655,88 @@ enum Command {
     /// Retire an identity. Retirement is terminal and never deletes evidence.
     AgentRetire {
         identity: String,
-        /// Optional same-project, same-role successor.
+        /// Optional same-project, compatible successor.
         #[arg(long)]
         successor: Option<String>,
+        /// Optional approved retirement proposal.
+        #[arg(long)]
+        proposal: Option<String>,
+        /// Explicit operator/Leader confirmation.
+        #[arg(long)]
+        approved: bool,
+        /// Release active assignments/workspaces after preserving evidence.
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        operator: Option<String>,
+    },
+    /// Read-only per-identity performance ledger, or the project summary.
+    AgentPerformance {
+        project: String,
+        /// One identity. Omit for the project summary.
+        #[arg(long)]
+        identity: Option<String>,
+        #[arg(long = "lookback-days")]
+        lookback_days: Option<u32>,
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Read retirement candidates/proposals, or record one explicit proposal
+    /// decision. Proposals never retire an identity by themselves.
+    AgentRetirement {
+        project: String,
+        /// List deterministic candidates (default).
+        #[arg(long)]
+        candidates: bool,
+        /// List proposals.
+        #[arg(long)]
+        proposals: bool,
+        /// Propose retirement for one identity (must cross a threshold).
+        #[arg(long)]
+        propose: Option<String>,
+        /// Approve a pending proposal.
+        #[arg(long)]
+        approve: Option<String>,
+        /// Reject a pending proposal.
+        #[arg(long)]
+        reject: Option<String>,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        identity: Option<String>,
+        /// pending, approved, rejected, executed, or expired.
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        operator: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+    /// Show the project retirement policy.
+    RetirementPolicy { project: String },
+    /// Set the project retirement policy. Omitted flags keep their value.
+    RetirementPolicySet {
+        project: String,
+        #[arg(long)]
+        enabled: Option<bool>,
+        #[arg(long = "lookback-days")]
+        lookback_days: Option<u32>,
+        #[arg(long = "min-completed-tasks")]
+        min_completed_tasks: Option<u32>,
+        #[arg(long = "max-consecutive-failures")]
+        max_consecutive_failures: Option<u32>,
+        #[arg(long = "max-verifier-rejections")]
+        max_verifier_rejections: Option<u32>,
+        #[arg(long = "max-unsubstantiated-handoffs")]
+        max_unsubstantiated_handoffs: Option<u32>,
+        #[arg(long = "max-false-consensus")]
+        max_false_consensus: Option<u32>,
+        #[arg(long = "cooldown-secs")]
+        cooldown_secs: Option<u64>,
+        #[arg(long = "require-approval")]
+        require_approval: Option<bool>,
     },
     /// Show the project agent-identity policy.
     AgentPolicy { project: String },
@@ -8325,24 +8502,45 @@ async fn run(cli: Cli) -> Result<()> {
             model,
             parent,
             policy,
+            approved,
         } => {
             let policy = parse_agent_identity_policy_json(policy.as_deref())?;
-            rpc(
-                &discovery,
-                "agent.identity.create",
-                json!({
-                    "project_id": project,
-                    "role": role,
-                    "department": department,
-                    "component": component,
-                    "title": title,
-                    "profile": profile,
-                    "model": model,
-                    "parent_identity_id": parent,
-                    "policy": policy,
-                }),
-            )
-            .await?
+            if role.trim().eq_ignore_ascii_case("leader") {
+                rpc(
+                    &discovery,
+                    "agent.identity.create",
+                    json!({
+                        "project_id": project,
+                        "role": role,
+                        "department": department,
+                        "component": component,
+                        "title": title,
+                        "profile": profile,
+                        "model": model,
+                        "parent_identity_id": parent,
+                        "policy": policy,
+                    }),
+                )
+                .await?
+            } else {
+                rpc(
+                    &discovery,
+                    "agent.hire",
+                    json!({
+                        "project_id": project,
+                        "role": role,
+                        "department": department,
+                        "component": component,
+                        "title": title,
+                        "profile": profile,
+                        "model": model,
+                        "parent_identity_id": parent,
+                        "policy": policy,
+                        "approved": approved,
+                    }),
+                )
+                .await?
+            }
         }
         Command::AgentUpdate {
             identity,
@@ -8363,6 +8561,18 @@ async fn run(cli: Cli) -> Result<()> {
             clear_successor,
             policy,
         } => {
+            if role.is_some()
+                || department.is_some()
+                || clear_department
+                || component.is_some()
+                || clear_component
+                || parent.is_some()
+                || clear_parent
+            {
+                bail!(
+                    "role/department/component/parent changes require `vp agent-promote` or `vp agent-transfer` approval"
+                );
+            }
             if clear_department && department.is_some() {
                 bail!("pass only one of --department or --clear-department");
             }
@@ -8423,11 +8633,320 @@ async fn run(cli: Cli) -> Result<()> {
         Command::AgentRetire {
             identity,
             successor,
+            proposal,
+            approved,
+            force,
+            reason,
+            operator,
         } => {
             rpc(
                 &discovery,
-                "agent.identity.retire",
-                json!({"identity_id": identity, "successor_id": successor}),
+                "agent.retire",
+                json!({
+                    "identity_id": identity,
+                    "successor_id": successor,
+                    "proposal_id": proposal,
+                    "approved": approved,
+                    "force": force,
+                    "reason": reason,
+                    "operator": operator,
+                }),
+            )
+            .await?
+        }
+        Command::AgentHire {
+            project,
+            role,
+            department,
+            component,
+            title,
+            profile,
+            model,
+            parent,
+            policy,
+            approved,
+            operator,
+        } => {
+            let policy = parse_agent_identity_policy_json(policy.as_deref())?;
+            rpc(
+                &discovery,
+                "agent.hire",
+                json!({
+                    "project_id": project,
+                    "role": role,
+                    "department": department,
+                    "component": component,
+                    "title": title,
+                    "profile": profile,
+                    "model": model,
+                    "parent_identity_id": parent,
+                    "policy": policy,
+                    "approved": approved,
+                    "operator": operator,
+                }),
+            )
+            .await?
+        }
+        Command::AgentHires {
+            project,
+            status,
+            limit,
+        } => {
+            rpc(
+                &discovery,
+                "agent.hire.list",
+                json!({"project_id": project, "status": status, "limit": limit}),
+            )
+            .await?
+        }
+        Command::AgentHireApprove { request, operator } => {
+            rpc(
+                &discovery,
+                "agent.hire.approve",
+                json!({"request_id": request, "operator": operator, "approval_risk": "host_state"}),
+            )
+            .await?
+        }
+        Command::AgentHireReject {
+            request,
+            reason,
+            operator,
+        } => {
+            rpc(
+                &discovery,
+                "agent.hire.reject",
+                json!({"request_id": request, "reason": reason, "operator": operator}),
+            )
+            .await?
+        }
+        Command::AgentPromote {
+            identity,
+            role,
+            parent,
+            title,
+            force,
+            operator,
+        } => {
+            rpc(
+                &discovery,
+                "agent.promote",
+                json!({
+                    "identity_id": identity,
+                    "target_role": role,
+                    "parent_identity_id": parent,
+                    "title": title,
+                    "approved": true,
+                    "force": force,
+                    "operator": operator,
+                }),
+            )
+            .await?
+        }
+        Command::AgentTransfer {
+            identity,
+            department,
+            clear_department,
+            component,
+            clear_component,
+            title,
+            clear_title,
+            parent,
+            clear_parent,
+            force,
+            operator,
+        } => {
+            if clear_department && department.is_some() {
+                bail!("pass only one of --department or --clear-department");
+            }
+            if clear_component && component.is_some() {
+                bail!("pass only one of --component or --clear-component");
+            }
+            if clear_title && title.is_some() {
+                bail!("pass only one of --title or --clear-title");
+            }
+            if clear_parent && parent.is_some() {
+                bail!("pass only one of --parent or --clear-parent");
+            }
+            if department.is_none()
+                && !clear_department
+                && component.is_none()
+                && !clear_component
+                && title.is_none()
+                && !clear_title
+                && parent.is_none()
+                && !clear_parent
+            {
+                bail!("pass at least one transfer field");
+            }
+            let mut params = serde_json::Map::new();
+            params.insert("identity_id".into(), json!(identity));
+            params.insert("approved".into(), json!(true));
+            params.insert("force".into(), json!(force));
+            if let Some(operator) = operator {
+                params.insert("operator".into(), json!(operator));
+            }
+            insert_agent_identity_optional(&mut params, "department", department, clear_department);
+            insert_agent_identity_optional(&mut params, "component", component, clear_component);
+            insert_agent_identity_optional(&mut params, "title", title, clear_title);
+            insert_agent_identity_optional(&mut params, "parent_identity_id", parent, clear_parent);
+            rpc(&discovery, "agent.transfer", Value::Object(params)).await?
+        }
+        Command::AgentPerformance {
+            project,
+            identity,
+            lookback_days,
+            limit,
+        } => {
+            if let Some(identity) = identity {
+                rpc(
+                    &discovery,
+                    "agent.performance",
+                    json!({
+                        "project_id": project,
+                        "identity_id": identity,
+                        "lookback_days": lookback_days,
+                    }),
+                )
+                .await?
+            } else {
+                rpc(
+                    &discovery,
+                    "agent.performance.summary",
+                    json!({
+                        "project_id": project,
+                        "lookback_days": lookback_days,
+                        "limit": limit,
+                    }),
+                )
+                .await?
+            }
+        }
+        Command::AgentRetirement {
+            project,
+            candidates,
+            proposals,
+            propose,
+            approve,
+            reject,
+            reason,
+            identity,
+            status,
+            operator,
+            limit,
+        } => {
+            let selected = [
+                candidates,
+                proposals,
+                propose.is_some(),
+                approve.is_some(),
+                reject.is_some(),
+            ]
+            .into_iter()
+            .filter(|value| *value)
+            .count();
+            if selected > 1 {
+                bail!("pass only one retirement action");
+            }
+            if let Some(identity) = propose {
+                rpc(
+                    &discovery,
+                    "agent.retirement.propose",
+                    json!({"identity_id": identity, "operator": operator}),
+                )
+                .await?
+            } else if let Some(proposal) = approve {
+                rpc(
+                    &discovery,
+                    "agent.retirement.approve",
+                    json!({"proposal_id": proposal, "operator": operator}),
+                )
+                .await?
+            } else if let Some(proposal) = reject {
+                rpc(
+                    &discovery,
+                    "agent.retirement.reject",
+                    json!({"proposal_id": proposal, "reason": reason, "operator": operator}),
+                )
+                .await?
+            } else if proposals {
+                rpc(
+                    &discovery,
+                    "agent.retirement.proposals",
+                    json!({
+                        "project_id": project,
+                        "identity_id": identity,
+                        "status": status,
+                        "limit": limit,
+                    }),
+                )
+                .await?
+            } else {
+                rpc(
+                    &discovery,
+                    "agent.retirement.candidates",
+                    json!({"project_id": project, "limit": limit}),
+                )
+                .await?
+            }
+        }
+        Command::RetirementPolicy { project } => {
+            rpc(
+                &discovery,
+                "project.retirement_policy.get",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::RetirementPolicySet {
+            project,
+            enabled,
+            lookback_days,
+            min_completed_tasks,
+            max_consecutive_failures,
+            max_verifier_rejections,
+            max_unsubstantiated_handoffs,
+            max_false_consensus,
+            cooldown_secs,
+            require_approval,
+        } => {
+            let current = rpc(
+                &discovery,
+                "project.retirement_policy.get",
+                json!({"project_id": project}),
+            )
+            .await?;
+            let mut policy = current.get("policy").cloned().unwrap_or_else(|| json!({}));
+            if let Some(enabled) = enabled {
+                policy["enabled"] = json!(enabled);
+            }
+            if let Some(value) = lookback_days {
+                policy["lookback_days"] = json!(value);
+            }
+            if let Some(value) = min_completed_tasks {
+                policy["min_completed_tasks"] = json!(value);
+            }
+            if let Some(value) = max_consecutive_failures {
+                policy["max_consecutive_failures"] = json!(value);
+            }
+            if let Some(value) = max_verifier_rejections {
+                policy["max_verifier_rejections"] = json!(value);
+            }
+            if let Some(value) = max_unsubstantiated_handoffs {
+                policy["max_unsubstantiated_handoffs"] = json!(value);
+            }
+            if let Some(value) = max_false_consensus {
+                policy["max_false_consensus"] = json!(value);
+            }
+            if let Some(value) = cooldown_secs {
+                policy["cooldown_secs"] = json!(value);
+            }
+            if let Some(value) = require_approval {
+                policy["require_approval"] = json!(value);
+            }
+            rpc(
+                &discovery,
+                "project.retirement_policy.set",
+                json!({"project_id": project, "policy": policy}),
             )
             .await?
         }
@@ -14944,7 +15463,184 @@ fn workspace_lines(value: &Value) -> Option<Vec<String>> {
     None
 }
 
+fn agent_employment_lines(value: &Value) -> Option<Vec<String>> {
+    if let Some(requests) = value.get("requests").and_then(Value::as_array) {
+        if requests.is_empty() {
+            return Some(vec!["No hire requests.".to_string()]);
+        }
+        let mut lines = vec![format!("{} hire requests", requests.len())];
+        for request in requests {
+            lines.push(format!(
+                "{}  {}  {}  {}  parent {}",
+                request["id"].as_str().unwrap_or("?"),
+                request["role"].as_str().unwrap_or("?"),
+                request["status"].as_str().unwrap_or("?"),
+                request["title"]
+                    .as_str()
+                    .or_else(|| request["component"].as_str())
+                    .unwrap_or("-"),
+                request["parent_identity_id"].as_str().unwrap_or("-"),
+            ));
+        }
+        return Some(lines);
+    }
+    if let Some(request) = value
+        .get("request")
+        .filter(|request| request.get("role").is_some())
+    {
+        return Some(vec![format!(
+            "hire {} · {} · {}{}",
+            request["id"].as_str().unwrap_or("?"),
+            request["role"].as_str().unwrap_or("?"),
+            value["state"].as_str().unwrap_or("pending"),
+            value["identity"]["id"]
+                .as_str()
+                .map(|id| format!(" · identity {id}"))
+                .unwrap_or_default(),
+        )]);
+    }
+    if let Some(candidates) = value.get("candidates").and_then(Value::as_array) {
+        if candidates.is_empty() {
+            let state = if value["policy_enabled"].as_bool().unwrap_or(false) {
+                "No retirement candidates crossed a configured threshold."
+            } else {
+                "Retirement policy is disabled; no candidates."
+            };
+            return Some(vec![state.to_string()]);
+        }
+        let mut lines = vec![format!("{} retirement candidates", candidates.len())];
+        for candidate in candidates {
+            let reasons = candidate["reasons"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|reason| {
+                    format!(
+                        "{} {}/{}",
+                        reason["code"].as_str().unwrap_or("?"),
+                        reason["count"].as_u64().unwrap_or(0),
+                        reason["threshold"].as_u64().unwrap_or(0)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!(
+                "{}  {}  gen {}  severity {}  {}",
+                candidate["identity_id"].as_str().unwrap_or("?"),
+                candidate["role"].as_str().unwrap_or("?"),
+                candidate["generation"].as_u64().unwrap_or(0),
+                candidate["severity"].as_u64().unwrap_or(0),
+                reasons
+            ));
+        }
+        return Some(lines);
+    }
+    if let Some(proposals) = value.get("proposals").and_then(Value::as_array) {
+        if proposals.is_empty() {
+            return Some(vec!["No retirement proposals.".to_string()]);
+        }
+        let mut lines = vec![format!("{} retirement proposals", proposals.len())];
+        for proposal in proposals {
+            lines.push(format!(
+                "{}  {}  {}  {}",
+                proposal["id"].as_str().unwrap_or("?"),
+                proposal["identity_id"].as_str().unwrap_or("?"),
+                proposal["status"].as_str().unwrap_or("?"),
+                proposal["reason_code"].as_str().unwrap_or("-")
+            ));
+        }
+        return Some(lines);
+    }
+    if value.get("proposal").is_some() && value.get("reason_code").is_some() {
+        return Some(vec![format!(
+            "{}  {}  {}",
+            value["proposal"]["id"].as_str().unwrap_or("?"),
+            value["proposal"]["status"].as_str().unwrap_or("?"),
+            value["changed"].as_bool().unwrap_or(false)
+        )]);
+    }
+    if value.get("candidate").is_some() && value.get("proposal").is_some() {
+        return Some(vec![format!(
+            "proposal {} · {} · {}",
+            value["proposal"]["id"].as_str().unwrap_or("?"),
+            value["proposal"]["status"].as_str().unwrap_or("?"),
+            if value["already_pending"].as_bool().unwrap_or(false) {
+                "already pending"
+            } else {
+                "created"
+            }
+        )]);
+    }
+    if value.get("totals").is_some() && value.get("identities").is_some() {
+        let totals = &value["totals"];
+        let mut lines = vec![format!(
+            "{} identities · completed {} · failed {} · verifier {}/{} · tokens {}/{} · ${:.4}",
+            totals["identities"].as_u64().unwrap_or(0),
+            totals["completed_tasks"].as_u64().unwrap_or(0),
+            totals["failed_tasks"].as_u64().unwrap_or(0),
+            totals["verifier_approvals"].as_u64().unwrap_or(0),
+            totals["verifier_rejections"].as_u64().unwrap_or(0),
+            totals["input_tokens"].as_u64().unwrap_or(0),
+            totals["output_tokens"].as_u64().unwrap_or(0),
+            totals["cost_usd"].as_f64().unwrap_or(0.0)
+        )];
+        if value["identities"].as_array().is_some_and(Vec::is_empty) {
+            lines.push("No performance rows.".to_string());
+        }
+        for row in value["identities"].as_array().into_iter().flatten() {
+            lines.push(performance_line(row));
+        }
+        return Some(lines);
+    }
+    if value.get("completed_tasks").is_some() && value.get("identity_id").is_some() {
+        return Some(vec![performance_line(value)]);
+    }
+    if value.get("previous_role").is_some() && value.get("identity").is_some() {
+        return Some(vec![format!(
+            "promoted {} → {} · gen {} · released {} assignment(s), archived {} workspace(s)",
+            value["previous_role"].as_str().unwrap_or("?"),
+            value["identity"]["role"].as_str().unwrap_or("?"),
+            value["identity"]["generation"].as_u64().unwrap_or(0),
+            value["released_assignments"].as_u64().unwrap_or(0),
+            value["archived_workspaces"].as_u64().unwrap_or(0)
+        )]);
+    }
+    if value.get("identity").is_some() && value.get("changed").is_some() {
+        return Some(vec![format!(
+            "{}  {}  changed {}  released {} assignment(s), archived {} workspace(s)",
+            value["identity"]["id"].as_str().unwrap_or("?"),
+            value["identity"]["status"].as_str().unwrap_or("?"),
+            value["changed"].as_bool().unwrap_or(false),
+            value["released_assignments"].as_u64().unwrap_or(0),
+            value["archived_workspaces"].as_u64().unwrap_or(0)
+        )]);
+    }
+    None
+}
+
+fn performance_line(row: &Value) -> String {
+    format!(
+        "{}  {}  {}  completed {} · failed {} · consecutive {} · retries {} · verifier {}/{} · evidence {}",
+        row["identity_id"].as_str().unwrap_or("?"),
+        row["role"].as_str().unwrap_or("?"),
+        row["status"].as_str().unwrap_or("?"),
+        row["completed_tasks"].as_u64().unwrap_or(0),
+        row["failed_tasks"].as_u64().unwrap_or(0),
+        row["consecutive_failures"].as_u64().unwrap_or(0),
+        row["retries"].as_u64().unwrap_or(0),
+        row["verifier_approvals"].as_u64().unwrap_or(0),
+        row["verifier_rejections"].as_u64().unwrap_or(0),
+        row["evidence"].as_array().map(Vec::len).unwrap_or(0)
+    )
+}
+
 fn print_human(value: &Value) {
+    if let Some(lines) = agent_employment_lines(value) {
+        for line in lines {
+            println!("{line}");
+        }
+        return;
+    }
     if let Some(lines) = workspace_lines(value) {
         for line in lines {
             println!("{line}");
@@ -24406,6 +25102,7 @@ mod agent_identity_cli_tests {
             Command::AgentRetire {
                 identity,
                 successor,
+                ..
             } => {
                 assert_eq!(identity, "identity-1");
                 assert_eq!(successor.as_deref(), Some("identity-2"));
@@ -24848,5 +25545,267 @@ mod coordination_cli_tests {
         let rendered = workspace_lines(&land).unwrap().join("\n");
         assert!(rendered.contains("landed"));
         assert!(rendered.contains("1 commit(s)"));
+    }
+
+    #[test]
+    fn hiring_and_retirement_commands_parse_and_render_bounded_surfaces() {
+        let cli = Cli::try_parse_from([
+            "vp",
+            "agent-hire",
+            "prj-1",
+            "--role",
+            "worker",
+            "--department",
+            "platform",
+            "--component",
+            "auth",
+            "--parent",
+            "mgr-1",
+            "--approved",
+            "--operator",
+            "ops",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::AgentHire {
+                project,
+                role,
+                department,
+                component,
+                parent,
+                approved,
+                operator,
+                ..
+            } => {
+                assert_eq!(project, "prj-1");
+                assert_eq!(role, "worker");
+                assert_eq!(department.as_deref(), Some("platform"));
+                assert_eq!(component.as_deref(), Some("auth"));
+                assert_eq!(parent.as_deref(), Some("mgr-1"));
+                assert!(approved);
+                assert_eq!(operator.as_deref(), Some("ops"));
+            }
+            other => panic!("expected agent-hire, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "agent-promote",
+            "id-1",
+            "--role",
+            "manager",
+            "--force",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::AgentPromote {
+                identity,
+                role,
+                force,
+                ..
+            } => {
+                assert_eq!(identity, "id-1");
+                assert_eq!(role, "manager");
+                assert!(force);
+            }
+            other => panic!("expected agent-promote, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "agent-transfer",
+            "id-1",
+            "--component",
+            "auth",
+            "--clear-title",
+            "--force",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::AgentTransfer {
+                identity,
+                component,
+                clear_title,
+                force,
+                ..
+            } => {
+                assert_eq!(identity, "id-1");
+                assert_eq!(component.as_deref(), Some("auth"));
+                assert!(clear_title);
+                assert!(force);
+            }
+            other => panic!("expected agent-transfer, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "agent-retire",
+            "id-1",
+            "--approved",
+            "--force",
+            "--proposal",
+            "pro-1",
+            "--successor",
+            "id-2",
+            "--reason",
+            "evidence",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::AgentRetire {
+                identity,
+                proposal,
+                approved,
+                force,
+                reason,
+                successor,
+                ..
+            } => {
+                assert_eq!(identity, "id-1");
+                assert_eq!(proposal.as_deref(), Some("pro-1"));
+                assert!(approved);
+                assert!(force);
+                assert_eq!(reason.as_deref(), Some("evidence"));
+                assert_eq!(successor.as_deref(), Some("id-2"));
+            }
+            other => panic!("expected agent-retire, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "agent-performance",
+            "prj-1",
+            "--identity",
+            "id-1",
+            "--lookback-days",
+            "7",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::AgentPerformance {
+                project,
+                identity,
+                lookback_days,
+                ..
+            } => {
+                assert_eq!(project, "prj-1");
+                assert_eq!(identity.as_deref(), Some("id-1"));
+                assert_eq!(lookback_days, Some(7));
+            }
+            other => panic!("expected agent-performance, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "agent-retirement",
+            "prj-1",
+            "--candidates",
+            "--limit",
+            "5",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::AgentRetirement {
+                project,
+                candidates,
+                limit,
+                ..
+            } => {
+                assert_eq!(project, "prj-1");
+                assert!(candidates);
+                assert_eq!(limit, 5);
+            }
+            other => panic!("expected agent-retirement, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "retirement-policy-set",
+            "prj-1",
+            "--enabled",
+            "true",
+            "--max-false-consensus",
+            "1",
+            "--require-approval",
+            "true",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::RetirementPolicySet {
+                project,
+                enabled,
+                max_false_consensus,
+                require_approval,
+                ..
+            } => {
+                assert_eq!(project, "prj-1");
+                assert_eq!(enabled, Some(true));
+                assert_eq!(max_false_consensus, Some(1));
+                assert_eq!(require_approval, Some(true));
+            }
+            other => panic!("expected retirement-policy-set, got {other:?}"),
+        }
+
+        let candidates = json!({
+            "project_id": "prj-1",
+            "policy_enabled": true,
+            "evaluated": 2,
+            "candidates": [{
+                "identity_id": "id-1",
+                "role": "worker",
+                "generation": 2,
+                "severity": 1001,
+                "reasons": [{
+                    "code": "consecutive_failures",
+                    "count": 3,
+                    "threshold": 2
+                }]
+            }]
+        });
+        let rendered = agent_employment_lines(&candidates).unwrap().join("\n");
+        assert!(rendered.contains("1 retirement candidates"));
+        assert!(rendered.contains("consecutive_failures 3/2"));
+        assert!(!rendered.contains("prompt"));
+
+        let proposals = json!({
+            "proposals": [{
+                "id": "pro-1",
+                "identity_id": "id-1",
+                "status": "pending",
+                "reason_code": "consecutive_failures"
+            }]
+        });
+        let rendered = agent_employment_lines(&proposals).unwrap().join("\n");
+        assert!(rendered.contains("1 retirement proposals"));
+        assert!(rendered.contains("pending"));
+
+        let summary = json!({
+            "totals": {
+                "identities": 1,
+                "completed_tasks": 2,
+                "failed_tasks": 3,
+                "verifier_approvals": 1,
+                "verifier_rejections": 1,
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cost_usd": 0.5
+            },
+            "identities": [{
+                "identity_id": "id-1",
+                "role": "worker",
+                "status": "active",
+                "completed_tasks": 2,
+                "failed_tasks": 3,
+                "consecutive_failures": 2,
+                "retries": 1,
+                "verifier_approvals": 1,
+                "verifier_rejections": 1,
+                "evidence": [{"kind": "task", "reference": "t-1"}]
+            }]
+        });
+        let rendered = agent_employment_lines(&summary).unwrap().join("\n");
+        assert!(rendered.contains("completed 2"));
+        assert!(rendered.contains("verifier 1/1"));
+        assert!(!rendered.contains("prompt"));
     }
 }

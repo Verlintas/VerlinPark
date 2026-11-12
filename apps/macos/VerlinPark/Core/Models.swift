@@ -7732,6 +7732,298 @@ struct AgentIdentitiesResult: Codable, Sendable {
     let identities: [AgentIdentity]
 }
 
+/// Read-only derived performance row. No prompt, tool, or file content is
+/// present; evidence pointers are ids and timestamps only.
+struct AgentPerformance: Codable, Identifiable, Hashable, Sendable {
+    let projectId: String
+    let identityId: String
+    let role: String
+    let status: String
+    let lookbackDays: Int
+    let completedTasks: Int
+    let failedTasks: Int
+    let cancelledTasks: Int?
+    let blockedTasks: Int?
+    let skippedTasks: Int?
+    let consecutiveFailures: Int
+    let retries: Int
+    let verifierApprovals: Int
+    let verifierRejections: Int
+    let unsubstantiatedHandoffs: Int?
+    let falseConsensus: Int?
+    let diagnosisFindings: Int?
+    let assignmentCount: Int?
+    let sessionCount: Int?
+    let inputTokens: Int?
+    let outputTokens: Int?
+    let costUsd: Double
+    let lastActiveAt: String?
+    let computedAt: String?
+    let reasonCounts: [AgentPerformanceReasonCount]?
+    let evidence: [AgentPerformanceEvidence]?
+
+    var id: String {
+        identityId
+    }
+
+    var evidenceCount: Int {
+        evidence?.count ?? 0
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case identityId = "identity_id"
+        case role
+        case status
+        case lookbackDays = "lookback_days"
+        case completedTasks = "completed_tasks"
+        case failedTasks = "failed_tasks"
+        case cancelledTasks = "cancelled_tasks"
+        case blockedTasks = "blocked_tasks"
+        case skippedTasks = "skipped_tasks"
+        case consecutiveFailures = "consecutive_failures"
+        case retries
+        case verifierApprovals = "verifier_approvals"
+        case verifierRejections = "verifier_rejections"
+        case unsubstantiatedHandoffs = "unsubstantiated_handoffs"
+        case falseConsensus = "false_consensus"
+        case diagnosisFindings = "diagnosis_findings"
+        case assignmentCount = "assignment_count"
+        case sessionCount = "session_count"
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case costUsd = "cost_usd"
+        case lastActiveAt = "last_active_at"
+        case computedAt = "computed_at"
+        case reasonCounts = "reason_counts"
+        case evidence
+    }
+}
+
+struct AgentPerformanceReasonCount: Codable, Hashable, Sendable {
+    let code: String
+    let count: Int
+}
+
+struct AgentPerformanceEvidence: Codable, Hashable, Sendable {
+    let kind: String
+    let reference: String
+    let reason: String?
+    let at: String?
+    let note: String?
+}
+
+struct AgentPerformanceTotals: Codable, Hashable, Sendable {
+    let identities: Int
+    let completedTasks: Int
+    let failedTasks: Int
+    let verifierApprovals: Int
+    let verifierRejections: Int
+    let inputTokens: Int
+    let outputTokens: Int
+    let costUsd: Double
+
+    enum CodingKeys: String, CodingKey {
+        case identities
+        case completedTasks = "completed_tasks"
+        case failedTasks = "failed_tasks"
+        case verifierApprovals = "verifier_approvals"
+        case verifierRejections = "verifier_rejections"
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case costUsd = "cost_usd"
+    }
+}
+
+struct AgentPerformanceSummaryResult: Codable, Sendable {
+    let projectId: String
+    let computedAt: String?
+    let lookbackDays: Int
+    let retirementPolicyEnabled: Bool
+    let identities: [AgentPerformance]
+    let totals: AgentPerformanceTotals
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case computedAt = "computed_at"
+        case lookbackDays = "lookback_days"
+        case retirementPolicyEnabled = "retirement_policy_enabled"
+        case identities
+        case totals
+    }
+}
+
+struct AgentRetirementReason: Codable, Hashable, Sendable {
+    let code: String
+    let count: Int
+    let threshold: Int
+}
+
+struct AgentRetirementCandidate: Codable, Identifiable, Hashable, Sendable {
+    let projectId: String
+    let identityId: String
+    let role: String
+    let department: String?
+    let component: String?
+    let title: String?
+    let status: String
+    let generation: Int
+    let severity: Int
+    let reasons: [AgentRetirementReason]
+    let performance: AgentPerformance?
+    let evidence: [AgentPerformanceEvidence]?
+
+    var id: String {
+        identityId
+    }
+
+    var reasonSummary: String {
+        reasons.map { "\($0.code) \($0.count)/\($0.threshold)" }.joined(separator: " · ")
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case identityId = "identity_id"
+        case role
+        case department
+        case component
+        case title
+        case status
+        case generation
+        case severity
+        case reasons
+        case performance
+        case evidence
+    }
+}
+
+struct AgentRetirementCandidatesResult: Codable, Sendable {
+    let projectId: String
+    let generatedAt: String?
+    let policyEnabled: Bool
+    let evaluated: Int
+    let candidates: [AgentRetirementCandidate]
+    let limited: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case generatedAt = "generated_at"
+        case policyEnabled = "policy_enabled"
+        case evaluated
+        case candidates
+        case limited
+    }
+}
+
+struct AgentRetirementProposal: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let projectId: String
+    let identityId: String
+    let status: String
+    let reasonCode: String
+    let reasons: [AgentRetirementReason]
+    let evidence: [AgentPerformanceEvidence]?
+    let proposedAt: String
+    let proposedBy: String
+    let decidedAt: String?
+    let decidedBy: String?
+    let decisionReason: String?
+    let successorId: String?
+    let executedAt: String?
+    let origin: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case projectId = "project_id"
+        case identityId = "identity_id"
+        case status
+        case reasonCode = "reason_code"
+        case reasons
+        case evidence
+        case proposedAt = "proposed_at"
+        case proposedBy = "proposed_by"
+        case decidedAt = "decided_at"
+        case decidedBy = "decided_by"
+        case decisionReason = "decision_reason"
+        case successorId = "successor_id"
+        case executedAt = "executed_at"
+        case origin
+    }
+}
+
+struct AgentRetirementProposalListResult: Codable, Sendable {
+    let proposals: [AgentRetirementProposal]
+}
+
+/// Decode-only S6 hire state. The mutation UI belongs to S7; this shape lets the
+/// client inspect a pending decision without inventing a local write path.
+struct AgentHireRequest: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let projectId: String
+    let identityId: String
+    let role: String
+    let department: String?
+    let component: String?
+    let title: String?
+    let profile: String?
+    let model: String?
+    let parentIdentityId: String?
+    let status: String
+    let requestedAt: String
+    let requestedBy: String
+    let approvalRisk: String
+    let decidedAt: String?
+    let decidedBy: String?
+    let reason: String?
+    let origin: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case projectId = "project_id"
+        case identityId = "identity_id"
+        case role
+        case department
+        case component
+        case title
+        case profile
+        case model
+        case parentIdentityId = "parent_identity_id"
+        case status
+        case requestedAt = "requested_at"
+        case requestedBy = "requested_by"
+        case approvalRisk = "approval_risk"
+        case decidedAt = "decided_at"
+        case decidedBy = "decided_by"
+        case reason
+        case origin
+    }
+}
+
+struct AgentHireResult: Codable, Sendable {
+    let request: AgentHireRequest
+    let identity: AgentIdentity?
+    let state: String
+    let changed: Bool
+}
+
+struct AgentRetireResult: Codable, Sendable {
+    let identity: AgentIdentity
+    let changed: Bool
+    let proposalId: String?
+    let releasedAssignments: Int
+    let archivedWorkspaces: Int
+    let employmentEventId: String?
+
+    enum CodingKeys: String, CodingKey {
+        case identity
+        case changed
+        case proposalId = "proposal_id"
+        case releasedAssignments = "released_assignments"
+        case archivedWorkspaces = "archived_workspaces"
+        case employmentEventId = "employment_event_id"
+    }
+}
+
 /// Read-only project-scoped identity/department/project memory. S5 has no
 /// mutation UI; writes and lifecycle actions are explicit RPC/CLI operations.
 struct AgentMemory: Codable, Identifiable, Hashable, Sendable {
