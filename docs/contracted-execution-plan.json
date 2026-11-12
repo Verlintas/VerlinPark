@@ -1,0 +1,470 @@
+{
+  "schema": "verlinpark.contracted-execution-plan/v1",
+  "created": "2026-11-12",
+  "base_commit": "448f1b5",
+  "status": "planned",
+  "goal": "Make long-horizon multi-agent runs authority-safe, effect-safe, durable across upgrades and external waits, and legible under failure without weakening approvals, Seatbelt, path jail, write scope, Verifier, merge queue, capacity, or budgets.",
+  "phases": [
+    {
+      "id": "phase-1",
+      "title": "Contract & Effects (next round)",
+      "status": "planned",
+      "tasks": ["C1", "C2", "C3", "C4", "C5"]
+    },
+    {
+      "id": "phase-2",
+      "title": "Diagnosis & Scale",
+      "status": "planned",
+      "tasks": ["C6", "C7", "C8", "C9"]
+    },
+    {
+      "id": "phase-3",
+      "title": "Tool Execution v2",
+      "status": "planned",
+      "tasks": ["C10", "C11", "C12"]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "C1",
+      "title": "TaskContract, intent authorization, and MCP schema drift",
+      "phase": "phase-1",
+      "priority": "P0",
+      "status": "planned",
+      "depends_on": [],
+      "files": [
+        "crates/vp-core/src/contract.rs",
+        "crates/vp-core/src/agent.rs",
+        "crates/vp-core/src/permissions.rs",
+        "crates/vp-core/src/instruction.rs",
+        "crates/vp-core/src/prompt_cache.rs",
+        "crates/vp-core/src/mcp.rs",
+        "crates/vp-store/src/store.rs",
+        "crates/vp-store/src/store/tests.rs",
+        "crates/vp-protocol/src/types.rs",
+        "crates/vp-daemon/src/main.rs",
+        "crates/vp-cli/src/main.rs",
+        "apps/macos/VerlinPark/Core/Models.swift",
+        "apps/macos/VerlinPark/Core/CoreClient.swift",
+        "apps/macos/VerlinPark/Features/StageView.swift",
+        "docs/adr/0193-task-contract-and-argument-level-intent.md"
+      ],
+      "deliverables": [
+        "canonical TaskContract derived only from trusted Leader plan/policy inputs",
+        "deterministic authorize(call, contract) with argument-level path/URL/argv checks",
+        "IntentViolation/IntentAmbiguous approval reasons; ambiguity escalates",
+        "mcp_tool_pins with per-(server,tool) schema/description digests and drift approval",
+        "tail/contract compaction capsule with contract_hash on context.compacted",
+        "RPC/CLI/UI: session.contract, project.mcp_pins, mcp.pin.approve, vp contract, vp mcp-pins"
+      ],
+      "tests": [
+        "in-scope tool + out-of-scope path escalates",
+        "URL/egress violation escalates; network=deny refuses",
+        "shell argv/command mutation outside contract escalates or unknown",
+        "MCP schema/description drift requires approval; unchanged tool does not prompt",
+        "ambiguous contract escalates and never allows",
+        "contract capsule survives compaction; summarizer cannot inject constraints",
+        "Destructive/HostState/remote/MCP/sensitive GUI/unknown are never auto-approved"
+      ],
+      "acceptance": "Contract checks are event-backed, narrowing-only, and replayable; no existing gate is weakened."
+    },
+    {
+      "id": "C2",
+      "title": "EffectReceipts and postconditions",
+      "phase": "phase-1",
+      "priority": "P0",
+      "status": "planned",
+      "depends_on": ["C1"],
+      "files": [
+        "crates/vp-core/src/effect.rs",
+        "crates/vp-core/src/agent.rs",
+        "crates/vp-core/src/tools.rs",
+        "crates/vp-core/src/remote.rs",
+        "crates/vp-store/src/store.rs",
+        "crates/vp-store/src/store/tests.rs",
+        "crates/vp-protocol/src/types.rs",
+        "crates/vp-daemon/src/main.rs",
+        "crates/vp-cli/src/main.rs",
+        "docs/adr/0194-effect-receipts-and-postconditions.md"
+      ],
+      "deliverables": [
+        "effect_receipts table with intent/done/failed/unknown states",
+        "begin_effect in the same transaction as tool.started; finish_effect with tool.finished",
+        "per-tool postcondition probes (file hash, git rev, run_project_task result, remote stat, HTTP status/body hash)",
+        "shell defaults to unknown unless an explicit probe is declared",
+        "effect.reconcile RPC/CLI; replay reads receipts first",
+        "coverage for git push, forge PR/MR creation, remote write, deploy, webhook"
+      ],
+      "tests": [
+        "crash between intent and finish becomes unknown",
+        "done receipt replays without re-execution",
+        "unknown blocks auto-retry and merge",
+        "double-push prevention",
+        "provider-dependent caveat is visible"
+      ],
+      "acceptance": "External effects have local settled/unknown evidence; no remote exactly-once claim; unknown fails closed."
+    },
+    {
+      "id": "C3",
+      "title": "Durable external gates",
+      "phase": "phase-1",
+      "priority": "P1",
+      "status": "planned",
+      "depends_on": ["C1"],
+      "files": [
+        "crates/vp-core/src/gates.rs",
+        "crates/vp-core/src/agent.rs",
+        "crates/vp-core/src/continuation.rs",
+        "crates/vp-store/src/store.rs",
+        "crates/vp-store/src/store/tests.rs",
+        "crates/vp-protocol/src/types.rs",
+        "crates/vp-daemon/src/main.rs",
+        "crates/vp-cli/src/main.rs",
+        "docs/adr/0195-external-gates-and-durable-waits.md"
+      ],
+      "deliverables": [
+        "external_gates table with open/resolved/expired/cancelled states",
+        "gate.open returns a scoped one-shot token; gate.resolve is authenticated and expiry-bound",
+        "agent wait_for_gate or session.defer watch gate; resume through the normal path",
+        "local CLI/GUI/same-host CI resolution; no public webhook by default",
+        "optional loopback listener behind explicit project policy"
+      ],
+      "tests": [
+        "one-shot resolution and replay idempotency",
+        "expiry fails closed",
+        "wrong token rejected; no secret in events/logs",
+        "gate wait survives daemon restart without holding a Worker slot",
+        "no public listener by default"
+      ],
+      "acceptance": "External waits are durable, local-only by default, and never bypass the normal resume/gate path."
+    },
+    {
+      "id": "C4",
+      "title": "Version pinning and controller replay",
+      "phase": "phase-1",
+      "priority": "P1",
+      "status": "planned",
+      "depends_on": ["C1"],
+      "files": [
+        "crates/vp-core/src/versioning.rs",
+        "crates/vp-core/src/agent.rs",
+        "crates/vp-core/src/orchestration.rs",
+        "crates/vp-store/src/store.rs",
+        "crates/vp-store/src/store/tests.rs",
+        "crates/vp-protocol/src/types.rs",
+        "crates/vp-daemon/src/main.rs",
+        "crates/vp-cli/src/main.rs",
+        "docs/adr/0196-runtime-version-pinning-and-controller-replay.md"
+      ],
+      "deliverables": [
+        "runtime_version, policy_hash, tool_bundle_hash, prompt_layout_version, plan_revision persisted on plans/runs",
+        "immutable policy_snapshots",
+        "resume drift warning; plan.migrate revalidates DAG/scopes/budgets/contracts",
+        "orchestration.replay diffs deterministic scheduler/task decisions",
+        "no model output replay; no budget bypass"
+      ],
+      "tests": [
+        "version drift warning",
+        "migration approval and revalidation",
+        "replay diff detects changed decision",
+        "no model call during replay"
+      ],
+      "acceptance": "Plans survive releases with visible drift and approval-classified migration; replay is advisory."
+    },
+    {
+      "id": "C5",
+      "title": "Reliability suite and OTel projection",
+      "phase": "phase-1",
+      "priority": "P1",
+      "status": "planned",
+      "depends_on": ["C1", "C2"],
+      "files": [
+        "crates/vp-bench/src/metrics.rs",
+        "crates/vp-bench/src/runner.rs",
+        "crates/vp-bench/src/report.rs",
+        "crates/vp-core/src/metrics.rs",
+        "crates/vp-daemon/src/main.rs",
+        "docs/adr/0197-reliability-metrics-and-otel-genai.md"
+      ],
+      "deliverables": [
+        "pass^k, variance, flake rate",
+        "Lucky-Pass signals: commit without passing test, retry with no new evidence, edit/revert, verify-before-implement",
+        "coordination overhead and cost per solved task",
+        "optional OTel GenAI export as an event-log projection",
+        "observation-only; never a merge gate"
+      ],
+      "tests": [
+        "deterministic metric math",
+        "Lucky-Pass fixtures",
+        "pass^k fixture",
+        "OTel span decode; no secret attributes"
+      ],
+      "acceptance": "Reliability is measurable without new model calls or gate changes."
+    },
+    {
+      "id": "C6",
+      "title": "Failure attribution and error-cascade ledger",
+      "phase": "phase-2",
+      "priority": "P1",
+      "status": "planned",
+      "depends_on": ["C2", "C4"],
+      "files": [
+        "crates/vp-core/src/attribution.rs",
+        "crates/vp-core/src/agent.rs",
+        "crates/vp-core/src/orchestration.rs",
+        "crates/vp-store/src/store.rs",
+        "crates/vp-protocol/src/types.rs",
+        "crates/vp-daemon/src/main.rs",
+        "crates/vp-cli/src/main.rs",
+        "docs/adr/0198-failure-attribution-and-cascade-ledger.md"
+      ],
+      "deliverables": [
+        "provenance DAG from task/input hashes/tool calls/commits/Verifier/integration",
+        "earliest unsupported claim and responsible agent/step",
+        "handoff contract: Worker result cites upstream artifact hash",
+        "false consensus: Worker+Verifier pass while integration fails",
+        "session.diagnosis / vp diagnose; advisory only"
+      ],
+      "tests": [
+        "upstream bad artifact is blamed before downstream failure",
+        "stale test evidence detected",
+        "false consensus flagged",
+        "no auto-retry/cancel/merge from attribution"
+      ],
+      "acceptance": "Failure reports point to the earliest unsupported claim with evidence, never to a guessed culprit."
+    },
+    {
+      "id": "C7",
+      "title": "Bounded dynamic fan-out",
+      "phase": "phase-2",
+      "priority": "P2",
+      "status": "planned",
+      "depends_on": ["C1"],
+      "files": [
+        "crates/vp-core/src/fanout.rs",
+        "crates/vp-core/src/agent.rs",
+        "crates/vp-core/src/orchestration.rs",
+        "crates/vp-store/src/store.rs",
+        "crates/vp-protocol/src/types.rs",
+        "crates/vp-daemon/src/main.rs",
+        "crates/vp-cli/src/main.rs",
+        "docs/adr/0199-bounded-dynamic-fanout.md"
+      ],
+      "deliverables": [
+        "plan.fanout template + JSON item list",
+        "N <= 20 children with parent_task_id, fanout_key, disjoint write scope, join task",
+        "dedupe by key; no recursive fan-out; sibling cancel; per-task budgets",
+        "explicit approval; no automatic plan rewrite"
+      ],
+      "tests": [
+        "disjoint scopes validated",
+        "cap and dedupe",
+        "batch abort cancels siblings",
+        "budget isolation",
+        "no recursive fan-out"
+      ],
+      "acceptance": "Fan-out is explicit, bounded, and cannot create overlapping write scopes."
+    },
+    {
+      "id": "C8",
+      "title": "Tool search v2 and delta browser snapshots",
+      "phase": "phase-2",
+      "priority": "P2",
+      "status": "planned",
+      "depends_on": ["C1", "C4"],
+      "files": [
+        "crates/vp-core/src/tool_bundle.rs",
+        "crates/vp-core/src/tooling/search.rs",
+        "crates/vp-core/src/browser.rs",
+        "crates/vp-core/src/prompt_cache.rs",
+        "apps/macos/VerlinParkBrowserHelper",
+        "docs/adr/0200-tool-search-v2-and-delta-snapshots.md"
+      ],
+      "deliverables": [
+        "BM25 + prerequisite closure set-complete retrieval",
+        "completeness_estimate and missing[]",
+        "turn-boundary event-backed schema promotion; priced tools_hash/cache epoch change",
+        "delta browser snapshots with changed/new/removed refs and text delta",
+        "snapshot generation binding; STALE_REF unchanged"
+      ],
+      "tests": [
+        "set completeness fixture",
+        "schema promotion event and cache epoch change",
+        "delta snapshot correctness",
+        "stale ref rejection"
+      ],
+      "acceptance": "Tool discovery returns complete call sets; schema promotion is visible and priced; snapshots are incremental."
+    },
+    {
+      "id": "C9",
+      "title": "MCP tasks and elicitation",
+      "phase": "phase-2",
+      "priority": "P2",
+      "status": "planned",
+      "depends_on": ["C2", "C3"],
+      "files": [
+        "crates/vp-core/src/mcp.rs",
+        "crates/vp-core/src/mcp/tasks.rs",
+        "crates/vp-core/src/mcp/elicitation.rs",
+        "crates/vp-store/src/store.rs",
+        "crates/vp-protocol/src/types.rs",
+        "crates/vp-daemon/src/main.rs",
+        "crates/vp-cli/src/main.rs",
+        "docs/adr/0201-mcp-tasks-and-elicitation.md"
+      ],
+      "deliverables": [
+        "MCP tools/call task handle: working/input_required/completed",
+        "tasks/get|result|cancel|list with ttl/pollInterval",
+        "no hidden polling; map to effect receipts/gates",
+        "form elicitation routes to question inbox",
+        "URL elicitation denied by default and never auto-opened; dynamic server add stays operator-approved"
+      ],
+      "tests": [
+        "task lifecycle and cancel",
+        "timeout and expiry",
+        "elicitation form round trip",
+        "URL elicitation denied by default",
+        "no secret leakage"
+      ],
+      "acceptance": "MCP async work and server input requests are durable, local-policy-bound, and auditable."
+    },
+    {
+      "id": "C10",
+      "title": "Code Mode run_script",
+      "phase": "phase-3",
+      "priority": "P1",
+      "status": "planned",
+      "depends_on": ["C1", "C2"],
+      "files": [
+        "crates/vp-core/src/script.rs",
+        "crates/vp-core/src/agent.rs",
+        "crates/vp-core/src/tools.rs",
+        "crates/vp-core/src/tool_bundle.rs",
+        "crates/vp-store/src/store.rs",
+        "crates/vp-protocol/src/types.rs",
+        "crates/vp-daemon/src/main.rs",
+        "crates/vp-cli/src/main.rs",
+        "docs/adr/0202-code-mode-run-script.md"
+      ],
+      "deliverables": [
+        "rquickjs + oxc script runner with 64 MB/CPU budget",
+        "typed bindings generated from the frozen bundle",
+        "no shell/HTTP/filesystem/process/native bindings",
+        "inner calls re-enter the dispatcher with contract/approval/budget/receipts",
+        "stdout via ToolOutputPolicy; tool.finished events",
+        "read-only spike first; write tools require per-call approvals and a declared call budget"
+      ],
+      "tests": [
+        "sandbox escape attempts fail",
+        "no network/filesystem/shell access",
+        "inner call permissions and approvals",
+        "budget debit and call cap",
+        "stdout cap and spill",
+        "deterministic replay of script tool calls"
+      ],
+      "acceptance": "Scripts compose tools without ambient capabilities; every inner call is authorized and receipted."
+    },
+    {
+      "id": "C11",
+      "title": "A2A loopback facade",
+      "phase": "phase-3",
+      "priority": "P3",
+      "status": "planned",
+      "depends_on": ["C3", "C4"],
+      "files": [
+        "crates/vp-core/src/a2a.rs",
+        "crates/vp-daemon/src/main.rs",
+        "crates/vp-protocol/src/types.rs",
+        "docs/adr/0203-a2a-loopback-facade.md"
+      ],
+      "deliverables": [
+        "signed/derived Agent Card",
+        "task lifecycle with input-required/auth-required",
+        "SSE + loopback only; no public push endpoint",
+        "maps external tasks to gates/contracts"
+      ],
+      "tests": [
+        "agent card decode",
+        "task lifecycle and input-required",
+        "no public bind by default",
+        "capability attenuation"
+      ],
+      "acceptance": "Inbound A2A is loopback-only and cannot exceed the parent contract."
+    },
+    {
+      "id": "C12",
+      "title": "Advisory progress ledger",
+      "phase": "phase-3",
+      "priority": "P3",
+      "status": "planned",
+      "depends_on": ["C6"],
+      "files": [
+        "crates/vp-core/src/orchestration.rs",
+        "crates/vp-core/src/agent.rs",
+        "crates/vp-protocol/src/types.rs",
+        "crates/vp-daemon/src/main.rs",
+        "docs/adr/0204-advisory-progress-ledger.md"
+      ],
+      "deliverables": [
+        "bounded progress_ledger: satisfied, in_loop, progressing, next_task, instruction, evidence",
+        "deterministic controller uses it only as evidence",
+        "max stalls/resets; no automatic replan or DAG rewrite"
+      ],
+      "tests": [
+        "ledger schema bounds",
+        "stall evidence only",
+        "no automatic plan rewrite"
+      ],
+      "acceptance": "Progress is legible without giving an LLM control of the scheduler."
+    }
+  ],
+  "invariants": [
+    "rust_daemon_owns_state",
+    "event_first",
+    "no_hidden_model_routing",
+    "no_gate_weakening",
+    "intent_is_narrowing_only",
+    "deny_wins",
+    "receipts_are_local_evidence_not_provider_exactly_once",
+    "external_gates_local_only_by_default",
+    "code_mode_capability_scoped",
+    "schema_promotion_event_backed",
+    "advisory_stays_advisory",
+    "no_free_magentic_replan"
+  ],
+  "non_goals": [
+    "full LangGraph/CrewAI/AutoGen framework port",
+    "LLM routing of scheduler decisions or automatic DAG rewrite",
+    "public A2A/push endpoint without a partner",
+    "provider exactly-once claim",
+    "hidden model routing",
+    "gate weakening",
+    "silent mid-run tool-schema mutation",
+    "Code Mode with shell/HTTP/fs/native bindings",
+    "auto-merge from attribution/replay/progress/reliability"
+  ],
+  "acceptance": [
+    "cargo fmt/clippy/test, just lint, xcodebuild test",
+    "new projections replay/repair/db-rebuild",
+    "no gate weakening",
+    "unknown effects block retry/merge",
+    "external gates one-shot, expiry-bound, no public listener by default",
+    "version drift visible and migration approval-classified",
+    "reliability math deterministic and observation-only",
+    "Code Mode sandbox cannot reach network/filesystem/shell"
+  ],
+  "references": [
+    "https://www.anthropic.com/research/advanced-tool-use",
+    "https://www.anthropic.com/engineering/code-execution-with-mcp",
+    "https://blog.cloudflare.com/code-mode/",
+    "https://www.inngest.com/blog/durable-execution-key-to-harnessing-ai-agents",
+    "https://arxiv.org/abs/2606.22528",
+    "https://arxiv.org/abs/2607.06624",
+    "https://arxiv.org/abs/2503.13657",
+    "https://arxiv.org/abs/2603.04474",
+    "https://www.nature.com/articles/s42256-026-01268-y.pdf",
+    "https://invariantlabs.ai/blog/mcp-security-notification-tool-poisoning-attacks",
+    "https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/tasks",
+    "https://github.com/a2aproject/A2A"
+  ]
+}
