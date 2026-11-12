@@ -112,4 +112,6 @@ pub mod codes {
     pub const INTERNAL_ERROR: i32 = -32603;
     pub const UNAUTHORIZED: i32 = -32001;
     pub const NOT_FOUND: i32 = -32004;
+    /// A live resource conflict (busy workspace, unresolved merge, etc.).
+    pub const CONFLICT: i32 = -32009;
 }

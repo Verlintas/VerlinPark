@@ -115,6 +115,7 @@ use crate::budget_governor::GovernorBudgetView;
 
 pub mod acp;
 pub mod agent;
+pub mod agent_workspace;
 pub mod approvals;
 pub mod archive_media;
 pub mod backup;
@@ -178,6 +179,7 @@ pub mod tool_output;
 pub mod tooling;
 pub mod update;
 pub mod workspace;
+pub mod workspace_engine;
 
 pub use rebuild::rebuild_database;
 pub mod tools;
@@ -255,6 +257,30 @@ pub struct Engine {
     /// Serializes MCP pin discovery so two concurrent agents cannot both
     /// perform the first TOFU sync and emit duplicate lifecycle events.
     pin_sync: Arc<tokio::sync::Mutex<()>>,
+    /// One async mutex per project workspace. Same-component Worker runs in one
+    /// session serialize; different components remain parallel.
+    workspace_runs: Arc<WorkspaceRunLocks>,
+}
+
+/// In-process serialization for workspace-bound Worker runs. Cross-session
+/// exclusion is the SQLite workspace lease; this only prevents two parallel
+/// children of one session from mutating one worktree at the same time.
+#[derive(Debug, Default)]
+pub struct WorkspaceRunLocks {
+    locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl WorkspaceRunLocks {
+    pub fn lock_for(&self, workspace_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = match self.locks.lock() {
+            Ok(locks) => locks,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        locks
+            .entry(workspace_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
 }
 
 /// A held cross-process session lease. Dropping without calling `release`
@@ -780,7 +806,13 @@ impl Engine {
             runtime_id,
             continuation_claims: Arc::new(Mutex::new(HashMap::new())),
             pin_sync: Arc::new(tokio::sync::Mutex::new(())),
+            workspace_runs: Arc::new(WorkspaceRunLocks::default()),
         }
+    }
+
+    /// Lock one workspace for an in-process Worker run.
+    pub fn workspace_run_lock(&self, workspace_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.workspace_runs.lock_for(workspace_id)
     }
 
     /// Replace the remote manager after construction. The daemon always uses
@@ -17027,6 +17059,18 @@ impl Engine {
                 ))
             })
             .await??;
+        let workspace_store = store.clone();
+        let workspace_project = project.id.clone();
+        let (agent_workspaces, session_worker_workspaces, agent_workspace_events) =
+            tokio::task::spawn_blocking(move || {
+                Ok::<_, anyhow::Error>((
+                    workspace_store.list_agent_workspaces_for_replay(&workspace_project)?,
+                    workspace_store.list_session_workspaces_for_replay(&workspace_project)?,
+                    workspace_store
+                        .list_agent_workspace_events_for_project(&workspace_project, None)?,
+                ))
+            })
+            .await??;
         Ok(SessionBundle {
             version: 1,
             exported_at: vp_protocol::now_rfc3339(),
@@ -17069,6 +17113,9 @@ impl Engine {
             session_agent_assignments,
             agent_inbox,
             agent_coordination_events,
+            agent_workspaces,
+            session_worker_workspaces,
+            agent_workspace_events,
         })
     }
 
@@ -17462,11 +17509,20 @@ impl Engine {
         let store = self.store.clone();
         let id = session_id.to_string();
         let status = status.to_string();
+        let release_status = status.clone();
         let event = tokio::task::spawn_blocking(move || {
             store.update_session_status_with_event(&id, &status)
         })
         .await??;
         let _ = self.events.send(event);
+        if matches!(
+            release_status.as_str(),
+            "idle" | "failed" | "cancelled" | "landed" | "interrupted"
+        ) {
+            let _ = self
+                .release_session_workspaces(session_id, "session_ended")
+                .await;
+        }
         Ok(())
     }
 
@@ -17543,6 +17599,30 @@ impl Engine {
         let branch = branch.to_string();
         let updated = tokio::task::spawn_blocking(move || {
             store.set_agent_worktree_with_snapshot(&id, &worktree, &branch)
+        })
+        .await??;
+        if let Some((_, event)) = updated {
+            let _ = self.events.send(event);
+        }
+        Ok(())
+    }
+
+    pub async fn set_agent_workspace_binding(
+        &self,
+        agent_id: &str,
+        workspace_id: Option<&str>,
+        parent_workspace_id: Option<&str>,
+    ) -> Result<()> {
+        let store = self.store.clone();
+        let id = agent_id.to_string();
+        let workspace_id = workspace_id.map(str::to_string);
+        let parent_workspace_id = parent_workspace_id.map(str::to_string);
+        let updated = tokio::task::spawn_blocking(move || {
+            store.set_agent_workspace_binding_with_snapshot(
+                &id,
+                workspace_id.as_deref(),
+                parent_workspace_id.as_deref(),
+            )
         })
         .await??;
         if let Some((_, event)) = updated {

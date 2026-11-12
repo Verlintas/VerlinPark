@@ -11286,6 +11286,19 @@ pub struct SessionBundle {
     /// colliding with an unrelated local sequence.
     #[serde(default)]
     pub agent_coordination_events: Vec<AgentCoordinationEvent>,
+    /// Project-scoped Worker component workspaces. Older bundles decode as an
+    /// empty list. Imported workspaces are read-only evidence; their branches
+    /// and worktrees are never attached or landed locally.
+    #[serde(default)]
+    pub agent_workspaces: Vec<AgentWorkspace>,
+    /// Session attachments of project workspaces. Older bundles decode as an
+    /// empty list and imported rows are released evidence.
+    #[serde(default)]
+    pub session_worker_workspaces: Vec<SessionWorkerWorkspace>,
+    /// Append-only workspace event stream. Portable by event id; a same-id
+    /// event must be byte-identical on import.
+    #[serde(default)]
+    pub agent_workspace_events: Vec<AgentWorkspaceEvent>,
 }
 
 /// Project policy for automatic crash resume. Manual `session.run.resume`
@@ -11644,6 +11657,14 @@ pub struct AgentRecord {
     /// assignment is a separate phase.
     #[serde(default)]
     pub identity_id: Option<String>,
+    /// Project workspace this Worker run is explicitly bound to. `None` means
+    /// the legacy task-worktree flow.
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    /// Parent session workspace for a Labour run. Labour worktrees branch from
+    /// the Worker workspace HEAD and merge back into it.
+    #[serde(default)]
+    pub parent_workspace_id: Option<String>,
     pub parent_id: Option<String>,
     /// Plan task this agent is currently responsible for, when applicable.
     #[serde(default)]
@@ -12623,6 +12644,506 @@ pub struct AgentCoordinationReplayReport {
     pub repaired: bool,
     #[serde(default)]
     pub mismatches: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Worker workspaces and two-level integration (S4)
+// ---------------------------------------------------------------------------
+
+/// A workspace is the durable Workowning checkout for one project identity
+/// component. `active` workspaces may be attached to one session at a time;
+/// `archived` and `retired` rows are evidence and are never deleted.
+pub const AGENT_WORKSPACE_STATUSES: [&str; 3] = ["active", "archived", "retired"];
+
+/// Session binding states. One active binding per `(session_id, identity_id)`.
+pub const AGENT_SESSION_WORKSPACE_STATUSES: [&str; 3] = ["active", "released", "archived"];
+
+pub const AGENT_WORKSPACE_CREATED_EVENT: &str = "agent.workspace.created";
+pub const AGENT_WORKSPACE_SESSION_ATTACHED_EVENT: &str = "agent.workspace.session_attached";
+pub const AGENT_WORKSPACE_LABOUR_MERGED_EVENT: &str = "agent.workspace.labour_merged";
+pub const AGENT_WORKSPACE_LANDED_EVENT: &str = "agent.workspace.landed";
+pub const AGENT_WORKSPACE_ARCHIVED_EVENT: &str = "agent.workspace.archived";
+pub const AGENT_WORKSPACE_RETIRED_EVENT: &str = "agent.workspace.retired";
+pub const AGENT_WORKSPACE_RELEASED_EVENT: &str = "agent.workspace.released";
+pub const AGENT_WORKSPACE_LEASE_EXPIRED_EVENT: &str = "agent.workspace.lease_expired";
+
+pub const AGENT_WORKSPACE_EVENT_KINDS: [&str; 8] = [
+    AGENT_WORKSPACE_CREATED_EVENT,
+    AGENT_WORKSPACE_SESSION_ATTACHED_EVENT,
+    AGENT_WORKSPACE_LABOUR_MERGED_EVENT,
+    AGENT_WORKSPACE_LANDED_EVENT,
+    AGENT_WORKSPACE_ARCHIVED_EVENT,
+    AGENT_WORKSPACE_RETIRED_EVENT,
+    AGENT_WORKSPACE_RELEASED_EVENT,
+    AGENT_WORKSPACE_LEASE_EXPIRED_EVENT,
+];
+
+/// Default workspace lease: ten minutes, renewed by an explicit operator or
+/// engine action. A lease is a same-database coordination claim, not a
+/// distributed lock or a security credential.
+pub const AGENT_WORKSPACE_DEFAULT_LEASE_SECS: u64 = 600;
+pub const AGENT_WORKSPACE_MIN_LEASE_SECS: u64 = 60;
+pub const AGENT_WORKSPACE_MAX_LEASE_SECS: u64 = 86_400;
+pub const AGENT_WORKSPACE_MAX_LIST: u32 = 500;
+pub const AGENT_WORKSPACE_MAX_COMPONENT_CHARS: usize = 120;
+pub const AGENT_WORKSPACE_MAX_REASON_CHARS: usize = 500;
+pub const AGENT_WORKSPACE_MAX_PATHS: usize = 200;
+
+/// Durable component branch namespace. A branch may only be created through
+/// the deterministic helper so an operator-supplied string can never become an
+/// arbitrary ref, a child of the Leader session ref, or a path traversal.
+pub const AGENT_WORKSPACE_COMPONENT_BRANCH_PREFIX: &str = "verlinpark/components/";
+pub const AGENT_WORKSPACE_SESSION_BRANCH_PREFIX: &str = "verlinpark/sessions/";
+
+/// Stable, bounded error codes for workspace RPCs. These are wire values, not
+/// message-text classifications.
+pub mod agent_workspace_codes {
+    pub const WORKSPACE_NOT_FOUND: &str = "WORKSPACE_NOT_FOUND";
+    pub const WORKSPACE_INVALID: &str = "WORKSPACE_INVALID";
+    pub const WORKSPACE_BUSY: &str = "WORKSPACE_BUSY";
+    pub const WORKSPACE_PROJECT_MISMATCH: &str = "WORKSPACE_PROJECT_MISMATCH";
+    pub const WORKSPACE_IDENTITY_INVALID: &str = "WORKSPACE_IDENTITY_INVALID";
+    pub const WORKSPACE_IDENTITY_RETIRED: &str = "WORKSPACE_IDENTITY_RETIRED";
+    pub const WORKSPACE_ASSIGNMENT_REQUIRED: &str = "WORKSPACE_ASSIGNMENT_REQUIRED";
+    pub const WORKSPACE_POLICY_DISABLED: &str = "WORKSPACE_POLICY_DISABLED";
+    pub const WORKSPACE_IMPORTED_READONLY: &str = "WORKSPACE_IMPORTED_READONLY";
+    pub const WORKSPACE_CONFLICT: &str = "WORKSPACE_CONFLICT";
+    pub const WORKSPACE_NOT_QUIESCENT: &str = "WORKSPACE_NOT_QUIESCENT";
+    pub const WORKSPACE_NOT_ACCEPTED: &str = "WORKSPACE_NOT_ACCEPTED";
+    pub const WORKSPACE_NOT_ACTIVE: &str = "WORKSPACE_NOT_ACTIVE";
+    pub const WORKSPACE_LAND_CONFLICT: &str = "WORKSPACE_LAND_CONFLICT";
+    pub const WORKSPACE_LAND_CHECK_FAILED: &str = "WORKSPACE_LAND_CHECK_FAILED";
+    pub const WORKSPACE_CONFIRMATION_REQUIRED: &str = "WORKSPACE_CONFIRMATION_REQUIRED";
+    pub const WORKSPACE_LEASE_EXPIRED: &str = "WORKSPACE_LEASE_EXPIRED";
+    pub const WORKSPACE_BRANCH_INVALID: &str = "WORKSPACE_BRANCH_INVALID";
+    pub const WORKSPACE_WORKTREE_INVALID: &str = "WORKSPACE_WORKTREE_INVALID";
+    pub const WORKSPACE_INVALID_EVENT: &str = "WORKSPACE_INVALID_EVENT";
+}
+
+/// Typed workspace failure. It carries only a stable code and a bounded message;
+/// prompt text, file content, and secrets never enter it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentWorkspaceError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl AgentWorkspaceError {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for AgentWorkspaceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for AgentWorkspaceError {}
+
+/// One durable project-scoped component workspace. The lease token is an
+/// internal fencing value and is never serialized on the wire.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentWorkspace {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub identity_id: String,
+    #[serde(default)]
+    pub component: String,
+    #[serde(default)]
+    pub branch: String,
+    #[serde(default)]
+    pub base_commit: String,
+    #[serde(default)]
+    pub worktree_path: String,
+    /// `active`, `archived`, or `retired`.
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+    #[serde(default)]
+    pub last_session_id: Option<String>,
+    /// Derived, time-relative convenience for read surfaces. Stored rows carry
+    /// the authoritative expiry; the lease token never leaves the store.
+    #[serde(default)]
+    pub lease_active: bool,
+    #[serde(default)]
+    pub lease_expires_at: Option<String>,
+    /// `local` or `imported`. Imported workspaces are read-only evidence and
+    /// can never be attached, merged into, landed, or re-leased locally.
+    #[serde(default = "default_identity_origin")]
+    pub origin: String,
+}
+
+impl Default for AgentWorkspace {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            project_id: String::new(),
+            identity_id: String::new(),
+            component: String::new(),
+            branch: String::new(),
+            base_commit: String::new(),
+            worktree_path: String::new(),
+            status: "active".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            last_session_id: None,
+            lease_active: false,
+            lease_expires_at: None,
+            origin: "local".to_string(),
+        }
+    }
+}
+
+/// One session attachment of a project workspace. The binding owns the session
+/// branch and worktree that a Worker run uses; it is evidence after release and
+/// is never silently reassigned to another workspace.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionWorkerWorkspace {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub workspace_id: String,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub identity_id: String,
+    #[serde(default)]
+    pub worktree_path: String,
+    #[serde(default)]
+    pub branch: String,
+    #[serde(default)]
+    pub base_commit: String,
+    /// `active`, `released`, or `archived`.
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+    #[serde(default)]
+    pub lease_active: bool,
+    #[serde(default)]
+    pub lease_expires_at: Option<String>,
+}
+
+impl Default for SessionWorkerWorkspace {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            workspace_id: String::new(),
+            session_id: String::new(),
+            identity_id: String::new(),
+            worktree_path: String::new(),
+            branch: String::new(),
+            base_commit: String::new(),
+            status: "active".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            lease_active: false,
+            lease_expires_at: None,
+        }
+    }
+}
+
+/// One append-only project-scoped workspace event. `seq` orders replay within
+/// one project; `id` is portable across databases so archive import is
+/// idempotent without colliding with an unrelated local stream.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentWorkspaceEvent {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub payload: Value,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentWorkspaceListParams {
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub identity_id: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentWorkspaceListResult {
+    #[serde(default)]
+    pub workspaces: Vec<AgentWorkspace>,
+    #[serde(default)]
+    pub sessions: Vec<SessionWorkerWorkspace>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentWorkspaceParams {
+    #[serde(default)]
+    pub workspace_id: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentWorkspaceGetResult {
+    #[serde(default)]
+    pub workspace: AgentWorkspace,
+    #[serde(default)]
+    pub sessions: Vec<SessionWorkerWorkspace>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentWorkspaceEnsureParams {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub identity_id: String,
+    #[serde(default)]
+    pub component: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub lease_secs: Option<u64>,
+    #[serde(default)]
+    pub operator: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentWorkspaceEnsureResult {
+    #[serde(default)]
+    pub workspace: AgentWorkspace,
+    #[serde(default)]
+    pub session: Option<SessionWorkerWorkspace>,
+    #[serde(default)]
+    pub created: bool,
+    #[serde(default)]
+    pub attached: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentWorkspaceLandParams {
+    #[serde(default)]
+    pub workspace_id: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub operator: Option<String>,
+    /// Explicit operator confirmation. A missing/false value fails closed.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentWorkspaceLandResult {
+    #[serde(default)]
+    pub workspace: AgentWorkspace,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub previous_component_commit: String,
+    #[serde(default)]
+    pub landed_commit: String,
+    #[serde(default)]
+    pub already_up_to_date: bool,
+    #[serde(default)]
+    pub commits: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentWorkspaceArchiveParams {
+    #[serde(default)]
+    pub workspace_id: String,
+    #[serde(default)]
+    pub operator: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentWorkspaceRetireParams {
+    #[serde(default)]
+    pub workspace_id: String,
+    #[serde(default)]
+    pub operator: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentWorkspaceResult {
+    #[serde(default)]
+    pub workspace: AgentWorkspace,
+    #[serde(default)]
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionWorkspaceParams {
+    #[serde(default)]
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionWorkspaceResult {
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub bindings: Vec<SessionWorkerWorkspace>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentWorkspaceReplayParams {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub repair: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentWorkspaceReplayReport {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub workspaces: u64,
+    #[serde(default)]
+    pub sessions: u64,
+    #[serde(default)]
+    pub events: u64,
+    #[serde(default)]
+    pub consistent: bool,
+    #[serde(default)]
+    pub repaired: bool,
+    #[serde(default)]
+    pub mismatches: Vec<String>,
+}
+
+/// Validate and normalize a component label. Components are single-line labels,
+/// never paths or refs; branch/path construction always goes through
+/// [`component_branch_name`] and [`workspace_ref_slug`].
+pub fn normalize_workspace_component(
+    value: &str,
+) -> std::result::Result<String, AgentWorkspaceError> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().count() > AGENT_WORKSPACE_MAX_COMPONENT_CHARS {
+        return Err(AgentWorkspaceError::new(
+            agent_workspace_codes::WORKSPACE_INVALID,
+            format!(
+                "component must be 1-{} characters",
+                AGENT_WORKSPACE_MAX_COMPONENT_CHARS
+            ),
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(AgentWorkspaceError::new(
+            agent_workspace_codes::WORKSPACE_INVALID,
+            "component must not contain control characters",
+        ));
+    }
+    if value.contains('/')
+        || value.contains('\\')
+        || value == "."
+        || value == ".."
+        || value.contains("..")
+    {
+        return Err(AgentWorkspaceError::new(
+            agent_workspace_codes::WORKSPACE_INVALID,
+            "component must be a label, not a path or ref",
+        ));
+    }
+    Ok(value.to_string())
+}
+
+/// Validate an optional workspace lease; defaults to ten minutes.
+pub fn normalize_workspace_lease_secs(
+    value: Option<u64>,
+) -> std::result::Result<u64, AgentWorkspaceError> {
+    let value = value.unwrap_or(AGENT_WORKSPACE_DEFAULT_LEASE_SECS);
+    if !(AGENT_WORKSPACE_MIN_LEASE_SECS..=AGENT_WORKSPACE_MAX_LEASE_SECS).contains(&value) {
+        return Err(AgentWorkspaceError::new(
+            agent_workspace_codes::WORKSPACE_INVALID,
+            format!(
+                "lease_secs must be {}..={}",
+                AGENT_WORKSPACE_MIN_LEASE_SECS, AGENT_WORKSPACE_MAX_LEASE_SECS
+            ),
+        ));
+    }
+    Ok(value)
+}
+
+/// Deterministic, bounded, ref/path-safe slug. Non-ASCII and punctuation
+/// collapse to `-`; a stable FNV-1a suffix keeps two long labels from silently
+/// sharing one branch or directory.
+pub fn workspace_ref_slug(value: &str) -> String {
+    let mut slug = String::new();
+    let mut last_dash = false;
+    for ch in value.chars() {
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() || lower == '.' || lower == '_' {
+            slug.push(lower);
+            last_dash = false;
+        } else if !last_dash {
+            slug.push('-');
+            last_dash = true;
+        }
+        if slug.len() >= 40 {
+            break;
+        }
+    }
+    let slug = slug.trim_matches(['-', '.']).to_string();
+    let slug = if slug.is_empty() {
+        "component".to_string()
+    } else {
+        slug
+    };
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{slug}-{hash:08x}")
+}
+
+/// Deterministic component branch for a Worker identity. The identity part
+/// must already be a safe path/ref component; callers validate it before this
+/// helper so a malformed identity cannot escape the namespace.
+pub fn component_branch_name(identity_id: &str, component: &str) -> String {
+    format!(
+        "{}{}--{}",
+        AGENT_WORKSPACE_COMPONENT_BRANCH_PREFIX,
+        workspace_ref_slug(component),
+        workspace_ref_slug(identity_id)
+    )
+}
+
+/// Deterministic session worker branch. It is intentionally in a separate ref
+/// namespace from both the component branch and `verlinpark/<session-id>` so
+/// no branch can be both a file and a directory.
+pub fn session_workspace_branch_name(session_id: &str, identity_id: &str) -> String {
+    format!(
+        "{}worker-{}-{}",
+        AGENT_WORKSPACE_SESSION_BRANCH_PREFIX,
+        workspace_ref_slug(session_id),
+        workspace_ref_slug(identity_id)
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -17997,6 +18518,9 @@ mod context_checkpoint_bundle_tests {
             session_agent_assignments: Vec::new(),
             agent_inbox: Vec::new(),
             agent_coordination_events: Vec::new(),
+            agent_workspaces: Vec::new(),
+            session_worker_workspaces: Vec::new(),
+            agent_workspace_events: Vec::new(),
         };
         let encoded = serde_json::to_string(&bundle).unwrap();
         let decoded: SessionBundle = serde_json::from_str(&encoded).unwrap();
@@ -21420,5 +21944,118 @@ mod agent_coordination_protocol_tests {
         assert!(bundle.session_agent_assignments.is_empty());
         assert!(bundle.agent_inbox.is_empty());
         assert!(bundle.agent_coordination_events.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod workspace_protocol_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn workspace_rows_and_bindings_decode_with_additive_defaults() {
+        let workspace: AgentWorkspace = serde_json::from_value(json!({
+            "id": "wsp-1",
+            "project_id": "prj-1",
+            "identity_id": "agt-1",
+            "component": "auth",
+            "branch": "verlinpark/components/auth-1234--agt-1",
+            "base_commit": "abc",
+            "worktree_path": "/data/workspaces/prj-1/agt-1",
+            "status": "active"
+        }))
+        .unwrap();
+        assert_eq!(workspace.status, "active");
+        assert!(!workspace.lease_active);
+        assert_eq!(workspace.origin, "local");
+        assert!(workspace.last_session_id.is_none());
+
+        let binding: SessionWorkerWorkspace = serde_json::from_value(json!({
+            "id": "sww-1",
+            "workspace_id": "wsp-1",
+            "session_id": "ses-1",
+            "identity_id": "agt-1",
+            "worktree_path": "/data/workspaces/prj-1/ses-1",
+            "branch": "verlinpark/sessions/ses-1/worker-agt-1",
+            "base_commit": "abc",
+            "status": "active"
+        }))
+        .unwrap();
+        assert_eq!(binding.status, "active");
+        assert!(!binding.lease_active);
+
+        let params: AgentWorkspaceEnsureParams = serde_json::from_value(json!({
+            "project_id": "prj-1",
+            "identity_id": "agt-1"
+        }))
+        .unwrap();
+        assert!(params.session_id.is_none());
+        assert!(params.lease_secs.is_none());
+    }
+
+    #[test]
+    fn workspace_branch_names_are_deterministic_and_ref_safe() {
+        let branch = component_branch_name("agt-1", "Auth / API");
+        assert!(branch.starts_with(AGENT_WORKSPACE_COMPONENT_BRANCH_PREFIX));
+        assert!(!branch.contains(' '));
+        assert!(!branch.contains("//"));
+        assert_eq!(branch, component_branch_name("agt-1", "Auth / API"));
+        assert_ne!(branch, component_branch_name("agt-2", "Auth / API"));
+        assert_ne!(branch, component_branch_name("agt-1", "Auth API"));
+        let session = session_workspace_branch_name("ses-1", "agt-1");
+        assert!(session.starts_with(AGENT_WORKSPACE_SESSION_BRANCH_PREFIX));
+        assert_ne!(session, branch);
+        assert!(workspace_ref_slug("").starts_with("component-"));
+        assert!(!workspace_ref_slug("../escape/..").contains('/'));
+        assert!(!workspace_ref_slug("../escape/..").contains(".."));
+    }
+
+    #[test]
+    fn component_and_lease_validation_is_bounded() {
+        assert_eq!(normalize_workspace_component(" auth ").unwrap(), "auth");
+        for invalid in ["", "a/b", "..", "a\\b", "line\nbreak"] {
+            assert!(
+                normalize_workspace_component(invalid).is_err(),
+                "{invalid:?} should be rejected"
+            );
+        }
+        assert_eq!(
+            normalize_workspace_lease_secs(None).unwrap(),
+            AGENT_WORKSPACE_DEFAULT_LEASE_SECS
+        );
+        assert!(normalize_workspace_lease_secs(Some(59)).is_err());
+        assert_eq!(normalize_workspace_lease_secs(Some(60)).unwrap(), 60);
+        assert!(normalize_workspace_lease_secs(Some(86_401)).is_err());
+    }
+
+    #[test]
+    fn workspace_event_kinds_and_codes_are_stable() {
+        assert!(AGENT_WORKSPACE_EVENT_KINDS.contains(&"agent.workspace.created"));
+        assert!(AGENT_WORKSPACE_EVENT_KINDS.contains(&"agent.workspace.session_attached"));
+        assert!(AGENT_WORKSPACE_EVENT_KINDS.contains(&"agent.workspace.labour_merged"));
+        assert!(AGENT_WORKSPACE_EVENT_KINDS.contains(&"agent.workspace.landed"));
+        assert!(AGENT_WORKSPACE_EVENT_KINDS.contains(&"agent.workspace.archived"));
+        assert!(AGENT_WORKSPACE_EVENT_KINDS.contains(&"agent.workspace.retired"));
+        assert!(AGENT_WORKSPACE_EVENT_KINDS.contains(&"agent.workspace.lease_expired"));
+        assert_eq!(agent_workspace_codes::WORKSPACE_BUSY, "WORKSPACE_BUSY");
+    }
+
+    #[test]
+    fn session_bundle_decodes_workspace_fields_as_empty() {
+        let bundle: SessionBundle = serde_json::from_value(json!({
+            "version": 1,
+            "exported_at": "2026-11-13T00:00:00Z",
+            "project": {"id": "prj-1", "name": "p", "root": "/tmp/p", "default_branch": "main", "created_at": "2026-11-13T00:00:00Z"},
+            "session": {"id": "ses-1", "project_id": "prj-1", "goal": "g", "status": "idle", "created_at": "2026-11-13T00:00:00Z"},
+            "events": [],
+            "agents": [],
+            "messages": [],
+            "todos": [],
+            "merge_queue": []
+        }))
+        .unwrap();
+        assert!(bundle.agent_workspaces.is_empty());
+        assert!(bundle.session_worker_workspaces.is_empty());
+        assert!(bundle.agent_workspace_events.is_empty());
     }
 }

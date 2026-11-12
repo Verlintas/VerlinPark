@@ -403,6 +403,7 @@ struct DashboardView: View {
         case .team:
             AgentsCard()
             ProjectIdentitiesCard()
+            ProjectWorkspacesCard()
             CoordinationCard()
             GuiSessionCard()
             ProgramsCard()

@@ -185,6 +185,9 @@ fn help_spec(role: AgentRole, profile: AgentProfile) -> AgentSpec {
         session_branch: "help".to_string(),
         write_scope: Vec::new(),
         base_commit: "0".repeat(40),
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     }
 }
 
@@ -1683,6 +1686,10 @@ async fn records_merge_conflicts_in_the_queue() {
         session_branch: branch,
         write_scope: vec!["README.md".into()],
         base_commit: task.base_commit.clone(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     let error = integrate_worker(&engine, &session, &spec, &commit, "verified", None)
         .await
@@ -1760,6 +1767,10 @@ async fn retries_a_conflicted_merge_after_rebase() {
         session_branch: branch,
         write_scope: vec!["README.md".into()],
         base_commit: task.base_commit.clone(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     integrate_worker(&engine, &session, &spec, &commit, "verified", None)
         .await
@@ -1859,6 +1870,10 @@ async fn auto_resolves_a_conflicted_merge_with_an_agent() {
         session_branch: branch,
         write_scope: vec!["README.md".into()],
         base_commit: task.base_commit.clone(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     integrate_worker(&engine, &session, &spec, &commit, "verified", None)
         .await
@@ -1997,6 +2012,10 @@ async fn auto_resolver_policy_resolves_pending_conflicts() {
         session_branch: branch,
         write_scope: vec!["README.md".into()],
         base_commit: task.base_commit.clone(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     integrate_worker(&engine, &session, &spec, &commit, "verified", None)
         .await
@@ -4276,6 +4295,10 @@ fn plan_budget_scope_includes_the_project_pool() {
         session_branch: "session".into(),
         write_scope: Vec::new(),
         base_commit: "base".into(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     let plan = TeamPlan {
         goal: "project budget".into(),
@@ -4990,6 +5013,10 @@ async fn mailbox_tools_send_read_and_publish() {
         session_branch: session.branch.clone().unwrap(),
         write_scope: Vec::new(),
         base_commit: session.base_commit.clone().unwrap(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     let sent = run_mailbox_tool(
         &engine,
@@ -5084,6 +5111,10 @@ async fn coordination_tool_records_blockers_and_team_status_reads_the_board() {
         session_branch: branch,
         write_scope: Vec::new(),
         base_commit: session.base_commit.clone().unwrap_or_default(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     let plan: TeamPlan = serde_json::from_value(serde_json::json!({
         "goal": "coordinate",
@@ -7958,6 +7989,10 @@ async fn prepared_summary_cache_invalidates_on_every_key_component() {
         session_branch: "test".into(),
         write_scope: Vec::new(),
         base_commit: String::new(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     let conversation = vec![
         ChatMessage::user("one"),
@@ -8087,6 +8122,10 @@ async fn structured_state_honors_an_explicit_task_id() {
         session_branch: "test".into(),
         write_scope: vec!["src/two".into()],
         base_commit: String::new(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     let state = load_compaction_structured_state(&engine, &session, &spec).await;
     assert_eq!(state.goal, "two tasks");
@@ -8128,6 +8167,10 @@ async fn structured_state_without_a_plan_uses_the_session_goal() {
         session_branch: "test".into(),
         write_scope: Vec::new(),
         base_commit: String::new(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     let state = load_compaction_structured_state(&engine, &session, &spec).await;
     assert_eq!(state.goal, "session-only goal");
@@ -8163,6 +8206,10 @@ async fn agent_shaping_uses_the_project_tool_output_policy() {
         session_branch: "test".into(),
         write_scope: Vec::new(),
         base_commit: String::new(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     let mut policy = vp_protocol::types::ToolOutputPolicy {
         spill_threshold_bytes: 100_000,
@@ -8225,6 +8272,10 @@ async fn error_failure_contract_survives_output_spill_shaping() {
         session_branch: "test".into(),
         write_scope: Vec::new(),
         base_commit: String::new(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     let policy = vp_protocol::types::ToolOutputPolicy {
         spill_threshold_bytes: 256,
@@ -8334,6 +8385,10 @@ async fn spills_large_tool_results_and_pages_them_with_read_tool_output() {
         session_branch: "test".into(),
         write_scope: Vec::new(),
         base_commit: String::new(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     let content = (0..1_000)
         .map(|index| format!("line {index:04} value {}", "x".repeat(20)))
@@ -8488,6 +8543,10 @@ async fn prepare_failure_is_distinct_from_compaction_failure() {
         session_branch: "test".into(),
         write_scope: Vec::new(),
         base_commit: String::new(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     let budget = SessionBudget::new(
         None,
@@ -8655,6 +8714,10 @@ async fn prepared_summary_is_invalidated_by_a_real_plan_revision() {
         session_branch: "test".into(),
         write_scope: Vec::new(),
         base_commit: String::new(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     let budget = SessionBudget::new(
         None,
@@ -8819,6 +8882,10 @@ async fn compaction_fallback_preserves_the_authoritative_plan_state() {
         session_branch: "test".into(),
         write_scope: Vec::new(),
         base_commit: String::new(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     let budget = SessionBudget::new(
         None,
@@ -8944,6 +9011,10 @@ async fn prepared_summary_is_reused_once_at_the_threshold() {
         session_branch: "test".into(),
         write_scope: Vec::new(),
         base_commit: String::new(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     let budget = SessionBudget::new(
         None,
@@ -9120,6 +9191,10 @@ async fn prepared_summary_is_invalidated_by_model_and_plan_changes() {
         session_branch: "test".into(),
         write_scope: Vec::new(),
         base_commit: String::new(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     let budget = SessionBudget::new(
         None,
@@ -9671,6 +9746,10 @@ async fn trims_older_messages_when_summarization_fails() {
         session_branch: "test".into(),
         write_scope: Vec::new(),
         base_commit: String::new(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     let budget = SessionBudget::new(
         None,
@@ -9784,6 +9863,10 @@ async fn compaction_counts_system_and_tool_tokens() {
         session_branch: "test".into(),
         write_scope: Vec::new(),
         base_commit: String::new(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     let budget = SessionBudget::new(
         None,
@@ -9892,6 +9975,10 @@ async fn compaction_applies_context_calibration() {
         session_branch: "test".into(),
         write_scope: Vec::new(),
         base_commit: String::new(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     let budget = SessionBudget::new(
         None,
@@ -11853,6 +11940,10 @@ async fn warm_on_resume_is_opt_in_and_adds_one_stable_section_call() {
         session_branch: "main".into(),
         write_scope: Vec::new(),
         base_commit: String::new(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     let budget = SessionBudget::new(
         None,
@@ -12871,6 +12962,10 @@ async fn task_detail_and_control_wrappers_are_event_backed() {
         session_branch: session.branch.clone().unwrap(),
         write_scope: vec!["src/t1".into()],
         base_commit: session.base_commit.clone().unwrap_or_default(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     let detail = run_task_detail(&engine, &session, &spec, serde_json::json!({}))
         .await
@@ -16270,6 +16365,10 @@ async fn stale_integration_owner_aborts_before_touching_the_session_branch() {
         session_branch: session_branch.clone(),
         write_scope: vec!["worker.txt".into()],
         base_commit: task.base_commit.clone(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     let error = process_merge_entry_fenced(&engine, &session, &spec, &entry, None, &stale)
         .await
@@ -23167,6 +23266,10 @@ async fn worker_wait_for_gate_releases_the_worker_slot() {
         session_branch: session_record.branch.clone().unwrap_or_default(),
         write_scope: Vec::new(),
         base_commit: session_record.base_commit.clone().unwrap_or_default(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     let config = service
         .config

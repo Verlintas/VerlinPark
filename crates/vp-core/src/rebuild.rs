@@ -185,6 +185,46 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
                     &inbox,
                 )?;
             }
+            if snapshot.agent_workspace_events.is_empty() {
+                // Forward compatibility for a manifest written before S4. No
+                // synthetic events are created.
+                for workspace in &snapshot.agent_workspaces {
+                    if workspace.project_id != snapshot.project.id {
+                        anyhow::bail!(
+                            "workspace {} belongs to another project in the manifest",
+                            workspace.id
+                        );
+                    }
+                    store.insert_agent_workspace_snapshot(workspace)?;
+                }
+                for binding in &snapshot.session_worker_workspaces {
+                    store.insert_session_worker_workspace_snapshot(binding)?;
+                }
+            } else {
+                for event in &snapshot.agent_workspace_events {
+                    if event.project_id != snapshot.project.id {
+                        anyhow::bail!(
+                            "workspace event {} belongs to another project in the manifest",
+                            event.id
+                        );
+                    }
+                    store.insert_agent_workspace_event_snapshot(event)?;
+                }
+                let projection =
+                    crate::agent_workspace::project_from_events(&snapshot.agent_workspace_events)?;
+                if projection
+                    .workspaces
+                    .iter()
+                    .any(|workspace| workspace.project_id != snapshot.project.id)
+                {
+                    anyhow::bail!("workspace replay produced a row for another project");
+                }
+                store.replace_agent_workspace_projection(
+                    &snapshot.project.id,
+                    &projection.workspaces,
+                    &projection.sessions,
+                )?;
+            }
             let effect_policy = snapshot.effect_policy.normalized().map_err(|error| {
                 anyhow::anyhow!(
                     "effect policy for project {} is invalid: {error}",

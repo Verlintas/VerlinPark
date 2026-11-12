@@ -7637,6 +7637,8 @@ struct AgentRecord: Codable, Identifiable, Hashable, Sendable {
     let name: String
     let title: String?
     let identityId: String?
+    let workspaceId: String?
+    let parentWorkspaceId: String?
     let profile: String?
     let parentId: String?
     let taskId: String?
@@ -7654,6 +7656,8 @@ struct AgentRecord: Codable, Identifiable, Hashable, Sendable {
         case name
         case title
         case identityId = "identity_id"
+        case workspaceId = "workspace_id"
+        case parentWorkspaceId = "parent_workspace_id"
         case profile
         case parentId = "parent_id"
         case taskId = "task_id"
@@ -7780,6 +7784,138 @@ struct AgentAssignment: Codable, Identifiable, Hashable, Sendable {
 
 struct SessionAssignmentsResult: Codable, Sendable {
     let assignments: [AgentAssignment]
+}
+
+/// Read-only Worker component workspace metadata. The lease token is never on
+/// the wire; `leaseActive` is a server-derived hint. The client never attaches,
+/// lands, archives, or retires a workspace from a view.
+struct AgentWorkspace: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let projectId: String
+    let identityId: String
+    let component: String
+    let branch: String
+    let baseCommit: String
+    let worktreePath: String
+    let status: String
+    let createdAt: String
+    let updatedAt: String
+    let lastSessionId: String?
+    let leaseActive: Bool
+    let leaseExpiresAt: String?
+    let origin: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case projectId = "project_id"
+        case identityId = "identity_id"
+        case component
+        case branch
+        case baseCommit = "base_commit"
+        case worktreePath = "worktree_path"
+        case status
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+        case lastSessionId = "last_session_id"
+        case leaseActive = "lease_active"
+        case leaseExpiresAt = "lease_expires_at"
+        case origin
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        projectId = try container.decode(String.self, forKey: .projectId)
+        identityId = try container.decode(String.self, forKey: .identityId)
+        component = try container.decode(String.self, forKey: .component)
+        branch = try container.decode(String.self, forKey: .branch)
+        baseCommit = try container.decodeIfPresent(String.self, forKey: .baseCommit) ?? ""
+        worktreePath = try container.decodeIfPresent(String.self, forKey: .worktreePath) ?? ""
+        status = try container.decode(String.self, forKey: .status)
+        createdAt = try container.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
+        updatedAt = try container.decodeIfPresent(String.self, forKey: .updatedAt) ?? ""
+        lastSessionId = try container.decodeIfPresent(String.self, forKey: .lastSessionId)
+        leaseActive = try container.decodeIfPresent(Bool.self, forKey: .leaseActive) ?? false
+        leaseExpiresAt = try container.decodeIfPresent(String.self, forKey: .leaseExpiresAt)
+        origin = try container.decodeIfPresent(String.self, forKey: .origin) ?? "local"
+    }
+
+    var isImported: Bool {
+        origin == "imported"
+    }
+}
+
+/// Read-only session attachment of a project workspace.
+struct SessionWorkerWorkspace: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let workspaceId: String
+    let sessionId: String
+    let identityId: String
+    let worktreePath: String
+    let branch: String
+    let baseCommit: String
+    let status: String
+    let createdAt: String
+    let updatedAt: String
+    let leaseActive: Bool
+    let leaseExpiresAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case workspaceId = "workspace_id"
+        case sessionId = "session_id"
+        case identityId = "identity_id"
+        case worktreePath = "worktree_path"
+        case branch
+        case baseCommit = "base_commit"
+        case status
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+        case leaseActive = "lease_active"
+        case leaseExpiresAt = "lease_expires_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        workspaceId = try container.decode(String.self, forKey: .workspaceId)
+        sessionId = try container.decode(String.self, forKey: .sessionId)
+        identityId = try container.decode(String.self, forKey: .identityId)
+        worktreePath = try container.decodeIfPresent(String.self, forKey: .worktreePath) ?? ""
+        branch = try container.decodeIfPresent(String.self, forKey: .branch) ?? ""
+        baseCommit = try container.decodeIfPresent(String.self, forKey: .baseCommit) ?? ""
+        status = try container.decode(String.self, forKey: .status)
+        createdAt = try container.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
+        updatedAt = try container.decodeIfPresent(String.self, forKey: .updatedAt) ?? ""
+        leaseActive = try container.decodeIfPresent(Bool.self, forKey: .leaseActive) ?? false
+        leaseExpiresAt = try container.decodeIfPresent(String.self, forKey: .leaseExpiresAt)
+    }
+}
+
+struct AgentWorkspaceListResult: Codable, Sendable {
+    let workspaces: [AgentWorkspace]
+    let sessions: [SessionWorkerWorkspace]
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        workspaces = try container.decodeIfPresent([AgentWorkspace].self, forKey: .workspaces) ?? []
+        sessions = try container.decodeIfPresent([SessionWorkerWorkspace].self, forKey: .sessions) ?? []
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case workspaces
+        case sessions
+    }
+}
+
+struct SessionWorkspaceResult: Codable, Sendable {
+    let sessionId: String
+    let bindings: [SessionWorkerWorkspace]
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case bindings
+    }
 }
 
 /// Known inbox payload fields. Unknown fields are ignored by the view and are

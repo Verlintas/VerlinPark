@@ -90,6 +90,7 @@ private struct ProjectStageView: View {
         }
         .task(id: model.selectedSessionID) {
             await model.refreshProcessSummary()
+            await model.loadSessionWorkspaces()
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(5))
                 await model.refreshProcessSummary()
@@ -910,6 +911,41 @@ private struct ContextPopoverView: View {
 
                 if let gates = model.sessionGates, gates.counts.total > 0 {
                     GateBadge(report: gates)
+                }
+
+                if !model.sessionWorkspaces.isEmpty {
+                    Divider()
+                    HStack(spacing: 8) {
+                        Text("WORKER WORKSPACES")
+                            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                        Spacer()
+                        Text("\(model.sessionWorkspaces.count)")
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(model.sessionWorkspaces) { binding in
+                        HStack(spacing: 8) {
+                            Image(systemName: "shippingbox")
+                                .font(.system(size: 9))
+                                .foregroundStyle(
+                                    binding.status == "active" ? VPTheme.accent : Color.secondary
+                                )
+                                .frame(width: 12)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(binding.branch)
+                                    .font(.system(size: 9, design: .monospaced))
+                                    .lineLimit(1)
+                                Text(
+                                    "\(binding.status) · base \(String(binding.baseCommit.prefix(8)))"
+                                        + (binding.leaseActive ? " · leased" : "")
+                                )
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                        }
+                    }
                 }
 
                 if let compatibility = model.sessionCompatibility,

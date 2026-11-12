@@ -48,11 +48,13 @@ use vp_protocol::types::{
     AddProjectParams, AgentCoordinationReplayParams, AgentIdentityListParams, AgentIdentityParams,
     AgentIdentityPolicyParams, AgentIdentityPolicyResult, AgentIdentityReplayParams,
     AgentInboxListParams, AgentInboxMessageParams, AgentInboxSendParams, AgentListParams,
-    AgentListResult, AgentMessageResult, AnswerQuestionParams, AnswerQuestionResult,
-    ApprovalAuditParams, ApprovalBatchResolveParams, ApprovalBatchResolveResult,
-    ApprovalGrantCreateParams, ApprovalGrantCreateResult, ApprovalGrantDeleteParams,
-    ApprovalGrantDeleteResult, ApprovalGrantListParams, ApprovalGrantListResult,
-    ApprovalListResult, ApprovalQueueParams, ApprovalTemplateCreateParams,
+    AgentListResult, AgentMessageResult, AgentWorkspaceArchiveParams, AgentWorkspaceEnsureParams,
+    AgentWorkspaceLandParams, AgentWorkspaceListParams, AgentWorkspaceParams,
+    AgentWorkspaceReplayParams, AgentWorkspaceRetireParams, AnswerQuestionParams,
+    AnswerQuestionResult, ApprovalAuditParams, ApprovalBatchResolveParams,
+    ApprovalBatchResolveResult, ApprovalGrantCreateParams, ApprovalGrantCreateResult,
+    ApprovalGrantDeleteParams, ApprovalGrantDeleteResult, ApprovalGrantListParams,
+    ApprovalGrantListResult, ApprovalListResult, ApprovalQueueParams, ApprovalTemplateCreateParams,
     ApprovalTemplateDeleteParams, ApprovalTemplateFromApprovalParams, ApprovalTemplateListParams,
     ApprovalTemplateListResult, ApprovalTemplateUpdateParams, ArtifactArchiveExtractParams,
     ArtifactArchiveListParams, ArtifactBackfillParams, ArtifactDiffParams, ArtifactGcParams,
@@ -110,31 +112,32 @@ use vp_protocol::types::{
     SessionResumeResult, SessionRunCancelParams, SessionRunDetailParams, SessionRunPolicyParams,
     SessionRunResumeParams, SessionRunsParams, SessionSkillActivationsParams, SessionStallsParams,
     SessionSteerParams, SessionSteeringCancelParams, SessionSteeringParams, SessionTodosParams,
-    SessionTodosResult, SessionTranscriptParams, SetAgentIdentityPolicyParams,
-    SetArtifactPolicyParams, SetCachePolicyParams, SetCheckpointPolicyParams,
-    SetContextCheckpointPolicyParams, SetContractPolicyParams, SetCriticalPathPolicyParams,
-    SetGatePolicyParams, SetIntegrationPolicyParams, SetMailboxPolicyParams, SetMemoryPolicyParams,
-    SetPreemptionPolicyParams, SetProcessPolicyParams, SetProjectBudgetParams,
-    SetProjectPromptLayoutParams, SetSessionPriorityParams, SetSessionPromptLayoutParams,
-    SetSessionRunPolicyParams, SetSessionUnlimitedParams, SetShellPolicyParams,
-    SetSourceCollectionParams, SetSourceEmbeddingPolicyParams, SetSourceLabelsParams,
-    SetSourceRetrievalPolicyParams, SetTaskSchedulerPolicyParams, SetToolOutputPolicyParams,
-    SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult, SkillCreateParams,
-    SkillEnabledParams, SkillIdParams, SkillImportParams, SkillListParams, SkillUpdateParams,
-    SourceActionParams, SourceCollectionsParams, SourceCreateFileParams, SourceCreateNoteParams,
-    SourceCreateUrlParams, SourceEmbeddingPolicyParams, SourceEmbeddingReindexParams,
-    SourceEmbeddingStatusParams, SourceGetParams, SourceImportParams, SourceIndexRebuildParams,
-    SourceIndexStatusParams, SourceListParams, SourceRetrievalPolicyParams, SourceSearchParams,
-    SubscribeParams, TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult,
-    TaskQueueParams, TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult,
-    TerminalCloseParams, TerminalOpenParams, TerminalReadParams, TerminalResizeParams,
-    TerminalWriteParams, ToolActivityParams, ToolBundleDiffParams, ToolBundleHistoryParams,
-    ToolBundleMatrixParams, ToolBundleParams, ToolOutputAuditParams, ToolOutputListParams,
-    ToolOutputPolicyParams, ToolOutputPolicyResult, ToolOutputPruneParams, ToolOutputStatusParams,
-    UpdateAcpAgentParams, UpdateAgentIdentityParams, UpdateCheckParams, UpdateDownloadParams,
-    UpdateMcpServerParams, UpdateModelPresetParams, UpdateSourceMetadataParams, UsageLedgerParams,
-    WorkspaceFileParams, WorkspaceGrepParams, WorkspaceListParams, WorkspaceSearchParams,
-    WorkspaceTreeParams, WorkspaceWriteParams, WorktreePolicyParams,
+    SessionTodosResult, SessionTranscriptParams, SessionWorkspaceParams,
+    SetAgentIdentityPolicyParams, SetArtifactPolicyParams, SetCachePolicyParams,
+    SetCheckpointPolicyParams, SetContextCheckpointPolicyParams, SetContractPolicyParams,
+    SetCriticalPathPolicyParams, SetGatePolicyParams, SetIntegrationPolicyParams,
+    SetMailboxPolicyParams, SetMemoryPolicyParams, SetPreemptionPolicyParams,
+    SetProcessPolicyParams, SetProjectBudgetParams, SetProjectPromptLayoutParams,
+    SetSessionPriorityParams, SetSessionPromptLayoutParams, SetSessionRunPolicyParams,
+    SetSessionUnlimitedParams, SetShellPolicyParams, SetSourceCollectionParams,
+    SetSourceEmbeddingPolicyParams, SetSourceLabelsParams, SetSourceRetrievalPolicyParams,
+    SetTaskSchedulerPolicyParams, SetToolOutputPolicyParams, SetWorktreePolicyParams,
+    ShellPolicyParams, ShellPolicyResult, SkillCreateParams, SkillEnabledParams, SkillIdParams,
+    SkillImportParams, SkillListParams, SkillUpdateParams, SourceActionParams,
+    SourceCollectionsParams, SourceCreateFileParams, SourceCreateNoteParams, SourceCreateUrlParams,
+    SourceEmbeddingPolicyParams, SourceEmbeddingReindexParams, SourceEmbeddingStatusParams,
+    SourceGetParams, SourceImportParams, SourceIndexRebuildParams, SourceIndexStatusParams,
+    SourceListParams, SourceRetrievalPolicyParams, SourceSearchParams, SubscribeParams,
+    TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult, TaskQueueParams,
+    TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult, TerminalCloseParams,
+    TerminalOpenParams, TerminalReadParams, TerminalResizeParams, TerminalWriteParams,
+    ToolActivityParams, ToolBundleDiffParams, ToolBundleHistoryParams, ToolBundleMatrixParams,
+    ToolBundleParams, ToolOutputAuditParams, ToolOutputListParams, ToolOutputPolicyParams,
+    ToolOutputPolicyResult, ToolOutputPruneParams, ToolOutputStatusParams, UpdateAcpAgentParams,
+    UpdateAgentIdentityParams, UpdateCheckParams, UpdateDownloadParams, UpdateMcpServerParams,
+    UpdateModelPresetParams, UpdateSourceMetadataParams, UsageLedgerParams, WorkspaceFileParams,
+    WorkspaceGrepParams, WorkspaceListParams, WorkspaceSearchParams, WorkspaceTreeParams,
+    WorkspaceWriteParams, WorktreePolicyParams,
 };
 use vp_protocol::types::{
     ComputerLeaseInfo, ComputerLeaseListResult, ComputerLeaseReleaseParams,
@@ -237,6 +240,11 @@ async fn run() -> Result<()> {
         Ok(0) => {}
         Ok(expired) => tracing::info!(expired, "expired due project inbox rows"),
         Err(error) => tracing::warn!(%error, "failed to sweep project inbox expiry"),
+    }
+    match engine.sweep_agent_workspaces(Some(1_000)).await {
+        Ok(0) => {}
+        Ok(released) => tracing::info!(released, "reconciled Worker workspace leases"),
+        Err(error) => tracing::warn!(%error, "failed to reconcile Worker workspace leases"),
     }
     if let Err(error) = engine.retire_legacy_gui_leases().await {
         tracing::warn!(%error, "failed to retire legacy GUI leases");
@@ -2734,6 +2742,24 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             },
             Err(response) => response_with_id(id, response),
         },
+        // The historical `workspace.list` method is the file-browser listing.
+        // The S4 agent workspace list reuses the same method name only when the
+        // params carry an agent-shape selector; otherwise the file browser keeps
+        // the exact legacy behavior. `agent.workspace.list` is the canonical
+        // S4 name.
+        "workspace.list"
+            if request.params.get("project_id").is_some()
+                || request.params.get("identity_id").is_some()
+                || request.params.get("status").is_some() =>
+        {
+            match parse_params::<AgentWorkspaceListParams>(request.params) {
+                Ok(params) => match state.engine.list_agent_workspaces(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => workspace_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "workspace.list" => match parse_params::<WorkspaceListParams>(request.params) {
             Ok(params) => match state
                 .engine
@@ -4197,6 +4223,74 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 Err(response) => response_with_id(id, response),
             }
         }
+        "agent.workspace.list" => match parse_params::<AgentWorkspaceListParams>(request.params) {
+            Ok(params) => match state.engine.list_agent_workspaces(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => workspace_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "agent.workspace.get" | "workspace.get" => {
+            match parse_params::<AgentWorkspaceParams>(request.params) {
+                Ok(params) => match state.engine.get_agent_workspace(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => workspace_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "agent.workspace.ensure" | "workspace.ensure" => {
+            match parse_params::<AgentWorkspaceEnsureParams>(request.params) {
+                Ok(params) => match state.engine.ensure_agent_workspace(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => workspace_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "agent.workspace.land" | "workspace.land" => {
+            match parse_params::<AgentWorkspaceLandParams>(request.params) {
+                Ok(params) => match state.engine.land_agent_workspace(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => workspace_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "agent.workspace.archive" | "workspace.archive" => {
+            match parse_params::<AgentWorkspaceArchiveParams>(request.params) {
+                Ok(params) => match state.engine.archive_agent_workspace(params, false).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => workspace_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "agent.workspace.retire" | "workspace.retire" => {
+            match parse_params::<AgentWorkspaceRetireParams>(request.params) {
+                Ok(params) => match state.engine.retire_agent_workspace(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => workspace_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "agent.workspace.replay" | "workspace.replay" => {
+            match parse_params::<AgentWorkspaceReplayParams>(request.params) {
+                Ok(params) => match state.engine.replay_agent_workspaces(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => workspace_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "session.workspace" => match parse_params::<SessionWorkspaceParams>(request.params) {
+            Ok(params) => match state.engine.session_workspace(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => workspace_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
         "project.agent_identity_policy.get" => {
             match parse_params::<AgentIdentityPolicyParams>(request.params) {
                 Ok(params) => match state
@@ -5321,6 +5415,11 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             | "agent.inbox.read"
             | "agent.inbox.ack"
             | "agent.coordination.replay"
+            | "agent.workspace.ensure"
+            | "agent.workspace.land"
+            | "agent.workspace.archive"
+            | "agent.workspace.retire"
+            | "agent.workspace.replay"
             | "project.effect_policy.set"
             | "project.cache_policy.set"
             | "project.integration_policy.set"
@@ -5455,6 +5554,40 @@ fn identity_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
     RpcResponse::error(
         id,
         RpcError::with_data(rpc_code, typed.message.clone(), json!({"code": typed.code})),
+    )
+}
+
+/// Map the stable workspace taxonomy to a bounded RPC failure. The typed code is
+/// carried in `data.code`; message text is never used for classification.
+fn workspace_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
+    if let Some(typed) = error.downcast_ref::<vp_protocol::types::AgentWorkspaceError>() {
+        let rpc_code = match typed.code {
+            vp_protocol::types::agent_workspace_codes::WORKSPACE_NOT_FOUND => codes::NOT_FOUND,
+            vp_protocol::types::agent_workspace_codes::WORKSPACE_BUSY
+            | vp_protocol::types::agent_workspace_codes::WORKSPACE_CONFLICT
+            | vp_protocol::types::agent_workspace_codes::WORKSPACE_NOT_ACTIVE
+            | vp_protocol::types::agent_workspace_codes::WORKSPACE_NOT_QUIESCENT
+            | vp_protocol::types::agent_workspace_codes::WORKSPACE_NOT_ACCEPTED => codes::CONFLICT,
+            _ => codes::INVALID_PARAMS,
+        };
+        return RpcResponse::error(
+            id,
+            RpcError::with_data(rpc_code, typed.message.clone(), json!({"code": typed.code})),
+        );
+    }
+    if let Some(typed) = error.downcast_ref::<vp_protocol::types::AgentIdentityError>() {
+        let rpc_code = match typed.code {
+            vp_protocol::types::agent_identity_codes::IDENTITY_NOT_FOUND => codes::NOT_FOUND,
+            _ => codes::INVALID_PARAMS,
+        };
+        return RpcResponse::error(
+            id,
+            RpcError::with_data(rpc_code, typed.message.clone(), json!({"code": typed.code})),
+        );
+    }
+    RpcResponse::error(
+        id,
+        RpcError::new(codes::INTERNAL_ERROR, format!("{error:#}")),
     )
 }
 
@@ -5712,6 +5845,13 @@ fn spawn_coordination_sweeper(engine: Engine) {
                 }
                 Ok(_) => {}
                 Err(error) => tracing::warn!(%error, "project inbox expiry sweep failed"),
+            }
+            match engine.sweep_agent_workspaces(Some(1_000)).await {
+                Ok(released) if released > 0 => {
+                    tracing::info!(released, "Worker workspace lease sweep");
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "Worker workspace lease sweep failed"),
             }
         }
     });
@@ -7277,6 +7417,45 @@ mod agent_coordination_rpc_error_tests {
     #[test]
     fn untyped_coordination_failures_remain_internal_errors() {
         let response = coordination_error(Some(json!("4")), anyhow::anyhow!("database closed"));
+        let error = response.error.expect("error");
+        assert_eq!(error.code, codes::INTERNAL_ERROR);
+        assert!(error.data.is_none());
+    }
+
+    #[test]
+    fn workspace_busy_is_a_typed_conflict_and_imported_is_read_only() {
+        let busy = workspace_error(
+            Some(json!("9")),
+            anyhow::Error::new(vp_protocol::types::AgentWorkspaceError::new(
+                vp_protocol::types::agent_workspace_codes::WORKSPACE_BUSY,
+                "workspace is leased by session ses-1",
+            )),
+        );
+        let error = busy.error.expect("error");
+        assert_eq!(error.code, codes::CONFLICT);
+        assert_eq!(
+            error.data.expect("data")["code"],
+            vp_protocol::types::agent_workspace_codes::WORKSPACE_BUSY
+        );
+
+        let imported = workspace_error(
+            Some(json!("10")),
+            anyhow::Error::new(vp_protocol::types::AgentWorkspaceError::new(
+                vp_protocol::types::agent_workspace_codes::WORKSPACE_IMPORTED_READONLY,
+                "an imported workspace is read-only evidence",
+            )),
+        );
+        let error = imported.error.expect("error");
+        assert_eq!(error.code, codes::INVALID_PARAMS);
+        assert_eq!(
+            error.data.expect("data")["code"],
+            vp_protocol::types::agent_workspace_codes::WORKSPACE_IMPORTED_READONLY
+        );
+    }
+
+    #[test]
+    fn workspace_untyped_failures_remain_internal_errors() {
+        let response = workspace_error(Some(json!("11")), anyhow::anyhow!("git unavailable"));
         let error = response.error.expect("error");
         assert_eq!(error.code, codes::INTERNAL_ERROR);
         assert!(error.data.is_none());

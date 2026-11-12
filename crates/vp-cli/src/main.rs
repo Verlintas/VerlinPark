@@ -2608,6 +2608,52 @@ enum Command {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// List Worker component workspaces and session attachments.
+    Workspaces {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        identity: Option<String>,
+        /// active, archived, or retired.
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+    /// Show one workspace by id, or the workspace bindings of a session.
+    Workspace {
+        /// Workspace id. Omit when using --session.
+        workspace: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Explicitly land accepted workspace commits onto the component branch.
+    /// This never runs automatically and requires --yes.
+    WorkspaceLand {
+        workspace: String,
+        /// Session whose accepted commits are landed. Defaults to the
+        /// workspace's last session.
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        operator: Option<String>,
+        /// Confirm the irreversible component-branch merge.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Archive a released workspace, preserving branch and commit evidence.
+    WorkspaceArchive {
+        workspace: String,
+        /// Retire instead of archiving.
+        #[arg(long)]
+        retire: bool,
+        #[arg(long)]
+        operator: Option<String>,
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// List project inbox rows. Unread rows sort first.
     Inbox {
         identity: Option<String>,
@@ -8380,6 +8426,92 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await?
         }
+        Command::Workspaces {
+            project,
+            session,
+            identity,
+            status,
+            limit,
+        } => {
+            if project.is_none() && session.is_none() && identity.is_none() {
+                bail!("pass --project, --session, or --identity");
+            }
+            rpc(
+                &discovery,
+                "agent.workspace.list",
+                json!({
+                    "project_id": project,
+                    "session_id": session,
+                    "identity_id": identity,
+                    "status": status,
+                    "limit": limit,
+                }),
+            )
+            .await?
+        }
+        Command::Workspace { workspace, session } => match (workspace, session) {
+            (Some(workspace_id), None) => {
+                rpc(
+                    &discovery,
+                    "agent.workspace.get",
+                    json!({"workspace_id": workspace_id}),
+                )
+                .await?
+            }
+            (None, Some(session_id)) => {
+                rpc(
+                    &discovery,
+                    "session.workspace",
+                    json!({"session_id": session_id}),
+                )
+                .await?
+            }
+            (Some(_), Some(_)) => bail!("pass either a workspace id or --session, not both"),
+            (None, None) => bail!("pass a workspace id or --session"),
+        },
+        Command::WorkspaceLand {
+            workspace,
+            session,
+            operator,
+            yes,
+        } => {
+            if !yes {
+                bail!("workspace-land requires --yes to confirm the component-branch merge");
+            }
+            rpc(
+                &discovery,
+                "agent.workspace.land",
+                json!({
+                    "workspace_id": workspace,
+                    "session_id": session,
+                    "operator": operator,
+                    "confirm": true,
+                }),
+            )
+            .await?
+        }
+        Command::WorkspaceArchive {
+            workspace,
+            retire,
+            operator,
+            reason,
+        } => {
+            let method = if retire {
+                "agent.workspace.retire"
+            } else {
+                "agent.workspace.archive"
+            };
+            rpc(
+                &discovery,
+                method,
+                json!({
+                    "workspace_id": workspace,
+                    "operator": operator,
+                    "reason": reason,
+                }),
+            )
+            .await?
+        }
         Command::Inbox {
             identity,
             project,
@@ -14045,7 +14177,147 @@ fn coordination_lines(value: &Value) -> Option<Vec<String>> {
     None
 }
 
+fn workspace_line(workspace: &Value) -> String {
+    let lease = if workspace["lease_active"].as_bool().unwrap_or(false) {
+        " · live lease"
+    } else {
+        ""
+    };
+    format!(
+        "{}  {}  {}  {}  {}{}",
+        workspace["id"].as_str().unwrap_or("?"),
+        workspace["identity_id"].as_str().unwrap_or("?"),
+        workspace["component"].as_str().unwrap_or("?"),
+        workspace["status"].as_str().unwrap_or("?"),
+        workspace["branch"].as_str().unwrap_or("?"),
+        lease
+    )
+}
+
+fn workspace_session_line(session: &Value) -> String {
+    format!(
+        "{}  {}  {}  {}  {}",
+        session["session_id"].as_str().unwrap_or("?"),
+        session["identity_id"].as_str().unwrap_or("?"),
+        session["workspace_id"].as_str().unwrap_or("?"),
+        session["status"].as_str().unwrap_or("?"),
+        session["branch"].as_str().unwrap_or("?")
+    )
+}
+
+fn workspace_lines(value: &Value) -> Option<Vec<String>> {
+    if let Some(bindings) = value.get("bindings").and_then(Value::as_array) {
+        if bindings.is_empty() {
+            return Some(vec![format!(
+                "session {} has no Worker workspaces.",
+                value["session_id"].as_str().unwrap_or("?")
+            )]);
+        }
+        let mut lines = vec![format!(
+            "session {} · {} Worker workspace(s)",
+            value["session_id"].as_str().unwrap_or("?"),
+            bindings.len()
+        )];
+        lines.extend(bindings.iter().map(workspace_session_line));
+        return Some(lines);
+    }
+    if value.get("landed_commit").is_some() {
+        let status = if value["already_up_to_date"].as_bool().unwrap_or(false) {
+            "already up to date"
+        } else {
+            "landed"
+        };
+        let mut lines = vec![format!(
+            "workspace {} · {} · session {}",
+            value["workspace"]["id"].as_str().unwrap_or("?"),
+            status,
+            value["session_id"].as_str().unwrap_or("?")
+        )];
+        lines.push(format!(
+            "component {} -> {} ({} commit(s))",
+            value["previous_component_commit"].as_str().unwrap_or("?"),
+            value["landed_commit"].as_str().unwrap_or("?"),
+            value["commits"].as_array().map(Vec::len).unwrap_or(0)
+        ));
+        lines.push(format!(
+            "branch {} · worktree {}",
+            value["workspace"]["branch"].as_str().unwrap_or("?"),
+            value["workspace"]["worktree_path"].as_str().unwrap_or("?")
+        ));
+        return Some(lines);
+    }
+    if value.get("workspaces").is_some_and(Value::is_array) {
+        let workspaces = value["workspaces"].as_array()?;
+        let sessions = value["sessions"].as_array();
+        if workspaces.is_empty() && sessions.is_none_or(Vec::is_empty) {
+            return Some(vec!["No worker workspaces.".to_string()]);
+        }
+        let mut lines = vec![format!(
+            "{} worker workspace(s){}",
+            workspaces.len(),
+            sessions
+                .map(|rows| format!(" · {} session binding(s)", rows.len()))
+                .unwrap_or_default()
+        )];
+        lines.extend(workspaces.iter().map(workspace_line));
+        if let Some(sessions) = sessions {
+            lines.extend(sessions.iter().map(workspace_session_line));
+        }
+        return Some(lines);
+    }
+    if let Some(workspace) = value.get("workspace")
+        && workspace.is_object()
+    {
+        let mut lines = vec![workspace_line(workspace)];
+        if let Some(rows) = value.get("sessions").and_then(Value::as_array) {
+            lines.extend(rows.iter().map(workspace_session_line));
+        }
+        if value.get("created").is_some() || value.get("attached").is_some() {
+            lines.push(format!(
+                "created {} · attached {}",
+                value["created"].as_bool().unwrap_or(false),
+                value["attached"].as_bool().unwrap_or(false)
+            ));
+        }
+        if value.get("changed").is_some() {
+            lines.push(format!(
+                "changed {}",
+                value["changed"].as_bool().unwrap_or(false)
+            ));
+        }
+        if let Some(binding) = value.get("session")
+            && binding.is_object()
+        {
+            lines.push(workspace_session_line(binding));
+        }
+        return Some(lines);
+    }
+    if value.get("project_id").is_some()
+        && value.get("workspaces").is_some()
+        && value.get("events").is_some()
+    {
+        return Some(vec![format!(
+            "workspace replay: workspaces {} · sessions {} · events {} · {}",
+            value["workspaces"].as_u64().unwrap_or(0),
+            value["sessions"].as_u64().unwrap_or(0),
+            value["events"].as_u64().unwrap_or(0),
+            if value["consistent"].as_bool().unwrap_or(false) {
+                "consistent"
+            } else {
+                "drift detected"
+            }
+        )]);
+    }
+    None
+}
+
 fn print_human(value: &Value) {
+    if let Some(lines) = workspace_lines(value) {
+        for line in lines {
+            println!("{line}");
+        }
+        return;
+    }
     if let Some(lines) = coordination_lines(value) {
         for line in lines {
             println!("{line}");
@@ -23545,5 +23817,101 @@ mod coordination_cli_tests {
         let rendered = coordination_lines(&replay).unwrap().join("\n");
         assert!(rendered.contains("assignments 1"));
         assert!(rendered.contains("consistent"));
+    }
+
+    #[test]
+    fn workspace_commands_parse_and_render_without_mutation_shortcuts() {
+        let cli = Cli::try_parse_from([
+            "vp",
+            "workspaces",
+            "--project",
+            "prj-1",
+            "--status",
+            "active",
+            "--limit",
+            "25",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Workspaces {
+                project,
+                session,
+                identity,
+                status,
+                limit,
+            } => {
+                assert_eq!(project.as_deref(), Some("prj-1"));
+                assert!(session.is_none());
+                assert!(identity.is_none());
+                assert_eq!(status.as_deref(), Some("active"));
+                assert_eq!(limit, 25);
+            }
+            other => panic!("expected workspaces, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["vp", "workspace", "wsp-1"]).unwrap();
+        assert!(matches!(cli.command, Command::Workspace { .. }));
+        let cli = Cli::try_parse_from(["vp", "workspace-land", "wsp-1", "--yes"]).unwrap();
+        match cli.command {
+            Command::WorkspaceLand { workspace, yes, .. } => {
+                assert_eq!(workspace, "wsp-1");
+                assert!(yes);
+            }
+            other => panic!("expected workspace-land, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from([
+            "vp",
+            "workspace-archive",
+            "wsp-1",
+            "--retire",
+            "--reason",
+            "done",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::WorkspaceArchive {
+                workspace,
+                retire,
+                reason,
+                ..
+            } => {
+                assert_eq!(workspace, "wsp-1");
+                assert!(retire);
+                assert_eq!(reason.as_deref(), Some("done"));
+            }
+            other => panic!("expected workspace-archive, got {other:?}"),
+        }
+
+        let list = json!({
+            "workspaces": [{
+                "id": "wsp-1",
+                "identity_id": "agt-1",
+                "component": "auth",
+                "branch": "verlinpark/components/auth-1--agt-1",
+                "status": "active",
+                "lease_active": true
+            }],
+            "sessions": [{
+                "session_id": "ses-1",
+                "identity_id": "agt-1",
+                "workspace_id": "wsp-1",
+                "status": "active",
+                "branch": "verlinpark/sessions/ses-1/worker-agt-1"
+            }]
+        });
+        let rendered = workspace_lines(&list).unwrap().join("\n");
+        assert!(rendered.contains("1 worker workspace(s)"));
+        assert!(rendered.contains("live lease"));
+        let land = json!({
+            "workspace": {"id": "wsp-1", "branch": "b", "worktree_path": "/w"},
+            "session_id": "ses-1",
+            "previous_component_commit": "a",
+            "landed_commit": "b",
+            "already_up_to_date": false,
+            "commits": ["c"]
+        });
+        let rendered = workspace_lines(&land).unwrap().join("\n");
+        assert!(rendered.contains("landed"));
+        assert!(rendered.contains("1 commit(s)"));
     }
 }

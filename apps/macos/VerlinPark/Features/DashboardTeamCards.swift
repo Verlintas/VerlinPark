@@ -2426,6 +2426,113 @@ struct ProjectIdentitiesCard: View {
     }
 }
 
+struct ProjectWorkspacesCard: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Worker workspaces")
+                    Text(model.selectedProject?.name ?? "No project selected")
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                        .lineLimit(1)
+                }
+                Spacer()
+                if model.agentWorkspacesBusy {
+                    ProgressView().controlSize(.small)
+                }
+                if !model.agentWorkspaces.isEmpty {
+                    Text("\(model.agentWorkspaces.count)")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                Button("Refresh") {
+                    Task { await model.loadAgentWorkspaces() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.selectedProjectID == nil || model.agentWorkspacesBusy)
+            }
+            if model.selectedProjectID == nil {
+                Text("Select a project to inspect Worker component workspaces.")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            } else if model.agentWorkspaces.isEmpty {
+                Text(model.agentWorkspacesStatus ?? "No Worker workspaces.")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            } else {
+                VStack(spacing: 6) {
+                    ForEach(model.agentWorkspaces) { workspace in
+                        HStack(spacing: 8) {
+                            Image(systemName: "shippingbox")
+                                .font(.system(size: 10))
+                                .foregroundStyle(statusColor(workspace.status))
+                                .frame(width: 14)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(workspace.component)
+                                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                    .lineLimit(1)
+                                Text(subtitle(workspace))
+                                    .font(.system(size: 8, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                            Spacer()
+                            if workspace.isImported {
+                                Text("imported")
+                                    .font(.system(size: 8, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                Text(workspace.leaseActive ? "leased" : workspace.status)
+                                    .font(.system(size: 8, design: .monospaced))
+                                    .foregroundStyle(
+                                        workspace.leaseActive
+                                            ? VPTheme.warning
+                                            : statusColor(workspace.status)
+                                    )
+                            }
+                        }
+                        .padding(8)
+                        .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 8))
+                    }
+                }
+            }
+            Text("Land and archive are explicit operator/CLI actions; views never mutate a component branch.")
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.tertiary)
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 0)
+        .task { await model.loadAgentWorkspaces() }
+    }
+
+    private func subtitle(_ workspace: AgentWorkspace) -> String {
+        var parts = [workspace.identityId]
+        if let session = workspace.lastSessionId, !session.isEmpty {
+            parts.append("session \(session.prefix(8))")
+        }
+        parts.append(workspace.branch)
+        return parts.joined(separator: " · ")
+    }
+
+    private func statusColor(_ status: String) -> Color {
+        switch status {
+        case "active": .green
+        case "archived": .orange
+        case "retired": .secondary
+        default: .secondary
+        }
+    }
+}
+
 struct ProgramsCard: View {
     @Environment(AppModel.self) private var model
     @State private var showComposer = false

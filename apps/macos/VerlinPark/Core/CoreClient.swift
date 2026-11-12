@@ -1760,6 +1760,25 @@ actor CoreClient {
             .assignments
     }
 
+    /// Read-only project Worker workspace metadata. No attach/land/archive
+    /// action is exposed from a view; those are explicit operator/CLI actions.
+    func agentWorkspaces(projectID: String) async throws -> AgentWorkspaceListResult {
+        let params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "limit": .number(100),
+        ]
+        return try await request(method: "agent.workspace.list", params: params)
+            .decode(AgentWorkspaceListResult.self)
+    }
+
+    /// Read-only session workspace bindings.
+    func sessionWorkspaces(sessionID: String) async throws -> [SessionWorkerWorkspace] {
+        let params: [String: JSONValue] = ["session_id": .string(sessionID)]
+        return try await request(method: "session.workspace", params: params)
+            .decode(SessionWorkspaceResult.self)
+            .bindings
+    }
+
     /// Read-only project inbox metadata. Pull-based delivery is unchanged by
     /// this call; the app does not mark messages read from the dashboard.
     func agentInbox(projectID: String, limit: Int = 50) async throws -> AgentInboxListResult {

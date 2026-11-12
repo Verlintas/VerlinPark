@@ -1537,6 +1537,15 @@ struct AgentSpec {
     session_branch: String,
     write_scope: Vec<String>,
     base_commit: String,
+    /// Project workspace id when this Worker run is bound to a durable
+    /// component workspace. `None` keeps the legacy task-worktree flow.
+    workspace_id: Option<String>,
+    /// Session workspace binding id. A Worker run owns the workspace worktree;
+    /// a Labour run branches from it and merges back into it.
+    session_workspace_id: Option<String>,
+    /// Parent Worker session workspace binding id for a Labour child. `None`
+    /// means the Labour run shares its parent worktree (legacy behavior).
+    parent_workspace_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -3295,6 +3304,10 @@ impl AgentService {
             session_branch: session_branch.clone(),
             write_scope: Vec::new(),
             base_commit: session_head.clone(),
+
+            workspace_id: None,
+            session_workspace_id: None,
+            parent_workspace_id: None,
         };
         let worker_spec = AgentSpec {
             id: agent.id.clone(),
@@ -3315,6 +3328,10 @@ impl AgentService {
             session_branch: session_branch.clone(),
             write_scope: Vec::new(),
             base_commit: imported.commit.clone(),
+
+            workspace_id: None,
+            session_workspace_id: None,
+            parent_workspace_id: None,
         };
         let provenance = VerifierProvenance {
             source: Some(MERGE_SOURCE_REMOTE.to_string()),
@@ -3952,6 +3969,10 @@ impl AgentService {
             session_branch: session_branch.clone(),
             write_scope: Vec::new(),
             base_commit: base_commit.clone(),
+
+            workspace_id: None,
+            session_workspace_id: None,
+            parent_workspace_id: None,
         };
         let worker_spec = AgentSpec {
             id: agent.id.clone(),
@@ -3972,6 +3993,10 @@ impl AgentService {
             session_branch: session_branch.clone(),
             write_scope: Vec::new(),
             base_commit: base_commit.clone(),
+
+            workspace_id: None,
+            session_workspace_id: None,
+            parent_workspace_id: None,
         };
         let verification = verify_worker(
             &self.engine,
@@ -4055,6 +4080,10 @@ impl AgentService {
             session_branch,
             write_scope: Vec::new(),
             base_commit: entry.base_commit.clone(),
+
+            workspace_id: None,
+            session_workspace_id: None,
+            parent_workspace_id: None,
         };
         process_merge_entry(
             &self.engine,
@@ -4311,6 +4340,10 @@ impl AgentService {
             session_branch: session_branch.clone(),
             write_scope: Vec::new(),
             base_commit: base_commit.clone(),
+
+            workspace_id: None,
+            session_workspace_id: None,
+            parent_workspace_id: None,
         };
         emit(
             &self.engine,
@@ -4581,6 +4614,10 @@ impl AgentService {
             session_branch: session_branch.clone(),
             write_scope: Vec::new(),
             base_commit: base_commit.clone(),
+
+            workspace_id: None,
+            session_workspace_id: None,
+            parent_workspace_id: None,
         };
         let worker_spec = AgentSpec {
             id: worker.id.clone(),
@@ -4601,6 +4638,10 @@ impl AgentService {
             session_branch: session_branch.clone(),
             write_scope: Vec::new(),
             base_commit: base_commit.clone(),
+
+            workspace_id: None,
+            session_workspace_id: None,
+            parent_workspace_id: None,
         };
         let verification = verify_worker(
             &self.engine,
@@ -8529,6 +8570,10 @@ impl AgentService {
                 session_branch: branch,
                 write_scope: Vec::new(),
                 base_commit: session.base_commit.clone().unwrap_or_default(),
+
+                workspace_id: None,
+                session_workspace_id: None,
+                parent_workspace_id: None,
             };
             let system =
                 role_system_prompt(spec.role, &project, &session, &spec, &session.goal).render();
@@ -8724,6 +8769,10 @@ impl AgentService {
             session_branch: branch,
             write_scope: Vec::new(),
             base_commit: session.base_commit.clone().unwrap_or_default(),
+
+            workspace_id: None,
+            session_workspace_id: None,
+            parent_workspace_id: None,
         };
         let system = role_system_prompt(spec.role, project, session, &spec, &session.goal).render();
         let dynamic_mcp =
@@ -9694,6 +9743,10 @@ async fn run_plan_resume(
         session_branch,
         write_scope: Vec::new(),
         base_commit: session.base_commit.clone().unwrap_or_default(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     let budget = SessionBudget::new(
         session.token_budget,
@@ -10059,6 +10112,10 @@ async fn run_agent(
         session_branch,
         write_scope: Vec::new(),
         base_commit: session.base_commit.clone().unwrap_or_default(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     let budget = SessionBudget::new(
         session.token_budget,
@@ -10506,7 +10563,7 @@ pub(crate) fn normalize_scope(scope: &str) -> String {
         .to_string()
 }
 
-fn path_in_scope(path: &str, scopes: &[String]) -> bool {
+pub(crate) fn path_in_scope(path: &str, scopes: &[String]) -> bool {
     if scopes.is_empty() {
         return true;
     }
@@ -10578,6 +10635,9 @@ fn remote_integrator_spec(
         session_branch: session.branch.clone().unwrap_or_else(|| branch.to_string()),
         write_scope: Vec::new(),
         base_commit: base_commit.to_string(),
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     }
 }
 
@@ -10802,6 +10862,19 @@ async fn download_remote_bundle(
             let _ = tokio::fs::remove_file(&path).await;
             Err(error)
         }
+    }
+}
+
+/// Refresh a workspace-bound run's base commit after its in-process workspace
+/// lock is acquired. Without this, two serialized plan Workers on one workspace
+/// would each treat the other's commit as their own change and enqueue it again.
+async fn refresh_workspace_base(spec: &mut AgentSpec) {
+    if spec.workspace_id.is_none() {
+        return;
+    }
+    let path = spec.worktree.clone();
+    if let Ok(Ok(head)) = tokio::task::spawn_blocking(move || worktree::head_commit(&path)).await {
+        spec.base_commit = head;
     }
 }
 
@@ -11644,6 +11717,10 @@ async fn verify_worker(
         session_branch: manager_spec.session_branch.clone(),
         write_scope: Vec::new(),
         base_commit: worker_spec.base_commit.clone(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     let focus = match worker_spec.profile {
         AgentProfile::Research => {
@@ -12469,6 +12546,10 @@ async fn delegate_acp(
         session_branch: parent_spec.session_branch.clone(),
         write_scope: write_scope.clone(),
         base_commit: info.base_commit.clone(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     emit(
         engine,
@@ -13092,6 +13173,183 @@ async fn finish_worker(
                     success: false,
                 })
             }
+        }
+    }
+}
+
+/// Finish one workspace-bound Labour run. The Labour commit is merged into the
+/// parent Worker session workspace with scope/diff checks and an exact
+/// rollback. This is internal Worker integration, not a Verifier/Integrator
+/// bypass: the resulting Worker commit still enters the normal Verifier ->
+/// merge queue -> deterministic Integrator path.
+async fn finish_labour(
+    engine: &Engine,
+    session: &Session,
+    parent_spec: &AgentSpec,
+    labour_spec: &AgentSpec,
+    summary: &str,
+) -> Result<WorkerFinish> {
+    let commit = match commit_worker(labour_spec, &labour_spec.name).await {
+        Ok(commit) => commit,
+        Err(error) => {
+            let detail = format!("Labour commit failed: {error}");
+            engine
+                .update_agent_status(&labour_spec.id, "failed")
+                .await?;
+            emit(
+                engine,
+                &session.id,
+                labour_spec,
+                "agent.finished",
+                serde_json::json!({
+                    "status": "failed",
+                    "summary": truncate(&detail),
+                    "merged": false,
+                    "worktree": labour_spec.worktree,
+                    "branch": labour_spec.branch,
+                    "parent_workspace_id": labour_spec.parent_workspace_id,
+                }),
+            )
+            .await?;
+            return Ok(WorkerFinish::Done {
+                report: detail,
+                success: false,
+            });
+        }
+    };
+    let Some(commit) = commit else {
+        engine.update_agent_status(&labour_spec.id, "idle").await?;
+        emit(
+            engine,
+            &session.id,
+            labour_spec,
+            "agent.finished",
+            serde_json::json!({
+                "status": "idle",
+                "summary": truncate(summary),
+                "merged": false,
+                "worktree": labour_spec.worktree,
+                "branch": labour_spec.branch,
+                "parent_workspace_id": labour_spec.parent_workspace_id,
+            }),
+        )
+        .await?;
+        return Ok(WorkerFinish::Done {
+            report: format!("no changes to merge\n{}", truncate(summary)),
+            success: !worker_report_reports_failure(summary),
+        });
+    };
+    record_worker_commit_effect(engine, session, labour_spec, &commit).await;
+    let workspace_id = parent_spec
+        .workspace_id
+        .as_deref()
+        .ok_or_else(|| anyhow!("Labour workspace binding has no parent project workspace"))?;
+    let outcome = engine
+        .merge_labour_commit(
+            workspace_id,
+            &session.id,
+            &labour_spec.id,
+            labour_spec.task_id.as_deref(),
+            &commit,
+            &labour_spec.write_scope,
+        )
+        .await;
+    match outcome {
+        Ok(outcome) if outcome.merged => {
+            engine.update_agent_status(&labour_spec.id, "idle").await?;
+            emit(
+                engine,
+                &session.id,
+                labour_spec,
+                "agent.finished",
+                serde_json::json!({
+                    "status": "idle",
+                    "summary": truncate(summary),
+                    "commit": commit,
+                    "merged": true,
+                    "merged_into": "worker_workspace",
+                    "pre_merge": outcome.pre_merge,
+                    "post_merge": outcome.post_merge,
+                    "paths": outcome.paths,
+                    "worktree": labour_spec.worktree,
+                    "branch": labour_spec.branch,
+                    "parent_workspace_id": labour_spec.parent_workspace_id,
+                }),
+            )
+            .await?;
+            Ok(WorkerFinish::Done {
+                report: format!(
+                    "merged into Worker workspace: true\ncommit: {}\nworker commit: {}\npaths: {}\n{}",
+                    commit,
+                    outcome.post_merge,
+                    truncate(&outcome.paths.join(", ")),
+                    truncate(summary)
+                ),
+                success: true,
+            })
+        }
+        Ok(outcome) => {
+            let detail = truncate(&outcome.detail);
+            engine
+                .update_agent_status(&labour_spec.id, "failed")
+                .await?;
+            emit(
+                engine,
+                &session.id,
+                labour_spec,
+                "agent.finished",
+                serde_json::json!({
+                    "status": "failed",
+                    "summary": truncate(&detail),
+                    "commit": commit,
+                    "merged": false,
+                    "merged_into": "worker_workspace",
+                    "pre_merge": outcome.pre_merge,
+                    "post_merge": outcome.post_merge,
+                    "conflicts": outcome.conflicts,
+                    "paths": outcome.paths,
+                    "worktree": labour_spec.worktree,
+                    "branch": labour_spec.branch,
+                    "parent_workspace_id": labour_spec.parent_workspace_id,
+                }),
+            )
+            .await?;
+            Ok(WorkerFinish::Done {
+                report: format!(
+                    "internal Worker integration failed; Worker HEAD is unchanged at {}\n{}\n{}",
+                    outcome.pre_merge,
+                    detail,
+                    truncate(summary)
+                ),
+                success: false,
+            })
+        }
+        Err(error) => {
+            let detail = truncate(&format!("{error:#}"));
+            engine
+                .update_agent_status(&labour_spec.id, "failed")
+                .await?;
+            emit(
+                engine,
+                &session.id,
+                labour_spec,
+                "agent.finished",
+                serde_json::json!({
+                    "status": "failed",
+                    "summary": detail,
+                    "commit": commit,
+                    "merged": false,
+                    "merged_into": "worker_workspace",
+                    "worktree": labour_spec.worktree,
+                    "branch": labour_spec.branch,
+                    "parent_workspace_id": labour_spec.parent_workspace_id,
+                }),
+            )
+            .await?;
+            Ok(WorkerFinish::Done {
+                report: format!("internal Worker integration failed: {detail}"),
+                success: false,
+            })
         }
     }
 }
@@ -18333,9 +18591,47 @@ async fn run_loop_body(
                                     .set_agent_profile(&child.id, child_profile.as_str())
                                     .await?;
                                 let write_scope = parse_write_scope(&input)?;
-                                let (child_worktree, child_branch, child_base, child_scope) =
-                                    match role {
-                                        AgentRole::Worker => {
+                                let workspace_binding = if role == AgentRole::Worker {
+                                    engine
+                                        .attach_worker_workspace_for_run(
+                                            &session.id,
+                                            title.as_deref(),
+                                            spec.department.as_deref(),
+                                        )
+                                        .await?
+                                } else {
+                                    None
+                                };
+                                let labour_child_worktree = role == AgentRole::Labour
+                                    && spec.session_workspace_id.is_some();
+                                let (
+                                    child_worktree,
+                                    child_branch,
+                                    child_base,
+                                    child_scope,
+                                    child_workspace_id,
+                                    child_session_workspace_id,
+                                    child_parent_workspace_id,
+                                ) = match role {
+                                    AgentRole::Worker => match workspace_binding {
+                                        Some(binding) => {
+                                            let head_path =
+                                                PathBuf::from(&binding.session.worktree_path);
+                                            let head = tokio::task::spawn_blocking(move || {
+                                                worktree::head_commit(&head_path)
+                                            })
+                                            .await??;
+                                            (
+                                                PathBuf::from(&binding.session.worktree_path),
+                                                binding.session.branch.clone(),
+                                                head,
+                                                write_scope,
+                                                Some(binding.workspace.id.clone()),
+                                                Some(binding.session.id.clone()),
+                                                None,
+                                            )
+                                        }
+                                        None => {
                                             let info = engine
                                                 .create_task_worktree(
                                                     &project.root,
@@ -18345,38 +18641,86 @@ async fn run_loop_body(
                                                     &spec.session_branch,
                                                 )
                                                 .await?;
-                                            (info.path, info.branch, info.base_commit, write_scope)
+                                            (
+                                                info.path,
+                                                info.branch,
+                                                info.base_commit,
+                                                write_scope,
+                                                None,
+                                                None,
+                                                None,
+                                            )
                                         }
-                                        AgentRole::Manager => (
-                                            spec.session_worktree.clone(),
-                                            spec.session_branch.clone(),
-                                            spec.base_commit.clone(),
-                                            Vec::new(),
-                                        ),
-                                        AgentRole::Labour => (
-                                            spec.worktree.clone(),
-                                            spec.branch.clone(),
-                                            spec.base_commit.clone(),
+                                    },
+                                    AgentRole::Manager => (
+                                        spec.session_worktree.clone(),
+                                        spec.session_branch.clone(),
+                                        spec.base_commit.clone(),
+                                        Vec::new(),
+                                        None,
+                                        None,
+                                        None,
+                                    ),
+                                    AgentRole::Labour if labour_child_worktree => {
+                                        let info = engine
+                                            .create_task_worktree(
+                                                &project.root,
+                                                &project.id,
+                                                &session.id,
+                                                &child.id,
+                                                &spec.branch,
+                                            )
+                                            .await?;
+                                        (
+                                            info.path,
+                                            info.branch,
+                                            info.base_commit,
                                             spec.write_scope.clone(),
-                                        ),
-                                        AgentRole::Leader | AgentRole::Scout => (
-                                            spec.session_worktree.clone(),
-                                            spec.session_branch.clone(),
-                                            spec.base_commit.clone(),
-                                            Vec::new(),
-                                        ),
-                                        AgentRole::Verifier => (
-                                            spec.worktree.clone(),
-                                            spec.branch.clone(),
-                                            spec.base_commit.clone(),
-                                            Vec::new(),
-                                        ),
-                                    };
+                                            None,
+                                            None,
+                                            spec.session_workspace_id.clone(),
+                                        )
+                                    }
+                                    AgentRole::Labour => (
+                                        spec.worktree.clone(),
+                                        spec.branch.clone(),
+                                        spec.base_commit.clone(),
+                                        spec.write_scope.clone(),
+                                        None,
+                                        None,
+                                        None,
+                                    ),
+                                    AgentRole::Leader | AgentRole::Scout => (
+                                        spec.session_worktree.clone(),
+                                        spec.session_branch.clone(),
+                                        spec.base_commit.clone(),
+                                        Vec::new(),
+                                        None,
+                                        None,
+                                        None,
+                                    ),
+                                    AgentRole::Verifier => (
+                                        spec.worktree.clone(),
+                                        spec.branch.clone(),
+                                        spec.base_commit.clone(),
+                                        Vec::new(),
+                                        None,
+                                        None,
+                                        None,
+                                    ),
+                                };
                                 engine
                                     .set_agent_worktree(
                                         &child.id,
                                         &child_worktree.to_string_lossy(),
                                         &child_branch,
+                                    )
+                                    .await?;
+                                engine
+                                    .set_agent_workspace_binding(
+                                        &child.id,
+                                        child_workspace_id.as_deref(),
+                                        child_parent_workspace_id.as_deref(),
                                     )
                                     .await?;
                                 engine
@@ -18388,7 +18732,7 @@ async fn run_loop_body(
                                         spec.department.clone(),
                                     )
                                     .await?;
-                                let child_spec = AgentSpec {
+                                let mut child_spec = AgentSpec {
                                     id: child.id.clone(),
                                     role,
                                     name: child_name.clone(),
@@ -18411,6 +18755,9 @@ async fn run_loop_body(
                                     session_branch: spec.session_branch.clone(),
                                     write_scope: child_scope,
                                     base_commit: child_base,
+                                    workspace_id: child_workspace_id,
+                                    session_workspace_id: child_session_workspace_id,
+                                    parent_workspace_id: child_parent_workspace_id,
                                 };
                                 emit(
                                     engine,
@@ -18426,21 +18773,48 @@ async fn run_loop_body(
                                 .await?;
                                 let mut child_conversation =
                                     vec![ChatMessage::user(child_objective.clone())];
-                                let child_result = run_loop(
-                                    engine,
-                                    config,
-                                    session,
-                                    project,
-                                    control,
-                                    budget,
-                                    &child_spec,
-                                    &child_objective,
-                                    &mut child_conversation,
-                                    None,
-                                    false,
-                                    None,
-                                )
-                                .await;
+                                let workspace_lock = child_spec
+                                    .workspace_id
+                                    .as_ref()
+                                    .map(|workspace_id| engine.workspace_run_lock(workspace_id));
+                                let child_result = match workspace_lock {
+                                    Some(lock) => {
+                                        let _guard = lock.lock().await;
+                                        refresh_workspace_base(&mut child_spec).await;
+                                        run_loop(
+                                            engine,
+                                            config,
+                                            session,
+                                            project,
+                                            control,
+                                            budget,
+                                            &child_spec,
+                                            &child_objective,
+                                            &mut child_conversation,
+                                            None,
+                                            false,
+                                            None,
+                                        )
+                                        .await
+                                    }
+                                    None => {
+                                        run_loop(
+                                            engine,
+                                            config,
+                                            session,
+                                            project,
+                                            control,
+                                            budget,
+                                            &child_spec,
+                                            &child_objective,
+                                            &mut child_conversation,
+                                            None,
+                                            false,
+                                            None,
+                                        )
+                                        .await
+                                    }
+                                };
                                 match child_result {
                                     Ok(LoopOutcome::Verdict(_)) => ToolOutput::error(
                                         "a child agent returned a verdict unexpectedly",
@@ -18470,6 +18844,41 @@ async fn run_loop_body(
                                                 WorkerFinish::Done { report, success } => {
                                                     let text = format!(
                                                         "Worker {} finished:\n{}",
+                                                        child_name, report
+                                                    );
+                                                    if success {
+                                                        ToolOutput::ok(text)
+                                                    } else {
+                                                        ToolOutput::error(text)
+                                                    }
+                                                }
+                                                WorkerFinish::Cancelled => {
+                                                    return Ok(LoopOutcome::Cancelled);
+                                                }
+                                                WorkerFinish::BudgetExceeded(stop) => {
+                                                    if stop.is_abortive() {
+                                                        return Ok(LoopOutcome::BudgetExceeded(
+                                                            stop,
+                                                        ));
+                                                    }
+                                                    ToolOutput::error(stop.summary())
+                                                }
+                                            }
+                                        } else if role == AgentRole::Labour
+                                            && child_spec.parent_workspace_id.is_some()
+                                        {
+                                            match finish_labour(
+                                                engine,
+                                                session,
+                                                spec,
+                                                &child_spec,
+                                                &summary,
+                                            )
+                                            .await?
+                                            {
+                                                WorkerFinish::Done { report, success } => {
+                                                    let text = format!(
+                                                        "Labour {} finished:\n{}",
                                                         child_name, report
                                                     );
                                                     if success {
@@ -22578,6 +22987,10 @@ async fn run_scout(
         session_branch: parent.session_branch.clone(),
         write_scope: Vec::new(),
         base_commit: parent.base_commit.clone(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     emit(
         engine,
@@ -23076,17 +23489,43 @@ async fn run_parallel_workers(
                 &model_for(config, AgentRole::Worker),
             )
             .await?;
-        let info = engine
-            .create_task_worktree(
-                &project.root,
-                &project.id,
-                &session.id,
-                &child.id,
-                &spec.session_branch,
-            )
+        let workspace_binding = engine
+            .attach_worker_workspace_for_run(&session.id, None, spec.department.as_deref())
             .await?;
+        let (info, workspace_id, session_workspace_id) = match workspace_binding {
+            Some(binding) => {
+                let head_path = PathBuf::from(&binding.session.worktree_path);
+                let head = tokio::task::spawn_blocking(move || worktree::head_commit(&head_path))
+                    .await??;
+                (
+                    crate::worktree::WorktreeInfo {
+                        path: PathBuf::from(&binding.session.worktree_path),
+                        branch: binding.session.branch.clone(),
+                        base_commit: head,
+                    },
+                    Some(binding.workspace.id),
+                    Some(binding.session.id),
+                )
+            }
+            None => (
+                engine
+                    .create_task_worktree(
+                        &project.root,
+                        &project.id,
+                        &session.id,
+                        &child.id,
+                        &spec.session_branch,
+                    )
+                    .await?,
+                None,
+                None,
+            ),
+        };
         engine
             .set_agent_worktree(&child.id, &info.path.to_string_lossy(), &info.branch)
+            .await?;
+        engine
+            .set_agent_workspace_binding(&child.id, workspace_id.as_deref(), None)
             .await?;
         let child_spec = AgentSpec {
             id: child.id.clone(),
@@ -23107,6 +23546,9 @@ async fn run_parallel_workers(
             session_branch: spec.session_branch.clone(),
             write_scope: task.scope.clone(),
             base_commit: info.base_commit,
+            workspace_id,
+            session_workspace_id,
+            parent_workspace_id: None,
         };
         emit(
             engine,
@@ -23128,20 +23570,32 @@ async fn run_parallel_workers(
     let futures = prepared
         .iter_mut()
         .map(|(child_spec, objective, conversation)| {
-            run_loop(
-                engine,
-                config,
-                session,
-                project,
-                control,
-                budget,
-                child_spec,
-                objective,
-                conversation,
-                None,
-                false,
-                None,
-            )
+            let workspace_lock = child_spec
+                .workspace_id
+                .as_ref()
+                .map(|workspace_id| engine.workspace_run_lock(workspace_id));
+            async move {
+                let _guard = match workspace_lock {
+                    Some(lock) => Some(lock.lock_owned().await),
+                    None => None,
+                };
+                refresh_workspace_base(child_spec).await;
+                run_loop(
+                    engine,
+                    config,
+                    session,
+                    project,
+                    control,
+                    budget,
+                    child_spec,
+                    objective,
+                    conversation,
+                    None,
+                    false,
+                    None,
+                )
+                .await
+            }
         });
     let results = futures_util::future::join_all(futures).await;
 
@@ -24338,6 +24792,10 @@ async fn ensure_plan_manager(
         session_branch,
         write_scope: Vec::new(),
         base_commit: session.base_commit.clone().unwrap_or_default(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     };
     engine
         .set_agent_worktree(&agent.id, &spec.worktree.to_string_lossy(), &spec.branch)
@@ -24740,17 +25198,44 @@ async fn execute_team_plan(
                     Some(task.department.clone()),
                 )
                 .await?;
-            let info = engine
-                .create_task_worktree(
-                    &project.root,
-                    &project.id,
-                    &session.id,
-                    &task.id,
-                    &manager_spec.session_branch,
-                )
+            let workspace_binding = engine
+                .attach_worker_workspace_for_run(&session.id, None, Some(task.department.as_str()))
                 .await?;
+            let (info, workspace_id, session_workspace_id) = match workspace_binding {
+                Some(binding) => {
+                    let head_path = PathBuf::from(&binding.session.worktree_path);
+                    let head =
+                        tokio::task::spawn_blocking(move || worktree::head_commit(&head_path))
+                            .await??;
+                    (
+                        crate::worktree::WorktreeInfo {
+                            path: PathBuf::from(&binding.session.worktree_path),
+                            branch: binding.session.branch.clone(),
+                            base_commit: head,
+                        },
+                        Some(binding.workspace.id),
+                        Some(binding.session.id),
+                    )
+                }
+                None => (
+                    engine
+                        .create_task_worktree(
+                            &project.root,
+                            &project.id,
+                            &session.id,
+                            &task.id,
+                            &manager_spec.session_branch,
+                        )
+                        .await?,
+                    None,
+                    None,
+                ),
+            };
             engine
                 .set_agent_worktree(&worker.id, &info.path.to_string_lossy(), &info.branch)
+                .await?;
+            engine
+                .set_agent_workspace_binding(&worker.id, workspace_id.as_deref(), None)
                 .await?;
             let worker_spec = AgentSpec {
                 id: worker.id.clone(),
@@ -24773,6 +25258,9 @@ async fn execute_team_plan(
                 session_branch: manager_spec.session_branch.clone(),
                 write_scope,
                 base_commit: info.base_commit,
+                workspace_id,
+                session_workspace_id,
+                parent_workspace_id: None,
             };
             emit(
                 engine,
@@ -24845,20 +25333,32 @@ async fn execute_team_plan(
         let futures = prepared
             .iter_mut()
             .map(|(_, worker_spec, _, objective, _, conversation)| {
-                run_loop(
-                    engine,
-                    config,
-                    session,
-                    project,
-                    control,
-                    budget,
-                    worker_spec,
-                    objective,
-                    conversation,
-                    None,
-                    false,
-                    None,
-                )
+                let workspace_lock = worker_spec
+                    .workspace_id
+                    .as_ref()
+                    .map(|workspace_id| engine.workspace_run_lock(workspace_id));
+                async move {
+                    let _guard = match workspace_lock {
+                        Some(lock) => Some(lock.lock_owned().await),
+                        None => None,
+                    };
+                    refresh_workspace_base(worker_spec).await;
+                    run_loop(
+                        engine,
+                        config,
+                        session,
+                        project,
+                        control,
+                        budget,
+                        worker_spec,
+                        objective,
+                        conversation,
+                        None,
+                        false,
+                        None,
+                    )
+                    .await
+                }
             });
         let results = futures_util::future::join_all(futures).await;
 
@@ -25600,6 +26100,9 @@ fn stable_agent_spec(
         session_branch: branch,
         write_scope: Vec::new(),
         base_commit: session.base_commit.clone().unwrap_or_default(),
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     }
 }
 
@@ -26104,6 +26607,9 @@ fn preview_spec(role: AgentRole, profile: AgentProfile, task_kind: Option<String
         session_branch: String::new(),
         write_scope: Vec::new(),
         base_commit: String::new(),
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
     }
 }
 

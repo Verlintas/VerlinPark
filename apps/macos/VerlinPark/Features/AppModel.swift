@@ -78,6 +78,12 @@ final class AppModel {
     var sessionAssignments: [AgentAssignment] = []
     var sessionAssignmentsStatus: String?
     var sessionAssignmentsBusy = false
+    var agentWorkspaces: [AgentWorkspace] = []
+    var agentWorkspacesStatus: String?
+    var agentWorkspacesBusy = false
+    var sessionWorkspaces: [SessionWorkerWorkspace] = []
+    var sessionWorkspacesStatus: String?
+    var sessionWorkspacesBusy = false
     var coordinationInbox: [AgentInboxMessage] = []
     var coordinationInboxCounts: AgentInboxCounts?
     var coordinationInboxStatus: String?
@@ -8212,6 +8218,54 @@ final class AppModel {
         } catch {
             if isCurrent(sessionID: sessionID, generation: generation) {
                 sessionAssignmentsStatus = error.localizedDescription
+            }
+        }
+    }
+
+    /// Read-only project workspace metadata for the team card.
+    func loadAgentWorkspaces() async {
+        guard let projectID = selectedProjectID else {
+            agentWorkspaces = []
+            agentWorkspacesStatus = nil
+            return
+        }
+        agentWorkspacesBusy = true
+        defer { agentWorkspacesBusy = false }
+        do {
+            let result = try await core.agentWorkspaces(projectID: projectID)
+            if projectID == selectedProjectID {
+                agentWorkspaces = result.workspaces
+                agentWorkspacesStatus = result.workspaces.isEmpty
+                    ? "No Worker workspaces."
+                    : "\(result.workspaces.count) workspaces"
+            }
+        } catch {
+            if projectID == selectedProjectID {
+                agentWorkspacesStatus = error.localizedDescription
+            }
+        }
+    }
+
+    /// Read-only session workspace bindings for the Stage inspector.
+    func loadSessionWorkspaces() async {
+        guard let sessionID = selectedSessionID else {
+            sessionWorkspaces = []
+            sessionWorkspacesStatus = nil
+            return
+        }
+        sessionWorkspacesBusy = true
+        defer { sessionWorkspacesBusy = false }
+        let generation = selectionGeneration
+        do {
+            let rows = try await core.sessionWorkspaces(sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            sessionWorkspaces = rows
+            sessionWorkspacesStatus = rows.isEmpty
+                ? "No Worker workspaces bound to this session."
+                : "\(rows.count) workspace binding(s)"
+        } catch {
+            if isCurrent(sessionID: sessionID, generation: generation) {
+                sessionWorkspacesStatus = error.localizedDescription
             }
         }
     }

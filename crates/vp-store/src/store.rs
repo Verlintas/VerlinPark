@@ -15,29 +15,29 @@ use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
     AcpAgent, AcpAgentConfig, AcpTransport, AgentAssignment, AgentCoordinationEvent, AgentIdentity,
     AgentIdentityError, AgentIdentityEvent, AgentIdentityPolicy, AgentInboxMessage, AgentMessage,
-    AgentRecord, Approval, ApprovalAuditEvent, ApprovalGrant, ApprovalTemplate, Artifact,
-    ArtifactPolicy, ArtifactProvenance, ArtifactVersion, AttentionPolicy, CacheEpochBundleBucket,
-    CacheEpochReuseSession, CachePolicy, CheckpointRetentionPolicy, ContextCheckpoint,
-    ContextCheckpointPolicy, ContinuationOutcome, ContractPolicy, CriticalPathPolicy,
-    EffectEvidence, EffectPolicy, EffectReceipt, EffectState, EffectTarget, Event, GatePolicy,
-    GateRecord, GuiActionInfo, GuiPolicy, InstructionBlob, IntakeTask, IntegrationPolicy,
-    MailboxPolicy, McpServer, McpServerConfig, McpToolPin, McpTransport, MemoryConflict,
-    MemoryEmbeddingJobStatus, MemoryEmbeddingPolicy, MemoryEmbeddingUsage,
-    MemoryEmbeddingsStatusResult, MemoryEvidence, MemoryHealthResult, MemoryItem, MemoryPolicy,
-    MemoryStatCount, MergeQueueEntry, MergeQueueSource, MetricCount, ModelPreset,
-    OrchestrationDecision, OrchestrationNote, OrchestrationPolicy, OrchestrationRecovery,
-    PlanTaskProgress, PreemptionPolicy, PreemptionSessionSummary, ProcessPolicy, Program,
-    ProgramEvent, ProgramMilestone, ProgramMilestoneStatus, ProgramPolicy, ProgramStatus,
-    ProgramUsage, Project, ProjectBudget, ProjectUsageSession, PromptPrefixAggregate,
-    PromptPrefixObservation, PromptPrefixRecord, PromptSectionRef, Question, RunBudgetSnapshot,
-    RunCheckpoint, RunStep, RunToolCall, ScheduledTask, SearchHit, Session, SessionBundle,
-    SessionContinuation, SessionInstructionState, SessionRun, SessionRunPolicy, ShellPolicy, Skill,
-    Source, SourceChunk, SourceCollection, SourceEmbeddingIntegrity, SourceEmbeddingJobStatus,
-    SourceEmbeddingPolicy, SourceEmbeddingStatusResult, SourceEmbeddingUsage,
-    SourceRetrievalPolicy, SourceSearchHit, SourceStats, SteeringMessage, StoredMessage,
-    SupervisedProcess, TaskSchedulerPolicy, TaskStall, TeamPlan, TodoItem, ToolOutputAuditResult,
-    ToolOutputPolicy, ToolOutputToolStat, UsageEntry, WorktreeRetentionPolicy, WriteLease,
-    cache_hit_ratio,
+    AgentRecord, AgentWorkspace, AgentWorkspaceEvent, Approval, ApprovalAuditEvent, ApprovalGrant,
+    ApprovalTemplate, Artifact, ArtifactPolicy, ArtifactProvenance, ArtifactVersion,
+    AttentionPolicy, CacheEpochBundleBucket, CacheEpochReuseSession, CachePolicy,
+    CheckpointRetentionPolicy, ContextCheckpoint, ContextCheckpointPolicy, ContinuationOutcome,
+    ContractPolicy, CriticalPathPolicy, EffectEvidence, EffectPolicy, EffectReceipt, EffectState,
+    EffectTarget, Event, GatePolicy, GateRecord, GuiActionInfo, GuiPolicy, InstructionBlob,
+    IntakeTask, IntegrationPolicy, MailboxPolicy, McpServer, McpServerConfig, McpToolPin,
+    McpTransport, MemoryConflict, MemoryEmbeddingJobStatus, MemoryEmbeddingPolicy,
+    MemoryEmbeddingUsage, MemoryEmbeddingsStatusResult, MemoryEvidence, MemoryHealthResult,
+    MemoryItem, MemoryPolicy, MemoryStatCount, MergeQueueEntry, MergeQueueSource, MetricCount,
+    ModelPreset, OrchestrationDecision, OrchestrationNote, OrchestrationPolicy,
+    OrchestrationRecovery, PlanTaskProgress, PreemptionPolicy, PreemptionSessionSummary,
+    ProcessPolicy, Program, ProgramEvent, ProgramMilestone, ProgramMilestoneStatus, ProgramPolicy,
+    ProgramStatus, ProgramUsage, Project, ProjectBudget, ProjectUsageSession,
+    PromptPrefixAggregate, PromptPrefixObservation, PromptPrefixRecord, PromptSectionRef, Question,
+    RunBudgetSnapshot, RunCheckpoint, RunStep, RunToolCall, ScheduledTask, SearchHit, Session,
+    SessionBundle, SessionContinuation, SessionInstructionState, SessionRun, SessionRunPolicy,
+    SessionWorkerWorkspace, ShellPolicy, Skill, Source, SourceChunk, SourceCollection,
+    SourceEmbeddingIntegrity, SourceEmbeddingJobStatus, SourceEmbeddingPolicy,
+    SourceEmbeddingStatusResult, SourceEmbeddingUsage, SourceRetrievalPolicy, SourceSearchHit,
+    SourceStats, SteeringMessage, StoredMessage, SupervisedProcess, TaskSchedulerPolicy, TaskStall,
+    TeamPlan, TodoItem, ToolOutputAuditResult, ToolOutputPolicy, ToolOutputToolStat, UsageEntry,
+    WorktreeRetentionPolicy, WriteLease, cache_hit_ratio,
 };
 
 use vp_protocol::types::{
@@ -45,8 +45,9 @@ use vp_protocol::types::{
     AGENT_IDENTITY_MAX_DEPARTMENT_CHARS, AGENT_IDENTITY_MAX_ID_CHARS,
     AGENT_IDENTITY_MAX_MODEL_CHARS, AGENT_IDENTITY_MAX_POLICY_BYTES,
     AGENT_IDENTITY_MAX_TITLE_CHARS, AGENT_IDENTITY_PROFILE_VALUES, AGENT_IDENTITY_STATUSES,
-    AGENT_INBOX_KINDS, AGENT_INBOX_STATUSES, CreateAgentIdentityParams, RetireAgentIdentityParams,
-    UpdateAgentIdentityParams, agent_identity_codes, agent_identity_role,
+    AGENT_INBOX_KINDS, AGENT_INBOX_STATUSES, AGENT_WORKSPACE_EVENT_KINDS, AGENT_WORKSPACE_STATUSES,
+    CreateAgentIdentityParams, RetireAgentIdentityParams, UpdateAgentIdentityParams,
+    agent_identity_codes, agent_identity_role,
 };
 
 use vp_protocol::otel::OtelPolicy;
@@ -1364,6 +1365,15 @@ pub struct ProjectManifestSnapshot {
     /// Append-only assignment/inbox stream for this project.
     #[serde(default)]
     pub agent_coordination_events: Vec<AgentCoordinationEvent>,
+    /// Event-derived project Worker workspaces (S4).
+    #[serde(default)]
+    pub agent_workspaces: Vec<AgentWorkspace>,
+    /// Event-derived session workspace bindings (S4).
+    #[serde(default)]
+    pub session_worker_workspaces: Vec<SessionWorkerWorkspace>,
+    /// Append-only workspace stream for this project.
+    #[serde(default)]
+    pub agent_workspace_events: Vec<AgentWorkspaceEvent>,
     /// Project-scoped effect-receipt policy. Older manifests decode as the
     /// enabled, unknown-blocks-merge, 120s-grace default.
     #[serde(default)]
@@ -1788,6 +1798,70 @@ fn validate_session_bundle(bundle: &SessionBundle) -> Result<()> {
         {
             return Err(anyhow!(
                 "bundle coordination event {} has an unknown kind",
+                event.id
+            ));
+        }
+    }
+    let mut workspace_ids = std::collections::HashSet::new();
+    for workspace in &bundle.agent_workspaces {
+        if workspace.project_id != bundle.project.id {
+            return Err(anyhow!(
+                "bundle workspace {} belongs to a different project",
+                workspace.id
+            ));
+        }
+        if !identity_ids.contains(workspace.identity_id.as_str()) {
+            return Err(anyhow!(
+                "bundle workspace {} has no identity snapshot",
+                workspace.id
+            ));
+        }
+        if !workspace_ids.insert(workspace.id.clone()) {
+            return Err(anyhow!("bundle workspace {} is duplicated", workspace.id));
+        }
+        if !AGENT_WORKSPACE_STATUSES.contains(&workspace.status.as_str()) {
+            return Err(anyhow!(
+                "bundle workspace {} has an invalid status",
+                workspace.id
+            ));
+        }
+    }
+    for session in &bundle.session_worker_workspaces {
+        if !workspace_ids.contains(&session.workspace_id) {
+            return Err(anyhow!(
+                "bundle session workspace {} references a missing workspace",
+                session.id
+            ));
+        }
+        if !vp_protocol::types::AGENT_SESSION_WORKSPACE_STATUSES.contains(&session.status.as_str())
+        {
+            return Err(anyhow!(
+                "bundle session workspace {} has an invalid status",
+                session.id
+            ));
+        }
+    }
+    let mut workspace_event_ids = std::collections::HashSet::new();
+    let mut workspace_event_seqs = std::collections::HashSet::new();
+    for event in &bundle.agent_workspace_events {
+        if event.project_id != bundle.project.id {
+            return Err(anyhow!(
+                "bundle workspace event {} belongs to a different project",
+                event.id
+            ));
+        }
+        if event.id.trim().is_empty() || event.seq == 0 {
+            return Err(anyhow!("bundle workspace event has an empty id or seq"));
+        }
+        if !workspace_event_ids.insert(event.id.clone()) {
+            return Err(anyhow!("bundle workspace event {} is duplicated", event.id));
+        }
+        if !workspace_event_seqs.insert(event.seq) {
+            return Err(anyhow!("bundle workspace events repeat seq {}", event.seq));
+        }
+        if !AGENT_WORKSPACE_EVENT_KINDS.contains(&event.kind.as_str()) {
+            return Err(anyhow!(
+                "bundle workspace event {} has an unknown kind",
                 event.id
             ));
         }
@@ -2558,6 +2632,79 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_agent_coordination_events_project
                 ON agent_coordination_events(project_id, seq);
+
+            -- Durable Worker component workspaces. The branch is the long-lived
+            -- component branch; a session attaches it and gets its own session
+            -- branch/worktree. One active row per (project, identity, component)
+            -- is a hard invariant. One live component lease per project/component
+            -- is a second partial unique index so two identities or sessions can
+            -- never mutate the same component branch concurrently.
+            CREATE TABLE IF NOT EXISTS agent_workspaces (
+                id               TEXT PRIMARY KEY,
+                project_id       TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                identity_id      TEXT NOT NULL REFERENCES agent_identities(id) ON DELETE CASCADE,
+                component        TEXT NOT NULL,
+                branch           TEXT NOT NULL,
+                base_commit      TEXT NOT NULL,
+                worktree_path    TEXT NOT NULL,
+                status           TEXT NOT NULL,
+                created_at       TEXT NOT NULL,
+                updated_at       TEXT NOT NULL,
+                last_session_id  TEXT,
+                lease_token      TEXT,
+                lease_expires_at TEXT,
+                origin           TEXT NOT NULL DEFAULT 'local'
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_workspaces_active_identity_component
+                ON agent_workspaces(project_id, identity_id, component)
+                WHERE status = 'active';
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_workspaces_one_component_lease
+                ON agent_workspaces(project_id, component)
+                WHERE lease_token IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_agent_workspaces_project_status
+                ON agent_workspaces(project_id, status, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_agent_workspaces_lease_expiry
+                ON agent_workspaces(status, lease_expires_at);
+
+            -- One row per (session, identity); the row is reactivated on a later
+            -- attach instead of inventing duplicate binding history.
+            CREATE TABLE IF NOT EXISTS session_worker_workspaces (
+                id               TEXT PRIMARY KEY,
+                workspace_id     TEXT NOT NULL REFERENCES agent_workspaces(id) ON DELETE CASCADE,
+                session_id       TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                identity_id      TEXT NOT NULL,
+                worktree_path    TEXT NOT NULL,
+                branch           TEXT NOT NULL,
+                base_commit      TEXT NOT NULL,
+                status           TEXT NOT NULL,
+                created_at       TEXT NOT NULL,
+                updated_at       TEXT NOT NULL,
+                lease_token      TEXT,
+                lease_expires_at TEXT,
+                UNIQUE (session_id, identity_id)
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_session_worker_workspaces_one_active
+                ON session_worker_workspaces(session_id, identity_id)
+                WHERE status = 'active';
+            CREATE INDEX IF NOT EXISTS idx_session_worker_workspaces_workspace
+                ON session_worker_workspaces(workspace_id, status);
+
+            -- Append-only project workspace stream. Portable by event id for
+            -- idempotent archive import; seq is the per-project replay order.
+            CREATE TABLE IF NOT EXISTS agent_workspace_events (
+                id         TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                seq        INTEGER NOT NULL,
+                kind       TEXT NOT NULL,
+                payload    TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE (project_id, seq)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_agent_workspace_events_project
+                ON agent_workspace_events(project_id, seq);
 
             CREATE TABLE IF NOT EXISTS messages (
                 id           TEXT PRIMARY KEY,
@@ -4298,6 +4445,8 @@ impl Store {
         // `NULL` because session assignment is a later phase. No synthetic
         // identities are backfilled.
         ensure_column(&conn, "agents", "identity_id", "TEXT")?;
+        ensure_column(&conn, "agents", "workspace_id", "TEXT")?;
+        ensure_column(&conn, "agents", "parent_workspace_id", "TEXT")?;
         ensure_column(
             &conn,
             "agent_identities",
@@ -4715,6 +4864,10 @@ impl Store {
                 agent_inbox: self.list_agent_inbox_for_replay(&project.id)?,
                 agent_coordination_events: self
                     .list_agent_coordination_events_for_project(&project.id, None)?,
+                agent_workspaces: self.list_agent_workspaces_for_replay(&project.id)?,
+                session_worker_workspaces: self.list_session_workspaces_for_replay(&project.id)?,
+                agent_workspace_events: self
+                    .list_agent_workspace_events_for_project(&project.id, None)?,
                 effect_policy: self.get_effect_policy(&project.id)?,
                 gate_policy: self.get_gate_policy(&project.id)?,
                 otel_policy: self.get_otel_policy(&project.id)?,
@@ -20833,6 +20986,8 @@ impl Store {
             name: name.to_string(),
             title: title.map(ToOwned::to_owned),
             identity_id: None,
+            workspace_id: None,
+            parent_workspace_id: None,
             profile: None,
             parent_id: parent_id.map(ToOwned::to_owned),
             task_id: None,
@@ -20884,6 +21039,8 @@ impl Store {
             name: name.to_string(),
             title: title.map(ToOwned::to_owned),
             identity_id: None,
+            workspace_id: None,
+            parent_workspace_id: None,
             profile: None,
             parent_id: parent_id.map(ToOwned::to_owned),
             task_id: None,
@@ -20959,6 +21116,40 @@ impl Store {
             &agent.session_id,
             "agent.snapshot",
             serde_json::to_value(&agent)?,
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some((agent, event)))
+    }
+
+    pub fn set_agent_workspace_binding_with_snapshot(
+        &self,
+        id: &str,
+        workspace_id: Option<&str>,
+        parent_workspace_id: Option<&str>,
+    ) -> Result<Option<(AgentRecord, Event)>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE agents SET workspace_id = ?1, parent_workspace_id = ?2 WHERE id = ?3",
+            params![workspace_id, parent_workspace_id, id],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let agent = get_agent_tx(&tx, id)?;
+        let event = insert_event_tx(
+            &tx,
+            &agent.session_id,
+            "agent.workspace_binding",
+            serde_json::json!({
+                "agent_id": id,
+                "workspace_id": workspace_id,
+                "parent_workspace_id": parent_workspace_id,
+                "agent": agent,
+            }),
         )?;
         tx.commit()?;
         if let Err(error) = self.append_event_mirror(&event) {
@@ -21089,7 +21280,8 @@ impl Store {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id, session_id, role, name, title, profile, parent_id, task_id, department,
-                    worktree, branch, status, model, created_at, identity_id
+                    worktree, branch, status, model, created_at, identity_id, workspace_id,
+                    parent_workspace_id
              FROM agents WHERE session_id = ?1 ORDER BY created_at ASC, rowid ASC",
         )?;
         let rows = stmt.query_map(params![session_id], |row| {
@@ -21100,6 +21292,8 @@ impl Store {
                 name: row.get(3)?,
                 title: row.get(4)?,
                 identity_id: row.get(14)?,
+                workspace_id: row.get(15)?,
+                parent_workspace_id: row.get(16)?,
                 profile: row.get(5)?,
                 parent_id: row.get(6)?,
                 task_id: row.get(7)?,
@@ -27590,6 +27784,97 @@ impl Store {
                 }
             }
         }
+        // Workspaces travel as archive evidence only. Imported rows are
+        // read-only, carry no lease, and never attach a local worktree.
+        for workspace in &bundle.agent_workspaces {
+            let mut imported = workspace.clone();
+            imported.origin = "imported".to_string();
+            imported.lease_active = false;
+            imported.lease_expires_at = None;
+            match tx
+                .query_row(
+                    "SELECT status, updated_at FROM agent_workspaces WHERE id = ?1",
+                    params![workspace.id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?
+            {
+                Some((status, updated_at))
+                    if status == imported.status && updated_at == imported.updated_at => {}
+                Some(_) => {
+                    return Err(anyhow!(
+                        "bundle workspace {} conflicts with the local projection",
+                        workspace.id
+                    ));
+                }
+                None => {
+                    crate::store::workspaces::insert_workspace_row_tx(&tx, &imported)?;
+                }
+            }
+        }
+        for event in &bundle.agent_workspace_events {
+            let expected_payload = serde_json::to_string(&event.payload)?;
+            match tx
+                .query_row(
+                    "SELECT seq, kind, payload, created_at FROM agent_workspace_events WHERE id = ?1",
+                    params![event.id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .optional()?
+            {
+                Some((seq, kind, payload, created_at)) => {
+                    if seq != event.seq as i64
+                        || kind != event.kind
+                        || payload != expected_payload
+                        || created_at != event.created_at
+                    {
+                        return Err(anyhow!(
+                            "bundle workspace event {} conflicts with the local event stream",
+                            event.id
+                        ));
+                    }
+                }
+                None => {
+                    let seq_owner: Option<String> = tx
+                        .query_row(
+                            "SELECT id FROM agent_workspace_events
+                             WHERE project_id = ?1 AND seq = ?2",
+                            params![bundle.project.id, event.seq as i64],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if let Some(owner) = seq_owner
+                        && owner != event.id
+                    {
+                        return Err(anyhow!(
+                            "bundle workspace event {} conflicts with local seq {}",
+                            event.id,
+                            event.seq
+                        ));
+                    }
+                    tx.execute(
+                        "INSERT INTO agent_workspace_events
+                         (id, project_id, seq, kind, payload, created_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            event.id,
+                            event.project_id,
+                            event.seq as i64,
+                            event.kind,
+                            expected_payload,
+                            event.created_at
+                        ],
+                    )?;
+                }
+            }
+        }
 
         let session_exists: bool = tx
             .query_row(
@@ -27684,6 +27969,36 @@ impl Store {
                 plan_runtime_snapshot_json
             ],
         )?;
+        // Session workspace bindings require the imported session row; insert
+        // them after the session itself.
+        for binding in &bundle.session_worker_workspaces {
+            let mut imported = binding.clone();
+            if imported.status == "active" {
+                imported.status = "released".to_string();
+            }
+            imported.lease_active = false;
+            imported.lease_expires_at = None;
+            match tx
+                .query_row(
+                    "SELECT status, updated_at FROM session_worker_workspaces WHERE id = ?1",
+                    params![binding.id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?
+            {
+                Some((status, updated_at))
+                    if status == imported.status && updated_at == imported.updated_at => {}
+                Some(_) => {
+                    return Err(anyhow!(
+                        "bundle session workspace {} conflicts with the local projection",
+                        binding.id
+                    ));
+                }
+                None => {
+                    crate::store::workspaces::insert_session_row_tx(&tx, &imported)?;
+                }
+            }
+        }
         for blob in &bundle.instruction_blobs {
             let actual = format!("{:x}", Sha256::digest(blob.text.as_bytes()));
             if actual != blob.hash {
@@ -29446,7 +29761,8 @@ fn insert_agent_identity_event_snapshot_conn(
 fn get_agent_tx(tx: &Transaction<'_>, id: &str) -> Result<AgentRecord> {
     tx.query_row(
         "SELECT id, session_id, role, name, title, profile, parent_id, task_id, department,
-                worktree, branch, status, model, created_at, identity_id
+                worktree, branch, status, model, created_at, identity_id, workspace_id,
+                parent_workspace_id
          FROM agents WHERE id = ?1",
         params![id],
         map_agent_record,
@@ -29463,6 +29779,8 @@ fn map_agent_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
         name: row.get(3)?,
         title: row.get(4)?,
         identity_id: row.get(14)?,
+        workspace_id: row.get(15)?,
+        parent_workspace_id: row.get(16)?,
         profile: row.get(5)?,
         parent_id: row.get(6)?,
         task_id: row.get(7)?,
@@ -32625,6 +32943,7 @@ mod continuation_lease;
 mod coordination;
 mod gate;
 mod lease;
+pub mod workspaces;
 
 pub use continuation_lease::{
     ContinuationAckLostReason, ContinuationClaimToken, SessionContinuationAckError,
