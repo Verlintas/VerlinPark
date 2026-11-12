@@ -1828,7 +1828,11 @@ impl AgentTool for Shell {
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "Command to run with the user's shell"},
-                "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 900}
+                "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 900},
+                "effect_probe": {
+                    "type": "object",
+                    "description": "Optional explicit postcondition probe. A raw shell command settles as unknown unless this is declared. Supported kinds: file_hash {path, sha256}, file_absent {path}, git_head {commit}, git_branch {branch}."
+                }
             },
             "required": ["command"]
         })

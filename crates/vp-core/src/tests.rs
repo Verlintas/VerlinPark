@@ -2048,8 +2048,18 @@ async fn lands_a_committed_session_into_the_default_branch() {
     );
     let sessions = engine.list_sessions(Some(project.id)).await.unwrap();
     assert_eq!(sessions[0].status, "landed");
-    let events = engine.list_events(session.id, 0, 100).await.unwrap();
+    let events = engine
+        .list_events(session.id.clone(), 0, 100)
+        .await
+        .unwrap();
     assert!(events.iter().any(|event| event.kind == "session.landed"));
+    let effects = engine
+        .session_effects(&session.id, None, true, 100)
+        .await
+        .unwrap();
+    assert!(effects.receipts.iter().any(|receipt| {
+        receipt.target.kind == "git_merge" && receipt.state == vp_protocol::types::EffectState::Done
+    }));
 }
 
 static PR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -2893,9 +2903,13 @@ async fn pushes_a_branch_and_opens_a_pull_request() {
         .unwrap();
 
     let gh = data.path().join("fake-gh");
+    let gh_log = data.path().join("fake-gh.log");
     std::fs::write(
             &gh,
-            "#!/bin/sh\nif [ \"$1\" = \"auth\" ]; then exit 0; fi\nif [ \"$1\" = \"pr\" ]; then echo https://example.test/pr/1; exit 0; fi\nexit 0\n",
+            format!(
+                "#!/bin/sh\necho \"$@\" >> {}\nif [ \"$1\" = \"auth\" ]; then exit 0; fi\nif [ \"$1\" = \"pr\" ]; then echo https://example.test/pr/1; exit 0; fi\nexit 0\n",
+                gh_log.display()
+            ),
         )
         .unwrap();
     let mut permissions = std::fs::metadata(&gh).unwrap().permissions();
@@ -2916,9 +2930,57 @@ async fn pushes_a_branch_and_opens_a_pull_request() {
         .output()
         .unwrap();
     assert!(remote_ref.status.success());
-    let events = engine.list_events(session.id, 0, 100).await.unwrap();
+    let events = engine
+        .list_events(session.id.clone(), 0, 100)
+        .await
+        .unwrap();
     assert!(events.iter().any(|event| event.kind == "session.pushed"));
     assert!(events.iter().any(|event| event.kind == "session.pr_opened"));
+
+    let effects = engine
+        .session_effects(&session.id, None, true, 100)
+        .await
+        .unwrap();
+    assert_eq!(effects.counts.done, 3, "{effects:?}");
+    assert!(effects.receipts.iter().any(|receipt| {
+        receipt.target.kind == "git_push" && receipt.state == vp_protocol::types::EffectState::Done
+    }));
+    assert!(effects.receipts.iter().any(|receipt| {
+        receipt.target.kind == "forge_pr"
+            && receipt.external_id.as_deref() == Some("https://example.test/pr/1")
+    }));
+
+    // Repeating the exact PR request replays both receipts: no second push and
+    // no second `gh pr create`. The local action is idempotent.
+    let replay = engine
+        .open_pull_request_with_cli(&session.id, gh.to_str().unwrap(), PrCli::GitHub)
+        .await
+        .unwrap();
+    assert_eq!(replay.url.as_deref(), Some("https://example.test/pr/1"));
+    assert!(replay.detail.contains("replayed"), "{}", replay.detail);
+    let log = std::fs::read_to_string(&gh_log).unwrap();
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.starts_with("pr create"))
+            .count(),
+        1,
+        "{log}"
+    );
+    let events = engine.list_events(session.id, 0, 200).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "session.pr_opened")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "session.push_replayed")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -15449,5 +15511,272 @@ async fn db_rebuild_restores_approval_templates_policy_and_audit() {
         audit
             .iter()
             .any(|event| event.kind == "approval.policy.updated")
+    );
+}
+
+#[tokio::test]
+async fn effect_receipts_gate_merge_until_an_explicit_reconcile() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("effects".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "effect gate".into(), None)
+        .await
+        .unwrap();
+
+    let plan = crate::effect::classify_tool_effect(
+        "remote_write",
+        &serde_json::json!({"path": "out/app.txt", "content": "deploy"}),
+        crate::permissions::RiskLevel::External,
+        false,
+        &vp_protocol::types::EffectPolicy::default(),
+    )
+    .unwrap()
+    .expect("remote write plan");
+    let prepare = engine
+        .prepare_tool_effect(&session.id, Some("task-1"), &plan)
+        .await
+        .unwrap();
+    let intent = match prepare {
+        crate::effect::EffectPrepare::Proceed(receipt) => receipt,
+        other => panic!("expected proceed, got {other:?}"),
+    };
+    let (stored, inserted) = engine.begin_effect(intent).await.unwrap();
+    assert!(inserted);
+
+    let error = engine
+        .enqueue_merge(
+            &session.id,
+            "agent-1",
+            "Worker",
+            Some("task-1".to_string()),
+            "worker/task-1",
+            "deadbeef",
+            "cafebabe",
+            None,
+        )
+        .await
+        .expect_err("an intent receipt must block the merge queue");
+    assert!(error.to_string().starts_with("EFFECT_UNKNOWN"), "{error}");
+    assert!(
+        error
+            .downcast_ref::<crate::effect::EffectBlocked>()
+            .is_some()
+    );
+
+    // The same logical effect is blocked before execution.
+    let prepare = engine
+        .prepare_tool_effect(&session.id, Some("task-1"), &plan)
+        .await
+        .unwrap();
+    assert!(matches!(
+        prepare,
+        crate::effect::EffectPrepare::Blocked(receipt) if receipt.state == EffectState::Intent
+    ));
+
+    let reconciled = engine
+        .reconcile_effect(vp_protocol::types::EffectReconcileParams {
+            session_id: Some(session.id.clone()),
+            effect_id: stored.id.clone(),
+            decision: EffectState::Done,
+            evidence: vp_protocol::types::EffectReconcileEvidence {
+                sha256: Some("d".repeat(64)),
+                note: Some("operator verified the remote file hash".to_string()),
+                ..Default::default()
+            },
+            operator: Some("test".to_string()),
+        })
+        .await
+        .unwrap();
+    assert!(reconciled.changed);
+    assert_eq!(reconciled.receipt.state, EffectState::Done);
+
+    engine
+        .enqueue_merge(
+            &session.id,
+            "agent-1",
+            "Worker",
+            Some("task-1".to_string()),
+            "worker/task-1",
+            "deadbeef",
+            "cafebabe",
+            None,
+        )
+        .await
+        .expect("a reconciled done receipt no longer blocks");
+
+    let report = engine
+        .session_effects(&session.id, None, true, 100)
+        .await
+        .unwrap();
+    assert_eq!(report.counts.total, 1);
+    assert_eq!(report.counts.done, 1);
+    assert!(!report.blocked);
+    assert!(report.receipts[0].evidence.has_resolution_evidence());
+}
+
+#[tokio::test]
+async fn done_effect_replays_and_unknown_effects_survive_daemon_restart() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("effects".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "replay".into(), None)
+        .await
+        .unwrap();
+    engine
+        .set_effect_policy(
+            &project.id,
+            vp_protocol::types::EffectPolicy {
+                stale_intent_grace_secs: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let plan = crate::effect::classify_tool_effect(
+        "write_file",
+        &serde_json::json!({"path": "a.txt", "content": "one"}),
+        crate::permissions::RiskLevel::WorkspaceWrite,
+        false,
+        &vp_protocol::types::EffectPolicy::default(),
+    )
+    .unwrap()
+    .expect("write plan");
+    let crate::effect::EffectPrepare::Proceed(intent) = engine
+        .prepare_tool_effect(&session.id, Some("task-1"), &plan)
+        .await
+        .unwrap()
+    else {
+        panic!("expected proceed");
+    };
+    let (intent, inserted) = engine.begin_effect(intent).await.unwrap();
+    assert!(inserted);
+    let probe = crate::effect::EffectProbe::done(vp_protocol::types::EffectEvidence {
+        probe: "workspace_sha256".to_string(),
+        outcome: "observed".to_string(),
+        sha256: Some("e".repeat(64)),
+        ..Default::default()
+    });
+    let settled = crate::effect::settled_receipt(intent.clone(), probe);
+    engine.settle_effect(settled).await.unwrap();
+
+    // A done receipt replays its evidence and never executes again.
+    let prepare = engine
+        .prepare_tool_effect(&session.id, Some("task-1"), &plan)
+        .await
+        .unwrap();
+    assert!(matches!(
+        prepare,
+        crate::effect::EffectPrepare::Replay(receipt) if receipt.state == EffectState::Done
+    ));
+
+    // A crash between intent and finish leaves a stale intent. The sweep turns
+    // it into unknown only after the project grace period.
+    let mut stale = crate::effect::intent_receipt(&session.id, Some("task-2"), &plan, 1);
+    stale.id = "stale-effect".to_string();
+    stale.created_at = (time::OffsetDateTime::now_utc() - time::Duration::hours(1))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    engine.begin_effect(stale).await.unwrap();
+    let swept = engine.sweep_stale_effect_intents(100).await.unwrap();
+    assert_eq!(swept, 1);
+    let receipt = engine.get_effect("stale-effect").await.unwrap().unwrap();
+    assert_eq!(receipt.state, EffectState::Unknown);
+    let blocked = engine
+        .effect_blockers(&session.id, Some("task-2"))
+        .await
+        .unwrap();
+    assert_eq!(blocked.len(), 1);
+
+    // Replay and repair rebuild the effect projection from events.
+    let report = engine.replay_session(&session.id).await.unwrap();
+    assert!(report.effects_match, "{:?}", report.mismatches);
+    let store = engine.store().clone();
+    store.replace_effect_receipts(&session.id, &[]).unwrap();
+    let report = engine.replay_session(&session.id).await.unwrap();
+    assert!(!report.effects_match);
+    let repaired = engine.repair_session(&session.id).await.unwrap();
+    assert!(repaired.consistent, "{:?}", repaired.mismatches);
+    assert_eq!(
+        engine
+            .session_effects(&session.id, None, true, 100)
+            .await
+            .unwrap()
+            .counts
+            .total,
+        2
+    );
+}
+
+#[tokio::test]
+async fn unknown_effect_blocks_landing_and_session_scope_is_included() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("effects".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "land".into(), None)
+        .await
+        .unwrap();
+    let plan = crate::effect::classify_tool_effect(
+        "remote_write",
+        &serde_json::json!({"path": "out.txt", "content": "x"}),
+        crate::permissions::RiskLevel::External,
+        false,
+        &vp_protocol::types::EffectPolicy::default(),
+    )
+    .unwrap()
+    .unwrap();
+    let crate::effect::EffectPrepare::Proceed(intent) = engine
+        .prepare_tool_effect(&session.id, None, &plan)
+        .await
+        .unwrap()
+    else {
+        panic!("expected proceed");
+    };
+    let (intent, _) = engine.begin_effect(intent).await.unwrap();
+    let mut unknown = intent;
+    unknown.state = EffectState::Unknown;
+    unknown.evidence =
+        vp_protocol::types::EffectEvidence::unverifiable("no_postcondition_probe", "no_probe");
+    engine.settle_effect(unknown).await.unwrap();
+
+    let error = engine
+        .assert_effects_settled(&session.id, Some("unrelated-task"))
+        .await
+        .expect_err("session-scoped unknown effects block every merge");
+    assert!(error.to_string().starts_with("EFFECT_UNKNOWN"));
+    let land_error = engine
+        .land_session(&session.id)
+        .await
+        .expect_err("landing must fail closed on an unknown effect");
+    assert!(
+        land_error.to_string().starts_with("EFFECT_UNKNOWN"),
+        "{land_error}"
     );
 }

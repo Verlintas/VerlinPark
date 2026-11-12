@@ -15214,8 +15214,8 @@ async fn resumes_a_crashed_run_and_hard_blocks_a_completed_write() {
     )
     .await;
     let input = serde_json::json!({"path": "journal-duplicate.txt", "content": "should-not-run"});
-    let (step, tool) = journal
-        .tool_intent(&engine, 1, "call-prior", "write_file", &input)
+    let (step, tool, _) = journal
+        .tool_intent(&engine, 1, "call-prior", "write_file", &input, None)
         .await
         .unwrap();
     journal
@@ -15659,13 +15659,14 @@ async fn resume_fills_missing_tool_results_for_a_persisted_multi_call_assistant_
         None,
     )
     .await;
-    let (write_step, write_tool) = journal
+    let (write_step, write_tool, _) = journal
         .tool_intent(
             &engine,
             1,
             "call-write-missing",
             "write_file",
             &serde_json::json!({"path": "recovered.txt", "content": "one"}),
+            None,
         )
         .await
         .unwrap();
@@ -15685,6 +15686,7 @@ async fn resume_fills_missing_tool_results_for_a_persisted_multi_call_assistant_
             "call-shell-missing",
             "shell",
             &serde_json::json!({"command": "touch maybe"}),
+            None,
         )
         .await
         .unwrap();
@@ -15985,13 +15987,14 @@ async fn resumed_read_only_tools_re_run_instead_of_returning_a_journaled_result(
         None,
     )
     .await;
-    let (step, tool) = journal
+    let (step, tool, _) = journal
         .tool_intent(
             &engine,
             1,
             "call-read-again",
             "read_file",
             &serde_json::json!({"path": "README.md"}),
+            None,
         )
         .await
         .unwrap();
@@ -18866,6 +18869,16 @@ async fn imports_verifies_and_integrates_a_remote_bundle() {
         Some("feature/remote")
     );
     assert_eq!(result.entry.commit, head);
+    let effects = engine
+        .session_effects(&session.id, None, true, 100)
+        .await
+        .unwrap();
+    assert!(effects.receipts.iter().any(|receipt| {
+        receipt.target.kind == "remote_integration"
+            && receipt.target.key == "build.example.com:feature/remote"
+            && receipt.state == EffectState::Done
+            && receipt.external_id.as_deref() == Some(head.as_str())
+    }));
     assert_eq!(result.entry.verifier_approved, Some(true));
     assert_eq!(
         result.entry.verifier_summary.as_deref(),
@@ -22742,5 +22755,95 @@ async fn model_switch_creates_a_second_project_epoch_and_names_the_change() {
             .epochs
             .iter()
             .any(|epoch| epoch.cache_epoch == second_epoch)
+    );
+}
+
+#[tokio::test]
+async fn workspace_write_creates_a_done_receipt_and_replays_without_rewriting() {
+    let dir = TempDir::new().unwrap();
+    let write_call = || {
+        vec![
+            StreamEvent::ToolCall(ToolCall {
+                id: format!("call_write_{}", Uuid::now_v7().simple()),
+                name: "write_file".into(),
+                arguments: serde_json::json!({
+                    "path": "notes/effect.txt",
+                    "content": "effect receipt\n"
+                })
+                .to_string(),
+            }),
+            StreamEvent::Done,
+        ]
+    };
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            write_call(),
+            vec![
+                StreamEvent::TextDelta("wrote the file".into()),
+                StreamEvent::Done,
+            ],
+            write_call(),
+            vec![
+                StreamEvent::TextDelta("the write was replayed".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "effect replay".into(), None)
+        .await
+        .unwrap();
+    service
+        .start(&session.id, "write the file once")
+        .await
+        .unwrap();
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "idle");
+    let worktree = std::path::PathBuf::from(session.worktree.clone().unwrap());
+    let path = worktree.join("notes/effect.txt");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "effect receipt\n");
+
+    let effects = engine
+        .session_effects(&session.id, None, true, 100)
+        .await
+        .unwrap();
+    assert_eq!(effects.counts.total, 1, "{effects:?}");
+    assert_eq!(effects.counts.done, 1);
+    let receipt = &effects.receipts[0];
+    assert_eq!(receipt.target.key, "notes/effect.txt");
+    assert_eq!(
+        receipt.evidence.sha256.as_deref(),
+        Some(crate::effect::sha256_bytes(b"effect receipt\n").as_str())
+    );
+
+    // Remove the file behind the runtime's back. A replayed done receipt must
+    // not execute the write again, so the file stays absent.
+    std::fs::remove_file(&path).unwrap();
+    service
+        .start(&session.id, "try the same write again")
+        .await
+        .unwrap();
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "idle");
+    assert!(!path.exists(), "a done receipt must not rewrite the file");
+    let events = engine
+        .list_events(session.id.clone(), 0, 400)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "tool.finished"
+            && event.payload["name"] == "write_file"
+            && event.payload["output"]
+                .as_str()
+                .is_some_and(|text| text.contains("effect already completed"))
+    }));
+    let effects = engine
+        .session_effects(&session.id, None, true, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        effects.counts.total, 1,
+        "replay must not create a second row"
     );
 }

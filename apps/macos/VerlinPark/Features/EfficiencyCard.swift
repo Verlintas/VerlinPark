@@ -20,6 +20,9 @@ struct EfficiencyCard: View {
                 cachePlanRow(snapshot)
                 cacheBreakdownRows(snapshot)
                 recentCacheRows(snapshot)
+                if let effects = model.sessionEffects, effects.counts.total > 0 {
+                    EffectReceiptsSection(report: effects)
+                }
                 CacheCallTable(
                     calls: model.cacheCallRows,
                     truncated: model.sessionCacheCallsTruncated

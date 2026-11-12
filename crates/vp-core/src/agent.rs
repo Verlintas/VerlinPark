@@ -24,12 +24,13 @@ use vp_protocol::remote::{
 use vp_protocol::types::{
     AgentInfo, AgentProbeResult, AgentRecord, ApprovalMode, CapacityInfo, ConfigureAgentParams,
     ContextCheckpoint, ContextCheckpointDetailResult, ContextCompactionSummary, ContextMeasurement,
-    ContextRestorePreflight, ContextRestoreResult, ContextStructuredState, IntakeDispatchResult,
-    IntakeTask, MERGE_SOURCE_REMOTE, MergeQueueEntry, MergeQueueSource, OrchestrationRecovery,
-    PlanDepartment, PlanRevisionDetailResult, PlanTask, Program, ProgramMilestone,
-    ProgramTickResult, Project, ReviseTeamPlanResult, RoleModels, RunBudgetSnapshot, ScheduledTask,
-    SchedulerProjectStatus, SchedulerStatusResult, Session, SessionCachePlanResult,
-    SessionCachePlanRole, SessionCacheWarmResult, SessionCheckpoint, SessionCheckpointDiffResult,
+    ContextRestorePreflight, ContextRestoreResult, ContextStructuredState, EffectReceipt,
+    EffectState, IntakeDispatchResult, IntakeTask, MERGE_SOURCE_REMOTE, MergeQueueEntry,
+    MergeQueueSource, OrchestrationRecovery, PlanDepartment, PlanRevisionDetailResult, PlanTask,
+    Program, ProgramMilestone, ProgramTickResult, Project, ReviseTeamPlanResult, RoleModels,
+    RunBudgetSnapshot, RunStep, RunToolCall, ScheduledTask, SchedulerProjectStatus,
+    SchedulerStatusResult, Session, SessionCachePlanResult, SessionCachePlanRole,
+    SessionCacheWarmResult, SessionCheckpoint, SessionCheckpointDiffResult,
     SessionCheckpointRestoreResult, SessionCompactResult, SessionForkResult,
     SessionMergeForkResult, SessionPreemptResult, SessionPreemptionResult, SessionRunCancelResult,
     SessionRunResumeResult, Skill, SourceCitation, SourceSearchHit, StallRecoveryMode,
@@ -2355,6 +2356,91 @@ fn tool_finished_payload(
     })
 }
 
+/// Bounded, secret-free effect metadata attached to a tool result. This is
+/// how a completed write returns its receipt even when the run-journal
+/// fingerprint gate, not the dispatcher, produced the output.
+fn annotate_effect_output(output: &mut ToolOutput, receipt: &EffectReceipt) {
+    let summary = json!({
+        "id": receipt.id,
+        "state": receipt.state.as_str(),
+        "attempt": receipt.attempt,
+        "target": receipt.target.canonical(),
+        "probe": receipt.evidence.probe,
+        "reason": receipt.evidence.reason,
+        "sha256": receipt.evidence.sha256,
+        "commit": receipt.evidence.commit,
+        "external_id": receipt.external_id,
+        "caveat": receipt.evidence.caveat,
+        "replayed": receipt.evidence.replayed,
+    });
+    match output.structured.as_mut() {
+        Some(Value::Object(object)) => {
+            object.insert("effect".to_string(), summary);
+        }
+        Some(value) => {
+            *value = json!({"value": value, "effect": summary});
+        }
+        None => {
+            output.structured = Some(json!({"effect": summary}));
+        }
+    }
+}
+
+fn effect_replay_output(_tool: &str, receipt: &EffectReceipt) -> ToolOutput {
+    let mut evidence = receipt.evidence.clone();
+    evidence.replayed = true;
+    let anchor = evidence
+        .sha256
+        .as_deref()
+        .or(receipt.external_id.as_deref())
+        .or(evidence.commit.as_deref())
+        .unwrap_or("no additional evidence");
+    let mut output = ToolOutput::ok_structured(
+        format!(
+            "effect already completed: {} {} (attempt {}); the original action was not executed again. evidence: {anchor}",
+            receipt.target.canonical(),
+            receipt.state.as_str(),
+            receipt.attempt
+        ),
+        json!({
+            "effect": {
+                "id": receipt.id,
+                "state": receipt.state.as_str(),
+                "attempt": receipt.attempt,
+                "target": receipt.target.canonical(),
+                "probe": evidence.probe,
+                "sha256": evidence.sha256,
+                "commit": evidence.commit,
+                "external_id": receipt.external_id,
+                "caveat": evidence.caveat,
+                "replayed": true,
+            },
+            "replayed": true,
+        }),
+    );
+    output.failure = None;
+    output
+}
+
+fn effect_blocked_output(tool: &str, receipt: &EffectReceipt) -> ToolOutput {
+    ToolOutput::error_coded(
+        tool,
+        crate::tooling::errors::ToolErrorCode::EFFECT_UNKNOWN,
+        format!(
+            "effect receipt {} for {} is {}; it must be reconciled with effect.reconcile before this action can run again",
+            receipt.id,
+            receipt.target.canonical(),
+            receipt.state.as_str()
+        ),
+    )
+    .with_failure_evidence(format!(
+        "effect_id={}; state={}; target={}",
+        receipt.id,
+        receipt.state.as_str(),
+        receipt.target.canonical()
+    ))
+}
+
 impl AgentService {
     pub fn from_env(engine: Engine) -> Self {
         let base_url = env::var("VERLINPARK_BASE_URL")
@@ -3382,6 +3468,59 @@ impl AgentService {
             bundle.sha256.clone(),
             imported.imported_ref.clone(),
         );
+        let remote_target = crate::effect::EffectTarget::new(
+            crate::effect::kinds::REMOTE_INTEGRATION,
+            format!("{}:{}", bundle.host, bundle.branch),
+        );
+        let remote_request = crate::effect::canonical_request_hash(
+            "remote.integrate",
+            json!({
+                "host": bundle.host,
+                "branch": bundle.branch,
+                "commit": imported.commit,
+            }),
+        );
+        let remote_request = match remote_request {
+            Ok(value) => value,
+            Err(error) => return Err(error),
+        };
+        let existing = self
+            .engine
+            .lookup_effect(
+                &session.id,
+                params.task_id.as_deref(),
+                "remote.integrate",
+                &remote_target.canonical(),
+                &remote_request,
+            )
+            .await?;
+        if let Some(receipt) = existing.as_ref() {
+            match receipt.state {
+                EffectState::Done => {
+                    return Err(anyhow!(
+                        "EFFECT_REPLAYED: remote {}:{} @ {} was already integrated; inspect the stored receipt {} and the existing queue entry instead of integrating again",
+                        bundle.host,
+                        bundle.branch,
+                        imported.commit,
+                        receipt.id
+                    ));
+                }
+                EffectState::Intent | EffectState::Unknown => {
+                    return Err(anyhow::Error::new(crate::effect::EffectBlocked {
+                        session_id: session.id.clone(),
+                        task_id: params.task_id.clone(),
+                        receipt_ids: vec![receipt.id.clone()],
+                        message: format!(
+                            "EFFECT_UNKNOWN: a previous remote integration of {}:{} is {}; reconcile it before retrying",
+                            bundle.host,
+                            bundle.branch,
+                            receipt.state.as_str()
+                        ),
+                    }));
+                }
+                EffectState::Failed => {}
+            }
+        }
         let entry = self
             .engine
             .enqueue_merge_with_source(
@@ -3422,6 +3561,36 @@ impl AgentService {
             }),
         )
         .await?;
+        // The remote effect is the verified bundle import/enqueue: the remote
+        // commit is now a durable queue identity. The local deterministic
+        // merge is tracked by the merge queue and the `git_merge` receipt, so
+        // this receipt settles done before integration instead of blocking
+        // its own queue entry.
+        let mut accepted = crate::effect::runtime_receipt(
+            &session.id,
+            params.task_id.as_deref(),
+            "remote.integrate",
+            remote_target,
+            remote_request,
+            Some(bundle.host.clone()),
+        );
+        accepted.state = EffectState::Done;
+        accepted.external_id = Some(imported.commit.clone());
+        accepted.response_hash = Some(crate::sha256_hex(imported.commit.as_bytes()));
+        accepted.evidence = vp_protocol::types::EffectEvidence {
+            probe: "remote_bundle_import".to_string(),
+            outcome: "observed".to_string(),
+            commit: Some(imported.commit.clone()),
+            branch: Some(bundle.branch.clone()),
+            repository: Some(bundle.host.clone()),
+            note: Some(format!(
+                "accepted as merge queue entry {}; local integration is tracked separately",
+                entry.id
+            )),
+            caveat: Some(remote_integration::environment_caveat().to_string()),
+            ..Default::default()
+        };
+        self.engine.record_settled_effect(accepted).await?;
         let integration_spec = AgentSpec {
             auto_approve: false,
             ..worker_spec
@@ -10509,6 +10678,127 @@ async fn commit_worker(spec: &AgentSpec, name: &str) -> Result<Option<String>> {
     .await?
 }
 
+/// Record the local Worker commit as `done` evidence. The commit is already
+/// visible in the task branch; `rev-parse` supplies the postcondition and a
+/// duplicate logical commit (same task/branch/commit) returns the stored row.
+async fn record_worker_commit_effect(
+    engine: &Engine,
+    session: &Session,
+    spec: &AgentSpec,
+    commit: &str,
+) {
+    let target = crate::effect::EffectTarget::new(
+        crate::effect::kinds::GIT_COMMIT,
+        format!(
+            "{}:{}",
+            spec.branch,
+            spec.task_id.as_deref().unwrap_or("session")
+        ),
+    );
+    let request = match crate::effect::canonical_request_hash(
+        "worker.commit",
+        json!({
+            "branch": spec.branch,
+            "base": spec.base_commit,
+            "commit": commit,
+            "task_id": spec.task_id,
+        }),
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error, "failed to build the worker commit effect identity");
+            return;
+        }
+    };
+    let mut receipt = crate::effect::runtime_receipt(
+        &session.id,
+        spec.task_id.as_deref(),
+        "worker.commit",
+        target,
+        request,
+        Some("workspace".to_string()),
+    );
+    receipt.state = EffectState::Done;
+    receipt.external_id = Some(commit.to_string());
+    receipt.response_hash = Some(crate::sha256_hex(commit.as_bytes()));
+    receipt.evidence = vp_protocol::types::EffectEvidence {
+        probe: crate::effect::probes::GIT_REV_PARSE.to_string(),
+        outcome: "observed".to_string(),
+        commit: Some(commit.to_string()),
+        branch: Some(spec.branch.clone()),
+        ..Default::default()
+    };
+    if let Err(error) = engine.record_settled_effect(receipt).await {
+        tracing::warn!(%error, "failed to record the worker commit effect receipt");
+    }
+}
+
+/// Record the deterministic Integrator's merge as `done` after the final
+/// lease check. The session HEAD is the postcondition; the entry commit is
+/// retained as the source identity.
+async fn record_integration_merge_effect(
+    engine: &Engine,
+    session: &Session,
+    spec: &AgentSpec,
+    entry: &MergeQueueEntry,
+) {
+    let worktree_path = spec.session_worktree.clone();
+    let head = tokio::task::spawn_blocking(move || worktree::head_commit(&worktree_path)).await;
+    let head = match head {
+        Ok(Ok(head)) => head,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "integration merge head probe failed");
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(%error, "integration merge head probe task failed");
+            return;
+        }
+    };
+    let target = crate::effect::EffectTarget::new(
+        crate::effect::kinds::GIT_MERGE,
+        format!("{}:{}", spec.branch, entry.id),
+    );
+    let request = match crate::effect::canonical_request_hash(
+        "integrator.merge",
+        json!({
+            "entry_id": entry.id,
+            "branch": spec.branch,
+            "commit": entry.commit,
+            "merge_head": head,
+            "attempt": entry.attempt,
+        }),
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error, "failed to build the integration merge effect identity");
+            return;
+        }
+    };
+    let mut receipt = crate::effect::runtime_receipt(
+        &session.id,
+        entry.task_id.as_deref(),
+        "integrator.merge",
+        target,
+        request,
+        Some("workspace".to_string()),
+    );
+    receipt.state = EffectState::Done;
+    receipt.external_id = Some(head.clone());
+    receipt.response_hash = Some(crate::sha256_hex(head.as_bytes()));
+    receipt.evidence = vp_protocol::types::EffectEvidence {
+        probe: crate::effect::probes::GIT_MERGE_HEAD.to_string(),
+        outcome: "observed".to_string(),
+        commit: Some(head),
+        branch: Some(spec.branch.clone()),
+        note: Some(format!("merged queue entry {}", entry.id)),
+        ..Default::default()
+    };
+    if let Err(error) = engine.record_settled_effect(receipt).await {
+        tracing::warn!(%error, "failed to record the integration merge effect receipt");
+    }
+}
+
 async fn run_integration_command(
     engine: &Engine,
     project: &Project,
@@ -10722,6 +11012,31 @@ async fn process_merge_entry_fenced(
     lease: &RuntimeLeaseGuard,
 ) -> Result<String> {
     let (_, project) = load_session_project(engine.store().clone(), &session.id).await?;
+    // Effects may have become unresolved while the entry waited in the queue.
+    // Re-check under the integration lease; never merge incomplete work.
+    if let Err(error) = engine
+        .assert_effects_settled(&session.id, entry.task_id.as_deref())
+        .await
+    {
+        let detail = truncate(&format!("{error:#}"));
+        engine
+            .update_merge_queue_entry(&entry.id, "failed", Some(detail.clone()))
+            .await?;
+        emit(
+            engine,
+            &session.id,
+            spec,
+            "integrator.finished",
+            serde_json::json!({
+                "entry_id": entry.id,
+                "status": "failed",
+                "detail": detail,
+                "reason": "effect_unsettled",
+            }),
+        )
+        .await?;
+        return Err(error);
+    }
     let preflight_worktree = spec.session_worktree.clone();
     let git_lock = engine.git_mutex();
     let preflight = {
@@ -11004,6 +11319,7 @@ async fn process_merge_entry_fenced(
         .await?;
         return Err(anyhow!(detail));
     }
+    record_integration_merge_effect(engine, session, spec, entry).await;
     engine
         .update_merge_queue_entry(&entry.id, "merged", Some(integration_detail.clone()))
         .await?;
@@ -12367,6 +12683,7 @@ async fn finish_worker(
         });
     };
 
+    record_worker_commit_effect(engine, session, worker_spec, &commit).await;
     let verification = verify_worker(
         engine,
         config,
@@ -15056,6 +15373,7 @@ async fn run_loop_body(
         None
     };
     let shell_policy = engine.get_shell_policy(&project.id).await?;
+    let effect_policy = engine.get_effect_policy(&project.id).await?;
     let mut secret_roots = shell_secret_roots(engine.store().data_dir());
     secret_roots.extend(shell_policy.read_deny.iter().map(PathBuf::from));
     let tool_context = ToolContext {
@@ -16338,10 +16656,10 @@ async fn run_loop_body(
                     {
                         tracing::warn!(%error, "failed to record task tool progress");
                     }
-                    let pair = journal
-                        .tool_intent(engine, turn + 1, call_id, name, input)
+                    let (step, tool, _) = journal
+                        .tool_intent(engine, turn + 1, call_id, name, input, None)
                         .await?;
-                    journal_pairs.insert(call_id.to_string(), pair);
+                    journal_pairs.insert(call_id.to_string(), (step, tool));
                     emit(
                         engine,
                         &session.id,
@@ -16578,21 +16896,16 @@ async fn run_loop_body(
             };
             let input: serde_json::Value =
                 serde_json::from_str(&call.arguments).unwrap_or_else(|_| serde_json::json!({}));
+            // The probe needs the original arguments after dispatch consumes
+            // `input`; cloning one bounded JSON value is cheaper than threading
+            // it through every tool branch.
+            let effect_input = input.clone();
             // Duplicate-write gate runs before approval and before any journal
             // intent: an already-completed write is returned from the journal,
             // not executed again. Read-only tools re-run normally.
             let duplicate = journal
                 .check_duplicate_write(engine, &call.name, &input)
                 .await?;
-            let journal_pair = if duplicate.is_none() {
-                Some(
-                    journal
-                        .tool_intent(engine, turn + 1, &call_id, &call.name, &input)
-                        .await?,
-                )
-            } else {
-                None
-            };
             if duplicate.is_some() {
                 emit(
                     engine,
@@ -16907,6 +17220,107 @@ async fn run_loop_body(
             let skill_denied = active_skill
                 .as_ref()
                 .filter(|skill| !skill_allows_tool(skill, &call.name));
+            // Effect receipts are written in the same transaction as the run
+            // journal intent. A completed logical effect replays its stored
+            // evidence without executing; an unresolved one blocks execution
+            // until an operator reconciles it. A denied/skill-blocked call
+            // never creates an effect intent because it never runs.
+            let planned_effect = if denied_reason.is_none() && skill_denied.is_none() {
+                crate::effect::classify_tool_effect_for_host(
+                    &call.name,
+                    &input,
+                    approval_risk,
+                    dynamic_mcp_tool.is_some(),
+                    &effect_policy,
+                    tool_context
+                        .remote
+                        .as_ref()
+                        .map(|remote| remote.label())
+                        .as_deref(),
+                )?
+            } else {
+                None
+            };
+            let mut effect_override: Option<ToolOutput> = None;
+            let mut effect_begin: Option<EffectReceipt> = None;
+            let mut effect_duplicate: Option<EffectReceipt> = None;
+            let mut journal_pair: Option<(RunStep, RunToolCall)> = None;
+            if duplicate.is_some() {
+                if let Some(plan) = &planned_effect
+                    && let crate::effect::EffectPrepare::Replay(receipt)
+                    | crate::effect::EffectPrepare::Blocked(receipt)
+                    | crate::effect::EffectPrepare::Proceed(receipt) = engine
+                        .prepare_tool_effect(&session.id, spec.task_id.as_deref(), plan)
+                        .await?
+                {
+                    effect_duplicate = Some(receipt);
+                }
+            } else if let Some(plan) = &planned_effect {
+                match engine
+                    .prepare_tool_effect(&session.id, spec.task_id.as_deref(), plan)
+                    .await?
+                {
+                    crate::effect::EffectPrepare::Replay(receipt) => {
+                        effect_override = Some(effect_replay_output(&call.name, &receipt));
+                    }
+                    crate::effect::EffectPrepare::Blocked(receipt) => {
+                        effect_override = Some(effect_blocked_output(&call.name, &receipt));
+                    }
+                    crate::effect::EffectPrepare::Proceed(receipt) => {
+                        let (step, tool, begin) = journal
+                            .tool_intent(
+                                engine,
+                                turn + 1,
+                                &call_id,
+                                &call.name,
+                                &input,
+                                Some(&receipt),
+                            )
+                            .await?;
+                        match begin {
+                            Some(begin) if begin.inserted => {
+                                effect_begin = Some(begin.receipt);
+                                journal_pair = Some((step, tool));
+                            }
+                            Some(begin) => {
+                                if begin.receipt.state == EffectState::Done {
+                                    effect_override =
+                                        Some(effect_replay_output(&call.name, &begin.receipt));
+                                } else {
+                                    effect_override =
+                                        Some(effect_blocked_output(&call.name, &begin.receipt));
+                                }
+                                journal_pair = Some((step, tool));
+                            }
+                            None => journal_pair = Some((step, tool)),
+                        }
+                    }
+                }
+            } else {
+                let (step, tool, _) = journal
+                    .tool_intent(engine, turn + 1, &call_id, &call.name, &input, None)
+                    .await?;
+                journal_pair = Some((step, tool));
+            }
+            if effect_override.is_some() {
+                // No dispatch branch runs for a replayed or blocked effect, so
+                // emit the same start marker the executing branches emit.
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                        "effect_blocked": effect_override
+                            .as_ref()
+                            .is_some_and(|output| output.is_error),
+                    }),
+                )
+                .await?;
+            }
             control
                 .preempt
                 .set_phase(crate::preemption::Phase::Tool, Some(&call.name));
@@ -16914,7 +17328,15 @@ async fn run_loop_body(
             let tool_token = crate::preemption::Token::tool_child(&control.preempt, tool_deadline);
             tool_token.set_phase(crate::preemption::Phase::Tool, Some(&call.name));
             let tool_started = Instant::now();
-            let output = if let Some(output) = duplicate {
+            let output = if let Some(mut output) = effect_override {
+                if let Some(receipt) = &effect_begin {
+                    annotate_effect_output(&mut output, receipt);
+                }
+                output
+            } else if let Some(mut output) = duplicate {
+                if let Some(receipt) = &effect_duplicate {
+                    annotate_effect_output(&mut output, receipt);
+                }
                 output
             } else if let Some(reason) = denied_reason {
                 ToolOutput::error_coded(
@@ -18009,27 +18431,44 @@ async fn run_loop_body(
                 .output;
             output.annotate_shape_metadata();
 
+            let effect_settled = if let (Some(intent), Some(plan)) =
+                (effect_begin.take(), planned_effect.as_ref())
+            {
+                let probe =
+                    crate::effect::probe_tool_effect(plan, &effect_input, &output, &spec.worktree)
+                        .await;
+                let settled = crate::effect::settled_receipt(intent, probe);
+                annotate_effect_output(&mut output, &settled);
+                Some(settled)
+            } else {
+                None
+            };
+            let mut finished_payload = tool_finished_payload(
+                &call_id,
+                &call.name,
+                &output,
+                tool_duration_ms,
+                Some(approval_risk),
+                config.approval_mode,
+                approval_wait_ms,
+            );
+            agent_fields(&mut finished_payload, spec);
             if let Some((journal_step, journal_tool)) = &journal_pair {
                 journal
-                    .tool_completed(engine, journal_step, journal_tool, &output)
+                    .tool_completed_with_effect(
+                        engine,
+                        journal_step,
+                        journal_tool,
+                        &output,
+                        effect_settled.as_ref(),
+                        Some(("tool.finished", finished_payload)),
+                    )
+                    .await?;
+            } else {
+                engine
+                    .append_event(&session.id, "tool.finished", finished_payload)
                     .await?;
             }
-            emit(
-                engine,
-                &session.id,
-                spec,
-                "tool.finished",
-                tool_finished_payload(
-                    &call_id,
-                    &call.name,
-                    &output,
-                    tool_duration_ms,
-                    Some(approval_risk),
-                    config.approval_mode,
-                    approval_wait_ms,
-                ),
-            )
-            .await?;
             if top_level {
                 let stored = engine
                     .append_message(

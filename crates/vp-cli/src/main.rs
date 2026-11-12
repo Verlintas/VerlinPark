@@ -2320,6 +2320,78 @@ enum Command {
         #[arg(long)]
         max_commits: Option<u64>,
     },
+    /// Show local effect receipts for a session. `done`/`failed` rows are
+    /// settled evidence; `intent`/`unknown` rows block merge until reconciled.
+    Effects {
+        session: String,
+        /// Inspect one plan task's receipts (session-scoped rows are included
+        /// in the blocking check but not in this filtered view).
+        #[arg(long)]
+        task: Option<String>,
+        /// Newest-first row limit (1-500, default 100).
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Only unresolved intent/unknown rows.
+        #[arg(long)]
+        unresolved: bool,
+    },
+    /// Explicitly resolve an intent/unknown effect to done or failed. Marking
+    /// done requires bounded evidence (hash, commit, external id, status, or a
+    /// note of at least 8 characters).
+    #[command(name = "effect-reconcile")]
+    EffectReconcile {
+        effect: String,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        done: bool,
+        #[arg(long)]
+        failed: bool,
+        #[arg(long)]
+        sha256: Option<String>,
+        #[arg(long)]
+        commit: Option<String>,
+        #[arg(long = "external-id")]
+        external_id: Option<String>,
+        #[arg(long = "http-status")]
+        http_status: Option<u16>,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long)]
+        operator: Option<String>,
+    },
+    /// Show the project effect-receipt policy.
+    #[command(name = "effect-policy")]
+    EffectPolicy { project: String },
+    /// Set the project effect-receipt policy. Omitted flags keep the current
+    /// value.
+    #[command(name = "effect-policy-set")]
+    EffectPolicySet {
+        project: String,
+        #[arg(long)]
+        enabled: Option<bool>,
+        #[arg(long = "unknown-blocks-merge")]
+        unknown_blocks_merge: Option<bool>,
+        #[arg(long = "stale-grace-secs")]
+        stale_intent_grace_secs: Option<u64>,
+        /// `external_only` (default) or `all`.
+        #[arg(long = "shell-mode")]
+        shell_mode: Option<String>,
+        #[arg(long = "track-mutating-http")]
+        track_mutating_http: Option<bool>,
+        #[arg(long = "track-read-http")]
+        track_read_http: Option<bool>,
+        #[arg(long = "track-mcp-mutations")]
+        track_mcp_mutations: Option<bool>,
+        #[arg(long = "track-workspace-writes")]
+        track_workspace_writes: Option<bool>,
+    },
+    /// Move stale effect intents to unknown after the project grace period.
+    #[command(name = "effect-sweep")]
+    EffectSweep {
+        #[arg(long)]
+        limit: Option<u32>,
+    },
     /// List project-scoped MCP tool schema pins and their trust status.
     #[command(name = "mcp-pins")]
     McpPins {
@@ -7575,6 +7647,122 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await?
         }
+        Command::Effects {
+            session,
+            task,
+            limit,
+            unresolved,
+        } => {
+            rpc(
+                &discovery,
+                "session.effects",
+                json!({
+                    "session_id": session,
+                    "task_id": task,
+                    "limit": limit,
+                    "include_settled": !unresolved,
+                }),
+            )
+            .await?
+        }
+        Command::EffectReconcile {
+            effect,
+            session,
+            done,
+            failed,
+            sha256,
+            commit,
+            external_id,
+            http_status,
+            note,
+            operator,
+        } => {
+            if done == failed {
+                bail!("pass exactly one of --done or --failed");
+            }
+            let decision = if done { "done" } else { "failed" };
+            rpc(
+                &discovery,
+                "effect.reconcile",
+                json!({
+                    "session_id": session,
+                    "effect_id": effect,
+                    "decision": decision,
+                    "evidence": {
+                        "sha256": sha256,
+                        "commit": commit,
+                        "external_id": external_id,
+                        "http_status": http_status,
+                        "note": note,
+                    },
+                    "operator": operator,
+                }),
+            )
+            .await?
+        }
+        Command::EffectPolicy { project } => {
+            rpc(
+                &discovery,
+                "project.effect_policy.get",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::EffectPolicySet {
+            project,
+            enabled,
+            unknown_blocks_merge,
+            stale_intent_grace_secs,
+            shell_mode,
+            track_mutating_http,
+            track_read_http,
+            track_mcp_mutations,
+            track_workspace_writes,
+        } => {
+            let current = rpc(
+                &discovery,
+                "project.effect_policy.get",
+                json!({"project_id": project}),
+            )
+            .await?;
+            let mut policy = current.get("policy").cloned().unwrap_or_else(|| json!({}));
+            if let Some(enabled) = enabled {
+                policy["enabled"] = json!(enabled);
+            }
+            if let Some(value) = unknown_blocks_merge {
+                policy["unknown_blocks_merge"] = json!(value);
+            }
+            if let Some(value) = stale_intent_grace_secs {
+                policy["stale_intent_grace_secs"] = json!(value);
+            }
+            if let Some(mode) = shell_mode {
+                if vp_protocol::types::EffectShellMode::parse(&mode).is_none() {
+                    bail!("shell mode must be `external_only` or `all`, got {mode}");
+                }
+                policy["shell_mode"] = json!(mode.to_ascii_lowercase());
+            }
+            if let Some(value) = track_mutating_http {
+                policy["track_mutating_http"] = json!(value);
+            }
+            if let Some(value) = track_read_http {
+                policy["track_read_http"] = json!(value);
+            }
+            if let Some(value) = track_mcp_mutations {
+                policy["track_mcp_mutations"] = json!(value);
+            }
+            if let Some(value) = track_workspace_writes {
+                policy["track_workspace_writes"] = json!(value);
+            }
+            rpc(
+                &discovery,
+                "project.effect_policy.set",
+                json!({"project_id": project, "policy": policy}),
+            )
+            .await?
+        }
+        Command::EffectSweep { limit } => {
+            rpc(&discovery, "effect.sweep", json!({"limit": limit})).await?
+        }
         Command::McpPins { project, server } => {
             rpc(
                 &discovery,
@@ -12218,7 +12406,158 @@ fn tool_bundle_lines(value: &Value) -> Option<Vec<String>> {
     Some(lines)
 }
 
+/// Bounded human rendering for effect receipts and policy. It prints only
+/// target labels, states, attempts, and probe evidence — never file content,
+/// command text, or provider secrets.
+fn effect_lines(value: &Value) -> Option<Vec<String>> {
+    if let Some(receipts) = value.get("receipts").and_then(Value::as_array) {
+        let policy = value.get("policy").cloned().unwrap_or_else(|| json!({}));
+        let counts = value.get("counts").cloned().unwrap_or_else(|| json!({}));
+        let blocked = value
+            .get("blocked")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mut lines = vec![format!(
+            "effects: {} total · {} intent · {} done · {} failed · {} unknown · {} blocking{}",
+            counts.get("total").and_then(Value::as_u64).unwrap_or(0),
+            counts.get("intent").and_then(Value::as_u64).unwrap_or(0),
+            counts.get("done").and_then(Value::as_u64).unwrap_or(0),
+            counts.get("failed").and_then(Value::as_u64).unwrap_or(0),
+            counts.get("unknown").and_then(Value::as_u64).unwrap_or(0),
+            counts.get("blocking").and_then(Value::as_u64).unwrap_or(0),
+            if blocked { " (merge blocked)" } else { "" },
+        )];
+        lines.push(format!(
+            "policy: enabled={} unknown_blocks_merge={} stale_grace={}s shell_mode={}",
+            policy
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            policy
+                .get("unknown_blocks_merge")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            policy
+                .get("stale_intent_grace_secs")
+                .and_then(Value::as_u64)
+                .unwrap_or(120),
+            policy
+                .get("shell_mode")
+                .and_then(Value::as_str)
+                .unwrap_or("external_only"),
+        ));
+        if let Some(reason) = value.get("block_reason").and_then(Value::as_str) {
+            lines.push(reason.to_string());
+        }
+        for receipt in receipts {
+            let target = receipt
+                .get("target")
+                .map(|target| {
+                    format!(
+                        "{}:{}",
+                        target.get("kind").and_then(Value::as_str).unwrap_or("?"),
+                        target.get("key").and_then(Value::as_str).unwrap_or("")
+                    )
+                })
+                .unwrap_or_else(|| "?".to_string());
+            let evidence = receipt
+                .get("evidence")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let anchor = evidence
+                .get("sha256")
+                .and_then(Value::as_str)
+                .or_else(|| evidence.get("commit").and_then(Value::as_str))
+                .or_else(|| receipt.get("external_id").and_then(Value::as_str))
+                .map(|value| format!(" @ {}", value.chars().take(16).collect::<String>()))
+                .unwrap_or_default();
+            lines.push(format!(
+                "{}  {}  attempt {}{}  {} → {}",
+                receipt.get("id").and_then(Value::as_str).unwrap_or("?"),
+                receipt.get("state").and_then(Value::as_str).unwrap_or("?"),
+                receipt.get("attempt").and_then(Value::as_u64).unwrap_or(0),
+                anchor,
+                receipt.get("tool").and_then(Value::as_str).unwrap_or("?"),
+                target,
+            ));
+            if let Some(reason) = evidence.get("reason").and_then(Value::as_str) {
+                lines.push(format!("    reason: {reason}"));
+            }
+        }
+        return Some(lines);
+    }
+    if let Some(receipt) = value.get("receipt")
+        && let Some(state) = receipt.get("state").and_then(Value::as_str)
+    {
+        return Some(vec![format!(
+            "effect {}: {} attempt {} · {}",
+            receipt.get("id").and_then(Value::as_str).unwrap_or("?"),
+            state,
+            receipt.get("attempt").and_then(Value::as_u64).unwrap_or(0),
+            receipt
+                .get("target")
+                .map(|target| format!(
+                    "{}:{}",
+                    target.get("kind").and_then(Value::as_str).unwrap_or("?"),
+                    target.get("key").and_then(Value::as_str).unwrap_or("")
+                ))
+                .unwrap_or_else(|| "?".to_string()),
+        )]);
+    }
+    if let Some(policy) = value.get("policy")
+        && let Some(project) = value.get("project_id").and_then(Value::as_str)
+    {
+        return Some(vec![format!(
+            "project {project}  effects enabled={} unknown_blocks_merge={} stale_grace={}s shell_mode={} http_mutations={} http_reads={} mcp_mutations={} workspace_writes={}",
+            policy
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            policy
+                .get("unknown_blocks_merge")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            policy
+                .get("stale_intent_grace_secs")
+                .and_then(Value::as_u64)
+                .unwrap_or(120),
+            policy
+                .get("shell_mode")
+                .and_then(Value::as_str)
+                .unwrap_or("external_only"),
+            policy
+                .get("track_mutating_http")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            policy
+                .get("track_read_http")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            policy
+                .get("track_mcp_mutations")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            policy
+                .get("track_workspace_writes")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+        )]);
+    }
+    if let Some(swept) = value.get("swept").and_then(Value::as_u64) {
+        return Some(vec![format!(
+            "effect sweep: {swept} stale intent(s) moved to unknown"
+        )]);
+    }
+    None
+}
+
 fn print_human(value: &Value) {
+    if let Some(lines) = effect_lines(value) {
+        for line in lines {
+            println!("{line}");
+        }
+        return;
+    }
     if let Some(lines) = instruction_lines(value) {
         for line in lines {
             println!("{line}");
@@ -20655,5 +20994,166 @@ mod i5_cli_tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod effect_cli_tests {
+    use super::*;
+
+    #[test]
+    fn effect_commands_parse_and_require_evidence_flags() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "effects",
+                    "ses-123",
+                    "--task",
+                    "task-1",
+                    "--limit",
+                    "40",
+                    "--unresolved",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::Effects {
+                        session,
+                        task,
+                        limit,
+                        unresolved,
+                    } => {
+                        assert_eq!(session, "ses-123");
+                        assert_eq!(task.as_deref(), Some("task-1"));
+                        assert_eq!(limit, Some(40));
+                        assert!(unresolved);
+                    }
+                    other => panic!("expected effects, got {other:?}"),
+                }
+
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "effect-reconcile",
+                    "effect-1",
+                    "--done",
+                    "--sha256",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "--note",
+                    "verified on the remote host",
+                    "--operator",
+                    "ops",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::EffectReconcile {
+                        effect,
+                        done,
+                        failed,
+                        sha256,
+                        note,
+                        operator,
+                        ..
+                    } => {
+                        assert_eq!(effect, "effect-1");
+                        assert!(done);
+                        assert!(!failed);
+                        assert!(sha256.is_some());
+                        assert!(note.is_some());
+                        assert_eq!(operator.as_deref(), Some("ops"));
+                    }
+                    other => panic!("expected effect-reconcile, got {other:?}"),
+                }
+
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "effect-policy-set",
+                    "prj-1",
+                    "--unknown-blocks-merge",
+                    "false",
+                    "--stale-grace-secs",
+                    "300",
+                    "--shell-mode",
+                    "all",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::EffectPolicySet {
+                        project,
+                        unknown_blocks_merge,
+                        stale_intent_grace_secs,
+                        shell_mode,
+                        ..
+                    } => {
+                        assert_eq!(project, "prj-1");
+                        assert_eq!(unknown_blocks_merge, Some(false));
+                        assert_eq!(stale_intent_grace_secs, Some(300));
+                        assert_eq!(shell_mode.as_deref(), Some("all"));
+                    }
+                    other => panic!("expected effect-policy-set, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn effect_lines_render_state_without_secret_material() {
+        let value = json!({
+            "session_id": "ses-1",
+            "policy": {"enabled": true, "unknown_blocks_merge": true, "stale_intent_grace_secs": 120, "shell_mode": "external_only"},
+            "counts": {"total": 2, "intent": 0, "done": 1, "failed": 0, "unknown": 1, "blocking": 1},
+            "blocked": true,
+            "block_reason": "EFFECT_UNKNOWN: 1 unknown effect receipt(s) block integration",
+            "receipts": [
+                {
+                    "id": "effect-1",
+                    "state": "done",
+                    "attempt": 1,
+                    "tool": "write_file",
+                    "target": {"kind": "workspace_write", "key": "src/lib.rs"},
+                    "evidence": {"probe": "workspace_sha256", "outcome": "observed", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+                },
+                {
+                    "id": "effect-2",
+                    "state": "unknown",
+                    "attempt": 1,
+                    "tool": "remote_write",
+                    "target": {"kind": "remote_write", "key": "out/app.txt"},
+                    "evidence": {"probe": "remote_helper_hash", "outcome": "unverifiable", "reason": "probe_incomplete"}
+                }
+            ]
+        });
+        let lines = effect_lines(&value).unwrap();
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("2 total"));
+        assert!(rendered.contains("merge blocked"));
+        assert!(rendered.contains("workspace_write:src/lib.rs"));
+        assert!(rendered.contains("unknown"));
+        assert!(rendered.contains("remote_helper_hash") || rendered.contains("probe_incomplete"));
+        assert!(!rendered.contains("content"));
+    }
+
+    #[test]
+    fn effect_policy_lines_and_sweep_result_render() {
+        let policy = json!({
+            "project_id": "prj-1",
+            "policy": {
+                "enabled": true,
+                "unknown_blocks_merge": true,
+                "stale_intent_grace_secs": 120,
+                "shell_mode": "external_only",
+                "track_mutating_http": true,
+                "track_read_http": false,
+                "track_mcp_mutations": true,
+                "track_workspace_writes": true
+            }
+        });
+        let lines = effect_lines(&policy).unwrap();
+        assert!(lines[0].contains("prj-1"));
+        assert!(lines[0].contains("external_only"));
+        let sweep = json!({"swept": 2});
+        assert!(effect_lines(&sweep).unwrap()[0].contains("2 stale intent"));
     }
 }

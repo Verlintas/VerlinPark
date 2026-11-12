@@ -28,8 +28,8 @@ use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
-    Event, RunBudgetSnapshot, RunCheckpoint, RunFailure, RunStep, RunToolCall, Session, SessionRun,
-    SessionRunPolicy,
+    EffectReceipt, Event, RunBudgetSnapshot, RunCheckpoint, RunFailure, RunStep, RunToolCall,
+    Session, SessionRun, SessionRunPolicy,
 };
 use vp_providers::ChatRequest;
 
@@ -258,6 +258,7 @@ impl RunJournal {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn tool_intent(
         &self,
         engine: &Engine,
@@ -265,7 +266,8 @@ impl RunJournal {
         tool_call_id: &str,
         tool_name: &str,
         input: &Value,
-    ) -> Result<(RunStep, RunToolCall)> {
+        effect: Option<&EffectReceipt>,
+    ) -> Result<(RunStep, RunToolCall, Option<vp_store::store::EffectBegin>)> {
         let fingerprint = tool_fingerprint(tool_name, input)?;
         let now = now_rfc3339();
         let step = RunStep {
@@ -303,8 +305,13 @@ impl RunJournal {
         };
         let store = engine.store().clone();
         let tool_for_store = tool.clone();
+        let effect_for_store = effect.cloned();
         let stored = tokio::task::spawn_blocking(move || {
-            store.record_run_step_intent(&step, Some(&tool_for_store))
+            store.record_run_step_intent_with_effect(
+                &step,
+                Some(&tool_for_store),
+                effect_for_store.as_ref(),
+            )
         })
         .await??;
         for event in &stored.1 {
@@ -312,7 +319,7 @@ impl RunJournal {
         }
         // The store assigned a sequence; return the tool row that matches the
         // stored step identity (the input tool row is unchanged apart from seq).
-        Ok((stored.0, tool))
+        Ok((stored.0, tool, stored.2))
     }
 
     pub(crate) async fn tool_completed(
@@ -321,6 +328,24 @@ impl RunJournal {
         step: &RunStep,
         tool: &RunToolCall,
         output: &ToolOutput,
+    ) -> Result<()> {
+        self.tool_completed_with_effect(engine, step, tool, output, None, None)
+            .await
+    }
+
+    /// Complete a tool step, settle its effect receipt, and append the
+    /// provider-visible `tool.finished` event in one transaction. A crash
+    /// between these writes is impossible: either all four rows/events commit
+    /// or none do.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn tool_completed_with_effect(
+        &self,
+        engine: &Engine,
+        step: &RunStep,
+        tool: &RunToolCall,
+        output: &ToolOutput,
+        effect: Option<&EffectReceipt>,
+        tool_finished: Option<(&str, Value)>,
     ) -> Result<()> {
         let mut completed_step = step.clone();
         completed_step.status = if output.is_error {
@@ -354,8 +379,23 @@ impl RunJournal {
             .is_error
             .then(|| truncate_chars(&output.content, MAX_ERROR_CHARS));
         completed_tool.updated_at = completed_step.updated_at.clone();
-        self.complete_step(engine, completed_step, Some(completed_tool))
-            .await?;
+        let store = engine.store().clone();
+        let effect = effect.cloned();
+        let tool_finished = tool_finished.map(|(kind, payload)| (kind.to_string(), payload));
+        let stored = tokio::task::spawn_blocking(move || {
+            store.record_run_step_completed_with_effect(
+                &completed_step,
+                Some(&completed_tool),
+                effect.as_ref(),
+                tool_finished
+                    .as_ref()
+                    .map(|(kind, payload)| (kind.as_str(), payload.clone())),
+            )
+        })
+        .await??;
+        for event in &stored.2 {
+            engine.broadcast_event(event.clone());
+        }
         Ok(())
     }
 
@@ -1873,13 +1913,14 @@ mod integration_tests {
             )
             .await
             .unwrap();
-        let (tool_step, tool) = journal
+        let (tool_step, tool, _) = journal
             .tool_intent(
                 &fixture.engine,
                 1,
                 "call-1",
                 "write_file",
                 &serde_json::json!({"path": "a.txt", "content": "x"}),
+                None,
             )
             .await
             .unwrap();
@@ -1953,13 +1994,14 @@ mod integration_tests {
             .model_intent(&fixture.engine, 1, &request)
             .await
             .unwrap();
-        let (_tool_step, tool) = journal
+        let (_tool_step, tool, _) = journal
             .tool_intent(
                 &fixture.engine,
                 1,
                 "call-crash",
                 "shell",
                 &serde_json::json!({"command": "touch marker"}),
+                None,
             )
             .await
             .unwrap();
@@ -2068,13 +2110,14 @@ mod integration_tests {
     async fn duplicate_write_gate_consumes_once_and_releases_after_failure() {
         let fixture = fixture().await;
         let journal = begin_journal(&fixture, "write", true, None).await;
-        let (step, tool) = journal
+        let (step, tool, _) = journal
             .tool_intent(
                 &fixture.engine,
                 1,
                 "call-write",
                 "write_file",
                 &serde_json::json!({"path": "dup.txt", "content": "one"}),
+                None,
             )
             .await
             .unwrap();
@@ -2150,13 +2193,14 @@ mod integration_tests {
         );
 
         let failed_journal = begin_journal(&fixture, "failed write", true, None).await;
-        let (failed_step, failed_tool) = failed_journal
+        let (failed_step, failed_tool, _) = failed_journal
             .tool_intent(
                 &fixture.engine,
                 1,
                 "call-failed-write",
                 "write_file",
                 &serde_json::json!({"path": "failed.txt", "content": "x"}),
+                None,
             )
             .await
             .unwrap();
@@ -2521,13 +2565,14 @@ mod integration_tests {
             .checkpoint(&fixture.engine, 1, RunBudgetSnapshot::default())
             .await
             .unwrap();
-        let (step, tool) = journal
+        let (step, tool, _) = journal
             .tool_intent(
                 &fixture.engine,
                 1,
                 "call-r",
                 "read_file",
                 &serde_json::json!({"path": "README.md"}),
+                None,
             )
             .await
             .unwrap();
@@ -3052,13 +3097,14 @@ mod journal_store_edge_tests {
     async fn concurrent_claim_allows_exactly_one_consumer() {
         let fixture = fixture().await;
         let journal = journal(&fixture, "claim race").await;
-        let (step, tool) = journal
+        let (step, tool, _) = journal
             .tool_intent(
                 &fixture.engine,
                 1,
                 "call-race",
                 "write_file",
                 &serde_json::json!({"path": "race.txt", "content": "x"}),
+                None,
             )
             .await
             .unwrap();
@@ -3141,13 +3187,14 @@ mod journal_store_edge_tests {
     async fn lineage_note_includes_tools_from_an_earlier_attempt() {
         let fixture = fixture().await;
         let first = journal(&fixture, "lineage").await;
-        let (step, tool) = first
+        let (step, tool, _) = first
             .tool_intent(
                 &fixture.engine,
                 1,
                 "call-first",
                 "write_file",
                 &serde_json::json!({"path": "first.txt", "content": "1"}),
+                None,
             )
             .await
             .unwrap();

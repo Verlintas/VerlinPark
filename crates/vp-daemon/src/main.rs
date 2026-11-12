@@ -59,7 +59,8 @@ use vp_protocol::types::{
     ContextCheckpointPruneParams, ContextRestoreParams, ContractPolicyParams, ContractPolicyResult,
     CreateModelPresetParams, CreateSessionParams, CriticalPathMode, CriticalPathPolicyParams,
     CriticalPathPolicyResult, DaemonMetrics, DaemonMetricsResult, DashboardParams,
-    DeleteModelPresetParams, DiscardSessionParams, DoctorCheck, DoctorReport, EventListResult,
+    DeleteModelPresetParams, DiscardSessionParams, DoctorCheck, DoctorReport, EffectPolicyParams,
+    EffectPolicyResult, EffectReconcileParams, EffectReconcileResult, EventListResult,
     ForgePreflightParams, ForgeStatusParams, ForkAuditParams, ForkRepairParams, GitLogParams,
     GitShowParams, GovernorPreviewParams, GovernorStatusParams, IntakeCreateParams,
     IntakeDeleteResult, IntakeListParams, IntakeTaskParams, IntakeUpdateParams,
@@ -90,13 +91,13 @@ use vp_protocol::types::{
     SessionCitationAuditParams, SessionCitationsParams, SessionCompactParams, SessionCompareParams,
     SessionContextParams, SessionContinuationCancelParams, SessionContinuationReclaimParams,
     SessionContinuationStatusParams, SessionContinuationsParams, SessionContractParams,
-    SessionDeferParams, SessionDiffParams, SessionExportParams, SessionForkParams,
-    SessionForkTreeParams, SessionImportParams, SessionInstructionsParams, SessionLineageParams,
-    SessionListResult, SessionLogParams, SessionMergeForkParams, SessionPauseParams,
-    SessionPauseResult, SessionPlanResumeParams, SessionPlanResumeResult, SessionPreemptParams,
-    SessionPreemptionParams, SessionResumeParams, SessionResumeResult, SessionRunCancelParams,
-    SessionRunDetailParams, SessionRunPolicyParams, SessionRunResumeParams, SessionRunsParams,
-    SessionSkillActivationsParams, SessionStallsParams, SessionSteerParams,
+    SessionDeferParams, SessionDiffParams, SessionEffectsParams, SessionExportParams,
+    SessionForkParams, SessionForkTreeParams, SessionImportParams, SessionInstructionsParams,
+    SessionLineageParams, SessionListResult, SessionLogParams, SessionMergeForkParams,
+    SessionPauseParams, SessionPauseResult, SessionPlanResumeParams, SessionPlanResumeResult,
+    SessionPreemptParams, SessionPreemptionParams, SessionResumeParams, SessionResumeResult,
+    SessionRunCancelParams, SessionRunDetailParams, SessionRunPolicyParams, SessionRunResumeParams,
+    SessionRunsParams, SessionSkillActivationsParams, SessionStallsParams, SessionSteerParams,
     SessionSteeringCancelParams, SessionSteeringParams, SessionTodosParams, SessionTodosResult,
     SessionTranscriptParams, SetArtifactPolicyParams, SetCachePolicyParams,
     SetCheckpointPolicyParams, SetContextCheckpointPolicyParams, SetContractPolicyParams,
@@ -278,6 +279,7 @@ async fn run() -> Result<()> {
     spawn_gui_grace_sweeper(state.engine.clone());
     spawn_gui_timeline_retention_sweeper(state.engine.clone());
     spawn_task_stall_sweeper(state.engine.clone());
+    spawn_effect_sweeper(state.engine.clone());
     spawn_stall_recovery_reconciler(state.agent.clone());
     spawn_process_sweeper(state.engine.clone());
     spawn_approval_sweeper(state.engine.clone());
@@ -1389,6 +1391,91 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             }
             Err(response) => response_with_id(id, response),
         },
+        "project.effect_policy.get" => match parse_params::<EffectPolicyParams>(request.params) {
+            Ok(params) => match state.engine.get_effect_policy(&params.project_id).await {
+                Ok(policy) => RpcResponse::success(
+                    id,
+                    EffectPolicyResult {
+                        project_id: params.project_id,
+                        policy,
+                    },
+                ),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "project.effect_policy.set" => {
+            match parse_params::<vp_protocol::types::SetEffectPolicyParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .set_effect_policy(&params.project_id, params.policy)
+                    .await
+                {
+                    Ok(policy) => RpcResponse::success(
+                        id,
+                        EffectPolicyResult {
+                            project_id: params.project_id,
+                            policy,
+                        },
+                    ),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "session.effects" => match parse_params::<SessionEffectsParams>(request.params) {
+            Ok(params) => {
+                let include_settled = params.include_settled.unwrap_or(true);
+                match state
+                    .engine
+                    .session_effects(
+                        &params.session_id,
+                        params.task_id.as_deref(),
+                        include_settled,
+                        params.limit.unwrap_or(100),
+                    )
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                }
+            }
+            Err(response) => response_with_id(id, response),
+        },
+        "effect.reconcile" => match parse_params::<EffectReconcileParams>(request.params) {
+            Ok(params) => match state.engine.reconcile_effect(params).await {
+                Ok(result) => {
+                    let _ = state.engine.record_project_manifest().await;
+                    RpcResponse::success(
+                        id,
+                        EffectReconcileResult {
+                            receipt: result.receipt,
+                            changed: result.changed,
+                        },
+                    )
+                }
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "effect.sweep" => {
+            #[derive(serde::Deserialize)]
+            struct EffectSweepParams {
+                #[serde(default)]
+                limit: Option<u32>,
+            }
+            match parse_params::<EffectSweepParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .sweep_stale_effect_intents(params.limit.unwrap_or(100))
+                    .await
+                {
+                    Ok(swept) => RpcResponse::success(id, json!({"swept": swept})),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "project.mcp_pins" => match parse_params::<ProjectMcpPinsParams>(request.params) {
             Ok(params) => match state
                 .engine
@@ -4747,6 +4834,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "project.add"
             | "project.shell_policy.set"
             | "project.contract_policy.set"
+            | "project.effect_policy.set"
             | "project.cache_policy.set"
             | "project.integration_policy.set"
             | "project.budget.set"
@@ -4979,6 +5067,31 @@ fn spawn_gui_timeline_retention_sweeper(engine: Engine) {
                 }
                 Ok(_) => {}
                 Err(error) => tracing::warn!(%error, "GUI timeline retention sweep failed"),
+            }
+        }
+    });
+}
+
+/// Move stale effect `intent` rows to `unknown` after the project grace
+/// period. The first tick runs immediately so a daemon restart cannot leave a
+/// crash-between-intent-and-finish row silently retryable.
+fn spawn_effect_sweeper(engine: Engine) {
+    let seconds = std::env::var("VERLINPARK_EFFECT_SWEEP_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(30)
+        .clamp(5, 3_600);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(seconds));
+        loop {
+            interval.tick().await;
+            match engine.sweep_stale_effect_intents(100).await {
+                Ok(0) => {}
+                Ok(swept) => tracing::warn!(
+                    swept,
+                    "moved stale effect intents to unknown; reconcile before retrying or merging"
+                ),
+                Err(error) => tracing::warn!(%error, "effect intent sweep failed"),
             }
         }
     });

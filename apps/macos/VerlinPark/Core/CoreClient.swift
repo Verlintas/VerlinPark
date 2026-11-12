@@ -1172,6 +1172,74 @@ actor CoreClient {
         .decode(SessionContractReport.self)
     }
 
+    func sessionEffects(
+        sessionID: String,
+        taskID: String? = nil,
+        limit: Int = 100,
+        includeSettled: Bool = true
+    ) async throws -> SessionEffectsReport {
+        var params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "limit": .number(Double(limit)),
+            "include_settled": .bool(includeSettled),
+        ]
+        if let taskID {
+            params["task_id"] = .string(taskID)
+        }
+        return try await request(method: "session.effects", params: params)
+            .decode(SessionEffectsReport.self)
+    }
+
+    func reconcileEffect(
+        effectID: String,
+        sessionID: String? = nil,
+        decision: String,
+        sha256: String? = nil,
+        commit: String? = nil,
+        externalID: String? = nil,
+        httpStatus: Int? = nil,
+        note: String? = nil,
+        operatorName: String? = nil
+    ) async throws -> EffectReconcileResponse {
+        var evidence: [String: JSONValue] = [:]
+        if let sha256 {
+            evidence["sha256"] = .string(sha256)
+        }
+        if let commit {
+            evidence["commit"] = .string(commit)
+        }
+        if let externalID {
+            evidence["external_id"] = .string(externalID)
+        }
+        if let httpStatus {
+            evidence["http_status"] = .number(Double(httpStatus))
+        }
+        if let note {
+            evidence["note"] = .string(note)
+        }
+        var params: [String: JSONValue] = [
+            "effect_id": .string(effectID),
+            "decision": .string(decision),
+            "evidence": .object(evidence),
+        ]
+        if let sessionID {
+            params["session_id"] = .string(sessionID)
+        }
+        if let operatorName {
+            params["operator"] = .string(operatorName)
+        }
+        return try await request(method: "effect.reconcile", params: params)
+            .decode(EffectReconcileResponse.self)
+    }
+
+    func effectPolicy(projectID: String) async throws -> SessionEffectPolicySummary {
+        let response = try await request(
+            method: "project.effect_policy.get",
+            params: ["project_id": .string(projectID)]
+        )
+        return try response.decode(EffectPolicyEnvelope.self).policy
+    }
+
     func setSessionPromptLayout(
         sessionID: String,
         layout: Int

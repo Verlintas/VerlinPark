@@ -523,6 +523,485 @@ pub struct SessionContractParams {
     pub task_id: Option<String>,
 }
 
+/// Stable effect event kinds. Each payload contains
+/// `{"receipt": <EffectReceipt>}`; a reconcile adds a bounded `operator`.
+pub const EFFECT_INTENT_EVENT: &str = "effect.intent";
+pub const EFFECT_SETTLED_EVENT: &str = "effect.settled";
+pub const EFFECT_FAILED_EVENT: &str = "effect.failed";
+pub const EFFECT_UNKNOWN_EVENT: &str = "effect.unknown";
+pub const EFFECT_RECONCILED_EVENT: &str = "effect.reconciled";
+
+/// Lifecycle of one local effect receipt.
+///
+/// - `intent` is written in the same transaction as the tool intent, before
+///   the effect can happen.
+/// - `done` means the local runtime observed the declared postcondition.
+/// - `failed` means the postcondition was not observed and the call reported a
+///   failure; it may be retried as a new attempt row or reconciled.
+/// - `unknown` means the runtime cannot prove whether the effect happened.
+///   It requires explicit operator reconciliation and never auto-retries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectState {
+    #[default]
+    Intent,
+    Done,
+    Failed,
+    Unknown,
+}
+
+impl EffectState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Intent => "intent",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "intent" | "pending" => Some(Self::Intent),
+            "done" | "settled" | "succeeded" => Some(Self::Done),
+            "failed" | "error" => Some(Self::Failed),
+            "unknown" | "ambiguous" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Done | Self::Failed)
+    }
+
+    pub fn blocks_merge(self) -> bool {
+        matches!(self, Self::Intent | Self::Unknown)
+    }
+}
+
+/// Secret-free canonical effect target. `key` is stable across retries and is
+/// derived from trusted arguments, never from model prose or tool output.
+/// Examples: `workspace_write:src/lib.rs`, `git_push:origin/feature/x`,
+/// `forge_pr:github/owner/repo:feature/x->main`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EffectTarget {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub key: String,
+}
+
+impl EffectTarget {
+    pub fn new(kind: impl Into<String>, key: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            key: key.into(),
+        }
+    }
+
+    /// Canonical single-column representation used by the receipt table and
+    /// its unique index. The first `:` separates kind from key.
+    pub fn canonical(&self) -> String {
+        format!("{}:{}", self.kind, self.key)
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value.split_once(':') {
+            Some((kind, key)) => Self::new(kind, key),
+            None => Self::new(value, ""),
+        }
+    }
+
+    pub fn label(&self) -> String {
+        if self.key.is_empty() {
+            self.kind.clone()
+        } else {
+            format!("{}:{}", self.kind, self.key)
+        }
+    }
+}
+
+/// One observed path in a postcondition probe. `status` is one of `created`,
+/// `modified`, `deleted`, `unchanged`, `missing`, `unexpected`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectPathEvidence {
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub exists: bool,
+    #[serde(default)]
+    pub sha256: Option<String>,
+}
+
+/// Bounded postcondition evidence. It never contains command output, file
+/// content, URLs with credentials, provider keys, or free-form model text.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectEvidence {
+    /// Probe identifier, for example `workspace_sha256` or `git_ls_remote`.
+    #[serde(default)]
+    pub probe: String,
+    /// `observed`, `mismatch`, `unverifiable`, `declared`, `tool_error`, or
+    /// `reconciled`.
+    #[serde(default)]
+    pub outcome: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub sha256: Option<String>,
+    #[serde(default)]
+    pub paths: Vec<EffectPathEvidence>,
+    #[serde(default)]
+    pub exit_code: Option<i64>,
+    #[serde(default)]
+    pub http_status: Option<u16>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub commit: Option<String>,
+    #[serde(default)]
+    pub external_id: Option<String>,
+    /// Forge change name (`pull request`, `merge request`, `PR`) or the
+    /// remote integration id. Bounded and never secret.
+    #[serde(default)]
+    pub change: Option<String>,
+    /// Host/provider repository identifier. Not a filesystem path.
+    #[serde(default)]
+    pub repository: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+    /// Honest boundary statement. For HTTP it says the response does not prove
+    /// a remote side effect; for remote writes it says the helper reported the
+    /// postcondition.
+    #[serde(default)]
+    pub caveat: Option<String>,
+    /// True when a stored receipt was returned instead of executing again.
+    #[serde(default)]
+    pub replayed: bool,
+    #[serde(default)]
+    pub tool_error_code: Option<String>,
+}
+
+impl EffectEvidence {
+    pub fn declared(probe: impl Into<String>) -> Self {
+        Self {
+            probe: probe.into(),
+            outcome: "declared".to_string(),
+            ..Self::default()
+        }
+    }
+
+    pub fn observed(probe: impl Into<String>) -> Self {
+        Self {
+            probe: probe.into(),
+            outcome: "observed".to_string(),
+            ..Self::default()
+        }
+    }
+
+    pub fn unverifiable(probe: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            probe: probe.into(),
+            outcome: "unverifiable".to_string(),
+            reason: Some(reason.into()),
+            ..Self::default()
+        }
+    }
+
+    pub fn has_resolution_evidence(&self) -> bool {
+        self.sha256
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            || self
+                .commit
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            || self
+                .external_id
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            || self.http_status.is_some()
+            || self
+                .note
+                .as_deref()
+                .is_some_and(|value| value.trim().chars().count() >= 8)
+    }
+}
+
+/// One persisted effect receipt. `done` is terminal and replays the stored
+/// evidence; `unknown` requires `effect.reconcile`; `failed` may retry only as
+/// a new attempt row or an explicit reconcile.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectReceipt {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub attempt: u64,
+    #[serde(default)]
+    pub tool: String,
+    #[serde(default)]
+    pub target: EffectTarget,
+    #[serde(default)]
+    pub request_hash: String,
+    #[serde(default)]
+    pub state: EffectState,
+    #[serde(default)]
+    pub provider_key: Option<String>,
+    #[serde(default)]
+    pub external_id: Option<String>,
+    #[serde(default)]
+    pub response_hash: Option<String>,
+    #[serde(default)]
+    pub evidence: EffectEvidence,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub resolved_at: Option<String>,
+}
+
+impl EffectReceipt {
+    pub fn target_label(&self) -> String {
+        self.target.label()
+    }
+
+    pub fn blocks_merge(&self) -> bool {
+        self.state.blocks_merge()
+    }
+}
+
+/// How the runtime treats raw shell effects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectShellMode {
+    /// Only shell commands whose risk classifier is `external` or higher are
+    /// recorded as effects. Workspace-write shell stays covered by the
+    /// worktree sandbox and the Verifier/Integrator diff, not by a receipt.
+    #[default]
+    ExternalOnly,
+    /// Every shell command that the classifier does not mark read-only is
+    /// recorded. A raw shell effect is `unknown` unless the call declares an
+    /// explicit postcondition probe.
+    All,
+}
+
+impl EffectShellMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ExternalOnly => "external_only",
+            Self::All => "all",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "external_only" | "external" => Some(Self::ExternalOnly),
+            "all" | "every" => Some(Self::All),
+            _ => None,
+        }
+    }
+}
+
+/// Project-scoped effect-receipt policy. Every field defaults to the safe,
+/// narrow behavior so an older project decodes without changing its gates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectPolicy {
+    /// Master switch. Disabled means no receipts are created and the merge
+    /// gate is not applied. Default true for new and upgraded projects.
+    #[serde(default = "default_effect_enabled")]
+    pub enabled: bool,
+    /// When true (default), `intent`/`unknown` receipts block merge queue
+    /// integration and local landing. A project may observe without blocking
+    /// only by explicitly turning this off.
+    #[serde(default = "default_effect_unknown_blocks_merge")]
+    pub unknown_blocks_merge: bool,
+    /// Grace period before a stale `intent` moves to `unknown` after a daemon
+    /// restart. Bounded 1..=86_400 seconds.
+    #[serde(default = "default_effect_stale_grace")]
+    pub stale_intent_grace_secs: u64,
+    #[serde(default)]
+    pub shell_mode: EffectShellMode,
+    /// Record mutating `local_http` calls. Default true; read-only methods are
+    /// never recorded by this flag.
+    #[serde(default = "default_effect_track_mutating_http")]
+    pub track_mutating_http: bool,
+    /// Record `fetch_url` GET observations. Default false: a GET is a read
+    /// observation, not an effect. When enabled the receipt is `done` with an
+    /// explicit "no remote side effect proven" caveat.
+    #[serde(default)]
+    pub track_read_http: bool,
+    /// Record MCP calls as `unknown` effects. Default true; a mutating MCP tool
+    /// has no stable local postcondition probe.
+    #[serde(default = "default_effect_track_mcp")]
+    pub track_mcp_mutations: bool,
+    /// Record workspace writes. Default true so a daemon restart can replay a
+    /// completed write from the receipt even when the run journal is gone.
+    #[serde(default = "default_effect_track_workspace")]
+    pub track_workspace_writes: bool,
+}
+
+impl Default for EffectPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: default_effect_enabled(),
+            unknown_blocks_merge: default_effect_unknown_blocks_merge(),
+            stale_intent_grace_secs: default_effect_stale_grace(),
+            shell_mode: EffectShellMode::ExternalOnly,
+            track_mutating_http: default_effect_track_mutating_http(),
+            track_read_http: false,
+            track_mcp_mutations: default_effect_track_mcp(),
+            track_workspace_writes: default_effect_track_workspace(),
+        }
+    }
+}
+
+fn default_effect_enabled() -> bool {
+    true
+}
+
+fn default_effect_unknown_blocks_merge() -> bool {
+    true
+}
+
+fn default_effect_stale_grace() -> u64 {
+    120
+}
+
+fn default_effect_track_mutating_http() -> bool {
+    true
+}
+
+fn default_effect_track_mcp() -> bool {
+    true
+}
+
+fn default_effect_track_workspace() -> bool {
+    true
+}
+
+impl EffectPolicy {
+    pub const MAX_STALE_GRACE_SECS: u64 = 86_400;
+
+    pub fn normalized(&self) -> std::result::Result<Self, String> {
+        let policy = self.clone();
+        if policy.stale_intent_grace_secs == 0
+            || policy.stale_intent_grace_secs > Self::MAX_STALE_GRACE_SECS
+        {
+            return Err(format!(
+                "stale_intent_grace_secs must be 1..={}",
+                Self::MAX_STALE_GRACE_SECS
+            ));
+        }
+        Ok(policy)
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct EffectPolicyParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetEffectPolicyParams {
+    pub project_id: String,
+    pub policy: EffectPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EffectPolicyResult {
+    pub project_id: String,
+    pub policy: EffectPolicy,
+}
+
+/// Per-state receipt counts. `blocking` counts `intent` plus `unknown` rows
+/// that the active policy treats as blocking.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectCounts {
+    #[serde(default)]
+    pub total: u64,
+    #[serde(default)]
+    pub intent: u64,
+    #[serde(default)]
+    pub done: u64,
+    #[serde(default)]
+    pub failed: u64,
+    #[serde(default)]
+    pub unknown: u64,
+    #[serde(default)]
+    pub blocking: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SessionEffectsParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Include `done`/`failed` rows. Default true. When false only unresolved
+    /// `intent`/`unknown` rows are returned.
+    #[serde(default)]
+    pub include_settled: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionEffectsResult {
+    pub session_id: String,
+    pub policy: EffectPolicy,
+    pub receipts: Vec<EffectReceipt>,
+    pub counts: EffectCounts,
+    /// True when at least one receipt blocks merge under the active policy.
+    pub blocked: bool,
+    #[serde(default)]
+    pub block_reason: Option<String>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// Operator-supplied evidence for `effect.reconcile`. At least one bounded
+/// field must be present for a `done` decision.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectReconcileEvidence {
+    #[serde(default)]
+    pub sha256: Option<String>,
+    #[serde(default)]
+    pub commit: Option<String>,
+    #[serde(default)]
+    pub external_id: Option<String>,
+    #[serde(default)]
+    pub http_status: Option<u16>,
+    #[serde(default)]
+    pub note: Option<String>,
+    /// The probe identifier the operator used, e.g. `remote_stat` or
+    /// `git_ls_remote`. Defaults to `operator_reconcile`.
+    #[serde(default)]
+    pub probe: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EffectReconcileParams {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub effect_id: String,
+    /// `done` or `failed`; `intent`/`unknown` are not valid decisions.
+    pub decision: EffectState,
+    #[serde(default)]
+    pub evidence: EffectReconcileEvidence,
+    #[serde(default)]
+    pub operator: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectReconcileResult {
+    pub receipt: EffectReceipt,
+    /// False when the receipt already had the requested terminal state.
+    pub changed: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionContractResult {
     #[serde(default)]
@@ -10392,6 +10871,11 @@ pub struct SessionBundle {
     /// cache events.
     #[serde(default)]
     pub prompt_prefix_observations: Vec<PromptPrefixObservation>,
+    /// Event-backed local effect receipts. Older bundles decode as an empty
+    /// list; the archived `effect.*` events remain authoritative and replay
+    /// rebuilds the rows.
+    #[serde(default)]
+    pub effects: Vec<EffectReceipt>,
 }
 
 /// Project policy for automatic crash resume. Manual `session.run.resume`
@@ -10714,6 +11198,9 @@ pub struct SessionReplayReport {
     /// Event-backed task-contract projection (`contract.derived` events).
     #[serde(default)]
     pub contracts_match: bool,
+    /// Event-backed local effect receipt projection (`effect.*` events).
+    #[serde(default)]
+    pub effects_match: bool,
     pub consistent: bool,
     #[serde(default)]
     pub repaired: bool,
@@ -16036,10 +16523,19 @@ mod context_checkpoint_bundle_tests {
             instruction_blobs: Vec::new(),
             instructions: Vec::new(),
             prompt_prefix_observations: Vec::new(),
+            effects: vec![EffectReceipt {
+                id: "effect-1".into(),
+                session_id: "ses-1".into(),
+                state: EffectState::Done,
+                target: EffectTarget::new("workspace_write", "src/lib.rs"),
+                evidence: EffectEvidence::observed("workspace_sha256"),
+                ..Default::default()
+            }],
         };
         let encoded = serde_json::to_string(&bundle).unwrap();
         let decoded: SessionBundle = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded.context_checkpoints, bundle.context_checkpoints);
+        assert_eq!(decoded.effects, bundle.effects);
         let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         assert_eq!(value["context_checkpoints"][0]["id"], "ctx-1");
         assert_eq!(value["context_checkpoints"][0]["source_compaction_seq"], 3);
@@ -18927,5 +19423,81 @@ mod contract_protocol_tests {
         }))
         .unwrap();
         assert!(pinned.callable());
+    }
+
+    #[test]
+    fn effect_receipt_fields_decode_with_safe_defaults() {
+        let receipt: EffectReceipt = serde_json::from_value(serde_json::json!({
+            "id": "effect-1",
+            "session_id": "ses",
+            "tool": "write_file",
+            "target": {"kind": "workspace_write", "key": "src/lib.rs"},
+            "request_hash": "abc",
+            "state": "unknown"
+        }))
+        .unwrap();
+        assert_eq!(receipt.state, EffectState::Unknown);
+        assert_eq!(receipt.attempt, 0);
+        assert!(receipt.task_id.is_none());
+        assert!(receipt.evidence.paths.is_empty());
+        assert!(receipt.evidence.sha256.is_none());
+        assert!(receipt.evidence.caveat.is_none());
+
+        let settled: EffectReceipt = serde_json::from_value(serde_json::json!({
+            "state": "done",
+            "target": {"kind": "git_push", "key": "origin/feature"},
+            "evidence": {"sha256": "deadbeef", "http_status": 201}
+        }))
+        .unwrap();
+        assert_eq!(settled.state, EffectState::Done);
+        assert_eq!(settled.evidence.http_status, Some(201));
+        assert_eq!(settled.target.label(), "git_push:origin/feature");
+        assert_eq!(
+            EffectTarget::parse(&settled.target.canonical()),
+            settled.target
+        );
+    }
+
+    #[test]
+    fn effect_policy_and_state_wire_defaults_are_narrow() {
+        let policy: EffectPolicy = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(policy.enabled);
+        assert!(policy.unknown_blocks_merge);
+        assert_eq!(policy.stale_intent_grace_secs, 120);
+        assert_eq!(policy.shell_mode, EffectShellMode::ExternalOnly);
+        assert!(!policy.track_read_http);
+        assert!(policy.track_mutating_http);
+        assert!(policy.track_mcp_mutations);
+        assert!(policy.track_workspace_writes);
+        assert!(EffectState::Intent.blocks_merge());
+        assert!(EffectState::Unknown.blocks_merge());
+        assert!(!EffectState::Done.blocks_merge());
+        assert!(!EffectState::Failed.blocks_merge());
+        assert!(EffectState::Done.is_terminal());
+        assert!(EffectState::parse("UNKNOWN").is_some());
+        assert!(EffectState::parse("not-a-state").is_none());
+    }
+
+    #[test]
+    fn effect_reconcile_decision_decodes_and_counts_are_stable() {
+        let params: EffectReconcileParams = serde_json::from_value(serde_json::json!({
+            "effect_id": "effect-1",
+            "decision": "done",
+            "evidence": {"note": "verified on the remote host"}
+        }))
+        .unwrap();
+        assert_eq!(params.decision, EffectState::Done);
+        assert!(params.session_id.is_none());
+        assert!(params.operator.is_none());
+        let counts = EffectCounts {
+            total: 4,
+            intent: 1,
+            done: 1,
+            failed: 1,
+            unknown: 1,
+            blocking: 2,
+        };
+        let encoded = serde_json::to_value(counts).unwrap();
+        assert_eq!(encoded["blocking"], 2);
     }
 }

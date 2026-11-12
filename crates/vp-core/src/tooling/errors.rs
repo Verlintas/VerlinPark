@@ -331,6 +331,10 @@ tool_error_codes! {
     CONFLICT => "CONFLICT", true, "general", "Re-read the current state and reconcile before retrying.";
     INVALID_ACTION => "INVALID_ACTION", false, "general", "Use one of the actions listed in the tool schema.";
 
+    // Effect receipts
+    EFFECT_UNKNOWN => "EFFECT_UNKNOWN", false, "effects", "An earlier effect receipt is intent/unknown. Reconcile it with effect.reconcile (or `vp effect-reconcile`) before retrying; do not repeat the external action.";
+    EFFECT_REPLAYED => "EFFECT_REPLAYED", false, "effects", "A completed effect receipt was replayed instead of executing again. Use the stored evidence; a different request needs different arguments.";
+
     // File, read, write, edit, patch
     FILE_NOT_FOUND => "FILE_NOT_FOUND", false, "file", "Verify the path relative to the worktree; use find_files or list_dir instead of guessing.";
     FILE_TOO_LARGE => "FILE_TOO_LARGE", false, "file", "Read a bounded line range or search for the relevant region instead of loading the whole file.";

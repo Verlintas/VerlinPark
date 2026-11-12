@@ -12057,6 +12057,7 @@ fn context_checkpoint_bundle_validation_checks_session_and_project() {
         instruction_blobs: Vec::new(),
         instructions: Vec::new(),
         prompt_prefix_observations: Vec::new(),
+        effects: Vec::new(),
     };
     validate_session_bundle(&bundle).unwrap();
     bundle.context_checkpoints[0].project_id = "other-project".into();
@@ -12315,6 +12316,7 @@ fn importing_a_projection_only_bundle_synthesizes_checkpoint_events() {
         instruction_blobs: Vec::new(),
         instructions: Vec::new(),
         prompt_prefix_observations: Vec::new(),
+        effects: Vec::new(),
     };
     let imported = Store::open(data.path().join("imported")).unwrap();
     imported.import_session_bundle(&bundle).unwrap();
@@ -14154,6 +14156,27 @@ fn bundle_import_preserves_supervised_process_lifecycle_rows() {
         instruction_blobs: Vec::new(),
         instructions: Vec::new(),
         prompt_prefix_observations: Vec::new(),
+        effects: vec![EffectReceipt {
+            id: "effect-bundle".to_string(),
+            session_id: session.id.clone(),
+            task_id: Some("T1".to_string()),
+            attempt: 1,
+            tool: "write_file".to_string(),
+            target: EffectTarget::new("workspace_write", "README.md"),
+            request_hash: "bundle-hash".to_string(),
+            state: EffectState::Done,
+            provider_key: Some("workspace".to_string()),
+            external_id: None,
+            response_hash: None,
+            evidence: EffectEvidence {
+                probe: "workspace_sha256".to_string(),
+                outcome: "observed".to_string(),
+                sha256: Some("f".repeat(64)),
+                ..Default::default()
+            },
+            created_at: now_rfc3339(),
+            resolved_at: Some(now_rfc3339()),
+        }],
     };
     validate_session_bundle(&bundle).unwrap();
     let data = TempDir::new().unwrap();
@@ -14171,6 +14194,13 @@ fn bundle_import_preserves_supervised_process_lifecycle_rows() {
     // Imported rows keep their archived path; the daemon refuses to read a
     // path outside its own managed root. The store never rewrites it.
     assert_eq!(rows[0].output_path, "/tmp/archive-output.log");
+    let effects = imported
+        .list_effect_receipts(&session.id, None, true, 10)
+        .unwrap();
+    assert_eq!(effects.len(), 1);
+    assert_eq!(effects[0].id, "effect-bundle");
+    assert_eq!(effects[0].state, EffectState::Done);
+    assert_eq!(effects[0].target.key, "README.md");
 }
 
 #[test]
@@ -14216,6 +14246,7 @@ fn supervised_process_bundle_validation_rejects_wrong_session() {
         instruction_blobs: Vec::new(),
         instructions: Vec::new(),
         prompt_prefix_observations: Vec::new(),
+        effects: Vec::new(),
     };
     let error = validate_session_bundle(&bundle).unwrap_err();
     assert!(error.to_string().contains("belongs to session"), "{error}");
@@ -16439,6 +16470,7 @@ fn bundle_import_preserves_instruction_state_and_rejects_missing_blobs() {
             updated_at: now_rfc3339(),
         }],
         prompt_prefix_observations: Vec::new(),
+        effects: Vec::new(),
     };
     store.import_session_bundle(&bundle).unwrap();
     assert_eq!(
@@ -16507,6 +16539,7 @@ fn bundle_import_rejects_a_corrupt_instruction_blob() {
         }],
         instructions: Vec::new(),
         prompt_prefix_observations: Vec::new(),
+        effects: Vec::new(),
     };
     assert!(store.import_session_bundle(&bundle).is_err());
 }
@@ -17124,4 +17157,376 @@ fn prune_keeps_newest_and_active_session_epochs_and_supports_dry_run() {
         .prune_prompt_prefixes(&project.id, cutoff, 1, false)
         .unwrap();
     assert_eq!(second_prune.removed_epochs, 0);
+}
+
+fn effect_fixture(session_id: &str, target: &str) -> EffectReceipt {
+    EffectReceipt {
+        id: uuid_like("effect"),
+        session_id: session_id.to_string(),
+        task_id: Some("task-1".to_string()),
+        attempt: 1,
+        tool: "write_file".to_string(),
+        target: EffectTarget::new("workspace_write", target),
+        request_hash: format!("hash-{target}"),
+        state: EffectState::Intent,
+        provider_key: Some("workspace".to_string()),
+        external_id: None,
+        response_hash: None,
+        evidence: EffectEvidence::declared("workspace_sha256"),
+        created_at: now_rfc3339(),
+        resolved_at: None,
+    }
+}
+
+fn uuid_like(prefix: &str) -> String {
+    format!("{prefix}-{}", &Uuid::now_v7().simple().to_string()[..12])
+}
+
+#[test]
+fn effect_intent_is_idempotent_and_done_is_terminal() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("effects"))
+        .unwrap();
+    let session = store.create_session(&project.id, "effects").unwrap();
+    let intent = effect_fixture(&session.id, "src/lib.rs");
+    let (first, events, inserted) = store.begin_effect(&intent).unwrap();
+    assert!(inserted);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, vp_protocol::types::EFFECT_INTENT_EVENT);
+    assert_eq!(first.state, EffectState::Intent);
+
+    // A second intent for the same logical effect returns the first row and
+    // emits no second event.
+    let (second, events, inserted) = store.begin_effect(&intent).unwrap();
+    assert!(!inserted);
+    assert!(events.is_empty());
+    assert_eq!(second.id, first.id);
+
+    let mut settled = first.clone();
+    settled.state = EffectState::Done;
+    settled.evidence = EffectEvidence {
+        probe: "workspace_sha256".to_string(),
+        outcome: "observed".to_string(),
+        sha256: Some("a".repeat(64)),
+        ..Default::default()
+    };
+    let (done, events, changed) = store.settle_effect(&settled).unwrap();
+    assert!(changed);
+    assert_eq!(done.state, EffectState::Done);
+    assert_eq!(events[0].kind, vp_protocol::types::EFFECT_SETTLED_EVENT);
+
+    // Done is terminal: a new intent and a conflicting settle both fail.
+    let (again, events, inserted) = store.begin_effect(&intent).unwrap();
+    assert!(!inserted);
+    assert!(events.is_empty());
+    assert_eq!(again.state, EffectState::Done);
+    let mut conflicting = done.clone();
+    conflicting.state = EffectState::Unknown;
+    assert!(store.settle_effect(&conflicting).is_err());
+
+    let rows = store
+        .list_effect_receipts(&session.id, None, true, 100)
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].state, EffectState::Done);
+}
+
+#[test]
+fn failed_effect_retries_only_as_a_new_attempt_row() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("effects"))
+        .unwrap();
+    let session = store.create_session(&project.id, "effects").unwrap();
+    let intent = effect_fixture(&session.id, "src/lib.rs");
+    let (first, _, _) = store.begin_effect(&intent).unwrap();
+    let mut failed = first.clone();
+    failed.state = EffectState::Failed;
+    failed.evidence = EffectEvidence {
+        probe: "tool_error".to_string(),
+        outcome: "tool_error".to_string(),
+        reason: Some("tool_reported_failure".to_string()),
+        ..Default::default()
+    };
+    store.settle_effect(&failed).unwrap();
+
+    let (retry, events, inserted) = store.begin_effect(&intent).unwrap();
+    assert!(inserted);
+    assert_eq!(retry.attempt, 2);
+    assert_ne!(retry.id, first.id);
+    assert_eq!(events.len(), 1);
+    let rows = store
+        .list_effect_receipts(&session.id, None, true, 100)
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.state == EffectState::Failed)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn unknown_effect_blocks_retry_until_explicit_reconcile() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("effects"))
+        .unwrap();
+    let session = store.create_session(&project.id, "effects").unwrap();
+    let intent = effect_fixture(&session.id, "remote/file.txt");
+    let (first, _, _) = store.begin_effect(&intent).unwrap();
+    let mut unknown = first.clone();
+    unknown.state = EffectState::Unknown;
+    unknown.evidence = EffectEvidence::unverifiable("no_postcondition_probe", "no_probe");
+    store.settle_effect(&unknown).unwrap();
+    let (again, events, inserted) = store.begin_effect(&intent).unwrap();
+    assert!(!inserted);
+    assert!(events.is_empty());
+    assert_eq!(again.state, EffectState::Unknown);
+
+    // Evidence-free done is rejected; a hash is accepted and the event is
+    // `effect.reconciled`.
+    let empty = EffectEvidence {
+        probe: "operator_reconcile".to_string(),
+        outcome: "reconciled".to_string(),
+        ..Default::default()
+    };
+    assert!(
+        store
+            .reconcile_effect(&first.id, EffectState::Done, &empty, Some("ops"))
+            .is_err()
+    );
+    let evidence = EffectEvidence {
+        probe: "remote_stat".to_string(),
+        outcome: "reconciled".to_string(),
+        sha256: Some("b".repeat(64)),
+        ..Default::default()
+    };
+    let (reconciled, events, changed) = store
+        .reconcile_effect(&first.id, EffectState::Done, &evidence, Some("ops"))
+        .unwrap();
+    assert!(changed);
+    assert_eq!(reconciled.state, EffectState::Done);
+    assert_eq!(events[0].kind, vp_protocol::types::EFFECT_RECONCILED_EVENT);
+    assert_eq!(events[0].payload["operator"], "ops");
+    // A reconciled done row is terminal.
+    assert!(
+        store
+            .reconcile_effect(&first.id, EffectState::Failed, &evidence, None)
+            .is_err()
+    );
+}
+
+#[test]
+fn stale_intent_sweep_marks_only_rows_past_the_grace_period() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("effects"))
+        .unwrap();
+    let session = store.create_session(&project.id, "effects").unwrap();
+    let mut stale = effect_fixture(&session.id, "stale");
+    stale.created_at = (time::OffsetDateTime::now_utc() - time::Duration::hours(2))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    store.begin_effect(&stale).unwrap();
+    let fresh = effect_fixture(&session.id, "fresh");
+    store.begin_effect(&fresh).unwrap();
+    let now = time::OffsetDateTime::now_utc();
+    let events = store
+        .sweep_stale_effect_intents(&project.id, 60, 100, &now)
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, vp_protocol::types::EFFECT_UNKNOWN_EVENT);
+    let rows = store
+        .list_effect_receipts(&session.id, None, true, 100)
+        .unwrap();
+    let stale_row = rows.iter().find(|row| row.target.key == "stale").unwrap();
+    let fresh_row = rows.iter().find(|row| row.target.key == "fresh").unwrap();
+    assert_eq!(stale_row.state, EffectState::Unknown);
+    assert_eq!(
+        stale_row.evidence.reason.as_deref(),
+        Some("stale_intent_after_restart")
+    );
+    assert_eq!(fresh_row.state, EffectState::Intent);
+    // A second sweep is idempotent for the already-unknown row.
+    assert!(
+        store
+            .sweep_stale_effect_intents(&project.id, 60, 100, &now)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn effect_list_filters_task_and_unresolved_rows() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("effects"))
+        .unwrap();
+    let session = store.create_session(&project.id, "effects").unwrap();
+    let mut task_a = effect_fixture(&session.id, "a");
+    task_a.task_id = Some("task-a".to_string());
+    store.begin_effect(&task_a).unwrap();
+    let mut task_b = effect_fixture(&session.id, "b");
+    task_b.task_id = Some("task-b".to_string());
+    let (b, _, _) = store.begin_effect(&task_b).unwrap();
+    let mut done = b.clone();
+    done.state = EffectState::Done;
+    done.evidence = EffectEvidence::observed("workspace_sha256");
+    store.settle_effect(&done).unwrap();
+    let mut session_scoped = effect_fixture(&session.id, "session");
+    session_scoped.task_id = None;
+    store.begin_effect(&session_scoped).unwrap();
+
+    let all = store
+        .list_effect_receipts(&session.id, None, true, 100)
+        .unwrap();
+    assert_eq!(all.len(), 3);
+    let unresolved = store
+        .list_effect_receipts(&session.id, None, false, 100)
+        .unwrap();
+    assert_eq!(unresolved.len(), 2);
+    let task_a_rows = store
+        .list_effect_receipts(&session.id, Some("task-a"), true, 100)
+        .unwrap();
+    assert_eq!(task_a_rows.len(), 1);
+    assert_eq!(task_a_rows[0].task_id.as_deref(), Some("task-a"));
+}
+
+#[test]
+fn run_step_intent_and_effect_commit_in_one_transaction() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("effects"))
+        .unwrap();
+    let session = store.create_session(&project.id, "effects").unwrap();
+    let run = SessionRun {
+        run_id: "run-effects".to_string(),
+        session_id: session.id.clone(),
+        project_id: project.id.clone(),
+        agent_id: "agent".to_string(),
+        agent_name: "Worker".to_string(),
+        agent_role: "worker".to_string(),
+        task_id: Some("task-1".to_string()),
+        department: Some("Build".to_string()),
+        objective: "write".to_string(),
+        provider: "test".to_string(),
+        model: "test".to_string(),
+        status: "running".to_string(),
+        attempt: 1,
+        resumed_from_run_id: None,
+        resume_root_id: "run-effects".to_string(),
+        top_level: false,
+        started_at: now_rfc3339(),
+        updated_at: now_rfc3339(),
+        ended_at: None,
+        budget: RunBudgetSnapshot::default(),
+        worktree_head: String::new(),
+        plan_revision: 1,
+        last_event_seq: 0,
+        failure: None,
+    };
+    store.start_session_run(&run).unwrap();
+    let step = RunStep {
+        step_id: "step-effects".to_string(),
+        run_id: run.run_id.clone(),
+        session_id: session.id.clone(),
+        seq: 0,
+        turn: 1,
+        kind: "tool_call".to_string(),
+        status: "intent".to_string(),
+        input_hash: "input".to_string(),
+        output_hash: String::new(),
+        payload: serde_json::json!({"tool_name": "write_file"}),
+        created_at: now_rfc3339(),
+        updated_at: now_rfc3339(),
+    };
+    let tool = RunToolCall {
+        run_id: run.run_id.clone(),
+        session_id: session.id.clone(),
+        step_id: step.step_id.clone(),
+        tool_call_id: "call-effects".to_string(),
+        tool_name: "write_file".to_string(),
+        input_fingerprint: "input".to_string(),
+        status: "intent".to_string(),
+        result: None,
+        error: None,
+        consumed_by_run_id: None,
+        consumed_at: None,
+        created_at: now_rfc3339(),
+        updated_at: now_rfc3339(),
+    };
+    let intent = effect_fixture(&session.id, "src/lib.rs");
+    let (stored, events, begin) = store
+        .record_run_step_intent_with_effect(&step, Some(&tool), Some(&intent))
+        .unwrap();
+    assert!(begin.as_ref().unwrap().inserted);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == vp_protocol::types::EFFECT_INTENT_EVENT)
+            .count(),
+        1
+    );
+    let mut settled = begin.unwrap().receipt;
+    settled.state = EffectState::Done;
+    settled.evidence = EffectEvidence {
+        probe: "workspace_sha256".to_string(),
+        outcome: "observed".to_string(),
+        sha256: Some("c".repeat(64)),
+        ..Default::default()
+    };
+    let mut completed_step = stored.clone();
+    completed_step.status = "completed".to_string();
+    completed_step.output_hash = "output".to_string();
+    let mut completed_tool = tool.clone();
+    completed_tool.status = "completed".to_string();
+    completed_tool.result = Some(serde_json::json!({"ok": true}));
+    let (_, _, events) = store
+        .record_run_step_completed_with_effect(
+            &completed_step,
+            Some(&completed_tool),
+            Some(&settled),
+            Some(("tool.finished", serde_json::json!({"name": "write_file"}))),
+        )
+        .unwrap();
+    let kinds = events
+        .iter()
+        .map(|event| event.kind.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        vec![
+            "session.run.step_completed",
+            "session.run.tool_completed",
+            vp_protocol::types::EFFECT_SETTLED_EVENT,
+            "tool.finished",
+        ]
+    );
+    let row = store.get_effect(&settled.id).unwrap().unwrap();
+    assert_eq!(row.state, EffectState::Done);
+}
+
+#[test]
+fn effect_policy_round_trips_and_rejects_an_invalid_grace() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("effects"))
+        .unwrap();
+    assert_eq!(
+        store.get_effect_policy(&project.id).unwrap(),
+        EffectPolicy::default()
+    );
+    let mut policy = EffectPolicy {
+        unknown_blocks_merge: false,
+        stale_intent_grace_secs: 300,
+        shell_mode: vp_protocol::types::EffectShellMode::All,
+        ..Default::default()
+    };
+    store.set_effect_policy(&project.id, &policy).unwrap();
+    assert_eq!(store.get_effect_policy(&project.id).unwrap(), policy);
+    policy.stale_intent_grace_secs = 0;
+    assert!(store.set_effect_policy(&project.id, &policy).is_err());
 }

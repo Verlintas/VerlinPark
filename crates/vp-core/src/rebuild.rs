@@ -88,6 +88,13 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
                 )
             })?;
             store.set_contract_policy(&snapshot.project.id, &contract_policy)?;
+            let effect_policy = snapshot.effect_policy.normalized().map_err(|error| {
+                anyhow::anyhow!(
+                    "effect policy for project {} is invalid: {error}",
+                    snapshot.project.id
+                )
+            })?;
+            store.set_effect_policy(&snapshot.project.id, &effect_policy)?;
             store.replace_mcp_tool_pins(&snapshot.project.id, &snapshot.mcp_tool_pins)?;
             store.set_cache_policy(&snapshot.project.id, &snapshot.cache_policy)?;
             store.set_execution_host(&snapshot.project.id, &snapshot.execution_host)?;
@@ -1026,5 +1033,114 @@ mod remote_integration_rebuild_tests {
                 .await
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod effect_rebuild_tests {
+    use super::*;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn init_repo(path: &Path) {
+        std::fs::write(path.join("README.md"), "hello\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@verlinpark.local"],
+            vec!["config", "user.name", "VerlinPark Test"],
+            vec!["add", "."],
+            vec!["commit", "-q", "-m", "initial"],
+        ] {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+    }
+
+    #[tokio::test]
+    async fn rebuild_restores_effect_policy_and_receipt_projection() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let (project_id, session_id, effect_id) = {
+            let engine = Engine::new(Store::open(data.path()).unwrap());
+            let project = engine
+                .add_project(
+                    repo.path().to_string_lossy().to_string(),
+                    Some("effect rebuild".into()),
+                )
+                .await
+                .unwrap();
+            let session = engine
+                .create_session(project.id.clone(), "effect rebuild".into(), None)
+                .await
+                .unwrap();
+            engine
+                .set_effect_policy(
+                    &project.id,
+                    vp_protocol::types::EffectPolicy {
+                        unknown_blocks_merge: false,
+                        stale_intent_grace_secs: 300,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let plan = crate::effect::classify_tool_effect(
+                "write_file",
+                &serde_json::json!({"path": "README.md", "content": "hello\n"}),
+                crate::permissions::RiskLevel::WorkspaceWrite,
+                false,
+                &vp_protocol::types::EffectPolicy::default(),
+            )
+            .unwrap()
+            .expect("write plan");
+            let crate::effect::EffectPrepare::Proceed(intent) = engine
+                .prepare_tool_effect(&session.id, Some("T1"), &plan)
+                .await
+                .unwrap()
+            else {
+                panic!("expected proceed");
+            };
+            let (intent, inserted) = engine.begin_effect(intent).await.unwrap();
+            assert!(inserted);
+            let settled = crate::effect::settled_receipt(
+                intent.clone(),
+                crate::effect::EffectProbe::done(vp_protocol::types::EffectEvidence {
+                    probe: "workspace_sha256".to_string(),
+                    outcome: "observed".to_string(),
+                    sha256: Some("a".repeat(64)),
+                    ..Default::default()
+                }),
+            );
+            engine.settle_effect(settled).await.unwrap();
+            engine.record_project_manifest().await.unwrap();
+            (project.id, session.id, intent.id)
+        };
+
+        let report = rebuild_database(data.path(), false).await.unwrap();
+        assert_eq!(report.sessions, 1, "{:?}", report.skipped);
+        let store = Store::open(data.path()).unwrap();
+        let policy = store.get_effect_policy(&project_id).unwrap();
+        assert!(!policy.unknown_blocks_merge);
+        assert_eq!(policy.stale_intent_grace_secs, 300);
+        let receipts = store
+            .list_effect_receipts(&session_id, None, true, 100)
+            .unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].id, effect_id);
+        assert_eq!(receipts[0].state, vp_protocol::types::EffectState::Done);
+        let engine = Engine::new(store);
+        let replay = engine.replay_session(&session_id).await.unwrap();
+        assert!(replay.effects_match, "{:?}", replay.mismatches);
+        let effects = engine
+            .session_effects(&session_id, None, true, 100)
+            .await
+            .unwrap();
+        assert_eq!(effects.counts.done, 1);
     }
 }

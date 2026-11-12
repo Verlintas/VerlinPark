@@ -31,46 +31,46 @@ use vp_protocol::types::{
     ConsoleCloseResult, ConsoleOpenResult, ConsoleReadResult, ConsoleSignalResult,
     ConsoleWriteResult, ContextCompactionSummary, ContextMeasurement, ContextUsage,
     ContinuationOutcome, ContractPolicy, CreateModelPresetParams, CriticalPathPolicy, DoctorCheck,
-    Event, ForgeOriginStatus, ForgePreflightResult, ForgeProviderStatus, ForgeStatusResult,
-    GitLogResult, GitShowResult, GovernorSessionStatus, IntakeCreateParams, IntakeListResult,
-    IntakeTask, IntakeUpdateParams, IntegrationPolicy, IntentDecisionRecord, MailboxGcResult,
-    MailboxPolicy, McpCallResult, McpGetPromptResult, McpPinActionResult, McpPinApproveParams,
-    McpPinRejectParams, McpProbeResult, McpPromptListResult, McpReadResourceResult,
-    McpResourceListResult, McpServer, McpServerConfig, McpServerListResult, McpToolListResult,
-    McpToolPin, MemoryBriefResult, MemoryConflict, MemoryConflictResolveResult,
-    MemoryConflictScanResult, MemoryConflictsResult, MemoryDeleteResult, MemoryEmbeddingPolicy,
-    MemoryEmbeddingsIndexRebuildResult, MemoryEmbeddingsIndexStatusResult,
-    MemoryEmbeddingsRebuildResult, MemoryEmbeddingsStatusResult, MemoryEmbeddingsTestResult,
-    MemoryEvidence, MemoryHealthResult, MemoryItem, MemoryListResult, MemoryMatch, MemoryPolicy,
-    MemoryPolicyResult, MemoryPruneResult, MemorySearchParams, MemorySearchResult,
-    MemorySemanticSummary, MemoryStatsResult, MemorySweepResult, MemoryUpdateResult,
-    MemoryVerificationCheck, MemoryVerifyResult, MergeQueueEntry, MessageCitation, MetricCount,
-    ModelPreset, ModelPresetListResult, OrchestrationDecision, OrchestrationNote,
-    OrchestrationOverviewResult, OrchestrationOverviewTotals, OrchestrationPolicy,
-    OrchestrationPreviewAction, OrchestrationPreviewResult, OrchestrationRecoveriesResult,
-    OrchestrationRecovery, OrchestrationSessionSummary, OrchestrationSnapshot,
-    PlanRevisionDetailResult, PlanRevisionInfo, PreemptionOverviewResult, PreemptionPolicy,
-    PreemptionRecord, ProcessListResult, ProcessLogsResult, ProcessPolicy, ProcessRestartResult,
-    ProcessStopResult, ProcessSupervisorStatus, Program, ProgramActionParams, ProgramCreateParams,
-    ProgramDeleteParams, ProgramListResult, ProgramMilestone, ProgramMilestoneActionParams,
-    ProgramMilestoneCreateParams, ProgramMilestoneListResult, ProgramMilestoneUpdateParams,
-    ProgramPolicy, ProgramReplayReport, ProgramStatus, ProgramStatusParams, ProgramStatusResult,
-    ProgramTickParams, ProgramTickResult, ProgramUpdateParams, Project, ProjectBudget,
-    ProjectBudgetResult, ProjectCacheEpochPruneResult, ProjectCacheEpochResult,
-    ProjectMcpPinsResult, ProjectUsageResult, PromptPrefixAggregate, PromptPrefixObservation,
-    PullRequestResult, Question, QuestionListResult, ReviseTeamPlanResult, ScheduledTask,
-    SearchResult, Session, SessionBundle, SessionCacheStatus, SessionCheckpoint,
+    EffectPolicy, EffectReceipt, EffectReconcileParams, EffectReconcileResult, EffectState, Event,
+    ForgeOriginStatus, ForgePreflightResult, ForgeProviderStatus, ForgeStatusResult, GitLogResult,
+    GitShowResult, GovernorSessionStatus, IntakeCreateParams, IntakeListResult, IntakeTask,
+    IntakeUpdateParams, IntegrationPolicy, IntentDecisionRecord, MailboxGcResult, MailboxPolicy,
+    McpCallResult, McpGetPromptResult, McpPinActionResult, McpPinApproveParams, McpPinRejectParams,
+    McpProbeResult, McpPromptListResult, McpReadResourceResult, McpResourceListResult, McpServer,
+    McpServerConfig, McpServerListResult, McpToolListResult, McpToolPin, MemoryBriefResult,
+    MemoryConflict, MemoryConflictResolveResult, MemoryConflictScanResult, MemoryConflictsResult,
+    MemoryDeleteResult, MemoryEmbeddingPolicy, MemoryEmbeddingsIndexRebuildResult,
+    MemoryEmbeddingsIndexStatusResult, MemoryEmbeddingsRebuildResult, MemoryEmbeddingsStatusResult,
+    MemoryEmbeddingsTestResult, MemoryEvidence, MemoryHealthResult, MemoryItem, MemoryListResult,
+    MemoryMatch, MemoryPolicy, MemoryPolicyResult, MemoryPruneResult, MemorySearchParams,
+    MemorySearchResult, MemorySemanticSummary, MemoryStatsResult, MemorySweepResult,
+    MemoryUpdateResult, MemoryVerificationCheck, MemoryVerifyResult, MergeQueueEntry,
+    MessageCitation, MetricCount, ModelPreset, ModelPresetListResult, OrchestrationDecision,
+    OrchestrationNote, OrchestrationOverviewResult, OrchestrationOverviewTotals,
+    OrchestrationPolicy, OrchestrationPreviewAction, OrchestrationPreviewResult,
+    OrchestrationRecoveriesResult, OrchestrationRecovery, OrchestrationSessionSummary,
+    OrchestrationSnapshot, PlanRevisionDetailResult, PlanRevisionInfo, PreemptionOverviewResult,
+    PreemptionPolicy, PreemptionRecord, ProcessListResult, ProcessLogsResult, ProcessPolicy,
+    ProcessRestartResult, ProcessStopResult, ProcessSupervisorStatus, Program, ProgramActionParams,
+    ProgramCreateParams, ProgramDeleteParams, ProgramListResult, ProgramMilestone,
+    ProgramMilestoneActionParams, ProgramMilestoneCreateParams, ProgramMilestoneListResult,
+    ProgramMilestoneUpdateParams, ProgramPolicy, ProgramReplayReport, ProgramStatus,
+    ProgramStatusParams, ProgramStatusResult, ProgramTickParams, ProgramTickResult,
+    ProgramUpdateParams, Project, ProjectBudget, ProjectBudgetResult, ProjectCacheEpochPruneResult,
+    ProjectCacheEpochResult, ProjectMcpPinsResult, ProjectUsageResult, PromptPrefixAggregate,
+    PromptPrefixObservation, PullRequestResult, Question, QuestionListResult, ReviseTeamPlanResult,
+    ScheduledTask, SearchResult, Session, SessionBundle, SessionCacheStatus, SessionCheckpoint,
     SessionCheckpointDeleteResult, SessionCheckpointDiffResult, SessionCheckpointListResult,
     SessionCheckpointPruneResult, SessionCheckpointRestoreResult, SessionCheckpointStatsResult,
     SessionCitationAuditResult, SessionCitationsResult, SessionCommit, SessionCompareFile,
     SessionCompareResult, SessionContextStatus, SessionContinuation,
     SessionContinuationCancelResult, SessionContinuationClaimInfo,
     SessionContinuationReclaimResult, SessionContinuationStatusResult, SessionContinuationsResult,
-    SessionContractResult, SessionDeferResult, SessionDiff, SessionForkResult, SessionForkTreeNode,
-    SessionForkTreeResult, SessionImportResult, SessionInstructionSection,
-    SessionInstructionStateReport, SessionInstructionsReport, SessionLandResult,
-    SessionLineageEntry, SessionLineageResult, SessionLogStatus, SessionPreemptionResult,
-    SessionPriorityResult, SessionRehydrateResult, SessionReplayReport,
+    SessionContractResult, SessionDeferResult, SessionDiff, SessionEffectsResult,
+    SessionForkResult, SessionForkTreeNode, SessionForkTreeResult, SessionImportResult,
+    SessionInstructionSection, SessionInstructionStateReport, SessionInstructionsReport,
+    SessionLandResult, SessionLineageEntry, SessionLineageResult, SessionLogStatus,
+    SessionPreemptionResult, SessionPriorityResult, SessionRehydrateResult, SessionReplayReport,
     SessionSkillActivationsResult, SessionStallsResult, SessionSteerResult,
     SessionSteeringCancelResult, SessionSteeringListResult, SessionTranscriptResult,
     SessionUnlimitedResult, ShellPolicy, Skill, SkillActivation, SkillCreateParams,
@@ -123,6 +123,7 @@ pub mod conversation;
 pub mod critical_path;
 pub mod daemon_agent;
 mod dashboard;
+pub mod effect;
 pub mod forge;
 pub mod gui;
 pub mod history;
@@ -198,6 +199,7 @@ struct ReplayData {
     instructions: Vec<vp_protocol::types::SessionInstructionState>,
     contracts: Vec<StoredContractRow>,
     contract_usage: Vec<ContractUsageRow>,
+    effects: Vec<EffectReceipt>,
     prompt_prefix_observations: Vec<PromptPrefixObservation>,
     prompt_prefix_aggregates: Vec<PromptPrefixAggregate>,
     prompt_prefix_inconsistent_epochs: Vec<String>,
@@ -9394,6 +9396,39 @@ impl Engine {
         })
         .await??;
 
+        let commit_target = crate::effect::EffectTarget::new(
+            crate::effect::kinds::GIT_COMMIT,
+            session
+                .branch
+                .clone()
+                .unwrap_or_else(|| "session".to_string()),
+        );
+        let commit_request = crate::effect::canonical_request_hash(
+            "session.commit",
+            serde_json::json!({
+                "branch": session.branch.clone(),
+                "commit": commit.clone(),
+                "message_hash": crate::sha256_hex(message.as_bytes()),
+            }),
+        )?;
+        let mut commit_effect = crate::effect::runtime_receipt(
+            &session_id,
+            None,
+            "session.commit",
+            commit_target,
+            commit_request,
+            Some("workspace".to_string()),
+        );
+        commit_effect.state = EffectState::Done;
+        commit_effect.external_id = Some(commit.clone());
+        commit_effect.evidence = vp_protocol::types::EffectEvidence {
+            probe: crate::effect::probes::GIT_REV_PARSE.to_string(),
+            outcome: "observed".to_string(),
+            commit: Some(commit.clone()),
+            branch: session.branch.clone(),
+            ..Default::default()
+        };
+        self.record_settled_effect(commit_effect).await?;
         self.append_event(
             &session_id,
             "session.committed",
@@ -9419,6 +9454,7 @@ impl Engine {
         if session.status == "landed" {
             anyhow::bail!("session is already landed");
         }
+        self.assert_effects_settled(&session.id, None).await?;
         let session_branch = session
             .branch
             .clone()
@@ -9429,6 +9465,9 @@ impl Engine {
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("session has no worktree"))?,
         );
+        let head_worktree = session_worktree.clone();
+        let session_head =
+            tokio::task::spawn_blocking(move || worktree::head_commit(&head_worktree)).await??;
         let status = tokio::task::spawn_blocking(move || {
             git_output(&session_worktree, &["status", "--porcelain"])
         })
@@ -9445,8 +9484,68 @@ impl Engine {
         let project_root = PathBuf::from(&project.root);
         let branch_for_merge = session_branch.clone();
         let target_for_merge = target_branch.clone();
+        let effect_target = crate::effect::EffectTarget::new(
+            crate::effect::kinds::GIT_MERGE,
+            format!("land:{target_branch}:{session_branch}"),
+        );
+        let effect_request = crate::effect::canonical_request_hash(
+            "session.land",
+            serde_json::json!({
+                "branch": session_branch.clone(),
+                "target_branch": target_branch.clone(),
+                "head": session_head.clone(),
+            }),
+        )?;
+        let existing = self
+            .lookup_effect(
+                &session.id,
+                None,
+                "session.land",
+                &effect_target.canonical(),
+                &effect_request,
+            )
+            .await?;
+        if let Some(receipt) = existing.as_ref()
+            && receipt.state == EffectState::Done
+        {
+            let commit = receipt
+                .external_id
+                .clone()
+                .or_else(|| receipt.evidence.commit.clone())
+                .unwrap_or_else(|| session_head.clone());
+            return Ok(SessionLandResult {
+                session_id: session.id,
+                branch: session_branch,
+                target_branch,
+                commit,
+                detail:
+                    "already landed; the stored effect receipt was replayed without merging again"
+                        .to_string(),
+            });
+        }
+        let intent = crate::effect::runtime_receipt(
+            &session.id,
+            None,
+            "session.land",
+            effect_target,
+            effect_request,
+            Some("workspace".to_string()),
+        );
+        let (intent, inserted) = self.begin_effect(intent).await?;
+        if !inserted && intent.state != EffectState::Intent {
+            return Err(anyhow::Error::new(crate::effect::EffectBlocked {
+                session_id: session.id.clone(),
+                task_id: None,
+                receipt_ids: vec![intent.id.clone()],
+                message: format!(
+                    "EFFECT_UNKNOWN: landing is blocked by effect receipt {} ({})",
+                    intent.id,
+                    intent.state.as_str()
+                ),
+            }));
+        }
         let git_lock = self.git_lock.clone();
-        let commit = tokio::task::spawn_blocking(move || -> Result<String> {
+        let merge = tokio::task::spawn_blocking(move || -> Result<(String, String)> {
             let _guard = git_lock
                 .lock()
                 .map_err(|_| anyhow::anyhow!("git mutex poisoned"))?;
@@ -9478,9 +9577,40 @@ impl Engine {
                 let _ = git_output(&project_root, &["merge", "--abort"]);
                 anyhow::bail!("landing merge failed: {detail}");
             }
-            git_output(&project_root, &["rev-parse", "--short", "HEAD"])
+            Ok((
+                git_output(&project_root, &["rev-parse", "--short", "HEAD"])?,
+                worktree::head_commit(&project_root)?,
+            ))
         })
-        .await??;
+        .await?;
+        let (commit, full_commit) = match merge {
+            Ok(value) => value,
+            Err(error) => {
+                let mut failed = intent.clone();
+                failed.state = EffectState::Failed;
+                failed.evidence = vp_protocol::types::EffectEvidence {
+                    probe: "git_merge_head".to_string(),
+                    outcome: "mismatch".to_string(),
+                    reason: Some("landing_merge_failed".to_string()),
+                    branch: Some(session_branch.clone()),
+                    ..Default::default()
+                };
+                let _ = self.settle_effect(failed).await;
+                return Err(error);
+            }
+        };
+        let mut settled = intent;
+        settled.state = EffectState::Done;
+        settled.external_id = Some(commit.clone());
+        settled.response_hash = Some(crate::sha256_hex(full_commit.as_bytes()));
+        settled.evidence = vp_protocol::types::EffectEvidence {
+            probe: "git_merge_head".to_string(),
+            outcome: "observed".to_string(),
+            commit: Some(full_commit),
+            branch: Some(session_branch.clone()),
+            ..Default::default()
+        };
+        self.settle_effect(settled).await?;
 
         self.append_event(
             &session.id,
@@ -9678,12 +9808,87 @@ impl Engine {
         // never leaves a pushed branch behind.
         let preflight = provider.preflight(&target).await?;
         let repository = preflight.repository.clone().or_else(|| target.repository());
+        let provider_id = target.provider.id().to_string();
+        let repository_key = repository
+            .clone()
+            .unwrap_or_else(|| format!("origin:{branch}"));
+        let head_worktree = project_root.clone();
+        let head_branch = branch.clone();
+        let head_commit = tokio::task::spawn_blocking(move || {
+            git_output(&head_worktree, &["rev-parse", &head_branch])
+        })
+        .await??;
+
+        // --- git push effect -------------------------------------------------
+        let push_target = crate::effect::EffectTarget::new(
+            crate::effect::kinds::GIT_PUSH,
+            format!("{provider_id}:{repository_key}:{branch}"),
+        );
+        let push_request = crate::effect::canonical_request_hash(
+            "session.pr.push",
+            serde_json::json!({
+                "provider": provider_id.clone(),
+                "repository": repository_key.clone(),
+                "branch": branch.clone(),
+                "commit": head_commit.clone(),
+            }),
+        )?;
+        let existing_push = self
+            .lookup_effect(
+                &session.id,
+                None,
+                "session.pr.push",
+                &push_target.canonical(),
+                &push_request,
+            )
+            .await?;
+        let push_done = matches!(
+            existing_push.as_ref().map(|receipt| receipt.state),
+            Some(EffectState::Done)
+        );
+        if let Some(receipt) = existing_push.as_ref()
+            && matches!(receipt.state, EffectState::Intent | EffectState::Unknown)
+        {
+            return Err(anyhow::Error::new(crate::effect::EffectBlocked {
+                session_id: session.id.clone(),
+                task_id: None,
+                receipt_ids: vec![receipt.id.clone()],
+                message: format!(
+                    "EFFECT_UNKNOWN: a previous push of {branch} is {}; reconcile it before pushing again",
+                    receipt.state.as_str()
+                ),
+            }));
+        }
+        let mut push_intent = None;
+        if !push_done {
+            let intent = crate::effect::runtime_receipt(
+                &session.id,
+                None,
+                "session.pr.push",
+                push_target,
+                push_request,
+                Some(provider_id.clone()),
+            );
+            let (intent, inserted) = self.begin_effect(intent).await?;
+            if !inserted && intent.state != EffectState::Intent {
+                return Err(anyhow::Error::new(crate::effect::EffectBlocked {
+                    session_id: session.id.clone(),
+                    task_id: None,
+                    receipt_ids: vec![intent.id.clone()],
+                    message: format!(
+                        "EFFECT_UNKNOWN: a previous push of {branch} is {}; reconcile it before pushing again",
+                        intent.state.as_str()
+                    ),
+                }));
+            }
+            push_intent = Some(intent);
+        }
 
         let project_root_for_push = project_root.clone();
         let branch_for_push = branch.clone();
         let base_for_push_check = base_branch.clone();
         let git_lock = self.git_lock.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        let push_result = tokio::task::spawn_blocking(move || -> Result<()> {
             let _guard = git_lock
                 .lock()
                 .map_err(|_| anyhow::anyhow!("git mutex poisoned"))?;
@@ -9717,26 +9922,199 @@ impl Engine {
             }
             Ok(())
         })
-        .await??;
+        .await?;
+        if let Some(intent) = push_intent {
+            let mut settled = intent;
+            match &push_result {
+                Ok(()) => {
+                    settled.state = EffectState::Done;
+                    settled.external_id = Some(head_commit.clone());
+                    settled.evidence = vp_protocol::types::EffectEvidence {
+                        probe: crate::effect::probes::GIT_LS_REMOTE.to_string(),
+                        outcome: "declared".to_string(),
+                        branch: Some(branch.clone()),
+                        commit: Some(head_commit.clone()),
+                        note: Some(
+                            "the push command completed; reconcile if the remote head is disputed"
+                                .to_string(),
+                        ),
+                        ..Default::default()
+                    };
+                }
+                Err(error) => {
+                    let unknown = push_error_is_ambiguous(error);
+                    settled.state = if unknown {
+                        EffectState::Unknown
+                    } else {
+                        EffectState::Failed
+                    };
+                    settled.evidence = vp_protocol::types::EffectEvidence {
+                        probe: crate::effect::probes::GIT_LS_REMOTE.to_string(),
+                        outcome: if unknown { "unverifiable" } else { "mismatch" }.to_string(),
+                        reason: Some(if unknown {
+                            crate::effect::reasons::TRANSPORT_UNKNOWN.to_string()
+                        } else {
+                            "git_push_failed".to_string()
+                        }),
+                        branch: Some(branch.clone()),
+                        ..Default::default()
+                    };
+                }
+            }
+            self.settle_effect(settled).await?;
+        }
+        push_result?;
 
         self.append_event(
             &session.id,
-            "session.pushed",
+            if push_done {
+                "session.push_replayed"
+            } else {
+                "session.pushed"
+            },
             serde_json::json!({
-                "branch": branch,
-                "base_branch": base_branch,
-                "provider": target.provider.id(),
+                "branch": branch.clone(),
+                "base_branch": base_branch.clone(),
+                "provider": provider_id.clone(),
                 "provider_selected_by": selection_source_id(target.selected_by),
-                "repository": repository,
+                "repository": repository.clone(),
+                "effect_receipt_id": existing_push.as_ref().map(|receipt| receipt.id.clone()),
+                "effect_replayed": push_done,
             }),
         )
         .await?;
 
-        let change = provider.create(&target, &request).await.map_err(|error| {
-            // The branch is already on the remote at this point. Make the
-            // failure detail honest without claiming the PR exists.
-            anyhow::Error::new(error.prefix_message("branch pushed, but "))
-        })?;
+        // --- forge PR effect -------------------------------------------------
+        let pr_target = crate::effect::EffectTarget::new(
+            crate::effect::kinds::FORGE_PR,
+            format!("{provider_id}/{repository_key}:{branch}->{base_branch}"),
+        );
+        let pr_request = crate::effect::canonical_request_hash(
+            "session.pr.create",
+            serde_json::json!({
+                "provider": provider_id.clone(),
+                "repository": repository_key.clone(),
+                "branch": branch.clone(),
+                "base_branch": base_branch.clone(),
+                "commit": head_commit.clone(),
+            }),
+        )?;
+        let existing_pr = self
+            .lookup_effect(
+                &session.id,
+                None,
+                "session.pr.create",
+                &pr_target.canonical(),
+                &pr_request,
+            )
+            .await?;
+        if let Some(receipt) = existing_pr.as_ref() {
+            match receipt.state {
+                EffectState::Done => {
+                    let url = receipt
+                        .external_id
+                        .clone()
+                        .filter(|value| !value.is_empty());
+                    return Ok(PullRequestResult {
+                        session_id: session.id,
+                        branch,
+                        base_branch,
+                        pushed: true,
+                        url: url.clone(),
+                        detail: format!(
+                            "the stored effect receipt for this branch was replayed instead of opening a duplicate {}",
+                            receipt.evidence.change.as_deref().unwrap_or("change")
+                        ),
+                        provider: Some(provider_id),
+                        repository: receipt.evidence.repository.clone().or(repository),
+                        change: receipt.evidence.change.clone(),
+                    });
+                }
+                EffectState::Intent | EffectState::Unknown => {
+                    return Err(anyhow::Error::new(crate::effect::EffectBlocked {
+                        session_id: session.id.clone(),
+                        task_id: None,
+                        receipt_ids: vec![receipt.id.clone()],
+                        message: format!(
+                            "EFFECT_UNKNOWN: a previous PR/MR creation for {branch} is {}; reconcile it before trying again",
+                            receipt.state.as_str()
+                        ),
+                    }));
+                }
+                EffectState::Failed => {}
+            }
+        }
+        let pr_intent = crate::effect::runtime_receipt(
+            &session.id,
+            None,
+            "session.pr.create",
+            pr_target,
+            pr_request,
+            Some(provider_id.clone()),
+        );
+        let (pr_intent, inserted) = self.begin_effect(pr_intent).await?;
+        if !inserted && pr_intent.state != EffectState::Intent {
+            return Err(anyhow::Error::new(crate::effect::EffectBlocked {
+                session_id: session.id.clone(),
+                task_id: None,
+                receipt_ids: vec![pr_intent.id.clone()],
+                message: format!(
+                    "EFFECT_UNKNOWN: a previous PR/MR creation for {branch} is {}; reconcile it before trying again",
+                    pr_intent.state.as_str()
+                ),
+            }));
+        }
+        let change = match provider.create(&target, &request).await {
+            Ok(change) => {
+                let mut settled = pr_intent;
+                settled.state = EffectState::Done;
+                settled.external_id = Some(change.url.clone());
+                settled.evidence = vp_protocol::types::EffectEvidence {
+                    probe: crate::effect::probes::FORGE_RESPONSE.to_string(),
+                    outcome: "observed".to_string(),
+                    branch: Some(branch.clone()),
+                    commit: Some(head_commit.clone()),
+                    external_id: Some(change.url.clone()),
+                    change: Some(change.change_name.to_string()),
+                    repository: change.repository.clone().or_else(|| repository.clone()),
+                    caveat: Some(
+                        "the forge response proves the local client observed a change; it is not a provider exactly-once guarantee"
+                            .to_string(),
+                    ),
+                    ..Default::default()
+                };
+                self.settle_effect(settled).await?;
+                change
+            }
+            Err(error) => {
+                let unknown = forge_error_is_ambiguous(&error);
+                let mut settled = pr_intent;
+                settled.state = if unknown {
+                    EffectState::Unknown
+                } else {
+                    EffectState::Failed
+                };
+                settled.evidence = vp_protocol::types::EffectEvidence {
+                    probe: crate::effect::probes::FORGE_RESPONSE.to_string(),
+                    outcome: if unknown { "unverifiable" } else { "mismatch" }.to_string(),
+                    reason: Some(if unknown {
+                        crate::effect::reasons::TRANSPORT_UNKNOWN.to_string()
+                    } else {
+                        "forge_create_failed".to_string()
+                    }),
+                    branch: Some(branch.clone()),
+                    commit: Some(head_commit.clone()),
+                    repository: repository.clone(),
+                    ..Default::default()
+                };
+                self.settle_effect(settled).await?;
+                // The branch is already on the remote at this point. Make the
+                // failure detail honest without claiming the PR exists.
+                return Err(anyhow::Error::new(
+                    error.prefix_message("branch pushed, but "),
+                ));
+            }
+        };
 
         let mut event = serde_json::json!({
             "branch": branch,
@@ -14028,6 +14406,7 @@ impl Engine {
             let instructions = store.list_instruction_states_for_session(&id)?;
             let contracts = store.list_contracts_for_session(&id)?;
             let contract_usage = store.list_contract_usage_for_session(&id)?;
+            let effects = store.list_effect_receipts(&id, None, true, 500)?;
             let prompt_prefix_observations =
                 store.list_prompt_prefix_observations(&session.project_id, &id)?;
             let prompt_prefix_aggregates =
@@ -14070,6 +14449,7 @@ impl Engine {
                 instructions,
                 contracts,
                 contract_usage,
+                effects,
                 prompt_prefix_observations,
                 prompt_prefix_aggregates,
                 prompt_prefix_inconsistent_epochs,
@@ -15407,6 +15787,39 @@ impl Engine {
                 .push("remote test evidence projection differs from event stream".to_string());
         }
 
+        let has_effect_events = data.events.iter().any(|event| {
+            matches!(
+                event.kind.as_str(),
+                crate::effect::EFFECT_INTENT_EVENT
+                    | crate::effect::EFFECT_SETTLED_EVENT
+                    | crate::effect::EFFECT_FAILED_EVENT
+                    | crate::effect::EFFECT_UNKNOWN_EVENT
+                    | crate::effect::EFFECT_RECONCILED_EVENT
+            )
+        });
+        let effects_match = if !has_effect_events {
+            // Legacy/imported archives may carry rows without effect events.
+            true
+        } else {
+            match crate::effect::receipts_from_events(&data.events) {
+                Some(expected) => {
+                    let rows_match = crate::effect::receipts_match(&data.effects, &expected);
+                    if !rows_match {
+                        mismatches.push(format!(
+                            "effect receipts: projection={}, replay={}",
+                            data.effects.len(),
+                            expected.len()
+                        ));
+                    }
+                    rows_match
+                }
+                None => {
+                    mismatches.push("effect receipts: malformed replay event".to_string());
+                    false
+                }
+            }
+        };
+
         let consistent = status_matches
             && prompt_layout_matches
             && instructions_match
@@ -15438,7 +15851,8 @@ impl Engine {
             && context_checkpoints_match
             && processes_match
             && remote_test_evidence_matches
-            && contracts_match;
+            && contracts_match
+            && effects_match;
         Ok(SessionReplayReport {
             session_id: data.session.id.clone(),
             event_count: data.events.len(),
@@ -15470,6 +15884,7 @@ impl Engine {
             processes_match,
             remote_test_evidence_matches,
             contracts_match,
+            effects_match,
             consistent,
             repaired,
             rebuilt: false,
@@ -15841,6 +16256,24 @@ impl Engine {
                     None => None,
                 }
             },
+            effects: if !data.events.iter().any(|event| {
+                matches!(
+                    event.kind.as_str(),
+                    crate::effect::EFFECT_INTENT_EVENT
+                        | crate::effect::EFFECT_SETTLED_EVENT
+                        | crate::effect::EFFECT_FAILED_EVENT
+                        | crate::effect::EFFECT_UNKNOWN_EVENT
+                        | crate::effect::EFFECT_RECONCILED_EVENT
+                )
+            }) {
+                None
+            } else {
+                match crate::effect::receipts_from_events(&data.events) {
+                    Some(rows) => Some(rows),
+                    None if data.effects.is_empty() => Some(Vec::new()),
+                    None => None,
+                }
+            },
             prompt_prefix_observations: match crate::cache_epoch::observations_from_events(
                 &data.session.project_id,
                 &data.session.id,
@@ -16097,6 +16530,21 @@ impl Engine {
                 replayed_test_results
             };
             projection_store.replace_test_results(&projection_id, &test_results)?;
+            // Effect events are authoritative when the archive carries them;
+            // a legacy projection-only bundle keeps the rows inserted above.
+            if events.iter().any(|event| {
+                matches!(
+                    event.kind.as_str(),
+                    crate::effect::EFFECT_INTENT_EVENT
+                        | crate::effect::EFFECT_SETTLED_EVENT
+                        | crate::effect::EFFECT_FAILED_EVENT
+                        | crate::effect::EFFECT_UNKNOWN_EVENT
+                        | crate::effect::EFFECT_RECONCILED_EVENT
+                )
+            }) && let Some(effects) = crate::effect::receipts_from_events(&events)
+            {
+                projection_store.replace_effect_receipts(&projection_id, &effects)?;
+            }
             Ok(())
         })
         .await??;
@@ -16240,6 +16688,7 @@ impl Engine {
             instruction_blobs,
             instructions: data.instructions,
             prompt_prefix_observations: data.prompt_prefix_observations,
+            effects: data.effects,
         })
     }
 
@@ -16786,6 +17235,11 @@ impl Engine {
         detail: Option<String>,
         source: vp_protocol::types::MergeQueueSource,
     ) -> Result<MergeQueueEntry> {
+        // Fail closed before a queue row exists. Integration re-checks the
+        // same gate under the integration lease in case an effect becomes
+        // unresolved while the entry waits.
+        self.assert_effects_settled(session_id, task_id.as_deref())
+            .await?;
         let store = self.store.clone();
         let session_id = session_id.to_string();
         let agent_id = agent_id.to_string();
@@ -18938,6 +19392,301 @@ impl Engine {
         Ok(policy)
     }
 
+    // ---------------------------------------------------------------------
+    // Effect receipts and postconditions
+    // ---------------------------------------------------------------------
+
+    pub async fn get_effect_policy(&self, project_id: &str) -> Result<EffectPolicy> {
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        tokio::task::spawn_blocking(move || store.get_effect_policy(&project_id)).await?
+    }
+
+    pub async fn set_effect_policy(
+        &self,
+        project_id: &str,
+        policy: EffectPolicy,
+    ) -> Result<EffectPolicy> {
+        let store = self.store.clone();
+        let project_id_for_check = project_id.to_string();
+        tokio::task::spawn_blocking(move || store.get_project(&project_id_for_check))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("project not found: {project_id}"))?;
+        let policy = policy
+            .normalized()
+            .map_err(|error| anyhow::anyhow!("invalid effect policy: {error}"))?;
+        let for_store = policy.clone();
+        let project_id = project_id.to_string();
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || store.set_effect_policy(&project_id, &for_store))
+            .await??;
+        Ok(policy)
+    }
+
+    /// Look up the logical effect before a call executes. A completed row is
+    /// replayed, an unresolved row blocks execution, and a failed row starts a
+    /// new attempt. The caller still passes the returned receipt to the journal
+    /// intent so the idempotency check happens inside the same transaction.
+    pub async fn prepare_tool_effect(
+        &self,
+        session_id: &str,
+        task_id: Option<&str>,
+        plan: &crate::effect::ToolEffectPlan,
+    ) -> Result<crate::effect::EffectPrepare> {
+        let store = self.store.clone();
+        let session = session_id.to_string();
+        let task = task_id.map(str::to_string);
+        let tool = plan.tool.clone();
+        let target = plan.target.canonical();
+        let request_hash = plan.request_hash.clone();
+        let existing = tokio::task::spawn_blocking(move || {
+            store.latest_effect(&session, task.as_deref(), &tool, &target, &request_hash)
+        })
+        .await??;
+        let prepared = match existing {
+            Some(receipt) if receipt.state == EffectState::Done => {
+                crate::effect::EffectPrepare::Replay(receipt)
+            }
+            Some(receipt)
+                if matches!(receipt.state, EffectState::Intent | EffectState::Unknown) =>
+            {
+                crate::effect::EffectPrepare::Blocked(receipt)
+            }
+            Some(receipt) => crate::effect::EffectPrepare::Proceed(crate::effect::intent_receipt(
+                session_id,
+                task_id,
+                plan,
+                receipt.attempt.saturating_add(1),
+            )),
+            None => crate::effect::EffectPrepare::Proceed(crate::effect::intent_receipt(
+                session_id, task_id, plan, 1,
+            )),
+        };
+        Ok(prepared)
+    }
+
+    /// Persist a standalone effect intent (runtime actions such as a Git push,
+    /// PR creation, landing, or remote integration). Returns the stored row and
+    /// whether a new intent was actually inserted.
+    pub async fn begin_effect(&self, receipt: EffectReceipt) -> Result<(EffectReceipt, bool)> {
+        let store = self.store.clone();
+        let (stored, events, inserted) =
+            tokio::task::spawn_blocking(move || store.begin_effect(&receipt)).await??;
+        for event in events {
+            let _ = self.events.send(event);
+        }
+        Ok((stored, inserted))
+    }
+
+    /// Settle a standalone effect with bounded evidence. The stored state is
+    /// terminal for that attempt.
+    pub async fn settle_effect(&self, receipt: EffectReceipt) -> Result<EffectReceipt> {
+        let store = self.store.clone();
+        let (stored, events, _) =
+            tokio::task::spawn_blocking(move || store.settle_effect(&receipt)).await??;
+        for event in events {
+            let _ = self.events.send(event);
+        }
+        Ok(stored)
+    }
+
+    /// Record an already-settled runtime effect (Worker commit, integration
+    /// merge). The row and event commit together; an existing logical receipt
+    /// is returned unchanged.
+    pub async fn record_settled_effect(&self, receipt: EffectReceipt) -> Result<EffectReceipt> {
+        let store = self.store.clone();
+        let (stored, event, _) =
+            tokio::task::spawn_blocking(move || store.record_settled_effect(&receipt)).await??;
+        if let Some(event) = event {
+            let _ = self.events.send(event);
+        }
+        Ok(stored)
+    }
+
+    pub async fn lookup_effect(
+        &self,
+        session_id: &str,
+        task_id: Option<&str>,
+        tool: &str,
+        target: &str,
+        request_hash: &str,
+    ) -> Result<Option<EffectReceipt>> {
+        let store = self.store.clone();
+        let session = session_id.to_string();
+        let task = task_id.map(str::to_string);
+        let tool = tool.to_string();
+        let target = target.to_string();
+        let hash = request_hash.to_string();
+        tokio::task::spawn_blocking(move || {
+            store.latest_effect(&session, task.as_deref(), &tool, &target, &hash)
+        })
+        .await?
+    }
+
+    pub async fn get_effect(&self, id: &str) -> Result<Option<EffectReceipt>> {
+        let store = self.store.clone();
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || store.get_effect(&id)).await?
+    }
+
+    /// Unresolved receipts that block a task merge. The check always includes
+    /// session-scoped rows (for example a partially failed PR or remote
+    /// integration) and, when `task_id` is present, that task's rows too.
+    pub async fn effect_blockers(
+        &self,
+        session_id: &str,
+        task_id: Option<&str>,
+    ) -> Result<Vec<EffectReceipt>> {
+        let store = self.store.clone();
+        let session = session_id.to_string();
+        let rows = tokio::task::spawn_blocking(move || {
+            store.list_effect_receipts(&session, None, false, 500)
+        })
+        .await??;
+        let project_id = self.session_project_id(session_id).await?;
+        let policy = self.get_effect_policy(&project_id).await?;
+        let task = task_id.map(str::to_string);
+        Ok(rows
+            .into_iter()
+            .filter(|receipt| {
+                let in_scope = receipt.task_id.is_none()
+                    || task
+                        .as_deref()
+                        .is_some_and(|task| receipt.task_id.as_deref() == Some(task));
+                in_scope
+                    && receipt.state.blocks_merge()
+                    && policy.enabled
+                    && policy.unknown_blocks_merge
+            })
+            .collect())
+    }
+
+    /// Fail-closed integration gate. This is checked before a queue entry is
+    /// created and again immediately before the session branch is mutated.
+    pub async fn assert_effects_settled(
+        &self,
+        session_id: &str,
+        task_id: Option<&str>,
+    ) -> Result<()> {
+        let blockers = self.effect_blockers(session_id, task_id).await?;
+        if blockers.is_empty() {
+            return Ok(());
+        }
+        let refs = blockers.iter().collect::<Vec<_>>();
+        Err(anyhow::Error::new(crate::effect::EffectBlocked {
+            session_id: session_id.to_string(),
+            task_id: task_id.map(str::to_string),
+            receipt_ids: blockers.iter().map(|receipt| receipt.id.clone()).collect(),
+            message: crate::effect::block_message(&refs),
+        }))
+    }
+
+    async fn session_project_id(&self, session_id: &str) -> Result<String> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        tokio::task::spawn_blocking(move || store.get_session(&id))
+            .await??
+            .map(|session| session.project_id)
+            .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))
+    }
+
+    pub async fn session_effects(
+        &self,
+        session_id: &str,
+        task_id: Option<&str>,
+        include_settled: bool,
+        limit: u32,
+    ) -> Result<SessionEffectsResult> {
+        let project_id = self.session_project_id(session_id).await?;
+        let policy = self.get_effect_policy(&project_id).await?;
+        let store = self.store.clone();
+        let session = session_id.to_string();
+        let task = task_id.map(str::to_string);
+        let limit = limit.clamp(1, 500);
+        let receipts = tokio::task::spawn_blocking(move || {
+            store.list_effect_receipts(&session, task.as_deref(), include_settled, limit)
+        })
+        .await??;
+        let other_store = self.store.clone();
+        let other_session = session_id.to_string();
+        let other_task = task_id.map(str::to_string);
+        let rows = tokio::task::spawn_blocking(move || {
+            other_store.list_effect_receipts(&other_session, other_task.as_deref(), true, 500)
+        })
+        .await??;
+        let counts = crate::effect::counts(&rows, &policy);
+        let blockers = crate::effect::blocking_receipts(&rows, &policy);
+        let blocked = !blockers.is_empty();
+        Ok(SessionEffectsResult {
+            session_id: session_id.to_string(),
+            policy,
+            receipts,
+            counts,
+            blocked,
+            block_reason: blocked.then(|| crate::effect::block_message(&blockers)),
+            truncated: rows.len() >= 500,
+        })
+    }
+
+    pub async fn reconcile_effect(
+        &self,
+        params: EffectReconcileParams,
+    ) -> Result<EffectReconcileResult> {
+        let receipt = self
+            .get_effect(&params.effect_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("effect receipt not found: {}", params.effect_id))?;
+        if let Some(session_id) = params.session_id.as_deref()
+            && session_id != receipt.session_id
+        {
+            anyhow::bail!("effect receipt belongs to a different session");
+        }
+        let evidence = crate::effect::reconcile_evidence(params.decision, &params.evidence)?;
+        let store = self.store.clone();
+        let effect_id = params.effect_id.clone();
+        let decision = params.decision;
+        let operator = params.operator.clone();
+        let (stored, events, changed) = tokio::task::spawn_blocking(move || {
+            store.reconcile_effect(&effect_id, decision, &evidence, operator.as_deref())
+        })
+        .await??;
+        for event in events {
+            let _ = self.events.send(event);
+        }
+        Ok(EffectReconcileResult {
+            receipt: stored,
+            changed,
+        })
+    }
+
+    /// Sweep stale intents across every project with an enabled effect policy.
+    /// This is the daemon-restart path: an `intent` that outlived the grace
+    /// period becomes `unknown`, never a silent retry.
+    pub async fn sweep_stale_effect_intents(&self, limit: u32) -> Result<usize> {
+        let store = self.store.clone();
+        let projects = tokio::task::spawn_blocking(move || store.list_projects()).await??;
+        let mut total = 0usize;
+        let now = time::OffsetDateTime::now_utc();
+        for project in projects {
+            let policy = self.get_effect_policy(&project.id).await?;
+            if !policy.enabled {
+                continue;
+            }
+            let store = self.store.clone();
+            let project_id = project.id.clone();
+            let grace = policy.stale_intent_grace_secs;
+            let events = tokio::task::spawn_blocking(move || {
+                store.sweep_stale_effect_intents(&project_id, grace, limit, &now)
+            })
+            .await??;
+            total = total.saturating_add(events.len());
+            for event in events {
+                let _ = self.events.send(event);
+            }
+        }
+        Ok(total)
+    }
+
     /// Derive and persist a contract from trusted inputs. The same inputs
     /// return the existing row unchanged; a changed plan/policy produces a new
     /// contract and a new `contract.derived` event.
@@ -19740,6 +20489,35 @@ fn parse_event_reference(reference: &str, fallback_session_id: &str) -> Option<(
         .parse::<u64>()
         .ok()
         .map(|seq| (fallback_session_id.to_string(), seq))
+}
+
+/// A failed push is `unknown` only when the transport may have reached the
+/// remote. A local rejection (non-fast-forward, missing remote) is `failed`.
+fn push_error_is_ambiguous(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("timed out")
+        || message.contains("timeout")
+        || message.contains("connection reset")
+        || message.contains("connection refused")
+        || message.contains("could not resolve")
+        || message.contains("unable to access")
+        || message.contains("ssl")
+        || message.contains("tls")
+        || message.contains("remote end hung up")
+}
+
+/// A forge create error is `unknown` when the provider may have created the
+/// change despite the local failure. This is exactly the double-PR case the
+/// receipt prevents; the operator reconciles rather than retries blindly.
+fn forge_error_is_ambiguous(error: &crate::forge::ForgeError) -> bool {
+    matches!(
+        error.code.as_str(),
+        "FORGE_TIMEOUT"
+            | "FORGE_SERVICE_UNAVAILABLE"
+            | "FORGE_NETWORK_FAILED"
+            | "FORGE_CONFLICT"
+            | "FORGE_RESPONSE_INVALID"
+    )
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Result<String> {

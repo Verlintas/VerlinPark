@@ -4366,6 +4366,299 @@ struct SessionContractReport: Codable, Sendable, Equatable {
     }
 }
 
+/// Bounded local effect-receipt metadata from `session.effects`. No file
+/// content, command text, prompt text, or provider secret is rendered.
+struct EffectTargetView: Codable, Sendable, Equatable {
+    let kind: String
+    let key: String
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try container.decodeIfPresent(String.self, forKey: .kind) ?? ""
+        key = try container.decodeIfPresent(String.self, forKey: .key) ?? ""
+    }
+
+    var label: String {
+        key.isEmpty ? kind : "\(kind):\(key)"
+    }
+}
+
+struct EffectEvidenceView: Codable, Sendable, Equatable {
+    let probe: String
+    let outcome: String
+    let reason: String?
+    let sha256: String?
+    let commit: String?
+    let externalID: String?
+    let change: String?
+    let repository: String?
+    let note: String?
+    let caveat: String?
+    let replayed: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case probe
+        case outcome
+        case reason
+        case sha256
+        case commit
+        case externalID = "external_id"
+        case change
+        case repository
+        case note
+        case caveat
+        case replayed
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        probe = try container.decodeIfPresent(String.self, forKey: .probe) ?? ""
+        outcome = try container.decodeIfPresent(String.self, forKey: .outcome) ?? ""
+        reason = try container.decodeIfPresent(String.self, forKey: .reason)
+        sha256 = try container.decodeIfPresent(String.self, forKey: .sha256)
+        commit = try container.decodeIfPresent(String.self, forKey: .commit)
+        externalID = try container.decodeIfPresent(String.self, forKey: .externalID)
+        change = try container.decodeIfPresent(String.self, forKey: .change)
+        repository = try container.decodeIfPresent(String.self, forKey: .repository)
+        note = try container.decodeIfPresent(String.self, forKey: .note)
+        caveat = try container.decodeIfPresent(String.self, forKey: .caveat)
+        replayed = try container.decodeIfPresent(Bool.self, forKey: .replayed) ?? false
+    }
+
+    var anchor: String? {
+        if let sha256, !sha256.isEmpty {
+            return String(sha256.prefix(16))
+        }
+        if let commit, !commit.isEmpty {
+            return String(commit.prefix(16))
+        }
+        if let externalID, !externalID.isEmpty {
+            return String(externalID.prefix(48))
+        }
+        return nil
+    }
+}
+
+struct EffectReceiptView: Codable, Sendable, Identifiable, Equatable {
+    let id: String
+    let sessionID: String
+    let taskID: String?
+    let attempt: Int
+    let tool: String
+    let target: EffectTargetView
+    let state: String
+    let externalID: String?
+    let evidence: EffectEvidenceView
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case sessionID = "session_id"
+        case taskID = "task_id"
+        case attempt
+        case tool
+        case target
+        case state
+        case externalID = "external_id"
+        case evidence
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(String.self, forKey: .id) ?? ""
+        sessionID = try container.decodeIfPresent(String.self, forKey: .sessionID) ?? ""
+        taskID = try container.decodeIfPresent(String.self, forKey: .taskID)
+        attempt = try container.decodeIfPresent(Int.self, forKey: .attempt) ?? 0
+        tool = try container.decodeIfPresent(String.self, forKey: .tool) ?? ""
+        target = try container.decodeIfPresent(EffectTargetView.self, forKey: .target)
+            ?? EffectTargetView.empty
+        state = try container.decodeIfPresent(String.self, forKey: .state) ?? "unknown"
+        externalID = try container.decodeIfPresent(String.self, forKey: .externalID)
+        evidence = try container.decodeIfPresent(EffectEvidenceView.self, forKey: .evidence)
+            ?? EffectEvidenceView.empty
+    }
+
+    var blocksMerge: Bool {
+        state == "intent" || state == "unknown"
+    }
+
+    var stateLabel: String {
+        state.uppercased()
+    }
+}
+
+extension EffectTargetView {
+    static let empty = EffectTargetView(kind: "", key: "")
+
+    init(kind: String, key: String) {
+        self.kind = kind
+        self.key = key
+    }
+}
+
+extension EffectEvidenceView {
+    static let empty = EffectEvidenceView(
+        probe: "",
+        outcome: "",
+        reason: nil,
+        sha256: nil,
+        commit: nil,
+        externalID: nil,
+        change: nil,
+        repository: nil,
+        note: nil,
+        caveat: nil,
+        replayed: false
+    )
+
+    init(
+        probe: String,
+        outcome: String,
+        reason: String?,
+        sha256: String?,
+        commit: String?,
+        externalID: String?,
+        change: String?,
+        repository: String?,
+        note: String?,
+        caveat: String?,
+        replayed: Bool
+    ) {
+        self.probe = probe
+        self.outcome = outcome
+        self.reason = reason
+        self.sha256 = sha256
+        self.commit = commit
+        self.externalID = externalID
+        self.change = change
+        self.repository = repository
+        self.note = note
+        self.caveat = caveat
+        self.replayed = replayed
+    }
+}
+
+struct SessionEffectCounts: Codable, Sendable, Equatable {
+    let total: Int
+    let intent: Int
+    let done: Int
+    let failed: Int
+    let unknown: Int
+    let blocking: Int
+
+    init() {
+        total = 0
+        intent = 0
+        done = 0
+        failed = 0
+        unknown = 0
+        blocking = 0
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        total = try container.decodeIfPresent(Int.self, forKey: .total) ?? 0
+        intent = try container.decodeIfPresent(Int.self, forKey: .intent) ?? 0
+        done = try container.decodeIfPresent(Int.self, forKey: .done) ?? 0
+        failed = try container.decodeIfPresent(Int.self, forKey: .failed) ?? 0
+        unknown = try container.decodeIfPresent(Int.self, forKey: .unknown) ?? 0
+        blocking = try container.decodeIfPresent(Int.self, forKey: .blocking) ?? 0
+    }
+}
+
+struct SessionEffectPolicySummary: Codable, Sendable, Equatable {
+    let enabled: Bool
+    let unknownBlocksMerge: Bool
+    let staleIntentGraceSecs: Int
+    let shellMode: String
+
+    enum CodingKeys: String, CodingKey {
+        case enabled
+        case unknownBlocksMerge = "unknown_blocks_merge"
+        case staleIntentGraceSecs = "stale_intent_grace_secs"
+        case shellMode = "shell_mode"
+    }
+
+    init() {
+        enabled = true
+        unknownBlocksMerge = true
+        staleIntentGraceSecs = 120
+        shellMode = "external_only"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        unknownBlocksMerge =
+            try container.decodeIfPresent(Bool.self, forKey: .unknownBlocksMerge) ?? true
+        staleIntentGraceSecs =
+            try container.decodeIfPresent(Int.self, forKey: .staleIntentGraceSecs) ?? 120
+        shellMode = try container.decodeIfPresent(String.self, forKey: .shellMode)
+            ?? "external_only"
+    }
+}
+
+struct SessionEffectsReport: Codable, Sendable, Equatable {
+    let sessionID: String
+    let receipts: [EffectReceiptView]
+    let counts: SessionEffectCounts
+    let blocked: Bool
+    let blockReason: String?
+    let truncated: Bool
+    let policy: SessionEffectPolicySummary
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case receipts
+        case counts
+        case blocked
+        case blockReason = "block_reason"
+        case truncated
+        case policy
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = try container.decodeIfPresent(String.self, forKey: .sessionID) ?? ""
+        receipts = try container.decodeIfPresent([EffectReceiptView].self, forKey: .receipts) ?? []
+        counts = try container.decodeIfPresent(SessionEffectCounts.self, forKey: .counts)
+            ?? SessionEffectCounts()
+        blocked = try container.decodeIfPresent(Bool.self, forKey: .blocked) ?? false
+        blockReason = try container.decodeIfPresent(String.self, forKey: .blockReason)
+        truncated = try container.decodeIfPresent(Bool.self, forKey: .truncated) ?? false
+        policy = try container.decodeIfPresent(SessionEffectPolicySummary.self, forKey: .policy)
+            ?? SessionEffectPolicySummary()
+    }
+
+    var unresolved: [EffectReceiptView] {
+        receipts.filter(\.blocksMerge)
+    }
+
+    var blockingReceipts: [EffectReceiptView] {
+        blocked ? receipts.filter(\.blocksMerge) : []
+    }
+}
+
+struct EffectPolicyEnvelope: Codable, Sendable, Equatable {
+    let policy: SessionEffectPolicySummary
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        policy = try container.decodeIfPresent(SessionEffectPolicySummary.self, forKey: .policy)
+            ?? SessionEffectPolicySummary()
+    }
+}
+
+struct EffectReconcileResponse: Codable, Sendable, Equatable {
+    let receipt: EffectReceiptView?
+    let changed: Bool
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        receipt = try container.decodeIfPresent(EffectReceiptView.self, forKey: .receipt)
+        changed = try container.decodeIfPresent(Bool.self, forKey: .changed) ?? false
+    }
+}
+
 /// One bounded per-call cache observation from `session.cache`.
 struct SessionCacheCall: Codable, Sendable, Identifiable, Equatable {
     var id: String {
