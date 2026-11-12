@@ -2220,6 +2220,36 @@ enum Command {
     },
     /// Show session cache-read telemetry and the prompt-prefix generation.
     Cache { session: String },
+    /// Show the finalized stable cache epoch, cross-session reuse, and the
+    /// bounded prefix/compaction timeline. Read-only; never calls a provider.
+    #[command(name = "cache-epoch")]
+    CacheEpoch {
+        session: String,
+        /// Maximum timeline and epoch rows. Clamped to 1..=200.
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
+    /// List project-wide cache epochs, tool-bundle buckets, and reuse totals.
+    /// Read-only; never calls a provider.
+    #[command(name = "cache-epochs")]
+    CacheEpochs {
+        project: String,
+        /// Maximum epoch rows. Clamped to 1..=100.
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
+    /// Prune old cache-epoch telemetry. Active-session epochs and the newest
+    /// N epochs are always retained.
+    #[command(name = "cache-epochs-prune")]
+    CacheEpochsPrune {
+        project: String,
+        #[arg(long, default_value_t = 90)]
+        older_than_days: u32,
+        #[arg(long, default_value_t = 50)]
+        keep_epochs: u32,
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Show the ordered content-addressed instruction sections and hashes.
     /// Section text is never printed.
     Instructions {
@@ -7299,6 +7329,40 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Cache { session } => {
             rpc(&discovery, "session.cache", json!({"session_id": session})).await?
+        }
+        Command::CacheEpoch { session, limit } => {
+            rpc(
+                &discovery,
+                "session.cache.epoch",
+                json!({"session_id": session, "limit": limit}),
+            )
+            .await?
+        }
+        Command::CacheEpochs { project, limit } => {
+            rpc(
+                &discovery,
+                "project.cache_epochs",
+                json!({"project_id": project, "limit": limit}),
+            )
+            .await?
+        }
+        Command::CacheEpochsPrune {
+            project,
+            older_than_days,
+            keep_epochs,
+            dry_run,
+        } => {
+            rpc(
+                &discovery,
+                "project.cache_epochs.prune",
+                json!({
+                    "project_id": project,
+                    "older_than_days": older_than_days,
+                    "keep_epochs": keep_epochs,
+                    "dry_run": dry_run,
+                }),
+            )
+            .await?
         }
         Command::Instructions { session, agent } => {
             rpc(
@@ -15074,6 +15138,76 @@ mod tests {
                 match cli.command {
                     Command::Cache { session } => assert_eq!(session, "ses-123"),
                     other => panic!("expected cache command, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn cache_epoch_command_parses_session_and_bounded_limit() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let cli =
+                    Cli::try_parse_from(["vp", "cache-epoch", "ses-123", "--limit", "10"]).unwrap();
+                match cli.command {
+                    Command::CacheEpoch { session, limit } => {
+                        assert_eq!(session, "ses-123");
+                        assert_eq!(limit, 10);
+                    }
+                    other => panic!("expected cache-epoch command, got {other:?}"),
+                }
+                let default = Cli::try_parse_from(["vp", "cache-epoch", "ses-123"]).unwrap();
+                match default.command {
+                    Command::CacheEpoch { limit, .. } => assert_eq!(limit, 50),
+                    other => panic!("expected cache-epoch command, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn cache_epochs_command_parses_project_and_limit() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let cli =
+                    Cli::try_parse_from(["vp", "cache-epochs", "prj-123", "--limit", "7"]).unwrap();
+                match cli.command {
+                    Command::CacheEpochs { project, limit } => {
+                        assert_eq!(project, "prj-123");
+                        assert_eq!(limit, 7);
+                    }
+                    other => panic!("expected cache-epochs command, got {other:?}"),
+                }
+                let prune = Cli::try_parse_from([
+                    "vp",
+                    "cache-epochs-prune",
+                    "prj-123",
+                    "--older-than-days",
+                    "30",
+                    "--keep-epochs",
+                    "10",
+                    "--dry-run",
+                ])
+                .unwrap();
+                match prune.command {
+                    Command::CacheEpochsPrune {
+                        project,
+                        older_than_days,
+                        keep_epochs,
+                        dry_run,
+                    } => {
+                        assert_eq!(project, "prj-123");
+                        assert_eq!(older_than_days, 30);
+                        assert_eq!(keep_epochs, 10);
+                        assert!(dry_run);
+                    }
+                    other => panic!("expected cache-epochs-prune command, got {other:?}"),
                 }
             })
             .unwrap()

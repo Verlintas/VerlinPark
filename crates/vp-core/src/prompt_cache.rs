@@ -486,7 +486,29 @@ impl PromptSectionHashes {
             tools_hash: self.tools_hash.clone(),
             volatile_hash: self.volatile_hash.clone(),
             prefix_hash: self.prefix_hash.clone(),
+            cache_epoch: String::new(),
+            model: String::new(),
         }
+    }
+
+    /// Fingerprint including the finalized L4 epoch. Callers that have an
+    /// epoch must use this variant so same-epoch provider misses are not
+    /// confused with local prefix changes.
+    pub fn fingerprint_with_epoch(&self, cache_epoch: &str) -> CacheCallFingerprint {
+        let mut fingerprint = self.fingerprint();
+        fingerprint.cache_epoch = cache_epoch.to_string();
+        fingerprint
+    }
+
+    /// Fingerprint including the finalized epoch and provider model.
+    pub fn fingerprint_with_epoch_and_model(
+        &self,
+        cache_epoch: &str,
+        model: &str,
+    ) -> CacheCallFingerprint {
+        let mut fingerprint = self.fingerprint_with_epoch(cache_epoch);
+        fingerprint.model = model.to_string();
+        fingerprint
     }
 }
 
@@ -584,6 +606,13 @@ pub struct CacheCallFingerprint {
     pub tools_hash: String,
     pub volatile_hash: String,
     pub prefix_hash: String,
+    /// Finalized L4 epoch. Legacy events leave this empty; attribution then
+    /// falls back to the prefix hash and never invents a cross-session reuse.
+    pub cache_epoch: String,
+    /// Provider-facing model. A model switch changes the epoch even when the
+    /// text and tool schemas are byte-identical, so attribution names it
+    /// explicitly instead of collapsing it into `unknown`.
+    pub model: String,
 }
 
 impl CacheCallFingerprint {
@@ -596,6 +625,8 @@ impl CacheCallFingerprint {
             tools_hash: get("tools_hash").unwrap_or_default(),
             volatile_hash: get("volatile_hash").unwrap_or_default(),
             prefix_hash,
+            cache_epoch: get("cache_epoch").unwrap_or_default(),
+            model: get("model").unwrap_or_default(),
         })
     }
 }
@@ -607,8 +638,13 @@ impl CacheCallFingerprint {
 pub enum CacheMissReason {
     FirstCall,
     PrefixChanged,
+    ModelChanged,
     ToolsChanged,
     ProjectChanged,
+    /// Same epoch, same tools/project, but the provider reported a low or zero
+    /// cache hit. This is a provider/TTL observation, not local prefix churn.
+    ProviderCacheMiss,
+    /// Legacy attribution for events that predate component hashes.
     TtlOrProviderMiss,
     CompactionReset,
     Unknown,
@@ -619,8 +655,10 @@ impl CacheMissReason {
         match self {
             Self::FirstCall => "first_call",
             Self::PrefixChanged => "prefix_changed",
+            Self::ModelChanged => "model_changed",
             Self::ToolsChanged => "tools_changed",
             Self::ProjectChanged => "project_changed",
+            Self::ProviderCacheMiss => "provider_cache_miss",
             Self::TtlOrProviderMiss => "ttl_or_provider_miss",
             Self::CompactionReset => "compaction_reset",
             Self::Unknown => "unknown",
@@ -631,13 +669,24 @@ impl CacheMissReason {
         Some(match value {
             "first_call" => Self::FirstCall,
             "prefix_changed" => Self::PrefixChanged,
+            "model_changed" => Self::ModelChanged,
             "tools_changed" => Self::ToolsChanged,
             "project_changed" => Self::ProjectChanged,
+            "provider_cache_miss" => Self::ProviderCacheMiss,
             "ttl_or_provider_miss" => Self::TtlOrProviderMiss,
             "compaction_reset" => Self::CompactionReset,
             "unknown" => Self::Unknown,
             _ => return None,
         })
+    }
+
+    /// True when the reason points at a local identity change rather than at
+    /// provider eviction or a cold start.
+    pub fn is_prefix_change(self) -> bool {
+        matches!(
+            self,
+            Self::PrefixChanged | Self::ModelChanged | Self::ToolsChanged | Self::ProjectChanged
+        )
     }
 }
 
@@ -674,33 +723,88 @@ impl CacheCallTracker {
         self.compaction_pending
     }
 
-    /// Observe one call and return a miss reason when the provider reported no
-    /// cache reads. A hit clears the compaction marker because the following
-    /// call's prefix is no longer the pre-compaction generation.
+    /// Observe one call with only cache-read tokens. Retained for callers and
+    /// tests that do not have the full provider input count; it delegates to
+    /// [`Self::observe_call`] with an input equal to the cache reads so a hit
+    /// stays a hit and a zero-read call remains attributable.
     pub fn observe(
         &mut self,
         current: &CacheCallFingerprint,
         cache_read_tokens: u64,
     ) -> Option<CacheMissReason> {
-        let reason = if cache_read_tokens > 0 {
-            None
-        } else if let Some(last) = self.last.as_ref() {
-            if last.tools_hash != current.tools_hash {
+        self.observe_call(
+            current,
+            CacheCallObservation {
+                // A zero-read call must still be classified. With no input
+                // count, one token is the smallest honest denominator.
+                input_tokens: cache_read_tokens.max(1),
+                cache_read_tokens,
+                first_session_call: false,
+                prior_sessions: 0,
+            },
+        )
+    }
+
+    /// Observe one provider call and return a miss reason when the reported
+    /// hit is low.
+    ///
+    /// Attribution order:
+    ///
+    /// 1. a changed tool hash → `tools_changed`;
+    /// 2. a changed project hash → `project_changed`;
+    /// 3. a changed core hash or full prefix hash (with the same epoch) →
+    ///    `prefix_changed`;
+    /// 4. the first call after compaction → `compaction_reset`;
+    /// 5. same epoch with a low hit → `provider_cache_miss`;
+    /// 6. no previous call and no known session for the epoch → `first_call`;
+    /// 7. legacy/no component hashes → `ttl_or_provider_miss`.
+    ///
+    /// A hit clears the compaction marker because the following call's prefix
+    /// is no longer the pre-compaction generation.
+    pub fn observe_call(
+        &mut self,
+        current: &CacheCallFingerprint,
+        observation: CacheCallObservation,
+    ) -> Option<CacheMissReason> {
+        if !crate::cache_epoch::is_low_cache_hit(
+            observation.input_tokens,
+            observation.cache_read_tokens,
+        ) {
+            self.last = Some(current.clone());
+            self.compaction_pending = false;
+            return None;
+        }
+        let reason = if let Some(last) = self.last.as_ref() {
+            if !last.model.is_empty() && !current.model.is_empty() && last.model != current.model {
+                Some(CacheMissReason::ModelChanged)
+            } else if last.tools_hash != current.tools_hash {
                 Some(CacheMissReason::ToolsChanged)
             } else if last.project_hash != current.project_hash {
                 Some(CacheMissReason::ProjectChanged)
-            } else if last.core_hash != current.core_hash || last.prefix_hash != current.prefix_hash
+            } else if last.core_hash != current.core_hash
+                || (last.prefix_hash != current.prefix_hash
+                    && last.cache_epoch == current.cache_epoch)
             {
                 Some(CacheMissReason::PrefixChanged)
             } else if self.compaction_pending {
                 Some(CacheMissReason::CompactionReset)
-            } else {
+            } else if !current.cache_epoch.is_empty() && last.cache_epoch == current.cache_epoch {
+                Some(CacheMissReason::ProviderCacheMiss)
+            } else if current.cache_epoch.is_empty() {
                 Some(CacheMissReason::TtlOrProviderMiss)
+            } else {
+                Some(CacheMissReason::Unknown)
             }
         } else if self.compaction_pending {
             Some(CacheMissReason::CompactionReset)
-        } else {
+        } else if observation.prior_sessions > 0 && !current.cache_epoch.is_empty() {
+            // The epoch existed in this project, so a cold provider cache is
+            // an eviction observation rather than a brand-new session miss.
+            Some(CacheMissReason::ProviderCacheMiss)
+        } else if observation.first_session_call || current.cache_epoch.is_empty() {
             Some(CacheMissReason::FirstCall)
+        } else {
+            Some(CacheMissReason::ProviderCacheMiss)
         };
         self.last = Some(current.clone());
         // The marker describes the next observation only. Whether that call
@@ -709,6 +813,17 @@ impl CacheCallTracker {
         self.compaction_pending = false;
         reason
     }
+}
+
+/// Provider-reported shape for one call. `first_session_call` and
+/// `prior_sessions` come from the persisted epoch projection, not from an
+/// in-memory guess.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheCallObservation {
+    pub input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub first_session_call: bool,
+    pub prior_sessions: u64,
 }
 
 /// Estimated no-cache cost minus billed cost for one call. `input` already
@@ -845,6 +960,13 @@ pub fn cache_call_record(payload: &Value, created_at: &str) -> SessionCacheCall 
                     .collect()
             })
             .unwrap_or_default(),
+        cache_epoch: text("cache_epoch"),
+        cache_epoch_reused_from_sessions: u64("cache_epoch_reused_from_sessions"),
+        cross_session_cache_read_tokens: u64("cross_session_cache_read_tokens"),
+        cross_session_first_call: payload
+            .get("cross_session_first_call")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         estimated_savings_usd: payload
             .get("estimated_savings_usd")
             .and_then(Value::as_f64)
@@ -903,6 +1025,17 @@ pub struct CacheTelemetryAggregate {
     pub compaction_resets: u64,
     pub compaction_invalidation_tokens: u64,
     pub compaction_invalidation_estimated_usd: f64,
+    /// Epochs observed in the bounded cache window, sorted by epoch hash.
+    pub cache_epoch_counts: Vec<vp_protocol::types::CacheCountBucket>,
+    /// Provider-reported first-call reuse attributed to another session.
+    pub cross_session_hit_tokens: u64,
+    pub cross_session_first_calls: u64,
+    /// Same-epoch low-hit calls attributed to provider eviction/TTL.
+    pub provider_cache_misses: u64,
+    /// Calls attributed to a local model/tools/project/prefix change.
+    pub prefix_changes: u64,
+    /// Always-computed lost cache-read estimate from reset events.
+    pub compaction_lost_cache_usd: f64,
 }
 
 /// Nearest-rank percentile over a small sorted sample. Returns `None` for an
@@ -929,6 +1062,7 @@ pub fn aggregate_cache_events(
     let mut ttls: BTreeMap<String, u64> = BTreeMap::new();
     let mut breakpoints: BTreeMap<String, u64> = BTreeMap::new();
     let mut savings: BTreeMap<String, (u64, f64)> = BTreeMap::new();
+    let mut epochs: BTreeMap<String, u64> = BTreeMap::new();
     let mut first_tokens = Vec::new();
     for event in cache_events {
         let payload = &event.payload;
@@ -940,6 +1074,40 @@ pub fn aggregate_cache_events(
             aggregate.warm_calls = aggregate.warm_calls.saturating_add(1);
         } else {
             aggregate.calls = aggregate.calls.saturating_add(1);
+        }
+        if let Some(epoch) = payload
+            .get("cache_epoch")
+            .and_then(Value::as_str)
+            .filter(|value| crate::cache_epoch::is_cache_epoch(value))
+        {
+            *epochs.entry(epoch.to_string()).or_default() += 1;
+        }
+        if !warm {
+            if let Some(reason) = payload.get("miss_reason").and_then(Value::as_str)
+                && let Some(reason) = CacheMissReason::parse(reason)
+            {
+                if reason == CacheMissReason::ProviderCacheMiss {
+                    aggregate.provider_cache_misses =
+                        aggregate.provider_cache_misses.saturating_add(1);
+                }
+                if reason.is_prefix_change() {
+                    aggregate.prefix_changes = aggregate.prefix_changes.saturating_add(1);
+                }
+            }
+            if payload
+                .get("cross_session_first_call")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                aggregate.cross_session_first_calls =
+                    aggregate.cross_session_first_calls.saturating_add(1);
+            }
+            aggregate.cross_session_hit_tokens = aggregate.cross_session_hit_tokens.saturating_add(
+                payload
+                    .get("cross_session_cache_read_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            );
         }
         if let Some(reason) = payload.get("miss_reason").and_then(Value::as_str) {
             *misses.entry(reason.to_string()).or_default() += 1;
@@ -983,6 +1151,10 @@ pub fn aggregate_cache_events(
         .into_iter()
         .map(|(key, calls)| vp_protocol::types::CacheCountBucket { key, calls })
         .collect();
+    aggregate.cache_epoch_counts = epochs
+        .into_iter()
+        .map(|(key, calls)| vp_protocol::types::CacheCountBucket { key, calls })
+        .collect();
     aggregate.savings_by_role = savings
         .into_iter()
         .map(
@@ -994,30 +1166,35 @@ pub fn aggregate_cache_events(
         )
         .collect();
     for event in compaction_events {
-        if event
+        let reason = event
             .payload
             .get("cache_reset_reason")
-            .and_then(Value::as_str)
-            == Some("compaction")
-        {
+            .or_else(|| event.payload.get("reset_reason"))
+            .and_then(Value::as_str);
+        if reason == Some("compaction") {
             aggregate.compaction_resets = aggregate.compaction_resets.saturating_add(1);
         }
-        aggregate.compaction_invalidation_tokens =
-            aggregate.compaction_invalidation_tokens.saturating_add(
-                event
-                    .payload
-                    .get("cache_invalidation_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-            );
-        aggregate.compaction_invalidation_estimated_usd += event
+        let invalidated = event
+            .payload
+            .get("cache_invalidation_tokens")
+            .or_else(|| event.payload.get("invalidated_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        aggregate.compaction_invalidation_tokens = aggregate
+            .compaction_invalidation_tokens
+            .saturating_add(invalidated);
+        let lost = event
             .payload
             .get("cache_invalidation_estimated_usd")
+            .or_else(|| event.payload.get("estimated_lost_cache_read_usd"))
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
+        aggregate.compaction_invalidation_estimated_usd += lost;
+        aggregate.compaction_lost_cache_usd += lost;
     }
     aggregate.compaction_invalidation_estimated_usd =
         round_usd(aggregate.compaction_invalidation_estimated_usd);
+    aggregate.compaction_lost_cache_usd = round_usd(aggregate.compaction_lost_cache_usd);
     aggregate
 }
 
@@ -1540,12 +1717,193 @@ mod tests {
     }
 
     #[test]
+    fn same_epoch_low_hit_is_a_provider_miss_not_a_prefix_change() {
+        let mut tracker = CacheCallTracker::default();
+        let epoch = "a".repeat(64);
+        let current = sections()
+            .hashes("model", &[])
+            .fingerprint_with_epoch(&epoch);
+        assert_eq!(
+            tracker.observe_call(
+                &current,
+                CacheCallObservation {
+                    input_tokens: 1_000,
+                    cache_read_tokens: 400,
+                    first_session_call: true,
+                    prior_sessions: 0,
+                }
+            ),
+            Some(CacheMissReason::FirstCall),
+            "a brand-new epoch with a partial cold hit is a first call"
+        );
+        assert_eq!(
+            tracker.observe_call(
+                &current,
+                CacheCallObservation {
+                    input_tokens: 1_000,
+                    cache_read_tokens: 400,
+                    first_session_call: false,
+                    prior_sessions: 0,
+                }
+            ),
+            Some(CacheMissReason::ProviderCacheMiss),
+            "the same epoch must not be reported as our prefix changing"
+        );
+        assert_eq!(
+            tracker.observe_call(
+                &current,
+                CacheCallObservation {
+                    input_tokens: 1_000,
+                    cache_read_tokens: 900,
+                    first_session_call: false,
+                    prior_sessions: 0,
+                }
+            ),
+            None,
+            "a normal hit is not a miss"
+        );
+    }
+
+    #[test]
+    fn known_epoch_with_zero_reads_is_a_provider_cache_miss() {
+        let mut tracker = CacheCallTracker::default();
+        let epoch = "b".repeat(64);
+        let current = sections()
+            .hashes("model", &[])
+            .fingerprint_with_epoch(&epoch);
+        assert_eq!(
+            tracker.observe_call(
+                &current,
+                CacheCallObservation {
+                    input_tokens: 1_000,
+                    cache_read_tokens: 0,
+                    first_session_call: true,
+                    prior_sessions: 3,
+                }
+            ),
+            Some(CacheMissReason::ProviderCacheMiss),
+            "the epoch is known in the project, so a cold call is provider eviction"
+        );
+    }
+
+    #[test]
+    fn epoch_change_with_same_sections_is_not_a_provider_miss() {
+        let mut tracker = CacheCallTracker::default();
+        let first = sections()
+            .hashes("model-a", &[])
+            .fingerprint_with_epoch_and_model(&"a".repeat(64), "model-a");
+        tracker.observe_call(
+            &first,
+            CacheCallObservation {
+                input_tokens: 1_000,
+                cache_read_tokens: 900,
+                first_session_call: true,
+                prior_sessions: 0,
+            },
+        );
+        let second = sections()
+            .hashes("model-b", &[])
+            .fingerprint_with_epoch_and_model(&"b".repeat(64), "model-b");
+        assert_eq!(
+            tracker.observe_call(
+                &second,
+                CacheCallObservation {
+                    input_tokens: 1_000,
+                    cache_read_tokens: 0,
+                    first_session_call: false,
+                    prior_sessions: 0,
+                }
+            ),
+            Some(CacheMissReason::ModelChanged),
+            "a model switch is a new epoch, not provider eviction"
+        );
+    }
+
+    #[test]
+    fn aggregate_counts_epoch_reuse_and_provider_misses() {
+        let events = vec![
+            vp_protocol::types::Event {
+                session_id: "ses".into(),
+                seq: 1,
+                kind: "context.cache".into(),
+                payload: serde_json::json!({
+                    "input_tokens": 1_000,
+                    "cache_read_tokens": 900,
+                    "warm": false,
+                    "cache_epoch": "a".repeat(64),
+                    "cross_session_first_call": true,
+                    "cross_session_cache_read_tokens": 900,
+                    "miss_reason": null,
+                }),
+                created_at: "2026-11-12T00:00:01Z".into(),
+            },
+            vp_protocol::types::Event {
+                session_id: "ses".into(),
+                seq: 2,
+                kind: "context.cache".into(),
+                payload: serde_json::json!({
+                    "input_tokens": 1_000,
+                    "cache_read_tokens": 100,
+                    "warm": false,
+                    "cache_epoch": "a".repeat(64),
+                    "miss_reason": "provider_cache_miss",
+                }),
+                created_at: "2026-11-12T00:00:02Z".into(),
+            },
+        ];
+        let aggregate = aggregate_cache_events(&events, &[]);
+        assert_eq!(aggregate.calls, 2);
+        assert_eq!(aggregate.cross_session_hit_tokens, 900);
+        assert_eq!(aggregate.cross_session_first_calls, 1);
+        assert_eq!(aggregate.provider_cache_misses, 1);
+        assert_eq!(aggregate.prefix_changes, 0);
+        assert_eq!(aggregate.cache_epoch_counts.len(), 1);
+        assert_eq!(aggregate.cache_epoch_counts[0].calls, 2);
+    }
+
+    #[test]
+    fn aggregate_reads_l4_reset_events_and_legacy_compaction_fields() {
+        let reset = vp_protocol::types::Event {
+            session_id: "ses".into(),
+            seq: 3,
+            kind: "context.compaction.cache_reset".into(),
+            payload: serde_json::json!({
+                "reset_reason": "compaction",
+                "invalidated_tokens": 4_000,
+                "estimated_lost_cache_read_usd": 0.01,
+            }),
+            created_at: "2026-11-12T00:00:03Z".into(),
+        };
+        let legacy = vp_protocol::types::Event {
+            session_id: "ses".into(),
+            seq: 4,
+            kind: "context.compaction".into(),
+            payload: serde_json::json!({
+                "cache_reset_reason": "compaction",
+                "cache_invalidation_tokens": 2_000,
+                "cache_invalidation_estimated_usd": 0.005,
+            }),
+            created_at: "2026-11-12T00:00:04Z".into(),
+        };
+        let with_reset = aggregate_cache_events(&[], std::slice::from_ref(&reset));
+        assert_eq!(with_reset.compaction_resets, 1);
+        assert_eq!(with_reset.compaction_invalidation_tokens, 4_000);
+        assert!((with_reset.compaction_lost_cache_usd - 0.01).abs() < 1e-9);
+        let with_legacy = aggregate_cache_events(&[], std::slice::from_ref(&legacy));
+        assert_eq!(with_legacy.compaction_resets, 1);
+        assert_eq!(with_legacy.compaction_invalidation_tokens, 2_000);
+        assert!((with_legacy.compaction_lost_cache_usd - 0.005).abs() < 1e-9);
+    }
+
+    #[test]
     fn miss_reason_strings_round_trip() {
         for reason in [
             CacheMissReason::FirstCall,
             CacheMissReason::PrefixChanged,
+            CacheMissReason::ModelChanged,
             CacheMissReason::ToolsChanged,
             CacheMissReason::ProjectChanged,
+            CacheMissReason::ProviderCacheMiss,
             CacheMissReason::TtlOrProviderMiss,
             CacheMissReason::CompactionReset,
             CacheMissReason::Unknown,

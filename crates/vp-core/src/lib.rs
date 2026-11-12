@@ -55,19 +55,21 @@ use vp_protocol::types::{
     ProgramMilestoneCreateParams, ProgramMilestoneListResult, ProgramMilestoneUpdateParams,
     ProgramPolicy, ProgramReplayReport, ProgramStatus, ProgramStatusParams, ProgramStatusResult,
     ProgramTickParams, ProgramTickResult, ProgramUpdateParams, Project, ProjectBudget,
-    ProjectBudgetResult, ProjectUsageResult, PullRequestResult, Question, QuestionListResult,
-    ReviseTeamPlanResult, ScheduledTask, SearchResult, Session, SessionBundle, SessionCacheStatus,
-    SessionCheckpoint, SessionCheckpointDeleteResult, SessionCheckpointDiffResult,
-    SessionCheckpointListResult, SessionCheckpointPruneResult, SessionCheckpointRestoreResult,
-    SessionCheckpointStatsResult, SessionCitationAuditResult, SessionCitationsResult,
-    SessionCommit, SessionCompareFile, SessionCompareResult, SessionContextStatus,
-    SessionContinuation, SessionContinuationCancelResult, SessionContinuationClaimInfo,
-    SessionContinuationReclaimResult, SessionContinuationStatusResult, SessionContinuationsResult,
-    SessionDeferResult, SessionDiff, SessionForkResult, SessionForkTreeNode, SessionForkTreeResult,
-    SessionImportResult, SessionInstructionSection, SessionInstructionStateReport,
-    SessionInstructionsReport, SessionLandResult, SessionLineageEntry, SessionLineageResult,
-    SessionLogStatus, SessionPreemptionResult, SessionPriorityResult, SessionRehydrateResult,
-    SessionReplayReport, SessionSkillActivationsResult, SessionStallsResult, SessionSteerResult,
+    ProjectBudgetResult, ProjectCacheEpochPruneResult, ProjectCacheEpochResult, ProjectUsageResult,
+    PromptPrefixAggregate, PromptPrefixObservation, PullRequestResult, Question,
+    QuestionListResult, ReviseTeamPlanResult, ScheduledTask, SearchResult, Session, SessionBundle,
+    SessionCacheStatus, SessionCheckpoint, SessionCheckpointDeleteResult,
+    SessionCheckpointDiffResult, SessionCheckpointListResult, SessionCheckpointPruneResult,
+    SessionCheckpointRestoreResult, SessionCheckpointStatsResult, SessionCitationAuditResult,
+    SessionCitationsResult, SessionCommit, SessionCompareFile, SessionCompareResult,
+    SessionContextStatus, SessionContinuation, SessionContinuationCancelResult,
+    SessionContinuationClaimInfo, SessionContinuationReclaimResult,
+    SessionContinuationStatusResult, SessionContinuationsResult, SessionDeferResult, SessionDiff,
+    SessionForkResult, SessionForkTreeNode, SessionForkTreeResult, SessionImportResult,
+    SessionInstructionSection, SessionInstructionStateReport, SessionInstructionsReport,
+    SessionLandResult, SessionLineageEntry, SessionLineageResult, SessionLogStatus,
+    SessionPreemptionResult, SessionPriorityResult, SessionRehydrateResult, SessionReplayReport,
+    SessionSkillActivationsResult, SessionStallsResult, SessionSteerResult,
     SessionSteeringCancelResult, SessionSteeringListResult, SessionTranscriptResult,
     SessionUnlimitedResult, ShellPolicy, Skill, SkillActivation, SkillCreateParams,
     SkillDeleteResult, SkillEnabledParams, SkillImportParams, SkillListResult, SkillUpdateParams,
@@ -92,9 +94,9 @@ use vp_protocol::types::{
 use vp_store::Store;
 use vp_store::store::{
     DeliveredSteering, MemoryCandidate, NewIntakeTask, NewMemory, NewSessionContinuation,
-    RuntimeLeaseAcquisition, RuntimeLeaseToken, SessionContinuationAckError,
-    SessionContinuationClaim, SessionRepair, SourceEmbeddingChunkRow, SourceSearchQuery,
-    SourceSnapshot,
+    PromptPrefixCall, PromptPrefixTotals, RuntimeLeaseAcquisition, RuntimeLeaseToken,
+    SessionContinuationAckError, SessionContinuationClaim, SessionRepair, SourceEmbeddingChunkRow,
+    SourceSearchQuery, SourceSnapshot,
 };
 
 use crate::budget::BudgetRegistry;
@@ -109,6 +111,7 @@ pub mod browser;
 pub mod budget;
 pub mod budget_governor;
 pub mod cache_audit;
+pub mod cache_epoch;
 pub mod computer;
 pub mod console;
 pub mod context;
@@ -189,6 +192,9 @@ struct ReplayData {
     test_results: Vec<vp_protocol::test_cache::TestCacheEntry>,
     remote_test_evidence: Vec<RemoteTestEvidence>,
     instructions: Vec<vp_protocol::types::SessionInstructionState>,
+    prompt_prefix_observations: Vec<PromptPrefixObservation>,
+    prompt_prefix_aggregates: Vec<PromptPrefixAggregate>,
+    prompt_prefix_inconsistent_epochs: Vec<String>,
     events: Vec<Event>,
 }
 
@@ -10048,6 +10054,51 @@ impl Engine {
     /// Bounded cache telemetry derived from the usage ledger and the latest
     /// context prompt-prefix/measurement/cache events. Never returns prompt
     /// text or provider secrets.
+    /// Append a cache call event and its epoch observation atomically. The
+    /// store computes cross-session fields inside the same transaction so the
+    /// event payload and projection cannot disagree after a commit.
+    pub async fn append_cache_call_event(
+        &self,
+        session_id: &str,
+        kind: &str,
+        payload: serde_json::Value,
+        call: &PromptPrefixCall,
+    ) -> Result<Event> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let kind = kind.to_string();
+        let call = call.clone();
+        let (event, _record) = tokio::task::spawn_blocking(move || {
+            store.append_cache_call_event(&id, &kind, payload, &call)
+        })
+        .await??;
+        let _ = self.events.send(event.clone());
+        Ok(event)
+    }
+
+    /// Projection view of one epoch for one session. A read, not a claim.
+    pub async fn cache_epoch_reuse(
+        &self,
+        project_id: &str,
+        cache_epoch: &str,
+        session_id: &str,
+    ) -> Result<crate::cache_epoch::CacheEpochReuse> {
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        let cache_epoch = cache_epoch.to_string();
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let aggregate = store.prompt_prefix_aggregate(&project_id, &cache_epoch)?;
+            let observation =
+                store.prompt_prefix_observation(&project_id, &cache_epoch, &session_id)?;
+            Ok(crate::cache_epoch::reuse_from_projection(
+                aggregate.as_ref(),
+                observation.as_ref(),
+            ))
+        })
+        .await?
+    }
+
     pub async fn session_cache_status(&self, session_id: &str) -> Result<SessionCacheStatus> {
         const CACHE_CALL_SCAN_LIMIT: u32 = 2_000;
         const RECENT_CALLS: usize = 20;
@@ -10068,8 +10119,23 @@ impl Engine {
         let compaction_events = self
             .recent_events_of_kind(session_id, "context.compaction", CACHE_CALL_SCAN_LIMIT)
             .await?;
+        let cache_reset_events = self
+            .recent_events_of_kind(
+                session_id,
+                "context.compaction.cache_reset",
+                CACHE_CALL_SCAN_LIMIT,
+            )
+            .await?;
+        // L4 reset events are authoritative when present. Older sessions only
+        // have `context.compaction`, whose reset fields are policy-gated; using
+        // both would double-count the same boundary.
+        let lifecycle_events = if cache_reset_events.is_empty() {
+            compaction_events
+        } else {
+            cache_reset_events
+        };
         let aggregate =
-            crate::prompt_cache::aggregate_cache_events(&cache_events, &compaction_events);
+            crate::prompt_cache::aggregate_cache_events(&cache_events, &lifecycle_events);
         let continuity = crate::conversation::aggregate_continuity(&cache_events, &break_events);
 
         let prompt_prefix = prefix_event
@@ -10170,13 +10236,96 @@ impl Engine {
         let project_id = tokio::task::spawn_blocking(move || session_store.get_session(&lookup_id))
             .await??
             .map(|session| session.project_id);
+        let cache_epoch = prefix_event
+            .as_ref()
+            .and_then(|event| crate::cache_epoch::finalized_epoch_hash(&event.payload))
+            .map(str::to_string)
+            .or_else(|| {
+                last_cache
+                    .and_then(|event| crate::cache_epoch::finalized_epoch_hash(&event.payload))
+                    .map(str::to_string)
+            });
+        let (epoch_aggregate, epoch_observation) =
+            match (project_id.as_deref(), cache_epoch.as_deref()) {
+                (Some(project_id), Some(epoch)) => {
+                    let store = self.store.clone();
+                    let project = project_id.to_string();
+                    let epoch = epoch.to_string();
+                    let session = session_id.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        let aggregate = store.prompt_prefix_aggregate(&project, &epoch)?;
+                        let observation =
+                            store.prompt_prefix_observation(&project, &epoch, &session)?;
+                        Ok::<_, anyhow::Error>((aggregate, observation))
+                    })
+                    .await??
+                }
+                _ => (None, None),
+            };
         let policy = match project_id {
             Some(project_id) => self.get_cache_policy(&project_id).await.ok(),
             None => None,
         };
 
+        let epoch_reuse = crate::cache_epoch::reuse_from_projection(
+            epoch_aggregate.as_ref(),
+            epoch_observation.as_ref(),
+        );
+        let epoch_session_count = epoch_aggregate
+            .as_ref()
+            .map(|row| row.session_count)
+            .unwrap_or(0);
+
         Ok(SessionCacheStatus {
             session_id: session_id.to_string(),
+            cache_epoch: cache_epoch.clone(),
+            cache_epoch_source: cache_epoch.as_ref().and_then(|_| {
+                prefix_event
+                    .as_ref()
+                    .and_then(|event| event.payload.get("cache_epoch_source"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            }),
+            cache_epoch_first_seen: epoch_observation.as_ref().map(|row| row.first_seen.clone()),
+            cache_epoch_last_seen: epoch_observation.as_ref().map(|row| row.last_seen.clone()),
+            cache_epoch_project_first_seen: epoch_aggregate
+                .as_ref()
+                .map(|row| row.first_seen.clone()),
+            cache_epoch_project_last_seen: epoch_aggregate
+                .as_ref()
+                .map(|row| row.last_seen.clone()),
+            cache_epoch_core_sections: epoch_aggregate
+                .as_ref()
+                .map(|row| row.core_sections.clone())
+                .unwrap_or_default(),
+            cache_epoch_project_sections: epoch_aggregate
+                .as_ref()
+                .map(|row| row.project_sections.clone())
+                .unwrap_or_default(),
+            cache_epoch_session_count: epoch_session_count,
+            cache_epoch_call_count: epoch_aggregate
+                .as_ref()
+                .map(|row| row.call_count)
+                .unwrap_or(0),
+            cache_epoch_observed_input_tokens: epoch_aggregate
+                .as_ref()
+                .map(|row| row.observed_input_tokens)
+                .unwrap_or(0),
+            cache_epoch_observed_cache_read_tokens: epoch_aggregate
+                .as_ref()
+                .map(|row| row.observed_cache_read_tokens)
+                .unwrap_or(0),
+            cache_epochs_seen: aggregate.cache_epoch_counts.len() as u64,
+            prefix_reused_from_sessions: last_cache
+                .and_then(|event| event.payload.get("cache_epoch_reused_from_sessions"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(epoch_reuse.prior_sessions),
+            cross_session_hit_tokens: aggregate.cross_session_hit_tokens,
+            cross_session_first_calls: aggregate.cross_session_first_calls,
+            provider_cache_misses: aggregate.provider_cache_misses,
+            prefix_changes: aggregate.prefix_changes,
+            compaction_cache_resets: aggregate.compaction_resets,
+            compaction_lost_cache_usd: aggregate.compaction_lost_cache_usd,
             input_tokens: ledger.totals.input_tokens,
             cache_read_tokens: ledger.totals.cache_read_tokens,
             cache_write_tokens: ledger.totals.cache_write_tokens,
@@ -10299,6 +10448,210 @@ impl Engine {
             total_breaks,
             truncated: total_breaks > breaks.len() as u64,
             breaks,
+        })
+    }
+
+    /// Read-only cache-epoch inspection. No provider call is made and nothing
+    /// is mutated. The epoch timeline is derived from bounded event windows.
+    pub async fn session_cache_epoch(
+        &self,
+        session_id: &str,
+        limit: Option<u32>,
+    ) -> Result<vp_protocol::types::SessionCacheEpochResult> {
+        let limit = limit
+            .unwrap_or(50)
+            .clamp(1, crate::cache_epoch::MAX_CACHE_EPOCH_TIMELINE as u32);
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let session = tokio::task::spawn_blocking(move || store.get_session(&id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+        let prefix_events = self
+            .recent_events_of_kind(
+                session_id,
+                "context.prompt_prefix",
+                crate::cache_epoch::MAX_CACHE_EPOCH_TIMELINE as u32,
+            )
+            .await?;
+        let reset_events = self
+            .recent_events_of_kind(
+                session_id,
+                "context.compaction.cache_reset",
+                crate::cache_epoch::MAX_CACHE_EPOCH_TIMELINE as u32,
+            )
+            .await?;
+        let cache_events = self
+            .recent_events_of_kind(session_id, "context.cache", 2_000)
+            .await?;
+        let (timeline, timeline_truncated) =
+            crate::cache_epoch::epoch_timeline(&prefix_events, &reset_events, limit as usize);
+        let current_epoch = prefix_events
+            .iter()
+            .rev()
+            .find_map(|event| crate::cache_epoch::CacheEpoch::from_event_payload(&event.payload))
+            .map(|epoch| epoch.hash)
+            .or_else(|| {
+                cache_events.iter().rev().find_map(|event| {
+                    crate::cache_epoch::finalized_epoch_hash(&event.payload).map(str::to_string)
+                })
+            });
+        let store = self.store.clone();
+        let project_id = session.project_id.clone();
+        let reuse_project = session.project_id.clone();
+        let sid = session_id.to_string();
+        let epoch_limit = limit;
+        let (aggregates, observations, total_epochs) = tokio::task::spawn_blocking(move || {
+            let aggregates = store.list_prompt_prefix_aggregates(&project_id, 1_000)?;
+            let observations = store.list_prompt_prefix_observations(&project_id, &sid)?;
+            let total = store.count_prompt_prefix_aggregates(&project_id)?;
+            Ok::<_, anyhow::Error>((aggregates, observations, total))
+        })
+        .await??;
+        let epochs =
+            crate::cache_epoch::summarize_epochs(&aggregates, &observations, epoch_limit as usize);
+        let mut current = epochs
+            .iter()
+            .find(|summary| Some(&summary.cache_epoch) == current_epoch.as_ref())
+            .cloned();
+        if current.is_none()
+            && let Some(epoch) = current_epoch.as_deref()
+            && let Some(aggregate) = aggregates
+                .iter()
+                .find(|aggregate| aggregate.cache_epoch == epoch)
+        {
+            current = crate::cache_epoch::summarize_epochs(
+                std::slice::from_ref(aggregate),
+                &observations,
+                1,
+            )
+            .into_iter()
+            .next();
+        }
+        let reused_sessions = if let Some(epoch) = current_epoch.clone() {
+            let store = self.store.clone();
+            let sid = session_id.to_string();
+            tokio::task::spawn_blocking(move || {
+                store.list_prompt_prefix_reuse_sessions(
+                    &reuse_project,
+                    &epoch,
+                    Some(&sid),
+                    limit.min(50),
+                )
+            })
+            .await??
+        } else {
+            Vec::new()
+        };
+        let stats = crate::prompt_cache::aggregate_cache_events(&cache_events, &reset_events);
+        let reuse = crate::cache_epoch::reuse_from_projection(
+            current_epoch.as_deref().and_then(|epoch| {
+                aggregates
+                    .iter()
+                    .find(|aggregate| aggregate.cache_epoch == epoch)
+            }),
+            current_epoch.as_deref().and_then(|epoch| {
+                observations
+                    .iter()
+                    .find(|observation| observation.cache_epoch == epoch)
+            }),
+        );
+        Ok(vp_protocol::types::SessionCacheEpochResult {
+            session_id: session_id.to_string(),
+            project_id: session.project_id,
+            prompt_layout: session.prompt_layout,
+            current_epoch: current,
+            epochs,
+            timeline,
+            reused_sessions,
+            total_epochs,
+            timeline_truncated,
+            prefix_reused_from_sessions: reuse.prior_sessions,
+            cross_session_hit_tokens: stats.cross_session_hit_tokens,
+            cross_session_first_calls: stats.cross_session_first_calls,
+            provider_cache_misses: stats.provider_cache_misses,
+            compaction_resets: stats.compaction_resets,
+            compaction_lost_cache_usd: stats.compaction_lost_cache_usd,
+            generated_at: vp_protocol::now_rfc3339(),
+        })
+    }
+
+    /// Read-only project-wide cache-epoch report. It summarizes the same
+    /// event-derived projection as `session.cache.epoch` without requiring a
+    /// session and without a provider call.
+    pub async fn project_cache_epochs(
+        &self,
+        project_id: &str,
+        limit: Option<u32>,
+    ) -> Result<ProjectCacheEpochResult> {
+        let limit = limit
+            .unwrap_or(50)
+            .clamp(1, crate::cache_epoch::MAX_CACHE_EPOCH_AGGREGATES as u32);
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let (aggregates, total_epochs, bundles, totals) = tokio::task::spawn_blocking(move || {
+            let aggregates = store.list_prompt_prefix_aggregates(&project, 1_000)?;
+            let total = store.count_prompt_prefix_aggregates(&project)?;
+            let bundles = store.prompt_prefix_bundle_buckets(&project)?;
+            let totals = store.prompt_prefix_totals(&project)?;
+            Ok::<_, anyhow::Error>((aggregates, total, bundles, totals))
+        })
+        .await??;
+        let epochs = crate::cache_epoch::summarize_epochs(&aggregates, &[], limit as usize);
+        let PromptPrefixTotals {
+            total_sessions,
+            total_calls,
+            observed_input_tokens,
+            observed_cache_read_tokens,
+        } = totals;
+        Ok(ProjectCacheEpochResult {
+            project_id: project_id.to_string(),
+            epochs,
+            bundles,
+            total_epochs,
+            total_sessions,
+            total_calls,
+            observed_input_tokens,
+            observed_cache_read_tokens,
+            cache_hit_ratio: if observed_input_tokens == 0 {
+                0.0
+            } else {
+                (observed_cache_read_tokens as f64 / observed_input_tokens as f64).clamp(0.0, 1.0)
+            },
+            generated_at: vp_protocol::now_rfc3339(),
+        })
+    }
+
+    /// Prune old cache-epoch telemetry for one project. This is an explicit
+    /// maintenance operation; nothing in the scheduler calls it. The newest
+    /// epochs and epochs with active sessions are retained.
+    pub async fn prune_project_cache_epochs(
+        &self,
+        project_id: &str,
+        older_than_days: Option<u32>,
+        keep_epochs: Option<u32>,
+        dry_run: bool,
+    ) -> Result<ProjectCacheEpochPruneResult> {
+        let days = older_than_days.unwrap_or(90).clamp(1, 3_650);
+        let keep = keep_epochs.unwrap_or(50).clamp(1, 1_000);
+        let cutoff = (time::OffsetDateTime::now_utc() - time::Duration::days(i64::from(days)))
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|error| anyhow::anyhow!("formatting cache-epoch cutoff: {error}"))?;
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let cutoff_for_store = cutoff.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            store.prune_prompt_prefixes(&project, &cutoff_for_store, keep, dry_run)
+        })
+        .await??;
+        Ok(ProjectCacheEpochPruneResult {
+            project_id: project_id.to_string(),
+            dry_run,
+            cutoff,
+            removed_epochs: outcome.removed_epochs,
+            removed_observations: outcome.removed_observations,
+            kept_epochs: outcome.kept_epochs,
+            remaining_epochs: outcome.remaining_epochs,
+            protected_epochs: outcome.protected_epochs,
         })
     }
 
@@ -10487,6 +10840,16 @@ impl Engine {
         let break_events = self
             .recent_events_of_kind(session_id, "context.cache_break", LIMIT)
             .await?;
+        let cache_reset_events = self
+            .recent_events_of_kind(session_id, "context.compaction.cache_reset", LIMIT)
+            .await?;
+        // Prefer the L4 reset events when present; older sessions only have
+        // `context.compaction`, whose reset fields are policy-gated.
+        let lifecycle_events = if cache_reset_events.is_empty() {
+            compaction_events
+        } else {
+            cache_reset_events
+        };
         let session_store = self.store.clone();
         let lookup_id = session_id.to_string();
         let project_id = tokio::task::spawn_blocking(move || session_store.get_session(&lookup_id))
@@ -10513,7 +10876,7 @@ impl Engine {
             policy.as_ref(),
             &cache_events,
             &prefix_events,
-            &compaction_events,
+            &lifecycle_events,
             &break_events,
         ))
     }
@@ -13462,6 +13825,16 @@ impl Engine {
             )?;
             let remote_test_evidence = store.list_remote_test_evidence_for_session(&id)?;
             let instructions = store.list_instruction_states_for_session(&id)?;
+            let prompt_prefix_observations =
+                store.list_prompt_prefix_observations(&session.project_id, &id)?;
+            let prompt_prefix_aggregates =
+                store.list_prompt_prefix_aggregates(&session.project_id, 1_000)?;
+            let epochs = prompt_prefix_observations
+                .iter()
+                .map(|row| row.cache_epoch.clone())
+                .collect::<Vec<_>>();
+            let prompt_prefix_inconsistent_epochs =
+                store.prompt_prefix_inconsistent_epochs(&session.project_id, &epochs)?;
             let events = store.list_all_events(&id)?;
             Ok(ReplayData {
                 session,
@@ -13492,6 +13865,9 @@ impl Engine {
                 test_results,
                 remote_test_evidence,
                 instructions,
+                prompt_prefix_observations,
+                prompt_prefix_aggregates,
+                prompt_prefix_inconsistent_epochs,
                 events,
             })
         })
@@ -14442,6 +14818,50 @@ impl Engine {
             }
         };
 
+        let expected_prefix_observations = crate::cache_epoch::observations_from_events(
+            &data.session.project_id,
+            &data.session.id,
+            &data.events,
+        );
+        let (prefix_observations_match, prefix_aggregates_match) = if let Some(expected) =
+            expected_prefix_observations
+        {
+            let observations_match =
+                crate::cache_epoch::observations_match(&data.prompt_prefix_observations, &expected);
+            if !observations_match {
+                mismatches.push(format!(
+                    "prompt prefix observations: projection={}, replay={}",
+                    data.prompt_prefix_observations.len(),
+                    expected.len()
+                ));
+            }
+            let mut aggregates_match = data.prompt_prefix_inconsistent_epochs.is_empty();
+            if !aggregates_match {
+                mismatches.push(format!(
+                    "prompt prefix aggregates: {} epoch(s) diverge from observations",
+                    data.prompt_prefix_inconsistent_epochs.len()
+                ));
+            }
+            let missing_aggregate = expected.iter().any(|row| {
+                !data
+                    .prompt_prefix_aggregates
+                    .iter()
+                    .any(|aggregate| aggregate.cache_epoch == row.cache_epoch)
+            });
+            if missing_aggregate {
+                aggregates_match = false;
+                mismatches.push(format!(
+                    "prompt prefix aggregates: missing an epoch row for {} session epoch(s)",
+                    expected.len()
+                ));
+            }
+            (observations_match, aggregates_match)
+        } else {
+            // No epoch event stream means a legacy session; its projection
+            // is preserved rather than reported as drift.
+            (true, true)
+        };
+
         let expected_artifacts = Self::expected_artifacts(data);
         let projected_artifacts = data
             .artifacts
@@ -14715,6 +15135,8 @@ impl Engine {
         let consistent = status_matches
             && prompt_layout_matches
             && instructions_match
+            && prefix_observations_match
+            && prefix_aggregates_match
             && usage_matches
             && ledger_matches
             && mailbox_matches
@@ -15084,6 +15506,15 @@ impl Engine {
             instructions: match crate::instruction::states_from_events(&data.events) {
                 Some(rows) => Some(rows),
                 None if data.instructions.is_empty() => Some(Vec::new()),
+                None => None,
+            },
+            prompt_prefix_observations: match crate::cache_epoch::observations_from_events(
+                &data.session.project_id,
+                &data.session.id,
+                &data.events,
+            ) {
+                Some(rows) => Some(rows),
+                None if data.prompt_prefix_observations.is_empty() => Some(Vec::new()),
                 None => None,
             },
             artifact_warnings,
@@ -15475,6 +15906,7 @@ impl Engine {
             test_results: data.test_results,
             instruction_blobs,
             instructions: data.instructions,
+            prompt_prefix_observations: data.prompt_prefix_observations,
         })
     }
 

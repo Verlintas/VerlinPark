@@ -188,9 +188,12 @@ async fn leader_run_materializes_ordered_metadata_without_exposing_text() {
         .find(|event| event.kind == "context.prompt_prefix")
         .unwrap();
     assert_eq!(prefix.payload["prompt_layout"], 3);
-    assert_eq!(prefix.payload["cache_epoch"], prefix.payload["prefix_hash"]);
-    assert_eq!(prefix.payload["cache_epoch_source"], "l1_placeholder");
-    assert_eq!(prefix.payload["cache_epoch_placeholder"], true);
+    // L4 replaces the L1 placeholder with the finalized stable epoch.
+    assert_eq!(prefix.payload["cache_epoch_source"], "l4");
+    assert_eq!(prefix.payload["cache_epoch_placeholder"], false);
+    assert_ne!(prefix.payload["cache_epoch"], prefix.payload["prefix_hash"]);
+    assert_eq!(prefix.payload["cache_epoch"].as_str().unwrap().len(), 64);
+    assert_eq!(prefix.payload["cache_epoch_change_reason"], "first");
     assert!(
         prefix.payload["section_chars"]["core/charter"]
             .as_u64()

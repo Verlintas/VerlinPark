@@ -216,6 +216,112 @@ pub fn audit_cache_events(
     // 10. The prefix plan is the authoritative expectation. If a later call
     //     reports a different provider plan, surface the mismatch instead of
     //     silently trusting telemetry.
+    // 11. Epoch churn is distinct from tool/project churn: it says the stable
+    //     instruction identity moved enough times that cross-session reuse is
+    //     unlikely to pay back. It is informational unless the window is large
+    //     enough for the count to be meaningful.
+    if aggregate.cache_epoch_counts.len() > 2 {
+        findings.push(finding(
+            "cache_epoch_churn",
+            if calls_checked >= 5 {
+                "warning"
+            } else {
+                "info"
+            },
+            format!(
+                "{} distinct cache epochs were observed in the window; inspect model/tool/project changes before expecting cross-session reuse",
+                aggregate.cache_epoch_counts.len()
+            ),
+            BTreeMap::from([
+                ("epochs".to_string(), aggregate.cache_epoch_counts.len().into()),
+                ("calls".to_string(), calls_checked.into()),
+            ]),
+        ));
+    }
+
+    // 12. A same-epoch low hit is provider eviction or TTL pressure, not a
+    //     local prefix change. Report it separately so operators do not chase
+    //     a generator change that did not happen.
+    if aggregate.provider_cache_misses > 0 {
+        let severe =
+            calls_checked >= 3 && aggregate.provider_cache_misses.saturating_mul(4) > calls_checked;
+        findings.push(finding(
+            "provider_cache_miss_pressure",
+            if severe { "warning" } else { "info" },
+            format!(
+                "{} call(s) had an unchanged cache epoch but a low or zero provider cache hit; this is provider eviction/TTL pressure, not local prefix churn",
+                aggregate.provider_cache_misses
+            ),
+            BTreeMap::from([
+                (
+                    "provider_cache_misses".to_string(),
+                    aggregate.provider_cache_misses.into(),
+                ),
+                ("calls".to_string(), calls_checked.into()),
+            ]),
+        ));
+    }
+
+    // 13. Cross-session reuse is only claimed from provider-reported reads on
+    //     the first call of a session that shared a known epoch.
+    if aggregate.cross_session_first_calls > 0 {
+        findings.push(finding(
+            "cross_session_prefix_reuse",
+            "info",
+            format!(
+                "{} first session call(s) reused a known epoch and reported {} cache-read token(s)",
+                aggregate.cross_session_first_calls, aggregate.cross_session_hit_tokens
+            ),
+            BTreeMap::from([
+                (
+                    "first_calls".to_string(),
+                    aggregate.cross_session_first_calls.into(),
+                ),
+                (
+                    "cache_read_tokens".to_string(),
+                    aggregate.cross_session_hit_tokens.into(),
+                ),
+            ]),
+        ));
+    }
+
+    // 14. A compaction boundary that preserves the stable epoch is expected:
+    //     the conversation cache reset is real, but the shareable instruction
+    //     block did not change. Surface it so the reset is not misread as a
+    //     new epoch.
+    let preserved_epoch_resets = compaction_events
+        .iter()
+        .filter(|event| {
+            let before = event
+                .payload
+                .get("cache_epoch_before")
+                .and_then(serde_json::Value::as_str);
+            let after = event
+                .payload
+                .get("cache_epoch_after")
+                .and_then(serde_json::Value::as_str);
+            matches!((before, after), (Some(before), Some(after)) if before == after)
+                && event
+                    .payload
+                    .get("cache_epoch_changed")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+        })
+        .count() as u64;
+    if preserved_epoch_resets > 0 {
+        findings.push(finding(
+            "compaction_preserved_cache_epoch",
+            "info",
+            format!(
+                "{preserved_epoch_resets} compaction reset(s) kept the stable cache epoch; only the conversation cache boundary moved"
+            ),
+            BTreeMap::from([(
+                "resets".to_string(),
+                preserved_epoch_resets.into(),
+            )]),
+        ));
+    }
+
     let latest_plan = prefix_events
         .iter()
         .rev()
@@ -707,6 +813,63 @@ mod tests {
         let codes = codes(&result);
         assert!(codes.contains(&"disabled_policy_emitted_breakpoints"));
         assert!(!result.clean);
+    }
+
+    #[test]
+    fn epoch_churn_provider_misses_and_cross_session_reuse_are_distinct_findings() {
+        let epoch = "a".repeat(64);
+        let other_epoch = "b".repeat(64);
+        let third_epoch = "c".repeat(64);
+        let cache_events = vec![
+            cache(serde_json::json!({
+                "cache_epoch": epoch,
+                "input_tokens": 1000,
+                "cache_read_tokens": 900,
+                "cross_session_first_call": true,
+                "cross_session_cache_read_tokens": 900,
+            })),
+            cache(serde_json::json!({
+                "cache_epoch": epoch,
+                "input_tokens": 1000,
+                "cache_read_tokens": 100,
+                "miss_reason": "provider_cache_miss",
+            })),
+            cache(serde_json::json!({
+                "cache_epoch": other_epoch,
+                "input_tokens": 500,
+                "cache_read_tokens": 0,
+                "miss_reason": "provider_cache_miss",
+            })),
+            cache(serde_json::json!({
+                "cache_epoch": third_epoch,
+                "input_tokens": 500,
+                "cache_read_tokens": 0,
+                "miss_reason": "provider_cache_miss",
+            })),
+        ];
+        let resets = vec![event(
+            "context.compaction.cache_reset",
+            serde_json::json!({
+                "reset_reason": "compaction",
+                "cache_epoch_before": other_epoch,
+                "cache_epoch_after": other_epoch,
+                "cache_epoch_changed": false,
+                "invalidated_tokens": 400,
+                "estimated_lost_cache_read_usd": 0.001,
+            }),
+        )];
+        let result = audit_cache_events("ses-1", None, None, &cache_events, &[], &resets, &[]);
+        let codes = codes(&result);
+        assert!(codes.contains(&"cache_epoch_churn"));
+        assert!(codes.contains(&"provider_cache_miss_pressure"));
+        assert!(codes.contains(&"cross_session_prefix_reuse"));
+        assert!(codes.contains(&"compaction_preserved_cache_epoch"));
+        let pressure = result
+            .findings
+            .iter()
+            .find(|finding| finding.code == "provider_cache_miss_pressure")
+            .unwrap();
+        assert_eq!(pressure.evidence["provider_cache_misses"].as_u64(), Some(3));
     }
 
     #[test]

@@ -9473,19 +9473,45 @@ fn derives_context_limits_from_the_configured_model_window() {
 
     config.context_window = 128_000;
     let (threshold_128k, hard_128k) = context_limits(&config, AgentRole::Leader);
-    assert!(threshold_128k > 80_000, "128k model threshold too low");
+    assert!(
+        threshold_128k > 110_000,
+        "128k model threshold must follow the 90% window policy"
+    );
     assert!(hard_128k > threshold_128k);
+    assert_ne!(
+        threshold_128k,
+        hard_128k.saturating_mul(3) / 4,
+        "the old 75% threshold is gone"
+    );
 
     config.context_window = 1_000_000;
     let (threshold_1m, hard_1m) = context_limits(&config, AgentRole::Leader);
-    assert!(threshold_1m > 700_000, "1M model threshold too low");
+    assert!(
+        threshold_1m > 890_000,
+        "1M DeepSeek window must not compact at 75%"
+    );
     assert!(hard_1m > threshold_1m);
+    assert_ne!(threshold_1m, 750_000);
 
     config.context_window = 8_000;
     config.max_tokens = Some(2_048);
     let (threshold_8k, hard_8k) = context_limits(&config, AgentRole::Leader);
-    assert!(threshold_8k < 4_000, "8k model threshold too high");
+    assert_eq!(
+        threshold_8k, hard_8k,
+        "a small window is bounded by the hard output reserve"
+    );
+    assert!(
+        threshold_8k > 4_000,
+        "8k threshold must not use the old 3k default"
+    );
     assert!(hard_8k < 5_000);
+
+    // An explicit override remains explicit and is only clamped to the hard
+    // limit; it never silently becomes the 90% default.
+    config.compact_after_tokens = 4_000;
+    let (override_threshold, hard_override) = context_limits(&config, AgentRole::Leader);
+    assert_eq!(override_threshold, 4_000);
+    assert_eq!(hard_override, hard_8k);
 
     config.context_window = 8_000;
     config.role_models.worker.context_window = Some(200_000);
@@ -9496,8 +9522,15 @@ fn derives_context_limits_from_the_configured_model_window() {
 
     config.context_window = 0;
     let (threshold_off, hard_off) = context_limits(&config, AgentRole::Leader);
-    assert_eq!(threshold_off, 0);
+    assert_eq!(
+        threshold_off, 4_000,
+        "an explicit override survives a disabled automatic window"
+    );
     assert_eq!(hard_off, u64::MAX);
+    config.compact_after_tokens = 0;
+    let (threshold_disabled, hard_disabled) = context_limits(&config, AgentRole::Leader);
+    assert_eq!(threshold_disabled, 0);
+    assert_eq!(hard_disabled, u64::MAX);
 }
 
 #[tokio::test]
@@ -21992,4 +22025,617 @@ fn v3_task_agents_receive_run_task_and_isolated_instruction_state() {
                 .any(|section| section.key == "run/task" && !section.tail)
         );
     });
+}
+
+async fn run_one_cached_leader(
+    _dir: &TempDir,
+    service: &AgentService,
+    engine: &Engine,
+    project_id: &str,
+    goal: &str,
+    prompt: &str,
+) -> vp_protocol::types::Session {
+    let session = engine
+        .create_session(project_id.to_string(), goal.to_string(), None)
+        .await
+        .unwrap();
+    service.start(&session.id, prompt).await.unwrap();
+    let _ = wait_until_idle(engine, &session).await;
+    session
+}
+
+fn cached_usage_provider(read: u32) -> Arc<dyn Provider> {
+    let response = vec![
+        StreamEvent::TextDelta("cached answer".into()),
+        StreamEvent::Usage {
+            input_tokens: 1_000,
+            output_tokens: 10,
+            cache_read_tokens: read,
+            cache_write_tokens: 0,
+        },
+        StreamEvent::Done,
+    ];
+    Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            response.clone(),
+            response.clone(),
+            response.clone(),
+            response.clone(),
+            response,
+        ])),
+    })
+}
+
+#[tokio::test]
+async fn cache_epoch_is_stable_across_prompt_and_session_goal_changes() {
+    let dir = TempDir::new().unwrap();
+    let provider = cached_usage_provider(900);
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let first = run_one_cached_leader(
+        &dir,
+        &service,
+        &engine,
+        &project.id,
+        "first goal",
+        "first prompt",
+    )
+    .await;
+    let second = run_one_cached_leader(
+        &dir,
+        &service,
+        &engine,
+        &project.id,
+        "second goal",
+        "second prompt",
+    )
+    .await;
+
+    let prefix = |session_id: String| {
+        let engine = engine.clone();
+        async move {
+            engine
+                .list_events(session_id, 0, 300)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|event| event.kind == "context.prompt_prefix")
+                .expect("prompt prefix")
+        }
+    };
+    let first_prefix = prefix(first.id).await;
+    let second_prefix = prefix(second.id).await;
+    assert_eq!(first_prefix.payload["cache_epoch_source"], "l4");
+    assert_ne!(
+        first_prefix.payload["prefix_hash"], second_prefix.payload["prefix_hash"],
+        "session context changes the full head prefix"
+    );
+    assert_eq!(
+        first_prefix.payload["cache_epoch"], second_prefix.payload["cache_epoch"],
+        "the shareable epoch excludes prompt/session/run/tail bytes"
+    );
+    assert_eq!(
+        first_prefix.payload["cache_epoch_model"],
+        second_prefix.payload["cache_epoch_model"]
+    );
+    assert_eq!(
+        first_prefix.payload["cache_epoch_tools_hash"],
+        second_prefix.payload["cache_epoch_tools_hash"]
+    );
+    assert!(
+        first_prefix.payload["cache_epoch_core_sections"]
+            .as_array()
+            .is_some_and(|sections| !sections.is_empty())
+    );
+    assert!(
+        first_prefix.payload["cache_epoch_project_sections"]
+            .as_array()
+            .is_some()
+    );
+    assert_eq!(first_prefix.payload["cache_epoch_change_reason"], "first");
+    assert_eq!(second_prefix.payload["cache_epoch_change_reason"], "first");
+}
+
+#[tokio::test]
+async fn new_session_reports_cross_session_reuse_from_provider_usage() {
+    let dir = TempDir::new().unwrap();
+    let provider = cached_usage_provider(900);
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let first = run_one_cached_leader(&dir, &service, &engine, &project.id, "one", "one").await;
+    let first_events = engine.list_events(first.id.clone(), 0, 300).await.unwrap();
+    let first_cache = first_events
+        .iter()
+        .find(|event| event.kind == "context.cache")
+        .expect("first cache event");
+    assert_eq!(first_cache.payload["cache_epoch_reused_from_sessions"], 0);
+    assert_eq!(first_cache.payload["cross_session_first_call"], true);
+    assert_eq!(first_cache.payload["cross_session_cache_read_tokens"], 0);
+
+    let second = run_one_cached_leader(&dir, &service, &engine, &project.id, "two", "two").await;
+    let second_events = engine.list_events(second.id.clone(), 0, 300).await.unwrap();
+    let second_cache = second_events
+        .iter()
+        .find(|event| event.kind == "context.cache")
+        .expect("second cache event");
+    assert_eq!(second_cache.payload["cache_epoch_reused_from_sessions"], 1);
+    assert_eq!(second_cache.payload["cross_session_first_call"], true);
+    assert_eq!(
+        second_cache.payload["cross_session_cache_read_tokens"], 900,
+        "provider-reported reads are the only reuse evidence"
+    );
+    assert_eq!(second_cache.payload["cache_epoch_session_count"], 2);
+    assert_eq!(second_cache.payload["miss_reason"], serde_json::Value::Null);
+
+    let status = engine.session_cache_status(&second.id).await.unwrap();
+    assert_eq!(status.prefix_reused_from_sessions, 1);
+    assert_eq!(status.cross_session_hit_tokens, 900);
+    assert_eq!(status.cross_session_first_calls, 1);
+    assert_eq!(status.cache_epoch_session_count, 2);
+    assert_eq!(status.cache_epoch_call_count, 2);
+    assert!(status.cache_epoch.is_some());
+    assert_eq!(status.cache_epoch_source.as_deref(), Some("l4"));
+
+    let report = engine
+        .session_cache_epoch(&second.id, Some(10))
+        .await
+        .unwrap();
+    assert_eq!(report.project_id, project.id);
+    assert_eq!(report.total_epochs, 1);
+    assert_eq!(report.epochs.len(), 1);
+    assert_eq!(report.epochs[0].session_count, 2);
+    assert_eq!(report.epochs[0].reused_from_sessions, 1);
+    assert_eq!(report.prefix_reused_from_sessions, 1);
+    assert_eq!(report.cross_session_hit_tokens, 900);
+    assert_eq!(
+        report.timeline.len(),
+        1,
+        "the timeline is scoped to this session"
+    );
+    assert!(report.timeline.iter().all(|entry| entry.kind == "prefix"));
+    assert_eq!(
+        report
+            .current_epoch
+            .as_ref()
+            .map(|row| row.cache_epoch.as_str()),
+        status.cache_epoch.as_deref()
+    );
+    // The epoch RPC is read-only and bounded.
+    let bounded = engine
+        .session_cache_epoch(&second.id, Some(1))
+        .await
+        .unwrap();
+    assert_eq!(bounded.timeline.len(), 1);
+    assert_eq!(bounded.epochs.len(), 1);
+    assert!(!bounded.timeline_truncated);
+}
+
+#[tokio::test]
+async fn existing_epoch_with_zero_provider_reads_is_a_provider_cache_miss() {
+    let dir = TempDir::new().unwrap();
+    let provider = cached_usage_provider(0);
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let first = run_one_cached_leader(&dir, &service, &engine, &project.id, "one", "one").await;
+    let first_events = engine.list_events(first.id.clone(), 0, 300).await.unwrap();
+    let first_cache = first_events
+        .iter()
+        .find(|event| event.kind == "context.cache")
+        .expect("first cache event");
+    assert_eq!(first_cache.payload["miss_reason"], "first_call");
+
+    let second = run_one_cached_leader(&dir, &service, &engine, &project.id, "two", "two").await;
+    let second_events = engine.list_events(second.id.clone(), 0, 300).await.unwrap();
+    let second_cache = second_events
+        .iter()
+        .find(|event| event.kind == "context.cache")
+        .expect("second cache event");
+    assert_eq!(second_cache.payload["miss_reason"], "provider_cache_miss");
+    assert_eq!(second_cache.payload["cross_session_first_call"], true);
+    assert_eq!(second_cache.payload["cross_session_cache_read_tokens"], 0);
+    let status = engine.session_cache_status(&second.id).await.unwrap();
+    assert_eq!(status.provider_cache_misses, 1);
+    assert_eq!(status.prefix_changes, 0);
+    assert_eq!(status.cross_session_hit_tokens, 0);
+}
+
+#[tokio::test]
+async fn compaction_records_epoch_reset_and_lost_cache_read_estimate() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::TextDelta("run".into()),
+                StreamEvent::Usage {
+                    input_tokens: 1_000,
+                    output_tokens: 10,
+                    cache_read_tokens: 900,
+                    cache_write_tokens: 0,
+                },
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("cache-aware summary".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    set_leader_prices(&service, 3.0, 15.0, 0.3, 3.75);
+    set_compaction(&service, 0, 3);
+    let session = run_one_cached_leader(&dir, &service, &engine, &project.id, "one", "one").await;
+    let before = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|event| event.kind == "context.prompt_prefix")
+        .expect("prompt prefix");
+    let epoch = before.payload["cache_epoch"].as_str().unwrap().to_string();
+
+    for index in 0..14 {
+        engine
+            .append_message(
+                &session.id,
+                if index % 2 == 0 { "user" } else { "assistant" },
+                &format!("message {index}: compaction cache epoch boundary {index}"),
+                serde_json::json!([]),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let result = service.compact_now(&session.id).await.unwrap();
+    assert!(result.compacted);
+    let summary = result.compaction.expect("summary");
+    assert_eq!(summary.cache_epoch_before.as_deref(), Some(epoch.as_str()));
+    assert_eq!(summary.cache_epoch_after.as_deref(), Some(epoch.as_str()));
+    assert!(!summary.cache_epoch_changed);
+    assert!(!summary.cache_reset_reason.is_none());
+    assert!(summary.estimated_lost_cache_read_usd >= 0.0);
+
+    let events = engine
+        .list_events(session.id.clone(), 0, 500)
+        .await
+        .unwrap();
+    let reset = events
+        .iter()
+        .find(|event| event.kind == "context.compaction.cache_reset")
+        .expect("cache reset event");
+    assert_eq!(reset.payload["reset_reason"], "compaction");
+    assert_eq!(reset.payload["cache_epoch_before"], epoch);
+    assert_eq!(reset.payload["cache_epoch_after"], epoch);
+    assert_eq!(reset.payload["cache_epoch_changed"], false);
+    assert!(reset.payload["invalidated_tokens"].as_u64().unwrap() > 0);
+    assert!(
+        reset.payload["estimated_lost_cache_read_usd"]
+            .as_f64()
+            .unwrap()
+            >= 0.0
+    );
+    assert!(
+        reset.payload.get("summary").is_none(),
+        "the reset event is bounded accounting, not a transcript"
+    );
+
+    let status = engine.session_cache_status(&session.id).await.unwrap();
+    assert_eq!(status.compaction_cache_resets, 1);
+    assert_eq!(status.compaction_resets, 1);
+    assert!(status.compaction_lost_cache_usd >= 0.0);
+    assert_eq!(status.cache_epoch.as_deref(), Some(epoch.as_str()));
+
+    let report = engine
+        .session_cache_epoch(&session.id, Some(50))
+        .await
+        .unwrap();
+    assert_eq!(report.compaction_resets, 1);
+    assert!(report.timeline.iter().any(|entry| {
+        entry.kind == "compaction_reset"
+            && entry.change_reason.as_deref() == Some("compaction")
+            && entry.compaction_count == Some(1)
+    }));
+    assert_eq!(
+        report
+            .current_epoch
+            .as_ref()
+            .map(|row| row.cache_epoch.as_str()),
+        Some(epoch.as_str()),
+        "compaction does not rewrite the shareable epoch"
+    );
+
+    // Compaction rewrites the active context only. Original messages remain
+    // stored for search/audit, and the epoch projection is untouched.
+    let stored = engine.list_messages(&session.id).await.unwrap();
+    assert!(
+        stored.iter().any(|message| {
+            message
+                .content
+                .contains("message 0: compaction cache epoch boundary")
+        }),
+        "pre-compaction history must remain stored"
+    );
+    let observations = engine
+        .store()
+        .list_prompt_prefix_observations(&project.id, &session.id)
+        .unwrap();
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].calls, 1);
+    assert_eq!(observations[0].cache_epoch, epoch);
+}
+
+#[tokio::test]
+async fn warm_records_its_own_usage_without_changing_the_epoch_or_observation() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::TextDelta("run".into()),
+                StreamEvent::Usage {
+                    input_tokens: 1_000,
+                    output_tokens: 10,
+                    cache_read_tokens: 900,
+                    cache_write_tokens: 0,
+                },
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("OK".into()),
+                StreamEvent::Usage {
+                    input_tokens: 700,
+                    output_tokens: 1,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 600,
+                },
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    set_leader_prices(&service, 3.0, 15.0, 0.3, 3.75);
+    let session = run_one_cached_leader(&dir, &service, &engine, &project.id, "one", "one").await;
+    let before = engine.session_cache_status(&session.id).await.unwrap();
+    let epoch = before.cache_epoch.clone().expect("epoch");
+    let calls = before.cache_epoch_call_count;
+    let warm = service.warm_cache_now(&session.id, None).await.unwrap();
+    assert!(warm.warmed);
+    assert_eq!(warm.cache_epoch.as_deref(), Some(epoch.as_str()));
+    assert!(warm.cache_epoch_unchanged);
+    assert!(warm.input_tokens > 0);
+    assert!(warm.cost_usd >= 0.0);
+    let after = engine.session_cache_status(&session.id).await.unwrap();
+    assert_eq!(after.cache_epoch.as_deref(), Some(epoch.as_str()));
+    assert_eq!(
+        after.cache_epoch_call_count, calls,
+        "warm calls are billed but are not epoch observations"
+    );
+    let events = engine
+        .list_events(session.id.clone(), 0, 500)
+        .await
+        .unwrap();
+    let warm_event = events
+        .iter()
+        .filter(|event| event.kind == "context.cache")
+        .find(|event| event.payload["warm"] == true)
+        .expect("warm cache event");
+    assert_eq!(warm_event.payload["cache_epoch"], epoch);
+    assert_eq!(warm_event.payload["cache_epoch_unchanged"], true);
+    assert_eq!(warm_event.payload["cross_session_cache_read_tokens"], 0);
+}
+
+#[tokio::test]
+async fn normal_run_makes_one_provider_call_and_never_warm_caches_implicitly() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::TextDelta("one call".into()),
+                StreamEvent::Usage {
+                    input_tokens: 1_000,
+                    output_tokens: 10,
+                    cache_read_tokens: 900,
+                    cache_write_tokens: 0,
+                },
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("unexpected second call".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = run_one_cached_leader(&dir, &service, &engine, &project.id, "one", "one").await;
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "a normal run must not warm or probe the provider"
+    );
+    let events = engine
+        .list_events(session.id.clone(), 0, 500)
+        .await
+        .unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "context.cache_warm"),
+        "warm is explicit/opt-in only"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| { event.kind == "context.cache" && event.payload["warm"] == true }),
+        "no implicit warm cache event"
+    );
+}
+
+#[tokio::test]
+async fn automatic_compaction_emits_one_cache_reset_and_preserves_the_epoch() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::TextDelta("automatic summary".into()),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("answer after automatic compaction".into()),
+                StreamEvent::Usage {
+                    input_tokens: 2_000,
+                    output_tokens: 10,
+                    cache_read_tokens: 1_500,
+                    cache_write_tokens: 0,
+                },
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    set_compaction(&service, 1, 3);
+    set_leader_prices(&service, 3.0, 15.0, 0.3, 3.75);
+    let session = engine
+        .create_session(project.id.clone(), "auto compaction".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    for index in 0..14 {
+        engine
+            .append_message(
+                &session.id,
+                if index % 2 == 0 { "user" } else { "assistant" },
+                &format!("automatic history {index}: enough detail to force a late boundary"),
+                serde_json::json!([]),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    service
+        .start(&session.id, "continue after history")
+        .await
+        .unwrap();
+    let _ = wait_until_idle(&engine, &session).await;
+
+    let events = engine
+        .list_events(session.id.clone(), 0, 600)
+        .await
+        .unwrap();
+    let prefix = events
+        .iter()
+        .find(|event| event.kind == "context.prompt_prefix")
+        .expect("prompt prefix");
+    let epoch = prefix.payload["cache_epoch"]
+        .as_str()
+        .expect("final epoch")
+        .to_string();
+    let resets = events
+        .iter()
+        .filter(|event| event.kind == "context.compaction.cache_reset")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        resets.len(),
+        1,
+        "one automatic boundary must produce one reset event"
+    );
+    assert_eq!(resets[0].payload["reset_reason"], "compaction");
+    assert_eq!(resets[0].payload["cache_epoch_before"], epoch);
+    assert_eq!(resets[0].payload["cache_epoch_after"], epoch);
+    assert_eq!(resets[0].payload["cache_epoch_changed"], false);
+    assert!(resets[0].payload["invalidated_tokens"].as_u64().unwrap() > 0);
+    assert!(events.iter().any(|event| event.kind == "agent.message"
+        && event.payload["text"] == "answer after automatic compaction"));
+    let stored = engine.list_messages(&session.id).await.unwrap();
+    assert!(
+        stored
+            .iter()
+            .any(|message| message.content.contains("automatic history 0")),
+        "automatic compaction must not delete stored history"
+    );
+    let status = engine.session_cache_status(&session.id).await.unwrap();
+    assert_eq!(status.cache_epoch.as_deref(), Some(epoch.as_str()));
+    assert_eq!(status.compaction_cache_resets, 1);
+    let report = engine
+        .session_cache_epoch(&session.id, Some(50))
+        .await
+        .unwrap();
+    assert_eq!(report.compaction_resets, 1);
+    assert!(
+        report
+            .timeline
+            .iter()
+            .any(|entry| entry.kind == "compaction_reset")
+    );
+}
+
+#[tokio::test]
+async fn model_switch_creates_a_second_project_epoch_and_names_the_change() {
+    let dir = TempDir::new().unwrap();
+    let provider = cached_usage_provider(900);
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let first = run_one_cached_leader(&dir, &service, &engine, &project.id, "one", "one").await;
+    let first_prefix = engine
+        .list_events(first.id.clone(), 0, 300)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|event| event.kind == "context.prompt_prefix")
+        .expect("first prefix");
+    let first_epoch = first_prefix.payload["cache_epoch"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    {
+        let mut config = service.config.read().unwrap().as_ref().unwrap().clone();
+        config.role_models.leader.model = Some("second-model".into());
+        *service.config.write().unwrap() = Some(config);
+    }
+    let second = run_one_cached_leader(&dir, &service, &engine, &project.id, "two", "two").await;
+    let second_prefix = engine
+        .list_events(second.id.clone(), 0, 300)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|event| event.kind == "context.prompt_prefix")
+        .expect("second prefix");
+    let second_epoch = second_prefix.payload["cache_epoch"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(first_epoch, second_epoch);
+    assert_eq!(second_prefix.payload["cache_epoch_model"], "second-model");
+    assert_eq!(
+        second_prefix.payload["cache_epoch_core_hash"],
+        first_prefix.payload["cache_epoch_core_hash"],
+        "the model switch does not rewrite the instruction bytes"
+    );
+
+    let cache = engine
+        .list_events(second.id.clone(), 0, 300)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|event| event.kind == "context.cache")
+        .expect("cache event");
+    assert_eq!(cache.payload["cache_epoch"], second_epoch);
+    assert_eq!(cache.payload["cache_epoch_reused_from_sessions"], 0);
+    let report = engine
+        .project_cache_epochs(&project.id, Some(10))
+        .await
+        .unwrap();
+    assert_eq!(report.total_epochs, 2);
+    assert_eq!(report.total_sessions, 2);
+    assert!(
+        report
+            .epochs
+            .iter()
+            .any(|epoch| epoch.cache_epoch == first_epoch)
+    );
+    assert!(
+        report
+            .epochs
+            .iter()
+            .any(|epoch| epoch.cache_epoch == second_epoch)
+    );
 }

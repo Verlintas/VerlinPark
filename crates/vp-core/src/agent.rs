@@ -8170,7 +8170,9 @@ impl AgentService {
             let tool_tokens = serde_json::to_string(&tools)
                 .map(|schema| estimate_context_tokens(&schema))
                 .unwrap_or(0);
-            let (threshold, hard_limit) = context_limits(&config, spec.role);
+            let compaction_policy = context_compaction_policy(&config, spec.role);
+            let (threshold, hard_limit) =
+                (compaction_policy.threshold, compaction_policy.hard_limit);
             let loaded = load_conversation(&self.engine, session_id).await?;
             let mut conversation = loaded.messages;
             let mut conversation_ids = loaded.ids;
@@ -8249,6 +8251,9 @@ impl AgentService {
                             "context_window": context_window,
                             "threshold_tokens": threshold,
                             "hard_limit_tokens": hard_limit,
+                            "threshold_source": compaction_policy.source(),
+                            "threshold_ratio_basis_points": compaction_policy.ratio_basis_points,
+                            "output_reserve_tokens": compaction_policy.output_reserve,
                             "messages": conversation.len(),
                             "calibration": calibration.factor,
                         }),
@@ -13888,6 +13893,10 @@ async fn warm_prompt_cache(
         spec.role.as_str(),
     );
     let hashes = sections.hashes(&model, tools);
+    let prompt_epoch = crate::cache_epoch::CacheEpoch::from_hashes(&model, &hashes);
+    let epoch_reuse = engine
+        .cache_epoch_reuse(&session.project_id, &prompt_epoch.hash, &session.id)
+        .await?;
     if !cache_config.enabled {
         return Ok(SessionCacheWarmResult {
             session_id: session.id.clone(),
@@ -13902,6 +13911,9 @@ async fn warm_prompt_cache(
             core_hash: Some(hashes.core_hash),
             project_hash: Some(hashes.project_hash),
             tools_hash: Some(hashes.tools_hash),
+            cache_epoch: Some(prompt_epoch.hash),
+            cache_epoch_unchanged: true,
+            cache_epoch_reused_from_sessions: epoch_reuse.prior_sessions,
             input_tokens: 0,
             output_tokens: 0,
             cache_read_tokens: 0,
@@ -14086,11 +14098,21 @@ async fn warm_prompt_cache(
         "warm": true,
         "warm_source": source,
         "model": model,
+        "cache_epoch_source": "l4",
+        "cache_epoch_unchanged": true,
+        "cache_epoch_reused_from_sessions": epoch_reuse.prior_sessions,
+        "cross_session_cache_read_tokens": 0,
+        "cross_session_first_call": false,
     });
     if let (Some(target), Some(fields)) = (warm_payload.as_object_mut(), warm_canonical.as_object())
     {
         for (key, value) in fields {
             target.insert(key.clone(), value.clone());
+        }
+    }
+    if let Some(object) = warm_payload.as_object_mut() {
+        for (key, value) in prompt_epoch.payload_fields() {
+            object.insert(key, value);
         }
     }
     if let Err(error) = emit(engine, &session.id, spec, "context.cache", warm_payload).await {
@@ -14109,6 +14131,9 @@ async fn warm_prompt_cache(
         core_hash: Some(hashes.core_hash),
         project_hash: Some(hashes.project_hash),
         tools_hash: Some(hashes.tools_hash),
+        cache_epoch: Some(prompt_epoch.hash.clone()),
+        cache_epoch_unchanged: true,
+        cache_epoch_reused_from_sessions: epoch_reuse.prior_sessions,
         input_tokens,
         output_tokens,
         cache_read_tokens: usage.cache_read,
@@ -14281,6 +14306,25 @@ async fn compact_context_if_needed(
         .unwrap_or_default();
     let cache_generation_before =
         crate::prompt_cache::conversation_generation(prefix_hash, conversation);
+    // The stable epoch is recorded, not recomputed: a mid-run compaction must
+    // not silently re-derive an identity from changed in-memory state. A
+    // manual compaction on a session with no prefix event records `None`
+    // rather than inventing an epoch.
+    let cache_epoch_before = engine
+        .recent_events_of_kind(&session.id, "context.prompt_prefix", 1)
+        .await?
+        .into_iter()
+        .last()
+        .and_then(|event| {
+            event
+                .payload
+                .get("cache_epoch")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| crate::cache_epoch::is_cache_epoch(value))
+                .map(str::to_string)
+        });
+    let cache_epoch_after = cache_epoch_before.clone();
+    let cache_epoch_recorded = cache_epoch_before.is_some();
     let conversation_tokens_before_cache = estimate_messages_tokens(conversation);
     let state = load_compaction_structured_state(engine, session, spec).await;
     let mut estimated = estimated_before;
@@ -14480,6 +14524,14 @@ async fn compact_context_if_needed(
     } else {
         0.0
     };
+    // L4 always accounts for the boundary, even when the legacy
+    // `compact_aware` switch is off. The estimate is zero when prices are not
+    // configured, and it is explicitly an estimate, not an invoice.
+    let invalidated_tokens_all =
+        conversation_tokens_before_cache.saturating_sub(estimate_messages_tokens(conversation));
+    let estimated_lost_cache_read_usd = crate::prompt_cache::round_usd(
+        invalidated_tokens_all as f64 * (prices.input - prices.cache_read).max(0.0) / 1_000_000.0,
+    );
     let compaction_count = engine
         .count_events_of_kind(&session.id, "context.compacted")
         .await?
@@ -14525,6 +14577,11 @@ async fn compact_context_if_needed(
         "cache_invalidation_tokens": cache_invalidation_tokens,
         "cache_invalidation_estimated_usd": cache_invalidation_estimated_usd,
         "cache_compact_aware": cache_policy.compact_aware,
+        "cache_epoch_before": cache_epoch_before.clone(),
+        "cache_epoch_after": cache_epoch_after.clone(),
+        "cache_epoch_changed": false,
+        "cache_epoch_source": if cache_epoch_recorded { "recorded" } else { "unavailable" },
+        "estimated_lost_cache_read_usd": estimated_lost_cache_read_usd,
     });
     agent_fields(&mut compaction_payload, spec);
     let checkpoint = ContextCheckpoint {
@@ -14586,6 +14643,42 @@ async fn compact_context_if_needed(
             "cache_invalidation_tokens": cache_invalidation_tokens,
             "cache_invalidation_estimated_usd": cache_invalidation_estimated_usd,
             "cache_compact_aware": cache_policy.compact_aware,
+            "cache_epoch_before": cache_epoch_before.clone(),
+            "cache_epoch_after": cache_epoch_after.clone(),
+            "cache_epoch_changed": false,
+            "cache_epoch_source": if cache_epoch_recorded { "recorded" } else { "unavailable" },
+            "estimated_lost_cache_read_usd": estimated_lost_cache_read_usd,
+            "invalidated_tokens": invalidated_tokens_all,
+        }),
+    )
+    .await?;
+    // Bounded L4 accounting event. It contains counts, epochs, and USD
+    // estimates only; the summary text stays on `context.compacted`.
+    emit(
+        engine,
+        &session.id,
+        spec,
+        "context.compaction.cache_reset",
+        serde_json::json!({
+            "mode": mode,
+            "compaction_count": compaction_count,
+            "cache_epoch_before": cache_epoch_before,
+            "cache_epoch_after": cache_epoch_after,
+            "cache_epoch_changed": false,
+            "cache_epoch_source": if cache_epoch_recorded { "recorded" } else { "unavailable" },
+            "cache_generation_before": cache_generation_before,
+            "cache_generation_after": cache_generation_after,
+            "reset_reason": "compaction",
+            "conversation_tokens_before": conversation_tokens_before_cache,
+            "conversation_tokens_after": estimate_messages_tokens(conversation),
+            "invalidated_tokens": invalidated_tokens_all,
+            "estimated_lost_cache_read_tokens": invalidated_tokens_all,
+            "estimated_lost_cache_read_usd": estimated_lost_cache_read_usd,
+            "accounting_enabled": cache_policy.compact_aware,
+            "compact_aware": cache_policy.compact_aware,
+            "threshold_tokens": compact_threshold,
+            "hard_limit_tokens": hard_limit,
+            "background_reuse": background_reuse,
         }),
     )
     .await?;
@@ -14894,7 +14987,9 @@ async fn run_loop_body(
     let tool_tokens = serde_json::to_string(&tools)
         .map(|schema| estimate_context_tokens(&schema))
         .unwrap_or(0);
-    let (context_threshold, context_hard_limit) = context_limits(config, spec.role);
+    let compaction_policy = context_compaction_policy(config, spec.role);
+    let (context_threshold, context_hard_limit) =
+        (compaction_policy.threshold, compaction_policy.hard_limit);
     if context_hard_limit != u64::MAX
         && system_tokens.saturating_add(tool_tokens) > context_hard_limit
     {
@@ -14921,70 +15016,100 @@ async fn run_loop_body(
     );
     let cache_config = crate::prompt_cache::prompt_cache_config(&cache_policy, spec.role.as_str());
     let provider_capabilities = config.provider.cache_capabilities();
+    // L4 finalizes the shareable epoch. It commits to the model, canonical
+    // tool hash, and ordered core/project section hashes. Session context, run
+    // task, prompt, memory, and tail bytes are deliberately excluded.
+    let prompt_epoch = crate::cache_epoch::CacheEpoch::from_hashes(&model_name, &prompt_hashes);
+    let previous_prefix_event = engine
+        .recent_events_of_kind(&session.id, "context.prompt_prefix", 1)
+        .await?
+        .into_iter()
+        .last();
+    let previous_epoch = previous_prefix_event
+        .as_ref()
+        .and_then(|event| crate::cache_epoch::CacheEpoch::from_event_payload(&event.payload));
+    let epoch_change_reason = crate::cache_epoch::epoch_change_reason(
+        previous_epoch.as_ref().map(|epoch| &epoch.identity),
+        &prompt_epoch.identity,
+    );
+    let epoch_reuse = engine
+        .cache_epoch_reuse(&project.id, &prompt_epoch.hash, &session.id)
+        .await?;
+    let mut prefix_payload = serde_json::json!({
+        "version": prompt_hashes.prompt_layout,
+        "prompt_layout": prompt_hashes.prompt_layout,
+        "prompt_layout_name": crate::instruction::prompt_layout_name(prompt_hashes.prompt_layout),
+        "instruction_state_id": crate::instruction::instruction_state_id(
+            &session.id,
+            &spec.id,
+            spec.role == AgentRole::Leader,
+        ),
+        "provider_tail_system": provider_capabilities.tail_system.accepts_system(),
+        "provider_wire": provider_capabilities.wire.as_str(),
+        "tail_system_capability": provider_capabilities.tail_system.as_str(),
+        "canonical_version": vp_providers::canonical::CANONICAL_VERSION,
+        "memory_anchor": memory_anchor,
+        "cache_break_events": crate::conversation::CACHE_BREAK_EVENT,
+        "model": model_name,
+        "tool_bundle": frozen_bundle.selection.kind.as_str(),
+        "tool_bundle_hash": frozen_bundle.bundle_hash,
+        "tool_bundle_reason": frozen_bundle.selection.reason,
+        "tool_bundle_fallback": frozen_bundle.selection.fallback,
+        "tool_bundle_tool_count": frozen_bundle.builtin_count(),
+        "tool_bundle_mcp_count": frozen_bundle.mcp_count(),
+        "tool_bundle_total_tool_count": frozen_bundle.tool_count(),
+        "tool_bundle_target_limit": frozen_bundle.target_limit,
+        "tool_bundle_within_target": frozen_bundle.within_target(),
+        "tool_bundle_omitted": &frozen_bundle.omitted,
+        "tool_bundle_warnings": frozen_bundle.warnings.iter().map(|warning| warning.payload()).collect::<Vec<_>>(),
+        "tool_bundle_frozen": true,
+        "stable_system_hash": prompt_hashes.stable_system_hash,
+        "stable_prefix_hash": prompt_hashes.stable_prefix_hash,
+        "core_hash": prompt_hashes.core_hash,
+        "project_hash": prompt_hashes.project_hash,
+        "tools_hash": prompt_hashes.tools_hash,
+        "volatile_hash": prompt_hashes.volatile_hash,
+        "prefix_hash": prefix_hash,
+        "cache_generation": prefix_hash,
+        // The finalized L4 epoch replaces the L1 placeholder. A compaction
+        // boundary later in the run records a conversation-cache reset; it
+        // does not rewrite this shareable instruction identity.
+        "cache_epoch_source": "l4",
+        "cache_epoch_placeholder": false,
+        "cache_epoch_previous": previous_epoch.as_ref().map(|epoch| epoch.hash.clone()),
+        "cache_epoch_changed": previous_epoch.as_ref().map(|epoch| epoch.hash.as_str()) != Some(prompt_epoch.hash.as_str()),
+        "cache_epoch_change_reason": epoch_change_reason.as_str(),
+        "cache_epoch_reused_from_sessions": epoch_reuse.prior_sessions,
+        "cache_epoch_session_seen_before": !epoch_reuse.first_session_call,
+        "cache_epoch_session_calls": epoch_reuse.session_calls,
+        "head_sections": prompt_hashes.head_sections,
+        "tail_sections": prompt_hashes.tail_sections,
+        "section_chars": prompt_hashes.section_chars,
+        "tool_count": tools.len(),
+        "core_chars": sections.core.chars().count(),
+        "project_chars": sections.project.chars().count(),
+        "volatile_chars": sections.volatile.chars().count(),
+        "stable_prefix_chars": stable_prefix.chars().count(),
+        "cache_policy": cache_policy,
+        "cache_plan": cache_plan.payload(),
+        // Heuristic estimate of the system-prompt and tool-schema preamble.
+        // This is the same estimate already used for context-limit checks,
+        // not provider-reported usage.
+        "preamble_tokens_estimate": system_tokens.saturating_add(tool_tokens),
+        "system_tokens_estimate": system_tokens,
+        "tool_tokens_estimate": tool_tokens,
+    });
+    if let Some(object) = prefix_payload.as_object_mut() {
+        for (key, value) in prompt_epoch.payload_fields() {
+            object.insert(key, value);
+        }
+    }
     emit(
         engine,
         &session.id,
         spec,
         "context.prompt_prefix",
-        serde_json::json!({
-            "version": prompt_hashes.prompt_layout,
-            "prompt_layout": prompt_hashes.prompt_layout,
-            "prompt_layout_name": crate::instruction::prompt_layout_name(prompt_hashes.prompt_layout),
-            "instruction_state_id": crate::instruction::instruction_state_id(
-                &session.id,
-                &spec.id,
-                spec.role == AgentRole::Leader,
-            ),
-            "provider_tail_system": provider_capabilities.tail_system.accepts_system(),
-            "provider_wire": provider_capabilities.wire.as_str(),
-            "tail_system_capability": provider_capabilities.tail_system.as_str(),
-            "canonical_version": vp_providers::canonical::CANONICAL_VERSION,
-            "memory_anchor": memory_anchor,
-            "cache_break_events": crate::conversation::CACHE_BREAK_EVENT,
-            "model": model_name,
-            "tool_bundle": frozen_bundle.selection.kind.as_str(),
-            "tool_bundle_hash": frozen_bundle.bundle_hash,
-            "tool_bundle_reason": frozen_bundle.selection.reason,
-            "tool_bundle_fallback": frozen_bundle.selection.fallback,
-            "tool_bundle_tool_count": frozen_bundle.builtin_count(),
-            "tool_bundle_mcp_count": frozen_bundle.mcp_count(),
-            "tool_bundle_total_tool_count": frozen_bundle.tool_count(),
-            "tool_bundle_target_limit": frozen_bundle.target_limit,
-            "tool_bundle_within_target": frozen_bundle.within_target(),
-            "tool_bundle_omitted": &frozen_bundle.omitted,
-            "tool_bundle_warnings": frozen_bundle.warnings.iter().map(|warning| warning.payload()).collect::<Vec<_>>(),
-            "tool_bundle_frozen": true,
-            "stable_system_hash": prompt_hashes.stable_system_hash,
-            "stable_prefix_hash": prompt_hashes.stable_prefix_hash,
-            "core_hash": prompt_hashes.core_hash,
-            "project_hash": prompt_hashes.project_hash,
-            "tools_hash": prompt_hashes.tools_hash,
-            "volatile_hash": prompt_hashes.volatile_hash,
-            "prefix_hash": prefix_hash,
-            "cache_generation": prefix_hash,
-            // L1 records a deterministic placeholder identity. L4 owns the
-            // finalized cache epoch (model + tool bundle + stable sections +
-            // compaction boundary).
-            "cache_epoch": prefix_hash,
-            "cache_epoch_source": "l1_placeholder",
-            "cache_epoch_placeholder": true,
-            "head_sections": prompt_hashes.head_sections,
-            "tail_sections": prompt_hashes.tail_sections,
-            "section_chars": prompt_hashes.section_chars,
-            "tool_count": tools.len(),
-            "core_chars": sections.core.chars().count(),
-            "project_chars": sections.project.chars().count(),
-            "volatile_chars": sections.volatile.chars().count(),
-            "stable_prefix_chars": stable_prefix.chars().count(),
-            "cache_policy": cache_policy,
-            "cache_plan": cache_plan.payload(),
-            // Heuristic estimate of the system-prompt and tool-schema preamble.
-            // This is the same estimate already used for context-limit checks,
-            // not provider-reported usage.
-            "preamble_tokens_estimate": system_tokens.saturating_add(tool_tokens),
-            "system_tokens_estimate": system_tokens,
-            "tool_tokens_estimate": tool_tokens,
-        }),
+        prefix_payload,
     )
     .await?;
     // Durable per-run manifest. It is separate from `context.prompt_prefix`
@@ -15129,6 +15254,11 @@ async fn run_loop_body(
     // Bounded in-run prepared-summary cache. It is discarded at run end and
     // never starts a second agent run.
     let mut compaction_runtime = CompactionRuntime::default();
+    // Number of prior provider observations for this session/epoch. The first
+    // call of a new session can attribute provider cache reads to another
+    // session; later calls would double-count the conversation prefix this
+    // session itself created.
+    let mut epoch_observed_calls = epoch_reuse.session_calls;
 
     for turn in 0..config.max_turns {
         // Provider-facing bytes retained for tool results in this assistant
@@ -15230,6 +15360,9 @@ async fn run_loop_body(
                         "context_window": context_window,
                         "threshold_tokens": context_threshold,
                         "hard_limit_tokens": context_hard_limit,
+                        "threshold_source": compaction_policy.source(),
+                        "threshold_ratio_basis_points": compaction_policy.ratio_basis_points,
+                        "output_reserve_tokens": compaction_policy.output_reserve,
                         "messages": conversation.len(),
                         "calibration": calibration.factor,
                     }),
@@ -15574,8 +15707,18 @@ async fn run_loop_body(
                 .await?;
             // Operational cache telemetry after settlement. No prompt text or
             // provider secrets; failures must not discard the accounting.
-            let fingerprint = prompt_hashes.fingerprint();
-            let miss_reason = cache_tracker.observe(&fingerprint, cache_read_tokens);
+            let fingerprint =
+                prompt_hashes.fingerprint_with_epoch_and_model(&prompt_epoch.hash, &model_name);
+            let first_session_call = epoch_observed_calls == 0;
+            let miss_reason = cache_tracker.observe_call(
+                &fingerprint,
+                crate::prompt_cache::CacheCallObservation {
+                    input_tokens,
+                    cache_read_tokens,
+                    first_session_call,
+                    prior_sessions: epoch_reuse.prior_sessions,
+                },
+            );
             let savings =
                 crate::prompt_cache::round_usd(crate::prompt_cache::estimated_cache_savings_usd(
                     input_tokens,
@@ -15626,6 +15769,8 @@ async fn run_loop_body(
                     "volatile_hash": prompt_hashes.volatile_hash,
                     "prompt_prefix_hash": prefix_hash,
                     "cache_generation": prefix_hash,
+                    "cache_epoch_source": "l4",
+                    "cross_session_first_call": first_session_call,
                     "estimated_savings_usd": savings,
                     "miss_reason": miss_reason.map(|reason| reason.as_str()),
                     "estimated": estimated,
@@ -15640,15 +15785,39 @@ async fn run_loop_body(
                         target.insert(key.clone(), value.clone());
                     }
                 }
+                if let Some(object) = payload.as_object_mut() {
+                    for (key, value) in prompt_epoch.payload_fields() {
+                        object.insert(key, value);
+                    }
+                }
+                agent_fields(&mut payload, spec);
                 if provider_cache_miss && let Some(object) = payload.as_object_mut() {
                     object.insert(
                         "cache_break_reason".into(),
                         serde_json::json!("provider_cache_miss"),
                     );
                 }
-                if let Err(error) = emit(engine, &session.id, spec, "context.cache", payload).await
+                let call = crate::PromptPrefixCall {
+                    project_id: project.id.clone(),
+                    cache_epoch: prompt_epoch.hash.clone(),
+                    session_id: session.id.clone(),
+                    model: model_name.clone(),
+                    tool_bundle: frozen_bundle.selection.kind.as_str().to_string(),
+                    tool_bundle_hash: frozen_bundle.bundle_hash.clone(),
+                    core_hash: prompt_epoch.identity.core_hash.clone(),
+                    project_hash: prompt_epoch.identity.project_hash.clone(),
+                    core_sections: prompt_epoch.identity.core_sections.clone(),
+                    project_sections: prompt_epoch.identity.project_sections.clone(),
+                    input_tokens,
+                    cache_read_tokens,
+                };
+                if let Err(error) = engine
+                    .append_cache_call_event(&session.id, "context.cache", payload, &call)
+                    .await
                 {
                     tracing::warn!(%error, "could not persist context cache telemetry");
+                } else {
+                    epoch_observed_calls = epoch_observed_calls.saturating_add(1);
                 }
                 if provider_cache_miss {
                     let miss_payload = crate::conversation::provider_miss_payload(
@@ -19897,29 +20066,24 @@ fn context_window_for(config: &AgentConfig, role: AgentRole) -> u64 {
 /// Derive the summarization threshold and the hard total-request limit from
 /// the model window and output reserve. The caller's estimate includes the
 /// system prompt and tool schemas, so they are not deducted a second time.
-/// The fixed 24k default is gone: a 1M-token model gets a ~75% window
-/// threshold while a local 8k model gets a much lower one.
+///
+/// L4 replaces the old 75%-of-hard-limit default with the cache-lossless
+/// window policy: 90% of the configured model window, bounded by the hard
+/// limit. A 1M-token DeepSeek window therefore compacts around 943k tokens,
+/// not around 786k, and not at a fixed 24k. `VERLINPARK_COMPACT_AFTER_TOKENS`
+/// remains an explicit override and is only clamped to the hard limit.
 fn context_limits(config: &AgentConfig, role: AgentRole) -> (u64, u64) {
+    let policy = context_compaction_policy(config, role);
+    (policy.threshold, policy.hard_limit)
+}
+
+fn context_compaction_policy(
+    config: &AgentConfig,
+    role: AgentRole,
+) -> crate::context::CompactionPolicy {
     let window = context_window_for(config, role);
-    if window == 0 {
-        return (config.compact_after_tokens, u64::MAX);
-    }
     let output = u64::from(config.max_tokens.unwrap_or(4096));
-    // `estimated` in the compaction path includes the system prompt and tool
-    // schemas. The hard limit is therefore the budget for the whole request,
-    // not a second deduction of those same tokens. Keep a small safety reserve
-    // for provider framing and a final assistant turn.
-    let safety = 1_024u64;
-    let hard_limit = window
-        .saturating_sub(output.saturating_add(safety))
-        .max(1024);
-    let threshold = if config.compact_after_tokens > 0 {
-        config.compact_after_tokens.min(hard_limit)
-    } else {
-        hard_limit.saturating_mul(3) / 4
-    }
-    .max(512);
-    (threshold, hard_limit)
+    crate::context::CompactionPolicy::derive(window, output, config.compact_after_tokens)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

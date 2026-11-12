@@ -15,23 +15,25 @@ use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
     AcpAgent, AcpAgentConfig, AcpTransport, AgentMessage, AgentRecord, Approval,
     ApprovalAuditEvent, ApprovalGrant, ApprovalTemplate, Artifact, ArtifactPolicy,
-    ArtifactProvenance, ArtifactVersion, AttentionPolicy, CachePolicy, CheckpointRetentionPolicy,
-    ContextCheckpoint, ContextCheckpointPolicy, ContinuationOutcome, CriticalPathPolicy, Event,
-    GuiActionInfo, GuiPolicy, InstructionBlob, IntakeTask, IntegrationPolicy, MailboxPolicy,
-    McpServer, McpServerConfig, McpTransport, MemoryConflict, MemoryEmbeddingJobStatus,
-    MemoryEmbeddingPolicy, MemoryEmbeddingUsage, MemoryEmbeddingsStatusResult, MemoryEvidence,
-    MemoryHealthResult, MemoryItem, MemoryPolicy, MemoryStatCount, MergeQueueEntry,
-    MergeQueueSource, MetricCount, ModelPreset, OrchestrationDecision, OrchestrationNote,
-    OrchestrationPolicy, OrchestrationRecovery, PlanTaskProgress, PreemptionPolicy,
-    PreemptionSessionSummary, ProcessPolicy, Program, ProgramEvent, ProgramMilestone,
-    ProgramMilestoneStatus, ProgramPolicy, ProgramStatus, ProgramUsage, Project, ProjectBudget,
-    ProjectUsageSession, Question, RunBudgetSnapshot, RunCheckpoint, RunStep, RunToolCall,
-    ScheduledTask, SearchHit, Session, SessionBundle, SessionContinuation, SessionInstructionState,
-    SessionRun, SessionRunPolicy, ShellPolicy, Skill, Source, SourceChunk, SourceCollection,
-    SourceEmbeddingIntegrity, SourceEmbeddingJobStatus, SourceEmbeddingPolicy,
-    SourceEmbeddingStatusResult, SourceEmbeddingUsage, SourceRetrievalPolicy, SourceSearchHit,
-    SourceStats, SteeringMessage, StoredMessage, SupervisedProcess, TaskSchedulerPolicy, TaskStall,
-    TeamPlan, TodoItem, ToolOutputAuditResult, ToolOutputPolicy, ToolOutputToolStat, UsageEntry,
+    ArtifactProvenance, ArtifactVersion, AttentionPolicy, CacheEpochBundleBucket,
+    CacheEpochReuseSession, CachePolicy, CheckpointRetentionPolicy, ContextCheckpoint,
+    ContextCheckpointPolicy, ContinuationOutcome, CriticalPathPolicy, Event, GuiActionInfo,
+    GuiPolicy, InstructionBlob, IntakeTask, IntegrationPolicy, MailboxPolicy, McpServer,
+    McpServerConfig, McpTransport, MemoryConflict, MemoryEmbeddingJobStatus, MemoryEmbeddingPolicy,
+    MemoryEmbeddingUsage, MemoryEmbeddingsStatusResult, MemoryEvidence, MemoryHealthResult,
+    MemoryItem, MemoryPolicy, MemoryStatCount, MergeQueueEntry, MergeQueueSource, MetricCount,
+    ModelPreset, OrchestrationDecision, OrchestrationNote, OrchestrationPolicy,
+    OrchestrationRecovery, PlanTaskProgress, PreemptionPolicy, PreemptionSessionSummary,
+    ProcessPolicy, Program, ProgramEvent, ProgramMilestone, ProgramMilestoneStatus, ProgramPolicy,
+    ProgramStatus, ProgramUsage, Project, ProjectBudget, ProjectUsageSession,
+    PromptPrefixAggregate, PromptPrefixObservation, PromptPrefixRecord, PromptSectionRef, Question,
+    RunBudgetSnapshot, RunCheckpoint, RunStep, RunToolCall, ScheduledTask, SearchHit, Session,
+    SessionBundle, SessionContinuation, SessionInstructionState, SessionRun, SessionRunPolicy,
+    ShellPolicy, Skill, Source, SourceChunk, SourceCollection, SourceEmbeddingIntegrity,
+    SourceEmbeddingJobStatus, SourceEmbeddingPolicy, SourceEmbeddingStatusResult,
+    SourceEmbeddingUsage, SourceRetrievalPolicy, SourceSearchHit, SourceStats, SteeringMessage,
+    StoredMessage, SupervisedProcess, TaskSchedulerPolicy, TaskStall, TeamPlan, TodoItem,
+    ToolOutputAuditResult, ToolOutputPolicy, ToolOutputToolStat, UsageEntry,
     WorktreeRetentionPolicy, WriteLease, cache_hit_ratio,
 };
 
@@ -915,11 +917,54 @@ pub struct SessionRepair {
     /// Event-backed supplemental remote-test evidence rows. `None` leaves the
     /// projection untouched; output bodies are not reconstructed.
     pub remote_test_evidence: Option<Vec<RemoteTestEvidence>>,
+    /// Event-backed per-session cache-epoch observations. Aggregate
+    /// `prompt_prefixes` rows are recomputed from observations after the
+    /// replacement; `None` leaves the projection untouched.
+    pub prompt_prefix_observations: Option<Vec<PromptPrefixObservation>>,
     /// Event-backed ordered instruction state rows. Blob text is rebuilt
     /// deterministically from the current generator only on the next run, not
     /// during replay repair.
     pub instructions: Option<Vec<SessionInstructionState>>,
     pub artifact_warnings: Vec<String>,
+}
+
+/// One provider call's contribution to a cache epoch. The store folds this
+/// into `prompt_prefix_observations` and recomputes the project aggregate in
+/// the same transaction as the `context.cache` event.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PromptPrefixCall {
+    pub project_id: String,
+    pub cache_epoch: String,
+    pub session_id: String,
+    pub model: String,
+    pub tool_bundle: String,
+    pub tool_bundle_hash: String,
+    pub core_hash: String,
+    pub project_hash: String,
+    pub core_sections: Vec<PromptSectionRef>,
+    pub project_sections: Vec<PromptSectionRef>,
+    pub input_tokens: u64,
+    pub cache_read_tokens: u64,
+}
+
+/// Project-wide epoch totals derived from observations. Distinct sessions are
+/// counted across epochs; call and token totals are summed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PromptPrefixTotals {
+    pub total_sessions: u64,
+    pub total_calls: u64,
+    pub observed_input_tokens: u64,
+    pub observed_cache_read_tokens: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PromptPrefixPruneOutcome {
+    pub cutoff: String,
+    pub removed_epochs: u64,
+    pub removed_observations: u64,
+    pub kept_epochs: u64,
+    pub remaining_epochs: u64,
+    pub protected_epochs: u64,
 }
 
 /// Result of one coalescing-aware approval creation.
@@ -1754,6 +1799,55 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_session_instruction_state_session
                 ON session_instruction_state(session_id);
+
+            -- Per-session provider observations of one stable cache epoch.
+            -- Epoch identity excludes session/run/prompt/memory/tail content,
+            -- so multiple sessions legitimately share a row per epoch.
+            CREATE TABLE IF NOT EXISTS prompt_prefix_observations (
+                project_id               TEXT NOT NULL,
+                cache_epoch              TEXT NOT NULL,
+                session_id               TEXT NOT NULL,
+                model                    TEXT NOT NULL,
+                tool_bundle              TEXT NOT NULL,
+                tool_bundle_hash         TEXT NOT NULL,
+                core_hash                TEXT NOT NULL,
+                project_hash             TEXT NOT NULL,
+                core_sections            TEXT NOT NULL,
+                project_sections         TEXT NOT NULL,
+                first_seen               TEXT NOT NULL,
+                last_seen                TEXT NOT NULL,
+                observed_input_tokens    INTEGER NOT NULL,
+                observed_cache_read_tokens INTEGER NOT NULL,
+                calls                    INTEGER NOT NULL,
+                PRIMARY KEY (project_id, cache_epoch, session_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_prompt_prefix_observations_session
+                ON prompt_prefix_observations(project_id, session_id);
+            CREATE INDEX IF NOT EXISTS idx_prompt_prefix_observations_epoch
+                ON prompt_prefix_observations(project_id, cache_epoch);
+
+            -- Aggregate projection rebuilt from prompt_prefix_observations.
+            -- It is never derived from a session's current configuration.
+            CREATE TABLE IF NOT EXISTS prompt_prefixes (
+                project_id               TEXT NOT NULL,
+                cache_epoch              TEXT NOT NULL,
+                model                    TEXT NOT NULL,
+                tool_bundle              TEXT NOT NULL,
+                tool_bundle_hash         TEXT NOT NULL,
+                core_hash                TEXT NOT NULL,
+                project_hash             TEXT NOT NULL,
+                core_sections            TEXT NOT NULL,
+                project_sections         TEXT NOT NULL,
+                first_seen               TEXT NOT NULL,
+                last_seen                TEXT NOT NULL,
+                observed_input_tokens    INTEGER NOT NULL,
+                observed_cache_read_tokens INTEGER NOT NULL,
+                session_count            INTEGER NOT NULL,
+                call_count               INTEGER NOT NULL,
+                PRIMARY KEY (project_id, cache_epoch)
+            );
+            CREATE INDEX IF NOT EXISTS idx_prompt_prefixes_last_seen
+                ON prompt_prefixes(project_id, last_seen);
 
             CREATE TABLE IF NOT EXISTS project_execution_hosts (
                 project_id      TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
@@ -4969,6 +5063,511 @@ impl Store {
             params![scope_id, key],
         )?;
         Ok(removed > 0)
+    }
+
+    /// Append a `context.cache` event and fold its provider observation into
+    /// the cache-epoch projection in one transaction.
+    ///
+    /// Cross-session fields are computed *before* the event payload is
+    /// persisted, so replay derives exactly the same observation from the
+    /// event stream. This is intentionally not a post-hoc projection update:
+    /// an event without its observation, or an observation without its event,
+    /// cannot survive a commit.
+    pub fn append_cache_call_event(
+        &self,
+        session_id: &str,
+        kind: &str,
+        mut payload: serde_json::Value,
+        call: &PromptPrefixCall,
+    ) -> Result<(Event, PromptPrefixRecord)> {
+        if kind != "context.cache" {
+            return Err(anyhow!(
+                "append_cache_call_event only accepts context.cache, got {kind}"
+            ));
+        }
+        if call.session_id != session_id {
+            return Err(anyhow!(
+                "cache observation session {} does not match event session {}",
+                call.session_id,
+                session_id
+            ));
+        }
+        if !cache_epoch_hex(&call.cache_epoch) {
+            return Err(anyhow!(
+                "cache epoch must be 64 lowercase hex characters: {}",
+                call.cache_epoch
+            ));
+        }
+        if call.input_tokens == 0 {
+            return Err(anyhow!(
+                "cache observation for {} has zero input tokens",
+                call.session_id
+            ));
+        }
+        let session = self
+            .get_session(session_id)?
+            .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+        if session.project_id != call.project_id {
+            return Err(anyhow!(
+                "cache observation project {} does not match session project {}",
+                call.project_id,
+                session.project_id
+            ));
+        }
+        let now = now_rfc3339();
+        let (event, record) = {
+            let mut conn = self.lock()?;
+            let tx = conn.transaction()?;
+            let record = record_prompt_prefix_call_tx(&tx, call, &now)?;
+            if let Some(object) = payload.as_object_mut() {
+                object.insert(
+                    "cache_epoch".into(),
+                    serde_json::json!(record.aggregate.cache_epoch),
+                );
+                object.insert(
+                    "cache_epoch_reused_from_sessions".into(),
+                    serde_json::json!(record.prior_sessions),
+                );
+                object.insert(
+                    "cache_epoch_session_count".into(),
+                    serde_json::json!(record.aggregate.session_count),
+                );
+                object.insert(
+                    "cache_epoch_call_count".into(),
+                    serde_json::json!(record.aggregate.call_count),
+                );
+                object.insert(
+                    "cross_session_first_call".into(),
+                    serde_json::json!(record.first_session_call),
+                );
+                object.insert(
+                    "cross_session_cache_read_tokens".into(),
+                    serde_json::json!(if record.first_session_call && record.prior_sessions > 0 {
+                        call.cache_read_tokens.min(call.input_tokens)
+                    } else {
+                        0
+                    }),
+                );
+            }
+            let event = insert_event_at_tx(&tx, session_id, kind, payload, &now)?;
+            tx.commit()?;
+            (event, record)
+        };
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok((event, record))
+    }
+
+    /// Record one provider call without an event. Used by tests and by
+    /// maintenance paths that already own the event transaction.
+    pub fn record_prompt_prefix_call(&self, call: &PromptPrefixCall) -> Result<PromptPrefixRecord> {
+        if !cache_epoch_hex(&call.cache_epoch) {
+            return Err(anyhow!(
+                "cache epoch must be 64 lowercase hex characters: {}",
+                call.cache_epoch
+            ));
+        }
+        if call.input_tokens == 0 {
+            return Err(anyhow!("cache observation has zero input tokens"));
+        }
+        let session = self
+            .get_session(&call.session_id)?
+            .ok_or_else(|| anyhow!("session not found: {}", call.session_id))?;
+        if session.project_id != call.project_id {
+            return Err(anyhow!(
+                "cache observation project {} does not match session project {}",
+                call.project_id,
+                session.project_id
+            ));
+        }
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let record = record_prompt_prefix_call_tx(&tx, call, &now)?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    pub fn prompt_prefix_aggregate(
+        &self,
+        project_id: &str,
+        cache_epoch: &str,
+    ) -> Result<Option<PromptPrefixAggregate>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT project_id, cache_epoch, model, tool_bundle, tool_bundle_hash,
+                    core_hash, project_hash, core_sections, project_sections,
+                    first_seen, last_seen, observed_input_tokens,
+                    observed_cache_read_tokens, session_count, call_count
+             FROM prompt_prefixes
+             WHERE project_id = ?1 AND cache_epoch = ?2",
+            params![project_id, cache_epoch],
+            map_prompt_prefix_aggregate,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn prompt_prefix_observation(
+        &self,
+        project_id: &str,
+        cache_epoch: &str,
+        session_id: &str,
+    ) -> Result<Option<PromptPrefixObservation>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT project_id, cache_epoch, session_id, model, tool_bundle,
+                    tool_bundle_hash, core_hash, project_hash, core_sections,
+                    project_sections, first_seen, last_seen,
+                    observed_input_tokens, observed_cache_read_tokens, calls
+             FROM prompt_prefix_observations
+             WHERE project_id = ?1 AND cache_epoch = ?2 AND session_id = ?3",
+            params![project_id, cache_epoch, session_id],
+            map_prompt_prefix_observation,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_prompt_prefix_observations(
+        &self,
+        project_id: &str,
+        session_id: &str,
+    ) -> Result<Vec<PromptPrefixObservation>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT project_id, cache_epoch, session_id, model, tool_bundle,
+                    tool_bundle_hash, core_hash, project_hash, core_sections,
+                    project_sections, first_seen, last_seen,
+                    observed_input_tokens, observed_cache_read_tokens, calls
+             FROM prompt_prefix_observations
+             WHERE project_id = ?1 AND session_id = ?2
+             ORDER BY cache_epoch ASC",
+        )?;
+        let rows = statement.query_map(
+            params![project_id, session_id],
+            map_prompt_prefix_observation,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Bounded project-wide epoch aggregates, newest last-seen first.
+    pub fn list_prompt_prefix_aggregates(
+        &self,
+        project_id: &str,
+        limit: u32,
+    ) -> Result<Vec<PromptPrefixAggregate>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT project_id, cache_epoch, model, tool_bundle, tool_bundle_hash,
+                    core_hash, project_hash, core_sections, project_sections,
+                    first_seen, last_seen, observed_input_tokens,
+                    observed_cache_read_tokens, session_count, call_count
+             FROM prompt_prefixes
+             WHERE project_id = ?1
+             ORDER BY last_seen DESC, cache_epoch ASC
+             LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            params![project_id, i64::from(limit.clamp(1, 1_000))],
+            map_prompt_prefix_aggregate,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn count_prompt_prefix_aggregates(&self, project_id: &str) -> Result<u64> {
+        let conn = self.lock()?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM prompt_prefixes WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as u64)
+    }
+
+    /// Bounded other sessions that observed one epoch. Titles come from the
+    /// session row; no message or prompt body is read.
+    pub fn list_prompt_prefix_reuse_sessions(
+        &self,
+        project_id: &str,
+        cache_epoch: &str,
+        exclude_session: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<CacheEpochReuseSession>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT o.session_id, COALESCE(s.goal, ''), o.first_seen, o.last_seen,
+                    o.calls, o.observed_input_tokens, o.observed_cache_read_tokens
+             FROM prompt_prefix_observations o
+             LEFT JOIN sessions s ON s.id = o.session_id
+             WHERE o.project_id = ?1 AND o.cache_epoch = ?2
+               AND (?3 IS NULL OR o.session_id != ?3)
+             ORDER BY o.last_seen DESC, o.session_id ASC
+             LIMIT ?4",
+        )?;
+        let rows = statement.query_map(
+            params![
+                project_id,
+                cache_epoch,
+                exclude_session,
+                i64::from(limit.clamp(1, 200))
+            ],
+            |row| {
+                let input: i64 = row.get(5)?;
+                let read: i64 = row.get(6)?;
+                Ok(CacheEpochReuseSession {
+                    session_id: row.get(0)?,
+                    title: row.get(1)?,
+                    first_seen: row.get(2)?,
+                    last_seen: row.get(3)?,
+                    calls: row.get::<_, i64>(4)?.max(0) as u64,
+                    observed_input_tokens: input.max(0) as u64,
+                    observed_cache_read_tokens: read.max(0) as u64,
+                    cache_hit_ratio: if input <= 0 {
+                        0.0
+                    } else {
+                        (read.max(0) as f64 / input as f64).clamp(0.0, 1.0)
+                    },
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Group observations by frozen tool bundle for a project report.
+    pub fn prompt_prefix_bundle_buckets(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<CacheEpochBundleBucket>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT tool_bundle,
+                    COUNT(DISTINCT cache_epoch),
+                    COUNT(DISTINCT session_id),
+                    COALESCE(SUM(calls), 0),
+                    COALESCE(SUM(observed_input_tokens), 0),
+                    COALESCE(SUM(observed_cache_read_tokens), 0)
+             FROM prompt_prefix_observations
+             WHERE project_id = ?1
+             GROUP BY tool_bundle
+             ORDER BY tool_bundle ASC",
+        )?;
+        let rows = statement.query_map(params![project_id], |row| {
+            let input: i64 = row.get(4)?;
+            let read: i64 = row.get(5)?;
+            Ok(CacheEpochBundleBucket {
+                tool_bundle: row.get(0)?,
+                epochs: row.get::<_, i64>(1)?.max(0) as u64,
+                sessions: row.get::<_, i64>(2)?.max(0) as u64,
+                calls: row.get::<_, i64>(3)?.max(0) as u64,
+                observed_input_tokens: input.max(0) as u64,
+                observed_cache_read_tokens: read.max(0) as u64,
+                cache_hit_ratio: if input <= 0 {
+                    0.0
+                } else {
+                    (read.max(0) as f64 / input as f64).clamp(0.0, 1.0)
+                },
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Prune old cache-epoch observations for one project.
+    ///
+    /// The newest `keep_epochs` epochs are retained, and an epoch with any
+    /// observation attached to an active session is protected even when it is
+    /// older than the cutoff. Deleting an observation only removes derived
+    /// telemetry; a later provider call recreates it with fresh bytes.
+    pub fn prune_prompt_prefixes(
+        &self,
+        project_id: &str,
+        cutoff: &str,
+        keep_epochs: u32,
+        dry_run: bool,
+    ) -> Result<PromptPrefixPruneOutcome> {
+        let keep_epochs = keep_epochs.clamp(1, 1_000);
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let keep = {
+            let mut statement = tx.prepare(
+                "SELECT cache_epoch FROM prompt_prefixes
+                 WHERE project_id = ?1
+                 ORDER BY last_seen DESC, cache_epoch ASC
+                 LIMIT ?2",
+            )?;
+            let rows = statement.query_map(params![project_id, i64::from(keep_epochs)], |row| {
+                row.get::<_, String>(0)
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let protected = {
+            let mut statement = tx.prepare(
+                "SELECT DISTINCT o.cache_epoch
+                 FROM prompt_prefix_observations o
+                 JOIN sessions s ON s.id = o.session_id
+                 WHERE o.project_id = ?1 AND o.last_seen < ?2
+                   AND s.status IN ('running', 'queued', 'paused', 'waiting_input')
+                 ORDER BY o.cache_epoch ASC",
+            )?;
+            let rows =
+                statement.query_map(params![project_id, cutoff], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let keep_set = keep
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let protected_set = protected
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let total_epochs: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM prompt_prefixes WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+        let candidates = {
+            let mut statement = tx.prepare(
+                "SELECT cache_epoch FROM prompt_prefixes
+                 WHERE project_id = ?1 AND last_seen < ?2
+                 ORDER BY last_seen ASC, cache_epoch ASC",
+            )?;
+            let rows =
+                statement.query_map(params![project_id, cutoff], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut removed_epochs = 0u64;
+        let mut removed_observations = 0u64;
+        for epoch in candidates {
+            if keep_set.contains(&epoch) || protected_set.contains(&epoch) {
+                continue;
+            }
+            let observations: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM prompt_prefix_observations
+                 WHERE project_id = ?1 AND cache_epoch = ?2",
+                params![project_id, epoch],
+                |row| row.get(0),
+            )?;
+            if !dry_run {
+                tx.execute(
+                    "DELETE FROM prompt_prefix_observations
+                     WHERE project_id = ?1 AND cache_epoch = ?2",
+                    params![project_id, epoch],
+                )?;
+                tx.execute(
+                    "DELETE FROM prompt_prefixes
+                     WHERE project_id = ?1 AND cache_epoch = ?2",
+                    params![project_id, epoch],
+                )?;
+            }
+            removed_epochs = removed_epochs.saturating_add(1);
+            removed_observations = removed_observations.saturating_add(observations.max(0) as u64);
+        }
+        tx.commit()?;
+        let total_epochs = total_epochs.max(0) as u64;
+        Ok(PromptPrefixPruneOutcome {
+            cutoff: cutoff.to_string(),
+            removed_epochs,
+            removed_observations,
+            kept_epochs: keep.len() as u64,
+            remaining_epochs: total_epochs.saturating_sub(removed_epochs),
+            protected_epochs: protected.len() as u64,
+        })
+    }
+
+    pub fn prompt_prefix_totals(&self, project_id: &str) -> Result<PromptPrefixTotals> {
+        let conn = self.lock()?;
+        let (sessions, calls, input, read): (i64, i64, i64, i64) = conn.query_row(
+            "SELECT COUNT(DISTINCT session_id), COALESCE(SUM(calls), 0),
+                    COALESCE(SUM(observed_input_tokens), 0),
+                    COALESCE(SUM(observed_cache_read_tokens), 0)
+             FROM prompt_prefix_observations
+             WHERE project_id = ?1",
+            params![project_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        Ok(PromptPrefixTotals {
+            total_sessions: sessions.max(0) as u64,
+            total_calls: calls.max(0) as u64,
+            observed_input_tokens: input.max(0) as u64,
+            observed_cache_read_tokens: read.max(0) as u64,
+        })
+    }
+
+    /// Replace one session's observations and recompute every aggregate row
+    /// for the project from the observation table. Used by replay repair and
+    /// database rebuild; rows for other sessions are preserved.
+    pub fn replace_prompt_prefix_observations(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        rows: &[PromptPrefixObservation],
+    ) -> Result<usize> {
+        for row in rows {
+            if row.project_id != project_id || row.session_id != session_id {
+                return Err(anyhow!(
+                    "prompt-prefix observation {}:{} does not belong to {project_id}:{session_id}",
+                    row.project_id,
+                    row.session_id
+                ));
+            }
+            if !cache_epoch_hex(&row.cache_epoch) {
+                return Err(anyhow!(
+                    "prompt-prefix observation has an invalid cache epoch"
+                ));
+            }
+        }
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        replace_prompt_prefix_observations_tx(&tx, project_id, session_id, rows)?;
+        tx.commit()?;
+        Ok(rows.len())
+    }
+
+    /// Recompute every aggregate row for a project from observations. This is
+    /// the idempotent repair primitive; it never reads session configuration.
+    pub fn recompute_prompt_prefix_aggregates(&self, project_id: &str) -> Result<usize> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let count = rebuild_prompt_prefix_aggregates_tx(&tx, project_id)?;
+        tx.commit()?;
+        Ok(count)
+    }
+
+    /// Epochs whose aggregate row does not match the observation table.
+    /// Missing aggregates count as inconsistent when observations exist.
+    pub fn prompt_prefix_inconsistent_epochs(
+        &self,
+        project_id: &str,
+        epochs: &[String],
+    ) -> Result<Vec<String>> {
+        let conn = self.lock()?;
+        let mut inconsistent = Vec::new();
+        for epoch in epochs {
+            let computed = computed_prompt_prefix_aggregate(&conn, project_id, epoch)?;
+            let stored = conn
+                .query_row(
+                    "SELECT project_id, cache_epoch, model, tool_bundle, tool_bundle_hash,
+                            core_hash, project_hash, core_sections, project_sections,
+                            first_seen, last_seen, observed_input_tokens,
+                            observed_cache_read_tokens, session_count, call_count
+                     FROM prompt_prefixes
+                     WHERE project_id = ?1 AND cache_epoch = ?2",
+                    params![project_id, epoch],
+                    map_prompt_prefix_aggregate,
+                )
+                .optional()?;
+            let matches = match (stored, computed) {
+                (Some(stored), Some(computed)) => prompt_prefix_aggregate_equal(&stored, &computed),
+                (None, None) => true,
+                _ => false,
+            };
+            if !matches {
+                inconsistent.push(epoch.clone());
+            }
+        }
+        Ok(inconsistent)
     }
 
     pub fn get_execution_host(&self, project_id: &str) -> Result<ExecutionHost> {
@@ -23975,6 +24574,14 @@ impl Store {
                 insert_test_result_tx(&tx, entry, "{}")?;
             }
         }
+        if let Some(observations) = &repair.prompt_prefix_observations {
+            let project_id: String = tx.query_row(
+                "SELECT project_id FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )?;
+            replace_prompt_prefix_observations_tx(&tx, &project_id, session_id, observations)?;
+        }
         if let Some(instructions) = &repair.instructions {
             tx.execute(
                 "DELETE FROM session_instruction_state
@@ -24017,6 +24624,22 @@ impl Store {
 
     pub fn import_session_bundle(&self, bundle: &SessionBundle) -> Result<Event> {
         validate_session_bundle(bundle)?;
+        for row in &bundle.prompt_prefix_observations {
+            if row.project_id != bundle.project.id || row.session_id != bundle.session.id {
+                return Err(anyhow!(
+                    "bundle prompt-prefix observation {}:{} does not belong to {}/{}",
+                    row.project_id,
+                    row.session_id,
+                    bundle.project.id,
+                    bundle.session.id
+                ));
+            }
+            if !cache_epoch_hex(&row.cache_epoch) {
+                return Err(anyhow!(
+                    "bundle prompt-prefix observation has an invalid cache epoch"
+                ));
+            }
+        }
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
 
@@ -24161,6 +24784,12 @@ impl Store {
                 ));
             }
         }
+        replace_prompt_prefix_observations_tx(
+            &tx,
+            &bundle.project.id,
+            &bundle.session.id,
+            &bundle.prompt_prefix_observations,
+        )?;
         for agent in &bundle.agents {
             tx.execute(
                 "INSERT INTO agents
@@ -26369,13 +26998,26 @@ fn insert_event_tx(
     kind: &str,
     payload: serde_json::Value,
 ) -> Result<Event> {
+    insert_event_at_tx(tx, session_id, kind, payload, &now_rfc3339())
+}
+
+/// Insert an event with an explicit timestamp. Callers that must keep an
+/// event and a projection timestamp byte-identical (cache epochs) generate the
+/// timestamp once.
+fn insert_event_at_tx(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    kind: &str,
+    payload: serde_json::Value,
+    created_at: &str,
+) -> Result<Event> {
     let seq = next_event_seq_tx(tx, session_id)?;
     let event = Event {
         session_id: session_id.to_string(),
         seq,
         kind: kind.to_string(),
         payload,
-        created_at: now_rfc3339(),
+        created_at: created_at.to_string(),
     };
     tx.execute(
         "INSERT INTO events (session_id, seq, type, payload, created_at)
@@ -26389,6 +27031,361 @@ fn insert_event_tx(
         ],
     )?;
     Ok(event)
+}
+
+fn cache_epoch_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn prompt_prefix_aggregate_equal(
+    left: &PromptPrefixAggregate,
+    right: &PromptPrefixAggregate,
+) -> bool {
+    left.project_id == right.project_id
+        && left.cache_epoch == right.cache_epoch
+        && left.model == right.model
+        && left.tool_bundle == right.tool_bundle
+        && left.tool_bundle_hash == right.tool_bundle_hash
+        && left.core_hash == right.core_hash
+        && left.project_hash == right.project_hash
+        && left.core_sections == right.core_sections
+        && left.project_sections == right.project_sections
+        && left.first_seen == right.first_seen
+        && left.last_seen == right.last_seen
+        && left.observed_input_tokens == right.observed_input_tokens
+        && left.observed_cache_read_tokens == right.observed_cache_read_tokens
+        && left.session_count == right.session_count
+        && left.call_count == right.call_count
+}
+
+fn map_prompt_prefix_observation(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<PromptPrefixObservation> {
+    let core_sections: String = row.get(8)?;
+    let project_sections: String = row.get(9)?;
+    Ok(PromptPrefixObservation {
+        project_id: row.get(0)?,
+        cache_epoch: row.get(1)?,
+        session_id: row.get(2)?,
+        model: row.get(3)?,
+        tool_bundle: row.get(4)?,
+        tool_bundle_hash: row.get(5)?,
+        core_hash: row.get(6)?,
+        project_hash: row.get(7)?,
+        core_sections: serde_json::from_str(&core_sections).unwrap_or_default(),
+        project_sections: serde_json::from_str(&project_sections).unwrap_or_default(),
+        first_seen: row.get(10)?,
+        last_seen: row.get(11)?,
+        observed_input_tokens: row.get::<_, i64>(12)?.max(0) as u64,
+        observed_cache_read_tokens: row.get::<_, i64>(13)?.max(0) as u64,
+        calls: row.get::<_, i64>(14)?.max(0) as u64,
+    })
+}
+
+fn map_prompt_prefix_aggregate(row: &rusqlite::Row<'_>) -> rusqlite::Result<PromptPrefixAggregate> {
+    let core_sections: String = row.get(7)?;
+    let project_sections: String = row.get(8)?;
+    Ok(PromptPrefixAggregate {
+        project_id: row.get(0)?,
+        cache_epoch: row.get(1)?,
+        model: row.get(2)?,
+        tool_bundle: row.get(3)?,
+        tool_bundle_hash: row.get(4)?,
+        core_hash: row.get(5)?,
+        project_hash: row.get(6)?,
+        core_sections: serde_json::from_str(&core_sections).unwrap_or_default(),
+        project_sections: serde_json::from_str(&project_sections).unwrap_or_default(),
+        first_seen: row.get(9)?,
+        last_seen: row.get(10)?,
+        observed_input_tokens: row.get::<_, i64>(11)?.max(0) as u64,
+        observed_cache_read_tokens: row.get::<_, i64>(12)?.max(0) as u64,
+        session_count: row.get::<_, i64>(13)?.max(0) as u64,
+        call_count: row.get::<_, i64>(14)?.max(0) as u64,
+    })
+}
+
+fn record_prompt_prefix_call_tx(
+    tx: &Transaction<'_>,
+    call: &PromptPrefixCall,
+    at: &str,
+) -> Result<PromptPrefixRecord> {
+    let existing_calls: Option<i64> = tx
+        .query_row(
+            "SELECT calls FROM prompt_prefix_observations
+             WHERE project_id = ?1 AND cache_epoch = ?2 AND session_id = ?3",
+            params![call.project_id, call.cache_epoch, call.session_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let prior_sessions: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM prompt_prefix_observations
+         WHERE project_id = ?1 AND cache_epoch = ?2 AND session_id != ?3",
+        params![call.project_id, call.cache_epoch, call.session_id],
+        |row| row.get(0),
+    )?;
+    let core_sections = serde_json::to_string(&call.core_sections)?;
+    let project_sections = serde_json::to_string(&call.project_sections)?;
+    let input = i64::try_from(call.input_tokens).unwrap_or(i64::MAX);
+    let read = i64::try_from(call.cache_read_tokens.min(call.input_tokens)).unwrap_or(i64::MAX);
+    tx.execute(
+        "INSERT INTO prompt_prefix_observations
+         (project_id, cache_epoch, session_id, model, tool_bundle, tool_bundle_hash,
+          core_hash, project_hash, core_sections, project_sections,
+          first_seen, last_seen, observed_input_tokens,
+          observed_cache_read_tokens, calls)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?12, ?13, 1)
+         ON CONFLICT(project_id, cache_epoch, session_id) DO UPDATE SET
+            model = excluded.model,
+            tool_bundle = excluded.tool_bundle,
+            tool_bundle_hash = excluded.tool_bundle_hash,
+            core_hash = excluded.core_hash,
+            project_hash = excluded.project_hash,
+            core_sections = excluded.core_sections,
+            project_sections = excluded.project_sections,
+            first_seen = MIN(prompt_prefix_observations.first_seen, excluded.first_seen),
+            last_seen = MAX(prompt_prefix_observations.last_seen, excluded.last_seen),
+            observed_input_tokens =
+                prompt_prefix_observations.observed_input_tokens + excluded.observed_input_tokens,
+            observed_cache_read_tokens =
+                prompt_prefix_observations.observed_cache_read_tokens
+                + excluded.observed_cache_read_tokens,
+            calls = prompt_prefix_observations.calls + 1",
+        params![
+            call.project_id,
+            call.cache_epoch,
+            call.session_id,
+            call.model,
+            call.tool_bundle,
+            call.tool_bundle_hash,
+            call.core_hash,
+            call.project_hash,
+            core_sections,
+            project_sections,
+            at,
+            input,
+            read
+        ],
+    )?;
+    let aggregate = recompute_prompt_prefix_aggregate_tx(tx, &call.project_id, &call.cache_epoch)?;
+    Ok(PromptPrefixRecord {
+        first_session_call: existing_calls.unwrap_or(0) == 0,
+        prior_sessions: prior_sessions.max(0) as u64,
+        aggregate,
+    })
+}
+
+struct PromptPrefixAggregateMetadata {
+    model: String,
+    tool_bundle: String,
+    tool_bundle_hash: String,
+    core_hash: String,
+    project_hash: String,
+    core_sections: String,
+    project_sections: String,
+}
+
+fn computed_prompt_prefix_aggregate(
+    conn: &Connection,
+    project_id: &str,
+    cache_epoch: &str,
+) -> Result<Option<PromptPrefixAggregate>> {
+    let metadata: Option<PromptPrefixAggregateMetadata> = conn
+        .query_row(
+            "SELECT model, tool_bundle, tool_bundle_hash, core_hash, project_hash,
+                    core_sections, project_sections
+             FROM prompt_prefix_observations
+             WHERE project_id = ?1 AND cache_epoch = ?2
+             ORDER BY last_seen DESC, session_id ASC
+             LIMIT 1",
+            params![project_id, cache_epoch],
+            |row| {
+                Ok(PromptPrefixAggregateMetadata {
+                    model: row.get(0)?,
+                    tool_bundle: row.get(1)?,
+                    tool_bundle_hash: row.get(2)?,
+                    core_hash: row.get(3)?,
+                    project_hash: row.get(4)?,
+                    core_sections: row.get(5)?,
+                    project_sections: row.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(PromptPrefixAggregateMetadata {
+        model,
+        tool_bundle,
+        tool_bundle_hash,
+        core_hash,
+        project_hash,
+        core_sections,
+        project_sections,
+    }) = metadata
+    else {
+        return Ok(None);
+    };
+    let (first_seen, last_seen, input, read, sessions, calls): (
+        String,
+        String,
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = conn.query_row(
+        "SELECT MIN(first_seen), MAX(last_seen),
+                COALESCE(SUM(observed_input_tokens), 0),
+                COALESCE(SUM(observed_cache_read_tokens), 0),
+                COUNT(*), COALESCE(SUM(calls), 0)
+         FROM prompt_prefix_observations
+         WHERE project_id = ?1 AND cache_epoch = ?2",
+        params![project_id, cache_epoch],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        },
+    )?;
+    Ok(Some(PromptPrefixAggregate {
+        project_id: project_id.to_string(),
+        cache_epoch: cache_epoch.to_string(),
+        model,
+        tool_bundle,
+        tool_bundle_hash,
+        core_hash,
+        project_hash,
+        core_sections: serde_json::from_str(&core_sections).unwrap_or_default(),
+        project_sections: serde_json::from_str(&project_sections).unwrap_or_default(),
+        first_seen,
+        last_seen,
+        observed_input_tokens: input.max(0) as u64,
+        observed_cache_read_tokens: read.max(0) as u64,
+        session_count: sessions.max(0) as u64,
+        call_count: calls.max(0) as u64,
+    }))
+}
+
+fn recompute_prompt_prefix_aggregate_tx(
+    tx: &Transaction<'_>,
+    project_id: &str,
+    cache_epoch: &str,
+) -> Result<PromptPrefixAggregate> {
+    let Some(aggregate) = computed_prompt_prefix_aggregate(tx, project_id, cache_epoch)? else {
+        tx.execute(
+            "DELETE FROM prompt_prefixes WHERE project_id = ?1 AND cache_epoch = ?2",
+            params![project_id, cache_epoch],
+        )?;
+        return Ok(PromptPrefixAggregate::default());
+    };
+    tx.execute(
+        "INSERT INTO prompt_prefixes
+         (project_id, cache_epoch, model, tool_bundle, tool_bundle_hash, core_hash,
+          project_hash, core_sections, project_sections, first_seen, last_seen,
+          observed_input_tokens, observed_cache_read_tokens, session_count, call_count)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+         ON CONFLICT(project_id, cache_epoch) DO UPDATE SET
+            model = excluded.model,
+            tool_bundle = excluded.tool_bundle,
+            tool_bundle_hash = excluded.tool_bundle_hash,
+            core_hash = excluded.core_hash,
+            project_hash = excluded.project_hash,
+            core_sections = excluded.core_sections,
+            project_sections = excluded.project_sections,
+            first_seen = excluded.first_seen,
+            last_seen = excluded.last_seen,
+            observed_input_tokens = excluded.observed_input_tokens,
+            observed_cache_read_tokens = excluded.observed_cache_read_tokens,
+            session_count = excluded.session_count,
+            call_count = excluded.call_count",
+        params![
+            aggregate.project_id,
+            aggregate.cache_epoch,
+            aggregate.model,
+            aggregate.tool_bundle,
+            aggregate.tool_bundle_hash,
+            aggregate.core_hash,
+            aggregate.project_hash,
+            serde_json::to_string(&aggregate.core_sections)?,
+            serde_json::to_string(&aggregate.project_sections)?,
+            aggregate.first_seen,
+            aggregate.last_seen,
+            i64::try_from(aggregate.observed_input_tokens).unwrap_or(i64::MAX),
+            i64::try_from(aggregate.observed_cache_read_tokens).unwrap_or(i64::MAX),
+            i64::try_from(aggregate.session_count).unwrap_or(i64::MAX),
+            i64::try_from(aggregate.call_count).unwrap_or(i64::MAX)
+        ],
+    )?;
+    Ok(aggregate)
+}
+
+fn rebuild_prompt_prefix_aggregates_tx(tx: &Transaction<'_>, project_id: &str) -> Result<usize> {
+    let epochs = {
+        let mut statement = tx.prepare(
+            "SELECT DISTINCT cache_epoch FROM prompt_prefix_observations
+             WHERE project_id = ?1 ORDER BY cache_epoch ASC",
+        )?;
+        let rows = statement.query_map(params![project_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    tx.execute(
+        "DELETE FROM prompt_prefixes WHERE project_id = ?1",
+        params![project_id],
+    )?;
+    let mut rebuilt = 0usize;
+    for epoch in epochs {
+        let aggregate = recompute_prompt_prefix_aggregate_tx(tx, project_id, &epoch)?;
+        if !aggregate.cache_epoch.is_empty() {
+            rebuilt += 1;
+        }
+    }
+    Ok(rebuilt)
+}
+
+fn replace_prompt_prefix_observations_tx(
+    tx: &Transaction<'_>,
+    project_id: &str,
+    session_id: &str,
+    rows: &[PromptPrefixObservation],
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM prompt_prefix_observations WHERE project_id = ?1 AND session_id = ?2",
+        params![project_id, session_id],
+    )?;
+    for row in rows {
+        tx.execute(
+            "INSERT INTO prompt_prefix_observations
+             (project_id, cache_epoch, session_id, model, tool_bundle, tool_bundle_hash,
+              core_hash, project_hash, core_sections, project_sections,
+              first_seen, last_seen, observed_input_tokens,
+              observed_cache_read_tokens, calls)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                row.project_id,
+                row.cache_epoch,
+                row.session_id,
+                row.model,
+                row.tool_bundle,
+                row.tool_bundle_hash,
+                row.core_hash,
+                row.project_hash,
+                serde_json::to_string(&row.core_sections)?,
+                serde_json::to_string(&row.project_sections)?,
+                row.first_seen,
+                row.last_seen,
+                i64::try_from(row.observed_input_tokens).unwrap_or(i64::MAX),
+                i64::try_from(row.observed_cache_read_tokens).unwrap_or(i64::MAX),
+                i64::try_from(row.calls).unwrap_or(i64::MAX)
+            ],
+        )?;
+    }
+    rebuild_prompt_prefix_aggregates_tx(tx, project_id)?;
+    Ok(())
 }
 
 fn map_remote_bootstrap_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RemoteBootstrapRecord> {

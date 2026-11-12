@@ -33,6 +33,109 @@ pub const CONTEXT_CHECKPOINT_CREATED_EVENT: &str = "context.checkpointed";
 pub const CONTEXT_CHECKPOINT_DELETED_EVENT: &str = "context.checkpoint.deleted";
 pub const CONTEXT_RESTORED_EVENT: &str = "context.restored";
 
+/// Default fraction of a model window used as the compaction threshold. The
+/// cache-lossless plan deliberately compacts late: a 1M-token DeepSeek window
+/// keeps roughly 900k tokens of append-only conversation before a boundary.
+pub const DEFAULT_COMPACTION_WINDOW_RATIO_BASIS_POINTS: u32 = 9_000;
+pub const MIN_COMPACTION_THRESHOLD_TOKENS: u64 = 512;
+/// Provider framing and the final assistant turn need headroom even when the
+/// configured output budget is small. This is a fixed safety reserve, not a
+/// second deduction of the system/tool estimate.
+pub const CONTEXT_FRAMING_SAFETY_TOKENS: u64 = 1_024;
+
+/// Deterministic context-limit policy for one role/model window.
+///
+/// The threshold is `min(90% of the window, hard_limit)`:
+///
+/// - `hard_limit = window - output_reserve - framing_safety`;
+/// - an explicit `compact_after_tokens` override still wins, but is clamped to
+///   the hard limit so it cannot make a request impossible;
+/// - `window == 0` disables automatic management and leaves the explicit
+///   override untouched.
+///
+/// Compaction is still evaluated only when the *next* request is assembled.
+/// Nothing here compacts because a session is old, and nothing shortens a
+/// stable instruction prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionPolicy {
+    pub window: u64,
+    pub output_reserve: u64,
+    pub framing_safety: u64,
+    pub hard_limit: u64,
+    pub threshold: u64,
+    pub override_tokens: u64,
+    pub ratio_basis_points: u32,
+}
+
+impl CompactionPolicy {
+    pub fn derive(window: u64, output_reserve: u64, override_tokens: u64) -> Self {
+        let output_reserve = output_reserve.max(1);
+        let framing = CONTEXT_FRAMING_SAFETY_TOKENS;
+        if window == 0 {
+            return Self {
+                window,
+                output_reserve,
+                framing_safety: framing,
+                hard_limit: u64::MAX,
+                threshold: override_tokens,
+                override_tokens,
+                ratio_basis_points: 0,
+            };
+        }
+        let hard_limit = window
+            .saturating_sub(output_reserve.saturating_add(framing))
+            .max(1_024);
+        let ratio_threshold =
+            window.saturating_mul(u64::from(DEFAULT_COMPACTION_WINDOW_RATIO_BASIS_POINTS)) / 10_000;
+        let threshold = if override_tokens > 0 {
+            // An explicit operator override is intentional and may be tiny in
+            // tests or for a deliberately aggressive local setup. Only clamp
+            // it to the hard limit and to a non-zero value.
+            override_tokens.min(hard_limit).max(1)
+        } else {
+            ratio_threshold
+                .max(MIN_COMPACTION_THRESHOLD_TOKENS.min(hard_limit))
+                .min(hard_limit)
+        };
+        Self {
+            window,
+            output_reserve,
+            framing_safety: framing,
+            hard_limit,
+            threshold,
+            override_tokens,
+            ratio_basis_points: if override_tokens > 0 {
+                0
+            } else {
+                DEFAULT_COMPACTION_WINDOW_RATIO_BASIS_POINTS
+            },
+        }
+    }
+
+    pub fn source(&self) -> &'static str {
+        if self.window == 0 {
+            "disabled"
+        } else if self.override_tokens > 0 {
+            "environment_override"
+        } else {
+            "window_ratio"
+        }
+    }
+
+    pub fn payload(&self) -> serde_json::Value {
+        serde_json::json!({
+            "window_tokens": self.window,
+            "output_reserve_tokens": self.output_reserve,
+            "framing_safety_tokens": self.framing_safety,
+            "hard_limit_tokens": self.hard_limit,
+            "threshold_tokens": self.threshold,
+            "override_tokens": self.override_tokens,
+            "ratio_basis_points": self.ratio_basis_points,
+            "source": self.source(),
+        })
+    }
+}
+
 pub(crate) fn truncate_at_char_boundary(value: &str, max_bytes: usize) -> &str {
     if value.len() <= max_bytes {
         return value;
@@ -863,5 +966,99 @@ mod structured_state_shrink_tests {
         assert!(
             serde_json::to_vec(&state).unwrap().len() <= MAX_CONTEXT_CHECKPOINT_STRUCTURED_BYTES
         );
+    }
+}
+
+#[cfg(test)]
+mod compaction_policy_tests {
+    use super::*;
+
+    #[test]
+    fn one_megabyte_window_compacts_at_ninety_percent() {
+        let policy = CompactionPolicy::derive(1_048_576, 4_096, 0);
+        assert_eq!(policy.threshold, 943_718);
+        assert_eq!(policy.hard_limit, 1_043_456);
+        assert_eq!(policy.source(), "window_ratio");
+        assert_eq!(
+            policy.ratio_basis_points,
+            DEFAULT_COMPACTION_WINDOW_RATIO_BASIS_POINTS
+        );
+        assert!(
+            policy.threshold > policy.hard_limit * 3 / 4,
+            "must not compact at the old 75% default"
+        );
+    }
+
+    #[test]
+    fn one_hundred_twenty_eight_k_window_is_also_ninety_percent() {
+        let policy = CompactionPolicy::derive(128_000, 4_096, 0);
+        assert_eq!(policy.threshold, 115_200);
+        assert_eq!(policy.hard_limit, 122_880);
+        assert!(policy.threshold < policy.hard_limit);
+    }
+
+    #[test]
+    fn small_windows_are_bounded_by_the_output_reserve() {
+        let policy = CompactionPolicy::derive(8_000, 2_048, 0);
+        assert_eq!(policy.hard_limit, 4_928);
+        assert_eq!(policy.threshold, 4_928);
+        assert!(policy.threshold <= policy.hard_limit);
+    }
+
+    #[test]
+    fn explicit_override_wins_and_is_clamped_only_by_the_hard_limit() {
+        let override_policy = CompactionPolicy::derive(1_000_000, 4_096, 10_000);
+        assert_eq!(override_policy.threshold, 10_000);
+        assert_eq!(override_policy.source(), "environment_override");
+        assert_eq!(override_policy.ratio_basis_points, 0);
+
+        let tiny = CompactionPolicy::derive(8_000, 2_048, 1);
+        assert_eq!(
+            tiny.threshold, 1,
+            "tests and deliberate operators may force compaction"
+        );
+
+        let huge = CompactionPolicy::derive(8_000, 2_048, 99_999_999);
+        assert_eq!(huge.threshold, tiny.hard_limit.max(1));
+        assert_eq!(huge.threshold, huge.hard_limit);
+    }
+
+    #[test]
+    fn zero_window_disables_automatic_management_and_keeps_the_override() {
+        let disabled = CompactionPolicy::derive(0, 4_096, 50_000);
+        assert_eq!(disabled.hard_limit, u64::MAX);
+        assert_eq!(disabled.threshold, 50_000);
+        assert_eq!(disabled.source(), "disabled");
+        assert_eq!(disabled.ratio_basis_points, 0);
+    }
+
+    #[test]
+    fn threshold_table_matches_the_lossless_plan() {
+        for (window, output, expected_threshold, expected_source) in [
+            (4_096u64, 1_024u64, 2_048u64, "window_ratio"),
+            (16_384, 2_048, 13_312, "window_ratio"),
+            (32_768, 4_096, 27_648, "window_ratio"),
+            (65_536, 4_096, 58_982, "window_ratio"),
+            (131_072, 8_192, 117_964, "window_ratio"),
+            (262_144, 8_192, 235_929, "window_ratio"),
+        ] {
+            let policy = CompactionPolicy::derive(window, output, 0);
+            assert_eq!(
+                policy.threshold, expected_threshold,
+                "window {window} output {output}"
+            );
+            assert_eq!(policy.source(), expected_source);
+            assert!(policy.threshold <= policy.hard_limit);
+        }
+    }
+
+    #[test]
+    fn payload_is_bounded_and_deterministic() {
+        let policy = CompactionPolicy::derive(128_000, 4_096, 0);
+        let payload = policy.payload();
+        assert_eq!(payload["window_tokens"], 128_000);
+        assert_eq!(payload["threshold_tokens"], 115_200);
+        assert_eq!(payload["source"], "window_ratio");
+        assert!(payload.get("summary").is_none());
     }
 }

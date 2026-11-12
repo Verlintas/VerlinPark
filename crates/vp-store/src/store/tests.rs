@@ -11949,6 +11949,7 @@ fn context_checkpoint_bundle_validation_checks_session_and_project() {
         test_results: Vec::new(),
         instruction_blobs: Vec::new(),
         instructions: Vec::new(),
+        prompt_prefix_observations: Vec::new(),
     };
     validate_session_bundle(&bundle).unwrap();
     bundle.context_checkpoints[0].project_id = "other-project".into();
@@ -12206,6 +12207,7 @@ fn importing_a_projection_only_bundle_synthesizes_checkpoint_events() {
         test_results: Vec::new(),
         instruction_blobs: Vec::new(),
         instructions: Vec::new(),
+        prompt_prefix_observations: Vec::new(),
     };
     let imported = Store::open(data.path().join("imported")).unwrap();
     imported.import_session_bundle(&bundle).unwrap();
@@ -14044,6 +14046,7 @@ fn bundle_import_preserves_supervised_process_lifecycle_rows() {
         test_results: Vec::new(),
         instruction_blobs: Vec::new(),
         instructions: Vec::new(),
+        prompt_prefix_observations: Vec::new(),
     };
     validate_session_bundle(&bundle).unwrap();
     let data = TempDir::new().unwrap();
@@ -14105,6 +14108,7 @@ fn supervised_process_bundle_validation_rejects_wrong_session() {
         test_results: Vec::new(),
         instruction_blobs: Vec::new(),
         instructions: Vec::new(),
+        prompt_prefix_observations: Vec::new(),
     };
     let error = validate_session_bundle(&bundle).unwrap_err();
     assert!(error.to_string().contains("belongs to session"), "{error}");
@@ -16327,6 +16331,7 @@ fn bundle_import_preserves_instruction_state_and_rejects_missing_blobs() {
             tail: false,
             updated_at: now_rfc3339(),
         }],
+        prompt_prefix_observations: Vec::new(),
     };
     store.import_session_bundle(&bundle).unwrap();
     assert_eq!(
@@ -16394,6 +16399,622 @@ fn bundle_import_rejects_a_corrupt_instruction_blob() {
             created_at: now_rfc3339(),
         }],
         instructions: Vec::new(),
+        prompt_prefix_observations: Vec::new(),
     };
     assert!(store.import_session_bundle(&bundle).is_err());
+}
+
+fn prompt_prefix_call(
+    project_id: &str,
+    session_id: &str,
+    epoch: &str,
+    input: u64,
+    read: u64,
+) -> PromptPrefixCall {
+    PromptPrefixCall {
+        project_id: project_id.to_string(),
+        cache_epoch: epoch.to_string(),
+        session_id: session_id.to_string(),
+        model: "deepseek-flash".into(),
+        tool_bundle: "leader".into(),
+        tool_bundle_hash: "bundle-hash".into(),
+        core_hash: "core-hash".into(),
+        project_hash: "project-hash".into(),
+        core_sections: vec![PromptSectionRef::new(
+            "core/charter",
+            "c".repeat(64),
+            10,
+            false,
+        )],
+        project_sections: vec![PromptSectionRef::new(
+            "project/sources",
+            "p".repeat(64),
+            30,
+            false,
+        )],
+        input_tokens: input,
+        cache_read_tokens: read,
+    }
+}
+
+#[test]
+fn cache_epoch_observations_aggregate_across_sessions() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("cache"))
+        .unwrap();
+    let first = store.create_session(&project.id, "first").unwrap();
+    let second = store.create_session(&project.id, "second").unwrap();
+    let epoch = "a".repeat(64);
+
+    let record = store
+        .record_prompt_prefix_call(&prompt_prefix_call(
+            &project.id,
+            &first.id,
+            &epoch,
+            1_000,
+            900,
+        ))
+        .unwrap();
+    assert!(record.first_session_call);
+    assert_eq!(record.prior_sessions, 0);
+    assert_eq!(record.aggregate.session_count, 1);
+
+    let record = store
+        .record_prompt_prefix_call(&prompt_prefix_call(
+            &project.id,
+            &first.id,
+            &epoch,
+            2_000,
+            1_800,
+        ))
+        .unwrap();
+    assert!(!record.first_session_call);
+    assert_eq!(record.prior_sessions, 0);
+    assert_eq!(record.aggregate.call_count, 2);
+    assert_eq!(record.aggregate.observed_input_tokens, 3_000);
+    assert_eq!(record.aggregate.observed_cache_read_tokens, 2_700);
+
+    let record = store
+        .record_prompt_prefix_call(&prompt_prefix_call(
+            &project.id,
+            &second.id,
+            &epoch,
+            500,
+            400,
+        ))
+        .unwrap();
+    assert!(record.first_session_call);
+    assert_eq!(record.prior_sessions, 1);
+    assert_eq!(record.aggregate.session_count, 2);
+    assert_eq!(record.aggregate.call_count, 3);
+
+    let observation = store
+        .prompt_prefix_observation(&project.id, &epoch, &second.id)
+        .unwrap()
+        .expect("second observation");
+    assert_eq!(observation.model, "deepseek-flash");
+    assert_eq!(observation.core_sections.len(), 1);
+    assert_eq!(observation.project_sections[0].key, "project/sources");
+
+    let aggregate = store
+        .prompt_prefix_aggregate(&project.id, &epoch)
+        .unwrap()
+        .expect("aggregate");
+    assert_eq!(aggregate.session_count, 2);
+    assert_eq!(aggregate.first_seen, record.aggregate.first_seen);
+    assert_eq!(aggregate.last_seen, record.aggregate.last_seen);
+}
+
+#[test]
+fn cache_epoch_aggregate_is_partitioned_by_project_and_epoch() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("cache"))
+        .unwrap();
+    let session = store.create_session(&project.id, "one").unwrap();
+    for (index, byte) in ["a", "b", "c"].iter().enumerate() {
+        let epoch = byte.repeat(64);
+        store
+            .record_prompt_prefix_call(&prompt_prefix_call(
+                &project.id,
+                &session.id,
+                &epoch,
+                100 * (index as u64 + 1),
+                90,
+            ))
+            .unwrap();
+    }
+    let rows = store.list_prompt_prefix_aggregates(&project.id, 2).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        store
+            .list_prompt_prefix_aggregates(&project.id, 10)
+            .unwrap()
+            .len(),
+        3
+    );
+    let observations = store
+        .list_prompt_prefix_observations(&project.id, &session.id)
+        .unwrap();
+    assert_eq!(observations.len(), 3);
+}
+
+#[test]
+fn append_cache_call_event_injects_cross_session_fields_atomically() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("cache"))
+        .unwrap();
+    let first = store.create_session(&project.id, "first").unwrap();
+    let second = store.create_session(&project.id, "second").unwrap();
+    let epoch = "d".repeat(64);
+
+    store
+        .record_prompt_prefix_call(&prompt_prefix_call(
+            &project.id,
+            &first.id,
+            &epoch,
+            1_000,
+            900,
+        ))
+        .unwrap();
+
+    let payload = serde_json::json!({
+        "input_tokens": 800,
+        "cache_read_tokens": 700,
+        "cache_epoch": epoch,
+        "model": "deepseek-flash",
+    });
+    let (event, record) = store
+        .append_cache_call_event(
+            &second.id,
+            "context.cache",
+            payload,
+            &prompt_prefix_call(&project.id, &second.id, &epoch, 800, 700),
+        )
+        .unwrap();
+    assert_eq!(event.kind, "context.cache");
+    assert_eq!(event.payload["cache_epoch"], epoch);
+    assert_eq!(event.payload["cache_epoch_reused_from_sessions"], 1);
+    assert_eq!(event.payload["cross_session_first_call"], true);
+    assert_eq!(event.payload["cross_session_cache_read_tokens"], 700);
+    assert_eq!(event.payload["cache_epoch_session_count"], 2);
+    assert_eq!(record.prior_sessions, 1);
+    assert_eq!(record.aggregate.session_count, 2);
+
+    // The persisted event carries every field needed to reconstruct the same
+    // observation without reading session configuration.
+    let projected = store
+        .list_prompt_prefix_observations(&project.id, &second.id)
+        .unwrap();
+    assert_eq!(projected.len(), 1);
+    assert_eq!(projected[0].first_seen, event.created_at);
+    assert_eq!(projected[0].last_seen, event.created_at);
+    assert_eq!(projected[0].observed_input_tokens, 800);
+    assert_eq!(projected[0].observed_cache_read_tokens, 700);
+    assert_eq!(projected[0].calls, 1);
+    assert_eq!(projected[0].model, "deepseek-flash");
+}
+
+#[test]
+fn append_cache_call_event_rejects_invalid_epoch_and_missing_session() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("cache"))
+        .unwrap();
+    let session = store.create_session(&project.id, "one").unwrap();
+    let mut call = prompt_prefix_call(&project.id, &session.id, &"a".repeat(64), 100, 50);
+    call.cache_epoch = "short".into();
+    assert!(
+        store
+            .record_prompt_prefix_call(&call)
+            .unwrap_err()
+            .to_string()
+            .contains("64 lowercase")
+    );
+    let mut upper = prompt_prefix_call(&project.id, &session.id, &"A".repeat(64), 100, 50);
+    upper.cache_epoch = "A".repeat(64);
+    assert!(store.record_prompt_prefix_call(&upper).is_err());
+
+    let mut zero = prompt_prefix_call(&project.id, &session.id, &"b".repeat(64), 0, 0);
+    zero.input_tokens = 0;
+    assert!(store.record_prompt_prefix_call(&zero).is_err());
+
+    let missing = prompt_prefix_call(&project.id, "ses-missing", &"c".repeat(64), 10, 5);
+    assert!(store.record_prompt_prefix_call(&missing).is_err());
+}
+
+#[test]
+fn replace_prompt_prefix_observations_rebuilds_aggregates_and_detects_drift() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("cache"))
+        .unwrap();
+    let session = store.create_session(&project.id, "one").unwrap();
+    let other = store.create_session(&project.id, "other").unwrap();
+    let epoch = "e".repeat(64);
+    store
+        .record_prompt_prefix_call(&prompt_prefix_call(
+            &project.id,
+            &session.id,
+            &epoch,
+            100,
+            80,
+        ))
+        .unwrap();
+    store
+        .record_prompt_prefix_call(&prompt_prefix_call(
+            &project.id,
+            &other.id,
+            &epoch,
+            200,
+            160,
+        ))
+        .unwrap();
+
+    let expected = vec![PromptPrefixObservation {
+        project_id: project.id.clone(),
+        cache_epoch: epoch.clone(),
+        session_id: session.id.clone(),
+        model: "deepseek-flash".into(),
+        tool_bundle: "leader".into(),
+        tool_bundle_hash: "bundle-hash".into(),
+        core_hash: "core-hash".into(),
+        project_hash: "project-hash".into(),
+        core_sections: Vec::new(),
+        project_sections: Vec::new(),
+        first_seen: "2026-11-12T00:00:01Z".into(),
+        last_seen: "2026-11-12T00:00:01Z".into(),
+        observed_input_tokens: 300,
+        observed_cache_read_tokens: 240,
+        calls: 3,
+    }];
+    let replaced = store
+        .replace_prompt_prefix_observations(&project.id, &session.id, &expected)
+        .unwrap();
+    assert_eq!(replaced, 1);
+    let projected = store
+        .list_prompt_prefix_observations(&project.id, &session.id)
+        .unwrap();
+    assert_eq!(projected, expected);
+
+    // Replacement must recompute the aggregate from *all* sessions, not just
+    // the replaced one.
+    let aggregate = store
+        .prompt_prefix_aggregate(&project.id, &epoch)
+        .unwrap()
+        .expect("aggregate");
+    assert_eq!(aggregate.session_count, 2);
+    assert_eq!(aggregate.call_count, 4);
+    assert_eq!(aggregate.observed_input_tokens, 500);
+
+    assert!(
+        store
+            .prompt_prefix_inconsistent_epochs(&project.id, std::slice::from_ref(&epoch))
+            .unwrap()
+            .is_empty()
+    );
+
+    // Corrupt the aggregate directly through SQL and prove replay detects it.
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE prompt_prefixes SET session_count = 9
+             WHERE project_id = ?1 AND cache_epoch = ?2",
+            params![project.id, epoch],
+        )
+        .unwrap();
+    let inconsistent = store
+        .prompt_prefix_inconsistent_epochs(&project.id, std::slice::from_ref(&epoch))
+        .unwrap();
+    assert_eq!(inconsistent, vec![epoch.clone()]);
+    assert_eq!(
+        store
+            .recompute_prompt_prefix_aggregates(&project.id)
+            .unwrap(),
+        1
+    );
+    assert!(
+        store
+            .prompt_prefix_inconsistent_epochs(&project.id, &[epoch])
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn prompt_prefix_rows_survive_reopening_and_clear_with_the_session() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("cache"))
+        .unwrap();
+    let session = store.create_session(&project.id, "one").unwrap();
+    let epoch = "f".repeat(64);
+    store
+        .record_prompt_prefix_call(&prompt_prefix_call(
+            &project.id,
+            &session.id,
+            &epoch,
+            100,
+            70,
+        ))
+        .unwrap();
+    drop(store);
+    let store = Store::open(data.path()).unwrap();
+    assert!(
+        store
+            .prompt_prefix_aggregate(&project.id, &epoch)
+            .unwrap()
+            .is_some()
+    );
+    store
+        .replace_prompt_prefix_observations(&project.id, &session.id, &[])
+        .unwrap();
+    assert!(
+        store
+            .prompt_prefix_aggregate(&project.id, &epoch)
+            .unwrap()
+            .is_none(),
+        "an empty observation set removes the stale aggregate"
+    );
+}
+
+#[test]
+fn prompt_prefix_counts_and_clamps_reported_reads_to_input() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("cache"))
+        .unwrap();
+    let session = store.create_session(&project.id, "one").unwrap();
+    let epoch = "9".repeat(64);
+    let record = store
+        .record_prompt_prefix_call(&prompt_prefix_call(
+            &project.id,
+            &session.id,
+            &epoch,
+            100,
+            250,
+        ))
+        .unwrap();
+    assert_eq!(record.aggregate.observed_cache_read_tokens, 100);
+    assert_eq!(record.aggregate.observed_input_tokens, 100);
+    assert_eq!(
+        store.count_prompt_prefix_aggregates(&project.id).unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .count_prompt_prefix_aggregates("missing-project")
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .list_prompt_prefix_aggregates(&project.id, 1)
+            .unwrap()
+            .len(),
+        1
+    );
+    let observation = store
+        .prompt_prefix_observation(&project.id, &epoch, &session.id)
+        .unwrap()
+        .expect("observation");
+    assert!(observation.first_seen <= observation.last_seen);
+    assert_eq!(observation.calls, 1);
+}
+
+#[test]
+fn project_epoch_bundle_buckets_and_reuse_sessions_are_bounded_and_joined() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("cache"))
+        .unwrap();
+    let first = store.create_session(&project.id, "first goal").unwrap();
+    let second = store.create_session(&project.id, "second goal").unwrap();
+    let third = store.create_session(&project.id, "third goal").unwrap();
+    let epoch = "7".repeat(64);
+    let other_epoch = "8".repeat(64);
+    for (session, epoch, bundle) in [
+        (&first, &epoch, "leader"),
+        (&second, &epoch, "leader"),
+        (&third, &other_epoch, "coding"),
+    ] {
+        let mut call = prompt_prefix_call(&project.id, &session.id, epoch, 100, 90);
+        call.tool_bundle = bundle.into();
+        store.record_prompt_prefix_call(&call).unwrap();
+    }
+
+    let buckets = store.prompt_prefix_bundle_buckets(&project.id).unwrap();
+    assert_eq!(buckets.len(), 2);
+    assert_eq!(buckets[0].tool_bundle, "coding");
+    assert_eq!(buckets[0].epochs, 1);
+    assert_eq!(buckets[0].sessions, 1);
+    assert_eq!(buckets[1].tool_bundle, "leader");
+    assert_eq!(buckets[1].epochs, 1);
+    assert_eq!(buckets[1].sessions, 2);
+    assert_eq!(buckets[1].calls, 2);
+    assert!((buckets[1].cache_hit_ratio - 0.9).abs() < 1e-9);
+
+    let reuse = store
+        .list_prompt_prefix_reuse_sessions(&project.id, &epoch, Some(&second.id), 10)
+        .unwrap();
+    assert_eq!(reuse.len(), 1);
+    assert_eq!(reuse[0].session_id, first.id);
+    assert_eq!(reuse[0].title, "first goal");
+    assert_eq!(reuse[0].calls, 1);
+    assert!((reuse[0].cache_hit_ratio - 0.9).abs() < 1e-9);
+    assert_eq!(
+        store
+            .list_prompt_prefix_reuse_sessions(&project.id, &epoch, None, 1)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let totals = store.prompt_prefix_totals(&project.id).unwrap();
+    assert_eq!(totals.total_sessions, 3);
+    assert_eq!(totals.total_calls, 3);
+    assert_eq!(totals.observed_input_tokens, 300);
+    assert_eq!(totals.observed_cache_read_tokens, 270);
+}
+
+#[test]
+fn concurrent_epoch_observations_keep_one_atomic_aggregate() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("cache"))
+        .unwrap();
+    let sessions = (0..4)
+        .map(|index| {
+            store
+                .create_session(&project.id, &format!("concurrent {index}"))
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let epoch = "6".repeat(64);
+    let mut handles = Vec::new();
+    for session in &sessions {
+        let store = store.clone();
+        let project_id = project.id.clone();
+        let session_id = session.id.clone();
+        let epoch = epoch.clone();
+        handles.push(std::thread::spawn(move || {
+            store
+                .record_prompt_prefix_call(&prompt_prefix_call(
+                    &project_id,
+                    &session_id,
+                    &epoch,
+                    100,
+                    90,
+                ))
+                .unwrap();
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    let aggregate = store
+        .prompt_prefix_aggregate(&project.id, &epoch)
+        .unwrap()
+        .expect("aggregate");
+    assert_eq!(aggregate.session_count, 4);
+    assert_eq!(aggregate.call_count, 4);
+    assert_eq!(aggregate.observed_input_tokens, 400);
+    assert_eq!(aggregate.observed_cache_read_tokens, 360);
+    assert_eq!(
+        store.count_prompt_prefix_aggregates(&project.id).unwrap(),
+        1
+    );
+    assert!(
+        store
+            .prompt_prefix_inconsistent_epochs(&project.id, std::slice::from_ref(&epoch))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn prune_keeps_newest_and_active_session_epochs_and_supports_dry_run() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("cache"))
+        .unwrap();
+    let first = store.create_session(&project.id, "old").unwrap();
+    let second = store.create_session(&project.id, "active").unwrap();
+    let third = store.create_session(&project.id, "new").unwrap();
+    let old_epoch = "1".repeat(64);
+    let active_epoch = "2".repeat(64);
+    let new_epoch = "3".repeat(64);
+    for (session, epoch) in [
+        (&first, &old_epoch),
+        (&second, &active_epoch),
+        (&third, &new_epoch),
+    ] {
+        store
+            .record_prompt_prefix_call(&prompt_prefix_call(
+                &project.id,
+                &session.id,
+                epoch,
+                100,
+                90,
+            ))
+            .unwrap();
+    }
+    store.update_session_status(&second.id, "running").unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE prompt_prefix_observations
+             SET first_seen = '2025-01-01T00:00:00Z', last_seen = '2025-01-01T00:00:00Z'
+             WHERE project_id = ?1 AND cache_epoch IN (?2, ?3)",
+            params![project.id, old_epoch, active_epoch],
+        )
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE prompt_prefixes
+             SET first_seen = '2025-01-01T00:00:00Z', last_seen = '2025-01-01T00:00:00Z'
+             WHERE project_id = ?1 AND cache_epoch IN (?2, ?3)",
+            params![project.id, old_epoch, active_epoch],
+        )
+        .unwrap();
+
+    let cutoff = "2026-01-01T00:00:00Z";
+    let dry = store
+        .prune_prompt_prefixes(&project.id, cutoff, 1, true)
+        .unwrap();
+    assert_eq!(dry.removed_epochs, 1);
+    assert_eq!(dry.removed_observations, 1);
+    assert_eq!(dry.kept_epochs, 1);
+    assert_eq!(dry.protected_epochs, 1);
+    assert_eq!(
+        dry.remaining_epochs, 2,
+        "dry-run reports the hypothetical remaining count"
+    );
+    assert_eq!(
+        store.count_prompt_prefix_aggregates(&project.id).unwrap(),
+        3,
+        "dry-run must not delete rows"
+    );
+
+    let pruned = store
+        .prune_prompt_prefixes(&project.id, cutoff, 1, false)
+        .unwrap();
+    assert_eq!(pruned.removed_epochs, 1);
+    assert_eq!(pruned.remaining_epochs, 2);
+    assert_eq!(
+        store.count_prompt_prefix_aggregates(&project.id).unwrap(),
+        2
+    );
+    assert!(
+        store
+            .prompt_prefix_aggregate(&project.id, &old_epoch)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .prompt_prefix_aggregate(&project.id, &active_epoch)
+            .unwrap()
+            .is_some(),
+        "an active session's epoch is protected from age pruning"
+    );
+    assert!(
+        store
+            .prompt_prefix_aggregate(&project.id, &new_epoch)
+            .unwrap()
+            .is_some(),
+        "the newest epoch is always kept"
+    );
+    let second_prune = store
+        .prune_prompt_prefixes(&project.id, cutoff, 1, false)
+        .unwrap();
+    assert_eq!(second_prune.removed_epochs, 0);
 }

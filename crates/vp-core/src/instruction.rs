@@ -973,23 +973,36 @@ pub fn latest_prompt_prefix(events: &[Event]) -> (Option<String>, Option<String>
         .rev()
         .find(|event| event.kind == "context.prompt_prefix");
     match latest {
-        Some(event) => (
-            event
+        Some(event) => {
+            let finalized_epoch = event
                 .payload
-                .get("prefix_hash")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            event
-                .payload
-                .get("cache_epoch")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            event
-                .payload
-                .get("stable_prefix_hash")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        ),
+                .get("cache_epoch_placeholder")
+                .and_then(Value::as_bool)
+                != Some(true)
+                && event
+                    .payload
+                    .get("cache_epoch_source")
+                    .and_then(Value::as_str)
+                    != Some("l1_placeholder");
+            (
+                event
+                    .payload
+                    .get("prefix_hash")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                event
+                    .payload
+                    .get("cache_epoch")
+                    .and_then(Value::as_str)
+                    .filter(|_| finalized_epoch)
+                    .map(str::to_string),
+                event
+                    .payload
+                    .get("stable_prefix_hash")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            )
+        }
         None => (None, None, None),
     }
 }
@@ -1045,6 +1058,42 @@ mod tests {
             InstructionCandidate::new(InstructionSectionKey::RunTask, "task objective v1"),
             InstructionCandidate::new(InstructionSectionKey::TailMemory, "memory v1"),
         ]
+    }
+
+    #[test]
+    fn latest_prompt_prefix_ignores_l1_placeholder_epochs() {
+        let placeholder = Event {
+            session_id: "ses".into(),
+            seq: 1,
+            kind: "context.prompt_prefix".into(),
+            payload: serde_json::json!({
+                "prefix_hash": "a".repeat(64),
+                "cache_epoch": "a".repeat(64),
+                "cache_epoch_source": "l1_placeholder",
+                "cache_epoch_placeholder": true,
+                "stable_prefix_hash": "b".repeat(64),
+            }),
+            created_at: "2026-11-12T00:00:01Z".into(),
+        };
+        let (prefix, epoch, stable) = latest_prompt_prefix(&[placeholder]);
+        assert_eq!(prefix, Some("a".repeat(64)));
+        assert!(epoch.is_none());
+        assert_eq!(stable, Some("b".repeat(64)));
+
+        let finalized = Event {
+            session_id: "ses".into(),
+            seq: 2,
+            kind: "context.prompt_prefix".into(),
+            payload: serde_json::json!({
+                "prefix_hash": "c".repeat(64),
+                "cache_epoch": "d".repeat(64),
+                "cache_epoch_source": "l4",
+                "cache_epoch_placeholder": false,
+            }),
+            created_at: "2026-11-12T00:00:02Z".into(),
+        };
+        let (_, epoch, _) = latest_prompt_prefix(&[finalized]);
+        assert_eq!(epoch, Some("d".repeat(64)));
     }
 
     #[test]

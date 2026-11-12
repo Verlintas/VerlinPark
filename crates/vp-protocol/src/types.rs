@@ -1560,7 +1560,8 @@ pub struct SessionInstructionsReport {
     /// Latest `context.prompt_prefix` hash observed for the session, if any.
     #[serde(default)]
     pub latest_prefix_hash: Option<String>,
-    /// L1 placeholder for L4's finalized cache epoch.
+    /// Finalized L4 cache epoch from the latest prompt-prefix event. Legacy L1
+    /// placeholder events decode as `None`.
     #[serde(default)]
     pub latest_cache_epoch: Option<String>,
     /// Hash of the exact ordered head text from the latest prompt-prefix
@@ -6777,6 +6778,13 @@ pub struct ContextUsage {
     pub threshold_tokens: u64,
     #[serde(default)]
     pub hard_limit_tokens: u64,
+    /// `window_ratio`, `environment_override`, or `disabled`.
+    #[serde(default)]
+    pub threshold_source: Option<String>,
+    /// Ratio of the model window used before compaction, in basis points
+    /// (9000 = 90%). Zero when the threshold came from an explicit override.
+    #[serde(default)]
+    pub threshold_ratio_basis_points: u32,
     #[serde(default)]
     pub messages: usize,
     /// Multiplier applied to the heuristic active-context estimate. 1.0 means
@@ -6818,6 +6826,8 @@ impl Default for ContextUsage {
             context_window: 0,
             threshold_tokens: 0,
             hard_limit_tokens: 0,
+            threshold_source: None,
+            threshold_ratio_basis_points: 0,
             messages: 0,
             calibration: 1.0,
             created_at: String::new(),
@@ -6920,6 +6930,20 @@ pub struct ContextCompactionSummary {
     /// Whether the project cache policy asked for compaction cache metrics.
     #[serde(default)]
     pub cache_compact_aware: bool,
+    /// Stable cache epoch before the boundary. The instruction prefix does not
+    /// change, so `cache_epoch_after` normally equals this value.
+    #[serde(default)]
+    pub cache_epoch_before: Option<String>,
+    #[serde(default)]
+    pub cache_epoch_after: Option<String>,
+    /// True only when a stable instruction/tool change also moved the epoch.
+    /// A compaction boundary itself does not change the shareable epoch.
+    #[serde(default)]
+    pub cache_epoch_changed: bool,
+    /// Always-computed estimate of cache-read savings lost at the boundary.
+    /// Independent of the legacy `cache_compact_aware` accounting switch.
+    #[serde(default)]
+    pub estimated_lost_cache_read_usd: f64,
     #[serde(default)]
     pub created_at: String,
 }
@@ -6958,6 +6982,66 @@ pub struct SessionContextParams {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionCacheStatus {
     pub session_id: String,
+    /// Finalized L4 cache epoch for the latest prompt prefix. L1 recorded a
+    /// deterministic placeholder; L4 replaces it with the stable
+    /// `(model, tools, core/project)` identity.
+    #[serde(default)]
+    pub cache_epoch: Option<String>,
+    #[serde(default)]
+    pub cache_epoch_source: Option<String>,
+    /// First/last provider observation for this session's current epoch.
+    #[serde(default)]
+    pub cache_epoch_first_seen: Option<String>,
+    #[serde(default)]
+    pub cache_epoch_last_seen: Option<String>,
+    /// First/last observation across every session in the project. The
+    /// session-scoped fields above intentionally differ for a new session.
+    #[serde(default)]
+    pub cache_epoch_project_first_seen: Option<String>,
+    #[serde(default)]
+    pub cache_epoch_project_last_seen: Option<String>,
+    /// Ordered core/project section hashes for the current epoch.
+    #[serde(default)]
+    pub cache_epoch_core_sections: Vec<PromptSectionRef>,
+    #[serde(default)]
+    pub cache_epoch_project_sections: Vec<PromptSectionRef>,
+    /// Project-wide distinct sessions that have used the current epoch.
+    #[serde(default)]
+    pub cache_epoch_session_count: u64,
+    /// Project-wide calls and tokens for the current epoch, not just this
+    /// session. Session-scoped counts are exposed by `session.cache.epoch`.
+    #[serde(default)]
+    pub cache_epoch_call_count: u64,
+    #[serde(default)]
+    pub cache_epoch_observed_input_tokens: u64,
+    #[serde(default)]
+    pub cache_epoch_observed_cache_read_tokens: u64,
+    /// Distinct epochs observed in this session's prompt-prefix history.
+    #[serde(default)]
+    pub cache_epochs_seen: u64,
+    /// Other sessions that had already used this epoch before the latest
+    /// ordinary call. Derived from persisted observations, never inferred.
+    #[serde(default)]
+    pub prefix_reused_from_sessions: u64,
+    /// Provider-reported cache reads on the first call of a session that
+    /// reused an epoch already observed by another session.
+    #[serde(default)]
+    pub cross_session_hit_tokens: u64,
+    #[serde(default)]
+    pub cross_session_first_calls: u64,
+    /// Calls attributed to a provider cache miss with an unchanged epoch.
+    #[serde(default)]
+    pub provider_cache_misses: u64,
+    /// Calls attributed to a local model/tools/project/prefix change.
+    #[serde(default)]
+    pub prefix_changes: u64,
+    /// Compaction boundaries that invalidated the conversation cache.
+    #[serde(default)]
+    pub compaction_cache_resets: u64,
+    /// Estimated cache-read savings lost at those boundaries. This is an
+    /// estimate from configured role prices, never a provider invoice.
+    #[serde(default)]
+    pub compaction_lost_cache_usd: f64,
     #[serde(default)]
     pub input_tokens: u64,
     #[serde(default)]
@@ -7157,6 +7241,329 @@ pub struct SessionCacheBreak {
     pub warm: bool,
 }
 
+/// One session's contribution to a stable cache epoch. This is the
+/// event-derived projection row used for cross-session reuse; it contains no
+/// prompt text and no provider secret.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptPrefixObservation {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub cache_epoch: String,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub tool_bundle: String,
+    #[serde(default)]
+    pub tool_bundle_hash: String,
+    #[serde(default)]
+    pub core_hash: String,
+    #[serde(default)]
+    pub project_hash: String,
+    #[serde(default)]
+    pub core_sections: Vec<PromptSectionRef>,
+    #[serde(default)]
+    pub project_sections: Vec<PromptSectionRef>,
+    #[serde(default)]
+    pub first_seen: String,
+    #[serde(default)]
+    pub last_seen: String,
+    #[serde(default)]
+    pub observed_input_tokens: u64,
+    #[serde(default)]
+    pub observed_cache_read_tokens: u64,
+    #[serde(default)]
+    pub calls: u64,
+}
+
+/// Aggregate of [`PromptPrefixObservation`] rows for one epoch in one
+/// project. The aggregate is a projection rebuilt from observations; it is
+/// never computed from a session's current configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptPrefixAggregate {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub cache_epoch: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub tool_bundle: String,
+    #[serde(default)]
+    pub tool_bundle_hash: String,
+    #[serde(default)]
+    pub core_hash: String,
+    #[serde(default)]
+    pub project_hash: String,
+    #[serde(default)]
+    pub core_sections: Vec<PromptSectionRef>,
+    #[serde(default)]
+    pub project_sections: Vec<PromptSectionRef>,
+    #[serde(default)]
+    pub first_seen: String,
+    #[serde(default)]
+    pub last_seen: String,
+    #[serde(default)]
+    pub observed_input_tokens: u64,
+    #[serde(default)]
+    pub observed_cache_read_tokens: u64,
+    #[serde(default)]
+    pub session_count: u64,
+    #[serde(default)]
+    pub call_count: u64,
+}
+
+/// Result of one epoch observation. `prior_sessions` excludes the observing
+/// session, so a brand-new session sees how many other sessions already used
+/// the same bytes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptPrefixRecord {
+    #[serde(default)]
+    pub first_session_call: bool,
+    #[serde(default)]
+    pub prior_sessions: u64,
+    #[serde(default)]
+    pub aggregate: PromptPrefixAggregate,
+}
+
+/// Read-only cache-epoch inspection. It never calls a provider, starts a run,
+/// or changes the epoch.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SessionCacheEpochParams {
+    pub session_id: String,
+    /// Maximum timeline entries and aggregate epochs to return. Clamped by the
+    /// runtime to a bounded window.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheEpochTimelineEntry {
+    #[serde(default)]
+    pub at: String,
+    /// `prefix` or `compaction_reset`.
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub cache_epoch: Option<String>,
+    /// `first`, `model`, `tools`, `project`, `core`, `sections`, or `unknown`.
+    #[serde(default)]
+    pub change_reason: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub tool_bundle: Option<String>,
+    #[serde(default)]
+    pub prefix_hash: Option<String>,
+    #[serde(default)]
+    pub compaction_count: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CacheEpochSummary {
+    #[serde(default)]
+    pub cache_epoch: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub tool_bundle: String,
+    #[serde(default)]
+    pub tool_bundle_hash: String,
+    #[serde(default)]
+    pub core_hash: String,
+    #[serde(default)]
+    pub project_hash: String,
+    #[serde(default)]
+    pub core_sections: Vec<PromptSectionRef>,
+    #[serde(default)]
+    pub project_sections: Vec<PromptSectionRef>,
+    #[serde(default)]
+    pub first_seen: String,
+    #[serde(default)]
+    pub last_seen: String,
+    /// Distinct sessions in the project that observed this epoch.
+    #[serde(default)]
+    pub session_count: u64,
+    #[serde(default)]
+    pub call_count: u64,
+    #[serde(default)]
+    pub observed_input_tokens: u64,
+    #[serde(default)]
+    pub observed_cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_hit_ratio: f64,
+    /// This session's contribution, zero when the session never observed it.
+    #[serde(default)]
+    pub this_session_calls: u64,
+    #[serde(default)]
+    pub this_session_input_tokens: u64,
+    #[serde(default)]
+    pub this_session_cache_read_tokens: u64,
+    /// Other sessions that used this epoch. Provider-reported hits are the
+    /// only evidence of actual provider reuse.
+    #[serde(default)]
+    pub reused_from_sessions: u64,
+}
+
+/// One other session that observed the current epoch. The title is included
+/// only because operators need to recognize the session; no prompt text,
+/// message, or artifact is returned.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CacheEpochReuseSession {
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub first_seen: String,
+    #[serde(default)]
+    pub last_seen: String,
+    #[serde(default)]
+    pub calls: u64,
+    #[serde(default)]
+    pub observed_input_tokens: u64,
+    #[serde(default)]
+    pub observed_cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_hit_ratio: f64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionCacheEpochResult {
+    pub session_id: String,
+    pub project_id: String,
+    #[serde(default = "default_prompt_layout")]
+    pub prompt_layout: u32,
+    /// Latest epoch observed for this session, with project/session counts.
+    #[serde(default)]
+    pub current_epoch: Option<CacheEpochSummary>,
+    /// Bounded project epochs, newest last-seen first.
+    #[serde(default)]
+    pub epochs: Vec<CacheEpochSummary>,
+    /// Bounded chronological prefix/compaction timeline.
+    #[serde(default)]
+    pub timeline: Vec<CacheEpochTimelineEntry>,
+    /// Bounded other sessions that observed the current epoch.
+    #[serde(default)]
+    pub reused_sessions: Vec<CacheEpochReuseSession>,
+    #[serde(default)]
+    pub total_epochs: u64,
+    #[serde(default)]
+    pub timeline_truncated: bool,
+    /// Other sessions that already used the current epoch.
+    #[serde(default)]
+    pub prefix_reused_from_sessions: u64,
+    /// Provider-reported first-call cache reads attributed to another session.
+    #[serde(default)]
+    pub cross_session_hit_tokens: u64,
+    #[serde(default)]
+    pub cross_session_first_calls: u64,
+    #[serde(default)]
+    pub provider_cache_misses: u64,
+    #[serde(default)]
+    pub compaction_resets: u64,
+    #[serde(default)]
+    pub compaction_lost_cache_usd: f64,
+    #[serde(default)]
+    pub generated_at: String,
+}
+
+/// One tool-bundle bucket in a project epoch report. Epochs are already
+/// model/tool/core/project-specific, so this groups them for operators who
+/// want to know which frozen bundle is paying for cache reuse.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CacheEpochBundleBucket {
+    #[serde(default)]
+    pub tool_bundle: String,
+    #[serde(default)]
+    pub epochs: u64,
+    #[serde(default)]
+    pub sessions: u64,
+    #[serde(default)]
+    pub calls: u64,
+    #[serde(default)]
+    pub observed_input_tokens: u64,
+    #[serde(default)]
+    pub observed_cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_hit_ratio: f64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ProjectCacheEpochParams {
+    pub project_id: String,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// Project-scoped retention request for cache-epoch observations. The newest
+/// `keep_epochs` epochs are always retained regardless of age.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ProjectCacheEpochPruneParams {
+    pub project_id: String,
+    /// Remove observations whose last provider call is older than this many
+    /// days. Clamped to 1..=3650. Defaults to 90.
+    #[serde(default)]
+    pub older_than_days: Option<u32>,
+    /// Always retain this many newest epochs. Clamped to 1..=1000. Defaults
+    /// to 50.
+    #[serde(default)]
+    pub keep_epochs: Option<u32>,
+    /// Count only; no rows are deleted.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProjectCacheEpochPruneResult {
+    pub project_id: String,
+    #[serde(default)]
+    pub dry_run: bool,
+    /// RFC3339 cutoff used for age comparison.
+    #[serde(default)]
+    pub cutoff: String,
+    #[serde(default)]
+    pub removed_epochs: u64,
+    #[serde(default)]
+    pub removed_observations: u64,
+    #[serde(default)]
+    pub kept_epochs: u64,
+    /// For a dry run this is the hypothetical count after pruning; the
+    /// database still contains the pre-prune rows.
+    #[serde(default)]
+    pub remaining_epochs: u64,
+    /// Epochs retained because an active session still references them.
+    #[serde(default)]
+    pub protected_epochs: u64,
+}
+
+/// Read-only project-level epoch report. It never calls a provider and never
+/// mutates a projection.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProjectCacheEpochResult {
+    pub project_id: String,
+    #[serde(default)]
+    pub epochs: Vec<CacheEpochSummary>,
+    #[serde(default)]
+    pub bundles: Vec<CacheEpochBundleBucket>,
+    #[serde(default)]
+    pub total_epochs: u64,
+    #[serde(default)]
+    pub total_sessions: u64,
+    #[serde(default)]
+    pub total_calls: u64,
+    #[serde(default)]
+    pub observed_input_tokens: u64,
+    #[serde(default)]
+    pub observed_cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_hit_ratio: f64,
+    #[serde(default)]
+    pub generated_at: String,
+}
+
 impl Default for SessionCacheCall {
     fn default() -> Self {
         Self {
@@ -7193,6 +7600,10 @@ impl Default for SessionCacheCall {
             cache_break_reason: None,
             message_sequence_issue_count: 0,
             message_sequence_issues: Vec::new(),
+            cache_epoch: None,
+            cache_epoch_reused_from_sessions: 0,
+            cross_session_cache_read_tokens: 0,
+            cross_session_first_call: false,
             estimated_savings_usd: 0.0,
             miss_reason: None,
             warm: false,
@@ -7278,6 +7689,19 @@ pub struct SessionCacheCall {
     pub message_sequence_issue_count: u64,
     #[serde(default)]
     pub message_sequence_issues: Vec<String>,
+    /// Stable cache epoch for this call. Volatile/session/run/tail content is
+    /// deliberately excluded from the identity.
+    #[serde(default)]
+    pub cache_epoch: Option<String>,
+    /// Other sessions that had already observed this epoch before the call.
+    #[serde(default)]
+    pub cache_epoch_reused_from_sessions: u64,
+    /// Provider-reported cache reads attributed to cross-session reuse. Only
+    /// set on the first call of a session for an epoch another session used.
+    #[serde(default)]
+    pub cross_session_cache_read_tokens: u64,
+    #[serde(default)]
+    pub cross_session_first_call: bool,
     #[serde(default)]
     pub estimated_savings_usd: f64,
     #[serde(default)]
@@ -7446,6 +7870,15 @@ pub struct SessionCacheWarmResult {
     pub project_hash: Option<String>,
     #[serde(default)]
     pub tools_hash: Option<String>,
+    /// Stable epoch covered by the warm request. A warm never changes it.
+    #[serde(default)]
+    pub cache_epoch: Option<String>,
+    #[serde(default)]
+    pub cache_epoch_unchanged: bool,
+    /// Other sessions that had already observed the same epoch. Informational;
+    /// the warm call's own usage is billed and recorded separately.
+    #[serde(default)]
+    pub cache_epoch_reused_from_sessions: u64,
     #[serde(default)]
     pub input_tokens: u64,
     #[serde(default)]
@@ -9357,6 +9790,11 @@ pub struct SessionBundle {
     /// these rows are preserved for inspection and never trigger generation.
     #[serde(default)]
     pub instructions: Vec<SessionInstructionState>,
+    /// Event-derived cache-epoch observations for this session. Older bundles
+    /// decode as an empty list; replay can rebuild the rows from the archived
+    /// cache events.
+    #[serde(default)]
+    pub prompt_prefix_observations: Vec<PromptPrefixObservation>,
 }
 
 /// Project policy for automatic crash resume. Manual `session.run.resume`
@@ -12593,6 +13031,9 @@ mod tests {
             core_hash: Some("core".into()),
             project_hash: Some("project".into()),
             tools_hash: Some("tools".into()),
+            cache_epoch: Some("e".repeat(64)),
+            cache_epoch_unchanged: true,
+            cache_epoch_reused_from_sessions: 2,
             input_tokens: 1_000,
             output_tokens: 5,
             cache_read_tokens: 0,
@@ -14289,6 +14730,10 @@ mod program_wire_tests {
             cache_invalidation_tokens: 6_000,
             cache_invalidation_estimated_usd: 0.0162,
             cache_compact_aware: true,
+            cache_epoch_before: Some("a".repeat(64)),
+            cache_epoch_after: Some("a".repeat(64)),
+            cache_epoch_changed: false,
+            estimated_lost_cache_read_usd: 0.0162,
             created_at: "2026-11-11T00:00:00Z".into(),
         };
         let encoded = serde_json::to_string(&summary).unwrap();
@@ -14729,6 +15174,7 @@ mod context_checkpoint_bundle_tests {
             test_results: Vec::new(),
             instruction_blobs: Vec::new(),
             instructions: Vec::new(),
+            prompt_prefix_observations: Vec::new(),
         };
         let encoded = serde_json::to_string(&bundle).unwrap();
         let decoded: SessionBundle = serde_json::from_str(&encoded).unwrap();
@@ -17177,5 +17623,385 @@ mod archive_media_protocol_tests {
         assert!(info.tags.is_empty());
         assert!(info.warnings.is_empty());
         assert_eq!(info.source, "ffprobe");
+    }
+}
+
+#[cfg(test)]
+mod cache_epoch_protocol_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn cache_epoch_fields_default_on_legacy_status_and_call_payloads() {
+        let status: SessionCacheStatus = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "input_tokens": 10,
+        }))
+        .unwrap();
+        assert!(status.cache_epoch.is_none());
+        assert_eq!(status.cache_epoch_session_count, 0);
+        assert_eq!(status.prefix_reused_from_sessions, 0);
+        assert_eq!(status.compaction_lost_cache_usd, 0.0);
+
+        let call: SessionCacheCall = serde_json::from_value(json!({
+            "at": "now",
+            "input_tokens": 100,
+        }))
+        .unwrap();
+        assert!(call.cache_epoch.is_none());
+        assert_eq!(call.cache_epoch_reused_from_sessions, 0);
+        assert_eq!(call.cross_session_cache_read_tokens, 0);
+        assert!(!call.cross_session_first_call);
+    }
+
+    #[test]
+    fn cache_epoch_status_round_trips_final_identity_and_reuse() {
+        let status = SessionCacheStatus {
+            session_id: "ses-1".into(),
+            cache_epoch: Some("a".repeat(64)),
+            cache_epoch_source: Some("l4".into()),
+            cache_epoch_first_seen: Some("2026-11-12T00:00:00Z".into()),
+            cache_epoch_last_seen: Some("2026-11-12T00:05:00Z".into()),
+            cache_epoch_session_count: 3,
+            cache_epoch_call_count: 12,
+            cache_epoch_observed_input_tokens: 90_000,
+            cache_epoch_observed_cache_read_tokens: 88_000,
+            cache_epochs_seen: 1,
+            prefix_reused_from_sessions: 2,
+            cross_session_hit_tokens: 1_200,
+            cross_session_first_calls: 1,
+            provider_cache_misses: 1,
+            prefix_changes: 0,
+            compaction_cache_resets: 1,
+            compaction_lost_cache_usd: 0.01,
+            cache_calls: 10,
+            ..SessionCacheStatus::default()
+        };
+        let decoded: SessionCacheStatus =
+            serde_json::from_value(serde_json::to_value(&status).unwrap()).unwrap();
+        assert_eq!(decoded, status);
+        assert_eq!(decoded.cache_epoch_session_count, 3);
+        assert_eq!(decoded.cross_session_hit_tokens, 1_200);
+    }
+
+    #[test]
+    fn session_cache_epoch_result_and_timeline_round_trip() {
+        let result = SessionCacheEpochResult {
+            session_id: "ses-1".into(),
+            project_id: "prj-1".into(),
+            prompt_layout: 3,
+            current_epoch: Some(CacheEpochSummary {
+                cache_epoch: "b".repeat(64),
+                model: "deepseek-flash".into(),
+                session_count: 2,
+                call_count: 4,
+                observed_input_tokens: 4_000,
+                observed_cache_read_tokens: 3_600,
+                cache_hit_ratio: 0.9,
+                this_session_calls: 2,
+                reused_from_sessions: 1,
+                ..CacheEpochSummary::default()
+            }),
+            epochs: Vec::new(),
+            timeline: vec![
+                CacheEpochTimelineEntry {
+                    at: "2026-11-12T00:00:00Z".into(),
+                    kind: "prefix".into(),
+                    cache_epoch: Some("b".repeat(64)),
+                    change_reason: Some("first".into()),
+                    model: Some("deepseek-flash".into()),
+                    tool_bundle: Some("leader".into()),
+                    prefix_hash: Some("c".repeat(64)),
+                    compaction_count: None,
+                },
+                CacheEpochTimelineEntry {
+                    at: "2026-11-12T00:01:00Z".into(),
+                    kind: "compaction_reset".into(),
+                    cache_epoch: Some("b".repeat(64)),
+                    change_reason: Some("compaction".into()),
+                    compaction_count: Some(1),
+                    ..CacheEpochTimelineEntry::default()
+                },
+            ],
+            reused_sessions: vec![CacheEpochReuseSession {
+                session_id: "ses-2".into(),
+                title: "earlier run".into(),
+                calls: 2,
+                observed_input_tokens: 2_000,
+                observed_cache_read_tokens: 1_800,
+                cache_hit_ratio: 0.9,
+                ..CacheEpochReuseSession::default()
+            }],
+            total_epochs: 1,
+            timeline_truncated: false,
+            prefix_reused_from_sessions: 1,
+            cross_session_hit_tokens: 900,
+            cross_session_first_calls: 1,
+            provider_cache_misses: 0,
+            compaction_resets: 1,
+            compaction_lost_cache_usd: 0.002,
+            generated_at: "2026-11-12T00:02:00Z".into(),
+        };
+        let encoded = serde_json::to_string(&result).unwrap();
+        let decoded: SessionCacheEpochResult = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, result);
+        assert_eq!(decoded.timeline[1].kind, "compaction_reset");
+    }
+
+    #[test]
+    fn prompt_prefix_rows_and_records_round_trip() {
+        let observation = PromptPrefixObservation {
+            project_id: "prj".into(),
+            cache_epoch: "d".repeat(64),
+            session_id: "ses".into(),
+            model: "model".into(),
+            tool_bundle: "leader".into(),
+            tool_bundle_hash: "bundle".into(),
+            core_hash: "core".into(),
+            project_hash: "project".into(),
+            core_sections: vec![PromptSectionRef::new("core/charter", "hash", 10, false)],
+            project_sections: vec![PromptSectionRef::new("project/sources", "hash2", 30, false)],
+            first_seen: "a".into(),
+            last_seen: "b".into(),
+            observed_input_tokens: 10,
+            observed_cache_read_tokens: 9,
+            calls: 1,
+        };
+        let decoded: PromptPrefixObservation =
+            serde_json::from_str(&serde_json::to_string(&observation).unwrap()).unwrap();
+        assert_eq!(decoded, observation);
+        assert_eq!(decoded.core_sections[0].ordinal, 10);
+
+        let record = PromptPrefixRecord {
+            first_session_call: true,
+            prior_sessions: 2,
+            aggregate: PromptPrefixAggregate {
+                project_id: "prj".into(),
+                cache_epoch: "d".repeat(64),
+                session_count: 3,
+                ..PromptPrefixAggregate::default()
+            },
+        };
+        let decoded: PromptPrefixRecord =
+            serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn compaction_summary_epoch_fields_default_and_round_trip() {
+        let legacy: ContextCompactionSummary = serde_json::from_value(json!({
+            "mode": "summary",
+            "compaction_count": 1,
+        }))
+        .unwrap();
+        assert!(legacy.cache_epoch_before.is_none());
+        assert!(!legacy.cache_epoch_changed);
+        assert_eq!(legacy.estimated_lost_cache_read_usd, 0.0);
+
+        let mut current = legacy;
+        current.cache_epoch_before = Some("e".repeat(64));
+        current.cache_epoch_after = Some("e".repeat(64));
+        current.cache_epoch_changed = false;
+        current.estimated_lost_cache_read_usd = 0.0123;
+        let decoded: ContextCompactionSummary =
+            serde_json::from_str(&serde_json::to_string(&current).unwrap()).unwrap();
+        assert_eq!(decoded, current);
+    }
+
+    #[test]
+    fn project_epoch_prune_params_and_result_decode_with_defaults() {
+        let params: ProjectCacheEpochPruneParams =
+            serde_json::from_value(json!({"project_id": "prj"})).unwrap();
+        assert_eq!(params.project_id, "prj");
+        assert!(params.older_than_days.is_none());
+        assert!(params.keep_epochs.is_none());
+        assert!(!params.dry_run);
+
+        let result = ProjectCacheEpochPruneResult {
+            project_id: "prj".into(),
+            dry_run: true,
+            cutoff: "2026-01-01T00:00:00Z".into(),
+            removed_epochs: 2,
+            removed_observations: 3,
+            kept_epochs: 50,
+            remaining_epochs: 48,
+            protected_epochs: 1,
+        };
+        let decoded: ProjectCacheEpochPruneResult =
+            serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+        assert_eq!(decoded, result);
+        let minimal: ProjectCacheEpochPruneResult =
+            serde_json::from_value(json!({"project_id": "prj"})).unwrap();
+        assert_eq!(minimal.kept_epochs, 0);
+        assert!(!minimal.dry_run);
+    }
+
+    #[test]
+    fn warm_on_resume_remains_opted_out_by_default() {
+        let policy = CachePolicy::default();
+        assert!(!policy.warm_on_resume);
+        assert!(policy.compact_aware);
+        let decoded: CachePolicy = serde_json::from_value(json!({})).unwrap();
+        assert!(!decoded.warm_on_resume);
+    }
+
+    #[test]
+    fn context_usage_threshold_policy_fields_decode_with_defaults() {
+        let legacy: ContextUsage = serde_json::from_value(json!({
+            "estimated_tokens": 10,
+            "threshold_tokens": 5,
+        }))
+        .unwrap();
+        assert!(legacy.threshold_source.is_none());
+        assert_eq!(legacy.threshold_ratio_basis_points, 0);
+        let current: ContextUsage = serde_json::from_value(json!({
+            "estimated_tokens": 10,
+            "threshold_tokens": 5,
+            "threshold_source": "window_ratio",
+            "threshold_ratio_basis_points": 9000,
+        }))
+        .unwrap();
+        assert_eq!(current.threshold_source.as_deref(), Some("window_ratio"));
+        assert_eq!(current.threshold_ratio_basis_points, 9000);
+    }
+
+    #[test]
+    fn session_cache_epoch_params_default_to_optional_limit() {
+        let params: SessionCacheEpochParams =
+            serde_json::from_value(json!({"session_id": "ses-1"})).unwrap();
+        assert_eq!(params.session_id, "ses-1");
+        assert_eq!(params.limit, None);
+    }
+
+    #[test]
+    fn project_cache_epoch_report_round_trips_bundle_buckets() {
+        let result = ProjectCacheEpochResult {
+            project_id: "prj-1".into(),
+            epochs: vec![CacheEpochSummary {
+                cache_epoch: "f".repeat(64),
+                model: "deepseek-flash".into(),
+                tool_bundle: "coding".into(),
+                session_count: 4,
+                call_count: 9,
+                observed_input_tokens: 9_000,
+                observed_cache_read_tokens: 8_100,
+                cache_hit_ratio: 0.9,
+                reused_from_sessions: 3,
+                ..CacheEpochSummary::default()
+            }],
+            bundles: vec![CacheEpochBundleBucket {
+                tool_bundle: "coding".into(),
+                epochs: 2,
+                sessions: 5,
+                calls: 12,
+                observed_input_tokens: 12_000,
+                observed_cache_read_tokens: 10_800,
+                cache_hit_ratio: 0.9,
+            }],
+            total_epochs: 2,
+            total_sessions: 5,
+            total_calls: 12,
+            observed_input_tokens: 12_000,
+            observed_cache_read_tokens: 10_800,
+            cache_hit_ratio: 0.9,
+            generated_at: "2026-11-12T00:00:00Z".into(),
+        };
+        let decoded: ProjectCacheEpochResult =
+            serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+        assert_eq!(decoded, result);
+        assert_eq!(decoded.bundles[0].tool_bundle, "coding");
+        assert_eq!(decoded.epochs[0].reused_from_sessions, 3);
+    }
+
+    #[test]
+    fn project_cache_epoch_params_decode_without_limit() {
+        let params: ProjectCacheEpochParams =
+            serde_json::from_value(json!({"project_id": "prj-1"})).unwrap();
+        assert_eq!(params.project_id, "prj-1");
+        assert_eq!(params.limit, None);
+    }
+
+    #[test]
+    fn reuse_session_decodes_legacy_defaults_without_title() {
+        let row: CacheEpochReuseSession = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "calls": 2,
+        }))
+        .unwrap();
+        assert_eq!(row.title, "");
+        assert_eq!(row.calls, 2);
+        assert_eq!(row.cache_hit_ratio, 0.0);
+    }
+
+    #[test]
+    fn epoch_family_decodes_minimal_and_legacy_payloads() {
+        let summary: CacheEpochSummary = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(summary.cache_epoch, "");
+        assert_eq!(summary.session_count, 0);
+        assert_eq!(summary.cache_hit_ratio, 0.0);
+
+        let entry: CacheEpochTimelineEntry = serde_json::from_value(json!({
+            "at": "2026-11-12T00:00:00Z",
+            "kind": "prefix",
+        }))
+        .unwrap();
+        assert!(entry.cache_epoch.is_none());
+        assert!(entry.change_reason.is_none());
+        assert_eq!(entry.at, "2026-11-12T00:00:00Z");
+
+        let bucket: CacheEpochBundleBucket = serde_json::from_value(json!({
+            "tool_bundle": "minimal",
+        }))
+        .unwrap();
+        assert_eq!(bucket.tool_bundle, "minimal");
+        assert_eq!(bucket.epochs, 0);
+        assert_eq!(bucket.cache_hit_ratio, 0.0);
+
+        let aggregate: PromptPrefixAggregate = serde_json::from_value(json!({})).unwrap();
+        assert!(aggregate.cache_epoch.is_empty());
+        assert!(aggregate.core_sections.is_empty());
+        assert_eq!(aggregate.call_count, 0);
+
+        let observation: PromptPrefixObservation = serde_json::from_value(json!({
+            "cache_epoch": "a".repeat(64),
+        }))
+        .unwrap();
+        assert_eq!(observation.calls, 0);
+        assert_eq!(observation.observed_input_tokens, 0);
+    }
+
+    #[test]
+    fn session_bundle_legacy_payload_defaults_epoch_observations() {
+        let bundle: SessionBundle = serde_json::from_value(json!({
+            "version": 1,
+            "exported_at": "2026-11-12T00:00:00Z",
+            "project": {
+                "id": "prj",
+                "name": "p",
+                "root": "/tmp/p",
+                "default_branch": "main",
+                "created_at": "2026-11-12T00:00:00Z"
+            },
+            "session": {
+                "id": "ses",
+                "project_id": "prj",
+                "goal": "g",
+                "status": "idle",
+                "priority": 0,
+                "tokens_in": 0,
+                "tokens_out": 0,
+                "unlimited": false,
+                "cost_spent_usd": 0.0,
+                "created_at": "2026-11-12T00:00:00Z"
+            },
+            "events": [],
+            "agents": [],
+            "messages": [],
+            "todos": [],
+            "merge_queue": []
+        }))
+        .unwrap();
+        assert!(bundle.prompt_prefix_observations.is_empty());
+        assert!(bundle.instructions.is_empty());
     }
 }
