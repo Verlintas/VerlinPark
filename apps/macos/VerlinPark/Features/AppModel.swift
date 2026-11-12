@@ -542,6 +542,12 @@ final class AppModel {
     var lastLanding: SessionLandResult?
     var pullRequestBusy = false
     var lastPullRequest: PullRequestResult?
+    var forgeStatus: ForgeStatus?
+    var forgeStatusBusy = false
+    var forgeStatusError: String?
+    var forgeCheckResult: ForgePreflightResult?
+    var forgeCheckBusy = false
+    var forgeCheckError: String?
     var providerKind =
         UserDefaults.standard.string(forKey: "provider.kind") ?? "openai-compatible"
     var providerBaseURL =
@@ -7784,13 +7790,45 @@ final class AppModel {
             let pullRequest = try await core.openPullRequest(sessionID: sessionID)
             lastPullRequest = pullRequest
             await loadSessions()
+            let provider = pullRequest.provider.map { "\($0) · " } ?? ""
             showToast(
-                "Pull request opened",
-                detail: pullRequest.url ?? pullRequest.branch,
+                "\(pullRequest.change ?? "PR") opened",
+                detail: provider + (pullRequest.url ?? pullRequest.branch),
                 kind: .success
             )
         } catch {
             handle(error)
+        }
+    }
+
+    /// Read-only forge inventory for Settings. Never triggers a provider call or
+    /// a push; credentials stay in the daemon environment.
+    func loadForgeStatus() async {
+        forgeStatusBusy = true
+        defer { forgeStatusBusy = false }
+        do {
+            forgeStatus = try await core.forgeStatus(projectID: selectedProjectID)
+            forgeStatusError = nil
+        } catch {
+            forgeStatusError = error.localizedDescription
+        }
+    }
+
+    /// Explicit read-only provider probe. This can contact the forge, but it
+    /// never pushes a branch or creates a pull request.
+    func checkForgeCredentials() async {
+        guard let projectID = selectedProjectID else {
+            forgeCheckError = "Select a project before checking forge credentials."
+            return
+        }
+        forgeCheckBusy = true
+        defer { forgeCheckBusy = false }
+        do {
+            forgeCheckResult = try await core.forgePreflight(projectID: projectID)
+            forgeCheckError = nil
+        } catch {
+            forgeCheckResult = nil
+            forgeCheckError = error.localizedDescription
         }
     }
 

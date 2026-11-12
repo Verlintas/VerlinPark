@@ -805,3 +805,16 @@
 "No signing key configured" = "未配置签名密钥";
 "No keyring yet" = "尚未创建密钥环";
 "No verified backup anchor yet" = "尚无已校验的备份锚点";
+"Pull requests" = "拉取请求";
+"Refresh provider status" = "刷新服务商状态";
+"Detecting origin…" = "正在检测来源…";
+"No origin detected for the selected project" = "所选项目未检测到来源";
+"unknown origin" = "未知来源";
+"unavailable" = "不可用";
+"credentials configured" = "凭据已配置";
+"credentials missing" = "缺少凭据";
+"auth checked at preflight" = "预检时检查认证";
+"Bitbucket Cloud reads BITBUCKET_TOKEN or BITBUCKET_USERNAME + BITBUCKET_APP_PASSWORD from the daemon environment. Credentials are never stored, logged, or written to events. Bitbucket Server/Data Center is not supported." = "Bitbucket Cloud 从守护进程环境读取 BITBUCKET_TOKEN 或 BITBUCKET_USERNAME + BITBUCKET_APP_PASSWORD。凭据不会存储、记录或写入事件。不支持 Bitbucket Server/Data Center。";
+"Check credentials" = "检查凭据";
+"Runs the read-only provider preflight. It never pushes a branch or opens a pull request." = "运行只读的服务商预检。不会推送分支或创建拉取请求。";
+"Preflight passed" = "预检通过";

@@ -390,7 +390,7 @@ struct PreviewPanelView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(
-                "Pushes the session branch to origin and runs gh pr create. gh must be installed and authenticated; no merge is performed locally."
+                "Pushes the session branch to origin and asks the configured forge provider to open a PR/MR. GitHub uses gh, GitLab uses glab, Gitea/Forgejo use tea, and Bitbucket Cloud uses its REST API with environment credentials. Preflight runs before the push; no merge is performed locally."
             )
         }
         .confirmationDialog(
@@ -605,8 +605,11 @@ struct PreviewPanelView: View {
                        let url = URL(string: urlString)
                     {
                         Link(destination: url) {
-                            Label("Pull request opened", systemImage: "arrow.up.right.square")
-                                .font(.system(size: 9, design: .monospaced))
+                            Label(
+                                "\(pr.change ?? "PR") opened · \(pr.provider ?? "forge")",
+                                systemImage: "arrow.up.right.square"
+                            )
+                            .font(.system(size: 9, design: .monospaced))
                         }
                         .foregroundStyle(.green)
                     }

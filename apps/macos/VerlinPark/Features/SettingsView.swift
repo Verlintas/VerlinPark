@@ -412,6 +412,140 @@ struct GeneralSettingsView: View {
                 }
 
                 VStack(alignment: .leading, spacing: 9) {
+                    SectionLabel(title: L10n.t("Pull requests"))
+                    HStack(spacing: 8) {
+                        Text(
+                            (model.forgeStatus?.defaultProvider
+                                ?? "auto").uppercased()
+                        )
+                        .font(VPTheme.mono(7, weight: .semibold))
+                        .tracking(0.5)
+                        .foregroundStyle(VPTheme.accent)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(VPTheme.accent.opacity(0.10), in: Capsule())
+                        Text(forgeOriginSummary)
+                            .font(VPTheme.mono(8))
+                            .foregroundStyle(VPTheme.textSecondary)
+                            .lineLimit(1)
+                        Spacer()
+                        if model.forgeStatusBusy {
+                            ProgressView().controlSize(.mini)
+                        }
+                        Button {
+                            Task { await model.checkForgeCredentials() }
+                        } label: {
+                            if model.forgeCheckBusy {
+                                ProgressView().controlSize(.mini)
+                            } else {
+                                Label(
+                                    L10n.t("Check credentials"),
+                                    systemImage: "checkmark.shield"
+                                )
+                                .font(VPTheme.mono(7.5, weight: .medium))
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(VPTheme.textSecondary)
+                        .help(
+                            L10n.t(
+                                "Runs the read-only provider preflight. It never pushes a branch or opens a pull request."
+                            )
+                        )
+                        Button {
+                            Task { await model.loadForgeStatus() }
+                        } label: {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.system(size: 9, weight: .semibold))
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(VPTheme.textTertiary)
+                        .help(L10n.t("Refresh provider status"))
+                    }
+                    if let status = model.forgeStatus {
+                        ForEach(status.providers) { provider in
+                            HStack(spacing: 7) {
+                                Image(
+                                    systemName: provider.supported
+                                        ? "checkmark.circle.fill"
+                                        : "minus.circle"
+                                )
+                                .font(.system(size: 8))
+                                .foregroundStyle(
+                                    provider.supported
+                                        ? VPTheme.success
+                                        : VPTheme.textTertiary
+                                )
+                                Text(provider.provider.capitalized)
+                                    .font(VPTheme.mono(8, weight: .medium))
+                                    .foregroundStyle(VPTheme.textSecondary)
+                                    .frame(width: 74, alignment: .leading)
+                                Text(provider.transport.uppercased())
+                                    .font(VPTheme.mono(6.5))
+                                    .foregroundStyle(VPTheme.textTertiary)
+                                    .frame(width: 32, alignment: .leading)
+                                Text(forgeProviderStatusLine(provider))
+                                    .font(VPTheme.mono(7.5))
+                                    .foregroundStyle(VPTheme.textTertiary)
+                                    .lineLimit(1)
+                                Spacer(minLength: 4)
+                            }
+                        }
+                        if let origin = status.origin {
+                            Text(origin.detail)
+                                .font(VPTheme.mono(7.5))
+                                .foregroundStyle(
+                                    origin.supported
+                                        ? VPTheme.textTertiary
+                                        : VPTheme.warning
+                                )
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    } else if let error = model.forgeStatusError {
+                        Text(error)
+                            .font(VPTheme.mono(7.5))
+                            .foregroundStyle(VPTheme.warning)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if let check = model.forgeCheckResult {
+                        HStack(alignment: .top, spacing: 6) {
+                            Image(systemName: "checkmark.shield.fill")
+                                .font(.system(size: 8))
+                                .foregroundStyle(VPTheme.success)
+                            Text(
+                                L10n.t("Preflight passed")
+                                    + " · \(check.provider) \(check.changeName) · "
+                                    + (check.repository ?? "-")
+                                    + " · \(check.auth)"
+                            )
+                            .font(VPTheme.mono(7.5))
+                            .foregroundStyle(VPTheme.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    if let error = model.forgeCheckError {
+                        Text(error)
+                            .font(VPTheme.mono(7.5))
+                            .foregroundStyle(VPTheme.warning)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Text(
+                        L10n.t(
+                            "Bitbucket Cloud reads BITBUCKET_TOKEN or BITBUCKET_USERNAME + BITBUCKET_APP_PASSWORD from the daemon environment. Credentials are never stored, logged, or written to events. Bitbucket Server/Data Center is not supported."
+                        )
+                    )
+                    .font(VPTheme.mono(7.5))
+                    .foregroundStyle(VPTheme.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(11)
+                .background(VPTheme.surface, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .strokeBorder(VPTheme.hairline, lineWidth: 1)
+                }
+
+                VStack(alignment: .leading, spacing: 9) {
                     SectionLabel(title: L10n.t("Workspace"))
                     HStack(spacing: 14) {
                         Label(L10n.t("Isolated worktrees"), systemImage: "arrow.triangle.branch")
@@ -428,6 +562,7 @@ struct GeneralSettingsView: View {
         }
         .task {
             await model.loadApprovalGrants()
+            await model.loadForgeStatus()
         }
         .sheet(isPresented: $showSetupWizard) {
             SetupWizardView {
@@ -435,6 +570,33 @@ struct GeneralSettingsView: View {
             }
             .environment(model)
         }
+    }
+
+    private var forgeOriginSummary: String {
+        guard let status = model.forgeStatus else {
+            return L10n.t("Detecting origin…")
+        }
+        guard let origin = status.origin else {
+            return L10n.t("No origin detected for the selected project")
+        }
+        let repository = origin.repository ?? origin.host ?? L10n.t("unknown origin")
+        if origin.serverDetected {
+            return repository + " · Server unsupported"
+        }
+        return repository + (origin.supported ? "" : " · unsupported")
+    }
+
+    private func forgeProviderStatusLine(_ provider: ForgeProviderStatus) -> String {
+        if !provider.commandAvailable {
+            return L10n.t("unavailable")
+        }
+        if provider.authConfigured == true {
+            return provider.credentialSource ?? L10n.t("credentials configured")
+        }
+        if provider.authConfigured == false {
+            return L10n.t("credentials missing")
+        }
+        return L10n.t("auth checked at preflight")
     }
 
     private func widthControl(

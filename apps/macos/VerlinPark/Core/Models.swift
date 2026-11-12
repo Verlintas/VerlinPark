@@ -6429,6 +6429,10 @@ struct PullRequestResult: Codable, Sendable {
     let pushed: Bool
     let url: String?
     let detail: String
+    /// Missing on older daemons; `nil` means the provider was not reported.
+    let provider: String?
+    let repository: String?
+    let change: String?
 
     enum CodingKeys: String, CodingKey {
         case sessionId = "session_id"
@@ -6437,6 +6441,157 @@ struct PullRequestResult: Codable, Sendable {
         case pushed
         case url
         case detail
+        case provider
+        case repository
+        case change
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionId = try container.decode(String.self, forKey: .sessionId)
+        branch = try container.decode(String.self, forKey: .branch)
+        baseBranch = try container.decode(String.self, forKey: .baseBranch)
+        pushed = try container.decode(Bool.self, forKey: .pushed)
+        url = try container.decodeIfPresent(String.self, forKey: .url)
+        detail = try container.decode(String.self, forKey: .detail)
+        provider = try container.decodeIfPresent(String.self, forKey: .provider)
+        repository = try container.decodeIfPresent(String.self, forKey: .repository)
+        change = try container.decodeIfPresent(String.self, forKey: .change)
+    }
+}
+
+struct ForgeProviderStatus: Codable, Sendable, Identifiable {
+    let provider: String
+    let changeName: String
+    let transport: String
+    let command: String?
+    let commandAvailable: Bool
+    let authConfigured: Bool?
+    let credentialSource: String?
+    let supported: Bool
+    let detail: String
+
+    var id: String {
+        provider
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case provider
+        case changeName = "change_name"
+        case transport
+        case command
+        case commandAvailable = "command_available"
+        case authConfigured = "auth_configured"
+        case credentialSource = "credential_source"
+        case supported
+        case detail
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        provider = try container.decode(String.self, forKey: .provider)
+        changeName = try container.decodeIfPresent(String.self, forKey: .changeName) ?? "PR"
+        transport = try container.decodeIfPresent(String.self, forKey: .transport) ?? "cli"
+        command = try container.decodeIfPresent(String.self, forKey: .command)
+        commandAvailable = try container.decodeIfPresent(Bool.self, forKey: .commandAvailable)
+            ?? false
+        authConfigured = try container.decodeIfPresent(Bool.self, forKey: .authConfigured)
+        credentialSource = try container.decodeIfPresent(
+            String.self,
+            forKey: .credentialSource
+        )
+        supported = try container.decodeIfPresent(Bool.self, forKey: .supported) ?? false
+        detail = try container.decodeIfPresent(String.self, forKey: .detail) ?? ""
+    }
+}
+
+struct ForgeOriginStatus: Codable, Sendable {
+    let host: String?
+    let provider: String?
+    let repository: String?
+    let supported: Bool
+    let serverDetected: Bool
+    let detail: String
+
+    enum CodingKeys: String, CodingKey {
+        case host
+        case provider
+        case repository
+        case supported
+        case serverDetected = "server_detected"
+        case detail
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        host = try container.decodeIfPresent(String.self, forKey: .host)
+        provider = try container.decodeIfPresent(String.self, forKey: .provider)
+        repository = try container.decodeIfPresent(String.self, forKey: .repository)
+        supported = try container.decodeIfPresent(Bool.self, forKey: .supported) ?? false
+        serverDetected = try container.decodeIfPresent(Bool.self, forKey: .serverDetected)
+            ?? false
+        detail = try container.decodeIfPresent(String.self, forKey: .detail) ?? ""
+    }
+}
+
+struct ForgeStatus: Codable, Sendable {
+    let providerOverride: String?
+    let defaultProvider: String
+    let origin: ForgeOriginStatus?
+    let providers: [ForgeProviderStatus]
+    let detail: String
+
+    enum CodingKeys: String, CodingKey {
+        case providerOverride = "provider_override"
+        case defaultProvider = "default_provider"
+        case origin
+        case providers
+        case detail
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        providerOverride = try container.decodeIfPresent(
+            String.self,
+            forKey: .providerOverride
+        )
+        defaultProvider = try container.decodeIfPresent(String.self, forKey: .defaultProvider)
+            ?? "github"
+        origin = try container.decodeIfPresent(ForgeOriginStatus.self, forKey: .origin)
+        providers = try container.decodeIfPresent(
+            [ForgeProviderStatus].self,
+            forKey: .providers
+        ) ?? []
+        detail = try container.decodeIfPresent(String.self, forKey: .detail) ?? ""
+    }
+
+    var bitbucket: ForgeProviderStatus? {
+        providers.first { $0.provider == "bitbucket" }
+    }
+}
+
+struct ForgePreflightResult: Codable, Sendable {
+    let provider: String
+    let changeName: String
+    let repository: String?
+    let auth: String
+    let detail: String
+
+    enum CodingKeys: String, CodingKey {
+        case provider
+        case changeName = "change_name"
+        case repository
+        case auth
+        case detail
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        provider = try container.decode(String.self, forKey: .provider)
+        changeName = try container.decodeIfPresent(String.self, forKey: .changeName) ?? "PR"
+        repository = try container.decodeIfPresent(String.self, forKey: .repository)
+        auth = try container.decodeIfPresent(String.self, forKey: .auth) ?? "unknown"
+        detail = try container.decodeIfPresent(String.self, forKey: .detail) ?? ""
     }
 }
 

@@ -7466,6 +7466,11 @@ pub struct SessionLandResult {
 #[derive(Debug, Clone, Deserialize)]
 pub struct OpenPullRequestParams {
     pub session_id: String,
+    /// Explicit provider (`github`, `gitlab`, `gitea`/`forgejo`, `bitbucket`).
+    /// Older clients omit this and the daemon uses `VERLINPARK_PR_PROVIDER` or
+    /// origin detection.
+    #[serde(default)]
+    pub provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7476,6 +7481,96 @@ pub struct PullRequestResult {
     pub pushed: bool,
     #[serde(default)]
     pub url: Option<String>,
+    pub detail: String,
+    /// Stable forge id (`github`, `gitlab`, `gitea`, `bitbucket`). Older
+    /// daemons/clients omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// `owner/repository` when the origin was parseable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    /// `PR` or `MR`, matching the provider's terminology.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change: Option<String>,
+}
+
+/// Optional project context for `forge.status`. Omitting it reports the global
+/// provider/credential inventory without an origin inspection.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ForgeStatusParams {
+    #[serde(default)]
+    pub project_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForgeProviderStatus {
+    pub provider: String,
+    pub change_name: String,
+    pub transport: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub command_available: bool,
+    /// `Some` only when the daemon can decide from configuration alone
+    /// (Bitbucket Cloud). CLI providers report `None` until preflight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_configured: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_source: Option<String>,
+    #[serde(default)]
+    pub supported: bool,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForgeOriginStatus {
+    /// Sanitized origin identity (host and repository only, never userinfo).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    #[serde(default)]
+    pub supported: bool,
+    /// True when the origin looks like Bitbucket Server/Data Center.
+    #[serde(default)]
+    pub server_detected: bool,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForgeStatusResult {
+    /// Raw `VERLINPARK_PR_PROVIDER` selection, if set. This is a provider name,
+    /// never a credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_override: Option<String>,
+    /// Provider that would be used for the detected origin.
+    pub default_provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<ForgeOriginStatus>,
+    pub providers: Vec<ForgeProviderStatus>,
+    pub detail: String,
+}
+
+/// Explicit read-only credential/repository probe for one project. It never
+/// pushes a branch or creates a pull request.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ForgePreflightParams {
+    pub project_id: String,
+    /// Optional explicit provider; otherwise the daemon env/origin decides.
+    #[serde(default)]
+    pub provider: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForgePreflightResult {
+    pub provider: String,
+    pub change_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    /// `basic`, `bearer`, or `cli`. This is an auth mode, never a secret.
+    pub auth: String,
     pub detail: String,
 }
 
@@ -14362,5 +14457,188 @@ mod backup_status_revocation_tests {
         .unwrap();
         assert!(anchor.origin.is_none());
         assert_eq!(anchor.last_operation, "anchor_import");
+    }
+}
+
+#[cfg(test)]
+mod forge_protocol_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn open_pull_request_params_keep_legacy_decode() {
+        let legacy: OpenPullRequestParams =
+            serde_json::from_value(json!({"session_id": "ses-1"})).unwrap();
+        assert_eq!(legacy.session_id, "ses-1");
+        assert_eq!(legacy.provider, None);
+
+        let explicit: OpenPullRequestParams =
+            serde_json::from_value(json!({"session_id": "ses-1", "provider": "bitbucket"}))
+                .unwrap();
+        assert_eq!(explicit.provider.as_deref(), Some("bitbucket"));
+    }
+
+    #[test]
+    fn pull_request_result_decodes_without_new_fields() {
+        let legacy = json!({
+            "session_id": "ses-1",
+            "branch": "feature",
+            "base_branch": "main",
+            "pushed": true,
+            "url": "https://example.test/pr/1",
+            "detail": "opened"
+        });
+        let result: PullRequestResult = serde_json::from_value(legacy).unwrap();
+        assert_eq!(result.session_id, "ses-1");
+        assert_eq!(result.provider, None);
+        assert_eq!(result.repository, None);
+        assert_eq!(result.change, None);
+
+        let current = PullRequestResult {
+            session_id: "ses-1".into(),
+            branch: "feature".into(),
+            base_branch: "main".into(),
+            pushed: true,
+            url: Some("https://bitbucket.org/acme/widgets/pull-requests/7".into()),
+            detail: "opened".into(),
+            provider: Some("bitbucket".into()),
+            repository: Some("acme/widgets".into()),
+            change: Some("PR".into()),
+        };
+        let encoded = serde_json::to_value(&current).unwrap();
+        assert_eq!(encoded["provider"], "bitbucket");
+        assert_eq!(encoded["repository"], "acme/widgets");
+        assert_eq!(encoded["change"], "PR");
+        let decoded: PullRequestResult = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.provider.as_deref(), Some("bitbucket"));
+    }
+
+    #[test]
+    fn forge_status_params_default_without_project() {
+        let params: ForgeStatusParams = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(params.project_id, None);
+        let params: ForgeStatusParams =
+            serde_json::from_value(json!({"project_id": "prj-1"})).unwrap();
+        assert_eq!(params.project_id.as_deref(), Some("prj-1"));
+    }
+
+    #[test]
+    fn forge_status_result_round_trips_and_defaults_missing_fields() {
+        let status = ForgeStatusResult {
+            provider_override: Some("bitbucket".into()),
+            default_provider: "bitbucket".into(),
+            origin: Some(ForgeOriginStatus {
+                host: Some("bitbucket.org".into()),
+                provider: Some("bitbucket".into()),
+                repository: Some("acme/widgets".into()),
+                supported: true,
+                server_detected: false,
+                detail: "Bitbucket Cloud origin detected".into(),
+            }),
+            providers: vec![ForgeProviderStatus {
+                provider: "bitbucket".into(),
+                change_name: "PR".into(),
+                transport: "rest".into(),
+                command: None,
+                command_available: true,
+                auth_configured: Some(true),
+                credential_source: Some("BITBUCKET_TOKEN".into()),
+                supported: true,
+                detail: "credentials configured".into(),
+            }],
+            detail: "selected bitbucket".into(),
+        };
+        let value = serde_json::to_value(&status).unwrap();
+        let decoded: ForgeStatusResult = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.default_provider, "bitbucket");
+        assert_eq!(decoded.providers.len(), 1);
+        assert_eq!(decoded.providers[0].auth_configured, Some(true));
+
+        let minimal: ForgeStatusResult = serde_json::from_value(json!({
+            "default_provider": "github",
+            "providers": [],
+            "detail": "fallback"
+        }))
+        .unwrap();
+        assert_eq!(minimal.provider_override, None);
+        assert!(minimal.origin.is_none());
+    }
+
+    #[test]
+    fn forge_preflight_params_and_result_round_trip() {
+        let params: ForgePreflightParams =
+            serde_json::from_value(json!({"project_id": "prj-1"})).unwrap();
+        assert_eq!(params.project_id, "prj-1");
+        assert_eq!(params.provider, None);
+        let params: ForgePreflightParams =
+            serde_json::from_value(json!({"project_id": "prj-1", "provider": "bitbucket"}))
+                .unwrap();
+        assert_eq!(params.provider.as_deref(), Some("bitbucket"));
+
+        let result = ForgePreflightResult {
+            provider: "bitbucket".into(),
+            change_name: "PR".into(),
+            repository: Some("acme/widgets".into()),
+            auth: "bearer".into(),
+            detail: "Bitbucket Cloud credentials accepted".into(),
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["auth"], "bearer");
+        assert_eq!(value["repository"], "acme/widgets");
+        let decoded: ForgePreflightResult = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.provider, "bitbucket");
+
+        let minimal: ForgePreflightResult = serde_json::from_value(json!({
+            "provider": "github",
+            "change_name": "PR",
+            "auth": "cli",
+            "detail": "gh auth check passed"
+        }))
+        .unwrap();
+        assert!(minimal.repository.is_none());
+    }
+
+    #[test]
+    fn forge_origin_status_defaults_conservatively() {
+        let minimal: ForgeOriginStatus = serde_json::from_value(json!({
+            "detail": "not inspected"
+        }))
+        .unwrap();
+        assert_eq!(minimal.host, None);
+        assert_eq!(minimal.provider, None);
+        assert_eq!(minimal.repository, None);
+        assert!(!minimal.supported);
+        assert!(!minimal.server_detected);
+
+        let server: ForgeOriginStatus = serde_json::from_value(json!({
+            "host": "bitbucket.example.com",
+            "supported": false,
+            "server_detected": true,
+            "detail": "Bitbucket Server/Data Center is not supported"
+        }))
+        .unwrap();
+        assert!(server.server_detected);
+        assert!(!server.supported);
+        let encoded = serde_json::to_value(&server).unwrap();
+        assert_eq!(encoded["server_detected"], true);
+    }
+
+    #[test]
+    fn forge_status_rows_are_bounded_and_secret_free_by_shape() {
+        let row = ForgeProviderStatus {
+            provider: "bitbucket".into(),
+            change_name: "PR".into(),
+            transport: "rest".into(),
+            command: None,
+            command_available: true,
+            auth_configured: Some(false),
+            credential_source: None,
+            supported: true,
+            detail: "Bitbucket credentials are not configured".into(),
+        };
+        let value = serde_json::to_value(row).unwrap();
+        assert!(value.get("command").is_none());
+        assert!(value.get("credential_source").is_none());
+        assert!(value.get("auth_configured").is_some());
     }
 }

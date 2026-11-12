@@ -132,7 +132,7 @@ pub fn render_code_detail(code: ToolErrorCode) -> String {
 /// Bounded table of all codes, grouped by category. Used by `tool_help` so an
 /// agent can look up a code without guessing or parsing an ADR.
 pub fn render_catalog(max_chars: usize) -> String {
-    let max_chars = max_chars.clamp(500, 20_000);
+    let max_chars = max_chars.clamp(500, 24_000);
     let mut entries = catalog();
     entries.sort_by(|left, right| {
         left.category
@@ -496,6 +496,28 @@ tool_error_codes! {
     ACP_AGENT_FAILED => "ACP_AGENT_FAILED", false, "acp", "Inspect the external agent stderr/report; do not retry an unchanged session.";
     ACP_TOOL_FAILED => "ACP_TOOL_FAILED", false, "acp", "Inspect the external tool result; the ACP agent owns its own tools.";
     SUBAGENT_FAILED => "SUBAGENT_FAILED", false, "acp", "Inspect the child agent summary and task state before delegating again.";
+
+    // Forge and pull-request providers
+    FORGE_UNSUPPORTED_PROVIDER => "FORGE_UNSUPPORTED_PROVIDER", false, "forge", "Use github, gitlab, gitea/forgejo, or bitbucket; provider names are exact.";
+    FORGE_ORIGIN_UNSUPPORTED => "FORGE_ORIGIN_UNSUPPORTED", false, "forge", "Use a supported HTTPS or SSH origin, or pass an explicit provider with a provider-compatible repository.";
+    FORGE_SERVER_UNSUPPORTED => "FORGE_SERVER_UNSUPPORTED", false, "forge", "Only Bitbucket Cloud (bitbucket.org) is supported; Bitbucket Server/Data Center requires a different API and is not implemented.";
+    FORGE_AUTH_MISSING => "FORGE_AUTH_MISSING", false, "forge", "Configure the provider credentials in the daemon environment; VerlinPark never stores forge secrets.";
+    FORGE_AUTH_CONFLICT => "FORGE_AUTH_CONFLICT", false, "forge", "Set either BITBUCKET_TOKEN or BITBUCKET_USERNAME + BITBUCKET_APP_PASSWORD, not both.";
+    FORGE_AUTH_FAILED => "FORGE_AUTH_FAILED", false, "forge", "Check the provider credentials and repository access; do not retry rejected credentials unchanged.";
+    FORGE_PERMISSION_DENIED => "FORGE_PERMISSION_DENIED", false, "forge", "Grant the token repository write access or use an account that can create pull requests.";
+    FORGE_REPO_NOT_FOUND => "FORGE_REPO_NOT_FOUND", false, "forge", "Verify the workspace and repository slug and that the credentials can see the repository.";
+    FORGE_CONFLICT => "FORGE_CONFLICT", false, "forge", "Open or update the existing pull request instead of creating a duplicate; inspect the reported conflict.";
+    FORGE_RATE_LIMITED => "FORGE_RATE_LIMITED", true, "forge", "Wait for the provider retry window, then repeat the operation explicitly; no automatic retry is performed.";
+    FORGE_SERVICE_UNAVAILABLE => "FORGE_SERVICE_UNAVAILABLE", true, "forge", "Retry once after the provider recovers; a failed create may have reached the server, so check for an existing request first.";
+    FORGE_TIMEOUT => "FORGE_TIMEOUT", true, "forge", "Check whether the request reached the forge before retrying; a timed-out create may have succeeded server-side.";
+    FORGE_NETWORK_FAILED => "FORGE_NETWORK_FAILED", true, "forge", "Check DNS, proxy, and network access to the provider; a connection that never opened has no remote side effect.";
+    FORGE_RESPONSE_INVALID => "FORGE_RESPONSE_INVALID", false, "forge", "Treat the forge response as untrusted; verify the pull request on the provider before retrying.";
+    FORGE_RESPONSE_TOO_LARGE => "FORGE_RESPONSE_TOO_LARGE", false, "forge", "The forge response exceeded the bounded client limit; inspect the provider directly rather than retrying blindly.";
+    FORGE_REDIRECT_REFUSED => "FORGE_REDIRECT_REFUSED", false, "forge", "The forge attempted a cross-origin redirect; use the documented API host and do not follow redirects with credentials.";
+    FORGE_REQUEST_REJECTED => "FORGE_REQUEST_REJECTED", false, "forge", "Read the provider error message and correct the repository, branch, or request payload.";
+    FORGE_REQUEST_INVALID => "FORGE_REQUEST_INVALID", false, "forge", "Use a non-empty bounded title, description, and branch names without control characters.";
+    FORGE_CLI_UNAVAILABLE => "FORGE_CLI_UNAVAILABLE", false, "forge", "Install and authenticate the provider CLI, or configure a supported REST provider.";
+    FORGE_CONFIG_INVALID => "FORGE_CONFIG_INVALID", false, "forge", "Inspect the forge client configuration; invalid API or web base URLs fail closed.";
 }
 
 impl ToolErrorCode {
@@ -1025,7 +1047,7 @@ fn redact_secrets(text: &str) -> String {
         Regex::new(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s@]+@").expect("validated URL userinfo regex")
     });
     let token_shape = TOKEN_SHAPE.get_or_init(|| {
-        Regex::new(r"\b(sk-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|xox[baprs]-[A-Za-z0-9-]{8,}|AKIA[0-9A-Z]{12,})\b")
+        Regex::new(r"\b(sk-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|xox[baprs]-[A-Za-z0-9-]{8,}|AKIA[0-9A-Z]{12,}|ATATT[A-Za-z0-9_=-]{8,}|ATBB[A-Za-z0-9_=-]{8,})\b")
             .expect("validated token shape regex")
     });
     let redacted = assignment.replace_all(text, "$1=[redacted]");
@@ -1034,6 +1056,13 @@ fn redact_secrets(text: &str) -> String {
     token_shape
         .replace_all(&redacted, "[redacted-token]")
         .to_string()
+}
+
+/// Redact common credential shapes from text that is about to enter a log,
+/// event, error, or structured failure. This is a defense-in-depth filter, not
+/// a substitute for never placing secrets in those surfaces.
+pub(crate) fn redact_secrets_for_display(text: &str) -> String {
+    redact_secrets(text)
 }
 
 fn truncate_chars(text: &str, max_chars: usize) -> String {
@@ -1576,12 +1605,12 @@ mod tests {
         assert!(detail.contains("Take a fresh snapshot"));
         assert!(detail.contains("static contract"));
 
-        let catalog = render_catalog(20_000);
+        let catalog = render_catalog(24_000);
         assert!(catalog.contains("[file]"));
         assert!(catalog.contains("[remote]"));
         assert!(catalog.contains("PATCH_CONFLICT (retryable)"));
         assert!(catalog.contains("TOOL_FAILED"));
-        assert!(catalog.chars().count() <= 20_000);
+        assert!(catalog.chars().count() <= 24_000);
         let tiny = render_catalog(700);
         assert!(tiny.chars().count() <= 700);
         assert!(tiny.contains("Tool error codes"));
@@ -1589,7 +1618,7 @@ mod tests {
 
     #[test]
     fn rendered_catalog_names_every_code_and_category() {
-        let rendered = render_catalog(20_000);
+        let rendered = render_catalog(24_000);
         for code in ToolErrorCode::ALL {
             assert!(
                 rendered.contains(code.as_str()),

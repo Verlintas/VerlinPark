@@ -2065,6 +2065,12 @@ impl EnvGuard {
         unsafe { std::env::set_var(key, value) };
         Self { key, previous }
     }
+
+    fn remove(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe { std::env::remove_var(key) };
+        Self { key, previous }
+    }
 }
 
 impl Drop for EnvGuard {
@@ -2261,6 +2267,587 @@ async fn gitea_login_failure_is_clear_and_does_not_push() {
         .await
         .unwrap();
     assert!(!events.iter().any(|event| event.kind == "session.pushed"));
+    assert!(!events.iter().any(|event| event.kind == "session.pr_opened"));
+}
+
+fn bitbucket_test_credentials(token: &str) -> crate::forge::BitbucketCredentials {
+    crate::forge::BitbucketCredentials::from_lookup(|name| match name {
+        "BITBUCKET_TOKEN" => Some(token.to_string()),
+        _ => None,
+    })
+    .unwrap()
+}
+
+fn bitbucket_target() -> crate::forge::ForgeTarget {
+    crate::forge::ForgeTarget {
+        provider: PrCli::BitbucketCloud,
+        origin: Some(crate::forge::parse_origin("https://bitbucket.org/acme/widgets.git").unwrap()),
+        selected_by: crate::forge::ForgeSelectionSource::Explicit,
+    }
+}
+
+#[tokio::test]
+async fn opens_a_bitbucket_cloud_pull_request_after_preflight_and_push() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _lock = PR_ENV_LOCK.lock().await;
+    let fixture = pr_fixture("bitbucket-cloud").await;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.0/repositories/acme/widgets"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "full_name": "acme/widgets"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2.0/repositories/acme/widgets/pullrequests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": 42,
+            "title": "PR me",
+            "state": "OPEN",
+            "links": {"html": {"href": format!("{}/acme/widgets/pull-requests/42", server.uri())}}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = crate::forge::BitbucketCloudClient::for_test(
+        &format!("{}/2.0/", server.uri()),
+        &format!("{}/", server.uri()),
+        bitbucket_test_credentials("ATATT3xFfGF0engineToken1234567890"),
+        Duration::from_secs(5),
+        16 * 1024,
+    )
+    .unwrap();
+    let provider = crate::forge::BitbucketCloudProvider::new(client);
+
+    let result = fixture
+        .engine
+        .open_pull_request_with_target(
+            &fixture.session.id,
+            bitbucket_target(),
+            Some(provider),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(result.pushed);
+    assert_eq!(result.provider.as_deref(), Some("bitbucket"));
+    assert_eq!(result.repository.as_deref(), Some("acme/widgets"));
+    assert_eq!(result.change.as_deref(), Some("PR"));
+    assert_eq!(
+        result.url.as_deref(),
+        Some(format!("{}/acme/widgets/pull-requests/42", server.uri()).as_str())
+    );
+    assert!(result.detail.contains("Bitbucket Cloud"));
+
+    let branch = fixture.session.branch.clone().unwrap();
+    let remote_ref = Command::new("git")
+        .arg("--git-dir")
+        .arg(fixture._remote.path())
+        .args(["rev-parse", &format!("refs/heads/{branch}")])
+        .output()
+        .unwrap();
+    assert!(remote_ref.status.success());
+
+    let events = fixture
+        .engine
+        .list_events(fixture.session.id.clone(), 0, 100)
+        .await
+        .unwrap();
+    let pushed = events
+        .iter()
+        .find(|event| event.kind == "session.pushed")
+        .unwrap();
+    assert_eq!(pushed.payload["provider"], "bitbucket");
+    assert_eq!(pushed.payload["repository"], "acme/widgets");
+    let opened = events
+        .iter()
+        .find(|event| event.kind == "session.pr_opened")
+        .unwrap();
+    assert_eq!(opened.payload["provider"], "bitbucket");
+    assert_eq!(opened.payload["change"], "PR");
+    assert_eq!(opened.payload["change_id"], 42);
+    let serialized = serde_json::to_string(&events).unwrap();
+    assert!(!serialized.contains("engineToken"), "{serialized}");
+}
+
+#[tokio::test]
+async fn bitbucket_preflight_failure_does_not_push_or_leak_the_token() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _lock = PR_ENV_LOCK.lock().await;
+    let fixture = pr_fixture("bitbucket-auth").await;
+    let secret = "ATATT3xFfGF0doNotLeakThisToken123456";
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.0/repositories/acme/widgets"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": {"message": format!("rejected bearer {secret}")}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = crate::forge::BitbucketCloudClient::for_test(
+        &format!("{}/2.0/", server.uri()),
+        &format!("{}/", server.uri()),
+        bitbucket_test_credentials(secret),
+        Duration::from_secs(5),
+        16 * 1024,
+    )
+    .unwrap();
+    let provider = crate::forge::BitbucketCloudProvider::new(client);
+
+    let error = fixture
+        .engine
+        .open_pull_request_with_target(
+            &fixture.session.id,
+            bitbucket_target(),
+            Some(provider),
+            None,
+        )
+        .await
+        .unwrap_err();
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("FORGE_AUTH_FAILED"), "{rendered}");
+    assert!(!rendered.contains(secret), "{rendered}");
+
+    let branch = fixture.session.branch.clone().unwrap();
+    let remote_ref = Command::new("git")
+        .arg("--git-dir")
+        .arg(fixture._remote.path())
+        .args(["rev-parse", &format!("refs/heads/{branch}")])
+        .output()
+        .unwrap();
+    assert!(!remote_ref.status.success());
+    let events = fixture
+        .engine
+        .list_events(fixture.session.id.clone(), 0, 100)
+        .await
+        .unwrap();
+    assert!(!events.iter().any(|event| event.kind == "session.pushed"));
+    assert!(!events.iter().any(|event| event.kind == "session.pr_opened"));
+    let serialized = serde_json::to_string(&events).unwrap();
+    assert!(!serialized.contains(secret), "{serialized}");
+}
+
+#[tokio::test]
+async fn bitbucket_create_conflict_after_push_is_typed_and_has_no_pr_event() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _lock = PR_ENV_LOCK.lock().await;
+    let fixture = pr_fixture("bitbucket-conflict").await;
+    let secret = "ATATT3xFfGF0conflictToken1234567890";
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.0/repositories/acme/widgets"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "full_name": "acme/widgets"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2.0/repositories/acme/widgets/pullrequests"))
+        .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+            "error": {"message": "A pull request for this branch already exists"}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = crate::forge::BitbucketCloudClient::for_test(
+        &format!("{}/2.0/", server.uri()),
+        &format!("{}/", server.uri()),
+        bitbucket_test_credentials(secret),
+        Duration::from_secs(5),
+        16 * 1024,
+    )
+    .unwrap();
+    let provider = crate::forge::BitbucketCloudProvider::new(client);
+
+    let error = fixture
+        .engine
+        .open_pull_request_with_target(
+            &fixture.session.id,
+            bitbucket_target(),
+            Some(provider),
+            None,
+        )
+        .await
+        .unwrap_err();
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("FORGE_CONFLICT"), "{rendered}");
+    assert!(rendered.contains("branch pushed, but"), "{rendered}");
+    assert!(rendered.contains("already exists"), "{rendered}");
+    assert!(!rendered.contains(secret), "{rendered}");
+
+    let branch = fixture.session.branch.clone().unwrap();
+    let remote_ref = Command::new("git")
+        .arg("--git-dir")
+        .arg(fixture._remote.path())
+        .args(["rev-parse", &format!("refs/heads/{branch}")])
+        .output()
+        .unwrap();
+    assert!(remote_ref.status.success());
+    let events = fixture
+        .engine
+        .list_events(fixture.session.id.clone(), 0, 100)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| event.kind == "session.pushed"));
+    assert!(!events.iter().any(|event| event.kind == "session.pr_opened"));
+    let serialized = serde_json::to_string(&events).unwrap();
+    assert!(!serialized.contains(secret), "{serialized}");
+}
+
+#[tokio::test]
+async fn forge_status_reports_detected_bitbucket_without_secret_values() {
+    let _lock = PR_ENV_LOCK.lock().await;
+    let _token = EnvGuard::set("BITBUCKET_TOKEN", "ATATT3xFfGF0statusSecret1234567890");
+    let _username = EnvGuard::remove("BITBUCKET_USERNAME");
+    let _password = EnvGuard::remove("BITBUCKET_APP_PASSWORD");
+    let _provider = EnvGuard::remove("VERLINPARK_PR_PROVIDER");
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "https://bitbucket.org/acme/widgets.git",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("status".into()),
+        )
+        .await
+        .unwrap();
+
+    let status = engine.forge_status(Some(project.id)).await.unwrap();
+    assert_eq!(status.default_provider, "bitbucket");
+    assert_eq!(status.provider_override, None);
+    let origin = status.origin.clone().unwrap();
+    assert_eq!(origin.provider.as_deref(), Some("bitbucket"));
+    assert_eq!(origin.repository.as_deref(), Some("acme/widgets"));
+    assert!(origin.supported);
+    let bitbucket = status
+        .providers
+        .iter()
+        .find(|provider| provider.provider == "bitbucket")
+        .unwrap();
+    assert_eq!(bitbucket.auth_configured, Some(true));
+    assert_eq!(
+        bitbucket.credential_source.as_deref(),
+        Some("BITBUCKET_TOKEN")
+    );
+    let serialized = serde_json::to_string(&status).unwrap();
+    assert!(!serialized.contains("statusSecret"), "{serialized}");
+}
+
+#[tokio::test]
+async fn forge_status_reports_github_enterprise_origin_metadata() {
+    let _lock = PR_ENV_LOCK.lock().await;
+    let _provider = EnvGuard::remove("VERLINPARK_PR_PROVIDER");
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "git@github.example.com:acme/widgets.git",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("ghe".into()),
+        )
+        .await
+        .unwrap();
+
+    let status = engine.forge_status(Some(project.id)).await.unwrap();
+    assert_eq!(status.default_provider, "github");
+    let origin = status.origin.unwrap();
+    assert_eq!(origin.provider.as_deref(), Some("github"));
+    assert_eq!(origin.host.as_deref(), Some("github.example.com"));
+    assert_eq!(origin.repository.as_deref(), Some("acme/widgets"));
+    assert!(origin.supported);
+}
+
+#[tokio::test]
+async fn forge_status_without_a_project_reports_the_global_inventory() {
+    let _lock = PR_ENV_LOCK.lock().await;
+    let _provider = EnvGuard::remove("VERLINPARK_PR_PROVIDER");
+    let engine = Engine::new(Store::open(TempDir::new().unwrap().path()).unwrap());
+    let status = engine.forge_status(None).await.unwrap();
+    assert_eq!(status.default_provider, "github");
+    assert!(status.origin.is_none());
+    assert_eq!(status.providers.len(), 4);
+    assert!(
+        status
+            .providers
+            .iter()
+            .any(|provider| provider.provider == "bitbucket" && provider.transport == "rest")
+    );
+    assert!(status.detail.contains("no provider override"));
+}
+
+#[tokio::test]
+async fn forge_status_reports_an_invalid_provider_override() {
+    let _lock = PR_ENV_LOCK.lock().await;
+    let _provider = EnvGuard::set("VERLINPARK_PR_PROVIDER", "sourcehut");
+    let engine = Engine::new(Store::open(TempDir::new().unwrap().path()).unwrap());
+    let status = engine.forge_status(None).await.unwrap();
+    assert_eq!(status.provider_override.as_deref(), Some("sourcehut"));
+    assert_eq!(status.default_provider, "github");
+    assert!(status.detail.contains("is invalid"), "{}", status.detail);
+    assert!(
+        status.detail.contains("FORGE_UNSUPPORTED_PROVIDER")
+            || status.detail.contains("unsupported")
+    );
+}
+
+#[tokio::test]
+async fn forge_preflight_runs_the_cli_auth_check_without_pushing() {
+    let _lock = PR_ENV_LOCK.lock().await;
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let remote = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let status = Command::new("git")
+        .args(["init", "--bare", "-q"])
+        .arg(remote.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["remote", "add", "origin", remote.path().to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let tea = data.path().join("fake-tea");
+    write_executable(
+        &tea,
+        "#!/bin/sh\nif [ \"$1\" = \"login\" ]; then exit 0; fi\nexit 1\n",
+    );
+    let _bin = EnvGuard::set("VERLINPARK_TEA_BIN", tea.to_str().unwrap());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("preflight".into()),
+        )
+        .await
+        .unwrap();
+
+    let result = engine
+        .forge_preflight(&project.id, Some("gitea"))
+        .await
+        .unwrap();
+    assert_eq!(result.provider, "gitea");
+    assert_eq!(result.change_name, "PR");
+    assert_eq!(result.auth, "cli");
+    assert!(result.repository.is_none());
+    assert!(result.detail.contains("authentication check passed"));
+}
+
+#[tokio::test]
+async fn forge_preflight_reports_cli_auth_failure_before_any_push() {
+    let _lock = PR_ENV_LOCK.lock().await;
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let remote = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let status = Command::new("git")
+        .args(["init", "--bare", "-q"])
+        .arg(remote.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["remote", "add", "origin", remote.path().to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let tea = data.path().join("fake-tea");
+    write_executable(
+        &tea,
+        "#!/bin/sh\nif [ \"$1\" = \"login\" ]; then echo 'no login found' >&2; exit 1; fi\nexit 1\n",
+    );
+    let _bin = EnvGuard::set("VERLINPARK_TEA_BIN", tea.to_str().unwrap());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("preflight-fail".into()),
+        )
+        .await
+        .unwrap();
+
+    let error = engine
+        .forge_preflight(&project.id, Some("gitea"))
+        .await
+        .unwrap_err();
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("FORGE_AUTH_FAILED"), "{rendered}");
+    assert!(rendered.contains("tea is not authenticated"), "{rendered}");
+}
+
+#[tokio::test]
+async fn forge_preflight_uses_the_bounded_bitbucket_read_only_request() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "https://bitbucket.org/acme/widgets.git",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.0/repositories/acme/widgets"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "full_name": "acme/widgets"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = crate::forge::BitbucketCloudClient::for_test(
+        &format!("{}/2.0/", server.uri()),
+        &format!("{}/", server.uri()),
+        bitbucket_test_credentials("ATATT3xFfGF0preflightToken123456789"),
+        Duration::from_secs(5),
+        16 * 1024,
+    )
+    .unwrap();
+    let provider = crate::forge::BitbucketCloudProvider::new(client);
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let target = crate::forge::ForgeTarget {
+        provider: PrCli::BitbucketCloud,
+        origin: Some(crate::forge::parse_origin("https://bitbucket.org/acme/widgets.git").unwrap()),
+        selected_by: crate::forge::ForgeSelectionSource::Explicit,
+    };
+
+    let result = engine
+        .run_forge_preflight(&target, &provider)
+        .await
+        .unwrap();
+    assert_eq!(result.provider, "bitbucket");
+    assert_eq!(result.repository.as_deref(), Some("acme/widgets"));
+    assert_eq!(result.auth, "bearer");
+    assert!(result.detail.contains("credentials accepted"));
+}
+
+#[tokio::test]
+async fn github_auth_failure_does_not_push_or_open_a_pull_request() {
+    let _lock = PR_ENV_LOCK.lock().await;
+    let fixture = pr_fixture("github-auth").await;
+    let gh = fixture._data.path().join("fake-gh");
+    write_executable(
+        &gh,
+        "#!/bin/sh\nif [ \"$1\" = \"auth\" ]; then echo 'not logged in' >&2; exit 1; fi\nexit 1\n",
+    );
+    let _provider = EnvGuard::set("VERLINPARK_PR_PROVIDER", "github");
+    let _bin = EnvGuard::set("VERLINPARK_GH_BIN", gh.to_str().unwrap());
+
+    let error = fixture
+        .engine
+        .open_pull_request(&fixture.session.id)
+        .await
+        .unwrap_err();
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("gh is not authenticated"), "{rendered}");
+
+    let branch = fixture.session.branch.clone().unwrap();
+    let remote_ref = Command::new("git")
+        .arg("--git-dir")
+        .arg(fixture._remote.path())
+        .args(["rev-parse", &format!("refs/heads/{branch}")])
+        .output()
+        .unwrap();
+    assert!(!remote_ref.status.success());
+    let events = fixture
+        .engine
+        .list_events(fixture.session.id.clone(), 0, 100)
+        .await
+        .unwrap();
+    assert!(!events.iter().any(|event| event.kind == "session.pushed"));
+    assert!(!events.iter().any(|event| event.kind == "session.pr_opened"));
+}
+
+#[tokio::test]
+async fn cli_create_failure_after_push_is_honest_and_has_no_pr_event() {
+    let _lock = PR_ENV_LOCK.lock().await;
+    let fixture = pr_fixture("github-create-fail").await;
+    let gh = fixture._data.path().join("fake-gh");
+    write_executable(
+        &gh,
+        "#!/bin/sh\nif [ \"$1\" = \"auth\" ]; then exit 0; fi\nif [ \"$1\" = \"pr\" ]; then echo 'remote rejected the request' >&2; exit 1; fi\nexit 1\n",
+    );
+    let _provider = EnvGuard::set("VERLINPARK_PR_PROVIDER", "github");
+    let _bin = EnvGuard::set("VERLINPARK_GH_BIN", gh.to_str().unwrap());
+
+    let error = fixture
+        .engine
+        .open_pull_request(&fixture.session.id)
+        .await
+        .unwrap_err();
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains("branch pushed, but gh pr create failed"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("remote rejected the request"),
+        "{rendered}"
+    );
+
+    let branch = fixture.session.branch.clone().unwrap();
+    let remote_ref = Command::new("git")
+        .arg("--git-dir")
+        .arg(fixture._remote.path())
+        .args(["rev-parse", &format!("refs/heads/{branch}")])
+        .output()
+        .unwrap();
+    assert!(remote_ref.status.success());
+    let events = fixture
+        .engine
+        .list_events(fixture.session.id.clone(), 0, 100)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| event.kind == "session.pushed"));
     assert!(!events.iter().any(|event| event.kind == "session.pr_opened"));
 }
 

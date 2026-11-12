@@ -30,9 +30,10 @@ use vp_protocol::types::{
     ConsoleCloseResult, ConsoleOpenResult, ConsoleReadResult, ConsoleSignalResult,
     ConsoleWriteResult, ContextCompactionSummary, ContextMeasurement, ContextUsage,
     ContinuationOutcome, CreateModelPresetParams, CriticalPathPolicy, DoctorCheck, Event,
-    GitLogResult, GitShowResult, GovernorSessionStatus, IntakeCreateParams, IntakeListResult,
-    IntakeTask, IntakeUpdateParams, IntegrationPolicy, MailboxGcResult, MailboxPolicy,
-    McpCallResult, McpGetPromptResult, McpProbeResult, McpPromptListResult, McpReadResourceResult,
+    ForgeOriginStatus, ForgePreflightResult, ForgeProviderStatus, ForgeStatusResult, GitLogResult,
+    GitShowResult, GovernorSessionStatus, IntakeCreateParams, IntakeListResult, IntakeTask,
+    IntakeUpdateParams, IntegrationPolicy, MailboxGcResult, MailboxPolicy, McpCallResult,
+    McpGetPromptResult, McpProbeResult, McpPromptListResult, McpReadResourceResult,
     McpResourceListResult, McpServer, McpServerConfig, McpServerListResult, McpToolListResult,
     MemoryBriefResult, MemoryConflict, MemoryConflictResolveResult, MemoryConflictScanResult,
     MemoryConflictsResult, MemoryDeleteResult, MemoryEmbeddingPolicy,
@@ -109,6 +110,7 @@ pub mod context;
 pub mod continuation;
 pub mod critical_path;
 mod dashboard;
+pub mod forge;
 pub mod gui;
 pub mod history;
 pub mod mcp;
@@ -653,93 +655,19 @@ fn normalize_shell_policy(mut policy: ShellPolicy) -> Result<ShellPolicy> {
     Ok(policy)
 }
 
-#[derive(Clone, Copy)]
-enum PrCli {
-    GitHub,
-    GitLab,
-    Gitea,
-}
-
-impl PrCli {
-    fn binary_name(self) -> &'static str {
-        match self {
-            Self::GitHub => "gh",
-            Self::GitLab => "glab",
-            Self::Gitea => "tea",
-        }
-    }
-
-    fn change_name(self) -> &'static str {
-        match self {
-            Self::GitHub => "PR",
-            Self::GitLab => "MR",
-            Self::Gitea => "PR",
-        }
-    }
-
-    fn auth_args(self) -> &'static [&'static str] {
-        match self {
-            Self::GitHub | Self::GitLab => &["auth", "status"],
-            Self::Gitea => &["login", "list"],
-        }
-    }
-
-    fn create_args(self, base_branch: &str, branch: &str, title: &str, body: &str) -> Vec<String> {
-        match self {
-            Self::GitHub => vec![
-                "pr".into(),
-                "create".into(),
-                "--base".into(),
-                base_branch.into(),
-                "--head".into(),
-                branch.into(),
-                "--title".into(),
-                title.into(),
-                "--body".into(),
-                body.into(),
-            ],
-            Self::GitLab => vec![
-                "mr".into(),
-                "create".into(),
-                "--source-branch".into(),
-                branch.into(),
-                "--target-branch".into(),
-                base_branch.into(),
-                "--title".into(),
-                title.into(),
-                "--description".into(),
-                body.into(),
-                "--yes".into(),
-            ],
-            Self::Gitea => vec![
-                "pr".into(),
-                "create".into(),
-                "--head".into(),
-                branch.into(),
-                "--base".into(),
-                base_branch.into(),
-                "--title".into(),
-                title.into(),
-                "--description".into(),
-                body.into(),
-            ],
-        }
-    }
-
-    fn create_label(self) -> &'static str {
-        match self {
-            Self::GitHub => "gh pr create",
-            Self::GitLab => "glab mr create",
-            Self::Gitea => "tea pr create",
-        }
-    }
-}
+/// Backward-compatible alias for the CLI provider kinds used by existing tests
+/// and callers. `ForgeProviderKind` is the single source of provider metadata.
+pub(crate) use crate::forge::ForgeProviderKind as PrCli;
 
 fn detect_pr_cli(origin: &str) -> PrCli {
-    if origin.to_ascii_lowercase().contains("gitlab") {
-        PrCli::GitLab
-    } else {
-        PrCli::GitHub
+    crate::forge::detect_provider(origin)
+}
+
+fn selection_source_id(source: crate::forge::ForgeSelectionSource) -> &'static str {
+    match source {
+        crate::forge::ForgeSelectionSource::Explicit => "explicit",
+        crate::forge::ForgeSelectionSource::Environment => "environment",
+        crate::forge::ForgeSelectionSource::Detected => "detected",
     }
 }
 
@@ -9185,24 +9113,28 @@ impl Engine {
     }
 
     pub async fn open_pull_request(&self, session_id: &str) -> Result<PullRequestResult> {
+        self.open_pull_request_with_provider(session_id, None).await
+    }
+
+    /// Open a pull request with an optional explicit provider. Explicit input
+    /// wins over `VERLINPARK_PR_PROVIDER`, which wins over origin detection.
+    pub async fn open_pull_request_with_provider(
+        &self,
+        session_id: &str,
+        provider: Option<&str>,
+    ) -> Result<PullRequestResult> {
         self.reject_imported_session(session_id).await?;
-        let kind = match std::env::var("VERLINPARK_PR_PROVIDER")
-            .ok()
-            .map(|value| value.trim().to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("gitlab") => PrCli::GitLab,
-            Some("github") => PrCli::GitHub,
-            Some("gitea" | "forgejo") => PrCli::Gitea,
-            Some(other) => anyhow::bail!("unsupported PR provider: {other}"),
-            None => detect_pr_cli(&self.pull_request_origin(session_id).await?),
+        let origin = self.pull_request_origin(session_id).await?;
+        let environment = std::env::var("VERLINPARK_PR_PROVIDER").ok();
+        let target = crate::forge::resolve_target(provider, environment.as_deref(), &origin)?;
+        let bitbucket = if target.provider == PrCli::BitbucketCloud {
+            Some(crate::forge::BitbucketCloudProvider::from_env(
+                crate::forge::BitbucketCloudConfig::default(),
+            )?)
+        } else {
+            None
         };
-        let bin = match kind {
-            PrCli::GitHub => std::env::var("VERLINPARK_GH_BIN").unwrap_or_else(|_| "gh".into()),
-            PrCli::GitLab => std::env::var("VERLINPARK_GLAB_BIN").unwrap_or_else(|_| "glab".into()),
-            PrCli::Gitea => std::env::var("VERLINPARK_TEA_BIN").unwrap_or_else(|_| "tea".into()),
-        };
-        self.open_pull_request_with_cli(session_id, &bin, kind)
+        self.open_pull_request_with_target(session_id, target, bitbucket, None)
             .await
     }
 
@@ -9222,11 +9154,30 @@ impl Engine {
         .await?
     }
 
+    /// Testable CLI entry point. The fake CLI path is explicit while the
+    /// provider preflight/push/create sequence remains the production one.
+    #[cfg(test)]
     async fn open_pull_request_with_cli(
         &self,
         session_id: &str,
         cli_bin: &str,
         kind: PrCli,
+    ) -> Result<PullRequestResult> {
+        let target = crate::forge::ForgeTarget {
+            provider: kind,
+            origin: None,
+            selected_by: crate::forge::ForgeSelectionSource::Explicit,
+        };
+        self.open_pull_request_with_target(session_id, target, None, Some(cli_bin.to_string()))
+            .await
+    }
+
+    pub(crate) async fn open_pull_request_with_target(
+        &self,
+        session_id: &str,
+        target: crate::forge::ForgeTarget,
+        bitbucket: Option<crate::forge::BitbucketCloudProvider>,
+        cli_binary: Option<String>,
     ) -> Result<PullRequestResult> {
         let session = self.ensure_session_worktree(session_id).await?;
         if session.status == "running" {
@@ -9242,9 +9193,9 @@ impl Engine {
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("session has no worktree"))?,
         );
-        let session_worktree_for_cli = session_worktree.clone();
+        let session_worktree_for_status = session_worktree.clone();
         let status = tokio::task::spawn_blocking(move || {
-            git_output(&session_worktree, &["status", "--porcelain"])
+            git_output(&session_worktree_for_status, &["status", "--porcelain"])
         })
         .await??;
         if !status.is_empty() {
@@ -9258,9 +9209,6 @@ impl Engine {
             .ok_or_else(|| anyhow::anyhow!("project not found"))?;
         let project_root = PathBuf::from(&project.root);
         let base_branch = project.default_branch.clone();
-        let branch_for_push = branch.clone();
-        let base_for_check = base_branch.clone();
-        let cli_bin = cli_bin.to_string();
         let title = session
             .goal
             .lines()
@@ -9269,47 +9217,104 @@ impl Engine {
             .chars()
             .take(120)
             .collect::<String>();
-        let body = format!(
+        let description = format!(
             "Opened from VerlinPark session {}.\n\nGoal: {}",
             session.id, session.goal
         );
-        let title_for_cli = title.clone();
-        let body_for_cli = body.clone();
-        let cli_bin_for_create = cli_bin.clone();
-        let git_lock = self.git_lock.clone();
+        let request = crate::forge::ForgeChangeRequest::new(
+            title,
+            description,
+            branch.clone(),
+            base_branch.clone(),
+        );
 
+        // Local safety checks happen before any forge network preflight so a
+        // branch with no commits, or a dirty worktree, never causes a push or a
+        // provider call.
+        let project_root_for_check = project_root.clone();
+        let branch_for_check = branch.clone();
+        let base_for_check = base_branch.clone();
+        let git_lock = self.git_lock.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
             let _guard = git_lock
                 .lock()
                 .map_err(|_| anyhow::anyhow!("git mutex poisoned"))?;
-            git_output(&project_root, &["remote", "get-url", "origin"])
+            git_output(&project_root_for_check, &["remote", "get-url", "origin"])
                 .context("a git origin remote is required to open a PR")?;
             let ahead = git_output(
-                &project_root,
+                &project_root_for_check,
                 &[
                     "rev-list",
                     "--count",
-                    &format!("{base_for_check}..{branch_for_push}"),
+                    &format!("{base_for_check}..{branch_for_check}"),
                 ],
             )?;
             if ahead.trim() == "0" {
                 anyhow::bail!("session branch has no commits ahead of {base_for_check}");
             }
-            let auth = std::process::Command::new(&cli_bin)
-                .args(kind.auth_args())
-                .current_dir(&project_root)
-                .output()
-                .with_context(|| format!("running {} auth status", kind.binary_name()))?;
-            if !auth.status.success() {
-                anyhow::bail!(
-                    "{} is not authenticated: {}",
-                    kind.binary_name(),
-                    String::from_utf8_lossy(&auth.stderr).trim()
-                );
+            Ok(())
+        })
+        .await??;
+
+        let provider: Box<dyn crate::forge::ForgeProvider> = match target.provider {
+            PrCli::BitbucketCloud => Box::new(bitbucket.ok_or_else(|| {
+                anyhow::anyhow!("the Bitbucket Cloud client was not initialized")
+            })?),
+            kind => {
+                let binary = match cli_binary {
+                    Some(binary) => binary,
+                    None => kind.resolve_cli().ok_or_else(|| {
+                        anyhow::anyhow!("no CLI configured for the {kind} provider")
+                    })?,
+                };
+                // Gitea/Forgejo run from the session worktree where the branch
+                // is checked out; GitHub/GitLab keep the project-root cwd.
+                let create_cwd = if kind == PrCli::Gitea {
+                    session_worktree.clone()
+                } else {
+                    project_root.clone()
+                };
+                Box::new(crate::forge::CliForgeProvider::new(
+                    kind,
+                    binary,
+                    project_root.clone(),
+                    create_cwd,
+                ))
+            }
+        };
+
+        // Preflight (credential/repository check) happens before the push where
+        // practical, so missing Bitbucket credentials or an inaccessible repo
+        // never leaves a pushed branch behind.
+        let preflight = provider.preflight(&target).await?;
+        let repository = preflight.repository.clone().or_else(|| target.repository());
+
+        let project_root_for_push = project_root.clone();
+        let branch_for_push = branch.clone();
+        let base_for_push_check = base_branch.clone();
+        let git_lock = self.git_lock.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let _guard = git_lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("git mutex poisoned"))?;
+            git_output(&project_root_for_push, &["remote", "get-url", "origin"])
+                .context("a git origin remote is required to open a PR")?;
+            // Re-check after preflight (which may wait on the network) so a
+            // concurrently reset branch never gets pushed as an empty update.
+            let ahead = git_output(
+                &project_root_for_push,
+                &[
+                    "rev-list",
+                    "--count",
+                    &format!("{base_for_push_check}..{branch_for_push}"),
+                ],
+            )?;
+            if ahead.trim() == "0" {
+                anyhow::bail!("session branch has no commits ahead of {base_for_push_check}");
             }
             let output = std::process::Command::new("git")
                 .arg("-C")
-                .arg(&project_root)
+                .arg(&project_root_for_push)
                 .args(["push", "-u", "origin", &branch_for_push])
                 .env("GIT_TERMINAL_PROMPT", "0")
                 .output()
@@ -9330,65 +9335,187 @@ impl Engine {
             serde_json::json!({
                 "branch": branch,
                 "base_branch": base_branch,
+                "provider": target.provider.id(),
+                "provider_selected_by": selection_source_id(target.selected_by),
+                "repository": repository,
             }),
         )
         .await?;
 
-        // Gitea/Forgejo run from the session worktree where the branch is
-        // checked out; GitHub/GitLab keep their existing project-root cwd.
-        let cli_cwd = if matches!(kind, PrCli::Gitea) {
-            session_worktree_for_cli
-        } else {
-            PathBuf::from(&project.root)
-        };
-        let branch_for_pr = branch.clone();
-        let base_for_pr = base_branch.clone();
-        let url = tokio::task::spawn_blocking(move || -> Result<String> {
-            let output = std::process::Command::new(&cli_bin_for_create)
-                .args(kind.create_args(&base_for_pr, &branch_for_pr, &title_for_cli, &body_for_cli))
-                .current_dir(&cli_cwd)
-                .output()
-                .with_context(|| format!("running {}", kind.create_label()))?;
-            if !output.status.success() {
-                anyhow::bail!(
-                    "branch pushed, but {} failed: {}",
-                    kind.create_label(),
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-            }
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let url = stdout
-                .lines()
-                .map(str::trim)
-                .find(|line| line.starts_with("http"))
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "{} succeeded but did not return a URL: {stdout}",
-                        kind.create_label()
-                    )
-                })?
-                .to_string();
-            Ok(url)
-        })
-        .await??;
+        let change = provider.create(&target, &request).await.map_err(|error| {
+            // The branch is already on the remote at this point. Make the
+            // failure detail honest without claiming the PR exists.
+            anyhow::Error::new(error.prefix_message("branch pushed, but "))
+        })?;
 
-        self.append_event(
-            &session.id,
-            "session.pr_opened",
-            serde_json::json!({
-                "branch": branch,
-                "base_branch": base_branch,
-                "url": url,
-            }),
-        )
-        .await?;
+        let mut event = serde_json::json!({
+            "branch": branch,
+            "base_branch": base_branch,
+            "url": change.url,
+            "provider": change.provider.id(),
+            "repository": change.repository,
+            "change": change.change_name,
+        });
+        if let Some(id) = change.id {
+            event["change_id"] = serde_json::json!(id);
+        }
+        self.append_event(&session.id, "session.pr_opened", event)
+            .await?;
         Ok(PullRequestResult {
             session_id: session.id,
             branch,
             base_branch,
             pushed: true,
-            url: Some(url.clone()),
-            detail: format!("branch pushed and {} opened at {url}", kind.change_name()),
+            url: Some(change.url.clone()),
+            detail: format!(
+                "branch pushed and {} opened at {} via {}",
+                change.change_name,
+                change.url,
+                change.provider.display_name()
+            ),
+            provider: Some(change.provider.id().to_string()),
+            repository: change.repository,
+            change: Some(change.change_name.to_string()),
+        })
+    }
+
+    /// Read-only forge inventory for CLI/Settings. It does not spawn a CLI or
+    /// make a provider request, and it never returns credential values.
+    pub async fn forge_status(&self, project_id: Option<String>) -> Result<ForgeStatusResult> {
+        let provider_override = std::env::var("VERLINPARK_PR_PROVIDER")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(|value| crate::forge::sanitize_status_text(&value, 64));
+        let parsed_override = provider_override.as_deref().map(PrCli::parse).transpose();
+        let override_error = parsed_override
+            .as_ref()
+            .err()
+            .map(|error| error.message.clone());
+        let override_kind = parsed_override.ok().flatten();
+
+        let mut detected_provider = PrCli::GitHub;
+        let mut origin_status = None;
+        if let Some(project_id) = project_id {
+            let store = self.store.clone();
+            let project = tokio::task::spawn_blocking(move || store.get_project(&project_id))
+                .await??
+                .ok_or_else(|| anyhow::anyhow!("project not found"))?;
+            let root = PathBuf::from(&project.root);
+            let origin = tokio::task::spawn_blocking(move || {
+                git_output(&root, &["remote", "get-url", "origin"]).ok()
+            })
+            .await?
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+            if let Some(origin) = origin {
+                let inspection = crate::forge::inspect_origin(&origin);
+                detected_provider = inspection
+                    .provider
+                    .unwrap_or_else(|| detect_pr_cli(&origin));
+                origin_status = Some(ForgeOriginStatus {
+                    host: inspection.host,
+                    provider: inspection
+                        .provider
+                        .map(|provider| provider.id().to_string()),
+                    repository: inspection.repository,
+                    supported: inspection.supported,
+                    server_detected: inspection.server_detected,
+                    detail: inspection.detail,
+                });
+            }
+        }
+
+        let effective = override_kind.unwrap_or(detected_provider);
+        let providers = crate::forge::provider_snapshots()
+            .into_iter()
+            .map(|snapshot| ForgeProviderStatus {
+                provider: snapshot.provider.id().to_string(),
+                change_name: snapshot.provider.change_name().to_string(),
+                transport: snapshot.provider.transport().to_string(),
+                command: snapshot.command,
+                command_available: snapshot.command_available,
+                auth_configured: snapshot.auth_configured,
+                credential_source: snapshot.credential_source,
+                supported: snapshot.supported,
+                detail: snapshot.detail,
+            })
+            .collect::<Vec<_>>();
+        let detail = match (&provider_override, override_error) {
+            (Some(raw), Some(error)) => format!(
+                "VERLINPARK_PR_PROVIDER='{raw}' is invalid ({error}); pull request creation fails with FORGE_UNSUPPORTED_PROVIDER until the override is corrected"
+            ),
+            (Some(_), None) => format!(
+                "VERLINPARK_PR_PROVIDER selects {effective}; credentials are read from the daemon environment only"
+            ),
+            (None, _) => format!(
+                "no provider override; {effective} is selected from the origin; credentials are read from the daemon environment only"
+            ),
+        };
+        Ok(ForgeStatusResult {
+            provider_override,
+            default_provider: effective.id().to_string(),
+            origin: origin_status,
+            providers,
+            detail,
+        })
+    }
+
+    /// Run the provider's read-only preflight for a project origin without
+    /// pushing a branch or creating a pull request. This is the explicit
+    /// `forge.preflight` operator surface; it is never called by a scheduler.
+    pub async fn forge_preflight(
+        &self,
+        project_id: &str,
+        provider: Option<&str>,
+    ) -> Result<ForgePreflightResult> {
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        let project = tokio::task::spawn_blocking(move || store.get_project(&project_id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("project not found"))?;
+        let root = PathBuf::from(&project.root);
+        let root_for_origin = root.clone();
+        let origin = tokio::task::spawn_blocking(move || {
+            git_output(&root_for_origin, &["remote", "get-url", "origin"])
+                .map(|origin| origin.trim().to_string())
+                .context("a git origin remote is required to preflight a forge provider")
+        })
+        .await??;
+        let environment = std::env::var("VERLINPARK_PR_PROVIDER").ok();
+        let target = crate::forge::resolve_target(provider, environment.as_deref(), &origin)?;
+        let provider_impl: Box<dyn crate::forge::ForgeProvider> = match target.provider {
+            PrCli::BitbucketCloud => Box::new(crate::forge::BitbucketCloudProvider::from_env(
+                crate::forge::BitbucketCloudConfig::default(),
+            )?),
+            kind => {
+                let binary = kind
+                    .resolve_cli()
+                    .ok_or_else(|| anyhow::anyhow!("no CLI configured for the {kind} provider"))?;
+                Box::new(crate::forge::CliForgeProvider::new(
+                    kind,
+                    binary,
+                    root.clone(),
+                    root,
+                ))
+            }
+        };
+        self.run_forge_preflight(&target, provider_impl.as_ref())
+            .await
+    }
+
+    async fn run_forge_preflight(
+        &self,
+        target: &crate::forge::ForgeTarget,
+        provider: &dyn crate::forge::ForgeProvider,
+    ) -> Result<ForgePreflightResult> {
+        let preflight = provider.preflight(target).await?;
+        Ok(ForgePreflightResult {
+            provider: preflight.provider.id().to_string(),
+            change_name: preflight.provider.change_name().to_string(),
+            repository: preflight.repository.or_else(|| target.repository()),
+            auth: preflight.auth,
+            detail: preflight.detail,
         })
     }
 

@@ -57,15 +57,16 @@ use vp_protocol::types::{
     CreateModelPresetParams, CreateSessionParams, CriticalPathMode, CriticalPathPolicyParams,
     CriticalPathPolicyResult, DaemonMetrics, DaemonMetricsResult, DashboardParams,
     DeleteModelPresetParams, DiscardSessionParams, DoctorCheck, DoctorReport, EventListResult,
-    ForkAuditParams, ForkRepairParams, GitLogParams, GitShowParams, GovernorPreviewParams,
-    GovernorStatusParams, IntakeCreateParams, IntakeDeleteResult, IntakeListParams,
-    IntakeTaskParams, IntakeUpdateParams, IntegrationPolicyParams, IntegrationPolicyResult,
-    LandSessionParams, ListApprovalsParams, ListEventsParams, ListSessionsParams, MailboxGcParams,
-    MailboxListParams, MailboxListResult, MailboxPolicyParams, MailboxPolicyResult,
-    MarkMessageReadParams, McpCallParams, McpGetPromptParams, McpProbeParams,
-    McpReadResourceParams, McpServerIdParams, MemoryBriefParams, MemoryConflictResolveParams,
-    MemoryConflictScanParams, MemoryConflictsParams, MemoryCreateParams, MemoryCreateResult,
-    MemoryDeleteParams, MemoryEmbeddingsIndexRebuildParams, MemoryEmbeddingsIndexStatusParams,
+    ForgePreflightParams, ForgeStatusParams, ForkAuditParams, ForkRepairParams, GitLogParams,
+    GitShowParams, GovernorPreviewParams, GovernorStatusParams, IntakeCreateParams,
+    IntakeDeleteResult, IntakeListParams, IntakeTaskParams, IntakeUpdateParams,
+    IntegrationPolicyParams, IntegrationPolicyResult, LandSessionParams, ListApprovalsParams,
+    ListEventsParams, ListSessionsParams, MailboxGcParams, MailboxListParams, MailboxListResult,
+    MailboxPolicyParams, MailboxPolicyResult, MarkMessageReadParams, McpCallParams,
+    McpGetPromptParams, McpProbeParams, McpReadResourceParams, McpServerIdParams,
+    MemoryBriefParams, MemoryConflictResolveParams, MemoryConflictScanParams,
+    MemoryConflictsParams, MemoryCreateParams, MemoryCreateResult, MemoryDeleteParams,
+    MemoryEmbeddingsIndexRebuildParams, MemoryEmbeddingsIndexStatusParams,
     MemoryEmbeddingsRebuildParams, MemoryEmbeddingsStatusParams, MemoryEmbeddingsTestParams,
     MemoryHealthParams, MemoryListParams, MemoryPolicyParams, MemoryPruneParams,
     MemorySearchParams, MemoryStatsParams, MemorySweepParams, MemoryUpdateParams,
@@ -3966,9 +3967,31 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             Err(response) => response_with_id(id, response),
         },
         "session.pr" => match parse_params::<OpenPullRequestParams>(request.params) {
-            Ok(params) => match state.engine.open_pull_request(&params.session_id).await {
+            Ok(params) => match state
+                .engine
+                .open_pull_request_with_provider(&params.session_id, params.provider.as_deref())
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => forge_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "forge.status" => match parse_params::<ForgeStatusParams>(request.params) {
+            Ok(params) => match state.engine.forge_status(params.project_id).await {
                 Ok(result) => RpcResponse::success(id, result),
                 Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "forge.preflight" => match parse_params::<ForgePreflightParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .forge_preflight(&params.project_id, params.provider.as_deref())
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => forge_error(id, error),
             },
             Err(response) => response_with_id(id, response),
         },
@@ -4343,6 +4366,18 @@ fn response_with_id(id: Option<Value>, error: RpcError) -> RpcResponse {
 
 fn internal_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
     RpcResponse::error(id, RpcError::new(codes::INTERNAL_ERROR, error.to_string()))
+}
+
+/// Forge failures carry the Q3 `FORGE_*` code, retryability, hint, and safe
+/// evidence in RPC error data. The message already starts with `error[CODE]`.
+fn forge_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
+    if let Some(forge) = error.downcast_ref::<vp_core::forge::ForgeError>() {
+        return RpcResponse::error(
+            id,
+            RpcError::with_data(codes::INTERNAL_ERROR, forge.to_string(), forge.data()),
+        );
+    }
+    internal_error(id, error)
 }
 
 /// Approval rule failures are typed with the Q3 catalog. Invalid template or
@@ -5434,5 +5469,51 @@ mod process_rpc_tests {
         assert_eq!(overview["sessions"][0]["last_reason"], "wall_clock");
         assert_eq!(overview["sessions"][0]["last_phase"], "provider");
         assert_eq!(overview["by_phase"][0]["key"], "provider");
+    }
+
+    #[tokio::test]
+    async fn forge_status_and_preflight_rpcs_are_secret_free() {
+        let data = TempDir::new().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        let engine = Engine::new(store);
+        let state = AppState {
+            engine: engine.clone(),
+            agent: AgentService::from_env(engine),
+            token: Arc::new("test-token".to_string()),
+            data_dir: data.path().to_path_buf(),
+            started_at: now_rfc3339(),
+            started: Instant::now(),
+            pid: std::process::id(),
+        };
+
+        let status = call(&state, "forge.status", json!({})).await;
+        assert_eq!(status["default_provider"], "github");
+        let providers = status["providers"].as_array().unwrap();
+        assert_eq!(providers.len(), 4);
+        let bitbucket = providers
+            .iter()
+            .find(|provider| provider["provider"] == "bitbucket")
+            .unwrap();
+        assert_eq!(bitbucket["transport"], "rest");
+        assert_eq!(bitbucket["change_name"], "PR");
+        assert!(bitbucket.get("command").is_none());
+        let serialized = status.to_string();
+        assert!(!serialized.contains("BITBUCKET_APP_PASSWORD="));
+
+        let response = dispatch(
+            &state,
+            RpcRequest::new(
+                json!(2),
+                "forge.preflight",
+                json!({"project_id": "prj-missing"}),
+            ),
+        )
+        .await;
+        let error = response.error.unwrap();
+        assert!(
+            error.message.contains("project not found"),
+            "{}",
+            error.message
+        );
     }
 }

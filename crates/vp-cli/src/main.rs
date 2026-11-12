@@ -36,6 +36,46 @@ struct Cli {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
+enum ForgeProviderArg {
+    Github,
+    Gitlab,
+    Gitea,
+    Forgejo,
+    Bitbucket,
+}
+
+impl ForgeProviderArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Github => "github",
+            Self::Gitlab => "gitlab",
+            Self::Gitea => "gitea",
+            Self::Forgejo => "forgejo",
+            Self::Bitbucket => "bitbucket",
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum ForgeAction {
+    /// Report detected origin, provider availability, and credential source.
+    Status {
+        /// Restrict origin detection to one project.
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Run the provider's read-only auth/repository preflight without pushing.
+    Check {
+        /// Project whose origin should be checked.
+        #[arg(long)]
+        project: Option<String>,
+        /// Force one provider instead of environment/origin detection.
+        #[arg(long, value_enum)]
+        provider: Option<ForgeProviderArg>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
 enum McpTransportArg {
     Stdio,
     Http,
@@ -2426,8 +2466,19 @@ enum Command {
     /// Land the session branch into the project default branch.
     Land { session: String },
     /// Push the session branch and open a pull request (GitHub gh, GitLab glab,
-    /// or Gitea/Forgejo tea with VERLINPARK_PR_PROVIDER=gitea|forgejo).
-    Pr { session: String },
+    /// Gitea/Forgejo tea, or Bitbucket Cloud REST). Provider selection falls
+    /// back to VERLINPARK_PR_PROVIDER and then origin detection.
+    Pr {
+        session: String,
+        /// Force one provider instead of environment/origin detection.
+        #[arg(long, value_enum)]
+        provider: Option<ForgeProviderArg>,
+    },
+    /// Inspect pull-request forge providers and credential sources.
+    Forge {
+        #[command(subcommand)]
+        action: ForgeAction,
+    },
     /// Export a portable session bundle (events + projections).
     Export {
         session: String,
@@ -7429,9 +7480,30 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Land { session } => {
             rpc(&discovery, "session.land", json!({"session_id": session})).await?
         }
-        Command::Pr { session } => {
-            rpc(&discovery, "session.pr", json!({"session_id": session})).await?
+        Command::Pr { session, provider } => {
+            let mut params = json!({"session_id": session});
+            if let Some(provider) = provider {
+                params["provider"] = json!(provider.as_str());
+            }
+            rpc(&discovery, "session.pr", params).await?
         }
+        Command::Forge { action } => match action {
+            ForgeAction::Status { project } => {
+                let project = match project {
+                    Some(project) => Some(resolve_project(&discovery, Some(&project)).await?),
+                    None => None,
+                };
+                rpc(&discovery, "forge.status", json!({"project_id": project})).await?
+            }
+            ForgeAction::Check { project, provider } => {
+                let project = resolve_project(&discovery, project.as_deref()).await?;
+                let mut params = json!({"project_id": project});
+                if let Some(provider) = provider {
+                    params["provider"] = json!(provider.as_str());
+                }
+                rpc(&discovery, "forge.preflight", params).await?
+            }
+        },
         Command::Export { session, output } => {
             let value = rpc(&discovery, "session.export", json!({"session_id": session})).await?;
             if let Some(path) = output {
@@ -9961,7 +10033,108 @@ fn test_cache_lines(value: &Value) -> Option<Vec<String>> {
     None
 }
 
+fn forge_preflight_lines(value: &Value) -> Option<Vec<String>> {
+    if value.get("auth").is_none()
+        || value.get("change_name").is_none()
+        || value.get("provider").is_none()
+        || value.get("default_provider").is_some()
+    {
+        return None;
+    }
+    let mut lines = vec![format!(
+        "{} preflight  {}  auth {}  repository {}",
+        value["provider"].as_str().unwrap_or("?"),
+        value["change_name"].as_str().unwrap_or("PR"),
+        value["auth"].as_str().unwrap_or("?"),
+        value["repository"].as_str().unwrap_or("-")
+    )];
+    if let Some(detail) = value["detail"].as_str().filter(|detail| !detail.is_empty()) {
+        lines.push(format!("  {detail}"));
+    }
+    Some(lines)
+}
+
+fn forge_status_lines(value: &Value) -> Option<Vec<String>> {
+    let providers = value.get("providers")?.as_array()?;
+    value.get("default_provider")?;
+    let mut lines = vec![format!(
+        "forge  selected {}  override {}",
+        value["default_provider"].as_str().unwrap_or("?"),
+        value["provider_override"].as_str().unwrap_or("auto")
+    )];
+    if let Some(origin) = value.get("origin").filter(|origin| !origin.is_null()) {
+        lines.push(format!(
+            "  origin {}  provider {}  repository {}  supported {}",
+            origin["host"].as_str().unwrap_or("-"),
+            origin["provider"].as_str().unwrap_or("unknown"),
+            origin["repository"].as_str().unwrap_or("-"),
+            origin["supported"].as_bool().unwrap_or(false)
+        ));
+        if let Some(detail) = origin["detail"]
+            .as_str()
+            .filter(|detail| !detail.is_empty())
+        {
+            lines.push(format!("  {detail}"));
+        }
+    }
+    for provider in providers {
+        let available = provider["command_available"].as_bool().unwrap_or(false);
+        let auth = match provider.get("auth_configured").and_then(Value::as_bool) {
+            Some(true) => "credentials configured",
+            Some(false) => "credentials missing",
+            None => "auth checked at preflight",
+        };
+        lines.push(format!(
+            "  {:<16} {:<4} {:<4} {:<24} {}",
+            provider["provider"].as_str().unwrap_or("?"),
+            provider["change_name"].as_str().unwrap_or("?"),
+            provider["transport"].as_str().unwrap_or("?"),
+            provider["command"].as_str().unwrap_or("REST"),
+            if available { auth } else { "unavailable" }
+        ));
+        if let Some(detail) = provider["detail"].as_str().filter(|_| !available) {
+            lines.push(format!("    {detail}"));
+        }
+    }
+    if let Some(detail) = value.get("detail").and_then(Value::as_str) {
+        lines.push(format!("  {detail}"));
+    }
+    Some(lines)
+}
+
+fn pull_request_lines(value: &Value) -> Option<Vec<String>> {
+    let url = value.get("url")?.as_str()?;
+    if value.get("pushed").is_none() || value.get("branch").is_none() {
+        return None;
+    }
+    Some(vec![format!(
+        "{} opened via {}: {url}  ({} → {})",
+        value["change"].as_str().unwrap_or("PR"),
+        value["provider"].as_str().unwrap_or("forge"),
+        value["branch"].as_str().unwrap_or("?"),
+        value["base_branch"].as_str().unwrap_or("?")
+    )])
+}
+
 fn print_human(value: &Value) {
+    if let Some(lines) = forge_preflight_lines(value) {
+        for line in lines {
+            println!("{line}");
+        }
+        return;
+    }
+    if let Some(lines) = forge_status_lines(value) {
+        for line in lines {
+            println!("{line}");
+        }
+        return;
+    }
+    if let Some(lines) = pull_request_lines(value) {
+        for line in lines {
+            println!("{line}");
+        }
+        return;
+    }
     if let Some(lines) = test_cache_lines(value) {
         for line in lines {
             println!("{line}");
@@ -12391,14 +12564,6 @@ fn print_human(value: &Value) {
                 println!("  - {mismatch}");
             }
         }
-        return;
-    }
-    if let Some(url) = value.get("url").and_then(Value::as_str) {
-        println!(
-            "PR opened: {url}  ({} → {})",
-            value["branch"].as_str().unwrap_or("?"),
-            value["base_branch"].as_str().unwrap_or("?")
-        );
         return;
     }
     if let Some(target) = value.get("target_branch").and_then(Value::as_str) {
@@ -16134,5 +16299,239 @@ mod backup_revocation_cli_tests {
         });
         assert_eq!(import["repositories_raised"], 1);
         assert_eq!(import["raises"][0]["highest_generation"], 9);
+    }
+}
+
+#[cfg(test)]
+mod forge_cli_tests {
+    use super::*;
+
+    #[test]
+    fn pr_command_accepts_an_explicit_bitbucket_provider() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli =
+                    Cli::try_parse_from(["vp", "pr", "ses-1", "--provider", "bitbucket"]).unwrap();
+                match cli.command {
+                    Command::Pr { session, provider } => {
+                        assert_eq!(session, "ses-1");
+                        assert_eq!(provider.unwrap().as_str(), "bitbucket");
+                    }
+                    other => panic!("expected pr, got {other:?}"),
+                }
+
+                let cli = Cli::try_parse_from(["vp", "pr", "ses-1"]).unwrap();
+                match cli.command {
+                    Command::Pr { session, provider } => {
+                        assert_eq!(session, "ses-1");
+                        assert!(provider.is_none());
+                    }
+                    other => panic!("expected pr, got {other:?}"),
+                }
+
+                let cli =
+                    Cli::try_parse_from(["vp", "pr", "ses-1", "--provider", "forgejo"]).unwrap();
+                match cli.command {
+                    Command::Pr { provider, .. } => {
+                        assert_eq!(provider.unwrap().as_str(), "forgejo");
+                    }
+                    other => panic!("expected pr, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn pr_command_rejects_unknown_providers_before_rpc() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let error = Cli::try_parse_from(["vp", "pr", "ses-1", "--provider", "sourcehut"])
+                    .unwrap_err();
+                assert!(error.to_string().contains("sourcehut"), "{error}");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn forge_status_command_parses_optional_project() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from(["vp", "forge", "status"]).unwrap();
+                match cli.command {
+                    Command::Forge {
+                        action: ForgeAction::Status { project },
+                    } => assert!(project.is_none()),
+                    other => panic!("expected forge status, got {other:?}"),
+                }
+
+                let cli =
+                    Cli::try_parse_from(["vp", "forge", "status", "--project", "prj-1"]).unwrap();
+                match cli.command {
+                    Command::Forge {
+                        action: ForgeAction::Status { project },
+                    } => assert_eq!(project.as_deref(), Some("prj-1")),
+                    other => panic!("expected forge status, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn forge_check_command_parses_project_and_provider() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "forge",
+                    "check",
+                    "--project",
+                    "prj-1",
+                    "--provider",
+                    "bitbucket",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::Forge {
+                        action: ForgeAction::Check { project, provider },
+                    } => {
+                        assert_eq!(project.as_deref(), Some("prj-1"));
+                        assert_eq!(provider.unwrap().as_str(), "bitbucket");
+                    }
+                    other => panic!("expected forge check, got {other:?}"),
+                }
+
+                let cli = Cli::try_parse_from(["vp", "forge", "check"]).unwrap();
+                match cli.command {
+                    Command::Forge {
+                        action: ForgeAction::Check { project, provider },
+                    } => {
+                        assert!(project.is_none());
+                        assert!(provider.is_none());
+                    }
+                    other => panic!("expected forge check, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn forge_status_lines_cover_origin_and_provider_rows() {
+        let value = serde_json::json!({
+            "default_provider": "bitbucket",
+            "provider_override": "bitbucket",
+            "origin": {
+                "host": "bitbucket.org",
+                "provider": "bitbucket",
+                "repository": "acme/widgets",
+                "supported": true,
+                "server_detected": false,
+                "detail": "Bitbucket Cloud origin detected"
+            },
+            "providers": [
+                {
+                    "provider": "bitbucket",
+                    "change_name": "PR",
+                    "transport": "rest",
+                    "command_available": true,
+                    "auth_configured": true,
+                    "credential_source": "BITBUCKET_TOKEN",
+                    "supported": true,
+                    "detail": "credentials configured"
+                },
+                {
+                    "provider": "github",
+                    "change_name": "PR",
+                    "transport": "cli",
+                    "command": "gh",
+                    "command_available": false,
+                    "supported": false,
+                    "detail": "gh CLI not found; install gh or set VERLINPARK_GH_BIN."
+                }
+            ],
+            "detail": "selected bitbucket"
+        });
+        let lines = forge_status_lines(&value).unwrap().join(
+            "
+",
+        );
+        assert!(lines.contains("selected bitbucket"), "{lines}");
+        assert!(lines.contains("repository acme/widgets"), "{lines}");
+        assert!(lines.contains("credentials configured"), "{lines}");
+        assert!(lines.contains("gh CLI not found"), "{lines}");
+        assert!(!lines.contains("BITBUCKET_TOKEN"), "{lines}");
+    }
+
+    #[test]
+    fn preflight_lines_name_auth_mode_and_repository() {
+        let value = serde_json::json!({
+            "provider": "bitbucket",
+            "change_name": "PR",
+            "repository": "acme/widgets",
+            "auth": "bearer",
+            "detail": "Bitbucket Cloud credentials accepted for acme/widgets (bearer auth)"
+        });
+        let lines = forge_preflight_lines(&value).unwrap().join(
+            "
+",
+        );
+        assert!(lines.contains("bearer"), "{lines}");
+        assert!(lines.contains("acme/widgets"), "{lines}");
+        assert!(!lines.contains("ATATT"), "{lines}");
+    }
+
+    #[test]
+    fn pull_request_lines_prefer_provider_and_change_name() {
+        let value = serde_json::json!({
+            "session_id": "ses-1",
+            "branch": "feature",
+            "base_branch": "main",
+            "pushed": true,
+            "url": "https://bitbucket.org/acme/widgets/pull-requests/7",
+            "detail": "opened",
+            "provider": "bitbucket",
+            "repository": "acme/widgets",
+            "change": "PR"
+        });
+        let lines = pull_request_lines(&value).unwrap().join(
+            "
+",
+        );
+        assert!(lines.contains("PR opened via bitbucket"), "{lines}");
+        assert!(lines.contains("feature → main"), "{lines}");
+
+        let legacy = serde_json::json!({
+            "session_id": "ses-1",
+            "branch": "feature",
+            "base_branch": "main",
+            "pushed": true,
+            "url": "https://example.test/pr/1",
+            "detail": "opened"
+        });
+        let lines = pull_request_lines(&legacy).unwrap().join(
+            "
+",
+        );
+        assert!(lines.contains("PR opened via forge"), "{lines}");
+    }
+
+    #[test]
+    fn forge_provider_argument_has_stable_wire_values() {
+        assert_eq!(ForgeProviderArg::Github.as_str(), "github");
+        assert_eq!(ForgeProviderArg::Gitlab.as_str(), "gitlab");
+        assert_eq!(ForgeProviderArg::Gitea.as_str(), "gitea");
+        assert_eq!(ForgeProviderArg::Forgejo.as_str(), "forgejo");
+        assert_eq!(ForgeProviderArg::Bitbucket.as_str(), "bitbucket");
     }
 }

@@ -1761,6 +1761,26 @@ actor CoreClient {
             .decode(PullRequestResult.self)
     }
 
+    func forgeStatus(projectID: String?) async throws -> ForgeStatus {
+        var params: [String: JSONValue] = [:]
+        if let projectID {
+            params["project_id"] = .string(projectID)
+        }
+        return try await request(method: "forge.status", params: params)
+            .decode(ForgeStatus.self)
+    }
+
+    func forgePreflight(projectID: String, provider: String? = nil) async throws
+        -> ForgePreflightResult
+    {
+        var params: [String: JSONValue] = ["project_id": .string(projectID)]
+        if let provider {
+            params["provider"] = .string(provider)
+        }
+        return try await request(method: "forge.preflight", params: params)
+            .decode(ForgePreflightResult.self)
+    }
+
     func sessionTodos(sessionID: String) async throws -> [TodoItem] {
         let params: [String: JSONValue] = ["session_id": .string(sessionID)]
         return try await request(method: "session.todos", params: params)

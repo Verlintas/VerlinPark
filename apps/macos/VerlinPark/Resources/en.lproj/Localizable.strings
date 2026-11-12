@@ -228,3 +228,16 @@
 "Close" = "Close";
 "Save" = "Save";
 "The daemon returned an invalid artifact path." = "The daemon returned an invalid artifact path.";
+"Pull requests" = "Pull requests";
+"Refresh provider status" = "Refresh provider status";
+"Detecting origin…" = "Detecting origin…";
+"No origin detected for the selected project" = "No origin detected for the selected project";
+"unknown origin" = "unknown origin";
+"unavailable" = "unavailable";
+"credentials configured" = "credentials configured";
+"credentials missing" = "credentials missing";
+"auth checked at preflight" = "auth checked at preflight";
+"Bitbucket Cloud reads BITBUCKET_TOKEN or BITBUCKET_USERNAME + BITBUCKET_APP_PASSWORD from the daemon environment. Credentials are never stored, logged, or written to events. Bitbucket Server/Data Center is not supported." = "Bitbucket Cloud reads BITBUCKET_TOKEN or BITBUCKET_USERNAME + BITBUCKET_APP_PASSWORD from the daemon environment. Credentials are never stored, logged, or written to events. Bitbucket Server/Data Center is not supported.";
+"Check credentials" = "Check credentials";
+"Runs the read-only provider preflight. It never pushes a branch or opens a pull request." = "Runs the read-only provider preflight. It never pushes a branch or opens a pull request.";
+"Preflight passed" = "Preflight passed";
