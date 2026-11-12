@@ -319,7 +319,8 @@
         "no automatic firing",
         "caps enforced"
       ],
-      "acceptance": "Hiring/retirement is explicit, evidence-based, capped, and non-destructive."
+      "acceptance": "Hiring/retirement is explicit, evidence-based, capped, and non-destructive.",
+      "status": "implemented"
     },
     {
       "id": "S7",
@@ -608,6 +609,23 @@
         "brief is bounded best-effort ranking, not complete recall",
         "legacy project-memory tables/tools unchanged; explicit scope=project is distinct",
         "no mutation UI/org chart/hiring/team templates"
+      ]
+    },
+    "S6": {
+      "status": "implemented",
+      "commit": "5d308e3",
+      "adr": "0210",
+      "tests": {
+        "rust": 3833,
+        "swift": 516
+      },
+      "limits": [
+        "attribution is a conservative heuristic and may undercount",
+        "successor ownership transfer is not automatic",
+        "force does not interrupt an in-flight provider stream",
+        "same-host SQLite coordination only",
+        "no S7 org-chart GUI, S8 team templates, performance GC, cross-project sharing",
+        "no mutation UI yet"
       ]
     }
   }

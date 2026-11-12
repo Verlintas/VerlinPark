@@ -165,6 +165,18 @@ Limits:
 - Historical identity is not inferred from current assignments.
 - Ledger is event-only and recording is explicit; no cross-session/project attribution, retention sweep, GUI graph editor, or automatic remediation.
 
+## 0.14 2026-11-13 Project-scoped identities S6
+
+S6 is implemented and merged at `5d308e3` (ADR-0210): approved hiring with caps/hierarchy, promotion/transfer with generation and conflict handling, evidence-based default-off retirement policy using C6 diagnosis, terminal retirement with assignment/workspace release and evidence retention, and a read-only performance ledger. Rust 3,833 passed; Swift 516 passed.
+
+Limits:
+
+- Attribution is a conservative deterministic heuristic and may undercount when evidence is ambiguous.
+- Successor ownership transfer is not automatic; memory/component-branch ownership needs a future explicit transfer.
+- `force` releases coordination/workspace state but does not interrupt an in-flight provider stream.
+- Same-host SQLite coordination only; not distributed employment control.
+- No S7 org-chart GUI, S8 team templates, performance GC, cross-project identity sharing, or mutation UI yet.
+
 ## 0. 2026-10-30 跟进
 
 第一轮硬化已完成（同一 `main` 线，提交见仓库历史）：
