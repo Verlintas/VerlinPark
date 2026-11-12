@@ -45,6 +45,21 @@ Limits:
 - Browser/computer GUI actions remain governed by the GUI lease/action timeline, not effect receipts.
 - C3 durable external gates, C4 version pinning, C5 reliability, and C6+ failure attribution are still planned.
 
+## 0.5 2026-11-12 Contracted execution C3
+
+C3 is implemented and merged at `835cb17` (ADR-0195): durable `external_gates` for CI/PR-review/deploy/human/custom, one-time `vpg_` tokens with only a SHA-256 verifier stored, one-shot/expiry-bound `gate.resolve`, `session.defer --gate` and Leader/Manager/Worker `wait_for_gate`, continuation rescue without holding a Worker slot, local-only by default, and optional token-required loopback resolve. Rust 3,506 passed; Swift 491 passed.
+
+Limits:
+
+- Lost gate tokens are unrecoverable; cancel and reopen.
+- No public webhook listener and no provider-specific CI/review/deploy integration. The optional loopback endpoint is off by default and still token-required.
+- Resolution is an authenticated local claim, not external-system exactly-once.
+- Expiry is swept on the daemon interval (default 30s); delivery still waits for the session to be idle.
+- A deferring Worker/plan task leaves uncommitted work; the resumed Leader must continue or re-delegate it.
+- `wait_for_gate` is unavailable to Verifier, Labour, Scout, and the read-only Manager roundtable.
+- No GUI gate resolution and no cross-host/distributed gate consensus.
+- `gate.open` has no operation id; a blind retry can create a second gate.
+
 ## 0. 2026-10-30 跟进
 
 第一轮硬化已完成（同一 `main` 线，提交见仓库历史）：

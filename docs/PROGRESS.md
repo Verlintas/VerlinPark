@@ -1,7 +1,7 @@
 # VerlinPark 进度
 
 > 最后更新：2026-11-12
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark + task contracts/intent authorization/MCP schema pins + effect receipts/postconditions 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark + task contracts/intent authorization/MCP schema pins + effect receipts/postconditions + external gates/durable waits 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
@@ -161,6 +161,50 @@ C2 已实现并合入 `d78d253`，ADR-0194。Rust **3,458 passed / 0 failed / 6 
 - Mutating shell/MCP 可能产生 unknown 并阻塞 merge，直到 operator reconcile；`unknown_blocks_merge=false` 是显式观察模式。
 - Settled receipt retention/GC 尚未实现；查询有界但存储会增长。
 - Browser/computer GUI 仍由 GUI lease/action timeline 管，不走 effect receipts。
+
+---
+
+## 2026-11-12 Contracted execution C3: durable external gates
+
+C3 已实现并合入 `835cb17`，ADR-0195。Rust **3,506 passed / 0 failed / 6 ignored**，Swift **491 passed**（359 app + 132 helper），clippy/swiftformat/xcodebuild 通过。
+
+### Gate model + token
+
+- `external_gates`：`ci | pr_review | deploy | human | custom`；状态 `open|resolved|expired|cancelled`，结果 `resolved|rejected|failed`。
+- 事件：`gate.opened`、`gate.resolved`、`gate.expired`、`gate.cancelled`、`gate.continuation_ready`。
+- `gate.open` 返回 32-byte `vpg_` 一次性 token，**只返回一次**；SQLite 只存 `SHA-256(token)`；token 不进 events/logs/prompts/tool output/Swift models。
+- `gate.resolve` 必须带 scoped token；daemon Bearer token 不能绕过。wrong token `GATE_TOKEN_INVALID`；同 outcome 重复 resolve 幂等；不同 outcome `GATE_CONFLICT`；expired/cancelled fail closed。
+- `gate.cancel`/`gate.list`/`gate.status`/`gate.sweep`；expiry sweep 默认 30s。
+
+### Durable waits
+
+- `session.defer` additive `watch_gate_id`。
+- Leader/Manager/Worker `wait_for_gate`：校验 existing open gate、创建 continuation、返回 `waiting=true`，在再次 provider call 前以 `LoopOutcome::Deferred` 结束；不占 Worker/Labour slot。
+- top-level run 将 session 置 idle；Worker/Manager delegation 传播等待；plan-task worker 将 task 标 blocked 并 defer batch。
+- `gate.resolve`/expiry/cancel 原子地标记 gate terminal 并唤醒恰好一个 watching continuation；走正常 continuation/prompt 路径，带 bounded `[gate]` summary，无 secret。
+- restart/replay/repair/bundle import/db-rebuild 重建 gates 和 waits。
+
+### Authority
+
+- Gates 只唤醒 continuation；不能 approve approvals、绕过 Seatbelt/path jail/write scope、提交 Verifier verdict、进入 merge queue、改预算/容量或路由模型。
+- 默认 local-only；`GatePolicy.loopback_resolve` 可选开启 token-required loopback `POST /gate/resolve`，默认 off，daemon 仍 bind loopback。
+
+### 界面
+
+- RPC：`gate.open/resolve/cancel/list/status/sweep`、`project.gate_policy.get/set`；`session.defer` 增加 `watch_gate_id`。
+- CLI：`vp gate open|resolve|cancel|list|status|sweep|policy|policy-set`、`vp defer --gate`。
+- Swift：`ExternalGateView`、`SessionGateCounts`、`SessionGatesReport`、`CoreClient.sessionGates`、`AppModel.sessionGates`、Stage `GateBadge`、Efficiency `GateListSection`；UI 不含 token/verifier。
+
+### 限制
+
+- Token 丢失不可恢复；只能 cancel 后重开。
+- 没有 public webhook、没有 provider-specific CI/review/deploy 集成。
+- Resolution 是 authenticated local claim，不是外部系统 exactly-once。
+- Expiry 由 daemon 30s sweep；delivery 仍要等 session idle。
+- Deferring Worker/plan task 会留下未提交工作，恢复后 Leader 需要重新委派/继续。
+- `wait_for_gate` 不支持 Verifier/Labour/Scout/read-only Manager roundtable。
+- 没有 GUI gate resolution，也没有跨主机 gate consensus。
+- `gate.open` 没有 operation id，blind retry 可能创建第二个 gate。
 
 ---
 

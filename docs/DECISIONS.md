@@ -204,6 +204,7 @@
 | [0192](adr/0192-cache-telemetry-and-deepseek-benchmark.md) | Cache telemetry and DeepSeek benchmark | Accepted | Runtime/Observability |
 | [0193](adr/0193-task-contract-and-argument-level-intent.md) | TaskContract, argument-level intent authorization, and MCP schema pins | Accepted | Runtime/Security/Providers |
 | [0194](adr/0194-effect-receipts-and-postconditions.md) | Effect receipts, postcondition probes, and merge blocking for unknown effects | Accepted | Runtime/Effects |
+| [0195](adr/0195-external-gates-and-durable-waits.md) | Durable external gates, one-shot tokens, and continuation-based waits | Accepted | Runtime/Orchestration |
 
 ---
 
