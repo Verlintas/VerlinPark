@@ -225,6 +225,55 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
                     &projection.sessions,
                 )?;
             }
+            if snapshot.agent_memory_events.is_empty() {
+                // Forward compatibility for a manifest written before S5. No
+                // synthetic events are created.
+                for memory in &snapshot.agent_memories {
+                    if memory.project_id != snapshot.project.id {
+                        anyhow::bail!(
+                            "agent memory {} belongs to another project in the manifest",
+                            memory.id
+                        );
+                    }
+                    store.insert_agent_memory_snapshot(memory)?;
+                }
+            } else {
+                for event in &snapshot.agent_memory_events {
+                    if event.project_id != snapshot.project.id {
+                        anyhow::bail!(
+                            "agent memory event {} belongs to another project in the manifest",
+                            event.id
+                        );
+                    }
+                    store.insert_agent_memory_event_snapshot(event)?;
+                }
+                let expected =
+                    crate::identity_memory::memories_from_events(&snapshot.agent_memory_events)?;
+                if expected
+                    .iter()
+                    .any(|memory| memory.project_id != snapshot.project.id)
+                {
+                    anyhow::bail!("agent memory replay produced a row for another project");
+                }
+                let projection = if snapshot.agent_memories.is_empty() {
+                    expected
+                } else {
+                    let mismatches = crate::identity_memory::compare_memory_projection(
+                        &expected,
+                        &snapshot.agent_memories,
+                    );
+                    if !mismatches.is_empty() {
+                        anyhow::bail!(
+                            "agent memory manifest projection does not match its event stream: {}",
+                            mismatches.join("; ")
+                        );
+                    }
+                    // Preserve archive provenance markers. The comparison above
+                    // treats `origin` as storage metadata, not lifecycle state.
+                    snapshot.agent_memories.clone()
+                };
+                store.replace_agent_memory_projection(&snapshot.project.id, &projection)?;
+            }
             let effect_policy = snapshot.effect_policy.normalized().map_err(|error| {
                 anyhow::anyhow!(
                     "effect policy for project {} is invalid: {error}",

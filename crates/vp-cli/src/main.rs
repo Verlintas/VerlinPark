@@ -2558,6 +2558,84 @@ enum Command {
         #[arg(long = "retirement-requires-approval")]
         retirement_requires_approval: Option<bool>,
     },
+    /// List identity/department/project memory. Content is bounded by the daemon.
+    AgentMemory {
+        project: String,
+        /// Viewer identity; scope isolation is enforced when present.
+        #[arg(long)]
+        identity: Option<String>,
+        /// agent, department, or project.
+        #[arg(long)]
+        scope: Option<String>,
+        /// active, superseded, or stale.
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        department: Option<String>,
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long = "include-expired")]
+        include_expired: bool,
+    },
+    /// Record one explicit identity/department/project memory.
+    AgentMemoryRemember {
+        project: String,
+        /// agent, department, or project.
+        #[arg(long)]
+        scope: String,
+        #[arg(long)]
+        content: String,
+        /// Agent-scope owner; department scope derives from it when omitted.
+        #[arg(long)]
+        identity: Option<String>,
+        #[arg(long)]
+        department: Option<String>,
+        #[arg(long)]
+        component: Option<String>,
+        /// operator, agent, task_result, verifier, or integration.
+        #[arg(long)]
+        source: Option<String>,
+        /// Bounded pointer as kind:reference[:note]; repeatable.
+        #[arg(long = "evidence")]
+        evidence: Vec<String>,
+        #[arg(long = "expires-at")]
+        expires_at: Option<String>,
+        #[arg(long)]
+        pinned: bool,
+    },
+    /// Supersede one active memory with an existing or newly created memory.
+    AgentMemorySupersede {
+        memory: String,
+        /// Existing replacement memory in the exact same scope.
+        #[arg(long)]
+        replacement: Option<String>,
+        /// Or create a replacement with this bounded content.
+        #[arg(long)]
+        content: Option<String>,
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long = "expected-hash")]
+        expected_hash: Option<String>,
+    },
+    /// Soft-forget a memory, or prune a stale/superseded one.
+    AgentMemoryForget {
+        memory: String,
+        /// Hard-delete after the row has left active state.
+        #[arg(long)]
+        prune: bool,
+    },
+    /// Expire due memory and optionally prune old stale/superseded rows.
+    AgentMemorySweep {
+        project: String,
+        #[arg(long = "older-than-days")]
+        older_than_days: Option<u32>,
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long)]
+        prune: bool,
+    },
     /// List session→identity assignments. Requires one of session, identity, or
     /// project.
     Assignments {
@@ -8345,6 +8423,115 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await?
         }
+        Command::AgentMemory {
+            project,
+            identity,
+            scope,
+            status,
+            department,
+            query,
+            limit,
+            include_expired,
+        } => {
+            rpc(
+                &discovery,
+                "agent.memory.list",
+                json!({
+                    "project_id": project,
+                    "identity_id": identity,
+                    "scope": scope,
+                    "status": status,
+                    "department": department,
+                    "query": query,
+                    "limit": limit,
+                    "include_expired": include_expired,
+                }),
+            )
+            .await?
+        }
+        Command::AgentMemoryRemember {
+            project,
+            scope,
+            content,
+            identity,
+            department,
+            component,
+            source,
+            evidence,
+            expires_at,
+            pinned,
+        } => {
+            let evidence = evidence
+                .iter()
+                .map(|entry| parse_memory_evidence(entry))
+                .collect::<Result<Vec<_>>>()?;
+            rpc(
+                &discovery,
+                "agent.memory.remember",
+                json!({
+                    "project_id": project,
+                    "scope": scope,
+                    "content": content,
+                    "identity_id": identity,
+                    "department": department,
+                    "component": component,
+                    "source": source.unwrap_or_else(|| "operator".to_string()),
+                    "evidence": evidence,
+                    "expires_at": expires_at,
+                    "pinned": pinned,
+                }),
+            )
+            .await?
+        }
+        Command::AgentMemorySupersede {
+            memory,
+            replacement,
+            content,
+            source,
+            expected_hash,
+        } => {
+            if replacement.is_none() && content.is_none() {
+                bail!("pass --replacement or --content");
+            }
+            rpc(
+                &discovery,
+                "agent.memory.supersede",
+                json!({
+                    "memory_id": memory,
+                    "replacement_memory_id": replacement,
+                    "content": content,
+                    "source": source,
+                    "expected_content_hash": expected_hash,
+                }),
+            )
+            .await?
+        }
+        Command::AgentMemoryForget { memory, prune } => {
+            rpc(
+                &discovery,
+                "agent.memory.forget",
+                json!({"memory_id": memory, "prune": prune}),
+            )
+            .await?
+        }
+        Command::AgentMemorySweep {
+            project,
+            older_than_days,
+            limit,
+            prune,
+        } => {
+            rpc(
+                &discovery,
+                "agent.memory.sweep",
+                json!({
+                    "project_id": project,
+                    "older_than_days": older_than_days,
+                    "limit": limit,
+                    "prune": prune,
+                }),
+            )
+            .await?
+        }
         Command::Assignments {
             session,
             identity,
@@ -10493,6 +10680,22 @@ fn parse_agent_identity_policy_json(value: Option<&str>) -> Result<Option<Value>
         bail!("--policy-json must be a JSON object, for example '{{}}'");
     }
     Ok(Some(parsed))
+}
+
+/// `kind:reference[:note]`. The reference is opaque and bounded by the daemon;
+/// the CLI only splits on the first two colons.
+fn parse_memory_evidence(value: &str) -> Result<Value> {
+    let mut parts = value.splitn(3, ':');
+    let kind = parts.next().unwrap_or_default().trim();
+    let reference = parts.next().unwrap_or_default().trim();
+    if kind.is_empty() || reference.is_empty() {
+        bail!("--evidence must be kind:reference[:note]");
+    }
+    let mut evidence = json!({"kind": kind, "reference": reference});
+    if let Some(note) = parts.next().map(str::trim).filter(|note| !note.is_empty()) {
+        evidence["note"] = json!(note);
+    }
+    Ok(evidence)
 }
 
 fn insert_agent_identity_optional(
@@ -13959,6 +14162,105 @@ fn gate_lines(value: &Value) -> Option<Vec<String>> {
     None
 }
 
+fn agent_memory_lines(value: &Value) -> Option<Vec<String>> {
+    let line = |memory: &Value| {
+        let id = memory["id"].as_str().unwrap_or("?");
+        let scope = memory["scope"].as_str().unwrap_or("?");
+        let status = if memory["expired"].as_bool().unwrap_or(false) {
+            "expired"
+        } else {
+            memory["status"].as_str().unwrap_or("?")
+        };
+        let source = memory["source"].as_str().unwrap_or("?");
+        let content = memory["content"].as_str().unwrap_or("");
+        let evidence = memory["evidence"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| {
+                        let kind = row["kind"].as_str()?;
+                        let reference = row["reference"].as_str()?;
+                        Some(format!("{kind} {reference}"))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let provenance = if evidence.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", evidence.join(", "))
+        };
+        format!("{id}  {scope:<10}  {status:<10}  {source:<12}  {content}{provenance}")
+    };
+    if let Some(memories) = value.get("memories").and_then(Value::as_array)
+        && memories.iter().all(|memory| memory.get("scope").is_some())
+    {
+        if memories.is_empty() {
+            return Some(vec!["No identity memories.".to_string()]);
+        }
+        let mut lines = Vec::with_capacity(memories.len() + 1);
+        lines.push(format!(
+            "{} identity memories (total {})",
+            memories.len(),
+            value["total"].as_u64().unwrap_or(memories.len() as u64)
+        ));
+        lines.extend(memories.iter().map(line));
+        return Some(lines);
+    }
+    if let Some(memory) = value
+        .get("memory")
+        .filter(|memory| memory.get("scope").is_some())
+    {
+        let suffix = if value["changed"].as_bool().unwrap_or(false) {
+            " (changed)"
+        } else {
+            " (unchanged)"
+        };
+        return Some(vec![format!("{}{}", line(memory), suffix)]);
+    }
+    if let (Some(previous), Some(replacement)) = (
+        value
+            .get("previous")
+            .filter(|memory| memory.get("scope").is_some()),
+        value
+            .get("replacement")
+            .filter(|memory| memory.get("scope").is_some()),
+    ) {
+        return Some(vec![
+            format!("superseded {}", line(previous)),
+            format!("replacement {}", line(replacement)),
+        ]);
+    }
+    if value.get("memory_id").is_some()
+        && value.get("pruned").is_some()
+        && value.get("changed").is_some()
+    {
+        return Some(vec![format!(
+            "{}  {}",
+            value["memory_id"].as_str().unwrap_or("?"),
+            if value["pruned"].as_bool().unwrap_or(false) {
+                "pruned"
+            } else if value["changed"].as_bool().unwrap_or(false) {
+                "forgotten (stale)"
+            } else {
+                "unchanged"
+            }
+        )]);
+    }
+    if value.get("expired").is_some()
+        && value.get("pruned").is_some()
+        && value.get("remaining").is_some()
+    {
+        return Some(vec![format!(
+            "expired {} · pruned {} · remaining {}",
+            value["expired"].as_u64().unwrap_or(0),
+            value["pruned"].as_u64().unwrap_or(0),
+            value["remaining"].as_u64().unwrap_or(0)
+        )]);
+    }
+    None
+}
+
 fn agent_identity_lines(value: &Value) -> Option<Vec<String>> {
     if let Some(identities) = value.get("identities").and_then(Value::as_array)
         && identities
@@ -14319,6 +14621,12 @@ fn print_human(value: &Value) {
         return;
     }
     if let Some(lines) = coordination_lines(value) {
+        for line in lines {
+            println!("{line}");
+        }
+        return;
+    }
+    if let Some(lines) = agent_memory_lines(value) {
         for line in lines {
             println!("{line}");
         }
@@ -23389,6 +23697,186 @@ mod agent_identity_cli_tests {
             Command::Agents { session, .. } => assert_eq!(session.as_deref(), Some("ses-1")),
             other => panic!("expected agents, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn memory_commands_parse_and_render_without_secrets() {
+        let cli = Cli::try_parse_from([
+            "vp",
+            "agent-memory",
+            "prj-1",
+            "--identity",
+            "agt-1",
+            "--scope",
+            "agent",
+            "--status",
+            "active",
+            "--query",
+            "auth",
+            "--limit",
+            "20",
+            "--include-expired",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::AgentMemory {
+                project,
+                identity,
+                scope,
+                status,
+                query,
+                limit,
+                include_expired,
+                ..
+            } => {
+                assert_eq!(project, "prj-1");
+                assert_eq!(identity.as_deref(), Some("agt-1"));
+                assert_eq!(scope.as_deref(), Some("agent"));
+                assert_eq!(status.as_deref(), Some("active"));
+                assert_eq!(query.as_deref(), Some("auth"));
+                assert_eq!(limit, Some(20));
+                assert!(include_expired);
+            }
+            other => panic!("expected agent-memory, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "agent-memory-remember",
+            "prj-1",
+            "--scope",
+            "agent",
+            "--content",
+            "Auth owns token validation.",
+            "--identity",
+            "agt-1",
+            "--source",
+            "verifier",
+            "--evidence",
+            "task:T1:reviewed",
+            "--evidence",
+            "commit:abcdef123456",
+            "--expires-at",
+            "2027-01-01T00:00:00Z",
+            "--pinned",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::AgentMemoryRemember {
+                project,
+                scope,
+                content,
+                identity,
+                source,
+                evidence,
+                expires_at,
+                pinned,
+                ..
+            } => {
+                assert_eq!(project, "prj-1");
+                assert_eq!(scope, "agent");
+                assert_eq!(content, "Auth owns token validation.");
+                assert_eq!(identity.as_deref(), Some("agt-1"));
+                assert_eq!(source.as_deref(), Some("verifier"));
+                assert_eq!(evidence.len(), 2);
+                assert_eq!(expires_at.as_deref(), Some("2027-01-01T00:00:00Z"));
+                assert!(pinned);
+                let first = parse_memory_evidence(&evidence[0]).unwrap();
+                assert_eq!(first["kind"], "task");
+                assert_eq!(first["reference"], "T1");
+                assert_eq!(first["note"], "reviewed");
+                let second = parse_memory_evidence(&evidence[1]).unwrap();
+                assert!(second.get("note").is_none());
+                assert!(parse_memory_evidence("task").is_err());
+                assert!(parse_memory_evidence("task:").is_err());
+            }
+            other => panic!("expected agent-memory-remember, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "agent-memory-supersede",
+            "mem-1",
+            "--replacement",
+            "mem-2",
+            "--expected-hash",
+            "abc",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::AgentMemorySupersede {
+                memory,
+                replacement,
+                content,
+                expected_hash,
+                ..
+            } => {
+                assert_eq!(memory, "mem-1");
+                assert_eq!(replacement.as_deref(), Some("mem-2"));
+                assert!(content.is_none());
+                assert_eq!(expected_hash.as_deref(), Some("abc"));
+            }
+            other => panic!("expected agent-memory-supersede, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["vp", "agent-memory-forget", "mem-1", "--prune"]).unwrap();
+        match cli.command {
+            Command::AgentMemoryForget { memory, prune } => {
+                assert_eq!(memory, "mem-1");
+                assert!(prune);
+            }
+            other => panic!("expected agent-memory-forget, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "agent-memory-sweep",
+            "prj-1",
+            "--older-than-days",
+            "30",
+            "--limit",
+            "50",
+            "--prune",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::AgentMemorySweep {
+                project,
+                older_than_days,
+                limit,
+                prune,
+            } => {
+                assert_eq!(project, "prj-1");
+                assert_eq!(older_than_days, Some(30));
+                assert_eq!(limit, Some(50));
+                assert!(prune);
+            }
+            other => panic!("expected agent-memory-sweep, got {other:?}"),
+        }
+
+        let list = json!({
+            "memories": [{
+                "id": "mem-1",
+                "scope": "agent",
+                "status": "active",
+                "source": "operator",
+                "content": "Auth owns token validation.",
+                "expired": false,
+                "evidence": [{"kind": "task", "reference": "T1"}]
+            }],
+            "total": 1
+        });
+        let rendered = agent_memory_lines(&list).unwrap().join("\n");
+        assert!(rendered.contains("mem-1"));
+        assert!(rendered.contains("agent"));
+        assert!(rendered.contains("Auth owns token validation."));
+        assert!(rendered.contains("task T1"));
+        let sweep = json!({"expired": 2, "pruned": 1, "remaining": 4});
+        let rendered = agent_memory_lines(&sweep).unwrap().join("\n");
+        assert!(rendered.contains("expired 2"));
+        assert!(rendered.contains("pruned 1"));
+        assert!(rendered.contains("remaining 4"));
+        assert!(agent_memory_lines(&json!({"agents": []})).is_none());
     }
 
     #[test]

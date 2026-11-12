@@ -48,7 +48,8 @@ use vp_protocol::types::{
     AddProjectParams, AgentCoordinationReplayParams, AgentIdentityListParams, AgentIdentityParams,
     AgentIdentityPolicyParams, AgentIdentityPolicyResult, AgentIdentityReplayParams,
     AgentInboxListParams, AgentInboxMessageParams, AgentInboxSendParams, AgentListParams,
-    AgentListResult, AgentMessageResult, AgentWorkspaceArchiveParams, AgentWorkspaceEnsureParams,
+    AgentListResult, AgentMemoryListParams, AgentMemoryParams, AgentMemoryReplayParams,
+    AgentMessageResult, AgentWorkspaceArchiveParams, AgentWorkspaceEnsureParams,
     AgentWorkspaceLandParams, AgentWorkspaceListParams, AgentWorkspaceParams,
     AgentWorkspaceReplayParams, AgentWorkspaceRetireParams, AnswerQuestionParams,
     AnswerQuestionResult, ApprovalAuditParams, ApprovalBatchResolveParams,
@@ -67,11 +68,12 @@ use vp_protocol::types::{
     ConsoleWriteParams, ContextCheckpointCreateParams, ContextCheckpointDeleteParams,
     ContextCheckpointDetailParams, ContextCheckpointListParams, ContextCheckpointPolicyParams,
     ContextCheckpointPruneParams, ContextRestoreParams, ContractPolicyParams, ContractPolicyResult,
-    CreateAgentIdentityParams, CreateModelPresetParams, CreateSessionParams, CriticalPathMode,
-    CriticalPathPolicyParams, CriticalPathPolicyResult, DaemonMetrics, DaemonMetricsResult,
-    DashboardParams, DeleteModelPresetParams, DiscardSessionParams, DoctorCheck, DoctorReport,
-    EffectPolicyParams, EffectPolicyResult, EffectReconcileParams, EffectReconcileResult,
-    EventListResult, ForgePreflightParams, ForgeStatusParams, ForkAuditParams, ForkRepairParams,
+    CreateAgentIdentityParams, CreateAgentMemoryParams, CreateModelPresetParams,
+    CreateSessionParams, CriticalPathMode, CriticalPathPolicyParams, CriticalPathPolicyResult,
+    DaemonMetrics, DaemonMetricsResult, DashboardParams, DeleteModelPresetParams,
+    DiscardSessionParams, DoctorCheck, DoctorReport, EffectPolicyParams, EffectPolicyResult,
+    EffectReconcileParams, EffectReconcileResult, EventListResult, ForgePreflightParams,
+    ForgeStatusParams, ForgetAgentMemoryParams, ForkAuditParams, ForkRepairParams,
     GateCancelParams, GateListParams, GateOpenParams, GatePolicyParams, GatePolicyResult,
     GateResolveParams, GateStatusParams, GateSweepParams, GitLogParams, GitShowParams,
     GovernorPreviewParams, GovernorStatusParams, IntakeCreateParams, IntakeDeleteResult,
@@ -128,16 +130,17 @@ use vp_protocol::types::{
     SourceEmbeddingPolicyParams, SourceEmbeddingReindexParams, SourceEmbeddingStatusParams,
     SourceGetParams, SourceImportParams, SourceIndexRebuildParams, SourceIndexStatusParams,
     SourceListParams, SourceRetrievalPolicyParams, SourceSearchParams, SubscribeParams,
-    TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult, TaskQueueParams,
-    TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult, TerminalCloseParams,
-    TerminalOpenParams, TerminalReadParams, TerminalResizeParams, TerminalWriteParams,
-    ToolActivityParams, ToolBundleDiffParams, ToolBundleHistoryParams, ToolBundleMatrixParams,
-    ToolBundleParams, ToolOutputAuditParams, ToolOutputListParams, ToolOutputPolicyParams,
-    ToolOutputPolicyResult, ToolOutputPruneParams, ToolOutputStatusParams, UpdateAcpAgentParams,
-    UpdateAgentIdentityParams, UpdateCheckParams, UpdateDownloadParams, UpdateMcpServerParams,
-    UpdateModelPresetParams, UpdateSourceMetadataParams, UsageLedgerParams, WorkspaceFileParams,
-    WorkspaceGrepParams, WorkspaceListParams, WorkspaceSearchParams, WorkspaceTreeParams,
-    WorkspaceWriteParams, WorktreePolicyParams,
+    SupersedeAgentMemoryParams, SweepAgentMemoriesParams, TaskActionParams, TaskActionResult,
+    TaskDispatchParams, TaskDispatchResult, TaskQueueParams, TaskSchedulerPolicyParams,
+    TeamPlanParams, TeamPlanResult, TerminalCloseParams, TerminalOpenParams, TerminalReadParams,
+    TerminalResizeParams, TerminalWriteParams, ToolActivityParams, ToolBundleDiffParams,
+    ToolBundleHistoryParams, ToolBundleMatrixParams, ToolBundleParams, ToolOutputAuditParams,
+    ToolOutputListParams, ToolOutputPolicyParams, ToolOutputPolicyResult, ToolOutputPruneParams,
+    ToolOutputStatusParams, UpdateAcpAgentParams, UpdateAgentIdentityParams,
+    UpdateAgentMemoryParams, UpdateCheckParams, UpdateDownloadParams, UpdateMcpServerParams,
+    UpdateModelPresetParams, UpdateSourceMetadataParams, UsageLedgerParams,
+    VerifyAgentMemoryParams, WorkspaceFileParams, WorkspaceGrepParams, WorkspaceListParams,
+    WorkspaceSearchParams, WorkspaceTreeParams, WorkspaceWriteParams, WorktreePolicyParams,
 };
 use vp_protocol::types::{
     ComputerLeaseInfo, ComputerLeaseListResult, ComputerLeaseReleaseParams,
@@ -4156,6 +4159,71 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 Err(response) => response_with_id(id, response),
             }
         }
+        "agent.memory.list" => match parse_params::<AgentMemoryListParams>(request.params) {
+            Ok(params) => match state.engine.list_agent_memories(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => memory_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "agent.memory.get" => match parse_params::<AgentMemoryParams>(request.params) {
+            Ok(params) => match state.engine.get_agent_memory(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => memory_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "agent.memory.remember" => match parse_params::<CreateAgentMemoryParams>(request.params) {
+            Ok(params) => match state.engine.remember_agent_memory(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => memory_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "agent.memory.update" => match parse_params::<UpdateAgentMemoryParams>(request.params) {
+            Ok(params) => match state.engine.update_agent_memory(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => memory_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "agent.memory.supersede" => {
+            match parse_params::<SupersedeAgentMemoryParams>(request.params) {
+                Ok(params) => match state.engine.supersede_agent_memory(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => memory_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "agent.memory.forget" => match parse_params::<ForgetAgentMemoryParams>(request.params) {
+            Ok(params) => match state.engine.forget_agent_memory(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => memory_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "agent.memory.verify" => match parse_params::<VerifyAgentMemoryParams>(request.params) {
+            Ok(params) => match state.engine.verify_agent_memory(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => memory_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "agent.memory.sweep" => match parse_params::<SweepAgentMemoriesParams>(request.params) {
+            Ok(params) => match state.engine.sweep_agent_memories(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => memory_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "agent.memory.replay" => match parse_params::<AgentMemoryReplayParams>(request.params) {
+            Ok(params) => match state.engine.replay_agent_memories(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => memory_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
         "session.assignments" => match parse_params::<SessionAssignmentsParams>(request.params) {
             Ok(params) => match state.engine.session_assignments(params).await {
                 Ok(result) => RpcResponse::success(id, result),
@@ -5408,6 +5476,13 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             | "agent.identity.resume"
             | "agent.identity.retire"
             | "agent.identities.replay"
+            | "agent.memory.remember"
+            | "agent.memory.update"
+            | "agent.memory.supersede"
+            | "agent.memory.forget"
+            | "agent.memory.verify"
+            | "agent.memory.sweep"
+            | "agent.memory.replay"
             | "session.assign"
             | "session.assignment.renew"
             | "session.release"
@@ -5554,6 +5629,28 @@ fn identity_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
     RpcResponse::error(
         id,
         RpcError::with_data(rpc_code, typed.message.clone(), json!({"code": typed.code})),
+    )
+}
+
+/// Map the stable agent-memory taxonomy to a bounded RPC failure. Message text
+/// never changes the classification; only the typed code does.
+fn memory_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
+    if let Some(typed) = error.downcast_ref::<vp_protocol::types::AgentMemoryError>() {
+        let rpc_code = match typed.code {
+            vp_protocol::types::agent_memory_codes::MEMORY_NOT_FOUND => codes::NOT_FOUND,
+            vp_protocol::types::agent_memory_codes::MEMORY_CONFLICT
+            | vp_protocol::types::agent_memory_codes::MEMORY_IMPORTED_READONLY
+            | vp_protocol::types::agent_memory_codes::MEMORY_IDENTITY_RETIRED => codes::CONFLICT,
+            _ => codes::INVALID_PARAMS,
+        };
+        return RpcResponse::error(
+            id,
+            RpcError::with_data(rpc_code, typed.message.clone(), json!({"code": typed.code})),
+        );
+    }
+    RpcResponse::error(
+        id,
+        RpcError::new(codes::INTERNAL_ERROR, format!("{error:#}")),
     )
 }
 

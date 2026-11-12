@@ -31,7 +31,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
 use serde_json::Value;
-use vp_protocol::types::{Event, InstructionBlob, PromptSectionRef, SessionInstructionState};
+use vp_protocol::types::{
+    Event, IdentityMemoryTelemetry, InstructionBlob, PromptSectionRef, SessionInstructionState,
+};
 use vp_store::Store;
 
 use crate::sha256_hex;
@@ -1017,6 +1019,7 @@ pub struct LatestPromptPrefix {
     pub identity_id: Option<String>,
     pub identity_generation: Option<u64>,
     pub identity_hash: Option<String>,
+    pub identity_memory: Option<IdentityMemoryTelemetry>,
 }
 
 /// Latest prompt-prefix identity for one session.
@@ -1076,6 +1079,12 @@ pub fn latest_prompt_prefix(events: &[Event]) -> LatestPromptPrefix {
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
             .map(str::to_string),
+        identity_memory: event
+            .payload
+            .get("identity_memory")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<IdentityMemoryTelemetry>(value).ok())
+            .filter(|telemetry| !telemetry.source.is_empty()),
     }
 }
 

@@ -543,6 +543,24 @@ async fn identity_memory_is_tail_only_and_never_moves_the_head() {
     );
     assert_eq!(prefixes[0].payload["identity_memory_present"], false);
     assert_eq!(prefixes[1].payload["identity_memory_present"], true);
+    assert!(prefixes[0].payload["identity_memory"].is_null());
+    let telemetry = &prefixes[1].payload["identity_memory"];
+    assert_eq!(telemetry["source"], "legacy_project_memory");
+    assert_eq!(telemetry["memory_count"], 1);
+    assert!(
+        telemetry["brief_chars"].as_u64().unwrap_or(0) > 0,
+        "{telemetry:?}"
+    );
+    assert_eq!(
+        telemetry["brief_hash"].as_str().unwrap_or_default().len(),
+        64
+    );
+    assert!(
+        telemetry["memory_hashes"]
+            .as_array()
+            .is_some_and(|hashes| hashes.len() == 1)
+    );
+    assert!(!telemetry.to_string().contains("JWT validation"));
     let tail_keys = prefixes[1].payload["tail_sections"]
         .as_array()
         .unwrap()
@@ -555,6 +573,12 @@ async fn identity_memory_is_tail_only_and_never_moves_the_head() {
         .session_instructions(&session.id, None)
         .await
         .unwrap();
+    let latest_memory = report
+        .latest_identity_memory
+        .as_ref()
+        .expect("latest identity memory telemetry");
+    assert_eq!(latest_memory.memory_count, 1);
+    assert_eq!(latest_memory.source, "legacy_project_memory");
     let encoded = serde_json::to_string(&report).unwrap();
     assert!(!encoded.contains("JWT validation"));
 }
@@ -1319,8 +1343,8 @@ async fn identity_memory_is_scoped_to_the_resolved_identity() {
         .identity_memory_brief(&session.id, &resolved)
         .await
         .unwrap();
-    assert!(brief.contains("billing component"));
-    assert!(!brief.contains("auth component"));
+    assert!(brief.text.contains("billing component"));
+    assert!(!brief.text.contains("auth component"));
 
     let resolved = engine
         .prompt_identity_for_run(&session.id, "worker", Some("Auth Tech Lead"), None)
@@ -1331,13 +1355,15 @@ async fn identity_memory_is_scoped_to_the_resolved_identity() {
         .identity_memory_brief(&session.id, &resolved)
         .await
         .unwrap();
-    assert!(brief.contains("auth component"));
-    assert!(!brief.contains("billing component"));
+    assert!(brief.text.contains("auth component"));
+    assert!(!brief.text.contains("billing component"));
 
     // The same brief is bounded before it can become a prompt tail.
     assert!(
-        brief.chars().count() <= vp_core::identity_prompt::IDENTITY_MEMORY_BRIEF_CHARS as usize
+        brief.text.chars().count()
+            <= vp_core::identity_prompt::IDENTITY_MEMORY_BRIEF_CHARS as usize
     );
+    assert_eq!(brief.source, "legacy_project_memory");
 }
 
 #[tokio::test]

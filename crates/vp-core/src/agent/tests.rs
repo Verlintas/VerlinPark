@@ -23781,6 +23781,7 @@ async fn assigned_manager_and_worker_get_identity_sections_but_task_roles_do_not
         "own the platform department",
         true,
         InstructionBuildMode::Materialize,
+        None,
     )
     .await
     .unwrap();
@@ -23810,6 +23811,7 @@ async fn assigned_manager_and_worker_get_identity_sections_but_task_roles_do_not
         "implement auth",
         true,
         InstructionBuildMode::Materialize,
+        None,
     )
     .await
     .unwrap();
@@ -23857,6 +23859,7 @@ async fn assigned_manager_and_worker_get_identity_sections_but_task_roles_do_not
             "task objective",
             true,
             InstructionBuildMode::Materialize,
+            None,
         )
         .await
         .unwrap();
@@ -23903,6 +23906,7 @@ async fn assigned_identity_memory_is_tail_only_and_warm_omits_it() {
         "implement auth",
         false,
         InstructionBuildMode::Preview,
+        None,
     )
     .await
     .unwrap();
@@ -23925,6 +23929,7 @@ async fn assigned_identity_memory_is_tail_only_and_warm_omits_it() {
         "implement auth",
         true,
         InstructionBuildMode::Preview,
+        None,
     )
     .await
     .unwrap();
@@ -23947,6 +23952,7 @@ async fn assigned_identity_memory_is_tail_only_and_warm_omits_it() {
         "implement auth",
         true,
         InstructionBuildMode::Preview,
+        None,
     )
     .await
     .unwrap();
@@ -23993,6 +23999,7 @@ async fn layout_v2_on_an_assigned_session_keeps_legacy_combined_bytes() {
         "legacy task",
         true,
         InstructionBuildMode::Preview,
+        None,
     )
     .await
     .unwrap();
@@ -24418,4 +24425,294 @@ fn worker_and_labour_identity_roles_stay_distinct_from_execution_roles() {
     assert!(scout_contract.is_none());
     assert_eq!(AgentRole::Worker.child_role(), Some(AgentRole::Labour));
     assert_eq!(AgentRole::Labour.child_role(), None);
+}
+
+#[tokio::test]
+async fn identity_memory_change_moves_only_the_tail_not_the_prefix_or_epoch() {
+    let dir = TempDir::new().unwrap();
+    let (engine, _service, project) = test_service(&dir);
+    enable_identity_policy(&engine, &project.id).await;
+    let worker = project_identity(&engine, &project.id, "worker", "Auth Tech Lead", "auth").await;
+    let session = engine
+        .create_session(project.id.clone(), "tail-only memory".into(), None)
+        .await
+        .unwrap();
+    assign_identity(&engine, &session.id, &worker).await;
+    let spec = help_spec(AgentRole::Worker, AgentProfile::Coding);
+
+    let mut before_meta = None;
+    let before = build_prompt_sections(
+        &engine,
+        &project,
+        &session,
+        &spec,
+        None,
+        "implement auth",
+        true,
+        InstructionBuildMode::Preview,
+        Some(&mut before_meta),
+    )
+    .await
+    .unwrap();
+    assert!(before_meta.is_none());
+    assert!(
+        before
+            .exact_text(crate::identity_prompt::IDENTITY_MEMORY_SECTION_KEY)
+            .is_none()
+    );
+    let before_hashes = before.hashes("test-model", &[]);
+    let before_epoch = crate::cache_epoch::CacheEpoch::from_hashes("test-model", &before_hashes);
+
+    let worker_identity = engine
+        .prompt_identity_for_run(&session.id, "worker", None, None)
+        .await
+        .unwrap()
+        .expect("assigned worker");
+    engine
+        .remember_agent_memory(vp_protocol::types::CreateAgentMemoryParams {
+            project_id: project.id.clone(),
+            identity_id: Some(worker_identity.id),
+            scope: "agent".to_string(),
+            content: "Auth validates tokens before routing.".to_string(),
+            evidence: vec![vp_protocol::types::MemoryEvidence {
+                kind: "task".to_string(),
+                reference: "T1".to_string(),
+                note: None,
+            }],
+            source: Some("operator".to_string()),
+            ..vp_protocol::types::CreateAgentMemoryParams::default()
+        })
+        .await
+        .unwrap();
+
+    let mut after_meta = None;
+    let after = build_prompt_sections(
+        &engine,
+        &project,
+        &session,
+        &spec,
+        None,
+        "implement auth",
+        true,
+        InstructionBuildMode::Preview,
+        Some(&mut after_meta),
+    )
+    .await
+    .unwrap();
+    let after_hashes = after.hashes("test-model", &[]);
+    let after_epoch = crate::cache_epoch::CacheEpoch::from_hashes("test-model", &after_hashes);
+    assert_eq!(before_hashes.core_hash, after_hashes.core_hash);
+    assert_eq!(before_hashes.project_hash, after_hashes.project_hash);
+    assert_eq!(before_hashes.tools_hash, after_hashes.tools_hash);
+    assert_eq!(
+        before_hashes.stable_prefix_hash,
+        after_hashes.stable_prefix_hash
+    );
+    assert_eq!(before_hashes.prefix_hash, after_hashes.prefix_hash);
+    assert_eq!(before_hashes.identity_hash, after_hashes.identity_hash);
+    assert_eq!(before_epoch.hash, after_epoch.hash);
+    assert_ne!(before_hashes.volatile_hash, after_hashes.volatile_hash);
+    assert!(after_hashes.section_chars.contains_key("agent/memory"));
+    let memory_section = after
+        .exact_text(crate::identity_prompt::IDENTITY_MEMORY_SECTION_KEY)
+        .expect("identity memory tail");
+    assert!(memory_section.contains("Auth validates tokens"));
+    let meta = after_meta.expect("memory metadata");
+    assert_eq!(meta.source, "agent_memory");
+    assert_eq!(meta.memory_count, 1);
+    assert!(meta.brief_chars > 0);
+    let telemetry = meta.telemetry().expect("telemetry");
+    let serialized = serde_json::to_string(&telemetry).unwrap();
+    assert!(!serialized.contains("Auth validates tokens"));
+    assert_eq!(telemetry.memory_count, 1);
+    assert_eq!(telemetry.memory_hashes.len(), 1);
+
+    // A warm sends only the stable head; the memory tail is omitted entirely.
+    let mut warm_meta = Some(meta.clone());
+    let warm = build_prompt_sections(
+        &engine,
+        &project,
+        &session,
+        &spec,
+        None,
+        "implement auth",
+        false,
+        InstructionBuildMode::Preview,
+        Some(&mut warm_meta),
+    )
+    .await
+    .unwrap();
+    assert!(warm_meta.is_none());
+    assert!(
+        warm.exact_text(crate::identity_prompt::IDENTITY_MEMORY_SECTION_KEY)
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn remember_and_recall_scope_defaults_and_typed_scope_errors() {
+    let dir = TempDir::new().unwrap();
+    let (engine, _service, project) = test_service(&dir);
+    enable_identity_policy(&engine, &project.id).await;
+    let worker = project_identity(&engine, &project.id, "worker", "Auth Tech Lead", "auth").await;
+    let session = engine
+        .create_session(project.id.clone(), "scoped tools".into(), None)
+        .await
+        .unwrap();
+    assign_identity(&engine, &session.id, &worker).await;
+    let spec = help_spec(AgentRole::Worker, AgentProfile::Coding);
+
+    // Omitted scope remains the legacy project-memory path, exactly as before.
+    let legacy = run_memory_tool(
+        &engine,
+        &session,
+        &project,
+        &spec,
+        "remember",
+        serde_json::json!({
+            "kind": "decision",
+            "title": "Legacy decision",
+            "body": "The legacy store remains the default."
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(!legacy.is_error, "{}", legacy.content);
+    assert!(legacy.content.contains("[decision]"));
+    let legacy_rows = engine
+        .list_memories(&project.id, None, None, 10)
+        .await
+        .unwrap()
+        .memories;
+    assert_eq!(legacy_rows.len(), 1);
+    let agent_rows = engine
+        .list_agent_memories(vp_protocol::types::AgentMemoryListParams {
+            project_id: project.id.clone(),
+            ..vp_protocol::types::AgentMemoryListParams::default()
+        })
+        .await
+        .unwrap();
+    assert!(agent_rows.memories.is_empty());
+
+    let scoped = run_memory_tool(
+        &engine,
+        &session,
+        &project,
+        &spec,
+        "remember",
+        serde_json::json!({
+            "kind": "decision",
+            "title": "Auth boundary",
+            "body": "Auth owns token validation.",
+            "scope": "agent",
+            "evidence": [{"kind": "commit", "reference": "abcdef123456"}]
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(!scoped.is_error, "{}", scoped.content);
+    assert!(scoped.content.contains("[agent]"));
+    let rows = engine
+        .list_agent_memories(vp_protocol::types::AgentMemoryListParams {
+            project_id: project.id.clone(),
+            identity_id: Some(worker.clone()),
+            ..vp_protocol::types::AgentMemoryListParams::default()
+        })
+        .await
+        .unwrap()
+        .memories;
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0]
+            .evidence
+            .iter()
+            .any(|entry| entry.kind == "session" && entry.reference == session.id)
+    );
+    assert!(
+        rows[0]
+            .evidence
+            .iter()
+            .any(|entry| entry.kind == "commit" && entry.reference == "abcdef123456")
+    );
+
+    let recall = run_memory_tool(
+        &engine,
+        &session,
+        &project,
+        &spec,
+        "recall",
+        serde_json::json!({"query": "token", "scope": "agent"}),
+    )
+    .await
+    .unwrap();
+    assert!(!recall.is_error, "{}", recall.content);
+    assert!(recall.content.contains("Auth owns token validation"));
+    assert!(recall.content.contains("(commit abcdef1)"));
+
+    // Explicit scope=project is the org-memory store, not a silent redirect of
+    // the legacy default.
+    let project_recall = run_memory_tool(
+        &engine,
+        &session,
+        &project,
+        &spec,
+        "recall",
+        serde_json::json!({"query": "legacy", "scope": "project"}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        project_recall
+            .content
+            .contains("No matching identity memories.")
+    );
+
+    let invalid = run_memory_tool(
+        &engine,
+        &session,
+        &project,
+        &spec,
+        "remember",
+        serde_json::json!({
+            "kind": "fact",
+            "title": "bad",
+            "body": "scope is not free-form",
+            "scope": "session"
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(invalid.is_error);
+    assert!(invalid.content.contains("MEMORY_SCOPE_INVALID"));
+
+    // Task-scoped roles have no project identity; agent/department scope fails
+    // closed instead of falling back to project memory.
+    let labour = help_spec(AgentRole::Labour, AgentProfile::Coding);
+    let labour_attempt = run_memory_tool(
+        &engine,
+        &session,
+        &project,
+        &labour,
+        "remember",
+        serde_json::json!({
+            "kind": "fact",
+            "title": "labour memory",
+            "body": "must not switch scope silently",
+            "scope": "agent"
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(labour_attempt.is_error);
+    assert!(labour_attempt.content.contains("MEMORY_IDENTITY_REQUIRED"));
+    let legacy_count = engine
+        .list_memories(&project.id, None, None, 10)
+        .await
+        .unwrap()
+        .memories
+        .len();
+    assert_eq!(
+        legacy_count, 1,
+        "failed agent scope must not write legacy memory"
+    );
 }

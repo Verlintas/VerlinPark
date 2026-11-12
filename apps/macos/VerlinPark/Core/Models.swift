@@ -7732,6 +7732,89 @@ struct AgentIdentitiesResult: Codable, Sendable {
     let identities: [AgentIdentity]
 }
 
+/// Read-only project-scoped identity/department/project memory. S5 has no
+/// mutation UI; writes and lifecycle actions are explicit RPC/CLI operations.
+struct AgentMemory: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let projectId: String
+    let identityId: String?
+    let department: String?
+    let component: String?
+    let scope: String
+    let content: String
+    let contentHash: String?
+    let evidence: [MemoryEvidence]?
+    let source: String
+    let status: String
+    let pinned: Bool?
+    let createdAt: String?
+    let updatedAt: String?
+    let expiresAt: String?
+    let verifiedAt: String?
+    let supersededBy: String?
+    let staleReason: String?
+    let origin: String?
+    let expired: Bool?
+
+    var isImported: Bool {
+        origin == "imported"
+    }
+
+    var isExpired: Bool {
+        expired ?? false
+    }
+
+    var effectiveStatus: String {
+        isExpired ? "expired" : status
+    }
+
+    var isActive: Bool {
+        status == "active" && !isExpired
+    }
+
+    var evidenceLabelParts: [String] {
+        Array((evidence ?? []).prefix(3)).map(\.label)
+    }
+
+    var statusDetail: String? {
+        if let staleReason, !staleReason.isEmpty {
+            return staleReason
+        }
+        if let verifiedAt, !verifiedAt.isEmpty {
+            return "verified \(verifiedAt)"
+        }
+        return nil
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case projectId = "project_id"
+        case identityId = "identity_id"
+        case department
+        case component
+        case scope
+        case content
+        case contentHash = "content_hash"
+        case evidence
+        case source
+        case status
+        case pinned
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+        case expiresAt = "expires_at"
+        case verifiedAt = "verified_at"
+        case supersededBy = "superseded_by"
+        case staleReason = "stale_reason"
+        case origin
+        case expired
+    }
+}
+
+struct AgentMemoryListResult: Codable, Sendable {
+    let memories: [AgentMemory]
+    let total: Int?
+}
+
 /// Read-only session→identity assignment metadata. The lease token is never on
 /// the wire; `leaseActive` is a server-derived, time-relative hint.
 struct AgentAssignment: Codable, Identifiable, Hashable, Sendable {

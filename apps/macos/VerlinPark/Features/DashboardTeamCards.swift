@@ -2426,8 +2426,119 @@ struct ProjectIdentitiesCard: View {
     }
 }
 
-struct ProjectWorkspacesCard: View {
+struct ProjectAgentMemoriesCard: View {
     @Environment(AppModel.self) private var model
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Identity memory")
+                    Text(model.selectedProject?.name ?? "No project selected")
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                        .lineLimit(1)
+                }
+                Spacer()
+                if model.agentMemoriesBusy {
+                    ProgressView().controlSize(.small)
+                }
+                if !model.agentMemories.isEmpty {
+                    Text("\(model.agentMemories.count)")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                Button("Refresh") {
+                    Task { await model.loadAgentMemories() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.selectedProjectID == nil || model.agentMemoriesBusy)
+            }
+            if model.selectedProjectID == nil {
+                Text("Select a project to inspect identity, department, and project memory.")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            } else if model.agentMemories.isEmpty {
+                Text(model.agentMemoriesStatus ?? "No identity memories.")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            } else {
+                VStack(spacing: 6) {
+                    ForEach(model.agentMemories.prefix(12)) { memory in
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack(spacing: 6) {
+                                Image(systemName: icon(for: memory.scope))
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(color(for: memory))
+                                    .frame(width: 12)
+                                Text(memory.scope)
+                                    .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                if let department = memory.department, !department.isEmpty {
+                                    Text(department)
+                                        .font(.system(size: 8, design: .monospaced))
+                                        .foregroundStyle(.tertiary)
+                                        .lineLimit(1)
+                                }
+                                Spacer()
+                                Text(memory.isImported ? "imported" : memory.effectiveStatus)
+                                    .font(.system(size: 8, design: .monospaced))
+                                    .foregroundStyle(color(for: memory))
+                            }
+                            Text(memory.content)
+                                .font(.system(size: 10, design: .monospaced))
+                                .lineLimit(3)
+                            if !memory.evidenceLabelParts.isEmpty {
+                                Text(memory.evidenceLabelParts.joined(separator: " · "))
+                                    .font(.system(size: 8, design: .monospaced))
+                                    .foregroundStyle(.tertiary)
+                                    .lineLimit(1)
+                            }
+                        }
+                        .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 8))
+                    }
+                }
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 0)
+        .task { await model.loadAgentMemories() }
+    }
+
+    private func icon(for scope: String) -> String {
+        switch scope {
+        case "agent": "person.crop.circle"
+        case "department": "person.3"
+        case "project": "building.2"
+        default: "brain"
+        }
+    }
+
+    private func color(for memory: AgentMemory) -> Color {
+        if memory.isImported {
+            return .secondary
+        }
+        if memory.isExpired {
+            return .orange
+        }
+        switch memory.status {
+        case "active": return memory.scope == "agent" ? .green : .blue
+        case "superseded": return .secondary
+        case "stale": return .orange
+        default: return .secondary
+        }
+    }
+}
+
+struct ProjectWorkspacesCard: View { @Environment(AppModel.self) private var model
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {

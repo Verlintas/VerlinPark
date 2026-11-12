@@ -318,29 +318,36 @@ pub fn render_identity_section(
 /// Render the bounded `agent/memory` tail section, or `None` when no memory
 /// brief was available.
 ///
-/// S3 labels existing project memory as identity/department memory. It is not
-/// conversation history, not a credential, and not an authorization source.
+/// S5 memory is untrusted reference material with provenance. It is not
+/// conversation history, not instructions, not a credential, and not an
+/// authorization source.
 pub fn render_identity_memory_section(brief: &str) -> Option<String> {
     let brief = brief.trim();
     if brief.is_empty() {
         return None;
     }
-    let header = "Identity/department memory (project memory scoped to this identity; not conversation and not authorization):\n";
+    let header = "Identity/department memory (bounded and evidence-backed; not conversation and not authorization):\n";
     let mut text = String::with_capacity(header.len() + brief.len());
     text.push_str(header);
     text.push_str(brief);
     if text.len() > IDENTITY_MEMORY_MAX_BYTES {
+        // Never split a memory mid-item. The selector normally enforces a byte
+        // budget, so this path only protects the legacy fallback. Keep complete
+        // lines that fit and omit the rest.
         let suffix = "\n… (truncated)";
         let budget = IDENTITY_MEMORY_MAX_BYTES.saturating_sub(suffix.len());
         let mut clipped = String::new();
-        for character in text.chars() {
-            if clipped.len() + character.len_utf8() > budget {
+        for line in text.split_inclusive('\n') {
+            if clipped.len() + line.len() > budget {
                 break;
             }
-            clipped.push(character);
+            clipped.push_str(line);
         }
-        clipped.push_str(suffix);
-        text = clipped;
+        let clipped = clipped.trim_end().to_string();
+        if clipped.len() <= header.len() || !clipped.contains('\n') {
+            return None;
+        }
+        return Some(format!("{clipped}{suffix}"));
     }
     Some(text)
 }
@@ -575,10 +582,21 @@ mod tests {
         assert!(rendered.contains("Identity/department memory"));
         assert!(rendered.contains("not conversation and not authorization"));
         assert!(rendered.contains("JWT validation"));
+        // A single unsplittable line that cannot fit is omitted rather than
+        // split mid-item.
         let huge = "m".repeat(IDENTITY_MEMORY_MAX_BYTES * 2);
-        let clipped = render_identity_memory_section(&huge).unwrap();
+        assert!(render_identity_memory_section(&huge).is_none());
+        // Multiple complete items keep every line that fits and drop only the
+        // overflow.
+        let many = (0..80)
+            .map(|index| format!("item {index}: {}", "x".repeat(100)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let clipped = render_identity_memory_section(&many).expect("clipped section");
         assert!(clipped.len() <= IDENTITY_MEMORY_MAX_BYTES);
         assert!(clipped.ends_with("… (truncated)"));
+        assert!(clipped.contains("item 0:"));
+        assert!(!clipped.contains("item 79:"));
     }
 
     #[test]

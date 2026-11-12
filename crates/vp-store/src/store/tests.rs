@@ -12070,6 +12070,8 @@ fn context_checkpoint_bundle_validation_checks_session_and_project() {
         agent_workspaces: Vec::new(),
         session_worker_workspaces: Vec::new(),
         agent_workspace_events: Vec::new(),
+        agent_memories: Vec::new(),
+        agent_memory_events: Vec::new(),
     };
     validate_session_bundle(&bundle).unwrap();
     bundle.context_checkpoints[0].project_id = "other-project".into();
@@ -12339,6 +12341,8 @@ fn importing_a_projection_only_bundle_synthesizes_checkpoint_events() {
         agent_workspaces: Vec::new(),
         session_worker_workspaces: Vec::new(),
         agent_workspace_events: Vec::new(),
+        agent_memories: Vec::new(),
+        agent_memory_events: Vec::new(),
     };
     let imported = Store::open(data.path().join("imported")).unwrap();
     imported.import_session_bundle(&bundle).unwrap();
@@ -14209,6 +14213,8 @@ fn bundle_import_preserves_supervised_process_lifecycle_rows() {
         agent_workspaces: Vec::new(),
         session_worker_workspaces: Vec::new(),
         agent_workspace_events: Vec::new(),
+        agent_memories: Vec::new(),
+        agent_memory_events: Vec::new(),
     };
     validate_session_bundle(&bundle).unwrap();
     let data = TempDir::new().unwrap();
@@ -14289,6 +14295,8 @@ fn supervised_process_bundle_validation_rejects_wrong_session() {
         agent_workspaces: Vec::new(),
         session_worker_workspaces: Vec::new(),
         agent_workspace_events: Vec::new(),
+        agent_memories: Vec::new(),
+        agent_memory_events: Vec::new(),
     };
     let error = validate_session_bundle(&bundle).unwrap_err();
     assert!(error.to_string().contains("belongs to session"), "{error}");
@@ -16524,6 +16532,8 @@ fn bundle_import_preserves_instruction_state_and_rejects_missing_blobs() {
         agent_workspaces: Vec::new(),
         session_worker_workspaces: Vec::new(),
         agent_workspace_events: Vec::new(),
+        agent_memories: Vec::new(),
+        agent_memory_events: Vec::new(),
     };
     store.import_session_bundle(&bundle).unwrap();
     assert_eq!(
@@ -16603,6 +16613,8 @@ fn bundle_import_rejects_a_corrupt_instruction_blob() {
         agent_workspaces: Vec::new(),
         session_worker_workspaces: Vec::new(),
         agent_workspace_events: Vec::new(),
+        agent_memories: Vec::new(),
+        agent_memory_events: Vec::new(),
     };
     assert!(store.import_session_bundle(&bundle).is_err());
 }
@@ -18186,20 +18198,33 @@ mod agent_identity_tests {
                 .unwrap_or(false);
             assert!(exists, "{table} must exist after S2");
         }
-        for table in ["agent_memories", "project_agent_policy"] {
-            let exists: bool = store
-                .lock()
-                .unwrap()
-                .query_row(
-                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
-                    params![table],
-                    |_| Ok(true),
-                )
-                .optional()
-                .unwrap()
-                .unwrap_or(false);
-            assert!(!exists, "{table} must not exist before S3/S6");
-        }
+        let policy_table_exists: bool = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'project_agent_policy'",
+                [],
+                |_| Ok(true),
+            )
+            .optional()
+            .unwrap()
+            .unwrap_or(false);
+        assert!(
+            !policy_table_exists,
+            "project_agent_policy must not exist before S6"
+        );
+        let memory_table_exists: bool = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_memories'",
+                [],
+                |_| Ok(true),
+            )
+            .optional()
+            .unwrap()
+            .unwrap_or(false);
+        assert!(memory_table_exists, "S5 must add agent_memories");
         assert!(store.get_agent_identity(&agent.id).unwrap().is_none());
         assert!(
             store

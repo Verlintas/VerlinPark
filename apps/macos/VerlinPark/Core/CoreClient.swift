@@ -1751,9 +1751,22 @@ actor CoreClient {
             .identities
     }
 
+    /// Read-only identity/department/project memory. No mutation action is
+    /// exposed from the client in S5.
+    func agentMemories(projectID: String) async throws -> AgentMemoryListResult {
+        let params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "limit": .number(100),
+        ]
+        return try await request(method: "agent.memory.list", params: params)
+            .decode(AgentMemoryListResult.self)
+    }
+
     /// Read-only session assignments and lease metadata. The client never
     /// renews or releases a lease; those are explicit operator/CLI actions.
-    func sessionAssignments(sessionID: String) async throws -> [AgentAssignment] {
+    func sessionAssignments(sessionID: String) async throws
+        -> [AgentAssignment]
+    {
         let params: [String: JSONValue] = ["session_id": .string(sessionID)]
         return try await request(method: "session.assignments", params: params)
             .decode(SessionAssignmentsResult.self)

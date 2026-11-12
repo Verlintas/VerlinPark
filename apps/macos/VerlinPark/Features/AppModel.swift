@@ -75,6 +75,9 @@ final class AppModel {
     var agentIdentities: [AgentIdentity] = []
     var agentIdentitiesStatus: String?
     var agentIdentitiesBusy = false
+    var agentMemories: [AgentMemory] = []
+    var agentMemoriesStatus: String?
+    var agentMemoriesBusy = false
     var sessionAssignments: [AgentAssignment] = []
     var sessionAssignmentsStatus: String?
     var sessionAssignmentsBusy = false
@@ -8178,8 +8181,32 @@ final class AppModel {
         }
     }
 
+    func loadAgentMemories() async {
+        guard let projectID = selectedProjectID else {
+            agentMemories = []
+            agentMemoriesStatus = nil
+            return
+        }
+        agentMemoriesBusy = true
+        defer { agentMemoriesBusy = false }
+        do {
+            let result = try await core.agentMemories(projectID: projectID)
+            if projectID == selectedProjectID {
+                agentMemories = result.memories
+                agentMemoriesStatus = result.memories.isEmpty
+                    ? "No identity memories."
+                    : "\(result.memories.count) memories"
+            }
+        } catch {
+            if projectID == selectedProjectID {
+                agentMemoriesStatus = error.localizedDescription
+            }
+        }
+    }
+
     func loadMailbox() async {
-        guard let sessionID = selectedSessionID else {
+        guard let sessionID = selectedSessionID
+        else {
             mailbox = []
             artifacts = []
             usageLedger = nil

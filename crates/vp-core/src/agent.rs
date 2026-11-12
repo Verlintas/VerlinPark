@@ -7937,6 +7937,7 @@ impl AgentService {
                 &session.goal,
                 false,
                 InstructionBuildMode::Preview,
+                None,
             )
             .await?;
             let dynamic_mcp =
@@ -8463,6 +8464,7 @@ impl AgentService {
                 &session.goal,
                 false,
                 InstructionBuildMode::Materialize,
+                None,
             )
             .await?;
             let dynamic_mcp =
@@ -15868,6 +15870,7 @@ async fn run_loop_body(
             .unwrap_or_default(),
         None => crate::contract::MutationUsage::default(),
     };
+    let mut identity_memory_telemetry = None;
     let sections = build_prompt_sections(
         engine,
         project,
@@ -15877,6 +15880,7 @@ async fn run_loop_body(
         objective,
         true,
         InstructionBuildMode::Materialize,
+        Some(&mut identity_memory_telemetry),
     )
     .await?;
     // Tail memory is appended to history once, at the position where it was
@@ -15972,6 +15976,9 @@ async fn run_loop_body(
         .await?;
     let identity_section_count = prompt_hashes.identity_sections.len();
     let identity_memory_present = prompt_hashes.section_chars.contains_key("agent/memory");
+    let identity_memory_payload = identity_memory_telemetry
+        .as_ref()
+        .and_then(crate::identity_memory::IdentityMemoryBrief::telemetry);
     let identity_hash_value =
         (!prompt_hashes.identity_hash.is_empty()).then(|| prompt_hashes.identity_hash.clone());
     let mut prefix_payload = serde_json::json!({
@@ -16018,6 +16025,9 @@ async fn run_loop_body(
         "identity_sections": prompt_hashes.identity_sections,
         "identity_section_count": identity_section_count,
         "identity_memory_present": identity_memory_present,
+        // S5 memory telemetry: counts/hashes/chars only. Content never enters
+        // the event stream.
+        "identity_memory": identity_memory_payload,
         // The finalized L4 epoch replaces the L1 placeholder. A compaction
         // boundary later in the run records a conversation-cache reset; it
         // does not rewrite this shareable instruction identity.
@@ -16135,6 +16145,7 @@ async fn run_loop_body(
             objective,
             false,
             InstructionBuildMode::Materialize,
+            None,
         )
         .await?;
         match warm_prompt_cache(
@@ -21369,13 +21380,102 @@ async fn run_memory_tool(
                 .filter_map(serde_json::Value::as_str)
                 .map(str::to_string)
                 .collect::<Vec<_>>();
+            let scope = match tool_memory_scope(&input) {
+                Ok(scope) => scope,
+                Err(output) => return Ok(output),
+            };
+            let Some(scope) = scope else {
+                // Omitted scope is the legacy project-memory path, unchanged.
+                let memory = engine
+                    .create_memory_as(&session.id, &spec.id, &spec.name, kind, title, body, tags)
+                    .await?;
+                return Ok(ToolOutput::ok(format!(
+                    "remembered [{}] {} ({})",
+                    memory.kind, memory.title, memory.id
+                )));
+            };
+            let identity = match active_memory_identity(engine, session, spec).await {
+                Ok(identity) => identity,
+                Err(error) => return Ok(memory_tool_failure("remember", &error)),
+            };
+            let (identity_id, department) = match scope {
+                "agent" => {
+                    let Some(identity) = identity else {
+                        return Ok(ToolOutput::error_coded(
+                            "remember",
+                            crate::tooling::errors::ToolErrorCode::INVALID_ARGUMENT,
+                            "error[MEMORY_IDENTITY_REQUIRED] agent scope requires an assigned project identity; omit scope for legacy project memory",
+                        ));
+                    };
+                    (Some(identity.id), None)
+                }
+                "department" => {
+                    let Some(identity) = identity else {
+                        return Ok(ToolOutput::error_coded(
+                            "remember",
+                            crate::tooling::errors::ToolErrorCode::INVALID_ARGUMENT,
+                            "error[MEMORY_IDENTITY_REQUIRED] department scope requires an assigned project identity",
+                        ));
+                    };
+                    let Some(department) = identity.department.clone() else {
+                        return Ok(ToolOutput::error_coded(
+                            "remember",
+                            crate::tooling::errors::ToolErrorCode::INVALID_ARGUMENT,
+                            "error[MEMORY_DEPARTMENT_REQUIRED] department scope requires an identity with a department",
+                        ));
+                    };
+                    (None, Some(department))
+                }
+                "project" => (None, None),
+                other => {
+                    return Ok(ToolOutput::error_coded(
+                        "remember",
+                        crate::tooling::errors::ToolErrorCode::INVALID_ARGUMENT,
+                        format!(
+                            "error[MEMORY_SCOPE_INVALID] scope must be agent, department, or project: {other}"
+                        ),
+                    ));
+                }
+            };
+            let content = format!("{}: {}", title.trim(), body.trim());
+            let mut evidence = match tool_memory_evidence(&input, session, spec) {
+                Ok(evidence) => evidence,
+                Err(output) => return Ok(output),
+            };
+            if evidence.len() > vp_protocol::types::AGENT_MEMORY_MAX_EVIDENCE {
+                evidence.truncate(vp_protocol::types::AGENT_MEMORY_MAX_EVIDENCE);
+            }
+            let expires_at = input
+                .get("expires_at")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let pinned = input
+                .get("pinned")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
             let memory = engine
-                .create_memory_as(&session.id, &spec.id, &spec.name, kind, title, body, tags)
-                .await?;
-            Ok(ToolOutput::ok(format!(
-                "remembered [{}] {} ({})",
-                memory.kind, memory.title, memory.id
-            )))
+                .remember_agent_memory(vp_protocol::types::CreateAgentMemoryParams {
+                    project_id: project.id.clone(),
+                    identity_id,
+                    department,
+                    scope: scope.to_string(),
+                    content,
+                    evidence,
+                    source: Some("agent".to_string()),
+                    expires_at,
+                    pinned,
+                    ..vp_protocol::types::CreateAgentMemoryParams::default()
+                })
+                .await;
+            match memory {
+                Ok(result) => Ok(ToolOutput::ok(format!(
+                    "remembered [{}] {} ({})",
+                    result.memory.scope,
+                    truncate_to(&result.memory.content, 120),
+                    result.memory.id
+                ))),
+                Err(error) => Ok(memory_tool_failure("remember", &error)),
+            }
         }
         "recall" => {
             let query = input
@@ -21391,23 +21491,94 @@ async fn run_memory_tool(
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(10)
                 .clamp(1, 20) as u32;
-            let memories = engine
-                .list_memories(&project.id, query, kind, limit)
-                .await?
-                .memories;
-            if memories.is_empty() {
-                return Ok(ToolOutput::ok("No matching project memories."));
+            let scope = match tool_memory_scope(&input) {
+                Ok(scope) => scope,
+                Err(output) => return Ok(output),
+            };
+            let Some(scope) = scope else {
+                let memories = engine
+                    .list_memories(&project.id, query, kind, limit)
+                    .await?
+                    .memories;
+                if memories.is_empty() {
+                    return Ok(ToolOutput::ok("No matching project memories."));
+                }
+                let mut text = String::new();
+                for memory in memories {
+                    text.push_str(&format!(
+                        "[{}] {} · {} · {}\n{}\n",
+                        memory.kind,
+                        memory.title,
+                        memory.agent_name,
+                        truncate_to(&memory.body, 1200),
+                        memory.id
+                    ));
+                }
+                return Ok(ToolOutput::ok(text));
+            };
+            let identity = match active_memory_identity(engine, session, spec).await {
+                Ok(identity) => identity,
+                Err(error) => return Ok(memory_tool_failure("recall", &error)),
+            };
+            let viewer = match scope {
+                "agent" | "department" if identity.is_none() => {
+                    return Ok(ToolOutput::error_coded(
+                        "recall",
+                        crate::tooling::errors::ToolErrorCode::INVALID_ARGUMENT,
+                        format!(
+                            "error[MEMORY_IDENTITY_REQUIRED] {scope} scope requires an assigned project identity"
+                        ),
+                    ));
+                }
+                "agent" | "department" | "project" => {
+                    identity.as_ref().map(|identity| identity.id.clone())
+                }
+                other => {
+                    return Ok(ToolOutput::error_coded(
+                        "recall",
+                        crate::tooling::errors::ToolErrorCode::INVALID_ARGUMENT,
+                        format!(
+                            "error[MEMORY_SCOPE_INVALID] scope must be agent, department, or project: {other}"
+                        ),
+                    ));
+                }
+            };
+            let result = engine
+                .list_agent_memories(vp_protocol::types::AgentMemoryListParams {
+                    project_id: project.id.clone(),
+                    identity_id: viewer,
+                    scope: Some(scope.to_string()),
+                    query,
+                    limit: Some(limit),
+                    ..vp_protocol::types::AgentMemoryListParams::default()
+                })
+                .await;
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => return Ok(memory_tool_failure("recall", &error)),
+            };
+            if result.memories.is_empty() {
+                return Ok(ToolOutput::ok("No matching identity memories."));
             }
             let mut text = String::new();
-            for memory in memories {
+            for memory in result.memories {
+                let status = if memory.expired {
+                    "expired"
+                } else {
+                    memory.status.as_str()
+                };
+                let provenance = crate::identity_memory::memory_provenance_label(&memory);
                 text.push_str(&format!(
-                    "[{}] {} · {} · {}
-{}
-",
-                    memory.kind,
-                    memory.title,
-                    memory.agent_name,
-                    truncate_to(&memory.body, 1200),
+                    "[{}·{}·{}] {}{}\n{}\n",
+                    memory.scope,
+                    status,
+                    memory.source,
+                    truncate_to(&memory.content, 1200),
+                    if provenance.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({provenance})")
+                    },
                     memory.id
                 ));
             }
@@ -21419,6 +21590,130 @@ async fn run_memory_tool(
             format!("unknown memory tool: {other}"),
         )),
     }
+}
+
+/// Parse the optional S5 scope. An absent/blank value means the legacy
+/// project-memory path; an unknown non-empty value fails closed instead of
+/// silently switching stores.
+#[allow(clippy::result_large_err)] // carries the bounded Q3 tool failure
+fn tool_memory_scope(input: &serde_json::Value) -> std::result::Result<Option<&str>, ToolOutput> {
+    let Some(scope) = input.get("scope").and_then(serde_json::Value::as_str) else {
+        return Ok(None);
+    };
+    let scope = scope.trim();
+    if scope.is_empty() {
+        return Ok(None);
+    }
+    if vp_protocol::types::agent_memory_scope(scope).is_none() {
+        return Err(ToolOutput::error_coded(
+            "memory",
+            crate::tooling::errors::ToolErrorCode::INVALID_ARGUMENT,
+            format!(
+                "error[MEMORY_SCOPE_INVALID] scope must be agent, department, or project: {scope}"
+            ),
+        ));
+    }
+    Ok(Some(scope))
+}
+
+async fn active_memory_identity(
+    engine: &Engine,
+    session: &Session,
+    spec: &AgentSpec,
+) -> Result<Option<vp_protocol::types::AgentIdentity>> {
+    engine
+        .prompt_identity_for_run(
+            &session.id,
+            spec.role.as_str(),
+            spec.title.as_deref(),
+            spec.department.as_deref(),
+        )
+        .await
+}
+
+#[allow(clippy::result_large_err)] // carries the bounded Q3 tool failure
+fn tool_memory_evidence(
+    input: &serde_json::Value,
+    session: &Session,
+    spec: &AgentSpec,
+) -> std::result::Result<Vec<vp_protocol::types::MemoryEvidence>, ToolOutput> {
+    let mut evidence = Vec::new();
+    if let Some(items) = input.get("evidence").and_then(serde_json::Value::as_array) {
+        for item in items
+            .iter()
+            .take(vp_protocol::types::AGENT_MEMORY_MAX_EVIDENCE)
+        {
+            let kind = item
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let reference = item
+                .get("reference")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if kind.is_empty() || reference.is_empty() {
+                return Err(ToolOutput::error_coded(
+                    "remember",
+                    crate::tooling::errors::ToolErrorCode::INVALID_ARGUMENT,
+                    "error[MEMORY_EVIDENCE_INVALID] evidence items require kind and reference",
+                ));
+            }
+            evidence.push(vp_protocol::types::MemoryEvidence {
+                kind: kind.to_string(),
+                reference: reference.to_string(),
+                note: item
+                    .get("note")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            });
+        }
+    }
+    // Automatic session/task provenance, deduplicated and still bounded.
+    for (kind, reference) in [
+        ("session", Some(session.id.as_str())),
+        ("task", spec.task_id.as_deref()),
+    ] {
+        if let Some(reference) = reference
+            && !evidence
+                .iter()
+                .any(|entry| entry.kind == kind && entry.reference == reference)
+        {
+            evidence.push(vp_protocol::types::MemoryEvidence {
+                kind: kind.to_string(),
+                reference: reference.to_string(),
+                note: None,
+            });
+        }
+    }
+    if evidence.len() > vp_protocol::types::AGENT_MEMORY_MAX_EVIDENCE {
+        evidence.truncate(vp_protocol::types::AGENT_MEMORY_MAX_EVIDENCE);
+    }
+    Ok(evidence)
+}
+
+fn memory_tool_failure(tool: &str, error: &anyhow::Error) -> ToolOutput {
+    if let Some(typed) = error.downcast_ref::<vp_protocol::types::AgentMemoryError>() {
+        let code = if matches!(
+            typed.code,
+            vp_protocol::types::agent_memory_codes::MEMORY_CONFLICT
+                | vp_protocol::types::agent_memory_codes::MEMORY_IMPORTED_READONLY
+                | vp_protocol::types::agent_memory_codes::MEMORY_IDENTITY_RETIRED
+        ) {
+            crate::tooling::errors::ToolErrorCode::CONFLICT
+        } else {
+            crate::tooling::errors::ToolErrorCode::INVALID_ARGUMENT
+        };
+        return ToolOutput::error_coded(
+            tool,
+            code,
+            format!("error[{}] {}", typed.code, typed.message),
+        );
+    }
+    ToolOutput::error_coded(
+        tool,
+        crate::tooling::errors::ToolErrorCode::TOOL_FAILED,
+        format!("{tool}: {error:#}"),
+    )
 }
 
 async fn run_mailbox_tool(
@@ -21873,12 +22168,13 @@ fn source_tool_schemas() -> Vec<ToolSchema> {
 fn recall_tool_schema() -> ToolSchema {
     ToolSchema {
         name: "recall".to_string(),
-        description: "Search project memories recorded by any session or agent.".to_string(),
+        description: "Search durable project memory. Omit scope for the legacy project-memory store; scope=agent/department recalls this identity's scoped memory, and scope=project recalls project-wide org memory. Scope isolation is enforced.".to_string(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
                 "query": {"type": "string"},
-                "kind": {"type": "string"},
+                "kind": {"type": "string", "description": "Legacy project-memory kind; ignored for identity memory"},
+                "scope": {"type": "string", "enum": ["agent", "department", "project"]},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 20}
             }
         }),
@@ -22065,7 +22361,7 @@ fn tool_schemas(
     if role != AgentRole::Verifier {
         tools.push(ToolSchema {
             name: "remember".to_string(),
-            description: "Record a durable project memory (decision, fact, convention, or source) for later agents.".to_string(),
+            description: "Record a durable memory. Omit scope for the legacy project-memory store; agent/department/project scope writes the project org memory table with evidence and lifecycle. Scope never switches silently: an unassigned identity fails closed.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -22076,7 +22372,23 @@ fn tool_schemas(
                         "type": "array",
                         "maxItems": 10,
                         "items": {"type": "string"}
-                    }
+                    },
+                    "scope": {"type": "string", "enum": ["agent", "department", "project"]},
+                    "evidence": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": {"type": "string", "enum": ["task", "session", "commit", "artifact", "event"]},
+                                "reference": {"type": "string", "maxLength": 200},
+                                "note": {"type": "string", "maxLength": 200}
+                            },
+                            "required": ["kind", "reference"]
+                        }
+                    },
+                    "expires_at": {"type": "string", "description": "Optional RFC3339 expiry, bounded to ten years"},
+                    "pinned": {"type": "boolean"}
                 },
                 "required": ["kind", "title", "body"]
             }),
@@ -26290,6 +26602,7 @@ async fn build_prompt_sections(
     objective: &str,
     include_memory: bool,
     mode: InstructionBuildMode,
+    memory_meta: Option<&mut Option<crate::identity_memory::IdentityMemoryBrief>>,
 ) -> Result<crate::prompt_cache::PromptSections> {
     let parts = role_prompt_parts(spec.role, project, session, spec, objective);
     let source_brief = engine.source_brief(&project.id).await.unwrap_or_default();
@@ -26351,6 +26664,9 @@ async fn build_prompt_sections(
             volatile_section.push_str("\n\nRun memory (retrieved for this session):\n");
             volatile_section.push_str(&memory_brief);
         }
+        if let Some(slot) = memory_meta {
+            *slot = None;
+        }
         return Ok(crate::prompt_cache::PromptSections::new(
             parts.core,
             project_section,
@@ -26380,17 +26696,17 @@ async fn build_prompt_sections(
                 .identity_memory_brief(&session.id, identity)
                 .await
                 .unwrap_or_default(),
-            None => String::new(),
+            None => crate::identity_memory::IdentityMemoryBrief::default(),
         }
     } else {
-        String::new()
+        crate::identity_memory::IdentityMemoryBrief::default()
     };
     // Identity memory is optional. Never let it push the existing run-memory
     // tail over the aggregate tail cap and fail a run that would otherwise
     // succeed: omit this bounded brief instead. The identity head section is
     // unaffected either way.
-    let identity_memory_section = if include_memory {
-        crate::identity_prompt::render_identity_memory_section(&identity_memory)
+    let identity_memory_section = if include_memory && !identity_memory.is_empty() {
+        crate::identity_prompt::render_identity_memory_section(&identity_memory.text)
     } else {
         None
     };
@@ -26401,6 +26717,13 @@ async fn build_prompt_sections(
             .saturating_add(2)
             <= crate::instruction::MAX_INSTRUCTION_TAIL_BYTES
     });
+    if let Some(slot) = memory_meta {
+        *slot = if identity_memory_section.is_some() && !identity_memory.is_empty() {
+            Some(identity_memory)
+        } else {
+            None
+        };
+    }
     let mut candidates = Vec::with_capacity(10);
     candidates.push(InstructionCandidate::new(
         InstructionSectionKey::CoreCharter,

@@ -1374,6 +1374,12 @@ pub struct ProjectManifestSnapshot {
     /// Append-only workspace stream for this project.
     #[serde(default)]
     pub agent_workspace_events: Vec<AgentWorkspaceEvent>,
+    /// Event-derived identity/department/project memories (S5).
+    #[serde(default)]
+    pub agent_memories: Vec<vp_protocol::types::AgentMemory>,
+    /// Append-only memory stream for this project.
+    #[serde(default)]
+    pub agent_memory_events: Vec<vp_protocol::types::AgentMemoryEvent>,
     /// Project-scoped effect-receipt policy. Older manifests decode as the
     /// enabled, unknown-blocks-merge, 120s-grace default.
     #[serde(default)]
@@ -1865,6 +1871,99 @@ fn validate_session_bundle(bundle: &SessionBundle) -> Result<()> {
                 event.id
             ));
         }
+    }
+    let mut memory_ids = std::collections::HashSet::new();
+    for memory in &bundle.agent_memories {
+        if memory.project_id != bundle.project.id {
+            return Err(anyhow!(
+                "bundle memory {} belongs to a different project",
+                memory.id
+            ));
+        }
+        if !memory_ids.insert(memory.id.clone()) {
+            return Err(anyhow!("bundle memory {} is duplicated", memory.id));
+        }
+        if memory.scope == "agent" {
+            let Some(identity_id) = memory.identity_id.as_deref() else {
+                return Err(anyhow!(
+                    "bundle memory {} has agent scope without an identity",
+                    memory.id
+                ));
+            };
+            if !identity_ids.contains(identity_id) {
+                return Err(anyhow!(
+                    "bundle memory {} has no identity snapshot",
+                    memory.id
+                ));
+            }
+            if memory.department.is_some()
+                && !bundle.agent_identities.iter().any(|identity| {
+                    identity.id == identity_id
+                        && identity.department.as_deref() == memory.department.as_deref()
+                })
+            {
+                // The department is derived, not caller-controlled. A mismatch
+                // would make replay and scope isolation disagree.
+                return Err(anyhow!(
+                    "bundle memory {} department does not match its identity",
+                    memory.id
+                ));
+            }
+        }
+        crate::store::identity_memory::validate_memory_snapshot(memory)
+            .map_err(|error| anyhow!("bundle memory {} is invalid: {error}", memory.id))?;
+    }
+    let mut memory_event_ids = std::collections::HashSet::new();
+    let mut memory_event_seqs = std::collections::HashSet::new();
+    for event in &bundle.agent_memory_events {
+        if event.project_id != bundle.project.id {
+            return Err(anyhow!(
+                "bundle memory event {} belongs to a different project",
+                event.id
+            ));
+        }
+        if event.id.trim().is_empty() || event.seq == 0 {
+            return Err(anyhow!("bundle memory event has an empty id or seq"));
+        }
+        if !memory_event_ids.insert(event.id.clone()) {
+            return Err(anyhow!("bundle memory event {} is duplicated", event.id));
+        }
+        if !memory_event_seqs.insert(event.seq) {
+            return Err(anyhow!("bundle memory events repeat seq {}", event.seq));
+        }
+        if !vp_protocol::types::AGENT_MEMORY_EVENT_KINDS.contains(&event.kind.as_str()) {
+            return Err(anyhow!(
+                "bundle memory event {} has an unknown kind",
+                event.id
+            ));
+        }
+        let snapshot: vp_protocol::types::AgentMemory = serde_json::from_value(
+            event
+                .payload
+                .get("memory")
+                .cloned()
+                .ok_or_else(|| anyhow!("bundle memory event {} has no snapshot", event.id))?,
+        )
+        .map_err(|error| {
+            anyhow!(
+                "bundle memory event {} snapshot is invalid: {error}",
+                event.id
+            )
+        })?;
+        if snapshot.project_id != bundle.project.id {
+            return Err(anyhow!(
+                "bundle memory event {} snapshot belongs to another project",
+                event.id
+            ));
+        }
+        // A pruned memory legitimately has events but no current projection
+        // row, so the event stream is not required to match `agent_memories`.
+        crate::store::identity_memory::validate_memory_snapshot(&snapshot).map_err(|error| {
+            anyhow!(
+                "bundle memory event {} snapshot is invalid: {error}",
+                event.id
+            )
+        })?;
     }
     for message in &bundle.messages {
         ensure_bundle_session("message", &message.session_id, &bundle.session.id)?;
@@ -2705,6 +2804,59 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_agent_workspace_events_project
                 ON agent_workspace_events(project_id, seq);
+
+            -- Project-scoped identity/department/project memory (S5). This is
+            -- deliberately separate from the session-scoped `memories` table:
+            -- scope, evidence, TTL, supersede edges, and provenance are durable
+            -- project state. Retirement does not delete rows; it makes agent
+            -- memory read-only. Imported rows are read-only evidence.
+            CREATE TABLE IF NOT EXISTS agent_memories (
+                id            TEXT PRIMARY KEY,
+                project_id    TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                identity_id   TEXT REFERENCES agent_identities(id) ON DELETE CASCADE,
+                department    TEXT,
+                component     TEXT,
+                scope         TEXT NOT NULL,
+                content       TEXT NOT NULL,
+                content_hash  TEXT NOT NULL,
+                evidence_json TEXT NOT NULL DEFAULT '[]',
+                source        TEXT NOT NULL,
+                status        TEXT NOT NULL,
+                pinned        INTEGER NOT NULL DEFAULT 0,
+                created_at    TEXT NOT NULL,
+                updated_at    TEXT NOT NULL,
+                expires_at    TEXT,
+                verified_at   TEXT,
+                superseded_by TEXT,
+                stale_reason  TEXT,
+                origin        TEXT NOT NULL DEFAULT 'local'
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_agent_memories_project_scope
+                ON agent_memories(project_id, scope, status, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_agent_memories_identity
+                ON agent_memories(project_id, identity_id, status, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_agent_memories_department
+                ON agent_memories(project_id, department, status, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_agent_memories_expiry
+                ON agent_memories(status, expires_at);
+            CREATE INDEX IF NOT EXISTS idx_agent_memories_hash
+                ON agent_memories(project_id, content_hash);
+
+            -- Append-only project memory stream. Portable by event id for
+            -- idempotent archive import; seq is the per-project replay order.
+            CREATE TABLE IF NOT EXISTS agent_memory_events (
+                id         TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                seq        INTEGER NOT NULL,
+                kind       TEXT NOT NULL,
+                payload    TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE (project_id, seq)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_agent_memory_events_project
+                ON agent_memory_events(project_id, seq);
 
             CREATE TABLE IF NOT EXISTS messages (
                 id           TEXT PRIMARY KEY,
@@ -4868,6 +5020,16 @@ impl Store {
                 session_worker_workspaces: self.list_session_workspaces_for_replay(&project.id)?,
                 agent_workspace_events: self
                     .list_agent_workspace_events_for_project(&project.id, None)?,
+                agent_memories: crate::store::identity_memory::list_agent_memories_for_replay(
+                    self,
+                    &project.id,
+                )?,
+                agent_memory_events:
+                    crate::store::identity_memory::list_agent_memory_events_for_project(
+                        self,
+                        &project.id,
+                        None,
+                    )?,
                 effect_policy: self.get_effect_policy(&project.id)?,
                 gate_policy: self.get_gate_policy(&project.id)?,
                 otel_policy: self.get_otel_policy(&project.id)?,
@@ -27876,6 +28038,106 @@ impl Store {
             }
         }
 
+        // Memories travel as archive evidence only. Imported rows are
+        // read-only, never enter a prompt brief, and never remap their project.
+        let comparable_memory = |memory: &vp_protocol::types::AgentMemory| {
+            let mut comparable = memory.clone();
+            comparable.expired = false;
+            comparable
+        };
+        for memory in &bundle.agent_memories {
+            let mut imported = memory.clone();
+            imported.origin = "imported".to_string();
+            match crate::store::identity_memory::get_memory_tx(&tx, &memory.id)? {
+                Some(existing) if comparable_memory(&existing) == comparable_memory(&imported) => {}
+                Some(_) => {
+                    return Err(anyhow!(
+                        "bundle memory {} conflicts with the local projection",
+                        memory.id
+                    ));
+                }
+                None => {
+                    crate::store::identity_memory::insert_memory_row_tx(&tx, &imported)?;
+                }
+            }
+        }
+        for event in &bundle.agent_memory_events {
+            // Rehome the snapshot as read-only archive provenance. The rewrite
+            // is deterministic, so a repeated import compares byte-for-byte
+            // and a local event with the same id still conflicts.
+            let mut payload = event.payload.clone();
+            if let Some(memory) = payload
+                .get_mut("memory")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                memory.insert(
+                    "origin".to_string(),
+                    serde_json::Value::String("imported".to_string()),
+                );
+            }
+            let expected_payload = serde_json::to_string(&payload)?;
+            match tx
+                .query_row(
+                    "SELECT seq, kind, payload, created_at FROM agent_memory_events WHERE id = ?1",
+                    params![event.id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .optional()?
+            {
+                Some((seq, kind, payload, created_at)) => {
+                    if seq != event.seq as i64
+                        || kind != event.kind
+                        || payload != expected_payload
+                        || created_at != event.created_at
+                    {
+                        return Err(anyhow!(
+                            "bundle memory event {} conflicts with the local event stream",
+                            event.id
+                        ));
+                    }
+                }
+                None => {
+                    let seq_owner: Option<String> = tx
+                        .query_row(
+                            "SELECT id FROM agent_memory_events
+                             WHERE project_id = ?1 AND seq = ?2",
+                            params![bundle.project.id, event.seq as i64],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if let Some(owner) = seq_owner
+                        && owner != event.id
+                    {
+                        return Err(anyhow!(
+                            "bundle memory event {} conflicts with local seq {}",
+                            event.id,
+                            event.seq
+                        ));
+                    }
+                    tx.execute(
+                        "INSERT INTO agent_memory_events
+                         (id, project_id, seq, kind, payload, created_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            event.id,
+                            event.project_id,
+                            event.seq as i64,
+                            event.kind,
+                            expected_payload,
+                            event.created_at
+                        ],
+                    )?;
+                }
+            }
+        }
+
         let session_exists: bool = tx
             .query_row(
                 "SELECT 1 FROM sessions WHERE id = ?1",
@@ -32942,6 +33204,7 @@ fn search_snippet(text: &str, query: &str) -> String {
 mod continuation_lease;
 mod coordination;
 mod gate;
+pub mod identity_memory;
 mod lease;
 pub mod workspaces;
 
@@ -32951,6 +33214,7 @@ pub use continuation_lease::{
 };
 pub use coordination::{AGENT_COORDINATION_EVENT_LIMIT, AssignmentMutation};
 pub use gate::{GateTransition, gates_from_events};
+pub use identity_memory::{MemorySupersede, MemorySweep};
 pub use lease::{
     DaemonIdentity, LeaseLostReason, MAX_RUNTIME_LEASE_TTL_SECS, RuntimeLeaseAcquisition,
     RuntimeLeaseAuditEntry, RuntimeLeaseError, RuntimeLeaseState, RuntimeLeaseToken,

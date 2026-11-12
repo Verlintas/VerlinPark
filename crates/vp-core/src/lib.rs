@@ -24,20 +24,23 @@ use vp_protocol::types::{
     AgentIdentitiesResult, AgentIdentity, AgentIdentityPolicy, AgentIdentityReplayParams,
     AgentIdentityReplayReport, AgentIdentityResult, AgentInboxListParams, AgentInboxListResult,
     AgentInboxMessageParams, AgentInboxReadResult, AgentInboxSendParams, AgentInboxSendResult,
-    AgentMessage, AgentRecord, Approval, ApprovalAuditEvent, ApprovalAuditResult,
-    ApprovalBatchItemResult, ApprovalBatchResolveResult, ApprovalGrant, ApprovalQueueResult,
-    ApprovalTemplate, ApprovalTemplateCreateParams, ApprovalTemplateDeleteParams,
-    ApprovalTemplateDeleteResult, ApprovalTemplateFromApprovalParams, ApprovalTemplateResult,
-    ApprovalTemplateUpdateParams, Artifact, ArtifactBackfillResult, ArtifactDiffParams,
-    ArtifactDiffResult, ArtifactGcResult, ArtifactMaterialization, ArtifactPolicy,
-    ArtifactVersionsResult, AttentionPolicy, AttentionPolicyResult, AttentionPolicySetParams,
-    BudgetGovernorDecision, CachePolicy, CheckpointPolicyResult, CheckpointRetentionPolicy,
-    CitationAudit, CitationAuditMessage, ConsoleCloseResult, ConsoleOpenResult, ConsoleReadResult,
-    ConsoleSignalResult, ConsoleWriteResult, ContextCompactionSummary, ContextMeasurement,
-    ContextUsage, ContinuationOutcome, ContractPolicy, CreateAgentIdentityParams,
-    CreateModelPresetParams, CriticalPathPolicy, DoctorCheck, EffectPolicy, EffectReceipt,
-    EffectReconcileParams, EffectReconcileResult, EffectState, Event, ForgeOriginStatus,
-    ForgePreflightResult, ForgeProviderStatus, ForgeStatusResult, GateRecord, GitLogResult,
+    AgentMemoryForgetResult, AgentMemoryListParams, AgentMemoryListResult, AgentMemoryParams,
+    AgentMemoryReplayParams, AgentMemoryReplayReport, AgentMemoryResult,
+    AgentMemorySupersedeResult, AgentMemorySweepResult, AgentMessage, AgentRecord, Approval,
+    ApprovalAuditEvent, ApprovalAuditResult, ApprovalBatchItemResult, ApprovalBatchResolveResult,
+    ApprovalGrant, ApprovalQueueResult, ApprovalTemplate, ApprovalTemplateCreateParams,
+    ApprovalTemplateDeleteParams, ApprovalTemplateDeleteResult, ApprovalTemplateFromApprovalParams,
+    ApprovalTemplateResult, ApprovalTemplateUpdateParams, Artifact, ArtifactBackfillResult,
+    ArtifactDiffParams, ArtifactDiffResult, ArtifactGcResult, ArtifactMaterialization,
+    ArtifactPolicy, ArtifactVersionsResult, AttentionPolicy, AttentionPolicyResult,
+    AttentionPolicySetParams, BudgetGovernorDecision, CachePolicy, CheckpointPolicyResult,
+    CheckpointRetentionPolicy, CitationAudit, CitationAuditMessage, ConsoleCloseResult,
+    ConsoleOpenResult, ConsoleReadResult, ConsoleSignalResult, ConsoleWriteResult,
+    ContextCompactionSummary, ContextMeasurement, ContextUsage, ContinuationOutcome,
+    ContractPolicy, CreateAgentIdentityParams, CreateAgentMemoryParams, CreateModelPresetParams,
+    CriticalPathPolicy, DoctorCheck, EffectPolicy, EffectReceipt, EffectReconcileParams,
+    EffectReconcileResult, EffectState, Event, ForgeOriginStatus, ForgePreflightResult,
+    ForgeProviderStatus, ForgeStatusResult, ForgetAgentMemoryParams, GateRecord, GitLogResult,
     GitShowResult, GovernorSessionStatus, IntakeCreateParams, IntakeListResult, IntakeTask,
     IntakeUpdateParams, IntegrationPolicy, IntentDecisionRecord, MailboxGcResult, MailboxPolicy,
     McpCallResult, McpGetPromptResult, McpPinActionResult, McpPinApproveParams, McpPinRejectParams,
@@ -90,17 +93,19 @@ use vp_protocol::types::{
     SourceGetResult, SourceImportError, SourceImportParams, SourceImportResult,
     SourceIndexRebuildResult, SourceIndexStatusResult, SourceListResult, SourceReindexResult,
     SourceRetrievalPolicy, SourceRetrievalPolicyResult, SourceSearchMode, SourceSearchResult,
-    SourceStats, SteeringMessage, StoredMessage, TaskQueueResult, TaskSchedulerPolicy,
-    TaskSchedulerPolicyResult, TaskStall, TeamPlan, TerminalCloseResult, TerminalOpenResult,
-    TerminalReadResult, TerminalResizeResult, TerminalWriteResult, TodoItem, ToolActivityCodeStat,
-    ToolActivityEntry, ToolActivityResult, ToolActivitySummary, ToolActivityToolStat,
-    ToolOutputAuditParams, ToolOutputAuditResult, ToolOutputListParams, ToolOutputListResult,
-    ToolOutputPolicy, ToolOutputPolicyResult, ToolOutputPruneParams, ToolOutputPruneResult,
-    ToolOutputStatus, ToolOutputStatusParams, UpdateAgentIdentityParams, UpdateModelPresetParams,
-    UpdateSourceMetadataParams, UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult,
-    UsageTotals, WorkspaceFileResult, WorkspaceGrepResult, WorkspaceListResult,
-    WorkspaceSearchResult, WorkspaceTreeResult, WorkspaceWriteResult, WorktreeCleanupEntry,
-    WorktreeCleanupResult, WorktreePolicyResult, WorktreeRetentionPolicy, WriteLease,
+    SourceStats, SteeringMessage, StoredMessage, SupersedeAgentMemoryParams,
+    SweepAgentMemoriesParams, TaskQueueResult, TaskSchedulerPolicy, TaskSchedulerPolicyResult,
+    TaskStall, TeamPlan, TerminalCloseResult, TerminalOpenResult, TerminalReadResult,
+    TerminalResizeResult, TerminalWriteResult, TodoItem, ToolActivityCodeStat, ToolActivityEntry,
+    ToolActivityResult, ToolActivitySummary, ToolActivityToolStat, ToolOutputAuditParams,
+    ToolOutputAuditResult, ToolOutputListParams, ToolOutputListResult, ToolOutputPolicy,
+    ToolOutputPolicyResult, ToolOutputPruneParams, ToolOutputPruneResult, ToolOutputStatus,
+    ToolOutputStatusParams, UpdateAgentIdentityParams, UpdateAgentMemoryParams,
+    UpdateModelPresetParams, UpdateSourceMetadataParams, UsageBucket, UsageCsvResult, UsageEntry,
+    UsageLedgerResult, UsageTotals, VerifyAgentMemoryParams, WorkspaceFileResult,
+    WorkspaceGrepResult, WorkspaceListResult, WorkspaceSearchResult, WorkspaceTreeResult,
+    WorkspaceWriteResult, WorktreeCleanupEntry, WorktreeCleanupResult, WorktreePolicyResult,
+    WorktreeRetentionPolicy, WriteLease,
 };
 use vp_store::Store;
 use vp_store::store::{
@@ -140,6 +145,7 @@ pub mod gate;
 pub mod gui;
 pub mod history;
 pub mod identity;
+pub mod identity_memory;
 pub mod identity_prompt;
 pub mod instruction;
 pub mod mcp;
@@ -11547,6 +11553,7 @@ impl Engine {
             latest_identity_id: latest.identity_id,
             latest_identity_generation: latest.identity_generation,
             latest_identity_hash: latest.identity_hash,
+            latest_identity_memory: latest.identity_memory,
             states: reports,
             last_rebuilt: rebuilt_events.len() as u64,
         })
@@ -17071,6 +17078,22 @@ impl Engine {
                 ))
             })
             .await??;
+        let memory_store = store.clone();
+        let memory_project = project.id.clone();
+        let (agent_memories, agent_memory_events) = tokio::task::spawn_blocking(move || {
+            Ok::<_, anyhow::Error>((
+                vp_store::store::identity_memory::list_agent_memories_for_replay(
+                    &memory_store,
+                    &memory_project,
+                )?,
+                vp_store::store::identity_memory::list_agent_memory_events_for_project(
+                    &memory_store,
+                    &memory_project,
+                    None,
+                )?,
+            ))
+        })
+        .await??;
         Ok(SessionBundle {
             version: 1,
             exported_at: vp_protocol::now_rfc3339(),
@@ -17116,6 +17139,8 @@ impl Engine {
             agent_workspaces,
             session_worker_workspaces,
             agent_workspace_events,
+            agent_memories,
+            agent_memory_events,
         })
     }
 
@@ -17956,21 +17981,21 @@ impl Engine {
         .await?
     }
 
-    /// Bounded identity/department memory brief from existing project memory.
+    /// Bounded identity/department/project memory brief (S5).
     ///
-    /// S3 does not add the dedicated identity-memory table (S5). It reuses the
-    /// evidence-backed project memory store with a deterministic query derived
-    /// from trusted identity metadata and returns only a bounded brief. An empty
-    /// result omits the `agent/memory` tail section entirely. This read does not
-    /// mark memory as used; the ordinary run-memory brief retains that
-    /// accounting.
+    /// The primary source is `agent_memories` scoped to the active identity,
+    /// then its department, then project memory. Only local, active,
+    /// non-expired rows are eligible. If the project has no S5 memory yet, the
+    /// S3 legacy project-memory brief is used as a bounded compatibility
+    /// fallback; it is labelled separately in telemetry. An empty result omits
+    /// the `agent/memory` tail section entirely.
     pub async fn identity_memory_brief(
         &self,
         session_id: &str,
         identity: &AgentIdentity,
-    ) -> Result<String> {
+    ) -> Result<crate::identity_memory::IdentityMemoryBrief> {
         if !crate::identity_prompt::identity_role_applies(&identity.role) {
-            return Ok(String::new());
+            return Ok(crate::identity_memory::IdentityMemoryBrief::default());
         }
         let store = self.store.clone();
         let lookup = session_id.to_string();
@@ -17978,13 +18003,32 @@ impl Engine {
             .await??
             .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
         if session.project_id != identity.project_id {
-            return Ok(String::new());
+            return Ok(crate::identity_memory::IdentityMemoryBrief::default());
         }
-        // The lexical memory lane treats whitespace-separated terms as an AND
-        // query. Identity metadata is usually multi-word ("Project Lead"), so
-        // use one distinctive scope token rather than requiring every metadata
-        // word to appear in a memory. This is a bounded best-effort brief, not
-        // a claim that the retrieved memory is complete.
+        let memory_store = self.store.clone();
+        let project_id = session.project_id.clone();
+        let candidates = tokio::task::spawn_blocking(move || {
+            vp_store::store::identity_memory::list_agent_memories_for_brief(
+                &memory_store,
+                &project_id,
+                Some(128),
+            )
+        })
+        .await??;
+        let visible = candidates
+            .into_iter()
+            .filter(|memory| crate::identity_memory::memory_visible_to(memory, Some(identity)))
+            .collect::<Vec<_>>();
+        let brief = crate::identity_memory::select_identity_memory_brief(
+            &visible,
+            crate::identity_memory::DEFAULT_BRIEF_BYTES,
+            time::OffsetDateTime::now_utc(),
+        );
+        if !brief.is_empty() {
+            return Ok(brief);
+        }
+        // S3 compatibility fallback. It is read-only and never marked used;
+        // the ordinary run-memory brief retains that accounting.
         let query = identity
             .component
             .as_deref()
@@ -18022,13 +18066,314 @@ impl Engine {
             .await?
             .memories;
         if matches.is_empty() {
-            return Ok(String::new());
+            return Ok(crate::identity_memory::IdentityMemoryBrief::default());
         }
-        Ok(crate::memory::select_brief(
+        let selection = crate::memory::select_brief(
             &matches,
             crate::identity_prompt::IDENTITY_MEMORY_BRIEF_CHARS,
-        )
-        .text)
+        );
+        if selection.text.trim().is_empty() {
+            return Ok(crate::identity_memory::IdentityMemoryBrief::default());
+        }
+        let ids = selection
+            .memories
+            .iter()
+            .map(|matched| matched.memory.id.clone())
+            .collect();
+        let hashes = selection
+            .memories
+            .iter()
+            .map(|matched| crate::sha256_hex(matched.memory.body.as_bytes()))
+            .collect();
+        Ok(crate::identity_memory::legacy_brief(
+            selection.text,
+            ids,
+            hashes,
+        ))
+    }
+
+    // -----------------------------------------------------------------
+    // S5 identity, department, and project memory
+    // -----------------------------------------------------------------
+
+    /// Bounded project memory read. When `identity_id` is present it is a
+    /// viewer and scope isolation applies; an operator read may omit it.
+    pub async fn list_agent_memories(
+        &self,
+        params: AgentMemoryListParams,
+    ) -> Result<AgentMemoryListResult> {
+        let store = self.store.clone();
+        let viewer = match params.identity_id.as_deref() {
+            Some(identity_id) => {
+                let viewer = store.get_agent_identity(identity_id)?.ok_or_else(|| {
+                    vp_protocol::types::AgentMemoryError::new(
+                        vp_protocol::types::agent_memory_codes::MEMORY_NOT_FOUND,
+                        format!("agent identity not found: {identity_id}"),
+                    )
+                })?;
+                if viewer.project_id != params.project_id {
+                    return Err(vp_protocol::types::AgentMemoryError::new(
+                        vp_protocol::types::agent_memory_codes::MEMORY_PROJECT_MISMATCH,
+                        "viewer identity belongs to another project",
+                    )
+                    .into());
+                }
+                Some(viewer)
+            }
+            None => None,
+        };
+        let project_id = params.project_id.clone();
+        let scope = params.scope.clone();
+        let status = params.status.clone();
+        let department = params.department.clone();
+        let query = params.query.clone();
+        let include_expired = params.include_expired;
+        let limit = params.limit;
+        let has_viewer = viewer.is_some();
+        let memory_store = self.store.clone();
+        let (mut memories, total) = tokio::task::spawn_blocking(move || {
+            let rows = vp_store::store::identity_memory::list_agent_memories(
+                &memory_store,
+                &project_id,
+                scope.as_deref(),
+                status.as_deref(),
+                department.as_deref(),
+                query.as_deref(),
+                include_expired,
+                limit,
+            )?;
+            let total = if has_viewer {
+                0
+            } else {
+                vp_store::store::identity_memory::count_agent_memories(
+                    &memory_store,
+                    &project_id,
+                    scope.as_deref(),
+                    status.as_deref(),
+                    department.as_deref(),
+                    query.as_deref(),
+                    include_expired,
+                )?
+            };
+            Ok::<_, anyhow::Error>((rows, total))
+        })
+        .await??;
+        if let Some(viewer) = viewer.as_ref() {
+            memories
+                .retain(|memory| crate::identity_memory::memory_visible_to(memory, Some(viewer)));
+        }
+        let total = if viewer.is_some() {
+            memories.len() as u64
+        } else {
+            total
+        };
+        Ok(AgentMemoryListResult { memories, total })
+    }
+
+    pub async fn get_agent_memory(&self, params: AgentMemoryParams) -> Result<AgentMemoryResult> {
+        let store = self.store.clone();
+        let viewer = match params.identity_id.as_deref() {
+            Some(identity_id) => Some(store.get_agent_identity(identity_id)?.ok_or_else(|| {
+                vp_protocol::types::AgentMemoryError::new(
+                    vp_protocol::types::agent_memory_codes::MEMORY_NOT_FOUND,
+                    format!("agent identity not found: {identity_id}"),
+                )
+            })?),
+            None => None,
+        };
+        let memory_id = params.memory_id.clone();
+        let memory = tokio::task::spawn_blocking(move || {
+            vp_store::store::identity_memory::get_agent_memory(&store, &memory_id)
+        })
+        .await??
+        .ok_or_else(|| {
+            vp_protocol::types::AgentMemoryError::new(
+                vp_protocol::types::agent_memory_codes::MEMORY_NOT_FOUND,
+                format!("agent memory not found: {}", params.memory_id),
+            )
+        })?;
+        if let Some(project_id) = params.project_id.as_deref()
+            && project_id != memory.project_id
+        {
+            return Err(vp_protocol::types::AgentMemoryError::new(
+                vp_protocol::types::agent_memory_codes::MEMORY_PROJECT_MISMATCH,
+                "agent memory belongs to another project",
+            )
+            .into());
+        }
+        if let Some(viewer) = viewer.as_ref() {
+            if viewer.project_id != memory.project_id {
+                return Err(vp_protocol::types::AgentMemoryError::new(
+                    vp_protocol::types::agent_memory_codes::MEMORY_PROJECT_MISMATCH,
+                    "viewer identity belongs to another project",
+                )
+                .into());
+            }
+            crate::identity_memory::ensure_memory_visible(&memory, Some(viewer))?;
+        }
+        Ok(AgentMemoryResult {
+            memory,
+            changed: false,
+        })
+    }
+
+    pub async fn remember_agent_memory(
+        &self,
+        params: CreateAgentMemoryParams,
+    ) -> Result<AgentMemoryResult> {
+        let store = self.store.clone();
+        let (memory, _event) = tokio::task::spawn_blocking(move || {
+            vp_store::store::identity_memory::create_agent_memory_with_event(&store, &params)
+        })
+        .await??;
+        Ok(AgentMemoryResult {
+            memory,
+            changed: true,
+        })
+    }
+
+    pub async fn update_agent_memory(
+        &self,
+        params: UpdateAgentMemoryParams,
+    ) -> Result<AgentMemoryResult> {
+        let store = self.store.clone();
+        let memory_id = params.memory_id.clone();
+        match tokio::task::spawn_blocking(move || {
+            vp_store::store::identity_memory::update_agent_memory_with_event(&store, &params)
+        })
+        .await??
+        {
+            Some((memory, _event)) => Ok(AgentMemoryResult {
+                memory,
+                changed: true,
+            }),
+            None => {
+                let current = self
+                    .get_agent_memory(AgentMemoryParams {
+                        memory_id,
+                        project_id: None,
+                        identity_id: None,
+                    })
+                    .await?;
+                Ok(AgentMemoryResult {
+                    memory: current.memory,
+                    changed: false,
+                })
+            }
+        }
+    }
+
+    pub async fn supersede_agent_memory(
+        &self,
+        params: SupersedeAgentMemoryParams,
+    ) -> Result<AgentMemorySupersedeResult> {
+        let store = self.store.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            vp_store::store::identity_memory::supersede_agent_memory_with_events(&store, &params)
+        })
+        .await??;
+        Ok(AgentMemorySupersedeResult {
+            previous: result.previous,
+            replacement: result.replacement,
+        })
+    }
+
+    pub async fn forget_agent_memory(
+        &self,
+        params: ForgetAgentMemoryParams,
+    ) -> Result<AgentMemoryForgetResult> {
+        let store = self.store.clone();
+        let memory_id = params.memory_id.clone();
+        let prune = params.prune;
+        let outcome = tokio::task::spawn_blocking(move || {
+            vp_store::store::identity_memory::forget_agent_memory_with_event(&store, &params)
+        })
+        .await??;
+        Ok(AgentMemoryForgetResult {
+            memory_id,
+            pruned: prune && outcome.is_some(),
+            changed: outcome.is_some(),
+        })
+    }
+
+    pub async fn verify_agent_memory(
+        &self,
+        params: VerifyAgentMemoryParams,
+    ) -> Result<AgentMemoryResult> {
+        let store = self.store.clone();
+        let memory_id = params.memory_id.clone();
+        match tokio::task::spawn_blocking(move || {
+            vp_store::store::identity_memory::verify_agent_memory_with_event(&store, &params)
+        })
+        .await??
+        {
+            Some((memory, _event)) => Ok(AgentMemoryResult {
+                memory,
+                changed: true,
+            }),
+            None => {
+                let current = self
+                    .get_agent_memory(AgentMemoryParams {
+                        memory_id,
+                        project_id: None,
+                        identity_id: None,
+                    })
+                    .await?;
+                Ok(AgentMemoryResult {
+                    memory: current.memory,
+                    changed: false,
+                })
+            }
+        }
+    }
+
+    pub async fn sweep_agent_memories(
+        &self,
+        params: SweepAgentMemoriesParams,
+    ) -> Result<AgentMemorySweepResult> {
+        let store = self.store.clone();
+        let sweep = tokio::task::spawn_blocking(move || {
+            vp_store::store::identity_memory::sweep_agent_memories_with_events(&store, &params)
+        })
+        .await??;
+        Ok(AgentMemorySweepResult {
+            expired: sweep.expired,
+            pruned: sweep.pruned,
+            remaining: sweep.remaining,
+        })
+    }
+
+    /// Project-scoped memory replay, or explicit projection repair. It never
+    /// appends memory events and never crosses project boundaries.
+    pub async fn replay_agent_memories(
+        &self,
+        params: AgentMemoryReplayParams,
+    ) -> Result<AgentMemoryReplayReport> {
+        let store = self.store.clone();
+        let project_id = params.project_id;
+        let repair = params.repair;
+        tokio::task::spawn_blocking(move || {
+            let events = store.list_agent_memory_events_for_project(&project_id, None)?;
+            let expected = crate::identity_memory::memories_from_events(&events)?;
+            let mut actual = store.list_agent_memories_for_replay(&project_id)?;
+            let mut mismatches =
+                crate::identity_memory::compare_memory_projection(&expected, &actual);
+            let mut repaired = false;
+            if repair && !mismatches.is_empty() {
+                store.replace_agent_memory_projection(&project_id, &expected)?;
+                actual = store.list_agent_memories_for_replay(&project_id)?;
+                mismatches = crate::identity_memory::compare_memory_projection(&expected, &actual);
+                repaired = true;
+            }
+            Ok(crate::identity_memory::replay_report(
+                &project_id,
+                &expected,
+                events.len(),
+                repaired,
+                mismatches,
+            ))
+        })
+        .await?
     }
 
     // -----------------------------------------------------------------

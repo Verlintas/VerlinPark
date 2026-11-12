@@ -2756,6 +2756,10 @@ pub struct SessionInstructionsReport {
     pub latest_identity_generation: Option<u64>,
     #[serde(default)]
     pub latest_identity_hash: Option<String>,
+    /// Bounded identity-memory brief telemetry from the latest prompt-prefix
+    /// event. Counts and hashes only; no memory content is returned.
+    #[serde(default)]
+    pub latest_identity_memory: Option<IdentityMemoryTelemetry>,
     #[serde(default)]
     pub states: Vec<SessionInstructionStateReport>,
     /// Bounded diagnostic surfaced by the last materialization attempt.
@@ -11299,6 +11303,14 @@ pub struct SessionBundle {
     /// event must be byte-identical on import.
     #[serde(default)]
     pub agent_workspace_events: Vec<AgentWorkspaceEvent>,
+    /// Project-scoped identity/department/project memories. Older bundles
+    /// decode as an empty list. Imported memories are read-only evidence.
+    #[serde(default)]
+    pub agent_memories: Vec<AgentMemory>,
+    /// Append-only memory event stream. Portable by event id; a same-id event
+    /// must be byte-identical on import.
+    #[serde(default)]
+    pub agent_memory_events: Vec<AgentMemoryEvent>,
 }
 
 /// Project policy for automatic crash resume. Manual `session.run.resume`
@@ -13144,6 +13156,620 @@ pub fn session_workspace_branch_name(session_id: &str, identity_id: &str) -> Str
         workspace_ref_slug(session_id),
         workspace_ref_slug(identity_id)
     )
+}
+
+// ---------------------------------------------------------------------------
+// Identity, department, and project agent memory (S5)
+// ---------------------------------------------------------------------------
+
+/// Memory scopes. Agent memory belongs to one project identity, department
+/// memory is shared by one department, and project memory is visible to every
+/// identity in the project. This table is deliberately separate from the
+/// session-scoped project `memories` table: S5 memory is durable project state
+/// with explicit evidence and lifecycle, not a transcript summary.
+pub const AGENT_MEMORY_SCOPES: [&str; 3] = ["agent", "department", "project"];
+
+/// Stored lifecycle states. Expiry and forget are transitions to `stale`;
+/// supersede is a terminal replacement edge through `superseded_by`.
+pub const AGENT_MEMORY_STATUSES: [&str; 3] = ["active", "superseded", "stale"];
+
+/// Provenance sources. `imported` is reserved for archive provenance and is
+/// not accepted by the local create path.
+pub const AGENT_MEMORY_SOURCES: [&str; 6] = [
+    "operator",
+    "agent",
+    "task_result",
+    "verifier",
+    "integration",
+    "imported",
+];
+
+/// Bounded evidence pointers. No prompt text, tool output, or file content is
+/// stored here; a reference names a task/session/commit/artifact/event.
+pub const AGENT_MEMORY_EVIDENCE_KINDS: [&str; 5] =
+    ["task", "session", "commit", "artifact", "event"];
+
+pub const AGENT_MEMORY_CREATED_EVENT: &str = "agent.memory.created";
+pub const AGENT_MEMORY_UPDATED_EVENT: &str = "agent.memory.updated";
+pub const AGENT_MEMORY_SUPERSEDED_EVENT: &str = "agent.memory.superseded";
+pub const AGENT_MEMORY_EXPIRED_EVENT: &str = "agent.memory.expired";
+pub const AGENT_MEMORY_DELETED_EVENT: &str = "agent.memory.deleted";
+
+pub const AGENT_MEMORY_EVENT_KINDS: [&str; 5] = [
+    AGENT_MEMORY_CREATED_EVENT,
+    AGENT_MEMORY_UPDATED_EVENT,
+    AGENT_MEMORY_SUPERSEDED_EVENT,
+    AGENT_MEMORY_EXPIRED_EVENT,
+    AGENT_MEMORY_DELETED_EVENT,
+];
+
+/// Bounded memory content. A memory is a compact claim with provenance, not a
+/// document store; full artifacts and sources stay in their own stores.
+pub const AGENT_MEMORY_MAX_CONTENT_CHARS: usize = 2_000;
+pub const AGENT_MEMORY_MAX_EVIDENCE: usize = 8;
+pub const AGENT_MEMORY_MAX_REFERENCE_CHARS: usize = 200;
+pub const AGENT_MEMORY_MAX_NOTE_CHARS: usize = 200;
+pub const AGENT_MEMORY_MAX_DEPARTMENT_CHARS: usize = 120;
+pub const AGENT_MEMORY_MAX_COMPONENT_CHARS: usize = 200;
+pub const AGENT_MEMORY_MAX_LIST: u32 = 200;
+pub const AGENT_MEMORY_MAX_SWEEP: u32 = 1_000;
+pub const AGENT_MEMORY_MAX_TTL_DAYS: u32 = 3_650;
+pub const AGENT_MEMORY_DEFAULT_SWEEP_DAYS: u32 = 30;
+/// Hard byte budget for the rendered `agent/memory` tail brief. The existing
+/// 6 KiB section cap still applies; this leaves room for the deterministic
+/// header and never splits an item.
+pub const AGENT_MEMORY_BRIEF_MAX_BYTES: usize = 5_600;
+
+/// Stable, bounded error codes for agent-memory RPCs. These are wire values,
+/// not message-text classifications.
+pub mod agent_memory_codes {
+    pub const MEMORY_NOT_FOUND: &str = "MEMORY_NOT_FOUND";
+    pub const MEMORY_INVALID: &str = "MEMORY_INVALID";
+    pub const MEMORY_SCOPE_INVALID: &str = "MEMORY_SCOPE_INVALID";
+    pub const MEMORY_SCOPE_FORBIDDEN: &str = "MEMORY_SCOPE_FORBIDDEN";
+    pub const MEMORY_IDENTITY_REQUIRED: &str = "MEMORY_IDENTITY_REQUIRED";
+    pub const MEMORY_DEPARTMENT_REQUIRED: &str = "MEMORY_DEPARTMENT_REQUIRED";
+    pub const MEMORY_PROJECT_MISMATCH: &str = "MEMORY_PROJECT_MISMATCH";
+    pub const MEMORY_IDENTITY_RETIRED: &str = "MEMORY_IDENTITY_RETIRED";
+    pub const MEMORY_IDENTITY_UNAVAILABLE: &str = "MEMORY_IDENTITY_UNAVAILABLE";
+    pub const MEMORY_IMPORTED_READONLY: &str = "MEMORY_IMPORTED_READONLY";
+    pub const MEMORY_CONFLICT: &str = "MEMORY_CONFLICT";
+    pub const MEMORY_TOO_LARGE: &str = "MEMORY_TOO_LARGE";
+    pub const MEMORY_EVIDENCE_INVALID: &str = "MEMORY_EVIDENCE_INVALID";
+    pub const MEMORY_INVALID_EVENT: &str = "MEMORY_INVALID_EVENT";
+}
+
+/// Typed memory failure. It carries only a stable code and a bounded message;
+/// memory content, prompts, evidence bodies, and secrets never enter it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentMemoryError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl AgentMemoryError {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for AgentMemoryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for AgentMemoryError {}
+
+/// One durable project-scoped memory claim. `content_hash` is SHA-256 of the
+/// exact normalized content and is recomputed on every write. `expired` is a
+/// read-time derivation and is never stored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentMemory {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub identity_id: Option<String>,
+    #[serde(default)]
+    pub department: Option<String>,
+    #[serde(default)]
+    pub component: Option<String>,
+    /// `agent`, `department`, or `project`.
+    #[serde(default)]
+    pub scope: String,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub content_hash: String,
+    #[serde(default)]
+    pub evidence: Vec<MemoryEvidence>,
+    #[serde(default = "default_memory_source")]
+    pub source: String,
+    /// `active`, `superseded`, or `stale`.
+    #[serde(default = "default_memory_status")]
+    pub status: String,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub verified_at: Option<String>,
+    #[serde(default)]
+    pub superseded_by: Option<String>,
+    #[serde(default)]
+    pub stale_reason: Option<String>,
+    /// `local` or `imported`. Imported memories are read-only evidence until an
+    /// explicit future rehome; they never enter a prompt brief.
+    #[serde(default = "default_identity_origin")]
+    pub origin: String,
+    /// Derived at read time from `expires_at`. Absent/false for a live row.
+    #[serde(default)]
+    pub expired: bool,
+}
+
+impl Default for AgentMemory {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            project_id: String::new(),
+            identity_id: None,
+            department: None,
+            component: None,
+            scope: String::new(),
+            content: String::new(),
+            content_hash: String::new(),
+            evidence: Vec::new(),
+            source: "agent".to_string(),
+            status: "active".to_string(),
+            pinned: false,
+            created_at: String::new(),
+            updated_at: String::new(),
+            expires_at: None,
+            verified_at: None,
+            superseded_by: None,
+            stale_reason: None,
+            origin: "local".to_string(),
+            expired: false,
+        }
+    }
+}
+
+/// One append-only project-scoped memory event. `seq` orders replay within one
+/// project; `id` is portable across databases so archive import is idempotent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentMemoryEvent {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub payload: Value,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+/// Read-time metadata for the bounded `agent/memory` brief. It contains counts
+/// and hashes only; memory content is never part of prompt telemetry.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityMemoryTelemetry {
+    /// `agent_memory`, `legacy_project_memory`, or empty when omitted.
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub memory_count: u32,
+    #[serde(default)]
+    pub brief_chars: u64,
+    #[serde(default)]
+    pub brief_hash: String,
+    #[serde(default)]
+    pub memory_hashes: Vec<String>,
+    #[serde(default)]
+    pub scope_counts: BTreeMap<String, u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentMemoryListParams {
+    #[serde(default)]
+    pub project_id: String,
+    /// Optional viewer identity. When present, scope isolation is enforced:
+    /// agent memory only for that identity, department memory only for its
+    /// department, and project memory for everyone. Omitted means an operator
+    /// project-wide read.
+    #[serde(default)]
+    pub identity_id: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub department: Option<String>,
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub include_expired: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentMemoryListResult {
+    #[serde(default)]
+    pub memories: Vec<AgentMemory>,
+    #[serde(default)]
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentMemoryParams {
+    #[serde(default)]
+    pub memory_id: String,
+    /// Optional project guard. When present, a row from another project fails
+    /// closed instead of being returned by id.
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// Optional viewer identity used for a scope-isolation check.
+    #[serde(default)]
+    pub identity_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentMemoryResult {
+    #[serde(default)]
+    pub memory: AgentMemory,
+    #[serde(default)]
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CreateAgentMemoryParams {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub identity_id: Option<String>,
+    /// Required for department scope. Agent scope derives it from the identity.
+    #[serde(default)]
+    pub department: Option<String>,
+    #[serde(default)]
+    pub component: Option<String>,
+    /// `agent`, `department`, or `project`.
+    #[serde(default)]
+    pub scope: String,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub evidence: Vec<MemoryEvidence>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub pinned: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateAgentMemoryParams {
+    #[serde(default)]
+    pub memory_id: String,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<Vec<MemoryEvidence>>,
+    #[serde(default)]
+    pub pinned: Option<bool>,
+    /// Distinguish "leave unchanged" from "clear expiry".
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    pub expires_at: Option<Option<String>>,
+    /// Optimistic guard. A mismatch fails with `MEMORY_CONFLICT` and no write.
+    #[serde(default)]
+    pub expected_content_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SupersedeAgentMemoryParams {
+    #[serde(default)]
+    pub memory_id: String,
+    /// Supersede with an existing active memory in the same scope.
+    #[serde(default)]
+    pub replacement_memory_id: Option<String>,
+    /// Or create a replacement atomically from this bounded content.
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub evidence: Vec<MemoryEvidence>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub expected_content_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentMemorySupersedeResult {
+    #[serde(default)]
+    pub previous: AgentMemory,
+    #[serde(default)]
+    pub replacement: AgentMemory,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ForgetAgentMemoryParams {
+    #[serde(default)]
+    pub memory_id: String,
+    /// `false` transitions to stale and keeps evidence; `true` hard-deletes a
+    /// stale/superseded row. Active rows must be forgotten first.
+    #[serde(default)]
+    pub prune: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentMemoryForgetResult {
+    #[serde(default)]
+    pub memory_id: String,
+    #[serde(default)]
+    pub pruned: bool,
+    #[serde(default)]
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VerifyAgentMemoryParams {
+    #[serde(default)]
+    pub memory_id: String,
+    /// Optional TTL extension from now. Bounded by
+    /// `AGENT_MEMORY_MAX_TTL_DAYS`; verification never shortens an expiry.
+    #[serde(default)]
+    pub extend_days: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SweepAgentMemoriesParams {
+    #[serde(default)]
+    pub project_id: String,
+    /// Stale/superseded rows older than this are pruned when `prune` is set.
+    #[serde(default)]
+    pub older_than_days: Option<u32>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub prune: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentMemorySweepResult {
+    #[serde(default)]
+    pub expired: u64,
+    #[serde(default)]
+    pub pruned: u64,
+    #[serde(default)]
+    pub remaining: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentMemoryReplayParams {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub repair: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentMemoryReplayReport {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub memories: u64,
+    #[serde(default)]
+    pub events: u64,
+    #[serde(default)]
+    pub consistent: bool,
+    #[serde(default)]
+    pub repaired: bool,
+    #[serde(default)]
+    pub mismatches: Vec<String>,
+}
+
+/// Validate one scope value without normalizing unknown strings.
+pub fn agent_memory_scope(value: &str) -> Option<&'static str> {
+    match value {
+        "agent" => Some("agent"),
+        "department" => Some("department"),
+        "project" => Some("project"),
+        _ => None,
+    }
+}
+
+/// Validate one provenance source. `imported` is accepted so an archived row
+/// decodes, but the local create path rejects it explicitly.
+pub fn agent_memory_source(value: &str) -> Option<&'static str> {
+    AGENT_MEMORY_SOURCES
+        .iter()
+        .copied()
+        .find(|source| *source == value)
+}
+
+/// Normalize bounded memory content. Newlines and tabs are preserved; control
+/// characters, NUL, empty content, and oversized content fail closed.
+pub fn normalize_agent_memory_content(
+    value: &str,
+) -> std::result::Result<String, AgentMemoryError> {
+    let content = value.trim().to_string();
+    if content.is_empty() {
+        return Err(AgentMemoryError::new(
+            agent_memory_codes::MEMORY_INVALID,
+            "memory content must not be empty",
+        ));
+    }
+    if content.chars().count() > AGENT_MEMORY_MAX_CONTENT_CHARS {
+        return Err(AgentMemoryError::new(
+            agent_memory_codes::MEMORY_TOO_LARGE,
+            format!("memory content must be at most {AGENT_MEMORY_MAX_CONTENT_CHARS} characters"),
+        ));
+    }
+    if content
+        .chars()
+        .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
+    {
+        return Err(AgentMemoryError::new(
+            agent_memory_codes::MEMORY_INVALID,
+            "memory content must not contain control characters",
+        ));
+    }
+    Ok(content)
+}
+
+/// Normalize an optional department label. Department comparison is
+/// case-insensitive at query time, but the stored label preserves the
+/// operator/identity spelling.
+pub fn normalize_agent_memory_department(
+    value: &str,
+) -> std::result::Result<String, AgentMemoryError> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().count() > AGENT_MEMORY_MAX_DEPARTMENT_CHARS {
+        return Err(AgentMemoryError::new(
+            agent_memory_codes::MEMORY_DEPARTMENT_REQUIRED,
+            format!("department must be 1-{AGENT_MEMORY_MAX_DEPARTMENT_CHARS} characters"),
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(AgentMemoryError::new(
+            agent_memory_codes::MEMORY_INVALID,
+            "department must not contain control characters",
+        ));
+    }
+    Ok(value.to_string())
+}
+
+/// Normalize an optional component label. It is a label, not a path or ref.
+pub fn normalize_agent_memory_component(
+    value: &str,
+) -> std::result::Result<String, AgentMemoryError> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().count() > AGENT_MEMORY_MAX_COMPONENT_CHARS {
+        return Err(AgentMemoryError::new(
+            agent_memory_codes::MEMORY_INVALID,
+            format!("component must be 1-{AGENT_MEMORY_MAX_COMPONENT_CHARS} characters"),
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(AgentMemoryError::new(
+            agent_memory_codes::MEMORY_INVALID,
+            "component must not contain control characters",
+        ));
+    }
+    Ok(value.to_string())
+}
+
+/// Validate bounded evidence pointers. References are opaque ids/commits/paths
+/// supplied by a trusted caller; they are never rendered as instructions and
+/// never carry prompt or tool-output bodies.
+pub fn validate_agent_memory_evidence(
+    evidence: &[MemoryEvidence],
+) -> std::result::Result<(), AgentMemoryError> {
+    if evidence.len() > AGENT_MEMORY_MAX_EVIDENCE {
+        return Err(AgentMemoryError::new(
+            agent_memory_codes::MEMORY_EVIDENCE_INVALID,
+            format!("at most {AGENT_MEMORY_MAX_EVIDENCE} evidence pointers are allowed"),
+        ));
+    }
+    for entry in evidence {
+        if !AGENT_MEMORY_EVIDENCE_KINDS.contains(&entry.kind.as_str()) {
+            return Err(AgentMemoryError::new(
+                agent_memory_codes::MEMORY_EVIDENCE_INVALID,
+                format!(
+                    "evidence kind must be one of task, session, commit, artifact, event: {}",
+                    entry.kind
+                ),
+            ));
+        }
+        let reference = entry.reference.trim();
+        if reference.is_empty() || reference.chars().count() > AGENT_MEMORY_MAX_REFERENCE_CHARS {
+            return Err(AgentMemoryError::new(
+                agent_memory_codes::MEMORY_EVIDENCE_INVALID,
+                format!(
+                    "evidence reference must be 1-{AGENT_MEMORY_MAX_REFERENCE_CHARS} characters"
+                ),
+            ));
+        }
+        if reference.chars().any(char::is_control) {
+            return Err(AgentMemoryError::new(
+                agent_memory_codes::MEMORY_EVIDENCE_INVALID,
+                "evidence reference must not contain control characters",
+            ));
+        }
+        if let Some(note) = entry.note.as_deref()
+            && (note.chars().count() > AGENT_MEMORY_MAX_NOTE_CHARS
+                || note.chars().any(char::is_control))
+        {
+            return Err(AgentMemoryError::new(
+                agent_memory_codes::MEMORY_EVIDENCE_INVALID,
+                format!(
+                    "evidence note must be at most {AGENT_MEMORY_MAX_NOTE_CHARS} characters and contain no control characters"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the scope shape independent of any database row. This is the same
+/// rule the store enforces transactionally, exposed for protocol tests and the
+/// pure brief/visibility helpers.
+pub fn validate_agent_memory_scope_shape(
+    scope: &str,
+    identity_id: Option<&str>,
+    department: Option<&str>,
+) -> std::result::Result<(), AgentMemoryError> {
+    let scope = agent_memory_scope(scope).ok_or_else(|| {
+        AgentMemoryError::new(
+            agent_memory_codes::MEMORY_SCOPE_INVALID,
+            format!("scope must be agent, department, or project: {scope}"),
+        )
+    })?;
+    match scope {
+        "agent" => {
+            if identity_id.map(str::trim).unwrap_or_default().is_empty() {
+                return Err(AgentMemoryError::new(
+                    agent_memory_codes::MEMORY_IDENTITY_REQUIRED,
+                    "agent memory requires a project identity",
+                ));
+            }
+        }
+        "department" => {
+            if identity_id.is_some() {
+                return Err(AgentMemoryError::new(
+                    agent_memory_codes::MEMORY_SCOPE_INVALID,
+                    "department memory must not carry an identity id",
+                ));
+            }
+            if department.map(str::trim).unwrap_or_default().is_empty() {
+                return Err(AgentMemoryError::new(
+                    agent_memory_codes::MEMORY_DEPARTMENT_REQUIRED,
+                    "department memory requires a department",
+                ));
+            }
+        }
+        "project" if identity_id.is_some() || department.is_some() => {
+            return Err(AgentMemoryError::new(
+                agent_memory_codes::MEMORY_SCOPE_INVALID,
+                "project memory must not carry an identity id or department",
+            ));
+        }
+        "project" => {}
+        _ => {}
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -16401,6 +17027,13 @@ mod tests {
             latest_identity_id: Some("agt-1".into()),
             latest_identity_generation: Some(2),
             latest_identity_hash: Some("b".repeat(64)),
+            latest_identity_memory: Some(IdentityMemoryTelemetry {
+                source: "agent_memory".into(),
+                memory_count: 1,
+                brief_chars: 42,
+                brief_hash: "c".repeat(64),
+                ..IdentityMemoryTelemetry::default()
+            }),
             states: vec![SessionInstructionStateReport {
                 state_id: "ses-1".into(),
                 role: Some("leader".into()),
@@ -18521,6 +19154,8 @@ mod context_checkpoint_bundle_tests {
             agent_workspaces: Vec::new(),
             session_worker_workspaces: Vec::new(),
             agent_workspace_events: Vec::new(),
+            agent_memories: Vec::new(),
+            agent_memory_events: Vec::new(),
         };
         let encoded = serde_json::to_string(&bundle).unwrap();
         let decoded: SessionBundle = serde_json::from_str(&encoded).unwrap();
@@ -22057,5 +22692,199 @@ mod workspace_protocol_tests {
         assert!(bundle.agent_workspaces.is_empty());
         assert!(bundle.session_worker_workspaces.is_empty());
         assert!(bundle.agent_workspace_events.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod memory_protocol_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn memory_rows_decode_with_additive_defaults() {
+        let memory: AgentMemory = serde_json::from_value(json!({
+            "id": "mem-1",
+            "project_id": "prj-1",
+            "scope": "agent",
+            "identity_id": "agt-1",
+            "content": "Auth owns JWT validation.",
+            "content_hash": "a".repeat(64),
+            "source": "agent",
+            "status": "active"
+        }))
+        .unwrap();
+        assert_eq!(memory.scope, "agent");
+        assert_eq!(memory.source, "agent");
+        assert_eq!(memory.status, "active");
+        assert!(!memory.pinned);
+        assert!(!memory.expired);
+        assert!(memory.expires_at.is_none());
+        assert!(memory.superseded_by.is_none());
+        assert_eq!(memory.origin, "local");
+        assert!(memory.evidence.is_empty());
+
+        let partial: AgentMemory = serde_json::from_value(json!({
+            "id": "mem-2",
+            "project_id": "prj-1",
+            "scope": "project",
+            "content": "A project fact."
+        }))
+        .unwrap();
+        assert_eq!(partial.status, "active");
+        assert_eq!(partial.source, "agent");
+        assert_eq!(partial.origin, "local");
+    }
+
+    #[test]
+    fn memory_params_and_results_round_trip() {
+        let create = CreateAgentMemoryParams {
+            project_id: "prj-1".into(),
+            identity_id: Some("agt-1".into()),
+            scope: "agent".into(),
+            content: "A durable claim.".into(),
+            evidence: vec![MemoryEvidence {
+                kind: "task".into(),
+                reference: "T1".into(),
+                note: Some("reviewed".into()),
+            }],
+            source: Some("verifier".into()),
+            expires_at: Some("2027-01-01T00:00:00Z".into()),
+            pinned: true,
+            ..CreateAgentMemoryParams::default()
+        };
+        let decoded: CreateAgentMemoryParams =
+            serde_json::from_str(&serde_json::to_string(&create).unwrap()).unwrap();
+        assert_eq!(decoded, create);
+
+        let update: UpdateAgentMemoryParams = serde_json::from_value(json!({
+            "memory_id": "mem-1",
+            "content": "changed",
+            "expected_content_hash": "a".repeat(64),
+            "expires_at": null
+        }))
+        .unwrap();
+        assert_eq!(update.content.as_deref(), Some("changed"));
+        assert_eq!(update.expires_at, Some(None));
+        let omitted: UpdateAgentMemoryParams =
+            serde_json::from_value(json!({"memory_id": "mem-1"})).unwrap();
+        assert_eq!(omitted.expires_at, None);
+        assert!(omitted.pinned.is_none());
+
+        let report = AgentMemoryReplayReport {
+            project_id: "prj-1".into(),
+            memories: 2,
+            events: 4,
+            consistent: true,
+            ..AgentMemoryReplayReport::default()
+        };
+        let decoded: AgentMemoryReplayReport =
+            serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+        assert_eq!(decoded, report);
+    }
+
+    #[test]
+    fn memory_scope_shape_and_content_validation_is_bounded() {
+        assert_eq!(agent_memory_scope("agent"), Some("agent"));
+        assert_eq!(agent_memory_scope("Agent"), None);
+        assert_eq!(agent_memory_source("integration"), Some("integration"));
+        assert_eq!(agent_memory_source("imported"), Some("imported"));
+        assert_eq!(agent_memory_source("model"), None);
+
+        assert!(validate_agent_memory_scope_shape("agent", Some("agt-1"), None).is_ok());
+        assert!(validate_agent_memory_scope_shape("agent", None, None).is_err());
+        assert!(validate_agent_memory_scope_shape("department", None, Some("Platform")).is_ok());
+        assert!(validate_agent_memory_scope_shape("department", None, None).is_err());
+        assert!(
+            validate_agent_memory_scope_shape("department", Some("agt-1"), Some("Platform"))
+                .is_err()
+        );
+        assert!(validate_agent_memory_scope_shape("project", None, None).is_ok());
+        assert!(validate_agent_memory_scope_shape("project", Some("agt-1"), None).is_err());
+        assert!(validate_agent_memory_scope_shape("project", None, Some("Platform")).is_err());
+        let error = validate_agent_memory_scope_shape("session", None, None).unwrap_err();
+        assert_eq!(error.code, agent_memory_codes::MEMORY_SCOPE_INVALID);
+
+        assert_eq!(
+            normalize_agent_memory_content("  claim \n").unwrap(),
+            "claim"
+        );
+        assert!(normalize_agent_memory_content(" ").is_err());
+        assert!(
+            normalize_agent_memory_content(&"a".repeat(AGENT_MEMORY_MAX_CONTENT_CHARS + 1))
+                .is_err()
+        );
+        assert!(normalize_agent_memory_content("bad\u{0000}claim").is_err());
+        assert_eq!(
+            normalize_agent_memory_content("line\nbreak\tkept").unwrap(),
+            "line\nbreak\tkept"
+        );
+    }
+
+    #[test]
+    fn evidence_validation_rejects_unknown_kinds_and_oversized_notes() {
+        let good = MemoryEvidence {
+            kind: "commit".into(),
+            reference: "abcdef123456".into(),
+            note: None,
+        };
+        assert!(validate_agent_memory_evidence(std::slice::from_ref(&good)).is_ok());
+        let mut bad_kind = good.clone();
+        bad_kind.kind = "prompt".into();
+        assert_eq!(
+            validate_agent_memory_evidence(&[bad_kind])
+                .unwrap_err()
+                .code,
+            agent_memory_codes::MEMORY_EVIDENCE_INVALID
+        );
+        let mut empty = good.clone();
+        empty.reference = " ".into();
+        assert!(validate_agent_memory_evidence(&[empty]).is_err());
+        let mut huge = good.clone();
+        huge.note = Some("n".repeat(AGENT_MEMORY_MAX_NOTE_CHARS + 1));
+        assert!(validate_agent_memory_evidence(&[huge]).is_err());
+        let many = vec![good; AGENT_MEMORY_MAX_EVIDENCE + 1];
+        assert!(validate_agent_memory_evidence(&many).is_err());
+    }
+
+    #[test]
+    fn memory_event_kinds_codes_and_bundle_defaults_are_stable() {
+        assert!(AGENT_MEMORY_EVENT_KINDS.contains(&"agent.memory.created"));
+        assert!(AGENT_MEMORY_EVENT_KINDS.contains(&"agent.memory.superseded"));
+        assert!(AGENT_MEMORY_EVENT_KINDS.contains(&"agent.memory.deleted"));
+        assert_eq!(
+            agent_memory_codes::MEMORY_SCOPE_FORBIDDEN,
+            "MEMORY_SCOPE_FORBIDDEN"
+        );
+
+        let bundle: SessionBundle = serde_json::from_value(json!({
+            "version": 1,
+            "exported_at": "2026-11-13T00:00:00Z",
+            "project": {"id": "prj-1", "name": "p", "root": "/tmp/p", "default_branch": "main", "created_at": "2026-11-13T00:00:00Z"},
+            "session": {"id": "ses-1", "project_id": "prj-1", "goal": "g", "status": "idle", "created_at": "2026-11-13T00:00:00Z"},
+            "events": [],
+            "agents": [],
+            "messages": [],
+            "todos": [],
+            "merge_queue": []
+        }))
+        .unwrap();
+        assert!(bundle.agent_memories.is_empty());
+        assert!(bundle.agent_memory_events.is_empty());
+    }
+
+    #[test]
+    fn memory_telemetry_is_counts_and_hashes_only() {
+        let telemetry = IdentityMemoryTelemetry {
+            source: "agent_memory".into(),
+            memory_count: 2,
+            brief_chars: 120,
+            brief_hash: "b".repeat(64),
+            memory_hashes: vec!["a".repeat(64)],
+            scope_counts: BTreeMap::from([("agent".to_string(), 1), ("project".to_string(), 1)]),
+        };
+        let encoded = serde_json::to_string(&telemetry).unwrap();
+        assert!(!encoded.contains("secret memory content"));
+        let decoded: IdentityMemoryTelemetry = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, telemetry);
     }
 }
