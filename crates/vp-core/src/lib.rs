@@ -139,6 +139,7 @@ pub mod coordination;
 pub mod critical_path;
 pub mod daemon_agent;
 mod dashboard;
+pub mod diagnosis;
 pub mod effect;
 pub mod forge;
 pub mod gate;

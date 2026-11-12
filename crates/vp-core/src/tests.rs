@@ -15784,3 +15784,182 @@ async fn unknown_effect_blocks_landing_and_session_scope_is_included() {
         "{land_error}"
     );
 }
+
+#[tokio::test]
+async fn diagnosis_records_one_advisory_event_without_mutating_runtime_state() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("diagnosis".into()),
+        )
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "diagnose".into(), None)
+        .await
+        .unwrap();
+    let plan = vp_protocol::types::TeamPlan {
+        goal: "diagnose".into(),
+        departments: vec![],
+        tasks: vec![
+            vp_protocol::types::PlanTask {
+                id: "t1".into(),
+                department: "engineering".into(),
+                title: "upstream".into(),
+                kind: "coding".into(),
+                priority: 0,
+                profile: None,
+                deps: vec![],
+                write_scope: vec![],
+                acceptance: vec![],
+                token_budget: None,
+                cost_budget_usd: None,
+            },
+            vp_protocol::types::PlanTask {
+                id: "t2".into(),
+                department: "engineering".into(),
+                title: "downstream".into(),
+                kind: "coding".into(),
+                priority: 0,
+                profile: None,
+                deps: vec!["t1".into()],
+                write_scope: vec![],
+                acceptance: vec![],
+                token_budget: None,
+                cost_budget_usd: None,
+            },
+        ],
+    };
+    engine.set_team_plan(&session.id, &plan).await.unwrap();
+    engine
+        .append_event(
+            &session.id,
+            "plan_task.finished",
+            serde_json::json!({
+                "task_id": "t1",
+                "task_status": "failed",
+                "agent_id": "worker-1",
+                "agent_name": "Worker 1",
+                "agent_role": "worker",
+            }),
+        )
+        .await
+        .unwrap();
+    engine
+        .append_event(
+            &session.id,
+            "plan_task.finished",
+            serde_json::json!({
+                "task_id": "t2",
+                "task_status": "failed",
+                "agent_id": "worker-2",
+                "agent_name": "Worker 2",
+                "agent_role": "worker",
+            }),
+        )
+        .await
+        .unwrap();
+    let before_events = engine.recent_events(&session.id, 1_000).await.unwrap();
+    let before_session = engine
+        .store()
+        .get_session(&session.id)
+        .unwrap()
+        .expect("session");
+    let before_queue = engine.list_merge_queue(&session.id).await.unwrap();
+    let before_replay = engine.replay_session(&session.id).await.unwrap();
+
+    let read_only = engine
+        .session_diagnosis(vp_protocol::diagnosis::SessionDiagnosisParams {
+            session_id: session.id.clone(),
+            target_task_id: Some("t2".into()),
+            limit: Some(500),
+            include_graph: false,
+        })
+        .await
+        .unwrap();
+    assert!(read_only.advisory);
+    assert!(read_only.recorded_event_seq.is_none());
+    assert_eq!(
+        engine
+            .recent_events(&session.id, 1_000)
+            .await
+            .unwrap()
+            .len(),
+        before_events.len(),
+        "the plain diagnosis path must not append events"
+    );
+
+    let report = engine
+        .record_session_diagnosis(vp_protocol::diagnosis::SessionDiagnosisRecordParams {
+            session_id: session.id.clone(),
+            target_task_id: Some("t2".into()),
+            limit: Some(500),
+            include_graph: true,
+        })
+        .await
+        .unwrap();
+    assert!(report.advisory);
+    assert_eq!(
+        report
+            .earliest
+            .as_ref()
+            .map(|finding| finding.task_id.as_deref()),
+        Some(Some("t1"))
+    );
+    assert!(report.recorded_event_seq.is_some());
+
+    let after_events = engine.recent_events(&session.id, 1_000).await.unwrap();
+    let before_len = before_events.len();
+    assert_eq!(after_events.len(), before_len + 1);
+    assert_eq!(
+        after_events.last().map(|event| event.kind.as_str()),
+        Some("failure.attribution")
+    );
+    assert!(
+        !after_events[before_len..]
+            .iter()
+            .any(|event| event.kind != "failure.attribution")
+    );
+    assert!(
+        !after_events
+            .iter()
+            .any(|event| event.kind == "plan_task.retry_scheduled")
+    );
+    let after_session = engine
+        .store()
+        .get_session(&session.id)
+        .unwrap()
+        .expect("session");
+    assert_eq!(after_session.status, before_session.status);
+    let after_queue = engine.list_merge_queue(&session.id).await.unwrap();
+    assert_eq!(after_queue.len(), before_queue.len());
+    assert!(after_queue.iter().all(|entry| {
+        before_queue
+            .iter()
+            .find(|before| before.id == entry.id)
+            .is_some_and(|before| before.status == entry.status)
+    }));
+
+    let history = engine
+        .session_attributions(vp_protocol::diagnosis::SessionAttributionsParams {
+            session_id: session.id.clone(),
+            limit: Some(10),
+        })
+        .await
+        .unwrap();
+    assert_eq!(history.total, 1);
+    assert_eq!(history.attributions.len(), 1);
+    assert_eq!(
+        history.attributions[0].attribution.reason_code,
+        vp_protocol::diagnosis::reason_codes::CASCADE_UPSTREAM
+    );
+    let replay = engine.replay_session(&session.id).await.unwrap();
+    assert_eq!(
+        replay.mismatches, before_replay.mismatches,
+        "an advisory record must not create a new projection drift"
+    );
+}

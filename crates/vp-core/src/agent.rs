@@ -10880,6 +10880,24 @@ async fn refresh_workspace_base(spec: &mut AgentSpec) {
     }
 }
 
+/// Bounded, evidence-only changed paths for a Worker result. Paths are not
+/// file content and never include a diff. They are persisted so failure
+/// attribution can connect a commit to the files it touched without reading
+/// tool output or the repository at diagnosis time.
+fn bounded_worker_changed_paths(spec: &AgentSpec, commit: &str) -> Vec<String> {
+    let base = if spec.base_commit.trim().is_empty() {
+        format!("{commit}^")
+    } else {
+        spec.base_commit.clone()
+    };
+    crate::worktree::changed_paths(&spec.worktree, &base)
+        .unwrap_or_default()
+        .into_iter()
+        .take(64)
+        .map(|path| path.chars().take(240).collect())
+        .collect()
+}
+
 async fn commit_worker(spec: &AgentSpec, name: &str) -> Result<Option<String>> {
     let task_worktree = spec.worktree.clone();
     let message = format!("task: {name}");
@@ -12952,6 +12970,7 @@ async fn finish_worker(
     };
 
     record_worker_commit_effect(engine, session, worker_spec, &commit).await;
+    let changed_paths = bounded_worker_changed_paths(worker_spec, &commit);
     let verification = verify_worker(
         engine,
         config,
@@ -13002,6 +13021,7 @@ async fn finish_worker(
                             "status": "idle",
                             "summary": truncate(summary),
                             "commit": commit,
+                            "changed_paths": changed_paths,
                             "merged": true,
                             "verified": true,
                             "approved": true,
@@ -13036,6 +13056,7 @@ async fn finish_worker(
                             "status": "failed",
                             "summary": truncate(error.to_string().as_str()),
                             "commit": commit,
+                            "changed_paths": changed_paths,
                             "merged": false,
                             "verified": true,
                             "approved": true,
@@ -13080,6 +13101,7 @@ async fn finish_worker(
                     "status": "changes_requested",
                     "summary": truncate(summary),
                     "commit": commit,
+                    "changed_paths": changed_paths,
                     "merged": false,
                     "verified": true,
                     "approved": false,
@@ -13120,6 +13142,7 @@ async fn finish_worker(
                     "status": "failed",
                     "summary": truncate(&error),
                     "commit": commit,
+                    "changed_paths": changed_paths,
                     "merged": false,
                     "verified": false,
                     "worktree": worker_spec.worktree,

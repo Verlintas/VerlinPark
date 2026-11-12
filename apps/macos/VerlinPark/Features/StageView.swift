@@ -954,6 +954,12 @@ private struct ContextPopoverView: View {
                     RuntimeCompatibilityBadge(report: compatibility)
                 }
 
+                if let diagnosis = model.sessionDiagnosis,
+                   diagnosis.hasRootFinding
+                {
+                    FailureDiagnosisBadge(report: diagnosis)
+                }
+
                 if let instructions = model.sessionInstructions {
                     InstructionSectionsView(
                         report: instructions,

@@ -20186,6 +20186,47 @@ impl Store {
         Ok(events)
     }
 
+    /// Newest bounded event window in ascending sequence order. This is used
+    /// by read-only diagnosis, which must never load an unbounded session log.
+    /// The payload is the same JSON already stored for mirror/replay; callers
+    /// read only allowlisted structural fields.
+    pub fn list_recent_events_window(&self, session_id: &str, limit: u32) -> Result<Vec<Event>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT session_id, seq, type, payload, created_at
+             FROM events WHERE session_id = ?1
+             ORDER BY seq DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            params![session_id, i64::from(limit.clamp(1, 50_000))],
+            |row| {
+                let payload: String = row.get(3)?;
+                Ok(Event {
+                    session_id: row.get(0)?,
+                    seq: row.get::<_, i64>(1)? as u64,
+                    kind: row.get(2)?,
+                    payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
+                    created_at: row.get(4)?,
+                })
+            },
+        )?;
+        let mut events = rows.collect::<Result<Vec<_>, _>>()?;
+        events.reverse();
+        Ok(events)
+    }
+
+    /// Total event rows for a session. Diagnosis compares this with the
+    /// returned bounded window so truncation is visible in the report.
+    pub fn event_count(&self, session_id: &str) -> Result<u64> {
+        let conn = self.lock()?;
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count.max(0) as u64)
+    }
+
     /// Bounded GUI action timeline. Entries are derived from `gui.action`
     /// events; only action/target/generation/latency/result metadata is
     /// stored. Screen content and typed text are never included.

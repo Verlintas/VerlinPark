@@ -2247,6 +2247,25 @@ enum Command {
         #[arg(long)]
         run: Option<String>,
     },
+    /// Read-only failure attribution and bounded provenance diagnosis.
+    Diagnose {
+        session: String,
+        /// Attribute one plan task instead of the latest failure.
+        #[arg(long)]
+        task: Option<String>,
+        /// Bounded event window (500..=50000), or ledger row limit with --history.
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Include the bounded provenance graph in the JSON/report output.
+        #[arg(long)]
+        graph: bool,
+        /// Explicitly record a bounded `failure.attribution` ledger event.
+        #[arg(long)]
+        record: bool,
+        /// List explicitly recorded attribution snapshots instead of diagnosing.
+        #[arg(long)]
+        history: bool,
+    },
     /// Revalidate a stored plan and update its runtime snapshot after explicit
     /// operator approval. Never rewrites tasks, scopes, or budgets.
     PlanMigrate {
@@ -7792,6 +7811,40 @@ async fn run(cli: Cli) -> Result<()> {
                 params["run_id"] = json!(run);
             }
             rpc(&discovery, "session.compatibility", params).await?
+        }
+        Command::Diagnose {
+            session,
+            task,
+            limit,
+            graph,
+            record,
+            history,
+        } => {
+            if history {
+                rpc(
+                    &discovery,
+                    "session.attributions",
+                    json!({"session_id": session, "limit": limit}),
+                )
+                .await?
+            } else {
+                let method = if record {
+                    "session.diagnosis.record"
+                } else {
+                    "session.diagnosis"
+                };
+                rpc(
+                    &discovery,
+                    method,
+                    json!({
+                        "session_id": session,
+                        "target_task_id": task,
+                        "limit": limit,
+                        "include_graph": graph,
+                    }),
+                )
+                .await?
+            }
         }
         Command::PlanMigrate {
             session,
@@ -13879,6 +13932,284 @@ fn effect_lines(value: &Value) -> Option<Vec<String>> {
     None
 }
 
+fn diagnosis_lines(value: &Value) -> Option<Vec<String>> {
+    if let Some(rows) = value.get("attributions").and_then(Value::as_array) {
+        let mut lines = vec![format!(
+            "attributions: {} recorded  total={}  truncated={}",
+            rows.len(),
+            value.get("total").and_then(Value::as_u64).unwrap_or(0),
+            value
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        )];
+        for row in rows.iter().take(32) {
+            let attribution = row.get("attribution").unwrap_or(row);
+            let target = attribution.get("target").unwrap_or(&Value::Null);
+            let earliest = attribution
+                .get("earliest_node_id")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
+            lines.push(format!(
+                "  seq {} · {} · target={}:{} · earliest={} @{}",
+                row.get("event_seq").and_then(Value::as_u64).unwrap_or(0),
+                attribution
+                    .get("reason_code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                target.get("kind").and_then(Value::as_str).unwrap_or("?"),
+                target.get("id").and_then(Value::as_str).unwrap_or("-"),
+                earliest,
+                attribution
+                    .get("earliest_seq")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+            ));
+        }
+        lines.push(
+            "advisory only: recorded evidence never retries, cancels, merges, reassigns, or changes budgets"
+                .to_string(),
+        );
+        return Some(lines);
+    }
+    value.get("graph_summary")?;
+    let target = value.get("target").unwrap_or(&Value::Null);
+    let mut lines = vec![format!(
+        "diagnosis: {}  target={}:{}  status={}  truncated={}",
+        value
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_uppercase(),
+        target.get("kind").and_then(Value::as_str).unwrap_or("-"),
+        target.get("id").and_then(Value::as_str).unwrap_or("-"),
+        target.get("status").and_then(Value::as_str).unwrap_or("-"),
+        value
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    )];
+    if let Some(recorded) = value.get("recorded_event_seq").and_then(Value::as_u64) {
+        lines.push(format!("recorded: failure.attribution seq {recorded}"));
+    }
+    if let Some(earliest) = value.get("earliest") {
+        lines.push(format!(
+            "earliest unsupported claim: {} · {} @{} · task={} · node={}",
+            earliest
+                .get("reason_code")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            earliest
+                .get("severity")
+                .and_then(Value::as_str)
+                .unwrap_or("?"),
+            earliest.get("at_seq").and_then(Value::as_u64).unwrap_or(0),
+            earliest
+                .get("task_id")
+                .and_then(Value::as_str)
+                .unwrap_or("-"),
+            earliest
+                .get("node_id")
+                .and_then(Value::as_str)
+                .unwrap_or("-")
+        ));
+        if let Some(summary) = earliest.get("summary").and_then(Value::as_str) {
+            lines.push(format!("  {}", bounded_line(summary, 220)));
+        }
+        if let Some(agents) = earliest.get("agents").and_then(Value::as_array) {
+            for agent in agents.iter().take(4) {
+                lines.push(format!(
+                    "  responsible: {} [{}] {}",
+                    agent
+                        .get("agent_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("-"),
+                    agent.get("role").and_then(Value::as_str).unwrap_or("-"),
+                    agent.get("agent_id").and_then(Value::as_str).unwrap_or("-")
+                ));
+            }
+        }
+        if let Some(evidence) = earliest.get("evidence").and_then(Value::as_array) {
+            for item in evidence.iter().take(6) {
+                let hash = item
+                    .get("hash")
+                    .and_then(Value::as_str)
+                    .map(short_hash_str)
+                    .unwrap_or_else(|| "-".to_string());
+                lines.push(format!(
+                    "  evidence: {}:{} @{} hash={}",
+                    item.get("kind").and_then(Value::as_str).unwrap_or("?"),
+                    item.get("reference").and_then(Value::as_str).unwrap_or("-"),
+                    item.get("event_seq").and_then(Value::as_u64).unwrap_or(0),
+                    hash
+                ));
+            }
+        }
+    }
+    if let Some(cascade) = value.get("cascade").and_then(Value::as_array)
+        && !cascade.is_empty()
+    {
+        let path = cascade
+            .iter()
+            .take(24)
+            .map(|step| {
+                format!(
+                    "{}[{}]",
+                    step.get("task_id").and_then(Value::as_str).unwrap_or("?"),
+                    step.get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        lines.push(format!("cascade: {path}"));
+    }
+    if let Some(findings) = value.get("findings").and_then(Value::as_array) {
+        for finding in findings.iter().take(12) {
+            lines.push(format!(
+                "  finding: {} [{}] task={} node={}",
+                finding
+                    .get("reason_code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                finding
+                    .get("severity")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?"),
+                finding
+                    .get("task_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-"),
+                finding
+                    .get("node_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-")
+            ));
+        }
+    }
+    if let Some(summary) = value.get("graph_summary") {
+        lines.push(format!(
+            "provenance: nodes={} edges={} tasks={} agents={} artifacts={} commits={} checks={} verdicts={} merges={} depth={} depth_limited={} digest={}",
+            summary.get("nodes").and_then(Value::as_u64).unwrap_or(0),
+            summary.get("edges").and_then(Value::as_u64).unwrap_or(0),
+            summary.get("tasks").and_then(Value::as_u64).unwrap_or(0),
+            summary.get("agents").and_then(Value::as_u64).unwrap_or(0),
+            summary
+                .get("artifacts")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            summary.get("commits").and_then(Value::as_u64).unwrap_or(0),
+            summary
+                .get("test_evidence")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            summary
+                .get("verifications")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            summary.get("merges").and_then(Value::as_u64).unwrap_or(0),
+            summary
+                .get("max_depth")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            summary
+                .get("depth_limited")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            summary
+                .get("digest")
+                .and_then(Value::as_str)
+                .map(short_hash_str)
+                .unwrap_or_else(|| "-".to_string())
+        ));
+        lines.push(format!(
+            "window: {} of {} events (seq {}..{})",
+            summary
+                .get("scanned_events")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            summary
+                .get("total_events")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            summary
+                .get("window_start_seq")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            summary
+                .get("window_end_seq")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        ));
+    }
+    if value
+        .get("other_failures")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        > 0
+    {
+        lines.push(format!(
+            "other failures in window: {} (not attributed by this report)",
+            value
+                .get("other_failures")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        ));
+    }
+    if let Some(assignments) = value.get("assignments").and_then(Value::as_array)
+        && !assignments.is_empty()
+    {
+        let identity = assignments
+            .iter()
+            .take(4)
+            .map(|assignment| {
+                format!(
+                    "{} [{}] {}",
+                    assignment
+                        .get("identity_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("-"),
+                    assignment
+                        .get("role")
+                        .and_then(Value::as_str)
+                        .unwrap_or("-"),
+                    assignment
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("-")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!(
+            "assignment context (not proof of a historical run identity): {identity}"
+        ));
+    }
+    if let Some(warnings) = value.get("warnings").and_then(Value::as_array) {
+        for warning in warnings.iter().take(8).filter_map(Value::as_str) {
+            lines.push(format!("  warning: {}", bounded_line(warning, 220)));
+        }
+    }
+    lines.push(
+        "advisory only: this report never retries, cancels, merges, reassigns, or changes budgets, capacity, approvals, or plans"
+            .to_string(),
+    );
+    Some(lines)
+}
+
+fn bounded_line(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        value.to_string()
+    } else {
+        value.chars().take(max).collect::<String>() + "..."
+    }
+}
+
+fn short_hash_str(value: &str) -> String {
+    value.chars().take(12).collect()
+}
+
 fn runtime_pin_lines(value: &Value) -> Option<Vec<String>> {
     if let Some(status) = value.get("status").and_then(Value::as_str)
         && value.get("snapshot_age_secs").is_some()
@@ -14633,6 +14964,12 @@ fn print_human(value: &Value) {
         return;
     }
     if let Some(lines) = agent_identity_lines(value) {
+        for line in lines {
+            println!("{line}");
+        }
+        return;
+    }
+    if let Some(lines) = diagnosis_lines(value) {
         for line in lines {
             println!("{line}");
         }
@@ -23665,6 +24002,116 @@ mod gate_cli_tests {
         assert!(rendered.contains("MISMATCHED"));
         assert!(rendered.contains("controller-equivalent only"));
         assert!(!rendered.contains("verified"));
+    }
+
+    #[test]
+    fn diagnose_parses_and_renders_read_only_attribution() {
+        let cli = Cli::try_parse_from([
+            "vp", "diagnose", "ses-1", "--task", "t2", "--limit", "500", "--graph",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Diagnose {
+                session,
+                task,
+                limit,
+                graph,
+                record,
+                history,
+            } => {
+                assert_eq!(session, "ses-1");
+                assert_eq!(task.as_deref(), Some("t2"));
+                assert_eq!(limit, Some(500));
+                assert!(graph);
+                assert!(!record);
+                assert!(!history);
+            }
+            other => panic!("expected diagnose, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["vp", "diagnose", "ses-1", "--history"]).unwrap();
+        match cli.command {
+            Command::Diagnose { history, .. } => assert!(history),
+            other => panic!("expected diagnose history, got {other:?}"),
+        }
+
+        let report = json!({
+            "status": "attributed",
+            "session_id": "ses-1",
+            "target": {"kind": "task", "id": "t2", "task_id": "t2", "status": "failed", "at_seq": 9},
+            "earliest": {
+                "reason_code": "unsubstantiated_handoff",
+                "severity": "root",
+                "node_id": "task:t2",
+                "task_id": "t2",
+                "at_seq": 8,
+                "summary": "the Worker result does not cite an upstream commit or artifact hash it used",
+                "agents": [{"agent_id": "worker-2", "agent_name": "Worker 2", "role": "worker"}],
+                "evidence": [{"kind": "hash", "reference": "upstream", "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "event_seq": 4}]
+            },
+            "findings": [{
+                "reason_code": "unsubstantiated_handoff",
+                "severity": "root",
+                "task_id": "t2",
+                "node_id": "task:t2"
+            }],
+            "responsible_agents": [{"agent_id": "worker-2", "agent_name": "Worker 2", "role": "worker"}],
+            "cascade": [
+                {"kind": "task", "task_id": "t1", "status": "completed", "at_seq": 4, "relation": "root"},
+                {"kind": "task", "task_id": "t2", "status": "failed", "at_seq": 9, "relation": "failure"}
+            ],
+            "graph_summary": {
+                "nodes": 8,
+                "edges": 7,
+                "tasks": 2,
+                "agents": 2,
+                "artifacts": 1,
+                "commits": 1,
+                "test_evidence": 1,
+                "verifications": 1,
+                "merges": 1,
+                "max_depth": 1,
+                "depth_limited": false,
+                "truncated": false,
+                "scanned_events": 10,
+                "total_events": 10,
+                "window_start_seq": 1,
+                "window_end_seq": 10,
+                "digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            },
+            "other_failures": 0,
+            "assignments": [],
+            "advisory": true,
+            "truncated": false,
+            "warnings": [],
+            "recorded_event_seq": 11
+        });
+        let rendered = diagnosis_lines(&report).unwrap().join("\n");
+        assert!(rendered.contains("ATTRIBUTED"));
+        assert!(rendered.contains("unsubstantiated_handoff"));
+        assert!(rendered.contains("t1[completed] -> t2[failed]"));
+        assert!(rendered.contains("recorded: failure.attribution seq 11"));
+        assert!(rendered.contains("advisory only"));
+        assert!(!rendered.contains("SECRET"));
+        assert!(!rendered.contains("prompt"));
+
+        let history = json!({
+            "session_id": "ses-1",
+            "total": 1,
+            "truncated": false,
+            "attributions": [{
+                "event_seq": 11,
+                "recorded_at": "2026-11-13T00:00:00Z",
+                "attribution": {
+                    "reason_code": "cascade_upstream",
+                    "target": {"kind": "task", "id": "t2"},
+                    "earliest_node_id": "failure:task:t1:4",
+                    "earliest_seq": 4
+                }
+            }]
+        });
+        let rendered = diagnosis_lines(&history).unwrap().join("\n");
+        assert!(rendered.contains("cascade_upstream"));
+        assert!(rendered.contains("task:t2"));
     }
 }
 

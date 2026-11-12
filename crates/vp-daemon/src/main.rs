@@ -20,6 +20,9 @@ use tokio::sync::broadcast;
 use tracing::{info, warn};
 use vp_core::Engine;
 use vp_core::agent::AgentService;
+use vp_protocol::diagnosis::{
+    SessionAttributionsParams, SessionDiagnosisParams, SessionDiagnosisRecordParams,
+};
 use vp_protocol::discovery::Discovery;
 use vp_protocol::lsp::LspStatusParams;
 use vp_protocol::otel::{
@@ -3755,6 +3758,29 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 Err(response) => response_with_id(id, response),
             }
         }
+        "session.diagnosis" => match parse_params::<SessionDiagnosisParams>(request.params) {
+            Ok(params) => match state.engine.session_diagnosis(params).await {
+                Ok(report) => RpcResponse::success(id, report),
+                Err(error) => diagnosis_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.diagnosis.record" => {
+            match parse_params::<SessionDiagnosisRecordParams>(request.params) {
+                Ok(params) => match state.engine.record_session_diagnosis(params).await {
+                    Ok(report) => RpcResponse::success(id, report),
+                    Err(error) => diagnosis_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "session.attributions" => match parse_params::<SessionAttributionsParams>(request.params) {
+            Ok(params) => match state.engine.session_attributions(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => diagnosis_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
         "plan.migrate" => match parse_params::<PlanMigrateParams>(request.params) {
             Ok(params) => match state.engine.migrate_plan(params).await {
                 Ok(result) => RpcResponse::success(id, result),
@@ -5732,6 +5758,22 @@ fn runtime_pin_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
     internal_error(id, error)
 }
 
+/// Diagnosis failures use the Q3 `{code,message,retryable,hint}` shape. They
+/// never include prompt text, tool output, command text, or secrets.
+fn diagnosis_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
+    if let Some(diagnosis) = error.downcast_ref::<vp_core::diagnosis::DiagnosisError>() {
+        let rpc_code = match diagnosis.code {
+            vp_core::diagnosis::codes::DIAGNOSIS_SESSION_NOT_FOUND => codes::NOT_FOUND,
+            _ => codes::INVALID_PARAMS,
+        };
+        return RpcResponse::error(
+            id,
+            RpcError::with_data(rpc_code, diagnosis.to_string(), diagnosis.data()),
+        );
+    }
+    internal_error(id, error)
+}
+
 /// OTel export failures carry a stable `OTEL_*` code and bounded data. They
 /// never include a collector credential or session content.
 fn otel_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
@@ -7385,6 +7427,45 @@ mod runtime_pin_rpc_tests {
         assert_eq!(data["retryable"], false);
         assert!(!data.to_string().contains("api_key"));
         assert!(!data.to_string().contains("prompt"));
+    }
+
+    #[test]
+    fn diagnosis_params_decode_and_typed_errors_expose_no_content() {
+        let params = parse_params::<SessionDiagnosisParams>(json!({
+            "session_id": "ses-1",
+            "target_task_id": "t2",
+            "limit": 500,
+            "include_graph": true
+        }))
+        .unwrap();
+        assert_eq!(params.session_id, "ses-1");
+        assert_eq!(params.target_task_id.as_deref(), Some("t2"));
+        assert_eq!(params.limit, Some(500));
+        assert!(params.include_graph);
+        let record = parse_params::<SessionDiagnosisRecordParams>(json!({
+            "session_id": "ses-1",
+            "target_task_id": "t2"
+        }))
+        .unwrap();
+        assert_eq!(record.target_task_id.as_deref(), Some("t2"));
+        let history = parse_params::<SessionAttributionsParams>(json!({
+            "session_id": "ses-1"
+        }))
+        .unwrap();
+        assert!(history.limit.is_none());
+
+        let error = vp_core::diagnosis::DiagnosisError::new(
+            vp_core::diagnosis::codes::DIAGNOSIS_SESSION_NOT_FOUND,
+            "session not found: ses-missing",
+        );
+        let response = diagnosis_error(Some(json!("id")), error.into());
+        let error = response.error.expect("error");
+        let data = error.data.expect("data");
+        assert_eq!(data["code"], "DIAGNOSIS_SESSION_NOT_FOUND");
+        assert_eq!(data["advisory"], true);
+        assert_eq!(data["retryable"], false);
+        assert!(!data.to_string().contains("prompt"));
+        assert!(!data.to_string().contains("output"));
     }
 
     #[test]

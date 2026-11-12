@@ -4,6 +4,7 @@
 //! envelope, discovery file, and domain DTOs without pulling in storage or
 //! runtime concerns.
 
+pub mod diagnosis;
 pub mod discovery;
 pub mod lsp;
 pub mod otel;

@@ -1219,6 +1219,43 @@ actor CoreClient {
             .decode(CompatibilityReportView.self)
     }
 
+    /// Read-only failure attribution and bounded provenance diagnosis. The
+    /// daemon owns the graph and earliest-claim decision; this method never
+    /// retries, cancels, merges, or reassigns anything.
+    func sessionDiagnosis(
+        sessionID: String,
+        targetTaskID: String? = nil,
+        limit: Int? = nil,
+        includeGraph: Bool = false
+    ) async throws -> SessionDiagnosisReport {
+        var params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "include_graph": .bool(includeGraph),
+            "record": .bool(false),
+        ]
+        if let targetTaskID {
+            params["target_task_id"] = .string(targetTaskID)
+        }
+        if let limit {
+            params["limit"] = .number(Double(limit))
+        }
+        return try await request(method: "session.diagnosis", params: params)
+            .decode(SessionDiagnosisReport.self)
+    }
+
+    /// Bounded ledger of explicitly recorded diagnosis snapshots.
+    func sessionAttributions(
+        sessionID: String,
+        limit: Int? = nil
+    ) async throws -> SessionAttributionsReport {
+        var params: [String: JSONValue] = ["session_id": .string(sessionID)]
+        if let limit {
+            params["limit"] = .number(Double(limit))
+        }
+        return try await request(method: "session.attributions", params: params)
+            .decode(SessionAttributionsReport.self)
+    }
+
     /// Explicit approval-classified plan migration. The daemon revalidates the
     /// stored plan; the client sends only the acknowledgement and reason.
     func migratePlan(

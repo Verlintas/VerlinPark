@@ -115,6 +115,7 @@ final class AppModel {
     var sessionEffects: SessionEffectsReport?
     var sessionGates: SessionGatesReport?
     var sessionCompatibility: CompatibilityReportView?
+    var sessionDiagnosis: SessionDiagnosisReport?
     var otelStatus: OtelStatusReport?
     var otelMessage: String?
     var otelBusy = false
@@ -3807,6 +3808,7 @@ final class AppModel {
             sessionEffects = nil
             sessionGates = nil
             sessionCompatibility = nil
+            sessionDiagnosis = nil
             otelStatus = nil
             governorStatus = nil
             governorStatusMessage = nil
@@ -3888,6 +3890,15 @@ final class AppModel {
         } catch {
             guard isCurrent(sessionID: sessionID, generation: generation) else { return }
             sessionCompatibility = nil
+        }
+
+        do {
+            let diagnosis = try await core.sessionDiagnosis(sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            sessionDiagnosis = diagnosis
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            sessionDiagnosis = nil
         }
 
         do {
