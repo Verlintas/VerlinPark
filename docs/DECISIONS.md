@@ -202,6 +202,7 @@
 | [0190](adr/0190-tool-bundle-partition-and-canonical-schemas.md) | Tool bundle partition and canonical schemas | Accepted | Runtime/Tooling |
 | [0191](adr/0191-cache-epochs-compaction-and-cross-session-reuse.md) | Cache epochs, late compaction policy, and cross-session reuse | Accepted | Runtime/Cache |
 | [0192](adr/0192-cache-telemetry-and-deepseek-benchmark.md) | Cache telemetry and DeepSeek benchmark | Accepted | Runtime/Observability |
+| [0193](adr/0193-task-contract-and-argument-level-intent.md) | TaskContract, argument-level intent authorization, and MCP schema pins | Accepted | Runtime/Security/Providers |
 
 ---
 

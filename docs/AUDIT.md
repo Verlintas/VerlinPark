@@ -18,6 +18,19 @@ Honest limits:
 - **No cross-host or distributed cache index.** `prompt_prefixes` is local SQLite for one daemon; there is no cross-host cache sharing, automatic warm, or cache-hit exactly-once claim.
 - **Benchmark controls.** Live mode is never default and requires `--live --allow-live` plus an environment key; the simulator rejects >400k stable prefixes to prevent ratio manufacturing. The 99.84% stretch is reported honestly when not met.
 
+## 0.3 2026-11-12 Contracted execution C1
+
+C1 is implemented and merged at `2647e67` (ADR-0193): trusted `TaskContract` derivation, `ContractPolicy` (`advisory|enforce`), argument-level `authorize()` before the approval broker, `session/contract` head section, `contract.derived`/`intent.decision`/`intent.mutation` events, and project-scoped MCP schema/description/server pins with TOFU, drift, approve/reject. Rust 3,418 passed; Swift 483 passed; clippy/swiftformat/xcodebuild passed.
+
+Limits:
+
+- Shell analysis is bounded/syntactic, not a shell parser; it escalates obvious contradictions but does not prove arbitrary commands safe.
+- Read-only path access is not restricted by `write_scope`; the existing path jail and role policy still apply.
+- MCP pins detect advertised schema/description/server changes, not malicious runtime behavior behind an unchanged schema.
+- Internal Manager repair/integration runs with `auto_approve` are contract-exempt; sandbox, write-scope, Verifier, and Integrator gates still apply.
+- C1 does not add C2 effect receipts, so `git push`, PR/MR creation, remote writes, deploys, and webhooks still lack settled/unknown receipts. That is the next gap.
+- Contract policy defaults to `enforce`; out-of-contract path/URL/shell/MCP calls escalate rather than silently passing. Teams that need observation first can set `advisory`.
+
 ## 0. 2026-10-30 跟进
 
 第一轮硬化已完成（同一 `main` 线，提交见仓库历史）：

@@ -484,7 +484,24 @@ should wait until the identity/role contracts and Worker workspace phases
 
 ---
 
-## 9. References
+## 9. Implementation progress
+
+| Task | Status | Evidence |
+|---|---|---|
+| C1 TaskContract + intent + MCP pins | **implemented** | `2647e67`, ADR-0193, 3,418 Rust / 483 Swift tests |
+| C2 EffectReceipts | planned | next |
+| C3 Durable external gates | planned | |
+| C4 Version pinning + controller replay | planned | |
+| C5 Reliability + OTel | planned | |
+| C6 Failure attribution | planned | |
+| C7 Bounded fan-out | planned | |
+| C8 Tool search v2 + delta snapshots | planned | |
+| C9 MCP tasks/elicitation | planned | |
+| C10 Code Mode | planned | |
+| C11 A2A loopback | planned | |
+| C12 Advisory progress ledger | planned | |
+
+## 10. References
 
 - Anthropic, [Introducing advanced tool use](https://www.anthropic.com/research/advanced-tool-use), 2025-11-24.
 - Anthropic, [Code execution with MCP](https://www.anthropic.com/engineering/code-execution-with-mcp), 2025-11-04.

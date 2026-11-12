@@ -1,7 +1,7 @@
 # VerlinPark 进度
 
 > 最后更新：2026-11-12
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark + task contracts/intent authorization/MCP schema pins 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
@@ -55,6 +55,52 @@
 - 确定性 simulator：200k 上下文 / 50 turns **99.7081%**；200k / 100 turns **99.8099%**；420k / 100 turns **99.9077%**（stretch 达标）。默认 200k/50 turns 低于 99.84，因为首轮 20k uncached context 被 50 轮摊薄；这不是用 filler 刷分，benchmark 会拒绝 >400k stable prefix 的“prefix-size-driven ratio”。
 - 当前环境没有 `DEEPSEEK_API_KEY` / `VERLINPARK_LIVE_API_KEY`，因此 **live provider benchmark 未运行**；报告中的 provider-reported 数字仍是旧的 89.61%/90.31%，不能当作 L1–L5 后的实测结果。
 - 缓存命中由 provider 管理，epoch/append-only 只证明我们的字节连续性；cache reads 仍计费；simulator 不是 vendor tokenizer；没有跨主机 cache 共享、自动 warm 或 provider TTL 推断。详见 [AUDIT.md](AUDIT.md) 与 ADR-0188–0192。
+
+---
+
+## 2026-11-12 Contracted execution C1: task contracts, intent authorization, MCP pins
+
+第九轮 Contracted Execution 的 C1 已实现并合入 `2647e67`，ADR-0193。Rust **3,418 passed / 0 failed / 6 ignored**，Swift **483 passed**（351 app + 132 helper），`cargo clippy -D warnings`、`swiftformat --lint`、`xcodebuild test` 通过。
+
+### TaskContract + ContractPolicy
+
+- `vp-core::contract` 从**可信输入**派生 canonical `TaskContract`：Leader 写入的 PlanTask `write_scope`/`acceptance`/`kind`/`profile`、session goal、项目 `ContractPolicy`；不读取 tool output、retrieved content 或模型 prose。
+- `ContractPolicy`：`enabled`（默认 true）、`advisory|enforce`（默认 enforce）、`enforce_shell`、`forbidden_paths`、`egress_allowlist`、可选 `max_writes/max_bytes/max_commits`；SQLite + project manifest + `db-rebuild`。
+- 空 `write_scope` 归一为 `["."]` + `unrestricted_scope`，仍保持“独占运行”的 barrier 语义；绝对路径、`..`、可解析 symlink escape 会 escalate；forbidden path deny。
+- `contracts`/`contract_usage` + `contract.derived`/`intent.decision`/`intent.mutation` 事件；latest contract lookup、replay/repair/db-rebuild 覆盖。
+
+### 参数级 intent authorization
+
+- `authorize(call, contract, policy)` 在现有 approval broker **之前**执行：
+  - role/tool 不在 contract → `Deny` `CONTRACT_TOOL_DENIED`；
+  - path 参数越界 → `Escalate` `CONTRACT_PATH_VIOLATION`；
+  - URL/egress 越界 → `Escalate`，`ShellPolicy.network=deny` → `Deny`；
+  - shell obvious mutation / `git push` / `sudo` / `rm -rf` / remote → bounded syntactic 检查；默认 advisory，`enforce_shell` 时 escalate；
+  - generic MCP call 的 pin 未批准 → `Escalate` `CONTRACT_MCP_UNTRUSTED`；
+  - 无法解析 → `Escalate` `CONTRACT_AMBIGUOUS`。
+- path/egress/shell/MCP/ambiguous 映射 `HostState`，destructive 保持 `Destructive`；Destructive/HostState/remote/MCP/sensitive GUI/unknown 永不自动批准；Deny 永远优先。
+- Advisory 模式记录 raw/enforced outcome 但不阻塞；Enforce 模式才真正提示/拒绝。
+- 内部 Manager repair/integration 的 `auto_approve` run 为 contract-exempt，但 sandbox、write-scope、Verifier、Integrator 仍生效。
+
+### MCP schema pins
+
+- `mcp_tool_pins` + `vp-core::mcp_pins`：项目级 `(server, tool)` 的 schema/description/server-fingerprint digest。
+- 首次同步 TOFU 自动 pin；后续新工具 `unverified`；schema/description/server fingerprint 变化 → `drift`，不覆盖已批准 hash；移除工具 `removed` informational。
+- `mcp.tool.pinned/unverified/drift/removed/approved/rejected` 事件，bounded diff，无 env/header/secret。
+- 未批准工具不出现在 advertised/executable dynamic bindings；`tool_search` 显示 `trust` 且 `callable=false`；approve 需 expected observed hashes。
+
+### Prompt / cache / surfaces
+
+- `InstructionSectionKey::SessionContract` ordinal **55**，`session/contract` **head** section（不是 tail；compaction 不会丢，ADR-0193 记录该偏离）。
+- capsule 8 KiB，确定性、无 secret；`context.prompt_prefix` 记录 `contract_hash`/`contract_chars`/`contract_capsule`/`contract_policy_enabled`；`context.compacted` 记录 contract identity；cache audit 增加 `contract_capsule_missing`。
+- RPC：`session.contract`、`project.contract_policy.get/set`、`project.mcp_pins`、`mcp.pin.approve/reject`；CLI：`vp contract`、`vp contract-policy*`、`vp mcp-pins*`；Swift Stage/cache inspector 显示 bounded metadata。
+
+### 限制
+
+- shell 检查是 bounded/syntactic，不是 shell parser；不证明任意命令安全。
+- read-only path access 不受 `write_scope` 限制；现有 path jail/role policy 仍生效。
+- MCP pin 只检测 advertised schema/description 变化，不检测 schema 不变时的恶意运行时行为。
+- 没有 C2 effect receipts、C3 durable gates、C4 version pinning 或 S1–S8 identities；这些仍按计划分阶段。
 
 ---
 
