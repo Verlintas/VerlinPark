@@ -12921,6 +12921,82 @@ fn continuation_test_plan() -> TeamPlan {
 }
 
 #[tokio::test]
+async fn resume_plan_fails_closed_on_incompatible_runtime_snapshot() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "pin".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let plan = continuation_test_plan();
+    engine.set_team_plan(&session.id, &plan).await.unwrap();
+    let mut rewritten = plan;
+    rewritten.tasks[0].write_scope = vec!["src/other".into()];
+    engine
+        .store()
+        .set_team_plan(&session.id, &serde_json::to_string(&rewritten).unwrap())
+        .unwrap();
+    let error = service.resume_plan(&session.id).await.unwrap_err();
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("RUNTIME_INCOMPATIBLE"), "{rendered}");
+    let events = engine.all_events(&session.id).await.unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "agent.plan_resume_queued")
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == crate::runtime_pin::PLAN_MIGRATED_EVENT)
+    );
+}
+
+#[tokio::test]
+async fn resume_plan_records_visible_drift_before_other_checks() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "drift".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    engine
+        .set_team_plan(&session.id, &continuation_test_plan())
+        .await
+        .unwrap();
+    engine.skip_plan_task(&session.id, "T1").await.unwrap();
+    let mut policy = engine
+        .orchestration_policy(&session.project_id)
+        .await
+        .unwrap();
+    policy.max_attempts = policy.max_attempts.saturating_add(1);
+    engine
+        .set_orchestration_policy(&session.project_id, &policy)
+        .await
+        .unwrap();
+    let error = service.resume_plan(&session.id).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("already complete"),
+        "{error:#}"
+    );
+    let events = engine.all_events(&session.id).await.unwrap();
+    let drift = events
+        .iter()
+        .find(|event| event.kind == crate::runtime_pin::COMPATIBILITY_DRIFT_EVENT)
+        .expect("drift event");
+    assert_eq!(drift.payload["status"], "drift");
+    assert_eq!(drift.payload["target"], "plan");
+}
+
+#[tokio::test]
 async fn deferred_continuation_waits_for_active_session_and_delivers_once() {
     let dir = TempDir::new().unwrap();
     let (engine, service, project) = test_service(&dir);

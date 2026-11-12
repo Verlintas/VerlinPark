@@ -96,6 +96,15 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
             })?;
             store.set_effect_policy(&snapshot.project.id, &effect_policy)?;
             store.set_gate_policy(&snapshot.project.id, &snapshot.gate_policy)?;
+            for policy_snapshot in &snapshot.policy_snapshots {
+                if policy_snapshot.project_id != snapshot.project.id {
+                    anyhow::bail!(
+                        "policy snapshot {} belongs to another project in the manifest",
+                        policy_snapshot.hash
+                    );
+                }
+                store.insert_policy_snapshot_snapshot(policy_snapshot)?;
+            }
             store.replace_mcp_tool_pins(&snapshot.project.id, &snapshot.mcp_tool_pins)?;
             store.set_cache_policy(&snapshot.project.id, &snapshot.cache_policy)?;
             store.set_execution_host(&snapshot.project.id, &snapshot.execution_host)?;
@@ -1143,5 +1152,99 @@ mod effect_rebuild_tests {
             .await
             .unwrap();
         assert_eq!(effects.counts.done, 1);
+    }
+}
+
+#[cfg(test)]
+mod runtime_pin_rebuild_tests {
+    use super::*;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn init_repo(path: &std::path::Path) {
+        std::fs::write(path.join("README.md"), "hello\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@verlinpark.local"],
+            vec!["config", "user.name", "VerlinPark Test"],
+            vec!["add", "."],
+            vec!["commit", "-q", "-m", "initial"],
+        ] {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+    }
+
+    #[tokio::test]
+    async fn rebuild_restores_policy_snapshots_and_plan_runtime_identity() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let plan = vp_protocol::types::TeamPlan {
+            goal: "runtime pin rebuild".to_string(),
+            departments: vec![vp_protocol::types::PlanDepartment {
+                name: "impl".to_string(),
+                manager_title: "Implementation".to_string(),
+                profile: "coding".to_string(),
+                objective: "build".to_string(),
+                token_budget: None,
+                cost_budget_usd: None,
+            }],
+            tasks: vec![vp_protocol::types::PlanTask {
+                id: "T1".to_string(),
+                department: "impl".to_string(),
+                title: "T1".to_string(),
+                kind: "coding".to_string(),
+                priority: 0,
+                profile: Some("coding".to_string()),
+                deps: Vec::new(),
+                write_scope: vec!["src/T1.rs".to_string()],
+                acceptance: vec!["done".to_string()],
+                token_budget: None,
+                cost_budget_usd: None,
+            }],
+        };
+        let (project_id, session_id, policy_hash) = {
+            let engine = Engine::new(Store::open(data.path()).unwrap());
+            let project = engine
+                .add_project(
+                    repo.path().to_string_lossy().to_string(),
+                    Some("pin rebuild".into()),
+                )
+                .await
+                .unwrap();
+            let session = engine
+                .create_session(project.id.clone(), "pin rebuild".into(), None)
+                .await
+                .unwrap();
+            engine.set_team_plan(&session.id, &plan).await.unwrap();
+            let snapshot = engine
+                .store()
+                .get_plan_runtime_snapshot(&session.id)
+                .unwrap()
+                .expect("plan snapshot");
+            let snapshot = crate::runtime_pin::parse_snapshot(&snapshot).unwrap();
+            engine.record_project_manifest().await.unwrap();
+            (project.id, session.id, snapshot.policy_hash)
+        };
+
+        let report = rebuild_database(data.path(), false).await.unwrap();
+        assert_eq!(report.sessions, 1, "{:?}", report.skipped);
+        let store = Store::open(data.path()).unwrap();
+        let policy = store
+            .get_policy_snapshot(&project_id, &policy_hash)
+            .unwrap()
+            .expect("policy snapshot restored");
+        assert!(policy.json.contains("\"version\""));
+        let plan_snapshot = store
+            .get_plan_runtime_snapshot(&session_id)
+            .unwrap()
+            .expect("plan runtime snapshot restored from events");
+        assert!(crate::runtime_pin::parse_snapshot(&plan_snapshot).is_some());
     }
 }

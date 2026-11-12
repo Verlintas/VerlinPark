@@ -26,6 +26,9 @@ struct EfficiencyCard: View {
                 if let gates = model.sessionGates, gates.counts.total > 0 {
                     GateListSection(report: gates)
                 }
+                if let compatibility = model.sessionCompatibility {
+                    RuntimeCompatibilitySection(report: compatibility)
+                }
                 CacheCallTable(
                     calls: model.cacheCallRows,
                     truncated: model.sessionCacheCallsTruncated

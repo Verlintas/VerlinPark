@@ -149,6 +149,7 @@ pub mod remote_bootstrap;
 pub mod remote_integration;
 pub mod remote_test;
 pub mod run_journal;
+pub mod runtime_pin;
 pub mod scaling;
 pub mod scheduler;
 mod session_graph;
@@ -203,6 +204,8 @@ struct ReplayData {
     contracts: Vec<StoredContractRow>,
     contract_usage: Vec<ContractUsageRow>,
     effects: Vec<EffectReceipt>,
+    policy_snapshots: Vec<vp_protocol::runtime::PolicySnapshot>,
+    plan_runtime_snapshot: Option<String>,
     prompt_prefix_observations: Vec<PromptPrefixObservation>,
     prompt_prefix_aggregates: Vec<PromptPrefixAggregate>,
     prompt_prefix_inconsistent_epochs: Vec<String>,
@@ -7017,6 +7020,8 @@ impl Engine {
         crate::orchestration::ensure_revision_safe(&current, &plan, &statuses)?;
         let diff = crate::orchestration::diff_plan(&current, &plan);
         let revision = current_revision.saturating_add(1);
+        let snapshot = self.pin_plan_snapshot(&session, &plan, revision).await?;
+        let snapshot_json = serde_json::to_string(&snapshot)?;
         let payload = serde_json::json!({
             "plan": plan,
             "revision": revision,
@@ -7026,6 +7031,7 @@ impl Engine {
             "added": diff.added,
             "removed": diff.removed,
             "changed": diff.changed,
+            "runtime_snapshot": snapshot,
         });
         let plan_json = serde_json::to_string(&plan)?;
         let event = tokio::task::spawn_blocking({
@@ -7033,12 +7039,14 @@ impl Engine {
             let session_id = session_id.clone();
             let plan_json = plan_json.clone();
             let payload = payload.clone();
+            let snapshot_json = snapshot_json.clone();
             move || {
-                store.set_team_plan_revision_with_event(
+                store.set_team_plan_revision_with_runtime_snapshot_and_event(
                     &session_id,
                     &plan_json,
                     "team_plan.revised",
                     payload,
+                    Some(&snapshot_json),
                 )
             }
         })
@@ -7295,6 +7303,16 @@ impl Engine {
         let store = self.store.clone();
         let session_id = session_id.to_string();
         tokio::task::spawn_blocking(move || store.list_all_events(&session_id)).await?
+    }
+
+    /// Read-only controller replay. This never calls a provider, executes a
+    /// tool, appends an event, or mutates a projection.
+    pub async fn replay_orchestration(
+        &self,
+        session_id: &str,
+        limit: Option<u32>,
+    ) -> Result<vp_protocol::replay::ControllerReplayReport> {
+        crate::orchestration::replay::replay_orchestration(self, session_id, limit).await
     }
 
     pub async fn orchestration_snapshot(&self, session_id: &str) -> Result<OrchestrationSnapshot> {
@@ -7867,8 +7885,22 @@ impl Engine {
         let store = self.store.clone();
         let id = session_id.to_string();
         let json = serde_json::to_string(plan)?;
-        let event = tokio::task::spawn_blocking(move || store.set_team_plan_with_event(&id, &json))
-            .await??;
+        let loaded = {
+            let store = store.clone();
+            let id = id.clone();
+            tokio::task::spawn_blocking(move || store.get_session(&id)).await??
+        }
+        .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+        let revision = self
+            .current_plan_revision(session_id)
+            .await?
+            .saturating_add(1);
+        let snapshot = self.pin_plan_snapshot(&loaded, plan, revision).await?;
+        let snapshot_json = serde_json::to_string(&snapshot)?;
+        let event = tokio::task::spawn_blocking(move || {
+            store.set_team_plan_with_runtime_snapshot_and_event(&id, &json, Some(&snapshot_json))
+        })
+        .await??;
         let _ = self.events.send(event);
         let store = self.store.clone();
         let id = session_id.to_string();
@@ -14512,6 +14544,8 @@ impl Engine {
             let contracts = store.list_contracts_for_session(&id)?;
             let contract_usage = store.list_contract_usage_for_session(&id)?;
             let effects = store.list_effect_receipts(&id, None, true, 500)?;
+            let policy_snapshots = store.list_policy_snapshots(&session.project_id, 10_000)?;
+            let plan_runtime_snapshot = store.get_plan_runtime_snapshot(&id)?;
             let prompt_prefix_observations =
                 store.list_prompt_prefix_observations(&session.project_id, &id)?;
             let prompt_prefix_aggregates =
@@ -14556,6 +14590,8 @@ impl Engine {
                 contracts,
                 contract_usage,
                 effects,
+                policy_snapshots,
+                plan_runtime_snapshot,
                 prompt_prefix_observations,
                 prompt_prefix_aggregates,
                 prompt_prefix_inconsistent_epochs,
@@ -15824,8 +15860,19 @@ impl Engine {
             .events
             .iter()
             .rev()
-            .find(|event| event.kind == "team_plan.submitted")
-            .map(|event| event.payload.clone());
+            .find(|event| {
+                matches!(
+                    event.kind.as_str(),
+                    "team_plan.submitted" | "team_plan.revised"
+                )
+            })
+            .map(|event| {
+                let mut payload = event.payload.clone();
+                if let Some(object) = payload.as_object_mut() {
+                    object.remove("runtime_snapshot");
+                }
+                payload
+            });
         let projected_plan = data
             .plan
             .as_deref()
@@ -15971,6 +16018,45 @@ impl Engine {
             }
         };
 
+        let expected_policy = crate::runtime_pin::policy_snapshots_from_events(&data.events);
+        let mut referenced_policy_hashes = expected_policy
+            .iter()
+            .map(|row| row.hash.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        if let Some(raw) = &data.plan_runtime_snapshot
+            && let Some(snapshot) = crate::runtime_pin::parse_snapshot(raw)
+            && !snapshot.policy_hash.is_empty()
+        {
+            referenced_policy_hashes.insert(snapshot.policy_hash);
+        }
+        for run in &data.runs {
+            if let Some(snapshot) = &run.runtime_snapshot
+                && !snapshot.policy_hash.is_empty()
+            {
+                referenced_policy_hashes.insert(snapshot.policy_hash.clone());
+            }
+        }
+        let projected_policy = data
+            .policy_snapshots
+            .iter()
+            .map(|row| (row.hash.clone(), row.json.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let policy_snapshots_match = expected_policy.iter().all(|row| {
+            projected_policy
+                .get(&row.hash)
+                .is_some_and(|json| json == &row.json)
+        }) && referenced_policy_hashes
+            .iter()
+            .all(|hash| projected_policy.contains_key(hash));
+        if !policy_snapshots_match {
+            mismatches.push(format!(
+                "policy snapshots: projection={}, replay={}, referenced={}",
+                data.policy_snapshots.len(),
+                expected_policy.len(),
+                referenced_policy_hashes.len()
+            ));
+        }
+
         let consistent = status_matches
             && prompt_layout_matches
             && instructions_match
@@ -16004,7 +16090,8 @@ impl Engine {
             && processes_match
             && remote_test_evidence_matches
             && contracts_match
-            && effects_match;
+            && effects_match
+            && policy_snapshots_match;
         Ok(SessionReplayReport {
             session_id: data.session.id.clone(),
             event_count: data.events.len(),
@@ -16038,6 +16125,7 @@ impl Engine {
             remote_test_evidence_matches,
             contracts_match,
             effects_match,
+            policy_snapshots_match,
             consistent,
             repaired,
             rebuilt: false,
@@ -16072,14 +16160,21 @@ impl Engine {
                 )
             });
 
-        let plan_event = data
-            .events
-            .iter()
-            .rev()
-            .find(|event| event.kind == "team_plan.submitted");
+        let plan_event = data.events.iter().rev().find(|event| {
+            matches!(
+                event.kind.as_str(),
+                "team_plan.submitted" | "team_plan.revised"
+            )
+        });
         let replace_plan = plan_event.is_some() || data.plan.is_none();
         let plan = plan_event
-            .map(|event| serde_json::to_string(&event.payload))
+            .map(|event| {
+                let mut payload = event.payload.clone();
+                if let Some(object) = payload.as_object_mut() {
+                    object.remove("runtime_snapshot");
+                }
+                serde_json::to_string(&payload).map_err(anyhow::Error::from)
+            })
             .transpose()?
             .or_else(|| data.plan.clone());
 
@@ -16831,6 +16926,45 @@ impl Engine {
             Ok::<_, anyhow::Error>(blobs)
         })
         .await??;
+        let policy_store = store.clone();
+        let policy_project = data.session.project_id.clone();
+        let policy_session = data.session.id.clone();
+        let mut policy_hashes = data
+            .events
+            .iter()
+            .filter(|event| event.kind == crate::runtime_pin::POLICY_SNAPSHOT_EVENT)
+            .filter_map(|event| {
+                event
+                    .payload
+                    .get("hash")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        for run in &data.runs {
+            if let Some(snapshot) = &run.runtime_snapshot
+                && !snapshot.policy_hash.is_empty()
+            {
+                policy_hashes.insert(snapshot.policy_hash.clone());
+            }
+        }
+        let policy_snapshots = tokio::task::spawn_blocking(move || {
+            let mut policy_hashes = policy_hashes;
+            if let Some(raw) = policy_store.get_plan_runtime_snapshot(&policy_session)?
+                && let Some(snapshot) = crate::runtime_pin::parse_snapshot(&raw)
+                && !snapshot.policy_hash.is_empty()
+            {
+                policy_hashes.insert(snapshot.policy_hash);
+            }
+            let mut rows = Vec::new();
+            for hash in policy_hashes {
+                if let Some(row) = policy_store.get_policy_snapshot(&policy_project, &hash)? {
+                    rows.push(row);
+                }
+            }
+            Ok::<_, anyhow::Error>(rows)
+        })
+        .await??;
         Ok(SessionBundle {
             version: 1,
             exported_at: vp_protocol::now_rfc3339(),
@@ -16853,6 +16987,7 @@ impl Engine {
             steering: data.steering,
             continuations: data.continuations,
             gates: data.gates,
+            policy_snapshots,
             recoveries: data.recoveries,
             programs,
             program_milestones,
@@ -16873,6 +17008,8 @@ impl Engine {
     pub async fn rebuild_session(&self, session_id: &str) -> Result<SessionReplayReport> {
         ensure_session_not_active(&self.store, session_id, "rebuild a session").await?;
         let data = self.load_replay_data(session_id).await?;
+        self.restore_policy_snapshots_from_events(&data.events)
+            .await?;
         let repair = Self::build_session_repair(&data)?;
         for warning in &repair.artifact_warnings {
             tracing::warn!(session_id, %warning, "artifact replay warning");
@@ -17121,9 +17258,29 @@ impl Engine {
         Self::replay_report(&data, false)
     }
 
+    /// Rebuild the immutable policy projection from `policy.snapshot` events.
+    /// Rows are content-addressed and idempotent; a malformed row fails closed.
+    async fn restore_policy_snapshots_from_events(&self, events: &[Event]) -> Result<()> {
+        let rows = crate::runtime_pin::policy_snapshots_from_events(events);
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            for row in &rows {
+                store.insert_policy_snapshot_snapshot(row)?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        Ok(())
+    }
+
     pub async fn repair_session(&self, session_id: &str) -> Result<SessionReplayReport> {
         ensure_session_not_active(&self.store, session_id, "repair a session").await?;
         let data = self.load_replay_data(session_id).await?;
+        self.restore_policy_snapshots_from_events(&data.events)
+            .await?;
         let report = Self::replay_report(&data, false)?;
         if report.consistent {
             return Ok(report);

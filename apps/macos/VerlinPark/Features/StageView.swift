@@ -912,6 +912,12 @@ private struct ContextPopoverView: View {
                     GateBadge(report: gates)
                 }
 
+                if let compatibility = model.sessionCompatibility,
+                   compatibility.status != "compatible"
+                {
+                    RuntimeCompatibilityBadge(report: compatibility)
+                }
+
                 if let instructions = model.sessionInstructions {
                     InstructionSectionsView(
                         report: instructions,

@@ -566,7 +566,7 @@ fn task_scheduler_cooldown_default() -> u64 {
         .clamp(1, 86_400)
 }
 
-fn task_aging() -> Duration {
+pub(crate) fn task_aging() -> Duration {
     let seconds = env::var("VERLINPARK_PRIORITY_AGING_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -579,7 +579,7 @@ fn task_aging() -> Duration {
     }
 }
 
-fn is_retryable_status(status: &str) -> bool {
+pub(crate) fn is_retryable_status(status: &str) -> bool {
     matches!(
         status,
         "pending" | "interrupted" | "failed" | "blocked" | "cancelled"
@@ -612,7 +612,7 @@ fn intake_effective_priority(task: &IntakeTask, now: OffsetDateTime, aging: Dura
     base + (age / aging.as_secs().max(1) as i64).min(100)
 }
 
-fn task_effective_priority(
+pub(crate) fn task_effective_priority(
     session_priority: i32,
     task: &ScheduledTask,
     now: OffsetDateTime,

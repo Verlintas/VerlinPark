@@ -6739,6 +6739,26 @@ impl AgentService {
                 session.project_id
             );
         }
+        let compatibility = self
+            .engine
+            .run_compatibility(session_id, &run.run_id)
+            .await?;
+        if compatibility.status == vp_protocol::runtime::CompatibilityStatus::Incompatible {
+            return Err(crate::runtime_pin::RuntimePinError::new(
+                crate::runtime_pin::codes::RUNTIME_INCOMPATIBLE,
+                format!(
+                    "run runtime identity is incompatible with the stored snapshot: {}",
+                    compatibility.warnings.join("; ")
+                ),
+            )
+            .with_report(compatibility)
+            .into());
+        }
+        if compatibility.status == vp_protocol::runtime::CompatibilityStatus::Drift {
+            self.engine
+                .record_compatibility_drift(&compatibility)
+                .await?;
+        }
         let model = model_for(&config, AgentRole::Leader);
         let plan = crate::run_journal::preflight(
             &self.engine,
@@ -9251,6 +9271,23 @@ impl AgentService {
         let Some(plan) = self.engine.get_team_plan(session_id).await? else {
             anyhow::bail!("session has no TeamPlan");
         };
+        let compatibility = self.engine.plan_compatibility(session_id).await?;
+        if compatibility.status == vp_protocol::runtime::CompatibilityStatus::Incompatible {
+            return Err(crate::runtime_pin::RuntimePinError::new(
+                crate::runtime_pin::codes::RUNTIME_INCOMPATIBLE,
+                format!(
+                    "plan runtime identity is incompatible with the stored snapshot: {}",
+                    compatibility.warnings.join("; ")
+                ),
+            )
+            .with_report(compatibility)
+            .into());
+        }
+        if compatibility.status == vp_protocol::runtime::CompatibilityStatus::Drift {
+            self.engine
+                .record_compatibility_drift(&compatibility)
+                .await?;
+        }
         let (_, scheduled) = self.engine.scheduler().sync_plan(&session, &plan).await?;
         let mut terminal = scheduled
             .iter()

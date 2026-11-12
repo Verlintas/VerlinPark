@@ -30,7 +30,9 @@ use vp_protocol::remote::{
     RemoteTestPolicyParams, RemoteTestStatusParams, RemoteWorktreeListParams,
     SetRemoteIntegrationPolicyParams, SetRemoteTestPolicyParams,
 };
+use vp_protocol::replay::ControllerReplayParams;
 use vp_protocol::rpc::{RpcError, RpcNotification, RpcRequest, RpcResponse, codes};
+use vp_protocol::runtime::{PlanMigrateParams, SessionCompatibilityParams};
 use vp_protocol::scaling::{
     ScalingPolicyParams, ScalingPreviewParams, ScalingStatusParams, SetScalingPolicyParams,
 };
@@ -1295,6 +1297,17 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 Err(response) => response_with_id(id, response),
             }
         }
+        "orchestration.replay" => match parse_params::<ControllerReplayParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .replay_orchestration(&params.session_id, params.limit)
+                .await
+            {
+                Ok(report) => RpcResponse::success(id, report),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
         "orchestration.snapshot" => {
             match parse_params::<OrchestrationSnapshotParams>(request.params) {
                 Ok(params) => match state
@@ -3584,7 +3597,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                         started,
                     },
                 ),
-                Err(error) => internal_error(id, error),
+                Err(error) => runtime_pin_error(id, error),
             },
             Err(response) => response_with_id(id, response),
         },
@@ -3619,6 +3632,26 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             },
             Err(response) => response_with_id(id, response),
         },
+        "session.compatibility" => {
+            match parse_params::<SessionCompatibilityParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .session_compatibility(&params.session_id, params.run_id.as_deref())
+                    .await
+                {
+                    Ok(report) => RpcResponse::success(id, report),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "plan.migrate" => match parse_params::<PlanMigrateParams>(request.params) {
+            Ok(params) => match state.engine.migrate_plan(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => runtime_pin_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
         "session.run.resume" => match parse_params::<SessionRunResumeParams>(request.params) {
             Ok(params) => match state
                 .agent
@@ -3630,7 +3663,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 .await
             {
                 Ok(result) => RpcResponse::success(id, result),
-                Err(error) => internal_error(id, error),
+                Err(error) => runtime_pin_error(id, error),
             },
             Err(response) => response_with_id(id, response),
         },
@@ -5129,6 +5162,19 @@ fn response_with_id(id: Option<Value>, error: RpcError) -> RpcResponse {
 
 fn internal_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
     RpcResponse::error(id, RpcError::new(codes::INTERNAL_ERROR, error.to_string()))
+}
+
+/// Runtime pin/migration failures carry a stable Q3 code, retryability, hint,
+/// and the bounded compatibility report. The message already includes
+/// `error[CODE]`.
+fn runtime_pin_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
+    if let Some(pin) = error.downcast_ref::<vp_core::runtime_pin::RuntimePinError>() {
+        return RpcResponse::error(
+            id,
+            RpcError::with_data(codes::INTERNAL_ERROR, pin.to_string(), pin.data()),
+        );
+    }
+    internal_error(id, error)
 }
 
 /// Forge failures carry the Q3 `FORGE_*` code, retryability, hint, and safe
@@ -6680,5 +6726,61 @@ mod archive_media_rpc_tests {
             max_bytes: None,
             approved: false,
         };
+    }
+}
+
+#[cfg(test)]
+mod runtime_pin_rpc_tests {
+    use super::*;
+
+    #[test]
+    fn compatibility_and_replay_params_decode_with_defaults() {
+        let compatibility = parse_params::<SessionCompatibilityParams>(json!({
+            "session_id": "ses-1"
+        }))
+        .unwrap();
+        assert_eq!(compatibility.session_id, "ses-1");
+        assert!(compatibility.run_id.is_none());
+
+        let migrate = parse_params::<PlanMigrateParams>(json!({
+            "session_id": "ses-1"
+        }))
+        .unwrap();
+        assert!(!migrate.approved);
+        assert!(migrate.expected_revision.is_none());
+
+        let replay = parse_params::<ControllerReplayParams>(json!({
+            "session_id": "ses-1"
+        }))
+        .unwrap();
+        assert!(replay.limit.is_none());
+    }
+
+    #[test]
+    fn runtime_pin_errors_expose_q3_data_without_secrets() {
+        let report = vp_protocol::runtime::CompatibilityReport {
+            status: vp_protocol::runtime::CompatibilityStatus::Incompatible,
+            target: "plan".to_string(),
+            session_id: "ses-1".to_string(),
+            plan_revision: 2,
+            warnings: vec!["contract_changed".to_string()],
+            migration_required: true,
+            ..Default::default()
+        };
+        let error = anyhow::Error::new(
+            vp_core::runtime_pin::RuntimePinError::new(
+                vp_core::runtime_pin::codes::RUNTIME_INCOMPATIBLE,
+                "plan changed",
+            )
+            .with_report(report),
+        );
+        let response = runtime_pin_error(Some(json!("id")), error);
+        let error = response.error.expect("error");
+        assert!(error.message.contains("RUNTIME_INCOMPATIBLE"));
+        let data = error.data.expect("data");
+        assert_eq!(data["code"], "RUNTIME_INCOMPATIBLE");
+        assert_eq!(data["retryable"], false);
+        assert_eq!(data["compatibility"]["status"], "incompatible");
+        assert!(!data.to_string().contains("api_key"));
     }
 }

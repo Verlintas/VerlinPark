@@ -323,6 +323,66 @@ impl ScalingObservation {
     }
 }
 
+/// Capture the exact deterministic inputs for `orchestration.replay`.
+/// Times are RFC3339 strings; task observations and policy are already public
+/// wire types. Nothing here reads prompt text or provider output.
+pub(crate) fn replay_inputs(
+    policy: &ScalingPolicy,
+    observation: &ScalingObservation,
+) -> Option<serde_json::Value> {
+    let inputs = vp_protocol::scaling::ScalingReplayInputs {
+        policy: policy.clone(),
+        session_status: observation.session_status.clone(),
+        plan_revision: observation.plan_revision,
+        tasks: observation.tasks.clone(),
+        current_workers: observation.current_workers as u32,
+        current_labour: observation.current_labour as u32,
+        active_workers: observation.active_workers as u32,
+        active_labour: observation.active_labour as u32,
+        global_worker_available: observation.global_worker_available as u32,
+        global_labour_available: observation.global_labour_available as u32,
+        budget_headroom_ratio: observation.budget_headroom_ratio,
+        last_action_at: observation.last_action_at.map(format_time),
+        last_plan_revision: observation.last_plan_revision,
+        idle_since_workers: observation.idle_since_workers.map(format_time),
+        idle_since_labour: observation.idle_since_labour.map(format_time),
+        now: format_time(observation.now),
+        hard_worker_cap: observation.hard_worker_cap as u32,
+        hard_labour_cap: observation.hard_labour_cap as u32,
+    };
+    serde_json::to_value(inputs).ok()
+}
+
+pub(crate) fn observation_from_replay_inputs(
+    inputs: &vp_protocol::scaling::ScalingReplayInputs,
+) -> Option<ScalingObservation> {
+    fn parse(value: &str) -> Option<OffsetDateTime> {
+        OffsetDateTime::parse(value, &Rfc3339).ok()
+    }
+    let now = parse(&inputs.now)?;
+    Some(ScalingObservation {
+        session_id: String::new(),
+        project_id: String::new(),
+        session_status: inputs.session_status.clone(),
+        plan_revision: inputs.plan_revision,
+        tasks: inputs.tasks.clone(),
+        current_workers: inputs.current_workers as usize,
+        current_labour: inputs.current_labour as usize,
+        active_workers: inputs.active_workers as usize,
+        active_labour: inputs.active_labour as usize,
+        global_worker_available: inputs.global_worker_available as usize,
+        global_labour_available: inputs.global_labour_available as usize,
+        budget_headroom_ratio: inputs.budget_headroom_ratio,
+        last_action_at: inputs.last_action_at.as_deref().and_then(parse),
+        last_plan_revision: inputs.last_plan_revision,
+        idle_since_workers: inputs.idle_since_workers.as_deref().and_then(parse),
+        idle_since_labour: inputs.idle_since_labour.as_deref().and_then(parse),
+        now,
+        hard_worker_cap: inputs.hard_worker_cap as usize,
+        hard_labour_cap: inputs.hard_labour_cap as usize,
+    })
+}
+
 #[derive(Debug, Clone, Default)]
 struct PlanDemand {
     ready_tasks: usize,
@@ -368,6 +428,7 @@ pub fn evaluate(policy: &ScalingPolicy, observation: &ScalingObservation) -> Sca
         applied: false,
         idle_since_workers: None,
         idle_since_labour: None,
+        replay_inputs: None,
         created_at: format_time(observation.now),
     };
     let mut reasons = Vec::new();
@@ -1396,6 +1457,7 @@ pub(crate) async fn run_tick(
                 continue;
             }
             let mut decision = evaluate(&policy, &observation);
+            decision.replay_inputs = replay_inputs(&policy, &observation);
             decision.decision_key = format!(
                 "rev{}:policy{}:{}",
                 decision.plan_revision,

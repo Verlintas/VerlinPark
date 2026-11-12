@@ -2205,6 +2205,33 @@ enum Command {
     Resume { session: String },
     /// Resume the stored TeamPlan, skipping completed tasks.
     ResumePlan { session: String },
+    /// Compare the stored plan/run runtime snapshot with the current daemon.
+    Compatibility {
+        session: String,
+        /// Inspect one durable run instead of the plan snapshot.
+        #[arg(long)]
+        run: Option<String>,
+    },
+    /// Revalidate a stored plan and update its runtime snapshot after explicit
+    /// operator approval. Never rewrites tasks, scopes, or budgets.
+    PlanMigrate {
+        session: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        expected_revision: Option<u32>,
+        /// Required acknowledgement for this host-state operator action.
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        approved_by: Option<String>,
+    },
+    /// Read-only deterministic controller replay with matched/mismatched diff.
+    OrchestrateReplay {
+        session: String,
+        #[arg(long, default_value_t = 200)]
+        limit: u32,
+    },
     /// Show estimated context usage and the last compaction/trim.
     Context { session: String },
     /// Summarize or trim an idle session's active conversation now.
@@ -7311,6 +7338,41 @@ async fn run(cli: Cli) -> Result<()> {
                 &discovery,
                 "session.plan_resume",
                 json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::Compatibility { session, run } => {
+            let mut params = json!({"session_id": session});
+            if let Some(run) = run {
+                params["run_id"] = json!(run);
+            }
+            rpc(&discovery, "session.compatibility", params).await?
+        }
+        Command::PlanMigrate {
+            session,
+            reason,
+            expected_revision,
+            yes,
+            approved_by,
+        } => {
+            rpc(
+                &discovery,
+                "plan.migrate",
+                json!({
+                    "session_id": session,
+                    "reason": reason,
+                    "expected_revision": expected_revision,
+                    "approved": yes,
+                    "approved_by": approved_by,
+                }),
+            )
+            .await?
+        }
+        Command::OrchestrateReplay { session, limit } => {
+            rpc(
+                &discovery,
+                "orchestration.replay",
+                json!({"session_id": session, "limit": limit}),
             )
             .await?
         }
@@ -12733,6 +12795,183 @@ fn effect_lines(value: &Value) -> Option<Vec<String>> {
     None
 }
 
+fn runtime_pin_lines(value: &Value) -> Option<Vec<String>> {
+    if let Some(status) = value.get("status").and_then(Value::as_str)
+        && value.get("snapshot_age_secs").is_some()
+        && value.get("checked_at").is_some()
+    {
+        let mut lines = vec![format!(
+            "compatibility: {}  target={}  plan_revision={}  snapshot_age={}s",
+            status.to_uppercase(),
+            value.get("target").and_then(Value::as_str).unwrap_or("?"),
+            value
+                .get("plan_revision")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            value
+                .get("snapshot_age_secs")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        )];
+        if let Some(run_id) = value.get("run_id").and_then(Value::as_str) {
+            lines.push(format!("run: {run_id}"));
+        }
+        if let Some(changed) = value.get("changed").and_then(Value::as_array) {
+            for change in changed.iter().take(16) {
+                lines.push(format!(
+                    "  {}: {} -> {} ({})",
+                    change.get("field").and_then(Value::as_str).unwrap_or("?"),
+                    change.get("stored").and_then(Value::as_str).unwrap_or(""),
+                    change.get("current").and_then(Value::as_str).unwrap_or(""),
+                    change
+                        .get("severity")
+                        .and_then(Value::as_str)
+                        .unwrap_or("drift")
+                ));
+            }
+        }
+        if let Some(warnings) = value.get("warnings").and_then(Value::as_array) {
+            for warning in warnings.iter().take(16) {
+                if let Some(warning) = warning.as_str() {
+                    lines.push(format!("  warning: {warning}"));
+                }
+            }
+        }
+        if value
+            .get("migration_required")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            lines.push(
+                "migration required: review the diff, then run `vp plan-migrate <session> --yes`"
+                    .to_string(),
+            );
+        }
+        return Some(lines);
+    }
+    if value.get("migrated").is_some() {
+        let mut lines = vec![format!(
+            "plan migration: migrated={}  revision={}  event_seq={}",
+            value
+                .get("migrated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            value
+                .get("plan_revision")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            value.get("event_seq").and_then(Value::as_u64).unwrap_or(0)
+        )];
+        if let Some(snapshot) = value.get("snapshot") {
+            lines.push(format!(
+                "snapshot: runtime={} build={} policy={} bundle={} layout={} contract={}",
+                snapshot
+                    .get("runtime_version")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?"),
+                snapshot
+                    .get("runtime_build")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?"),
+                short_optional_hash(snapshot.get("policy_hash").and_then(Value::as_str)),
+                short_optional_hash(snapshot.get("tool_bundle_hash").and_then(Value::as_str)),
+                snapshot
+                    .get("prompt_layout_version")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                short_optional_hash(snapshot.get("contract_hash").and_then(Value::as_str)),
+            ));
+        }
+        if let Some(warnings) = value.get("warnings").and_then(Value::as_array) {
+            for warning in warnings.iter().take(16) {
+                if let Some(warning) = warning.as_str() {
+                    lines.push(format!("  note: {warning}"));
+                }
+            }
+        }
+        return Some(lines);
+    }
+    None
+}
+
+fn short_optional_hash(value: Option<&str>) -> String {
+    value
+        .map(|value| value.chars().take(12).collect::<String>())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn controller_replay_lines(value: &Value) -> Option<Vec<String>> {
+    if !value
+        .get("controller_equivalent_only")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let mut lines = vec![format!(
+        "controller replay: matched={} mismatched={} skipped={} examined={} total={} truncated={}",
+        value.get("matched").and_then(Value::as_u64).unwrap_or(0),
+        value.get("mismatched").and_then(Value::as_u64).unwrap_or(0),
+        value.get("skipped").and_then(Value::as_u64).unwrap_or(0),
+        value.get("examined").and_then(Value::as_u64).unwrap_or(0),
+        value
+            .get("total_recorded")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        value
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    )];
+    if let Some(entries) = value.get("entries").and_then(Value::as_array) {
+        for entry in entries.iter().take(200) {
+            let status = entry
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            if status == "matched" {
+                continue;
+            }
+            lines.push(format!(
+                "  #{} {} {} recorded={} recomputed={}",
+                entry.get("seq").and_then(Value::as_u64).unwrap_or(0),
+                entry.get("kind").and_then(Value::as_str).unwrap_or("?"),
+                status.to_uppercase(),
+                entry
+                    .get("recorded_action")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-"),
+                entry
+                    .get("recomputed_action")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-")
+            ));
+            if let Some(changes) = entry.get("changes").and_then(Value::as_array) {
+                for change in changes.iter().take(6) {
+                    lines.push(format!(
+                        "      {}: {} -> {}",
+                        change.get("field").and_then(Value::as_str).unwrap_or("?"),
+                        change.get("recorded").and_then(Value::as_str).unwrap_or(""),
+                        change
+                            .get("recomputed")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                    ));
+                }
+            }
+            if let Some(reason) = entry.get("reason").and_then(Value::as_str) {
+                lines.push(format!("      reason: {reason}"));
+            }
+        }
+    }
+    lines.push(
+        "controller-equivalent only; replay never proves model behavior and is not verification or merge evidence"
+            .to_string(),
+    );
+    Some(lines)
+}
+
 fn gate_lines(value: &Value) -> Option<Vec<String>> {
     if let Some(gate) = value.get("gate")
         && gate.is_object()
@@ -12840,6 +13079,18 @@ fn gate_lines(value: &Value) -> Option<Vec<String>> {
 }
 
 fn print_human(value: &Value) {
+    if let Some(lines) = runtime_pin_lines(value) {
+        for line in lines {
+            println!("{line}");
+        }
+        return;
+    }
+    if let Some(lines) = controller_replay_lines(value) {
+        for line in lines {
+            println!("{line}");
+        }
+        return;
+    }
     if let Some(lines) = gate_lines(value) {
         for line in lines {
             println!("{line}");
@@ -21676,5 +21927,97 @@ mod gate_cli_tests {
         assert!(!rendered.contains("token"));
         let sweep = json!({"expired_gates": 3});
         assert!(gate_lines(&sweep).unwrap()[0].contains("3 open gate"));
+    }
+
+    #[test]
+    fn compatibility_and_replay_commands_parse_and_render() {
+        let cli = Cli::try_parse_from(["vp", "compatibility", "ses-1", "--run", "run-1"]).unwrap();
+        match cli.command {
+            Command::Compatibility { session, run } => {
+                assert_eq!(session, "ses-1");
+                assert_eq!(run.as_deref(), Some("run-1"));
+            }
+            other => panic!("expected compatibility, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from([
+            "vp",
+            "plan-migrate",
+            "ses-1",
+            "--yes",
+            "--expected-revision",
+            "2",
+            "--reason",
+            "upgrade",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::PlanMigrate {
+                session,
+                reason,
+                expected_revision,
+                yes,
+                ..
+            } => {
+                assert_eq!(session, "ses-1");
+                assert_eq!(reason.as_deref(), Some("upgrade"));
+                assert_eq!(expected_revision, Some(2));
+                assert!(yes);
+            }
+            other => panic!("expected plan-migrate, got {other:?}"),
+        }
+        let cli =
+            Cli::try_parse_from(["vp", "orchestrate-replay", "ses-1", "--limit", "50"]).unwrap();
+        match cli.command {
+            Command::OrchestrateReplay { session, limit } => {
+                assert_eq!(session, "ses-1");
+                assert_eq!(limit, 50);
+            }
+            other => panic!("expected orchestrate-replay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compatibility_and_replay_render_without_secrets_or_model_claims() {
+        let report = json!({
+            "status": "incompatible",
+            "target": "plan",
+            "session_id": "ses-1",
+            "plan_revision": 2,
+            "snapshot_age_secs": 42,
+            "changed": [
+                {"field": "contract_hash", "stored": "aaaa", "current": "bbbb", "severity": "incompatible"}
+            ],
+            "warnings": ["contract_changed"],
+            "migration_required": true,
+            "checked_at": "2026-11-12T00:00:00Z"
+        });
+        let rendered = runtime_pin_lines(&report).unwrap().join("\n");
+        assert!(rendered.contains("INCOMPATIBLE"));
+        assert!(rendered.contains("migration required"));
+        assert!(rendered.contains("contract_hash"));
+        assert!(!rendered.contains("api_key"));
+        let replay = json!({
+            "session_id": "ses-1",
+            "matched": 3,
+            "mismatched": 1,
+            "skipped": 0,
+            "examined": 4,
+            "total_recorded": 9,
+            "truncated": true,
+            "controller_equivalent_only": true,
+            "entries": [{
+                "seq": 7,
+                "kind": "orchestration.decision",
+                "status": "mismatched",
+                "recorded_action": "retry:T1",
+                "recomputed_action": "block:T2",
+                "changes": [{"field": "action", "recorded": "retry:T1", "recomputed": "block:T2"}],
+                "reason": "different action set"
+            }]
+        });
+        let rendered = controller_replay_lines(&replay).unwrap().join("\n");
+        assert!(rendered.contains("MISMATCHED"));
+        assert!(rendered.contains("controller-equivalent only"));
+        assert!(!rendered.contains("verified"));
     }
 }

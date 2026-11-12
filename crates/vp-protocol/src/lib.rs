@@ -7,7 +7,9 @@
 pub mod discovery;
 pub mod lsp;
 pub mod remote;
+pub mod replay;
 pub mod rpc;
+pub mod runtime;
 pub mod scaling;
 pub mod test_cache;
 pub mod types;

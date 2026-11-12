@@ -1340,6 +1340,10 @@ pub struct ProjectManifestSnapshot {
     /// local-only with the loopback resolve endpoint disabled.
     #[serde(default)]
     pub gate_policy: GatePolicy,
+    /// Immutable project policy bundles referenced by plan/run runtime
+    /// snapshots. Content-addressed and deduplicated per project.
+    #[serde(default)]
+    pub policy_snapshots: Vec<vp_protocol::runtime::PolicySnapshot>,
     /// Project-scoped MCP tool schema pins. These are project configuration,
     /// not session events, so the manifest is their rebuild snapshot.
     #[serde(default)]
@@ -1915,6 +1919,21 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_contracts_session
                 ON contracts(session_id, created_at);
 
+            -- Immutable project policy bundles referenced by plan/run runtime
+            -- snapshots. Rows are content-addressed and deduplicated per
+            -- project; only canonical policy JSON is stored (no prompts,
+            -- provider keys, headers, or file content).
+            CREATE TABLE IF NOT EXISTS policy_snapshots (
+                project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                hash       TEXT NOT NULL,
+                json       TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (project_id, hash)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_policy_snapshots_project
+                ON policy_snapshots(project_id, created_at);
+
             -- Per-contract mutation usage derived from `intent.mutation`
             -- events. It is a projection, not an independent authority.
             CREATE TABLE IF NOT EXISTS contract_usage (
@@ -2172,6 +2191,7 @@ impl Store {
                 cost_spent_usd REAL NOT NULL DEFAULT 0,
                 base_commit   TEXT,
                 team_plan     TEXT,
+                plan_runtime_snapshot TEXT,
                 tokens_in     INTEGER NOT NULL DEFAULT 0,
                 tokens_out    INTEGER NOT NULL DEFAULT 0,
                 created_at    TEXT NOT NULL
@@ -3028,6 +3048,7 @@ impl Store {
                 applied              INTEGER NOT NULL DEFAULT 0,
                 idle_since_workers   TEXT,
                 idle_since_labour    TEXT,
+                replay_inputs_json   TEXT,
                 created_at           TEXT NOT NULL,
                 UNIQUE(session_id, decision_key)
             );
@@ -3261,6 +3282,7 @@ impl Store {
                 budget_json            TEXT NOT NULL DEFAULT '{}',
                 worktree_head          TEXT NOT NULL DEFAULT '',
                 plan_revision          INTEGER NOT NULL DEFAULT 0,
+                runtime_snapshot_json  TEXT,
                 last_event_seq         INTEGER NOT NULL DEFAULT 0,
                 failure_json           TEXT
             );
@@ -3861,6 +3883,7 @@ impl Store {
         )?;
         ensure_column(&conn, "sessions", "base_commit", "TEXT")?;
         ensure_column(&conn, "sessions", "team_plan", "TEXT")?;
+        ensure_column(&conn, "sessions", "plan_runtime_snapshot", "TEXT")?;
         // Existing sessions default to the legacy layout. New rows are written
         // with the project default (normally 3) by `insert_session`.
         ensure_column(
@@ -4157,6 +4180,8 @@ impl Store {
             "TEXT",
         )?;
         ensure_column(&conn, "plan_tasks", "next_attempt_at", "TEXT")?;
+        ensure_column(&conn, "scaling_decisions", "replay_inputs_json", "TEXT")?;
+        ensure_column(&conn, "session_runs", "runtime_snapshot_json", "TEXT")?;
         ensure_column(&conn, "approvals", "approval_risk", "TEXT")?;
         ensure_column(&conn, "approvals", "approval_reason", "TEXT")?;
         ensure_column(&conn, "approvals", "agent_id", "TEXT")?;
@@ -4331,6 +4356,7 @@ impl Store {
                 contract_policy: self.get_contract_policy(&project.id)?,
                 effect_policy: self.get_effect_policy(&project.id)?,
                 gate_policy: self.get_gate_policy(&project.id)?,
+                policy_snapshots: self.list_policy_snapshots(&project.id, 10_000)?,
                 mcp_tool_pins: self.list_mcp_tool_pins(&project.id, None)?,
                 cache_policy: self.get_cache_policy(&project.id)?,
                 execution_host: self.get_execution_host(&project.id)?,
@@ -11541,7 +11567,7 @@ impl Store {
                     current_workers, current_labour, target_workers, target_labour,
                     active_workers, active_labour, ready_tasks, running_tasks, inputs_hash,
                     reasons, manager_recommended, manager_evidence, applied,
-                    idle_since_workers, idle_since_labour, created_at
+                    idle_since_workers, idle_since_labour, created_at, replay_inputs_json
              FROM scaling_decisions
              WHERE session_id = ?1
              ORDER BY seq DESC
@@ -11582,7 +11608,7 @@ impl Store {
                     current_workers, current_labour, target_workers, target_labour,
                     active_workers, active_labour, ready_tasks, running_tasks, inputs_hash,
                     reasons, manager_recommended, manager_evidence, applied,
-                    idle_since_workers, idle_since_labour, created_at
+                    idle_since_workers, idle_since_labour, created_at, replay_inputs_json
              FROM scaling_decisions
              WHERE session_id = ?1
              ORDER BY seq DESC",
@@ -21820,7 +21846,7 @@ impl Store {
             "SELECT run_id, session_id, project_id, agent_id, agent_name, agent_role, task_id,
                     department, objective, provider, model, status, attempt, resumed_from_run_id,
                     resume_root_id, top_level, started_at, updated_at, ended_at, budget_json,
-                    worktree_head, plan_revision, last_event_seq, failure_json
+                    worktree_head, plan_revision, last_event_seq, failure_json, runtime_snapshot_json
              FROM session_runs WHERE session_id = ?1
              ORDER BY started_at ASC, run_id ASC",
         )?;
@@ -21835,7 +21861,7 @@ impl Store {
             "SELECT run_id, session_id, project_id, agent_id, agent_name, agent_role, task_id,
                     department, objective, provider, model, status, attempt, resumed_from_run_id,
                     resume_root_id, top_level, started_at, updated_at, ended_at, budget_json,
-                    worktree_head, plan_revision, last_event_seq, failure_json
+                    worktree_head, plan_revision, last_event_seq, failure_json, runtime_snapshot_json
              FROM session_runs WHERE session_id = ?1
              ORDER BY started_at DESC, run_id DESC LIMIT ?2",
         )?;
@@ -21850,7 +21876,7 @@ impl Store {
             "SELECT run_id, session_id, project_id, agent_id, agent_name, agent_role, task_id,
                     department, objective, provider, model, status, attempt, resumed_from_run_id,
                     resume_root_id, top_level, started_at, updated_at, ended_at, budget_json,
-                    worktree_head, plan_revision, last_event_seq, failure_json
+                    worktree_head, plan_revision, last_event_seq, failure_json, runtime_snapshot_json
              FROM session_runs
              WHERE top_level = 1 AND status IN ('interrupted', 'failed')
                AND (failure_json IS NULL
@@ -21868,7 +21894,7 @@ impl Store {
             "SELECT run_id, session_id, project_id, agent_id, agent_name, agent_role, task_id,
                     department, objective, provider, model, status, attempt, resumed_from_run_id,
                     resume_root_id, top_level, started_at, updated_at, ended_at, budget_json,
-                    worktree_head, plan_revision, last_event_seq, failure_json
+                    worktree_head, plan_revision, last_event_seq, failure_json, runtime_snapshot_json
              FROM session_runs WHERE run_id = ?1",
             params![run_id],
             map_session_run,
@@ -22717,16 +22743,37 @@ impl Store {
     }
 
     pub fn set_team_plan_with_event(&self, session_id: &str, plan: &str) -> Result<Event> {
+        self.set_team_plan_with_runtime_snapshot_and_event(session_id, plan, None)
+    }
+
+    /// Persist a submitted plan, its optional runtime snapshot, and the
+    /// `team_plan.submitted` event atomically. The snapshot JSON is also
+    /// embedded in the event payload so replay/repair can reconstruct it.
+    pub fn set_team_plan_with_runtime_snapshot_and_event(
+        &self,
+        session_id: &str,
+        plan: &str,
+        runtime_snapshot_json: Option<&str>,
+    ) -> Result<Event> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         let changed = tx.execute(
-            "UPDATE sessions SET team_plan = ?1 WHERE id = ?2",
-            params![plan, session_id],
+            "UPDATE sessions
+             SET team_plan = ?1,
+                 plan_runtime_snapshot = COALESCE(?3, plan_runtime_snapshot)
+             WHERE id = ?2",
+            params![plan, session_id, runtime_snapshot_json],
         )?;
         if changed == 0 {
             return Err(anyhow!("session not found: {session_id}"));
         }
-        let payload = serde_json::from_str(plan).unwrap_or(serde_json::Value::Null);
+        let mut payload = serde_json::from_str(plan).unwrap_or(serde_json::Value::Null);
+        if let (Some(snapshot_json), Some(object)) =
+            (runtime_snapshot_json, payload.as_object_mut())
+            && let Ok(snapshot) = serde_json::from_str::<serde_json::Value>(snapshot_json)
+        {
+            object.insert("runtime_snapshot".into(), snapshot);
+        }
         let event = insert_event_tx(&tx, session_id, "team_plan.submitted", payload)?;
         tx.commit()?;
         if let Err(error) = self.append_event_mirror(&event) {
@@ -22745,17 +22792,42 @@ impl Store {
         kind: &str,
         payload: serde_json::Value,
     ) -> Result<Event> {
+        self.set_team_plan_revision_with_runtime_snapshot_and_event(
+            session_id, plan, kind, payload, None,
+        )
+    }
+
+    /// Persist a plan revision, its optional runtime snapshot, and the plan
+    /// lifecycle event atomically. The snapshot is stored on the session row
+    /// and embedded in the event payload.
+    pub fn set_team_plan_revision_with_runtime_snapshot_and_event(
+        &self,
+        session_id: &str,
+        plan: &str,
+        kind: &str,
+        mut payload: serde_json::Value,
+        runtime_snapshot_json: Option<&str>,
+    ) -> Result<Event> {
         if !matches!(kind, "team_plan.submitted" | "team_plan.revised") {
             return Err(anyhow!("invalid team plan event kind: {kind}"));
         }
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         let changed = tx.execute(
-            "UPDATE sessions SET team_plan = ?1 WHERE id = ?2",
-            params![plan, session_id],
+            "UPDATE sessions
+             SET team_plan = ?1,
+                 plan_runtime_snapshot = COALESCE(?3, plan_runtime_snapshot)
+             WHERE id = ?2",
+            params![plan, session_id, runtime_snapshot_json],
         )?;
         if changed == 0 {
             return Err(anyhow!("session not found: {session_id}"));
+        }
+        if let (Some(snapshot_json), Some(object)) =
+            (runtime_snapshot_json, payload.as_object_mut())
+            && let Ok(snapshot) = serde_json::from_str::<serde_json::Value>(snapshot_json)
+        {
+            object.insert("runtime_snapshot".into(), snapshot);
         }
         let event = insert_event_tx(&tx, session_id, kind, payload)?;
         tx.commit()?;
@@ -22763,6 +22835,178 @@ impl Store {
             tracing::warn!(%error, "failed to append event mirror");
         }
         Ok(event)
+    }
+
+    /// Update only the stored plan runtime snapshot and append `plan.migrated`.
+    /// The plan JSON, task rows, contracts, budgets, effect receipts, and gates
+    /// are deliberately untouched.
+    pub fn migrate_plan_runtime_snapshot_with_event(
+        &self,
+        session_id: &str,
+        runtime_snapshot_json: &str,
+        payload: serde_json::Value,
+    ) -> Result<Event> {
+        let snapshot: vp_protocol::runtime::RuntimeSnapshot =
+            serde_json::from_str(runtime_snapshot_json)
+                .map_err(|error| anyhow!("invalid runtime snapshot: {error}"))?;
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE sessions SET plan_runtime_snapshot = ?1 WHERE id = ?2",
+            params![runtime_snapshot_json, session_id],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!("session not found: {session_id}"));
+        }
+        let mut payload = payload;
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("snapshot".into(), serde_json::to_value(&snapshot)?);
+        }
+        let event = insert_event_tx(&tx, session_id, "plan.migrated", payload)?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(event)
+    }
+
+    pub fn get_plan_runtime_snapshot(&self, session_id: &str) -> Result<Option<String>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT plan_runtime_snapshot FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(|value| value.flatten())
+        .map_err(Into::into)
+    }
+
+    /// Insert one immutable policy bundle and append `policy.snapshot` in the
+    /// same transaction when the row is new. Returns `None` when the exact
+    /// bundle already exists for the project.
+    pub fn ensure_policy_snapshot_with_event(
+        &self,
+        session_id: &str,
+        project_id: &str,
+        hash: &str,
+        json: &str,
+    ) -> Result<Option<Event>> {
+        if hash.is_empty() || json.is_empty() {
+            return Err(anyhow!("policy snapshot needs a hash and canonical json"));
+        }
+        let canonical_hash = format!("{:x}", Sha256::digest(json.as_bytes()));
+        if canonical_hash != hash {
+            return Err(anyhow!("policy snapshot hash does not match its json"));
+        }
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let exists: bool = tx
+            .query_row(
+                "SELECT 1 FROM policy_snapshots WHERE project_id = ?1 AND hash = ?2",
+                params![project_id, hash],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if exists {
+            return Ok(None);
+        }
+        let created_at = now_rfc3339();
+        tx.execute(
+            "INSERT INTO policy_snapshots (project_id, hash, json, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![project_id, hash, json, created_at],
+        )?;
+        let payload = serde_json::json!({
+            "project_id": project_id,
+            "hash": hash,
+            "json": json,
+            "created_at": created_at,
+        });
+        let event = insert_event_tx(&tx, session_id, "policy.snapshot", payload)?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some(event))
+    }
+
+    pub fn get_policy_snapshot(
+        &self,
+        project_id: &str,
+        hash: &str,
+    ) -> Result<Option<vp_protocol::runtime::PolicySnapshot>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT project_id, hash, json, created_at
+             FROM policy_snapshots WHERE project_id = ?1 AND hash = ?2",
+            params![project_id, hash],
+            |row| {
+                Ok(vp_protocol::runtime::PolicySnapshot {
+                    project_id: row.get(0)?,
+                    hash: row.get(1)?,
+                    json: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_policy_snapshots(
+        &self,
+        project_id: &str,
+        limit: u32,
+    ) -> Result<Vec<vp_protocol::runtime::PolicySnapshot>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT project_id, hash, json, created_at
+             FROM policy_snapshots WHERE project_id = ?1
+             ORDER BY created_at ASC, hash ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            params![project_id, i64::from(limit.clamp(1, 10_000))],
+            |row| {
+                Ok(vp_protocol::runtime::PolicySnapshot {
+                    project_id: row.get(0)?,
+                    hash: row.get(1)?,
+                    json: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Snapshot insertion for `db-rebuild` and bundle import. Existing rows are
+    /// preserved; the hash is verified so a malformed archive cannot poison
+    /// the policy projection.
+    pub fn insert_policy_snapshot_snapshot(
+        &self,
+        snapshot: &vp_protocol::runtime::PolicySnapshot,
+    ) -> Result<()> {
+        let actual = format!("{:x}", Sha256::digest(snapshot.json.as_bytes()));
+        if actual != snapshot.hash {
+            return Err(anyhow!(
+                "policy snapshot {} does not match its canonical json",
+                snapshot.hash
+            ));
+        }
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO policy_snapshots (project_id, hash, json, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(project_id, hash) DO NOTHING",
+            params![
+                snapshot.project_id,
+                snapshot.hash,
+                snapshot.json,
+                snapshot.created_at
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn get_team_plan(&self, session_id: &str) -> Result<Option<String>> {
@@ -25645,6 +25889,32 @@ impl Store {
                 "UPDATE sessions SET team_plan = ?1 WHERE id = ?2",
                 params![repair.plan, session_id],
             )?;
+            // Runtime snapshots are event-backed too. Reconstruct the newest
+            // plan snapshot from its lifecycle payload; a legacy event has no
+            // snapshot and leaves the column untouched.
+            let latest_plan_payload: Option<String> = tx
+                .query_row(
+                    "SELECT payload FROM events
+                     WHERE session_id = ?1
+                       AND type IN ('team_plan.submitted', 'team_plan.revised')
+                     ORDER BY seq DESC LIMIT 1",
+                    params![session_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let snapshot_json = latest_plan_payload
+                .and_then(|payload| serde_json::from_str::<serde_json::Value>(&payload).ok())
+                .and_then(|payload| payload.get("runtime_snapshot").cloned())
+                .and_then(|snapshot| {
+                    serde_json::from_value::<vp_protocol::runtime::RuntimeSnapshot>(snapshot).ok()
+                })
+                .and_then(|snapshot| serde_json::to_string(&snapshot).ok());
+            if let Some(snapshot_json) = snapshot_json {
+                tx.execute(
+                    "UPDATE sessions SET plan_runtime_snapshot = ?1 WHERE id = ?2",
+                    params![snapshot_json, session_id],
+                )?;
+            }
         }
         if let Some(todos) = &repair.todos {
             tx.execute(
@@ -26199,6 +26469,32 @@ impl Store {
         if session_exists {
             return Err(anyhow!("session already exists: {}", bundle.session.id));
         }
+        for snapshot in &bundle.policy_snapshots {
+            if snapshot.project_id != bundle.project.id {
+                return Err(anyhow!(
+                    "bundle policy snapshot {} belongs to another project",
+                    snapshot.hash
+                ));
+            }
+            let actual = format!("{:x}", Sha256::digest(snapshot.json.as_bytes()));
+            if actual != snapshot.hash {
+                return Err(anyhow!(
+                    "bundle policy snapshot {} does not match its canonical json",
+                    snapshot.hash
+                ));
+            }
+            tx.execute(
+                "INSERT INTO policy_snapshots (project_id, hash, json, created_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(project_id, hash) DO NOTHING",
+                params![
+                    snapshot.project_id,
+                    snapshot.hash,
+                    snapshot.json,
+                    snapshot.created_at
+                ],
+            )?;
+        }
 
         // Tool-output bodies are operational and never part of a bundle. Drop
         // any stale handle rows for this session id before registering the
@@ -26213,12 +26509,28 @@ impl Store {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
+        let plan_runtime_snapshot_json = bundle
+            .events
+            .iter()
+            .rev()
+            .filter(|event| {
+                matches!(
+                    event.kind.as_str(),
+                    "team_plan.submitted" | "team_plan.revised"
+                )
+            })
+            .find_map(|event| event.payload.get("runtime_snapshot").cloned())
+            .and_then(|snapshot| {
+                serde_json::from_value::<vp_protocol::runtime::RuntimeSnapshot>(snapshot).ok()
+            })
+            .and_then(|snapshot| serde_json::to_string(&snapshot).ok());
         tx.execute(
             "INSERT INTO sessions
              (id, project_id, goal, status, priority, worktree, branch, token_budget,
               cost_budget_usd, time_budget_secs, unlimited, cost_spent_usd, base_commit,
-              team_plan, tokens_in, tokens_out, prompt_layout, created_at)
-             VALUES (?1, ?2, ?3, 'imported', ?4, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+              team_plan, tokens_in, tokens_out, prompt_layout, created_at,
+              plan_runtime_snapshot)
+             VALUES (?1, ?2, ?3, 'imported', ?4, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 bundle.session.id,
                 bundle.session.project_id,
@@ -26235,7 +26547,8 @@ impl Store {
                 bundle.session.tokens_in as i64,
                 bundle.session.tokens_out as i64,
                 bundle.session.prompt_layout as i64,
-                bundle.session.created_at
+                bundle.session.created_at,
+                plan_runtime_snapshot_json
             ],
         )?;
         for blob in &bundle.instruction_blobs {
@@ -27474,6 +27787,9 @@ fn map_scaling_decision(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScalingDeci
         applied: row.get::<_, i64>(19)? != 0,
         idle_since_workers: row.get(20)?,
         idle_since_labour: row.get(21)?,
+        replay_inputs: row
+            .get::<_, Option<String>>(23)?
+            .and_then(|json| serde_json::from_str(&json).ok()),
         created_at: row.get(22)?,
     })
 }
@@ -27489,9 +27805,9 @@ fn insert_scaling_decision_tx(
           current_workers, current_labour, target_workers, target_labour, active_workers,
           active_labour, ready_tasks, running_tasks, inputs_hash, reasons,
           manager_recommended, manager_evidence, applied, idle_since_workers,
-          idle_since_labour, created_at)
+          idle_since_labour, created_at, replay_inputs_json)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
         params![
             decision.decision_id,
             decision.session_id,
@@ -27516,6 +27832,11 @@ fn insert_scaling_decision_tx(
             decision.idle_since_workers,
             decision.idle_since_labour,
             decision.created_at,
+            decision
+                .replay_inputs
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
         ],
     )?;
     Ok(())
@@ -27789,9 +28110,9 @@ fn replace_run_journal_projections_tx(
              (run_id, session_id, project_id, agent_id, agent_name, agent_role, task_id,
               department, objective, provider, model, status, attempt, resumed_from_run_id,
               resume_root_id, top_level, started_at, updated_at, ended_at, budget_json,
-              worktree_head, plan_revision, last_event_seq, failure_json)
+              worktree_head, plan_revision, last_event_seq, failure_json, runtime_snapshot_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
+                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
              ON CONFLICT(run_id) DO UPDATE SET
                 session_id = excluded.session_id,
                 project_id = excluded.project_id,
@@ -27815,7 +28136,8 @@ fn replace_run_journal_projections_tx(
                 worktree_head = excluded.worktree_head,
                 plan_revision = excluded.plan_revision,
                 last_event_seq = excluded.last_event_seq,
-                failure_json = excluded.failure_json",
+                failure_json = excluded.failure_json,
+                runtime_snapshot_json = excluded.runtime_snapshot_json",
             params![
                 run.run_id,
                 run.session_id,
@@ -27841,6 +28163,10 @@ fn replace_run_journal_projections_tx(
                 i64::from(run.plan_revision),
                 run.last_event_seq as i64,
                 run.failure
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+                run.runtime_snapshot
                     .as_ref()
                     .map(serde_json::to_string)
                     .transpose()?
@@ -27953,9 +28279,9 @@ fn insert_session_run_tx(tx: &Transaction<'_>, run: &SessionRun) -> Result<()> {
          (run_id, session_id, project_id, agent_id, agent_name, agent_role, task_id,
           department, objective, provider, model, status, attempt, resumed_from_run_id,
           resume_root_id, top_level, started_at, updated_at, ended_at, budget_json,
-          worktree_head, plan_revision, last_event_seq, failure_json)
+          worktree_head, plan_revision, last_event_seq, failure_json, runtime_snapshot_json)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                 ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                 ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
         params![
             run.run_id,
             run.session_id,
@@ -27981,6 +28307,10 @@ fn insert_session_run_tx(tx: &Transaction<'_>, run: &SessionRun) -> Result<()> {
             i64::from(run.plan_revision),
             run.last_event_seq as i64,
             run.failure
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+            run.runtime_snapshot
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?
@@ -28207,7 +28537,7 @@ fn load_session_run_tx(tx: &Transaction<'_>, run_id: &str) -> Result<SessionRun>
         "SELECT run_id, session_id, project_id, agent_id, agent_name, agent_role, task_id,
                 department, objective, provider, model, status, attempt, resumed_from_run_id,
                 resume_root_id, top_level, started_at, updated_at, ended_at, budget_json,
-                worktree_head, plan_revision, last_event_seq, failure_json
+                worktree_head, plan_revision, last_event_seq, failure_json, runtime_snapshot_json
          FROM session_runs WHERE run_id = ?1",
         params![run_id],
         map_session_run,
@@ -28219,6 +28549,7 @@ fn load_session_run_tx(tx: &Transaction<'_>, run_id: &str) -> Result<SessionRun>
 fn map_session_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRun> {
     let budget_json: String = row.get(19)?;
     let failure_json: Option<String> = row.get(23)?;
+    let runtime_snapshot_json: Option<String> = row.get(24)?;
     Ok(SessionRun {
         run_id: row.get(0)?,
         session_id: row.get(1)?,
@@ -28242,6 +28573,9 @@ fn map_session_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRun> {
         budget: serde_json::from_str::<RunBudgetSnapshot>(&budget_json).unwrap_or_default(),
         worktree_head: row.get(20)?,
         plan_revision: row.get::<_, i64>(21)?.max(0) as u32,
+        runtime_snapshot: runtime_snapshot_json.and_then(|json| {
+            serde_json::from_str::<vp_protocol::runtime::RuntimeSnapshot>(&json).ok()
+        }),
         last_event_seq: row.get::<_, i64>(22)?.max(0) as u64,
         failure: failure_json
             .and_then(|json| serde_json::from_str::<vp_protocol::types::RunFailure>(&json).ok()),

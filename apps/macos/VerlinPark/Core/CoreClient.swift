@@ -1206,6 +1206,58 @@ actor CoreClient {
             .decode(SessionGatesReport.self)
     }
 
+    /// Compare the stored plan/run runtime snapshot with the current daemon.
+    func sessionCompatibility(
+        sessionID: String,
+        runID: String? = nil
+    ) async throws -> CompatibilityReportView {
+        var params: [String: JSONValue] = ["session_id": .string(sessionID)]
+        if let runID {
+            params["run_id"] = .string(runID)
+        }
+        return try await request(method: "session.compatibility", params: params)
+            .decode(CompatibilityReportView.self)
+    }
+
+    /// Explicit approval-classified plan migration. The daemon revalidates the
+    /// stored plan; the client sends only the acknowledgement and reason.
+    func migratePlan(
+        sessionID: String,
+        reason: String? = nil,
+        expectedRevision: Int? = nil,
+        approvedBy: String? = nil
+    ) async throws -> PlanMigrateResultView {
+        var params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "approved": .bool(true),
+        ]
+        if let reason {
+            params["reason"] = .string(reason)
+        }
+        if let expectedRevision {
+            params["expected_revision"] = .number(Double(expectedRevision))
+        }
+        if let approvedBy {
+            params["approved_by"] = .string(approvedBy)
+        }
+        return try await request(method: "plan.migrate", params: params)
+            .decode(PlanMigrateResultView.self)
+    }
+
+    /// Read-only deterministic controller replay. Never used as verification or
+    /// merge evidence.
+    func orchestrationReplay(
+        sessionID: String,
+        limit: Int = 200
+    ) async throws -> ControllerReplayReportView {
+        let params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "limit": .number(Double(limit)),
+        ]
+        return try await request(method: "orchestration.replay", params: params)
+            .decode(ControllerReplayReportView.self)
+    }
+
     func reconcileEffect(
         effectID: String,
         sessionID: String? = nil,

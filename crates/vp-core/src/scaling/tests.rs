@@ -670,6 +670,7 @@ fn decision(
         applied: true,
         idle_since_workers: None,
         idle_since_labour: None,
+        replay_inputs: None,
         created_at: "2026-11-11T12:00:00Z".to_string(),
     }
 }

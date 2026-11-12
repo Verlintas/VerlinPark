@@ -12047,6 +12047,7 @@ fn context_checkpoint_bundle_validation_checks_session_and_project() {
         steering: Vec::new(),
         continuations: Vec::new(),
         gates: Vec::new(),
+        policy_snapshots: Vec::new(),
         recoveries: Vec::new(),
         programs: Vec::new(),
         program_milestones: Vec::new(),
@@ -12307,6 +12308,7 @@ fn importing_a_projection_only_bundle_synthesizes_checkpoint_events() {
         steering: Vec::new(),
         continuations: Vec::new(),
         gates: Vec::new(),
+        policy_snapshots: Vec::new(),
         recoveries: Vec::new(),
         programs: Vec::new(),
         program_milestones: Vec::new(),
@@ -14148,6 +14150,7 @@ fn bundle_import_preserves_supervised_process_lifecycle_rows() {
         steering: Vec::new(),
         continuations: Vec::new(),
         gates: Vec::new(),
+        policy_snapshots: Vec::new(),
         recoveries: Vec::new(),
         programs: Vec::new(),
         program_milestones: Vec::new(),
@@ -14239,6 +14242,7 @@ fn supervised_process_bundle_validation_rejects_wrong_session() {
         steering: Vec::new(),
         continuations: Vec::new(),
         gates: Vec::new(),
+        policy_snapshots: Vec::new(),
         recoveries: Vec::new(),
         programs: Vec::new(),
         program_milestones: Vec::new(),
@@ -14398,6 +14402,7 @@ fn scaling_decisions_are_idempotent_and_rebuildable() {
         applied: true,
         idle_since_workers: None,
         idle_since_labour: None,
+        replay_inputs: None,
         created_at: "2026-11-11T00:00:00Z".into(),
     };
     let (stored, event) = store
@@ -16457,6 +16462,7 @@ fn bundle_import_preserves_instruction_state_and_rejects_missing_blobs() {
         steering: Vec::new(),
         continuations: Vec::new(),
         gates: Vec::new(),
+        policy_snapshots: Vec::new(),
         recoveries: Vec::new(),
         programs: Vec::new(),
         program_milestones: Vec::new(),
@@ -16530,6 +16536,7 @@ fn bundle_import_rejects_a_corrupt_instruction_blob() {
         steering: Vec::new(),
         continuations: Vec::new(),
         gates: Vec::new(),
+        policy_snapshots: Vec::new(),
         recoveries: Vec::new(),
         programs: Vec::new(),
         program_milestones: Vec::new(),
@@ -17433,6 +17440,7 @@ fn run_step_intent_and_effect_commit_in_one_transaction() {
         budget: RunBudgetSnapshot::default(),
         worktree_head: String::new(),
         plan_revision: 1,
+        runtime_snapshot: None,
         last_event_seq: 0,
         failure: None,
     };
@@ -17537,4 +17545,159 @@ fn effect_policy_round_trips_and_rejects_an_invalid_grace() {
     assert_eq!(store.get_effect_policy(&project.id).unwrap(), policy);
     policy.stale_intent_grace_secs = 0;
     assert!(store.set_effect_policy(&project.id, &policy).is_err());
+}
+
+#[test]
+fn policy_snapshots_are_content_addressed_and_deduplicated() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("pin"))
+        .unwrap();
+    let session = store.create_session(&project.id, "pin").unwrap();
+    let json = "{\"version\":1,\"contract\":{\"enabled\":true}}";
+    let hash = format!("{:x}", Sha256::digest(json.as_bytes()));
+    let event = store
+        .ensure_policy_snapshot_with_event(&session.id, &project.id, &hash, json)
+        .unwrap()
+        .expect("first insert emits an event");
+    assert_eq!(event.kind, "policy.snapshot");
+    assert_eq!(event.payload["hash"], hash);
+    assert!(
+        store
+            .ensure_policy_snapshot_with_event(&session.id, &project.id, &hash, json)
+            .unwrap()
+            .is_none()
+    );
+    let rows = store.list_policy_snapshots(&project.id, 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].json, json);
+    assert_eq!(
+        store.get_policy_snapshot(&project.id, &hash).unwrap(),
+        Some(rows[0].clone())
+    );
+    assert!(
+        store
+            .ensure_policy_snapshot_with_event(&session.id, &project.id, &hash, "{}")
+            .is_err()
+    );
+}
+
+#[test]
+fn plan_and_migration_snapshot_updates_are_atomic_and_plan_preserving() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("pin"))
+        .unwrap();
+    let session = store.create_session(&project.id, "pin").unwrap();
+    let plan = vp_protocol::types::TeamPlan {
+        goal: "pin".to_string(),
+        departments: vec![vp_protocol::types::PlanDepartment {
+            name: "impl".to_string(),
+            manager_title: "Implementation".to_string(),
+            profile: "coding".to_string(),
+            objective: "build".to_string(),
+            token_budget: None,
+            cost_budget_usd: None,
+        }],
+        tasks: vec![vp_protocol::types::PlanTask {
+            id: "T1".to_string(),
+            department: "impl".to_string(),
+            title: "T1".to_string(),
+            kind: "coding".to_string(),
+            priority: 0,
+            profile: Some("coding".to_string()),
+            deps: Vec::new(),
+            write_scope: vec!["src/T1.rs".to_string()],
+            acceptance: vec!["done".to_string()],
+            token_budget: None,
+            cost_budget_usd: None,
+        }],
+    };
+    let plan_json = serde_json::to_string(&plan).unwrap();
+    let snapshot = vp_protocol::runtime::RuntimeSnapshot {
+        schema_version: 1,
+        runtime_version: "0.1.0".into(),
+        runtime_build: "test".into(),
+        policy_hash: "policy".into(),
+        tool_bundle_hash: "bundle".into(),
+        prompt_layout_version: 3,
+        plan_revision: 1,
+        contract_hash: "contract".into(),
+        created_at: vp_protocol::now_rfc3339(),
+    };
+    let snapshot_json = serde_json::to_string(&snapshot).unwrap();
+    let event = store
+        .set_team_plan_with_runtime_snapshot_and_event(
+            &session.id,
+            &plan_json,
+            Some(&snapshot_json),
+        )
+        .unwrap();
+    assert_eq!(event.payload["runtime_snapshot"]["policy_hash"], "policy");
+    assert_eq!(
+        store
+            .get_plan_runtime_snapshot(&session.id)
+            .unwrap()
+            .unwrap(),
+        snapshot_json
+    );
+    assert_eq!(
+        store.get_team_plan(&session.id).unwrap().unwrap(),
+        plan_json
+    );
+
+    let migrated = store
+        .migrate_plan_runtime_snapshot_with_event(
+            &session.id,
+            &snapshot_json,
+            serde_json::json!({"reason": "test", "approval_risk": "host_state"}),
+        )
+        .unwrap();
+    assert_eq!(migrated.kind, "plan.migrated");
+    assert_eq!(
+        store.get_team_plan(&session.id).unwrap().unwrap(),
+        plan_json
+    );
+}
+
+#[test]
+fn scaling_decision_replay_inputs_round_trip() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("pin"))
+        .unwrap();
+    let session = store.create_session(&project.id, "pin").unwrap();
+    let mut decision = vp_protocol::scaling::ScalingDecision {
+        decision_id: String::new(),
+        decision_key: "rev1:tick".into(),
+        session_id: session.id.clone(),
+        project_id: project.id.clone(),
+        plan_revision: 1,
+        action: vp_protocol::scaling::ScalingAction::Hold,
+        current_workers: 2,
+        current_labour: 4,
+        target_workers: 2,
+        target_labour: 4,
+        active_workers: 0,
+        active_labour: 0,
+        ready_tasks: 0,
+        running_tasks: 0,
+        inputs_hash: "hash".into(),
+        reasons: vec!["hold".into()],
+        manager_recommended: false,
+        manager_evidence: None,
+        applied: false,
+        idle_since_workers: None,
+        idle_since_labour: None,
+        replay_inputs: Some(serde_json::json!({"policy": {"enabled": false}})),
+        created_at: vp_protocol::now_rfc3339(),
+    };
+    let (stored, _event) = store
+        .record_scaling_decision_with_event(&decision)
+        .unwrap()
+        .expect("insert");
+    decision.decision_id = stored.decision_id.clone();
+    let rows = store.list_scaling_decisions(&session.id, 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].replay_inputs, decision.replay_inputs);
 }

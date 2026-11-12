@@ -89,6 +89,9 @@ impl RunJournal {
         let now = now_rfc3339();
         let head = worktree_head(worktree.to_path_buf()).await;
         let plan_revision = engine.current_plan_revision(&session.id).await?;
+        let runtime_snapshot = engine
+            .pin_run_snapshot(session, plan_revision, agent_role, task_id)
+            .await?;
         let run = SessionRun {
             run_id: run_id.clone(),
             session_id: session.id.clone(),
@@ -112,6 +115,7 @@ impl RunJournal {
             budget,
             worktree_head: head,
             plan_revision,
+            runtime_snapshot: Some(runtime_snapshot),
             last_event_seq: 0,
             failure: None,
         };
@@ -996,6 +1000,14 @@ pub(crate) async fn begin_resumed_run(
     } else {
         previous.resume_root_id.clone()
     };
+    let runtime_snapshot = engine
+        .pin_run_snapshot(
+            session,
+            plan_revision,
+            &previous.agent_role,
+            previous.task_id.as_deref(),
+        )
+        .await?;
     let run = SessionRun {
         run_id,
         session_id: session.id.clone(),
@@ -1019,6 +1031,7 @@ pub(crate) async fn begin_resumed_run(
         budget,
         worktree_head: head,
         plan_revision,
+        runtime_snapshot: Some(runtime_snapshot),
         last_event_seq: 0,
         failure: None,
     };
@@ -1533,6 +1546,7 @@ mod tests {
             budget: RunBudgetSnapshot::default(),
             worktree_head: String::new(),
             plan_revision: 0,
+            runtime_snapshot: None,
             last_event_seq: 0,
             failure: None,
         }
@@ -3097,6 +3111,7 @@ mod journal_store_edge_tests {
             budget: RunBudgetSnapshot::default(),
             worktree_head: String::new(),
             plan_revision: 0,
+            runtime_snapshot: None,
             last_event_seq: 0,
             failure: None,
         };

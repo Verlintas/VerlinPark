@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::runtime::{PolicySnapshot, RuntimeSnapshot};
 use crate::test_cache::TestCacheEntry;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -11164,6 +11165,10 @@ pub struct SessionBundle {
     /// verifier hash, never a raw token).
     #[serde(default)]
     pub gates: Vec<GateRecord>,
+    /// Immutable project policy bundles referenced by this archive's plan/run
+    /// snapshots. No secrets: policies only.
+    #[serde(default)]
+    pub policy_snapshots: Vec<PolicySnapshot>,
     /// Event-backed stall recovery rows. Older bundles decode as an empty
     /// list; importing the archive replays the recovery events it carries.
     #[serde(default)]
@@ -11323,6 +11328,10 @@ pub struct SessionRun {
     pub worktree_head: String,
     #[serde(default)]
     pub plan_revision: u32,
+    /// Runtime/policy/tool-bundle/layout identity captured when this run
+    /// started. Older rows and bundles decode as `None` (legacy drift).
+    #[serde(default)]
+    pub runtime_snapshot: Option<RuntimeSnapshot>,
     #[serde(default)]
     pub last_event_seq: u64,
     #[serde(default)]
@@ -11546,6 +11555,10 @@ pub struct SessionReplayReport {
     /// Event-backed local effect receipt projection (`effect.*` events).
     #[serde(default)]
     pub effects_match: bool,
+    /// Immutable policy-bundle rows referenced by this session's plan/run
+    /// snapshots and `policy.snapshot` events.
+    #[serde(default)]
+    pub policy_snapshots_match: bool,
     pub consistent: bool,
     #[serde(default)]
     pub repaired: bool,
@@ -16845,6 +16858,7 @@ mod context_checkpoint_bundle_tests {
             steering: Vec::new(),
             continuations: Vec::new(),
             gates: Vec::new(),
+            policy_snapshots: Vec::new(),
             recoveries: Vec::new(),
             programs: Vec::new(),
             program_milestones: Vec::new(),

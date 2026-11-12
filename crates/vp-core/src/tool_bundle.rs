@@ -1175,6 +1175,27 @@ pub fn bundle_hash(selection: &ToolBundleSelection, builtin_tools: &[ToolSchema]
     )
 }
 
+/// Identity hash of a bundle's advertised **membership**, independent of the
+/// dynamic schema bytes. Runtime pinning uses this to detect that a plan or run
+/// was created under a different tool partition without forcing a provider or
+/// MCP schema read during resume. The exact frozen schema bytes are still
+/// recorded in `context.prompt_prefix` as `tools_hash`.
+pub fn bundle_contract_hash(selection: &ToolBundleSelection) -> String {
+    let names = bundle_tool_names(selection.kind, &selection.role, &selection.profile);
+    crate::sha256_hex(
+        format!(
+            "vp.tool_bundle_contract/v1\n{TOOL_BUNDLE_VERSION}\n{}\n{}\n{}\n{}\n{}\n{}",
+            selection.kind.as_str(),
+            selection.role,
+            selection.profile,
+            selection.task_kind.as_deref().unwrap_or(""),
+            selection.fallback,
+            names.join(",")
+        )
+        .as_bytes(),
+    )
+}
+
 /// Rough schema-token estimate used only for reporting. The agent loop keeps
 /// its own estimator for hard context limits.
 pub fn estimate_tool_tokens(tools: &[ToolSchema]) -> u64 {

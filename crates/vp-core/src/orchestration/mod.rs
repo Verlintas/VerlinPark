@@ -8,6 +8,7 @@ pub mod controller;
 pub mod plan;
 pub mod policy;
 pub mod recovery;
+pub mod replay;
 pub mod snapshot;
 
 pub use controller::{

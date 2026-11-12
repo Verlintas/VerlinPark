@@ -95,6 +95,7 @@ final class AppModel {
     var sessionContract: SessionContractReport?
     var sessionEffects: SessionEffectsReport?
     var sessionGates: SessionGatesReport?
+    var sessionCompatibility: CompatibilityReportView?
     var governorStatus: GovernorSessionStatus?
     var governorStatusMessage: String?
     var efficiencyBusy = false
@@ -3765,6 +3766,7 @@ final class AppModel {
             sessionContract = nil
             sessionEffects = nil
             sessionGates = nil
+            sessionCompatibility = nil
             governorStatus = nil
             governorStatusMessage = nil
             toolActivity = nil
@@ -3836,6 +3838,15 @@ final class AppModel {
         } catch {
             guard isCurrent(sessionID: sessionID, generation: generation) else { return }
             sessionGates = nil
+        }
+
+        do {
+            let compatibility = try await core.sessionCompatibility(sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            sessionCompatibility = compatibility
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            sessionCompatibility = nil
         }
 
         do {

@@ -292,7 +292,7 @@ impl ScalingAction {
 /// One evaluated decision. The projection/event payload is this exact shape.
 /// `applied` is false for previews and holds; the tick sets it after the slot
 /// targets have been committed.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ScalingDecision {
     #[serde(default)]
     pub decision_id: String,
@@ -337,6 +337,12 @@ pub struct ScalingDecision {
     pub idle_since_workers: Option<String>,
     #[serde(default)]
     pub idle_since_labour: Option<String>,
+    /// Deterministic controller inputs captured when the decision was
+    /// recorded. Older decisions decode as `None` and controller replay marks
+    /// them skipped rather than guessing. The payload contains plan task
+    /// observations and project policy, never prompts or provider content.
+    #[serde(default)]
+    pub replay_inputs: Option<serde_json::Value>,
     #[serde(default)]
     pub created_at: String,
 }
@@ -349,6 +355,52 @@ impl ScalingDecision {
         }
         self.reasons.join(" | ")
     }
+}
+
+/// Exact deterministic inputs for one scaling decision. This is persisted in
+/// `ScalingDecision.replay_inputs` so `orchestration.replay` can feed the
+/// current pure controller without reading a later, mutated projection.
+///
+/// Times are RFC3339 strings (never local paths), and the payload contains no
+/// prompt, provider key, command text, or file content.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScalingReplayInputs {
+    #[serde(default)]
+    pub policy: ScalingPolicy,
+    #[serde(default)]
+    pub session_status: String,
+    #[serde(default)]
+    pub plan_revision: u64,
+    #[serde(default)]
+    pub tasks: Vec<ScalingTaskObservation>,
+    #[serde(default)]
+    pub current_workers: u32,
+    #[serde(default)]
+    pub current_labour: u32,
+    #[serde(default)]
+    pub active_workers: u32,
+    #[serde(default)]
+    pub active_labour: u32,
+    #[serde(default)]
+    pub global_worker_available: u32,
+    #[serde(default)]
+    pub global_labour_available: u32,
+    #[serde(default)]
+    pub budget_headroom_ratio: Option<f64>,
+    #[serde(default)]
+    pub last_action_at: Option<String>,
+    #[serde(default)]
+    pub last_plan_revision: Option<u64>,
+    #[serde(default)]
+    pub idle_since_workers: Option<String>,
+    #[serde(default)]
+    pub idle_since_labour: Option<String>,
+    #[serde(default)]
+    pub now: String,
+    #[serde(default)]
+    pub hard_worker_cap: u32,
+    #[serde(default)]
+    pub hard_labour_cap: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
