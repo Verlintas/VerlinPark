@@ -1898,19 +1898,19 @@ mod tests {
                 )
                 .unwrap();
         }
-        let stats = access.stats("2026-11-12T01:00:00Z").unwrap();
+        // Persisted rows use the wall clock, so the sweep boundary must be
+        // strictly after any plausible test-run time. A fixed past timestamp
+        // makes this test expire as soon as the calendar passes it.
+        let now = "2100-01-01T00:00:00Z";
+        let stats = access.stats(now).unwrap();
         assert_eq!(stats.entries, 3);
         assert_eq!(stats.passed, 3);
         assert_eq!(stats.output_bytes, 12);
-        let dry = access
-            .prune(Some(0), false, None, true, "2026-11-12T01:00:00Z")
-            .unwrap();
+        let dry = access.prune(Some(0), false, None, true, now).unwrap();
         assert_eq!(dry.removed_ids.len(), 3);
         assert_eq!(dry.remaining, 3);
         assert!(dry.events.is_empty());
-        let swept = access
-            .prune(Some(0), false, None, false, "2026-11-12T01:00:00Z")
-            .unwrap();
+        let swept = access.prune(Some(0), false, None, false, now).unwrap();
         assert_eq!(swept.remaining, 0);
         assert!(!swept.events.is_empty());
         assert!(require_clear_confirmation(false).is_err());

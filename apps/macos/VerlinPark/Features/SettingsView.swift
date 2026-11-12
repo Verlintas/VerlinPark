@@ -1791,6 +1791,11 @@ struct AboutSettingsView: View {
                     )
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundStyle(.secondary)
+                    if let revoked = status.revokedKeyCount, revoked > 0 {
+                        Text("Revoked keys: \(revoked) · historical verification requires --allow-revoked")
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(.orange)
+                    }
                     if let latest = status.repositories
                         .max(by: { $0.highestGeneration < $1.highestGeneration })
                     {
@@ -1805,6 +1810,18 @@ struct AboutSettingsView: View {
                         Text(L10n.t("No verified backup anchor yet"))
                             .font(.system(size: 9, design: .monospaced))
                             .foregroundStyle(.secondary)
+                    }
+                    if let imported = status.importedRepositories, imported > 0 {
+                        Text(
+                            "Portable anchor imports: \(imported) high-water mark\(imported == 1 ? "" : "s") (raise-only)"
+                        )
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    }
+                    if let version = status.portableAnchorFormatVersion, version > 0 {
+                        Text("Portable anchor documents: format v\(version) · signed, local-only")
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(.tertiary)
                     }
                     Text(status.note)
                         .font(.system(size: 8, design: .monospaced))

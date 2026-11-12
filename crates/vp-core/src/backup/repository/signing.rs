@@ -123,6 +123,10 @@ pub struct SignatureCheck {
     pub key_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// True when the signature verified but the signing key is revoked and the
+    /// caller explicitly allowed revoked keys.
+    #[serde(default)]
+    pub revoked: bool,
 }
 
 impl SignatureCheck {
@@ -131,6 +135,16 @@ impl SignatureCheck {
             status: "verified".to_string(),
             key_id: Some(key_id.to_string()),
             detail: None,
+            revoked: false,
+        }
+    }
+
+    pub fn verified_with_revoked_key(key_id: &str, detail: impl Into<String>) -> Self {
+        Self {
+            status: "verified".to_string(),
+            key_id: Some(key_id.to_string()),
+            detail: Some(detail.into()),
+            revoked: true,
         }
     }
 
@@ -139,6 +153,7 @@ impl SignatureCheck {
             status: "unsigned".to_string(),
             key_id: None,
             detail: Some(detail.into()),
+            revoked: false,
         }
     }
 
@@ -147,11 +162,27 @@ impl SignatureCheck {
             status: "unverified".to_string(),
             key_id: Some(key_id.to_string()),
             detail: Some(detail.into()),
+            revoked: false,
         }
     }
 
     pub fn is_verified(&self) -> bool {
         self.status == "verified"
+    }
+
+    pub fn is_revoked(&self) -> bool {
+        self.revoked
+    }
+
+    pub fn warning(&self) -> Option<String> {
+        self.revoked.then(|| {
+            self.detail.clone().unwrap_or_else(|| {
+                format!(
+                    "signature verified with revoked key {:?}",
+                    self.key_id.as_deref().unwrap_or("unknown")
+                )
+            })
+        })
     }
 }
 
@@ -266,7 +297,7 @@ pub(crate) fn verify_snapshot_signature(
             "no keyring was supplied; signature not checked",
         ));
     };
-    let public = keyring.public_key(&signature.key_id)?;
+    let public = keyring.public_key_for_verification(&signature.key_id)?;
     let payload = snapshot_signature_payload(&metadata.repository_id, &signature.key_id, manifest)?;
     verify_payload(
         &public,
@@ -288,6 +319,12 @@ pub(crate) fn verify_snapshot_signature(
             error
         }
     })?;
+    if let Some(warning) = keyring.revocation_warning(&signature.key_id) {
+        return Ok(SignatureCheck::verified_with_revoked_key(
+            &signature.key_id,
+            warning,
+        ));
+    }
     Ok(SignatureCheck::verified(&signature.key_id))
 }
 
@@ -328,7 +365,7 @@ pub(crate) fn verify_metadata_signature(
     let Some(keyring) = keyring else {
         return Err(BackupSecurityError::KeyringRequired.into());
     };
-    let public = keyring.public_key(&signing.active_key_id)?;
+    let public = keyring.public_key_for_verification(&signing.active_key_id)?;
     let payload = metadata_signature_payload(metadata)?;
     let signature = BASE64
         .decode(signature_b64.as_bytes())
@@ -347,6 +384,12 @@ pub(crate) fn verify_metadata_signature(
             error
         }
     })?;
+    if let Some(warning) = keyring.revocation_warning(&signing.active_key_id) {
+        return Ok(SignatureCheck::verified_with_revoked_key(
+            &signing.active_key_id,
+            warning,
+        ));
+    }
     Ok(SignatureCheck::verified(&signing.active_key_id))
 }
 

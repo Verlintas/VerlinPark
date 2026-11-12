@@ -98,6 +98,14 @@ fn help_exposes_repository_commands_and_no_passphrase_argument() {
     assert_success(&run(&["backup-key-export-public", "--help"]));
     assert_success(&run(&["backup-keyring", "--help"]));
     assert_success(&run(&["backup-anchor", "--help"]));
+    assert_success(&run(&["backup-key-revoke", "--help"]));
+    assert_success(&run(&["backup-rekey", "--help"]));
+    assert_success(&run(&["backup-anchor-export", "--help"]));
+    assert_success(&run(&["backup-anchor-import", "--help"]));
+    assert_success(&run(&["backup-anchor-verify", "--help"]));
+    assert_success(&run(&["backup-key-events", "--help"]));
+    let help = String::from_utf8_lossy(&run(&["backup-verify", "--help"]).stdout).to_string();
+    assert!(help.contains("--allow-revoked"), "{help}");
 }
 
 #[test]
@@ -782,4 +790,346 @@ fn cli_rollback_rejection_key_rotation_and_anchor_reset() {
     let anchor = run(&["--json", "backup-anchor", "--data-dir", path(data.path())]);
     assert_success(&anchor);
     assert_eq!(stdout_json(&anchor)["present"].as_bool(), Some(false));
+}
+
+#[test]
+fn cli_revocation_rekey_and_portable_anchor_round_trip() {
+    let data = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+    let keys = output_dir.path().join("keys");
+    seed_data_dir(data.path());
+    generate_key(&keys, "old");
+    let repo = output_dir.path().join("repository");
+    assert_success(&signed_backup(data.path(), &repo, &keys, "old", false));
+    fs::write(
+        data.path().join("projects.jsonl"),
+        b"{\"id\":\"project-1\",\"name\":\"rekey\"}\n",
+    )
+    .unwrap();
+    assert_success(&signed_backup(data.path(), &repo, &keys, "old", true));
+
+    let rotated = run(&[
+        "--json",
+        "backup-key-rotate",
+        "new",
+        "--keyring-dir",
+        path(&keys),
+    ]);
+    assert_success(&rotated);
+    let revoked = run(&[
+        "--json",
+        "backup-key-revoke",
+        "old",
+        "--keyring-dir",
+        path(&keys),
+    ]);
+    assert_success(&revoked);
+    let value = stdout_json(&revoked);
+    assert_eq!(value["key_id"], "old");
+    assert_eq!(value["changed"].as_bool(), Some(true));
+    assert_eq!(value["was_active"].as_bool(), Some(false));
+
+    let events = run(&[
+        "--json",
+        "backup-key-events",
+        "--keyring-dir",
+        path(&keys),
+        "--limit",
+        "10",
+    ]);
+    assert_success(&events);
+    let value = stdout_json(&events);
+    assert!(value["event_count"].as_u64().unwrap() >= 3);
+    assert_eq!(value["events"][0]["event"].as_str(), Some("key.revoked"));
+    let rendered = serde_json::to_string(&value).unwrap();
+    assert!(!rendered.contains("seed_b64"));
+    assert!(!rendered.contains("private"));
+
+    let listed_keys = run(&["--json", "backup-key-list", "--keyring-dir", path(&keys)]);
+    assert_success(&listed_keys);
+    let value = stdout_json(&listed_keys);
+    assert_eq!(value["revoked_key_count"].as_u64(), Some(1));
+    let old = value["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|key| key["key_id"] == "old")
+        .unwrap();
+    assert!(old["revoked_at"].is_string());
+
+    let refused = run_with_env(
+        &[
+            "backup-list",
+            "--repository",
+            path(&repo),
+            "--passphrase-env",
+            PASSPHRASE_ENV,
+            "--keyring-dir",
+            path(&keys),
+        ],
+        PASSPHRASE_ENV,
+        PASSPHRASE,
+    );
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(
+        stderr(&refused).contains("BACKUP_KEY_REVOKED"),
+        "{}",
+        stderr(&refused)
+    );
+
+    let allowed = run_with_env(
+        &[
+            "--json",
+            "backup-list",
+            "--repository",
+            path(&repo),
+            "--passphrase-env",
+            PASSPHRASE_ENV,
+            "--keyring-dir",
+            path(&keys),
+            "--allow-revoked",
+        ],
+        PASSPHRASE_ENV,
+        PASSPHRASE,
+    );
+    assert_success(&allowed);
+    let value = stdout_json(&allowed);
+    assert_eq!(value["validation"]["revoked_signatures"].as_u64(), Some(3));
+
+    let dry_run = run_with_env(
+        &[
+            "--json",
+            "backup-rekey",
+            "--repository",
+            path(&repo),
+            "--passphrase-env",
+            PASSPHRASE_ENV,
+            "--keyring-dir",
+            path(&keys),
+            "--dry-run",
+        ],
+        PASSPHRASE_ENV,
+        PASSPHRASE,
+    );
+    assert_success(&dry_run);
+    let value = stdout_json(&dry_run);
+    assert_eq!(value["dry_run"].as_bool(), Some(true));
+    assert_eq!(value["applied"].as_bool(), Some(false));
+    assert_eq!(value["snapshots_resigned"].as_u64(), Some(2));
+
+    let rekey = run_with_env(
+        &[
+            "--json",
+            "backup-rekey",
+            "--repository",
+            path(&repo),
+            "--passphrase-env",
+            PASSPHRASE_ENV,
+            "--keyring-dir",
+            path(&keys),
+        ],
+        PASSPHRASE_ENV,
+        PASSPHRASE,
+    );
+    assert_success(&rekey);
+    let value = stdout_json(&rekey);
+    assert_eq!(value["applied"].as_bool(), Some(true));
+    assert_eq!(value["previous_key_id"], "old");
+    assert_eq!(value["key_id"], "new");
+    assert_eq!(value["snapshots_resigned"].as_u64(), Some(2));
+    assert_eq!(value["blob_ciphertext_unchanged"].as_bool(), Some(true));
+    assert_eq!(value["parent_chain_preserved"].as_bool(), Some(true));
+    assert_eq!(value["entries_preserved"].as_bool(), Some(true));
+
+    let verified = run_with_env(
+        &[
+            "--json",
+            "backup-verify",
+            "--repository",
+            path(&repo),
+            "--passphrase-env",
+            PASSPHRASE_ENV,
+            "--keyring-dir",
+            path(&keys),
+            "--data-dir",
+            path(data.path()),
+        ],
+        PASSPHRASE_ENV,
+        PASSPHRASE,
+    );
+    assert_success(&verified);
+    let value = stdout_json(&verified);
+    assert_eq!(value["valid"].as_bool(), Some(true));
+    assert_eq!(value["metadata_signature"]["key_id"], "new");
+    assert_eq!(value["signed_snapshots"].as_u64(), Some(2));
+
+    // Portable anchor export from the source host.
+    let portable = output_dir.path().join("portable-anchor.json");
+    let exported = run(&[
+        "--json",
+        "--data-dir",
+        path(data.path()),
+        "backup-anchor-export",
+        "--keyring-dir",
+        path(&keys),
+        "--output",
+        path(&portable),
+    ]);
+    assert_success(&exported);
+    let value = stdout_json(&exported);
+    assert_eq!(value["key_id"], "new");
+    assert_eq!(value["repository_count"].as_u64(), Some(1));
+    assert!(portable.is_file());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&portable).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    // A fresh host previews, then imports the signed document and raises its
+    // anchor.
+    let fresh = TempDir::new().unwrap();
+    let inspected = run(&[
+        "--json",
+        "--data-dir",
+        path(fresh.path()),
+        "backup-anchor-verify",
+        "--keyring-dir",
+        path(&keys),
+        "--input",
+        path(&portable),
+    ]);
+    assert_success(&inspected);
+    let value = stdout_json(&inspected);
+    assert_eq!(value["signature"].as_str(), Some("verified"));
+    assert_eq!(value["would_raise"].as_u64(), Some(1));
+    assert_eq!(value["unchanged"].as_u64(), Some(0));
+    let imported = run(&[
+        "--json",
+        "--data-dir",
+        path(fresh.path()),
+        "backup-anchor-import",
+        "--keyring-dir",
+        path(&keys),
+        "--input",
+        path(&portable),
+    ]);
+    assert_success(&imported);
+    let value = stdout_json(&imported);
+    assert_eq!(value["repositories_total"].as_u64(), Some(1));
+    assert_eq!(value["repositories_raised"].as_u64(), Some(1));
+    assert_eq!(value["raises"][0]["highest_generation"].as_u64(), Some(2));
+    let anchor = run(&["--json", "backup-anchor", "--data-dir", path(fresh.path())]);
+    assert_success(&anchor);
+    let value = stdout_json(&anchor);
+    assert_eq!(value["imported_repositories"].as_u64(), Some(1));
+    assert_eq!(
+        value["repositories"][0]["last_operation"].as_str(),
+        Some("anchor_import")
+    );
+    assert_eq!(
+        value["repositories"][0]["origin"].as_str(),
+        Some("portable_import")
+    );
+
+    // Importing the same document again cannot lower or raise anything.
+    let imported_again = run(&[
+        "--json",
+        "--data-dir",
+        path(fresh.path()),
+        "backup-anchor-import",
+        "--keyring-dir",
+        path(&keys),
+        "--input",
+        path(&portable),
+    ]);
+    assert_success(&imported_again);
+    let value = stdout_json(&imported_again);
+    assert_eq!(value["repositories_raised"].as_u64(), Some(0));
+    assert_eq!(value["repositories_unchanged"].as_u64(), Some(1));
+    let inspected_again = run(&[
+        "--json",
+        "--data-dir",
+        path(fresh.path()),
+        "backup-anchor-verify",
+        "--keyring-dir",
+        path(&keys),
+        "--input",
+        path(&portable),
+    ]);
+    assert_success(&inspected_again);
+    let value = stdout_json(&inspected_again);
+    assert_eq!(value["would_raise"].as_u64(), Some(0));
+    assert_eq!(value["unchanged"].as_u64(), Some(1));
+
+    // Tampering with a signed document is rejected with a typed code.
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(&portable).unwrap()).unwrap();
+    document["repositories"][0]["highest_generation"] = serde_json::json!(99);
+    let tampered = output_dir.path().join("tampered-anchor.json");
+    fs::write(&tampered, serde_json::to_vec(&document).unwrap()).unwrap();
+    let rejected = run(&[
+        "--data-dir",
+        path(fresh.path()),
+        "backup-anchor-import",
+        "--keyring-dir",
+        path(&keys),
+        "--input",
+        path(&tampered),
+    ]);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(
+        stderr(&rejected).contains("BACKUP_ANCHOR_SIGNATURE_INVALID"),
+        "{}",
+        stderr(&rejected)
+    );
+}
+
+#[test]
+fn cli_active_key_revocation_requires_force() {
+    let output_dir = TempDir::new().unwrap();
+    let keys = output_dir.path().join("keys");
+    generate_key(&keys, "primary");
+
+    let refused = run(&["backup-key-revoke", "primary", "--keyring-dir", path(&keys)]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(
+        stderr(&refused).contains("BACKUP_KEY_REVOKE_ACTIVE"),
+        "{}",
+        stderr(&refused)
+    );
+
+    let forced = run(&[
+        "--json",
+        "backup-key-revoke",
+        "primary",
+        "--keyring-dir",
+        path(&keys),
+        "--force",
+    ]);
+    assert_success(&forced);
+    let value = stdout_json(&forced);
+    assert_eq!(value["was_active"].as_bool(), Some(true));
+    assert!(value["active_key_id"].is_null());
+    assert!(
+        value["warning"]
+            .as_str()
+            .unwrap()
+            .contains("no key can sign")
+    );
+
+    let listed = run(&["--json", "backup-key-list", "--keyring-dir", path(&keys)]);
+    assert_success(&listed);
+    assert!(stdout_json(&listed)["active_key_id"].is_null());
+
+    let replacement = run(&[
+        "--json",
+        "backup-key-generate",
+        "replacement",
+        "--keyring-dir",
+        path(&keys),
+    ]);
+    assert_success(&replacement);
+    assert_eq!(stdout_json(&replacement)["active"].as_bool(), Some(true));
 }

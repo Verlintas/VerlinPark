@@ -4260,14 +4260,21 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
 
 /// Read-only backup signing status. Never returns private key material.
 fn backup_status(data_dir: &Path) -> Result<vp_protocol::types::BackupStatusResult> {
+    backup_status_in(data_dir, &vp_core::backup::signing::default_key_dir())
+}
+
+/// Testable status reader with an explicit key directory.
+fn backup_status_in(
+    data_dir: &Path,
+    key_dir: &Path,
+) -> Result<vp_protocol::types::BackupStatusResult> {
     use vp_core::backup::anchor::AnchorStore;
-    use vp_core::backup::signing::{Keyring, default_key_dir};
+    use vp_core::backup::signing::Keyring;
     use vp_protocol::types::{BackupAnchorStatus, BackupSigningKeyStatus, BackupStatusResult};
 
     let anchor = AnchorStore::new(data_dir).summary()?;
-    let key_dir = default_key_dir();
     let keyring_path = key_dir.join("keyring.json");
-    let keyring = Keyring::load_optional(&key_dir)?;
+    let keyring = Keyring::load_optional(key_dir)?;
     let (keyring_present, active_key_id, keys) = match &keyring {
         Some(keyring) => {
             let summary = keyring.summary();
@@ -4283,6 +4290,7 @@ fn backup_status(data_dir: &Path) -> Result<vp_protocol::types::BackupStatusResu
                         public_key_b64: key.public_key_b64,
                         created_at: key.created_at,
                         retired_at: key.retired_at,
+                        revoked_at: key.revoked_at,
                         active: key.active,
                     })
                     .collect(),
@@ -4290,31 +4298,37 @@ fn backup_status(data_dir: &Path) -> Result<vp_protocol::types::BackupStatusResu
         }
         None => (false, None, Vec::new()),
     };
+    let imported_repositories = anchor.imported_repositories;
+    let repositories = anchor
+        .repositories
+        .into_iter()
+        .map(|entry| BackupAnchorStatus {
+            repository_id: entry.repository_id,
+            repository_path: entry.repository_path,
+            highest_generation: entry.highest_generation,
+            last_verified_generation: entry.last_verified_generation,
+            last_snapshot_id: entry.last_snapshot_id,
+            last_operation: entry.last_operation,
+            first_seen_at: entry.first_seen_at,
+            last_verified_at: entry.last_verified_at,
+            origin: entry.origin,
+        })
+        .collect();
     Ok(BackupStatusResult {
         anchor_path: anchor.path,
         anchor_present: anchor.present,
         anchor_updated_at: anchor.updated_at,
-        repositories: anchor
-            .repositories
-            .into_iter()
-            .map(|entry| BackupAnchorStatus {
-                repository_id: entry.repository_id,
-                repository_path: entry.repository_path,
-                highest_generation: entry.highest_generation,
-                last_verified_generation: entry.last_verified_generation,
-                last_snapshot_id: entry.last_snapshot_id,
-                last_operation: entry.last_operation,
-                first_seen_at: entry.first_seen_at,
-                last_verified_at: entry.last_verified_at,
-            })
-            .collect(),
+        repositories,
         keyring_path: keyring_path.display().to_string(),
         keyring_present,
         active_key_id,
         key_count: keys.len(),
+        revoked_key_count: keys.iter().filter(|key| key.revoked_at.is_some()).count(),
         keys,
         signed_repository_formats: vec![3],
-        note: "Backup signing, verification, and restore are CLI operations. The local anchor is not tamper-proof against this OS user or root and is not remote attestation, KMS, escrow, or a signed timestamp.".to_string(),
+        portable_anchor_format_version: vp_core::backup::anchor::PORTABLE_ANCHOR_FORMAT_VERSION,
+        imported_repositories,
+        note: "Backup signing, verification, rekey, and restore are CLI operations. Revoked keys verify only with --allow-revoked. The local anchor is not tamper-proof against this OS user or root and is not remote attestation, KMS, escrow, or a signed timestamp.".to_string(),
     })
 }
 
@@ -5202,18 +5216,95 @@ mod process_rpc_tests {
     #[tokio::test]
     async fn backup_status_reports_anchor_without_secret_material() {
         let data = TempDir::new().unwrap();
+        let keys = TempDir::new().unwrap();
         let repository_id = "0190f000-0000-7000-8000-000000000000";
         let anchor = vp_core::backup::anchor::AnchorStore::new(data.path());
         anchor
             .record_verified(repository_id, "/backups/repo", None, 4, "verify", false)
             .unwrap();
-        let status = backup_status(data.path()).unwrap();
+        let status = backup_status_in(data.path(), keys.path()).unwrap();
         assert!(status.anchor_present);
         assert_eq!(status.repositories.len(), 1);
         assert_eq!(status.repositories[0].highest_generation, 4);
         assert_eq!(status.repositories[0].last_verified_generation, 4);
         assert_eq!(status.signed_repository_formats, vec![3]);
+        assert_eq!(status.revoked_key_count, 0);
+        assert_eq!(
+            status.portable_anchor_format_version,
+            vp_core::backup::anchor::PORTABLE_ANCHOR_FORMAT_VERSION
+        );
+        assert_eq!(status.imported_repositories, 0);
         assert!(status.note.contains("not tamper-proof"));
+        assert!(status.note.contains("allow-revoked"));
+        let rendered = serde_json::to_string(&status).unwrap();
+        assert!(!rendered.contains("seed_b64"));
+        assert!(!rendered.contains("private_key"));
+        assert!(!rendered.contains("passphrase"));
+    }
+
+    #[tokio::test]
+    async fn backup_status_reports_revoked_keys_and_portable_imports_without_secrets() {
+        use vp_core::backup::anchor::{AnchorStore, PortableAnchorImportOptions};
+        use vp_core::backup::signing::{Keyring, SecretSource};
+
+        let data = TempDir::new().unwrap();
+        let keys = TempDir::new().unwrap();
+        let source_data = TempDir::new().unwrap();
+        Keyring::generate_key(
+            keys.path(),
+            "old",
+            true,
+            SecretSource::File {
+                name: "old.key".to_string(),
+            },
+        )
+        .unwrap();
+        Keyring::generate_key(
+            keys.path(),
+            "new",
+            true,
+            SecretSource::File {
+                name: "new.key".to_string(),
+            },
+        )
+        .unwrap();
+        let mut keyring = Keyring::load(keys.path()).unwrap();
+        keyring.revoke_key("old", false).unwrap();
+
+        let repository_id = "0190f000-0000-7000-8000-000000000011";
+        let source = AnchorStore::new(source_data.path());
+        source
+            .record_verified(repository_id, "/source/repo", None, 7, "verify", false)
+            .unwrap();
+        let export = source
+            .export_portable(&Keyring::load(keys.path()).unwrap(), None, None)
+            .unwrap();
+        let target = AnchorStore::new(data.path());
+        target
+            .import_portable(
+                &export.document,
+                PortableAnchorImportOptions {
+                    keyring: &Keyring::load(keys.path()).unwrap(),
+                    allow_revoked: false,
+                    reject_stale: false,
+                },
+            )
+            .unwrap();
+
+        let status = backup_status_in(data.path(), keys.path()).unwrap();
+        assert_eq!(status.active_key_id.as_deref(), Some("new"));
+        assert_eq!(status.revoked_key_count, 1);
+        assert_eq!(status.imported_repositories, 1);
+        assert_eq!(status.portable_anchor_format_version, 1);
+        let old = status.keys.iter().find(|key| key.key_id == "old").unwrap();
+        assert!(old.revoked_at.is_some());
+        assert!(!old.active);
+        assert_eq!(
+            status.repositories[0].origin.as_deref(),
+            Some("portable_import")
+        );
+        assert_eq!(status.repositories[0].last_operation, "anchor_import");
+
         let rendered = serde_json::to_string(&status).unwrap();
         assert!(!rendered.contains("seed_b64"));
         assert!(!rendered.contains("private_key"));

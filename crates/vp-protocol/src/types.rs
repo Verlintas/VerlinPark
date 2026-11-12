@@ -14215,6 +14215,8 @@ pub struct BackupAnchorStatus {
     pub last_operation: String,
     pub first_seen_at: String,
     pub last_verified_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 /// One public backup signing key.
@@ -14225,6 +14227,8 @@ pub struct BackupSigningKeyStatus {
     pub public_key_b64: String,
     pub created_at: String,
     pub retired_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<String>,
     pub active: bool,
 }
 
@@ -14241,6 +14245,122 @@ pub struct BackupStatusResult {
     pub key_count: usize,
     pub keys: Vec<BackupSigningKeyStatus>,
     pub signed_repository_formats: Vec<u32>,
+    /// Additive: number of public keys whose signatures are refused by default.
+    #[serde(default)]
+    pub revoked_key_count: usize,
+    /// Additive: portable anchor document format version accepted by this build.
+    #[serde(default)]
+    pub portable_anchor_format_version: u32,
+    /// Additive: repositories whose high-water mark came from a portable import.
+    #[serde(default)]
+    pub imported_repositories: usize,
     /// Always present: explains local-anchor and no-escrow limits.
     pub note: String,
+}
+
+#[cfg(test)]
+mod backup_status_revocation_tests {
+    use super::*;
+
+    #[test]
+    fn backup_status_round_trips_revocation_and_import_fields() {
+        let status = BackupStatusResult {
+            anchor_path: "/tmp/backup-anchor.json".into(),
+            anchor_present: true,
+            anchor_updated_at: Some("2026-11-12T03:00:00Z".into()),
+            repositories: vec![BackupAnchorStatus {
+                repository_id: "01930000-0000-7000-8000-000000000001".into(),
+                repository_path: "(portable import)".into(),
+                highest_generation: 9,
+                last_verified_generation: 9,
+                last_snapshot_id: None,
+                last_operation: "anchor_import".into(),
+                first_seen_at: "2026-11-12T00:00:00Z".into(),
+                last_verified_at: "2026-11-12T03:00:00Z".into(),
+                origin: Some("portable_import".into()),
+            }],
+            keyring_path: "/tmp/keys/keyring.json".into(),
+            keyring_present: true,
+            active_key_id: Some("new".into()),
+            key_count: 2,
+            keys: vec![
+                BackupSigningKeyStatus {
+                    key_id: "old".into(),
+                    algorithm: "ed25519".into(),
+                    public_key_b64: "AAAA".into(),
+                    created_at: "2026-11-01T00:00:00Z".into(),
+                    retired_at: Some("2026-11-10T00:00:00Z".into()),
+                    revoked_at: Some("2026-11-12T02:00:00Z".into()),
+                    active: false,
+                },
+                BackupSigningKeyStatus {
+                    key_id: "new".into(),
+                    algorithm: "ed25519".into(),
+                    public_key_b64: "BBBB".into(),
+                    created_at: "2026-11-10T00:00:00Z".into(),
+                    retired_at: None,
+                    revoked_at: None,
+                    active: true,
+                },
+            ],
+            signed_repository_formats: vec![3],
+            revoked_key_count: 1,
+            portable_anchor_format_version: 1,
+            imported_repositories: 1,
+            note: "Local anchor, no escrow.".into(),
+        };
+        let encoded = serde_json::to_value(&status).unwrap();
+        let decoded: BackupStatusResult = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, status);
+        assert_eq!(decoded.revoked_key_count, 1);
+        assert_eq!(
+            decoded.keys[0].revoked_at.as_deref(),
+            Some("2026-11-12T02:00:00Z")
+        );
+        assert!(decoded.keys[1].revoked_at.is_none());
+        assert_eq!(
+            decoded.repositories[0].origin.as_deref(),
+            Some("portable_import")
+        );
+    }
+
+    #[test]
+    fn revoked_key_and_portable_anchor_fields_are_additive() {
+        let key: BackupSigningKeyStatus = serde_json::from_value(serde_json::json!({
+            "key_id": "primary",
+            "algorithm": "ed25519",
+            "public_key_b64": "AAAA",
+            "created_at": "2026-11-12T00:00:00Z",
+            "retired_at": null,
+            "active": true
+        }))
+        .unwrap();
+        assert!(key.revoked_at.is_none());
+
+        let key: BackupSigningKeyStatus = serde_json::from_value(serde_json::json!({
+            "key_id": "old",
+            "algorithm": "ed25519",
+            "public_key_b64": "AAAA",
+            "created_at": "2026-11-12T00:00:00Z",
+            "retired_at": "2026-11-12T01:00:00Z",
+            "revoked_at": "2026-11-12T02:00:00Z",
+            "active": false
+        }))
+        .unwrap();
+        assert_eq!(key.revoked_at.as_deref(), Some("2026-11-12T02:00:00Z"));
+
+        let anchor: BackupAnchorStatus = serde_json::from_value(serde_json::json!({
+            "repository_id": "01930000-0000-7000-8000-000000000001",
+            "repository_path": "(portable import)",
+            "highest_generation": 9,
+            "last_verified_generation": 9,
+            "last_snapshot_id": null,
+            "last_operation": "anchor_import",
+            "first_seen_at": "2026-11-12T00:00:00Z",
+            "last_verified_at": "2026-11-12T00:00:00Z"
+        }))
+        .unwrap();
+        assert!(anchor.origin.is_none());
+        assert_eq!(anchor.last_operation, "anchor_import");
+    }
 }

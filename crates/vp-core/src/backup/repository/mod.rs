@@ -78,11 +78,15 @@ use super::crypto::{KdfParameters, RepositoryCrypto, sha256_hex};
 
 mod blob;
 mod format;
+mod rekey;
 mod signing;
 mod verify;
 
 pub use crate::backup::error::{BackupSecurityCode, BackupSecurityError};
 pub use blob::Compression;
+pub use rekey::{
+    MAX_REKEY_SNAPSHOTS, RepositoryRekeyOptions, RepositoryRekeyReport, rekey_repository,
+};
 pub use signing::{ManifestSignature, SignatureCheck, SignatureStatus};
 pub use verify::{RepositoryVerifyOptions, RepositoryVerifyReport, verify_repository};
 
@@ -258,6 +262,12 @@ pub struct RepositoryValidationReport {
     pub unsigned_snapshots: usize,
     #[serde(default)]
     pub metadata_signature: String,
+    /// Number of signature checks accepted from revoked keys because the
+    /// operator passed `--allow-revoked`.
+    #[serde(default)]
+    pub revoked_signatures: usize,
+    #[serde(default)]
+    pub revoked_key_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -317,6 +327,9 @@ pub struct RepositoryRestoreReport {
     pub anchor_update: Option<AnchorUpdate>,
     #[serde(default)]
     pub head_issues: Vec<String>,
+    /// Revoked-key signatures accepted because `allow_revoked` was explicit.
+    #[serde(default)]
+    pub revoked_signature_warnings: Vec<String>,
 }
 
 /// Options for a verified repository restore.
@@ -326,6 +339,8 @@ pub struct RepositoryRestoreOptions<'a> {
     pub keyring: Option<&'a Keyring>,
     pub anchor: Option<&'a AnchorStore>,
     pub allow_rollback: bool,
+    /// Accept signatures made by revoked keys. Default false fails closed.
+    pub allow_revoked: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -785,8 +800,20 @@ pub fn list_repository_snapshots_with_keyring(
     keyring: Option<&Keyring>,
     verify_blobs: bool,
 ) -> Result<RepositoryListReport> {
+    list_repository_snapshots_with_policy(repository, passphrase, keyring, verify_blobs, false)
+}
+
+/// List and validate with an explicit revoked-key policy.
+pub fn list_repository_snapshots_with_policy(
+    repository: &Path,
+    passphrase: Option<&Passphrase>,
+    keyring: Option<&Keyring>,
+    verify_blobs: bool,
+    allow_revoked: bool,
+) -> Result<RepositoryListReport> {
     let root = repository_root(repository, false)?;
-    let session = open_for_read(&root, passphrase, keyring)?;
+    let trusted = keyring.map(|keyring| keyring.clone().with_revoked_keys_allowed(allow_revoked));
+    let session = open_for_read(&root, passphrase, trusted.as_ref())?;
     let snapshots = scan_snapshots(
         &session.root,
         &session.metadata,
@@ -900,6 +927,21 @@ pub fn list_repository_snapshots_with_keyring(
     let nonce_table_valid = true;
     let metadata_check =
         signing::verify_metadata_signature(&session.metadata, session.keyring.as_ref())?;
+    let mut revoked_key_ids = BTreeSet::new();
+    if metadata_check.is_revoked()
+        && let Some(key_id) = &metadata_check.key_id
+    {
+        revoked_key_ids.insert(key_id.clone());
+    }
+    let mut revoked_signatures = usize::from(metadata_check.is_revoked());
+    for snapshot in &snapshots {
+        if snapshot.signature_check.is_revoked() {
+            revoked_signatures += 1;
+            if let Some(key_id) = &snapshot.signature_check.key_id {
+                revoked_key_ids.insert(key_id.clone());
+            }
+        }
+    }
     let signed = session.metadata.format_version >= 3;
     let signing_status = if signed { "signed" } else { "unsigned" }.to_string();
     let valid = blobs_missing == 0 && blobs_corrupt == 0 && issues.is_empty();
@@ -937,6 +979,8 @@ pub fn list_repository_snapshots_with_keyring(
             signed_snapshots,
             unsigned_snapshots,
             metadata_signature: metadata_check.status,
+            revoked_signatures,
+            revoked_key_ids: revoked_key_ids.into_iter().collect(),
         },
         signed,
         signing_status,
@@ -976,7 +1020,12 @@ pub fn restore_repository_snapshot_checked(
         bail!("invalid backup snapshot id {snapshot_id:?}");
     }
     let root = repository_root(repository, false)?;
-    let session = open_for_read(&root, options.passphrase, options.keyring)?;
+    let trusted = options.keyring.map(|keyring| {
+        keyring
+            .clone()
+            .with_revoked_keys_allowed(options.allow_revoked)
+    });
+    let session = open_for_read(&root, options.passphrase, trusted.as_ref())?;
     let snapshots = scan_snapshots(
         &session.root,
         &session.metadata,
@@ -984,6 +1033,21 @@ pub fn restore_repository_snapshot_checked(
         session.keyring.as_ref(),
     )?;
     let snapshot = find_snapshot(&snapshots, snapshot_id)?;
+    let mut revoked_warning_set = BTreeSet::new();
+    for snapshot in &snapshots {
+        if snapshot.signature_check.is_revoked()
+            && let Some(warning) = snapshot.signature_check.warning()
+        {
+            revoked_warning_set.insert(warning);
+        }
+    }
+    if let Some(signing) = &session.metadata.signing
+        && let Some(keyring) = session.keyring.as_ref()
+        && let Some(warning) = keyring.revocation_warning(&signing.active_key_id)
+    {
+        revoked_warning_set.insert(warning);
+    }
+    let revoked_signature_warnings: Vec<String> = revoked_warning_set.into_iter().collect();
     let head_issues = check_signed_head(&session.metadata, &snapshots);
     let rollback = match options.anchor {
         Some(anchor) => match anchor.check(
@@ -1159,6 +1223,7 @@ pub fn restore_repository_snapshot_checked(
         rollback,
         anchor_update,
         head_issues,
+        revoked_signature_warnings: revoked_signature_warnings.clone(),
     };
     if let Err(error) = append_event(
         &session.root,
@@ -1176,6 +1241,22 @@ pub fn restore_repository_snapshot_checked(
         }),
     ) {
         tracing::warn!(%error, "restore completed but its audit event could not be appended");
+    }
+    if !revoked_signature_warnings.is_empty()
+        && let Err(error) = append_event(
+            &session.root,
+            "snapshot.revoked_key_allowed",
+            json!({
+                "repository_id": session.metadata.repository_id,
+                "snapshot_id": report.snapshot_id,
+                "sequence": report.sequence,
+                "operation": "restore",
+                "allow_revoked": options.allow_revoked,
+                "warnings": revoked_signature_warnings,
+            }),
+        )
+    {
+        tracing::warn!(%error, "revoked-key restore audit event could not be appended");
     }
     Ok(report)
 }
@@ -1310,6 +1391,8 @@ pub fn prune_repository_with_signing(
         } else {
             "unsigned".to_string()
         },
+        revoked_signatures: 0,
+        revoked_key_ids: Vec::new(),
     };
     let (signed, signing_key_id, _) = signing_summary(&session.metadata);
     let report = RepositoryPruneReport {
@@ -2182,6 +2265,8 @@ fn _format_symbols() {
     );
 }
 
+#[cfg(test)]
+mod rekey_tests;
 #[cfg(test)]
 mod security_tests;
 #[cfg(test)]

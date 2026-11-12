@@ -21,15 +21,22 @@ pub enum BackupSecurityCode {
     KeyNotFound,
     KeyInvalid,
     KeyMaterialUnavailable,
+    KeyRevoked,
+    KeyRevokeActive,
     KeyringRequired,
     SigningRequired,
     SignatureMissing,
     SignatureInvalid,
     UnsignedRepository,
+    RekeyRefused,
+    RekeyFailed,
     RollbackDetected,
     VerificationFailed,
     AnchorInvalid,
     AnchorIo,
+    AnchorSignatureInvalid,
+    AnchorStale,
+    PortableAnchorInvalid,
     RepositoryFormat,
 }
 
@@ -42,15 +49,22 @@ impl BackupSecurityCode {
             Self::KeyNotFound => "BACKUP_KEY_NOT_FOUND",
             Self::KeyInvalid => "BACKUP_KEY_INVALID",
             Self::KeyMaterialUnavailable => "BACKUP_KEY_MATERIAL_UNAVAILABLE",
+            Self::KeyRevoked => "BACKUP_KEY_REVOKED",
+            Self::KeyRevokeActive => "BACKUP_KEY_REVOKE_ACTIVE",
             Self::KeyringRequired => "BACKUP_KEYRING_REQUIRED",
             Self::SigningRequired => "BACKUP_SIGNING_REQUIRED",
             Self::SignatureMissing => "BACKUP_SIGNATURE_MISSING",
             Self::SignatureInvalid => "BACKUP_SIGNATURE_INVALID",
             Self::UnsignedRepository => "BACKUP_UNSIGNED_REPOSITORY",
+            Self::RekeyRefused => "BACKUP_REKEY_REFUSED",
+            Self::RekeyFailed => "BACKUP_REKEY_FAILED",
             Self::RollbackDetected => "BACKUP_ROLLBACK_DETECTED",
             Self::VerificationFailed => "BACKUP_VERIFY_FAILED",
             Self::AnchorInvalid => "BACKUP_ANCHOR_INVALID",
             Self::AnchorIo => "BACKUP_ANCHOR_IO",
+            Self::AnchorSignatureInvalid => "BACKUP_ANCHOR_SIGNATURE_INVALID",
+            Self::AnchorStale => "BACKUP_ANCHOR_STALE",
+            Self::PortableAnchorInvalid => "BACKUP_PORTABLE_ANCHOR_INVALID",
             Self::RepositoryFormat => "BACKUP_REPOSITORY_FORMAT",
         }
     }
@@ -76,6 +90,12 @@ impl BackupSecurityCode {
             Self::KeyMaterialUnavailable => {
                 "Export the referenced environment variable or restore the 0600 key file."
             }
+            Self::KeyRevoked => {
+                "Rotate to a different signing key, then re-run `vp backup-rekey`; pass `--allow-revoked` only for historical verification."
+            }
+            Self::KeyRevokeActive => {
+                "Rotate to a new active key first with `vp backup-key-rotate`; `--force` revokes the active key and disables signing until a new key is active."
+            }
             Self::KeyringRequired => {
                 "Pass `--keyring-dir` pointing at the keyring that holds the repository's public keys."
             }
@@ -91,6 +111,12 @@ impl BackupSecurityCode {
             Self::UnsignedRepository => {
                 "v2 repositories are readable but unsigned; create a v3 signed repository."
             }
+            Self::RekeyRefused => {
+                "Only signed v3 repositories with a complete keyring can be rekeyed; inspect `vp backup-key-list` and `vp backup-verify`."
+            }
+            Self::RekeyFailed => {
+                "Do not use the repository until rekey finishes successfully; re-run `vp backup-rekey` to resume."
+            }
             Self::RollbackDetected => {
                 "Re-run with `--allow-rollback` only after confirming the older generation is intended."
             }
@@ -102,6 +128,15 @@ impl BackupSecurityCode {
             }
             Self::AnchorIo => {
                 "Check data-directory permissions and free space for the anchor file."
+            }
+            Self::AnchorSignatureInvalid => {
+                "The portable anchor was tampered with or signed by a different key; use the keyring that signs your backups."
+            }
+            Self::AnchorStale => {
+                "The portable anchor export is older than the local anchor; export a fresh document from the source host."
+            }
+            Self::PortableAnchorInvalid => {
+                "Inspect the portable anchor JSON; only documents written by `vp backup-anchor-export` are accepted."
             }
             Self::RepositoryFormat => {
                 "Use a build that supports this repository format; do not edit repository.json by hand."
@@ -140,6 +175,16 @@ pub enum BackupSecurityError {
     KeyMaterialUnavailable { key_id: String },
 
     #[error(
+        "backup signing key {key_id:?} was revoked at {revoked_at}; rotate to a trusted key and rekey the repository, or pass `--allow-revoked` for historical verification [BACKUP_KEY_REVOKED]"
+    )]
+    KeyRevoked { key_id: String, revoked_at: String },
+
+    #[error(
+        "backup signing key {key_id:?} is the active key; rotate to a new key first, or pass `--force` to revoke it and disable signing until another key is active [BACKUP_KEY_REVOKE_ACTIVE]"
+    )]
+    KeyRevokeActive { key_id: String },
+
+    #[error(
         "backup repository is signed but no keyring was provided; pass `--keyring-dir` with its public keys [BACKUP_KEYRING_REQUIRED]"
     )]
     KeyringRequired,
@@ -161,6 +206,12 @@ pub enum BackupSecurityError {
         "backup repository format {format_version} is unsigned; v2 repositories remain readable but cannot prove authenticity [BACKUP_UNSIGNED_REPOSITORY]"
     )]
     UnsignedRepository { format_version: u32 },
+
+    #[error("backup rekey refused: {reason} [BACKUP_REKEY_REFUSED]")]
+    RekeyRefused { reason: String },
+
+    #[error("backup rekey failed: {reason} [BACKUP_REKEY_FAILED]")]
+    RekeyFailed { reason: String },
 
     #[error(
         "backup rollback rejected: repository {repository_id} generation {generation} is older than the local anchor generation {anchor_generation}; pass `--allow-rollback` only after confirming intent [BACKUP_ROLLBACK_DETECTED]"
@@ -185,6 +236,22 @@ pub enum BackupSecurityError {
     AnchorIo { reason: String },
 
     #[error(
+        "backup portable anchor signature is invalid or signed by an untrusted key {key_id:?}: {reason} [BACKUP_ANCHOR_SIGNATURE_INVALID]"
+    )]
+    AnchorSignatureInvalid { key_id: String, reason: String },
+
+    #[error(
+        "backup portable anchor exported at {exported_at} is older than the local anchor updated at {local_updated_at}; export a fresh document or omit strict freshness [BACKUP_ANCHOR_STALE]"
+    )]
+    AnchorStale {
+        exported_at: String,
+        local_updated_at: String,
+    },
+
+    #[error("backup portable anchor is invalid: {reason} [BACKUP_PORTABLE_ANCHOR_INVALID]")]
+    PortableAnchorInvalid { reason: String },
+
+    #[error(
         "unsupported backup repository format version {format_version}; this build supports {minimum}..={maximum} [BACKUP_REPOSITORY_FORMAT]"
     )]
     RepositoryFormat {
@@ -203,15 +270,22 @@ impl BackupSecurityError {
             Self::KeyNotFound { .. } => BackupSecurityCode::KeyNotFound,
             Self::KeyInvalid { .. } => BackupSecurityCode::KeyInvalid,
             Self::KeyMaterialUnavailable { .. } => BackupSecurityCode::KeyMaterialUnavailable,
+            Self::KeyRevoked { .. } => BackupSecurityCode::KeyRevoked,
+            Self::KeyRevokeActive { .. } => BackupSecurityCode::KeyRevokeActive,
             Self::KeyringRequired => BackupSecurityCode::KeyringRequired,
             Self::SigningRequired => BackupSecurityCode::SigningRequired,
             Self::SignatureMissing { .. } => BackupSecurityCode::SignatureMissing,
             Self::SignatureInvalid { .. } => BackupSecurityCode::SignatureInvalid,
             Self::UnsignedRepository { .. } => BackupSecurityCode::UnsignedRepository,
+            Self::RekeyRefused { .. } => BackupSecurityCode::RekeyRefused,
+            Self::RekeyFailed { .. } => BackupSecurityCode::RekeyFailed,
             Self::RollbackDetected { .. } => BackupSecurityCode::RollbackDetected,
             Self::VerificationFailed => BackupSecurityCode::VerificationFailed,
             Self::AnchorInvalid { .. } => BackupSecurityCode::AnchorInvalid,
             Self::AnchorIo { .. } => BackupSecurityCode::AnchorIo,
+            Self::AnchorSignatureInvalid { .. } => BackupSecurityCode::AnchorSignatureInvalid,
+            Self::AnchorStale { .. } => BackupSecurityCode::AnchorStale,
+            Self::PortableAnchorInvalid { .. } => BackupSecurityCode::PortableAnchorInvalid,
             Self::RepositoryFormat { .. } => BackupSecurityCode::RepositoryFormat,
         }
     }
@@ -255,6 +329,13 @@ mod tests {
             BackupSecurityError::KeyMaterialUnavailable {
                 key_id: "primary".into(),
             },
+            BackupSecurityError::KeyRevoked {
+                key_id: "primary".into(),
+                revoked_at: "2026-11-12T00:00:00Z".into(),
+            },
+            BackupSecurityError::KeyRevokeActive {
+                key_id: "primary".into(),
+            },
             BackupSecurityError::KeyringRequired,
             BackupSecurityError::SigningRequired,
             BackupSecurityError::SignatureMissing {
@@ -265,6 +346,12 @@ mod tests {
                 key_id: "primary".into(),
             },
             BackupSecurityError::UnsignedRepository { format_version: 2 },
+            BackupSecurityError::RekeyRefused {
+                reason: "unsigned".into(),
+            },
+            BackupSecurityError::RekeyFailed {
+                reason: "partial".into(),
+            },
             BackupSecurityError::RollbackDetected {
                 repository_id: "repo".into(),
                 generation: 1,
@@ -275,6 +362,17 @@ mod tests {
                 reason: "bad".into(),
             },
             BackupSecurityError::AnchorIo {
+                reason: "bad".into(),
+            },
+            BackupSecurityError::AnchorSignatureInvalid {
+                key_id: "primary".into(),
+                reason: "tampered".into(),
+            },
+            BackupSecurityError::AnchorStale {
+                exported_at: "2026-11-01T00:00:00Z".into(),
+                local_updated_at: "2026-11-12T00:00:00Z".into(),
+            },
+            BackupSecurityError::PortableAnchorInvalid {
                 reason: "bad".into(),
             },
             BackupSecurityError::RepositoryFormat {

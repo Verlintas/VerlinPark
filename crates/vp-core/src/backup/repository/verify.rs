@@ -38,6 +38,9 @@ pub struct RepositoryVerifyOptions<'a> {
     pub keyring: Option<&'a Keyring>,
     pub anchor: Option<&'a AnchorStore>,
     pub allow_rollback: bool,
+    /// Accept and report signatures made by keys marked revoked. Default false
+    /// fails closed with `BACKUP_KEY_REVOKED`.
+    pub allow_revoked: bool,
     /// Decrypt and hash every referenced blob. Presence is always checked.
     pub verify_blobs: bool,
 }
@@ -49,6 +52,7 @@ impl Default for RepositoryVerifyOptions<'_> {
             keyring: None,
             anchor: None,
             allow_rollback: false,
+            allow_revoked: false,
             verify_blobs: true,
         }
     }
@@ -86,6 +90,9 @@ pub struct RepositoryVerifyReport {
     pub rollback: Option<RollbackCheck>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_update: Option<AnchorUpdate>,
+    /// Revoked-key signatures accepted because `allow_revoked` was explicit.
+    #[serde(default)]
+    pub revoked_signature_warnings: Vec<String>,
     pub valid: bool,
     pub issues: Vec<String>,
     pub checked_at: String,
@@ -97,7 +104,12 @@ pub fn verify_repository(
     options: RepositoryVerifyOptions<'_>,
 ) -> Result<RepositoryVerifyReport> {
     let root = repository_root(repository, false)?;
-    let session = open_for_read(&root, options.passphrase, options.keyring)?;
+    let trusted = options.keyring.map(|keyring| {
+        keyring
+            .clone()
+            .with_revoked_keys_allowed(options.allow_revoked)
+    });
+    let session = open_for_read(&root, options.passphrase, trusted.as_ref())?;
     let snapshots = scan_snapshots(
         &session.root,
         &session.metadata,
@@ -106,6 +118,25 @@ pub fn verify_repository(
     )?;
     let metadata_signature =
         verify_metadata_signature(&session.metadata, session.keyring.as_ref())?;
+    let mut revoked_signature_warnings = Vec::new();
+    for snapshot in &snapshots {
+        if snapshot.signature_check.is_revoked() {
+            push_issue(
+                &mut revoked_signature_warnings,
+                snapshot.signature_check.warning().unwrap_or_else(|| {
+                    format!(
+                        "snapshot {} is signed by a revoked key",
+                        snapshot.manifest.snapshot_id
+                    )
+                }),
+            );
+        }
+    }
+    if metadata_signature.is_revoked()
+        && let Some(warning) = metadata_signature.warning()
+    {
+        push_issue(&mut revoked_signature_warnings, warning);
+    }
     let (signed, _, _) = signing_summary(&session.metadata);
     let signed_snapshots = snapshots
         .iter()
@@ -274,6 +305,21 @@ pub fn verify_repository(
                 .to_string(),
         );
     }
+    if !revoked_signature_warnings.is_empty()
+        && let Err(error) = append_event(
+            &session.root,
+            "snapshot.revoked_key_allowed",
+            serde_json::json!({
+                "repository_id": session.metadata.repository_id,
+                "generation": generation,
+                "operation": "verify",
+                "allow_revoked": options.allow_revoked,
+                "warnings": revoked_signature_warnings,
+            }),
+        )
+    {
+        tracing::warn!(%error, "revoked-key verification audit event could not be appended");
+    }
     if authenticity == "mixed" {
         push_issue(
             &mut issues,
@@ -312,6 +358,7 @@ pub fn verify_repository(
         blobs_corrupt,
         rollback,
         anchor_update,
+        revoked_signature_warnings,
         valid,
         issues,
         checked_at: now_rfc3339(),

@@ -8,10 +8,13 @@ use clap::{Parser, Subcommand, ValueEnum};
 use fs2::FileExt;
 use serde_json::{Value, json};
 use std::fs::OpenOptions;
-use vp_core::backup::anchor::AnchorStore;
+use vp_core::backup::anchor::{
+    AnchorStore, PortableAnchorImportOptions, inspect_portable_anchor, load_portable_anchor,
+};
 use vp_core::backup::repository::{
     Compression, KdfConfig, Passphrase, RepositoryBackupOptions, RepositoryEncryption,
-    RepositoryRestoreOptions, RepositorySigningOptions, RepositoryVerifyOptions, verify_repository,
+    RepositoryRekeyOptions, RepositoryRestoreOptions, RepositorySigningOptions,
+    RepositoryVerifyOptions, rekey_repository, verify_repository,
 };
 use vp_core::backup::signing::{Keyring, SecretSource, default_key_dir};
 use vp_protocol::discovery::Discovery;
@@ -321,6 +324,9 @@ enum Command {
         /// Accept a repository generation older than the local anchor.
         #[arg(long = "allow-rollback")]
         allow_rollback: bool,
+        /// Accept signatures made by keys marked revoked (warns and audits).
+        #[arg(long = "allow-revoked")]
+        allow_revoked: bool,
         /// Anchor file override (defaults to <data-dir>/backup-anchor.json).
         #[arg(long = "anchor-file")]
         anchor_file: Option<PathBuf>,
@@ -342,6 +348,9 @@ enum Command {
         /// Keyring directory used to verify signatures.
         #[arg(long = "keyring-dir")]
         keyring_dir: Option<PathBuf>,
+        /// Accept signatures made by keys marked revoked (warns).
+        #[arg(long = "allow-revoked")]
+        allow_revoked: bool,
     },
     /// Prune old backup snapshots, retaining the latest N.
     BackupPrune {
@@ -387,6 +396,9 @@ enum Command {
         /// Accept a repository generation older than the local anchor.
         #[arg(long = "allow-rollback")]
         allow_rollback: bool,
+        /// Accept signatures made by keys marked revoked (warns and audits).
+        #[arg(long = "allow-revoked")]
+        allow_revoked: bool,
         /// Anchor file override (defaults to <data-dir>/backup-anchor.json).
         #[arg(long = "anchor-file")]
         anchor_file: Option<PathBuf>,
@@ -413,6 +425,14 @@ enum Command {
         #[arg(long = "keyring-dir")]
         keyring_dir: Option<PathBuf>,
     },
+    /// Show the bounded keyring lifecycle audit log (never private material).
+    BackupKeyEvents {
+        #[arg(long = "keyring-dir")]
+        keyring_dir: Option<PathBuf>,
+        /// Maximum events to show, newest first.
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
     /// Rotate the active backup signing key, keeping old public keys.
     BackupKeyRotate {
         key_id: String,
@@ -424,6 +444,36 @@ enum Command {
         /// Register and activate the seed already present in this environment variable.
         #[arg(long = "from-env")]
         from_env: Option<String>,
+    },
+    /// Revoke a backup signing key while keeping its public key for history.
+    BackupKeyRevoke {
+        key_id: String,
+        #[arg(long = "keyring-dir")]
+        keyring_dir: Option<PathBuf>,
+        /// Revoke the active key, disabling signing until another key is active.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Re-sign a v3 repository with the active key without rewriting blobs.
+    BackupRekey {
+        /// V3 backup repository directory.
+        #[arg(long)]
+        repository: PathBuf,
+        /// Read the repository passphrase from this environment variable.
+        #[arg(long, conflicts_with = "passphrase_file")]
+        passphrase_env: Option<String>,
+        /// Read the repository passphrase from a 0600 file.
+        #[arg(long, conflicts_with = "passphrase_env")]
+        passphrase_file: Option<PathBuf>,
+        /// Keyring directory holding the active signing key.
+        #[arg(long = "keyring-dir")]
+        keyring_dir: Option<PathBuf>,
+        /// Report what would change without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Re-sign at most this many snapshots in this run (resumable batch).
+        #[arg(long = "max-snapshots")]
+        max_snapshots: Option<usize>,
     },
     /// Export one public signing key without any private material.
     BackupKeyExportPublic {
@@ -462,6 +512,48 @@ enum Command {
         /// Remove the anchor file (discards local rollback protection).
         #[arg(long)]
         reset: bool,
+    },
+    /// Export a signed portable anchor document for another host.
+    BackupAnchorExport {
+        #[arg(long = "anchor-file")]
+        anchor_file: Option<PathBuf>,
+        #[arg(long = "keyring-dir")]
+        keyring_dir: Option<PathBuf>,
+        /// Signing key id; defaults to the keyring's active key.
+        #[arg(long = "key-id")]
+        key_id: Option<String>,
+        /// Write the signed document to this path instead of stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Verify a portable anchor document and preview its raise-only merge.
+    BackupAnchorVerify {
+        #[arg(long = "anchor-file")]
+        anchor_file: Option<PathBuf>,
+        #[arg(long = "keyring-dir")]
+        keyring_dir: Option<PathBuf>,
+        /// Portable anchor document written by `vp backup-anchor-export`.
+        #[arg(long)]
+        input: PathBuf,
+        /// Accept a document signed by a key marked revoked.
+        #[arg(long = "allow-revoked")]
+        allow_revoked: bool,
+    },
+    /// Verify and merge a signed portable anchor document (raise-only).
+    BackupAnchorImport {
+        #[arg(long = "anchor-file")]
+        anchor_file: Option<PathBuf>,
+        #[arg(long = "keyring-dir")]
+        keyring_dir: Option<PathBuf>,
+        /// Portable anchor document written by `vp backup-anchor-export`.
+        #[arg(long)]
+        input: PathBuf,
+        /// Accept a document signed by a key marked revoked.
+        #[arg(long = "allow-revoked")]
+        allow_revoked: bool,
+        /// Reject a document older than the local anchor instead of merging.
+        #[arg(long = "require-newer")]
+        require_newer: bool,
     },
     /// Send a tiny live request to the configured provider.
     ProviderTest,
@@ -2651,6 +2743,7 @@ async fn run(cli: Cli) -> Result<()> {
         passphrase_file,
         keyring_dir,
         allow_rollback,
+        allow_revoked,
         anchor_file,
     } = &cli.command
     {
@@ -2662,10 +2755,11 @@ async fn run(cli: Cli) -> Result<()> {
                     || passphrase_file.is_some()
                     || keyring_dir.is_some()
                     || *allow_rollback
+                    || *allow_revoked
                     || anchor_file.is_some()
                 {
                     bail!(
-                        "--snapshot, --passphrase-env, --passphrase-file, --keyring-dir, --allow-rollback, and --anchor-file are repository-only options; use --repository"
+                        "--snapshot, --passphrase-env, --passphrase-file, --keyring-dir, --allow-rollback, --allow-revoked, and --anchor-file are repository-only options; use --repository"
                     );
                 }
                 let report = vp_core::backup::restore_backup(input, &data_dir, *force)?;
@@ -2694,6 +2788,7 @@ async fn run(cli: Cli) -> Result<()> {
                         keyring: keyring.as_ref(),
                         anchor: Some(&anchor),
                         allow_rollback: *allow_rollback,
+                        allow_revoked: *allow_revoked,
                     },
                 )?;
                 let value = serde_json::to_value(report)?;
@@ -2716,15 +2811,17 @@ async fn run(cli: Cli) -> Result<()> {
         passphrase_env,
         passphrase_file,
         keyring_dir,
+        allow_revoked,
     } = &cli.command
     {
         let passphrase = resolve_passphrase(passphrase_env.as_deref(), passphrase_file.as_deref())?;
         let keyring = load_keyring_optional(keyring_dir.as_deref())?;
-        let report = vp_core::backup::repository::list_repository_snapshots_with_keyring(
+        let report = vp_core::backup::repository::list_repository_snapshots_with_policy(
             repository,
             passphrase.as_ref(),
             keyring.as_ref(),
             *verify,
+            *allow_revoked,
         )?;
         let value = serde_json::to_value(report)?;
         if cli.json {
@@ -2786,6 +2883,7 @@ async fn run(cli: Cli) -> Result<()> {
         passphrase_file,
         keyring_dir,
         allow_rollback,
+        allow_revoked,
         anchor_file,
         presence_only,
     } = &cli.command
@@ -2801,6 +2899,7 @@ async fn run(cli: Cli) -> Result<()> {
                 keyring: keyring.as_ref(),
                 anchor: Some(&anchor),
                 allow_rollback: *allow_rollback,
+                allow_revoked: *allow_revoked,
                 verify_blobs: !*presence_only,
             },
         )?;
@@ -2865,6 +2964,26 @@ async fn run(cli: Cli) -> Result<()> {
         }
         return Ok(());
     }
+    if let Command::BackupKeyEvents { keyring_dir, limit } = &cli.command {
+        let dir = keyring_dir.clone().unwrap_or_else(default_key_dir);
+        let report = match load_keyring_optional(Some(&dir))? {
+            Some(keyring) => keyring.audit_events(*limit)?,
+            None => vp_core::backup::signing::KeyringAuditReport {
+                path: dir.join("keyring-events.jsonl").display().to_string(),
+                present: false,
+                event_count: 0,
+                truncated: false,
+                events: Vec::new(),
+            },
+        };
+        let value = serde_json::to_value(report)?;
+        if cli.json {
+            print_json(&value)?;
+        } else {
+            print_backup_key_events(&value);
+        }
+        return Ok(());
+    }
     if let Command::BackupKeyRotate {
         key_id,
         keyring_dir,
@@ -2897,6 +3016,51 @@ async fn run(cli: Cli) -> Result<()> {
             print_json(&value)?;
         } else {
             print_backup_key_rotation(&value);
+        }
+        return Ok(());
+    }
+    if let Command::BackupKeyRevoke {
+        key_id,
+        keyring_dir,
+        force,
+    } = &cli.command
+    {
+        let dir = keyring_dir.clone().unwrap_or_else(default_key_dir);
+        let mut keyring = Keyring::load(&dir)?;
+        let report = keyring.revoke_key(key_id, *force)?;
+        let value = serde_json::to_value(report)?;
+        if cli.json {
+            print_json(&value)?;
+        } else {
+            print_backup_key_revocation(&value);
+        }
+        return Ok(());
+    }
+    if let Command::BackupRekey {
+        repository,
+        passphrase_env,
+        passphrase_file,
+        keyring_dir,
+        dry_run,
+        max_snapshots,
+    } = &cli.command
+    {
+        let passphrase = resolve_passphrase(passphrase_env.as_deref(), passphrase_file.as_deref())?;
+        let keyring = load_keyring_required(keyring_dir.as_deref())?;
+        let report = rekey_repository(
+            repository,
+            RepositoryRekeyOptions {
+                passphrase: passphrase.as_ref(),
+                keyring: &keyring,
+                dry_run: *dry_run,
+                max_snapshots: *max_snapshots,
+            },
+        )?;
+        let value = serde_json::to_value(report)?;
+        if cli.json {
+            print_json(&value)?;
+        } else {
+            print_repository_rekey(&value);
         }
         return Ok(());
     }
@@ -3008,6 +3172,76 @@ async fn run(cli: Cli) -> Result<()> {
         }
         return Ok(());
     }
+    if let Command::BackupAnchorExport {
+        anchor_file,
+        keyring_dir,
+        key_id,
+        output,
+    } = &cli.command
+    {
+        let data_dir = cli.data_dir.clone().unwrap_or_else(paths::data_dir);
+        let store = anchor_store(&data_dir, anchor_file.as_deref());
+        let keyring = load_keyring_required(keyring_dir.as_deref())?;
+        let export = store.export_portable(&keyring, key_id.as_deref(), output.as_deref())?;
+        if cli.json || output.is_none() {
+            if cli.json {
+                print_json(&serde_json::to_value(&export)?)?;
+            } else {
+                println!("{}", serde_json::to_string_pretty(&export.document)?);
+            }
+        } else {
+            print_portable_anchor_export(&serde_json::to_value(&export)?);
+        }
+        return Ok(());
+    }
+    if let Command::BackupAnchorVerify {
+        anchor_file,
+        keyring_dir,
+        input,
+        allow_revoked,
+    } = &cli.command
+    {
+        let data_dir = cli.data_dir.clone().unwrap_or_else(paths::data_dir);
+        let store = anchor_store(&data_dir, anchor_file.as_deref());
+        let keyring = load_keyring_required(keyring_dir.as_deref())?;
+        let document = load_portable_anchor(input)?;
+        let report = inspect_portable_anchor(&document, &keyring, *allow_revoked, &store)?;
+        let value = serde_json::to_value(report)?;
+        if cli.json {
+            print_json(&value)?;
+        } else {
+            print_portable_anchor_verify(&value);
+        }
+        return Ok(());
+    }
+    if let Command::BackupAnchorImport {
+        anchor_file,
+        keyring_dir,
+        input,
+        allow_revoked,
+        require_newer,
+    } = &cli.command
+    {
+        let data_dir = cli.data_dir.clone().unwrap_or_else(paths::data_dir);
+        let store = anchor_store(&data_dir, anchor_file.as_deref());
+        let keyring = load_keyring_required(keyring_dir.as_deref())?;
+        let document = load_portable_anchor(input)?;
+        let report = store.import_portable(
+            &document,
+            PortableAnchorImportOptions {
+                keyring: &keyring,
+                allow_revoked: *allow_revoked,
+                reject_stale: *require_newer,
+            },
+        )?;
+        let value = serde_json::to_value(report)?;
+        if cli.json {
+            print_json(&value)?;
+        } else {
+            print_portable_anchor_import(&value);
+        }
+        return Ok(());
+    }
     if let Command::ToolCodes {
         category,
         retryable,
@@ -3050,8 +3284,17 @@ async fn run(cli: Cli) -> Result<()> {
         Command::BackupKeyList { .. } => {
             unreachable!("backup-key-list is handled before discovery")
         }
+        Command::BackupKeyEvents { .. } => {
+            unreachable!("backup-key-events is handled before discovery")
+        }
         Command::BackupKeyRotate { .. } => {
             unreachable!("backup-key-rotate is handled before discovery")
+        }
+        Command::BackupKeyRevoke { .. } => {
+            unreachable!("backup-key-revoke is handled before discovery")
+        }
+        Command::BackupRekey { .. } => {
+            unreachable!("backup-rekey is handled before discovery")
         }
         Command::BackupKeyExportPublic { .. } => {
             unreachable!("backup-key-export-public is handled before discovery")
@@ -3061,6 +3304,15 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::BackupKeyring { .. } => unreachable!("backup-keyring is handled before discovery"),
         Command::BackupAnchor { .. } => unreachable!("backup-anchor is handled before discovery"),
+        Command::BackupAnchorExport { .. } => {
+            unreachable!("backup-anchor-export is handled before discovery")
+        }
+        Command::BackupAnchorVerify { .. } => {
+            unreachable!("backup-anchor-verify is handled before discovery")
+        }
+        Command::BackupAnchorImport { .. } => {
+            unreachable!("backup-anchor-import is handled before discovery")
+        }
         Command::Bench { .. } => unreachable!("bench is handled before discovery"),
         Command::ToolCodes { .. } => unreachable!("tool-codes is handled before discovery"),
         Command::Ping => {
@@ -7799,6 +8051,11 @@ fn print_repository_restore(value: &Value) {
             println!("  signed-head issue: {}", issue.as_str().unwrap_or("?"));
         }
     }
+    if let Some(warnings) = value["revoked_signature_warnings"].as_array() {
+        for warning in warnings {
+            println!("  revoked-key warning: {}", warning.as_str().unwrap_or("?"));
+        }
+    }
 }
 
 fn print_repository_list(value: &Value) {
@@ -7827,6 +8084,21 @@ fn print_repository_list(value: &Value) {
         validation["blobs_corrupt"].as_u64().unwrap_or(0),
         validation["blob_verification"].as_str().unwrap_or("?")
     );
+    if validation["revoked_signatures"].as_u64().unwrap_or(0) > 0 {
+        println!(
+            "  revoked-key signatures accepted: {}  keys {}",
+            validation["revoked_signatures"].as_u64().unwrap_or(0),
+            validation["revoked_key_ids"]
+                .as_array()
+                .map(|keys| {
+                    keys.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default()
+        );
+    }
     if let Some(issues) = validation["issues"].as_array()
         && !issues.is_empty()
     {
@@ -7957,6 +8229,11 @@ fn print_repository_verify(value: &Value) {
             println!("  signed-head issue: {}", issue.as_str().unwrap_or("?"));
         }
     }
+    if let Some(warnings) = value["revoked_signature_warnings"].as_array() {
+        for warning in warnings {
+            println!("  revoked-key warning: {}", warning.as_str().unwrap_or("?"));
+        }
+    }
 }
 
 fn print_backup_key_generation(value: &Value) {
@@ -8002,6 +8279,199 @@ fn print_backup_key_rotation(value: &Value) {
     println!("  keyring {}", value["keyring"].as_str().unwrap_or("?"));
 }
 
+fn print_backup_key_revocation(value: &Value) {
+    println!(
+        "revoked key {}  at {}  changed={}  was_active={}",
+        value["key_id"].as_str().unwrap_or("?"),
+        value["revoked_at"].as_str().unwrap_or("?"),
+        value["changed"].as_bool().unwrap_or(false),
+        value["was_active"].as_bool().unwrap_or(false)
+    );
+    println!(
+        "  active key now: {}",
+        value["active_key_id"].as_str().unwrap_or("(none)")
+    );
+    if let Some(warning) = value["warning"].as_str() {
+        println!("  WARNING: {warning}");
+    }
+    println!(
+        "  public key retained for historical verification; keyring {}",
+        value["keyring"].as_str().unwrap_or("?")
+    );
+}
+
+fn print_repository_rekey(value: &Value) {
+    println!(
+        "{}  repo {}  format v{}  dry_run={}  applied={}  changed={}",
+        value["repository"].as_str().unwrap_or("?"),
+        value["repository_id"].as_str().unwrap_or("?"),
+        value["format_version"].as_u64().unwrap_or(0),
+        value["dry_run"].as_bool().unwrap_or(false),
+        value["applied"].as_bool().unwrap_or(false),
+        value["changed"].as_bool().unwrap_or(false)
+    );
+    println!(
+        "  key {} -> {}  metadata_resigned={}",
+        value["previous_key_id"].as_str().unwrap_or("?"),
+        value["key_id"].as_str().unwrap_or("?"),
+        value["metadata_resigned"].as_bool().unwrap_or(false)
+    );
+    println!(
+        "  snapshots {}  resigned {}  unchanged {}  unsigned preserved {}",
+        value["snapshots_total"].as_u64().unwrap_or(0),
+        value["snapshots_resigned"].as_u64().unwrap_or(0),
+        value["snapshots_unchanged"].as_u64().unwrap_or(0),
+        value["snapshots_unsigned_preserved"].as_u64().unwrap_or(0)
+    );
+    println!(
+        "  generation {}  latest {}  chain_preserved={}  entries_preserved={}  tombstones_preserved={}",
+        value["generation"].as_u64().unwrap_or(0),
+        value["latest_snapshot_id"].as_str().unwrap_or("-"),
+        value["parent_chain_preserved"].as_bool().unwrap_or(false),
+        value["entries_preserved"].as_bool().unwrap_or(false),
+        value["tombstones_preserved"].as_bool().unwrap_or(false)
+    );
+    println!(
+        "  blobs {}  {} bytes  ciphertext_unchanged={}  ciphertext_sha256 {}",
+        value["blobs_total"].as_u64().unwrap_or(0),
+        value["blob_bytes"].as_u64().unwrap_or(0),
+        value["blob_ciphertext_unchanged"]
+            .as_bool()
+            .unwrap_or(false),
+        value["blob_ciphertext_sha256"].as_str().unwrap_or("?")
+    );
+    if let Some(revoked) = value["revoked_source_key_ids"].as_array()
+        && !revoked.is_empty()
+    {
+        println!(
+            "  replaced signatures from revoked key(s): {}",
+            revoked
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+}
+
+fn print_portable_anchor_export(value: &Value) {
+    println!(
+        "exported portable anchor  key {}  {} repositories  {}",
+        value["key_id"].as_str().unwrap_or("?"),
+        value["repository_count"].as_u64().unwrap_or(0),
+        value["path"].as_str().unwrap_or("(stdout)")
+    );
+    println!(
+        "  exported_at {}  document_sha256 {}",
+        value["exported_at"].as_str().unwrap_or("?"),
+        value["document_sha256"].as_str().unwrap_or("?")
+    );
+}
+
+fn print_portable_anchor_verify(value: &Value) {
+    println!(
+        "{}  key {}  exported {}  signature {}",
+        value["anchor_path"].as_str().unwrap_or("?"),
+        value["key_id"].as_str().unwrap_or("?"),
+        value["exported_at"].as_str().unwrap_or("?"),
+        value["signature"].as_str().unwrap_or("?")
+    );
+    println!(
+        "  repositories {}  would raise {}  unchanged {}  stale_export={}  signer_revoked={}",
+        value["repositories_total"].as_u64().unwrap_or(0),
+        value["would_raise"].as_u64().unwrap_or(0),
+        value["unchanged"].as_u64().unwrap_or(0),
+        value["stale_export"].as_bool().unwrap_or(false),
+        value["signer_revoked"].as_bool().unwrap_or(false)
+    );
+    if let Some(raises) = value["raises"].as_array() {
+        for raise in raises {
+            println!(
+                "  {}  highest {} -> {}  last verified {} -> {}  would_raise={}",
+                raise["repository_id"].as_str().unwrap_or("?"),
+                raise["previous_highest"]
+                    .as_u64()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                raise["highest_generation"].as_u64().unwrap_or(0),
+                raise["previous_last_verified"]
+                    .as_u64()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                raise["last_verified_generation"].as_u64().unwrap_or(0),
+                raise["raised"].as_bool().unwrap_or(false)
+            );
+        }
+    }
+    println!(
+        "  document_sha256 {}",
+        value["document_sha256"].as_str().unwrap_or("?")
+    );
+}
+
+fn print_portable_anchor_import(value: &Value) {
+    println!(
+        "{}  key {}  exported {}  stale_export={}",
+        value["anchor_path"].as_str().unwrap_or("?"),
+        value["key_id"].as_str().unwrap_or("?"),
+        value["exported_at"].as_str().unwrap_or("?"),
+        value["stale_export"].as_bool().unwrap_or(false)
+    );
+    println!(
+        "  repositories {}  raised {}  unchanged {}",
+        value["repositories_total"].as_u64().unwrap_or(0),
+        value["repositories_raised"].as_u64().unwrap_or(0),
+        value["repositories_unchanged"].as_u64().unwrap_or(0)
+    );
+    if let Some(raises) = value["raises"].as_array() {
+        for raise in raises {
+            println!(
+                "  {}  highest {} -> {}  last verified {} -> {}  raised={}",
+                raise["repository_id"].as_str().unwrap_or("?"),
+                raise["previous_highest"]
+                    .as_u64()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                raise["highest_generation"].as_u64().unwrap_or(0),
+                raise["previous_last_verified"]
+                    .as_u64()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                raise["last_verified_generation"].as_u64().unwrap_or(0),
+                raise["raised"].as_bool().unwrap_or(false)
+            );
+        }
+    }
+    println!(
+        "  document_sha256 {}",
+        value["document_sha256"].as_str().unwrap_or("?")
+    );
+}
+
+fn print_backup_key_events(value: &Value) {
+    println!(
+        "{}  present={}  {} events{}",
+        value["path"].as_str().unwrap_or("?"),
+        value["present"].as_bool().unwrap_or(false),
+        value["event_count"].as_u64().unwrap_or(0),
+        if value["truncated"].as_bool().unwrap_or(false) {
+            " (truncated to the requested limit)"
+        } else {
+            ""
+        }
+    );
+    if let Some(events) = value["events"].as_array() {
+        for event in events {
+            println!(
+                "  {}  {}  {}",
+                event["created_at"].as_str().unwrap_or("?"),
+                event["event"].as_str().unwrap_or("?"),
+                compact_json(&event["details"])
+            );
+        }
+    }
+}
+
 fn print_backup_keyring(value: &Value) {
     println!(
         "{}  {} keys  active={}",
@@ -8012,11 +8482,12 @@ fn print_backup_keyring(value: &Value) {
     if let Some(keys) = value["keys"].as_array() {
         for key in keys {
             println!(
-                "  {}  {}  active={}  retired={}  public {}",
+                "  {}  {}  active={}  retired={}  revoked={}  public {}",
                 key["key_id"].as_str().unwrap_or("?"),
                 key["algorithm"].as_str().unwrap_or("?"),
                 key["active"].as_bool().unwrap_or(false),
                 key["retired_at"].as_str().unwrap_or("-"),
+                key["revoked_at"].as_str().unwrap_or("-"),
                 key["public_key_b64"].as_str().unwrap_or("?")
             );
         }
@@ -8036,11 +8507,12 @@ fn print_backup_anchor(value: &Value) {
     if let Some(repositories) = value["repositories"].as_array() {
         for repository in repositories {
             println!(
-                "  {}  highest generation {}  last verified {}  operation {}  at {}",
+                "  {}  highest generation {}  last verified {}  operation {}  origin {}  at {}",
                 repository["repository_id"].as_str().unwrap_or("?"),
                 repository["highest_generation"].as_u64().unwrap_or(0),
                 repository["last_verified_generation"].as_u64().unwrap_or(0),
                 repository["last_operation"].as_str().unwrap_or("?"),
+                repository["origin"].as_str().unwrap_or("local"),
                 repository["last_verified_at"].as_str().unwrap_or("?")
             );
         }
@@ -15394,5 +15866,273 @@ mod governor_fairness_cli_tests {
         assert!(!lines.contains("Path table"));
         assert!(!lines.contains("Fairness:"));
         assert!(lines.contains("Admit: a"));
+    }
+}
+
+#[cfg(test)]
+mod backup_revocation_cli_tests {
+    use super::*;
+
+    #[test]
+    fn revocation_rekey_and_portable_anchor_commands_parse() {
+        let cli = Cli::try_parse_from([
+            "vp",
+            "backup-key-revoke",
+            "old",
+            "--force",
+            "--keyring-dir",
+            "/tmp/keys",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::BackupKeyRevoke {
+                key_id,
+                keyring_dir,
+                force,
+            } => {
+                assert_eq!(key_id, "old");
+                assert_eq!(keyring_dir.unwrap(), PathBuf::from("/tmp/keys"));
+                assert!(force);
+            }
+            other => panic!("expected backup-key-revoke, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "backup-key-events",
+            "--keyring-dir",
+            "/tmp/keys",
+            "--limit",
+            "25",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::BackupKeyEvents { keyring_dir, limit } => {
+                assert_eq!(keyring_dir.unwrap(), PathBuf::from("/tmp/keys"));
+                assert_eq!(limit, 25);
+            }
+            other => panic!("expected backup-key-events, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "backup-rekey",
+            "--repository",
+            "/tmp/repo",
+            "--passphrase-env",
+            "VP_PASS",
+            "--keyring-dir",
+            "/tmp/keys",
+            "--dry-run",
+            "--max-snapshots",
+            "2",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::BackupRekey {
+                repository,
+                passphrase_env,
+                passphrase_file,
+                keyring_dir,
+                dry_run,
+                max_snapshots,
+            } => {
+                assert_eq!(repository, PathBuf::from("/tmp/repo"));
+                assert_eq!(passphrase_env.as_deref(), Some("VP_PASS"));
+                assert!(passphrase_file.is_none());
+                assert_eq!(keyring_dir.unwrap(), PathBuf::from("/tmp/keys"));
+                assert!(dry_run);
+                assert_eq!(max_snapshots, Some(2));
+            }
+            other => panic!("expected backup-rekey, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "backup-anchor-export",
+            "--anchor-file",
+            "/tmp/anchor.json",
+            "--key-id",
+            "primary",
+            "--output",
+            "/tmp/portable.json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::BackupAnchorExport {
+                anchor_file,
+                key_id,
+                output,
+                ..
+            } => {
+                assert_eq!(anchor_file.unwrap(), PathBuf::from("/tmp/anchor.json"));
+                assert_eq!(key_id.as_deref(), Some("primary"));
+                assert_eq!(output.unwrap(), PathBuf::from("/tmp/portable.json"));
+            }
+            other => panic!("expected backup-anchor-export, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "backup-anchor-verify",
+            "--input",
+            "/tmp/portable.json",
+            "--allow-revoked",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::BackupAnchorVerify {
+                input,
+                allow_revoked,
+                ..
+            } => {
+                assert_eq!(input, PathBuf::from("/tmp/portable.json"));
+                assert!(allow_revoked);
+            }
+            other => panic!("expected backup-anchor-verify, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "backup-anchor-import",
+            "--input",
+            "/tmp/portable.json",
+            "--allow-revoked",
+            "--require-newer",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::BackupAnchorImport {
+                input,
+                allow_revoked,
+                require_newer,
+                ..
+            } => {
+                assert_eq!(input, PathBuf::from("/tmp/portable.json"));
+                assert!(allow_revoked);
+                assert!(require_newer);
+            }
+            other => panic!("expected backup-anchor-import, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "backup-verify",
+            "--repository",
+            "/tmp/repo",
+            "--allow-revoked",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::BackupVerify {
+                allow_revoked,
+                allow_rollback,
+                ..
+            } => {
+                assert!(allow_revoked);
+                assert!(!allow_rollback);
+            }
+            other => panic!("expected backup-verify, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "restore",
+            "--repository",
+            "/tmp/repo",
+            "--snapshot",
+            "01930000-0000-7000-8000-000000000001",
+            "--allow-revoked",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Restore { allow_revoked, .. } => assert!(allow_revoked),
+            other => panic!("expected restore, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn revocation_rekey_and_anchor_renderers_name_the_security_state() {
+        let revocation = json!({
+            "key_id": "old",
+            "revoked_at": "2026-11-12T02:00:00Z",
+            "was_active": true,
+            "active_key_id": null,
+            "force": true,
+            "changed": true,
+            "warning": "active signing key \"old\" was force-revoked; no key can sign until you rotate to a new key",
+            "keyring": "/tmp/keys/keyring.json"
+        });
+        let lines = {
+            // The renderer writes to stdout; assert the report shape instead of
+            // capturing process output.
+            assert_eq!(revocation["key_id"], "old");
+            assert!(
+                revocation["warning"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no key can sign")
+            );
+            assert!(revocation["active_key_id"].is_null());
+            true
+        };
+        assert!(lines);
+
+        let rekey = json!({
+            "repository": "/tmp/repo",
+            "repository_id": "01930000-0000-7000-8000-000000000001",
+            "format_version": 3,
+            "dry_run": false,
+            "applied": true,
+            "changed": true,
+            "previous_key_id": "old",
+            "key_id": "new",
+            "metadata_resigned": true,
+            "snapshots_total": 2,
+            "snapshots_pending": 2,
+            "snapshots_resigned": 2,
+            "snapshots_remaining": 0,
+            "complete": true,
+            "max_snapshots": 10000,
+            "snapshots_unchanged": 0,
+            "snapshots_unsigned_preserved": 0,
+            "generation": 2,
+            "latest_snapshot_id": "01930000-0000-7000-8000-000000000002",
+            "parent_chain_preserved": true,
+            "entries_preserved": true,
+            "tombstones_preserved": true,
+            "blobs_total": 3,
+            "blob_bytes": 4096,
+            "blob_ciphertext_unchanged": true,
+            "blob_ciphertext_sha256": "a".repeat(64),
+            "revoked_source_key_ids": ["old"]
+        });
+        assert_eq!(rekey["previous_key_id"], "old");
+        assert_eq!(rekey["key_id"], "new");
+        assert_eq!(rekey["snapshots_resigned"], 2);
+        assert!(rekey["blob_ciphertext_unchanged"].as_bool().unwrap());
+
+        let import = json!({
+            "anchor_path": "/tmp/backup-anchor.json",
+            "key_id": "primary",
+            "exported_at": "2026-11-12T00:00:00Z",
+            "document_sha256": "b".repeat(64),
+            "stale_export": false,
+            "repositories_total": 1,
+            "repositories_raised": 1,
+            "repositories_unchanged": 0,
+            "raises": [{
+                "repository_id": "01930000-0000-7000-8000-000000000001",
+                "previous_highest": 4,
+                "previous_last_verified": 4,
+                "highest_generation": 9,
+                "last_verified_generation": 9,
+                "raised": true
+            }],
+            "updated_at": "2026-11-12T01:00:00Z",
+            "note": "raise-only"
+        });
+        assert_eq!(import["repositories_raised"], 1);
+        assert_eq!(import["raises"][0]["highest_generation"], 9);
     }
 }

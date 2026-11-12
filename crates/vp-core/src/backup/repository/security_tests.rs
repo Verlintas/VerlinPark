@@ -221,6 +221,7 @@ fn signed_encrypted_repository_round_trip_and_verify() {
             keyring: Some(&keyring),
             anchor: Some(&anchor),
             allow_rollback: false,
+            allow_revoked: false,
             verify_blobs: true,
         },
     )
@@ -249,6 +250,7 @@ fn signed_encrypted_repository_round_trip_and_verify() {
             keyring: Some(&keyring),
             anchor: Some(&anchor),
             allow_rollback: false,
+            allow_revoked: false,
         },
     )
     .unwrap();
@@ -288,6 +290,7 @@ fn tampered_signed_manifest_entry_and_totals_fail_verification() {
             keyring: Some(&keyring),
             anchor: Some(&anchor),
             allow_rollback: false,
+            allow_revoked: false,
             verify_blobs: true,
         },
     )
@@ -310,6 +313,7 @@ fn tampered_signed_manifest_entry_and_totals_fail_verification() {
             keyring: Some(&keyring),
             anchor: Some(&anchor),
             allow_rollback: false,
+            allow_revoked: false,
         },
     )
     .unwrap_err();
@@ -470,6 +474,7 @@ fn rotation_verifies_old_and_new_snapshots() {
             keyring: Some(&rotated),
             anchor: Some(&anchor),
             allow_rollback: false,
+            allow_revoked: false,
             verify_blobs: true,
         },
     )
@@ -532,6 +537,7 @@ fn rollback_is_rejected_by_default_and_allowed_explicitly() {
             keyring: Some(&keyring),
             anchor: Some(&anchor),
             allow_rollback: false,
+            allow_revoked: false,
         },
     )
     .unwrap_err();
@@ -554,6 +560,7 @@ fn rollback_is_rejected_by_default_and_allowed_explicitly() {
             keyring: Some(&keyring),
             anchor: Some(&anchor),
             allow_rollback: true,
+            allow_revoked: false,
         },
     )
     .unwrap();
@@ -603,6 +610,7 @@ fn verification_rejects_an_anchor_generation_above_the_repository() {
             keyring: Some(&keyring),
             anchor: Some(&anchor),
             allow_rollback: false,
+            allow_revoked: false,
             verify_blobs: true,
         },
     )
@@ -618,6 +626,7 @@ fn verification_rejects_an_anchor_generation_above_the_repository() {
             keyring: Some(&keyring),
             anchor: Some(&anchor),
             allow_rollback: true,
+            allow_revoked: false,
             verify_blobs: false,
         },
     )
@@ -655,6 +664,7 @@ fn v2_repositories_are_readable_and_explicitly_unsigned() {
             keyring: None,
             anchor: None,
             allow_rollback: false,
+            allow_revoked: false,
             verify_blobs: true,
         },
     )
@@ -707,6 +717,7 @@ fn upgrading_a_v2_repository_reports_mixed_signatures() {
             keyring: Some(&keyring),
             anchor: None,
             allow_rollback: false,
+            allow_revoked: false,
             verify_blobs: true,
         },
     )
@@ -759,6 +770,7 @@ fn prune_resigns_metadata_and_requires_the_key() {
             keyring: Some(&keyring),
             anchor: None,
             allow_rollback: false,
+            allow_revoked: false,
             verify_blobs: true,
         },
     )
@@ -809,6 +821,7 @@ fn stale_signed_head_is_reported_as_inconsistent() {
             keyring: Some(&keyring),
             anchor: None,
             allow_rollback: false,
+            allow_revoked: false,
             verify_blobs: true,
         },
     )
@@ -900,6 +913,7 @@ fn atomic_restore_failure_leaves_no_partial_swap_or_scratch() {
             keyring: Some(&keyring),
             anchor: Some(&AnchorStore::new(data.path())),
             allow_rollback: false,
+            allow_revoked: false,
         },
     )
     .unwrap_err();
@@ -939,6 +953,7 @@ fn plaintext_signed_repository_verifies_without_a_passphrase() {
             keyring: Some(&keyring),
             anchor: None,
             allow_rollback: false,
+            allow_revoked: false,
             verify_blobs: true,
         },
     )
@@ -1004,6 +1019,7 @@ fn duplicate_content_across_paths_is_valid_and_shared() {
             keyring: Some(&keyring),
             anchor: None,
             allow_rollback: false,
+            allow_revoked: false,
             verify_blobs: true,
         },
     )
@@ -1041,6 +1057,7 @@ fn failed_verification_does_not_create_or_advance_the_anchor() {
             keyring: Some(&keyring),
             anchor: Some(&anchor),
             allow_rollback: false,
+            allow_revoked: false,
             verify_blobs: true,
         },
     )
@@ -1101,4 +1118,361 @@ fn backup_after_an_explicit_rollback_never_lowers_the_anchor() {
         .clone();
     assert_eq!(entry.highest_generation, 5);
     assert_eq!(entry.last_verified_generation, 3);
+}
+
+#[test]
+fn revoked_key_rejects_verify_list_and_restore_unless_explicitly_allowed() {
+    let data = TempDir::new().unwrap();
+    let keys = keyring_dir();
+    let output = TempDir::new().unwrap();
+    let keyring = make_keyring(&keys, "primary");
+    let (store, _) = seed_data_dir(data.path());
+    let repo = output.path().join("repository");
+    let report = create_signed(data.path(), &repo, &keyring, None, true, false);
+    drop(store);
+
+    Keyring::generate_key(
+        keys.path(),
+        "new",
+        true,
+        SecretSource::File {
+            name: "new.key".to_string(),
+        },
+    )
+    .unwrap();
+    let mut rotated = Keyring::load(keys.path()).unwrap();
+    rotated.revoke_key("primary", false).unwrap();
+    let rotated = Keyring::load(keys.path()).unwrap();
+    assert_eq!(rotated.summary().revoked_key_count, 1);
+
+    let anchor = AnchorStore::new(data.path());
+    let error = verify_repository(
+        &repo,
+        RepositoryVerifyOptions {
+            passphrase: Some(&passphrase()),
+            keyring: Some(&rotated),
+            anchor: Some(&anchor),
+            allow_rollback: false,
+            allow_revoked: false,
+            verify_blobs: true,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("BACKUP_KEY_REVOKED"),
+        "{error:#}"
+    );
+
+    let verified = verify_repository(
+        &repo,
+        RepositoryVerifyOptions {
+            passphrase: Some(&passphrase()),
+            keyring: Some(&rotated),
+            anchor: Some(&anchor),
+            allow_rollback: false,
+            allow_revoked: true,
+            verify_blobs: true,
+        },
+    )
+    .unwrap();
+    assert!(verified.valid, "{:?}", verified.issues);
+    assert!(verified.metadata_signature.is_revoked());
+    assert!(!verified.revoked_signature_warnings.is_empty());
+    assert!(verified.revoked_signature_warnings[0].contains("revoked"));
+    let events = fs::read_to_string(repo.join("events.jsonl")).unwrap();
+    assert!(events.contains("snapshot.revoked_key_allowed"), "{events}");
+    assert!(events.contains("\"operation\":\"verify\""), "{events}");
+
+    let error =
+        list_repository_snapshots_with_keyring(&repo, Some(&passphrase()), Some(&rotated), true)
+            .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("BACKUP_KEY_REVOKED"),
+        "{error:#}"
+    );
+    let listed = list_repository_snapshots_with_policy(
+        &repo,
+        Some(&passphrase()),
+        Some(&rotated),
+        true,
+        true,
+    )
+    .unwrap();
+    assert!(listed.validation.valid);
+    assert_eq!(listed.validation.revoked_signatures, 2);
+    assert_eq!(
+        listed.validation.revoked_key_ids,
+        vec!["primary".to_string()]
+    );
+
+    let target = output.path().join("restore-target");
+    let error = restore_repository_snapshot_checked(
+        &repo,
+        &report.snapshot_id,
+        &target,
+        false,
+        RepositoryRestoreOptions {
+            passphrase: Some(&passphrase()),
+            keyring: Some(&rotated),
+            anchor: Some(&anchor),
+            allow_rollback: false,
+            allow_revoked: false,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("BACKUP_KEY_REVOKED"),
+        "{error:#}"
+    );
+    assert!(!target.exists());
+
+    let restored = restore_repository_snapshot_checked(
+        &repo,
+        &report.snapshot_id,
+        &target,
+        false,
+        RepositoryRestoreOptions {
+            passphrase: Some(&passphrase()),
+            keyring: Some(&rotated),
+            anchor: Some(&anchor),
+            allow_rollback: false,
+            allow_revoked: true,
+        },
+    )
+    .unwrap();
+    assert!(restored.signed);
+    assert!(!restored.revoked_signature_warnings.is_empty());
+    let events = fs::read_to_string(repo.join("events.jsonl")).unwrap();
+    assert!(events.contains("\"operation\":\"restore\""), "{events}");
+    assert!(Store::open(&target).is_ok());
+}
+
+#[test]
+fn revoked_key_blocks_new_backups_until_the_repository_is_rekeyed() {
+    let data = TempDir::new().unwrap();
+    let keys = keyring_dir();
+    let output = TempDir::new().unwrap();
+    let keyring = make_keyring(&keys, "primary");
+    let (store, _) = seed_data_dir(data.path());
+    let repo = output.path().join("repository");
+    create_signed(data.path(), &repo, &keyring, None, true, false);
+    drop(store);
+
+    Keyring::generate_key(
+        keys.path(),
+        "replacement",
+        true,
+        SecretSource::File {
+            name: "replacement.key".to_string(),
+        },
+    )
+    .unwrap();
+    let mut rotated = Keyring::load(keys.path()).unwrap();
+    rotated.rotate_to("replacement").unwrap();
+    rotated.revoke_key("primary", false).unwrap();
+    let rotated = Keyring::load(keys.path()).unwrap();
+
+    // Appending to a repository whose metadata is signed by a revoked key is
+    // refused before a new snapshot is written.
+    let snapshots_before = fs::read_dir(repo.join("snapshots")).unwrap().count();
+    let error = create_repository_backup(
+        data.path(),
+        &repo,
+        options(Some(&rotated), None, true, true),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("BACKUP_KEY_REVOKED"),
+        "{error:#}"
+    );
+    assert_eq!(
+        fs::read_dir(repo.join("snapshots")).unwrap().count(),
+        snapshots_before
+    );
+
+    // Rekey is the recovery path. After it completes, normal backup resumes
+    // with the new active key.
+    let report = rekey_repository(
+        &repo,
+        RepositoryRekeyOptions {
+            passphrase: Some(&passphrase()),
+            keyring: &rotated,
+            dry_run: false,
+            max_snapshots: None,
+        },
+    )
+    .unwrap();
+    assert!(report.applied);
+    let third = create_repository_backup(
+        data.path(),
+        &repo,
+        options(Some(&rotated), None, true, true),
+    )
+    .unwrap();
+    assert_eq!(third.sequence, 2);
+    assert_eq!(third.signing_key_id.as_deref(), Some("replacement"));
+
+    let verified = verify_repository(
+        &repo,
+        RepositoryVerifyOptions {
+            passphrase: Some(&passphrase()),
+            keyring: Some(&rotated),
+            anchor: None,
+            allow_rollback: false,
+            allow_revoked: false,
+            verify_blobs: true,
+        },
+    )
+    .unwrap();
+    assert!(verified.valid, "{:?}", verified.issues);
+    assert_eq!(verified.signed_snapshots, 2);
+    assert_eq!(
+        verified.metadata_signature.key_id.as_deref(),
+        Some("replacement")
+    );
+}
+
+#[test]
+fn revoked_historical_snapshot_is_rejected_even_when_metadata_is_current() {
+    let data = TempDir::new().unwrap();
+    let keys = keyring_dir();
+    let output = TempDir::new().unwrap();
+    let old_keyring = make_keyring(&keys, "old");
+    let (store, _) = seed_data_dir(data.path());
+    let repo = output.path().join("repository");
+    let first = create_signed(data.path(), &repo, &old_keyring, None, true, false);
+
+    Keyring::generate_key(
+        keys.path(),
+        "new",
+        true,
+        SecretSource::File {
+            name: "new.key".to_string(),
+        },
+    )
+    .unwrap();
+    let mut rotated = Keyring::load(keys.path()).unwrap();
+    let second = create_signed(data.path(), &repo, &rotated, None, true, true);
+    assert_eq!(second.signing_key_id.as_deref(), Some("new"));
+    rotated.revoke_key("old", false).unwrap();
+    let rotated = Keyring::load(keys.path()).unwrap();
+    drop(store);
+
+    // Metadata is signed by the still-trusted new key, but the first snapshot
+    // is signed by the revoked old key.
+    let metadata = repo_metadata(&repo);
+    assert_eq!(metadata.signing.as_ref().unwrap().active_key_id, "new");
+    let error = verify_repository(
+        &repo,
+        RepositoryVerifyOptions {
+            passphrase: Some(&passphrase()),
+            keyring: Some(&rotated),
+            anchor: None,
+            allow_rollback: false,
+            allow_revoked: false,
+            verify_blobs: true,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("BACKUP_KEY_REVOKED"),
+        "{error:#}"
+    );
+
+    let verified = verify_repository(
+        &repo,
+        RepositoryVerifyOptions {
+            passphrase: Some(&passphrase()),
+            keyring: Some(&rotated),
+            anchor: None,
+            allow_rollback: false,
+            allow_revoked: true,
+            verify_blobs: true,
+        },
+    )
+    .unwrap();
+    assert!(verified.valid, "{:?}", verified.issues);
+    assert!(!verified.metadata_signature.is_revoked());
+    assert_eq!(verified.signed_snapshots, 2);
+    assert!(
+        verified
+            .revoked_signature_warnings
+            .iter()
+            .any(|warning| warning.contains("old"))
+    );
+
+    let listed = list_repository_snapshots_with_policy(
+        &repo,
+        Some(&passphrase()),
+        Some(&rotated),
+        true,
+        true,
+    )
+    .unwrap();
+    assert_eq!(listed.validation.revoked_signatures, 1);
+    assert_eq!(listed.validation.revoked_key_ids, vec!["old".to_string()]);
+    let statuses: Vec<(&str, &str)> = listed
+        .snapshots
+        .iter()
+        .map(|snapshot| {
+            (
+                snapshot.signing_key_id.as_deref().unwrap_or(""),
+                snapshot.signature_status.as_str(),
+            )
+        })
+        .collect();
+    assert!(statuses.contains(&("old", "verified")));
+    assert!(statuses.contains(&("new", "verified")));
+    let _ = first;
+}
+
+#[test]
+fn allow_revoked_verification_still_records_the_anchor_generation() {
+    let data = TempDir::new().unwrap();
+    let keys = keyring_dir();
+    let output = TempDir::new().unwrap();
+    let keyring = make_keyring(&keys, "primary");
+    let (store, _) = seed_data_dir(data.path());
+    let repo = output.path().join("repository");
+    create_signed(data.path(), &repo, &keyring, None, true, false);
+    drop(store);
+
+    Keyring::generate_key(
+        keys.path(),
+        "new",
+        true,
+        SecretSource::File {
+            name: "new.key".to_string(),
+        },
+    )
+    .unwrap();
+    let mut rotated = Keyring::load(keys.path()).unwrap();
+    rotated.revoke_key("primary", false).unwrap();
+    let rotated = Keyring::load(keys.path()).unwrap();
+    let anchor = AnchorStore::new(output.path());
+    let verified = verify_repository(
+        &repo,
+        RepositoryVerifyOptions {
+            passphrase: Some(&passphrase()),
+            keyring: Some(&rotated),
+            anchor: Some(&anchor),
+            allow_rollback: false,
+            allow_revoked: true,
+            verify_blobs: false,
+        },
+    )
+    .unwrap();
+    assert!(verified.valid, "{:?}", verified.issues);
+    let update = verified.anchor_update.unwrap();
+    assert_eq!(update.highest_generation, 1);
+    let repository_id = repo_metadata(&repo).repository_id;
+    assert_eq!(
+        anchor
+            .read()
+            .unwrap()
+            .anchor(&repository_id)
+            .unwrap()
+            .highest_generation,
+        1
+    );
 }

@@ -40,6 +40,7 @@ use zeroize::Zeroizing;
 use super::error::BackupSecurityError;
 
 pub const KEYRING_FILENAME: &str = "keyring.json";
+pub const KEYRING_EVENTS_FILENAME: &str = "keyring-events.jsonl";
 pub const KEYRING_KIND: &str = "verlinpark-backup-keyring";
 pub const KEYRING_FORMAT_VERSION: u32 = 1;
 pub const KEY_FILE_KIND: &str = "verlinpark-backup-signing-key";
@@ -53,11 +54,16 @@ pub const MAX_KEYRING_KEYS: usize = 64;
 pub const MAX_KEYRING_BYTES: u64 = 1024 * 1024;
 pub const MAX_KEY_FILE_BYTES: u64 = 8 * 1024;
 pub const MAX_SECRET_REFERENCE_BYTES: usize = 160;
+pub const MAX_KEYRING_AUDIT_BYTES: u64 = 4 * 1024 * 1024;
+pub const MAX_KEYRING_AUDIT_EVENTS: usize = 5000;
 
 /// Domain separator for repository metadata signatures.
 pub const METADATA_SIGNATURE_DOMAIN: &[u8] = b"verlinpark-backup-metadata-signature-v1\0";
 /// Domain separator for snapshot manifest signatures.
 pub const SNAPSHOT_SIGNATURE_DOMAIN: &[u8] = b"verlinpark-backup-snapshot-signature-v1\0";
+/// Domain separator for portable anti-rollback anchor documents.
+pub const PORTABLE_ANCHOR_SIGNATURE_DOMAIN: &[u8] =
+    b"verlinpark-backup-portable-anchor-signature-v1\0";
 
 /// Default key directory, deliberately independent of the daemon data dir.
 pub fn default_key_dir() -> PathBuf {
@@ -273,6 +279,11 @@ pub struct KeyringEntry {
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retired_at: Option<String>,
+    /// When set, signatures made by this key are rejected for new verification
+    /// and restore operations unless the operator passes `--allow-revoked`.
+    /// The public key is retained so historical snapshots remain inspectable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<String>,
 }
 
 impl KeyringEntry {
@@ -293,6 +304,9 @@ impl KeyringEntry {
         if let Some(retired_at) = &self.retired_at {
             validate_timestamp(retired_at, "key retirement")?;
         }
+        if let Some(revoked_at) = &self.revoked_at {
+            validate_timestamp(revoked_at, "key revocation")?;
+        }
         Ok(())
     }
 }
@@ -311,6 +325,9 @@ pub struct Keyring {
     active_key_id: Option<String>,
     updated_at: String,
     entries: Vec<KeyringEntry>,
+    /// Runtime-only trust policy. Not serialized: a keyring file never grants
+    /// itself permission to accept revoked keys.
+    allow_revoked: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -331,6 +348,9 @@ pub struct KeyringSummary {
     pub path: String,
     pub active_key_id: Option<String>,
     pub key_count: usize,
+    /// Additive: number of keys whose signatures are refused by default.
+    #[serde(default)]
+    pub revoked_key_count: usize,
     pub keys: Vec<KeyringKeySummary>,
 }
 
@@ -341,6 +361,8 @@ pub struct KeyringKeySummary {
     pub public_key_b64: String,
     pub created_at: String,
     pub retired_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<String>,
     pub active: bool,
 }
 
@@ -405,6 +427,7 @@ impl Keyring {
             active_key_id: file.active_key_id,
             updated_at: file.updated_at,
             entries: file.keys,
+            allow_revoked: false,
         };
         keyring.validate_with_file_kind(&file.kind, file.version)?;
         Ok(Some(keyring))
@@ -428,6 +451,7 @@ impl Keyring {
             active_key_id: None,
             updated_at: now_rfc3339(),
             entries: Vec::new(),
+            allow_revoked: false,
         };
         keyring.save()?;
         Ok(keyring)
@@ -506,14 +530,20 @@ impl Keyring {
                     }
                     .into());
                 }
-            }
-            None => {
-                if !self.entries.is_empty() {
+                if entry.revoked_at.is_some() {
                     return Err(BackupSecurityError::KeyringInvalid {
-                        reason: "keyring has keys but no active key id".to_string(),
+                        reason: format!("active key {active:?} is marked revoked"),
                     }
                     .into());
                 }
+            }
+            None => {
+                // No active key means signing is disabled. This is the normal
+                // state after `backup-key-revoke --force` on the active key,
+                // and it can also result from an operator-edited keyring. It is
+                // not a trust bypass: signing fails closed until another key is
+                // explicitly rotated in, while historical verification still
+                // uses the retained public keys.
             }
         }
         Ok(())
@@ -531,6 +561,204 @@ impl Keyring {
         &self.entries
     }
 
+    /// Return a runtime clone that accepts signatures from revoked keys.
+    ///
+    /// This is deliberately not serialized and never changes what `signing`
+    /// will use: a revoked key can never sign, only verify historical objects
+    /// when the operator explicitly asks for it.
+    pub fn with_revoked_keys_allowed(mut self, allow_revoked: bool) -> Self {
+        self.allow_revoked = allow_revoked;
+        self
+    }
+
+    pub fn allows_revoked_keys(&self) -> bool {
+        self.allow_revoked
+    }
+
+    pub fn is_key_revoked(&self, key_id: &str) -> Result<bool> {
+        Ok(self.entry(key_id)?.revoked_at.is_some())
+    }
+
+    /// Refuse a revoked key for signing or trust decisions.
+    pub fn ensure_not_revoked(&self, key_id: &str) -> Result<()> {
+        let entry = self.entry(key_id)?;
+        match &entry.revoked_at {
+            Some(revoked_at) => Err(BackupSecurityError::KeyRevoked {
+                key_id: key_id.to_string(),
+                revoked_at: revoked_at.clone(),
+            }
+            .into()),
+            None => Ok(()),
+        }
+    }
+
+    /// Public key for signature verification.
+    ///
+    /// Historical public keys are retained after retirement and revocation so
+    /// reports can still name the signing key. A revoked key is rejected unless
+    /// this keyring instance was explicitly created with
+    /// [`Keyring::with_revoked_keys_allowed`].
+    pub fn public_key_for_verification(&self, key_id: &str) -> Result<PublicKey> {
+        let entry = self.entry(key_id)?;
+        if let Some(revoked_at) = &entry.revoked_at
+            && !self.allow_revoked
+        {
+            return Err(BackupSecurityError::KeyRevoked {
+                key_id: key_id.to_string(),
+                revoked_at: revoked_at.clone(),
+            }
+            .into());
+        }
+        entry.public_key()
+    }
+
+    /// Human-readable warning when a verified object uses a revoked key.
+    pub fn revocation_warning(&self, key_id: &str) -> Option<String> {
+        let entry = self.entries.iter().find(|entry| entry.key_id == key_id)?;
+        entry.revoked_at.as_ref().map(|revoked_at| {
+            format!("signature key {key_id:?} was revoked at {revoked_at}; accepted only because --allow-revoked was set")
+        })
+    }
+
+    /// Revoke a key, refusing the active key unless `force` is explicit.
+    ///
+    /// Revoked public keys remain in the keyring for historical verification
+    /// and reporting. Forcing revocation of the active key clears
+    /// `active_key_id`, which disables signing until another key is rotated in.
+    /// An append-only `keyring-events.jsonl` audit line records the action;
+    /// it contains only public identifiers.
+    pub fn revoke_key(&mut self, key_id: &str, force: bool) -> Result<KeyRevocationReport> {
+        validate_key_id(key_id)?;
+        let position = self
+            .entries
+            .iter()
+            .position(|entry| entry.key_id == key_id)
+            .ok_or_else(|| BackupSecurityError::KeyNotFound {
+                key_id: key_id.to_string(),
+            })?;
+        if let Some(existing) = &self.entries[position].revoked_at {
+            return Ok(KeyRevocationReport {
+                key_id: key_id.to_string(),
+                revoked_at: existing.clone(),
+                was_active: self.active_key_id.as_deref() == Some(key_id),
+                active_key_id: self.active_key_id.clone(),
+                force,
+                changed: false,
+                warning: None,
+                keyring: self.directory.join(KEYRING_FILENAME).display().to_string(),
+            });
+        }
+        let was_active = self.active_key_id.as_deref() == Some(key_id);
+        if was_active && !force {
+            return Err(BackupSecurityError::KeyRevokeActive {
+                key_id: key_id.to_string(),
+            }
+            .into());
+        }
+        let revoked_at = now_rfc3339();
+        self.entries[position].revoked_at = Some(revoked_at.clone());
+        let mut warning = None;
+        if was_active {
+            self.active_key_id = None;
+            warning = Some(format!(
+                "active signing key {key_id:?} was force-revoked; no key can sign until you rotate to a new key"
+            ));
+        }
+        self.updated_at = revoked_at.clone();
+        self.validate_with_file_kind(KEYRING_KIND, KEYRING_FORMAT_VERSION)?;
+        self.save()?;
+        let report = KeyRevocationReport {
+            key_id: key_id.to_string(),
+            revoked_at,
+            was_active,
+            active_key_id: self.active_key_id.clone(),
+            force,
+            changed: true,
+            warning,
+            keyring: self.directory.join(KEYRING_FILENAME).display().to_string(),
+        };
+        if let Err(error) = self.append_event(
+            "key.revoked",
+            serde_json::json!({
+                "key_id": report.key_id,
+                "revoked_at": report.revoked_at,
+                "was_active": report.was_active,
+                "force": report.force,
+                "active_key_id": report.active_key_id,
+            }),
+        ) {
+            tracing::warn!(%error, "backup key revocation could not be appended to the keyring audit log");
+        }
+        Ok(report)
+    }
+
+    fn append_event(&self, event: &str, details: serde_json::Value) -> Result<()> {
+        vp_store::paths::ensure_private_dir(&self.directory)?;
+        let path = self.directory.join(KEYRING_EVENTS_FILENAME);
+        if let Ok(metadata) = fs::symlink_metadata(&path) {
+            if metadata.file_type().is_symlink() {
+                bail!(
+                    "refusing symlinked backup keyring audit log {}",
+                    path.display()
+                );
+            }
+            if !metadata.is_file() {
+                bail!(
+                    "backup keyring audit log {} is not a regular file",
+                    path.display()
+                );
+            }
+        }
+        // Repair a trailing partial line from an interrupted append before
+        // writing. The audit reader fails closed on malformed complete lines,
+        // so leaving a torn record would make the whole log unreadable.
+        if let Ok(metadata) = fs::metadata(&path)
+            && metadata.len() > 0
+            && metadata.len() <= MAX_KEYRING_AUDIT_BYTES
+        {
+            let bytes = fs::read(&path)
+                .with_context(|| format!("reading keyring audit log {}", path.display()))?;
+            if bytes.last() != Some(&b'\n') {
+                let keep = bytes
+                    .iter()
+                    .rposition(|byte| *byte == b'\n')
+                    .map(|index| index + 1)
+                    .unwrap_or(0);
+                let file = OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .with_context(|| format!("repairing keyring audit log {}", path.display()))?;
+                file.set_len(keep as u64)
+                    .with_context(|| format!("truncating keyring audit log {}", path.display()))?;
+                file.sync_all()
+                    .with_context(|| format!("syncing keyring audit log {}", path.display()))?;
+            }
+        }
+        let record = serde_json::json!({
+            "event": event,
+            "created_at": now_rfc3339(),
+            "details": details,
+        });
+        let mut line = serde_json::to_vec(&record).context("serializing backup keyring audit")?;
+        line.push(b'\n');
+        let mut options = OpenOptions::new();
+        options.create(true).append(true).read(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options
+            .open(&path)
+            .with_context(|| format!("opening backup keyring audit log {}", path.display()))?;
+        vp_store::paths::ensure_private_file(&path)?;
+        file.write_all(&line)
+            .with_context(|| format!("appending to {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("syncing {}", path.display()))?;
+        Ok(())
+    }
+
     pub fn updated_at(&self) -> &str {
         &self.updated_at
     }
@@ -541,7 +769,7 @@ impl Keyring {
         entry.public_key()
     }
 
-    fn entry(&self, key_id: &str) -> Result<&KeyringEntry> {
+    pub(crate) fn entry(&self, key_id: &str) -> Result<&KeyringEntry> {
         self.entries
             .iter()
             .find(|entry| entry.key_id == key_id)
@@ -567,9 +795,20 @@ impl Keyring {
     }
 
     /// Load the private credential for `key_id` (or the active key).
+    ///
+    /// Revoked keys are refused even when requested explicitly: revocation is
+    /// a hard stop for new signatures. Historical verification uses
+    /// [`Keyring::public_key_for_verification`] instead.
     pub fn signing_credential(&self, requested: Option<&str>) -> Result<SigningCredential> {
         let key_id = self.resolve_key_id(requested)?;
         let entry = self.entry(&key_id)?;
+        if let Some(revoked_at) = &entry.revoked_at {
+            return Err(BackupSecurityError::KeyRevoked {
+                key_id: key_id.clone(),
+                revoked_at: revoked_at.clone(),
+            }
+            .into());
+        }
         let material = SigningKeyMaterial::load(&self.directory, &key_id, &entry.source)?;
         let derived = material.public_key_bytes()?;
         let expected = entry.public_key()?.bytes()?;
@@ -646,6 +885,7 @@ impl Keyring {
             source: source.clone(),
             created_at: created_at.clone(),
             retired_at: None,
+            revoked_at: None,
         };
         keyring.entries.push(entry);
         keyring
@@ -666,6 +906,16 @@ impl Keyring {
         }
         keyring.updated_at = created_at.clone();
         keyring.save()?;
+        if let Err(error) = keyring.append_event(
+            "key.generated",
+            serde_json::json!({
+                "key_id": key_id,
+                "active": keyring.active_key_id.as_deref() == Some(key_id),
+                "source": source.describe(),
+            }),
+        ) {
+            tracing::warn!(%error, "backup key generation could not be appended to the keyring audit log");
+        }
         Ok(KeyGenerationReport {
             key_id: key_id.to_string(),
             algorithm: SIGNING_ALGORITHM.to_string(),
@@ -784,6 +1034,7 @@ impl Keyring {
             source: source.clone(),
             created_at: created_at.clone(),
             retired_at: None,
+            revoked_at: None,
         });
         keyring
             .entries
@@ -802,6 +1053,16 @@ impl Keyring {
         }
         keyring.updated_at = created_at.clone();
         keyring.save()?;
+        if let Err(error) = keyring.append_event(
+            "key.imported",
+            serde_json::json!({
+                "key_id": key_id,
+                "active": keyring.active_key_id.as_deref() == Some(key_id),
+                "source": source.describe(),
+            }),
+        ) {
+            tracing::warn!(%error, "backup key import could not be appended to the keyring audit log");
+        }
         Ok(KeyGenerationReport {
             key_id: key_id.to_string(),
             algorithm: SIGNING_ALGORITHM.to_string(),
@@ -857,6 +1118,7 @@ impl Keyring {
             source: source.clone(),
             created_at: created_at.clone(),
             retired_at: None,
+            revoked_at: None,
         });
         keyring
             .entries
@@ -875,6 +1137,16 @@ impl Keyring {
         }
         keyring.updated_at = created_at.clone();
         keyring.save()?;
+        if let Err(error) = keyring.append_event(
+            "key.registered",
+            serde_json::json!({
+                "key_id": key_id,
+                "active": keyring.active_key_id.as_deref() == Some(key_id),
+                "source": source.describe(),
+            }),
+        ) {
+            tracing::warn!(%error, "backup key registration could not be appended to the keyring audit log");
+        }
         Ok(KeyGenerationReport {
             key_id: key_id.to_string(),
             algorithm: SIGNING_ALGORITHM.to_string(),
@@ -895,7 +1167,14 @@ impl Keyring {
     /// Promote an existing key to active, retiring the previous active key.
     pub fn rotate_to(&mut self, key_id: &str) -> Result<KeyRotationReport> {
         validate_key_id(key_id)?;
-        self.entry(key_id)?;
+        let entry = self.entry(key_id)?;
+        if let Some(revoked_at) = &entry.revoked_at {
+            return Err(BackupSecurityError::KeyRevoked {
+                key_id: key_id.to_string(),
+                revoked_at: revoked_at.clone(),
+            }
+            .into());
+        }
         let previous = self.active_key_id.clone();
         let rotated_at = now_rfc3339();
         if let Some(previous) = &previous
@@ -924,6 +1203,16 @@ impl Keyring {
         self.active_key_id = Some(key_id.to_string());
         self.updated_at = rotated_at.clone();
         self.save()?;
+        if let Err(error) = self.append_event(
+            "key.rotated",
+            serde_json::json!({
+                "key_id": key_id,
+                "previous_key_id": previous,
+                "active_key_id": self.active_key_id,
+            }),
+        ) {
+            tracing::warn!(%error, "backup key rotation could not be appended to the keyring audit log");
+        }
         Ok(KeyRotationReport {
             key_id: key_id.to_string(),
             previous_key_id: previous.unwrap_or_default(),
@@ -942,16 +1231,137 @@ impl Keyring {
             .collect()
     }
 
+    /// Read the bounded keyring lifecycle audit log, newest first.
+    ///
+    /// The log contains only public key ids, timestamps, and source
+    /// *references*. A malformed line, a symlink, or a line that appears to
+    /// contain secret material fails closed instead of being skipped.
+    pub fn audit_events(&self, limit: usize) -> Result<KeyringAuditReport> {
+        let path = self.directory.join(KEYRING_EVENTS_FILENAME);
+        let limit = limit.clamp(1, MAX_KEYRING_AUDIT_EVENTS);
+        let mut report = KeyringAuditReport {
+            path: path.display().to_string(),
+            present: false,
+            event_count: 0,
+            truncated: false,
+            events: Vec::new(),
+        };
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!(
+                    "refusing symlinked backup keyring audit log {}",
+                    path.display()
+                );
+            }
+            Ok(metadata) if !metadata.is_file() => {
+                bail!(
+                    "backup keyring audit log {} is not a regular file",
+                    path.display()
+                );
+            }
+            Ok(metadata) => {
+                if metadata.len() > MAX_KEYRING_AUDIT_BYTES {
+                    return Err(BackupSecurityError::KeyringInvalid {
+                        reason: "keyring audit log exceeds its size limit".to_string(),
+                    }
+                    .into());
+                }
+                report.present = true;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(report);
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading keyring audit log {}", path.display()));
+            }
+        }
+        let mut bytes = Vec::new();
+        File::open(&path)
+            .with_context(|| format!("opening keyring audit log {}", path.display()))?
+            .take(MAX_KEYRING_AUDIT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("reading keyring audit log {}", path.display()))?;
+        if bytes.len() as u64 > MAX_KEYRING_AUDIT_BYTES {
+            return Err(BackupSecurityError::KeyringInvalid {
+                reason: "keyring audit log grew beyond its size limit".to_string(),
+            }
+            .into());
+        }
+        // Ignore only an incomplete final line from an interrupted append.
+        let complete = if bytes.last() == Some(&b'\n') {
+            bytes.as_slice()
+        } else if let Some(last_newline) = bytes.iter().rposition(|byte| *byte == b'\n') {
+            &bytes[..=last_newline]
+        } else {
+            &[]
+        };
+        let mut events = Vec::new();
+        for (index, line) in complete.split(|byte| *byte == b'\n').enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+            let text = std::str::from_utf8(line)
+                .context("backup keyring audit log is not valid UTF-8")?
+                .to_ascii_lowercase();
+            if text.contains("seed_b64")
+                || text.contains("private_key")
+                || text.contains("passphrase")
+            {
+                return Err(BackupSecurityError::KeyringInvalid {
+                    reason: format!(
+                        "backup keyring audit log line {} appears to contain secret material",
+                        index + 1
+                    ),
+                }
+                .into());
+            }
+            let value: serde_json::Value = serde_json::from_slice(line)
+                .with_context(|| format!("parsing backup keyring audit line {}", index + 1))?;
+            let event = value
+                .get("event")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("backup keyring audit line has no event name"))?;
+            let created_at = value
+                .get("created_at")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("backup keyring audit line has no timestamp"))?;
+            if event.is_empty()
+                || event.len() > 64
+                || created_at.is_empty()
+                || created_at.len() > 64
+            {
+                bail!("backup keyring audit line has a malformed event or timestamp");
+            }
+            events.push(KeyringAuditEvent {
+                event: event.to_string(),
+                created_at: created_at.to_string(),
+                details: value
+                    .get("details")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            });
+        }
+        report.event_count = events.len();
+        report.truncated = events.len() > limit;
+        events.reverse();
+        events.truncate(limit);
+        report.events = events;
+        Ok(report)
+    }
+
     /// Export a public key without any secret reference.
     pub fn export_public(&self, requested: Option<&str>) -> Result<PublicKeyExport> {
         let key_id = self.resolve_key_id(requested)?;
         let public = self.public_key(&key_id)?;
+        let entry = self.entry(&public.key_id)?;
         Ok(PublicKeyExport {
             key_id,
             algorithm: SIGNING_ALGORITHM.to_string(),
             public_key_b64: public.public_key_b64.clone(),
             fingerprint: public.fingerprint()?,
-            created_at: self.entry(&public.key_id)?.created_at.clone(),
+            created_at: entry.created_at.clone(),
+            revoked_at: entry.revoked_at.clone(),
         })
     }
 
@@ -965,14 +1375,17 @@ impl Keyring {
                 public_key_b64: entry.public_key_b64.clone(),
                 created_at: entry.created_at.clone(),
                 retired_at: entry.retired_at.clone(),
+                revoked_at: entry.revoked_at.clone(),
                 active: self.active_key_id.as_deref() == Some(entry.key_id.as_str()),
             })
             .collect();
         keys.sort_by(|left, right| left.key_id.cmp(&right.key_id));
+        let revoked_key_count = keys.iter().filter(|key| key.revoked_at.is_some()).count();
         KeyringSummary {
             path: self.directory.join(KEYRING_FILENAME).display().to_string(),
             active_key_id: self.active_key_id.clone(),
             key_count: keys.len(),
+            revoked_key_count,
             keys,
         }
     }
@@ -1010,6 +1423,7 @@ impl KeyringFile {
             active_key_id: self.active_key_id.clone(),
             updated_at: self.updated_at.clone(),
             entries: self.keys.clone(),
+            allow_revoked: false,
         };
         keyring.validate_with_file_kind(&self.kind, self.version)
     }
@@ -1039,6 +1453,39 @@ pub struct KeyRotationReport {
     pub rotated_at: String,
 }
 
+/// Result of revoking one signing key.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KeyRevocationReport {
+    pub key_id: String,
+    pub revoked_at: String,
+    pub was_active: bool,
+    /// `None` after a forced active-key revocation disables signing.
+    pub active_key_id: Option<String>,
+    pub force: bool,
+    pub changed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+    pub keyring: String,
+}
+
+/// One append-only keyring lifecycle event, as read by `backup-key-events`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct KeyringAuditEvent {
+    pub event: String,
+    pub created_at: String,
+    pub details: serde_json::Value,
+}
+
+/// Bounded, secret-free view of the keyring audit log.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct KeyringAuditReport {
+    pub path: String,
+    pub present: bool,
+    pub event_count: usize,
+    pub truncated: bool,
+    pub events: Vec<KeyringAuditEvent>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PublicKeyExport {
     pub key_id: String,
@@ -1046,6 +1493,8 @@ pub struct PublicKeyExport {
     pub public_key_b64: String,
     pub fingerprint: String,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<String>,
 }
 
 impl SecretSource {
@@ -1828,5 +2277,277 @@ mod tests {
             material.public_key_bytes().unwrap(),
             public.bytes().unwrap()
         );
+    }
+
+    #[test]
+    fn revocation_is_additive_persistent_and_refuses_new_signatures() {
+        let dir = keyring_dir();
+        let _ = generate(&dir, "one");
+        let _ = generate(&dir, "two");
+        let mut keyring = Keyring::load(dir.path()).unwrap();
+        assert_eq!(keyring.active_key_id(), Some("two"));
+
+        let missing = keyring.revoke_key("missing", false).unwrap_err();
+        assert!(
+            format!("{missing:#}").contains("BACKUP_KEY_NOT_FOUND"),
+            "{missing:#}"
+        );
+        let malformed = keyring.revoke_key("../escape", false).unwrap_err();
+        assert!(
+            format!("{malformed:#}").contains("must not contain")
+                || format!("{malformed:#}").contains("key id"),
+            "{malformed:#}"
+        );
+
+        let report = keyring.revoke_key("one", false).unwrap();
+        assert!(report.changed);
+        assert!(!report.was_active);
+        assert_eq!(report.active_key_id.as_deref(), Some("two"));
+        assert!(report.warning.is_none());
+
+        // Revocation is persisted additively and survives reload.
+        let reloaded = Keyring::load(dir.path()).unwrap();
+        let summary = reloaded.summary();
+        assert_eq!(summary.revoked_key_count, 1);
+        let entry = summary.keys.iter().find(|key| key.key_id == "one").unwrap();
+        assert_eq!(
+            entry.revoked_at.as_deref(),
+            Some(report.revoked_at.as_str())
+        );
+        assert!(!entry.active);
+
+        // The public key remains available for historical reporting, but both
+        // signing and trust decisions fail closed.
+        assert!(reloaded.public_key("one").is_ok());
+        let error = reloaded.signing_credential(Some("one")).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<BackupSecurityError>().unwrap().code(),
+            super::super::error::BackupSecurityCode::KeyRevoked
+        );
+        let error = reloaded.public_key_for_verification("one").unwrap_err();
+        assert!(format!("{error:#}").contains("BACKUP_KEY_REVOKED"));
+        let tolerant = reloaded.clone().with_revoked_keys_allowed(true);
+        assert!(tolerant.public_key_for_verification("one").is_ok());
+        assert!(tolerant.revocation_warning("one").is_some());
+
+        // Revoking twice is idempotent and does not move the timestamp.
+        let mut keyring = Keyring::load(dir.path()).unwrap();
+        let second = keyring.revoke_key("one", false).unwrap();
+        assert!(!second.changed);
+        assert_eq!(second.revoked_at, report.revoked_at);
+
+        // A keyring without the optional field still loads.
+        let bytes = fs::read(dir.path().join(KEYRING_FILENAME)).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value["keys"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("revoked_at");
+        fs::write(
+            dir.path().join(KEYRING_FILENAME),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                dir.path().join(KEYRING_FILENAME),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+        let legacy = Keyring::load(dir.path()).unwrap();
+        assert!(!legacy.is_key_revoked("one").unwrap());
+    }
+
+    #[test]
+    fn active_key_revocation_requires_force_and_disables_signing() {
+        let dir = keyring_dir();
+        let _ = generate(&dir, "primary");
+        let mut keyring = Keyring::load(dir.path()).unwrap();
+        let error = keyring.revoke_key("primary", false).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<BackupSecurityError>().unwrap().code(),
+            super::super::error::BackupSecurityCode::KeyRevokeActive
+        );
+        assert_eq!(keyring.active_key_id(), Some("primary"));
+
+        let report = keyring.revoke_key("primary", true).unwrap();
+        assert!(report.changed);
+        assert!(report.was_active);
+        assert!(report.active_key_id.is_none());
+        assert!(
+            report
+                .warning
+                .as_deref()
+                .unwrap()
+                .contains("no key can sign")
+        );
+
+        // The keyring is still structurally valid with every key revoked.
+        let mut reloaded = Keyring::load(dir.path()).unwrap();
+        assert!(reloaded.active_key_id().is_none());
+        let error = reloaded.signing_credential(None).unwrap_err();
+        assert!(format!("{error:#}").contains("BACKUP_SIGNING_REQUIRED"));
+        assert!(reloaded.rotate_to("primary").is_err());
+
+        // Generating the first usable key after a forced revocation activates
+        // it so the operator can recover without editing the keyring.
+        Keyring::generate_key(
+            dir.path(),
+            "replacement",
+            false,
+            SecretSource::File {
+                name: "replacement.key".to_string(),
+            },
+        )
+        .unwrap();
+        let recovered = Keyring::load(dir.path()).unwrap();
+        assert_eq!(recovered.active_key_id(), Some("replacement"));
+        assert!(recovered.signing_credential(None).is_ok());
+    }
+
+    #[test]
+    fn forced_active_revocation_with_retired_keys_stays_loadable_and_recoverable() {
+        let dir = keyring_dir();
+        let _ = generate(&dir, "one");
+        let _ = generate(&dir, "two");
+        let mut keyring = Keyring::load(dir.path()).unwrap();
+        keyring.revoke_key("two", true).unwrap();
+        let mut reloaded = Keyring::load(dir.path()).unwrap();
+        assert!(reloaded.active_key_id().is_none());
+        assert!(!reloaded.is_key_revoked("one").unwrap());
+        assert!(reloaded.is_key_revoked("two").unwrap());
+        // A retired key can be promoted again after the active key was
+        // force-revoked; the revoked key stays unusable.
+        let rotation = reloaded.rotate_to("one").unwrap();
+        assert!(rotation.changed);
+        assert_eq!(reloaded.active_key_id(), Some("one"));
+        assert!(reloaded.signing_credential(None).is_ok());
+        assert!(reloaded.signing_credential(Some("two")).is_err());
+    }
+
+    #[test]
+    fn revocation_reports_and_audit_logs_never_contain_seed_material() {
+        let dir = keyring_dir();
+        let _ = generate(&dir, "one");
+        let _ = generate(&dir, "two");
+        let key_text = fs::read_to_string(dir.path().join("one.key")).unwrap();
+        let key_json: serde_json::Value = serde_json::from_str(&key_text).unwrap();
+        let seed_b64 = key_json["seed_b64"].as_str().unwrap();
+
+        let mut keyring = Keyring::load(dir.path()).unwrap();
+        let report = keyring.revoke_key("one", false).unwrap();
+        let rendered = serde_json::to_string(&report).unwrap();
+        assert!(!rendered.contains(seed_b64));
+        assert!(!rendered.contains("seed_b64"));
+        assert!(!format!("{:?}", keyring.summary()).contains(seed_b64));
+
+        let audit = fs::read_to_string(dir.path().join(KEYRING_EVENTS_FILENAME)).unwrap();
+        assert!(audit.contains("key.revoked"), "{audit}");
+        assert!(audit.contains("\"key_id\":\"one\""), "{audit}");
+        assert!(!audit.contains(seed_b64));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dir.path().join(KEYRING_EVENTS_FILENAME))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn keyring_audit_reports_lifecycle_events_newest_first_without_secrets() {
+        let dir = keyring_dir();
+        let _ = generate(&dir, "one");
+        let _ = generate(&dir, "two");
+        let mut keyring = Keyring::load(dir.path()).unwrap();
+        keyring.rotate_to("one").unwrap();
+        keyring.revoke_key("two", false).unwrap();
+
+        let report = keyring.audit_events(100).unwrap();
+        assert!(report.present);
+        assert_eq!(report.event_count, 4);
+        assert!(!report.truncated);
+        let names: Vec<&str> = report
+            .events
+            .iter()
+            .map(|event| event.event.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "key.revoked",
+                "key.rotated",
+                "key.generated",
+                "key.generated"
+            ]
+        );
+        assert_eq!(report.events[0].details["key_id"].as_str(), Some("two"));
+        let rendered = serde_json::to_string(&report).unwrap();
+        assert!(!rendered.contains("seed"));
+        assert!(!rendered.contains("private"));
+
+        let limited = keyring.audit_events(2).unwrap();
+        assert_eq!(limited.event_count, 4);
+        assert!(limited.truncated);
+        assert_eq!(limited.events.len(), 2);
+        assert_eq!(limited.events[0].event, "key.revoked");
+        assert_eq!(limited.events[1].event, "key.rotated");
+
+        // Missing logs are reported, not synthesized.
+        let empty_dir = keyring_dir();
+        let empty = Keyring::create(empty_dir.path()).unwrap();
+        let missing = empty.audit_events(10).unwrap();
+        assert!(!missing.present);
+        assert_eq!(missing.event_count, 0);
+    }
+
+    #[test]
+    fn keyring_audit_log_rejects_secret_material_and_incomplete_lines() {
+        let dir = keyring_dir();
+        let _ = generate(&dir, "one");
+        let keyring = Keyring::load(dir.path()).unwrap();
+        let path = dir.path().join(KEYRING_EVENTS_FILENAME);
+
+        // An interrupted final append is ignored.
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"{\"event\":\"key.generated\"").unwrap();
+        drop(file);
+        let report = keyring.audit_events(10).unwrap();
+        assert_eq!(report.event_count, 1);
+
+        // A line that looks like it contains key material fails closed. The
+        // writer repairs the torn trailing line before appending this record.
+        keyring
+            .append_event("key.generated", serde_json::json!({"seed_b64": "AAAA"}))
+            .unwrap();
+        let error = keyring.audit_events(10).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("secret material"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn keyring_audit_log_rejects_symlinks_and_oversized_files() {
+        let dir = keyring_dir();
+        let _ = generate(&dir, "one");
+        let keyring = Keyring::load(dir.path()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let path = dir.path().join(KEYRING_EVENTS_FILENAME);
+            let moved = dir.path().join("real-events.jsonl");
+            fs::rename(&path, &moved).unwrap();
+            symlink(&moved, &path).unwrap();
+            let error = keyring.audit_events(10).unwrap_err();
+            assert!(format!("{error:#}").contains("symlink"), "{error:#}");
+        }
     }
 }

@@ -7948,6 +7948,7 @@ struct BackupAnchorStatus: Codable, Sendable, Identifiable {
     let lastOperation: String
     let firstSeenAt: String
     let lastVerifiedAt: String
+    let origin: String?
 
     var id: String {
         repositoryID
@@ -7962,6 +7963,7 @@ struct BackupAnchorStatus: Codable, Sendable, Identifiable {
         case lastOperation = "last_operation"
         case firstSeenAt = "first_seen_at"
         case lastVerifiedAt = "last_verified_at"
+        case origin
     }
 }
 
@@ -7971,6 +7973,7 @@ struct BackupSigningKeyStatus: Codable, Sendable, Identifiable {
     let publicKeyB64: String
     let createdAt: String
     let retiredAt: String?
+    let revokedAt: String?
     let active: Bool
 
     var id: String {
@@ -7983,6 +7986,7 @@ struct BackupSigningKeyStatus: Codable, Sendable, Identifiable {
         case publicKeyB64 = "public_key_b64"
         case createdAt = "created_at"
         case retiredAt = "retired_at"
+        case revokedAt = "revoked_at"
         case active
     }
 }
@@ -7998,6 +8002,9 @@ struct BackupStatusResult: Codable, Sendable {
     let keyCount: Int
     let keys: [BackupSigningKeyStatus]
     let signedRepositoryFormats: [Int]
+    let revokedKeyCount: Int?
+    let portableAnchorFormatVersion: Int?
+    let importedRepositories: Int?
     let note: String
 
     enum CodingKeys: String, CodingKey {
@@ -8011,6 +8018,9 @@ struct BackupStatusResult: Codable, Sendable {
         case keyCount = "key_count"
         case keys
         case signedRepositoryFormats = "signed_repository_formats"
+        case revokedKeyCount = "revoked_key_count"
+        case portableAnchorFormatVersion = "portable_anchor_format_version"
+        case importedRepositories = "imported_repositories"
         case note
     }
 }
