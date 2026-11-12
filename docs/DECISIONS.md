@@ -211,6 +211,7 @@
 | [0206](adr/0206-session-assignments-and-agent-inbox.md) | Session assignments, identity leases, project inbox, and optional wake | Accepted | Runtime/Orchestration |
 | [0207](adr/0207-identity-prompts-and-worker-labour-role-contracts.md) | Identity prompt sections, Worker/Labour role contracts, and identity cache epochs | Accepted | Runtime/Prompts |
 | [0208](adr/0208-worker-workspaces-and-two-level-integration.md) | Worker component workspaces, session worktrees, and two-level Labour→Worker→session integration | Accepted | Runtime/Git |
+| [0209](adr/0209-identity-memory-and-bounded-briefs.md) | Identity/department/project memory, evidence/lifecycle, and bounded tail briefs | Accepted | Runtime/Memory |
 
 ---
 

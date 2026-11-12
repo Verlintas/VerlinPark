@@ -498,7 +498,8 @@ should wait until the identity/role contracts and Worker workspace phases
 | S2 Session assignment + identity lease + inbox | **implemented** | `fa25081`, ADR-0206, 3,634 Rust / 506 Swift tests |
 | S3 Role contracts + prompts/cache | **implemented** | `5cedc62`, ADR-0207, 3,719 Rust / 506 Swift tests |
 | S4 Worker workspace + two-level integration | **implemented** | `349b9bb`, ADR-0208, 3,751 Rust / 508 Swift tests |
-| S5 Identity memory | planned | next |
+| S5 Identity memory | **implemented** | `91b40dd`, ADR-0209, 3,784 Rust / 509 Swift tests |
+| S6 Hiring, retirement, performance | planned | next |
 | C6 Failure attribution | planned | |
 | C7 Bounded fan-out | planned | |
 | C8 Tool search v2 + delta snapshots | planned | |

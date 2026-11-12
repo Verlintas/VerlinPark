@@ -139,6 +139,19 @@ Limits:
 - A busy component falls back to a legacy task worktree; that commit is not part of the component workspace until a future integration path.
 - No automatic land, hidden merge, force-push, cross-host workspace, S5–S8, or gate weakening.
 
+## 0.12 2026-11-13 Project-scoped identities S5
+
+S5 is implemented and merged at `91b40dd` (ADR-0209): agent/department/project identity memory with evidence, hashes, TTL, atomic supersede, soft forget/prune, bounded deterministic tail brief (≤5,600 bytes), and tail-only cache invalidation. Rust 3,784 passed; Swift 509 passed.
+
+Limits:
+
+- Same-host SQLite only; no cross-host/cross-project federation.
+- No identity-memory embeddings/ANN lane or model calls.
+- No S5 rehome for imported memory and no automatic background sweep/retention policy.
+- Brief is bounded best-effort ranking, not complete recall.
+- Legacy project-memory tables/tools are unchanged; explicit `scope=project` is a distinct store.
+- No mutation UI, org chart, hiring/retirement, or team templates (S6–S8).
+
 ## 0. 2026-10-30 跟进
 
 第一轮硬化已完成（同一 `main` 线，提交见仓库历史）：

@@ -282,7 +282,8 @@
         "stale memory visible",
         "no unbounded prompt growth"
       ],
-      "acceptance": "Identity memory is durable, evidence-backed, bounded, and cache-safe."
+      "acceptance": "Identity memory is durable, evidence-backed, bounded, and cache-safe.",
+      "status": "implemented"
     },
     {
       "id": "S6",
@@ -590,6 +591,23 @@
         "imported workspaces are read-only evidence",
         "busy component falls back to legacy task worktree",
         "no automatic land/hidden merge/force-push/cross-host/S5-S8"
+      ]
+    },
+    "S5": {
+      "status": "implemented",
+      "commit": "91b40dd",
+      "adr": "0209",
+      "tests": {
+        "rust": 3784,
+        "swift": 509
+      },
+      "limits": [
+        "same-host SQLite only; no cross-host/project federation",
+        "no identity-memory embeddings/ANN/model calls",
+        "no S5 rehome for imported memory or automatic sweep/retention",
+        "brief is bounded best-effort ranking, not complete recall",
+        "legacy project-memory tables/tools unchanged; explicit scope=project is distinct",
+        "no mutation UI/org chart/hiring/team templates"
       ]
     }
   }
