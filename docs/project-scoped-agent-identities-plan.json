@@ -175,7 +175,8 @@
         "cross-project assignment rejected",
         "Labour cannot receive project inbox"
       ],
-      "acceptance": "Identity assignment and inbox are durable, project-scoped, and fenced."
+      "acceptance": "Identity assignment and inbox are durable, project-scoped, and fenced.",
+      "status": "implemented"
     },
     {
       "id": "S3",
@@ -535,6 +536,24 @@
         "no identity budget/performance ledger",
         "one live Leader is same-database SQLite only",
         "identity model is metadata; gates unchanged"
+      ]
+    },
+    "S2": {
+      "status": "implemented",
+      "commit": "fa25081",
+      "adr": "0206",
+      "tests": {
+        "rust": 3634,
+        "swift": 506
+      },
+      "limits": [
+        "same-host SQLite lease, not distributed lock",
+        "one active session per identity; queued unused",
+        "no workspaces/identity prompts/memory/hire/org chart/team templates",
+        "wake is best-effort/cooperative",
+        "imported assignments are archive evidence",
+        "payload guard is key-name based, not a secret classifier",
+        "Swift card is read-only"
       ]
     }
   }

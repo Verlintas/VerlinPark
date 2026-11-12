@@ -99,6 +99,20 @@ Limits:
 - One-live-Leader is same-database SQLite, not cross-host consensus.
 - Identity `model` is metadata; role model routing and all approval/sandbox/Verifier/Integrator gates are unchanged.
 
+## 0.9 2026-11-13 Project-scoped identities S2
+
+S2 is implemented and merged at `fa25081` (ADR-0206): session assignments with a 600s heartbeat lease, one active session per identity, same-project/role checks, renewal/release/expiry sweep, project-scoped agent inbox with TTL/read/ack and credential-key rejection, and optional wake through the normal continuation path. Rust 3,634 passed; Swift 506 passed.
+
+Limits:
+
+- Lease is same-host SQLite coordination, not a distributed lock or cross-host fencing.
+- v1 allows one active session per identity; `queued` is reserved and unused.
+- No workspaces, identity prompts, identity memory, hire/retire workflow, org chart, or team templates.
+- Wake is best-effort/cooperative; it can stay pending or be cancelled and does not guarantee a run.
+- Imported assignments are archive evidence and never grant local authority.
+- Payload guard rejects obvious credential key names, not secret content.
+- The Swift card is read-only.
+
 ## 0. 2026-10-30 跟进
 
 第一轮硬化已完成（同一 `main` 线，提交见仓库历史）：

@@ -208,6 +208,7 @@
 | [0196](adr/0196-runtime-version-pinning-and-controller-replay.md) | Runtime identity pinning, compatibility/migration, and deterministic controller replay | Accepted | Runtime/Durability |
 | [0197](adr/0197-reliability-metrics-and-otel-genai.md) | Reliability metrics, Lucky-Pass signals, and OTel GenAI projection | Accepted | Runtime/Observability |
 | [0205](adr/0205-project-scoped-agent-identities.md) | Project-scoped Leader/Manager/Worker identity schema, lifecycle, policy, and migration | Accepted | Runtime/Orchestration |
+| [0206](adr/0206-session-assignments-and-agent-inbox.md) | Session assignments, identity leases, project inbox, and optional wake | Accepted | Runtime/Orchestration |
 
 ---
 
