@@ -7929,6 +7929,9 @@ impl AgentService {
                 tools_hash: hashes.tools_hash,
                 volatile_hash: hashes.volatile_hash,
                 prefix_hash: hashes.prefix_hash,
+                identity_hash: hashes.identity_hash,
+                identity_id: hashes.identity_id,
+                identity_generation: hashes.identity_generation,
                 prompt_layout: hashes.prompt_layout,
                 stable_prefix_hash: hashes.stable_prefix_hash,
                 head_sections: hashes.head_sections,
@@ -14515,6 +14518,9 @@ async fn warm_prompt_cache(
             core_hash: Some(hashes.core_hash),
             project_hash: Some(hashes.project_hash),
             tools_hash: Some(hashes.tools_hash),
+            identity_hash: (!hashes.identity_hash.is_empty()).then(|| hashes.identity_hash.clone()),
+            identity_id: hashes.identity_id.clone(),
+            identity_generation: hashes.identity_generation,
             cache_epoch: Some(prompt_epoch.hash),
             cache_epoch_unchanged: true,
             cache_epoch_reused_from_sessions: epoch_reuse.prior_sessions,
@@ -14743,6 +14749,9 @@ async fn warm_prompt_cache(
         core_hash: Some(hashes.core_hash),
         project_hash: Some(hashes.project_hash),
         tools_hash: Some(hashes.tools_hash),
+        identity_hash: (!hashes.identity_hash.is_empty()).then(|| hashes.identity_hash.clone()),
+        identity_id: hashes.identity_id.clone(),
+        identity_generation: hashes.identity_generation,
         cache_epoch: Some(prompt_epoch.hash.clone()),
         cache_epoch_unchanged: true,
         cache_epoch_reused_from_sessions: epoch_reuse.prior_sessions,
@@ -15703,6 +15712,10 @@ async fn run_loop_body(
     let epoch_reuse = engine
         .cache_epoch_reuse(&project.id, &prompt_epoch.hash, &session.id)
         .await?;
+    let identity_section_count = prompt_hashes.identity_sections.len();
+    let identity_memory_present = prompt_hashes.section_chars.contains_key("agent/memory");
+    let identity_hash_value =
+        (!prompt_hashes.identity_hash.is_empty()).then(|| prompt_hashes.identity_hash.clone());
     let mut prefix_payload = serde_json::json!({
         "version": prompt_hashes.prompt_layout,
         "prompt_layout": prompt_hashes.prompt_layout,
@@ -15739,6 +15752,14 @@ async fn run_loop_body(
         "volatile_hash": prompt_hashes.volatile_hash,
         "prefix_hash": prefix_hash,
         "cache_generation": prefix_hash,
+        // S3 identity metadata. It is hash/size only; no identity prompt text
+        // or memory brief ever enters telemetry.
+        "identity_hash": identity_hash_value,
+        "identity_id": prompt_hashes.identity_id,
+        "identity_generation": prompt_hashes.identity_generation,
+        "identity_sections": prompt_hashes.identity_sections,
+        "identity_section_count": identity_section_count,
+        "identity_memory_present": identity_memory_present,
         // The finalized L4 epoch replaces the L1 placeholder. A compaction
         // boundary later in the run records a conversation-cache reset; it
         // does not rewrite this shareable instruction identity.
@@ -21765,20 +21786,28 @@ fn tool_schemas(
         });
     }
     if role.child_role().is_some() && allow_delegation {
+        let child_role = role.child_role();
+        let child_name = child_role.map(AgentRole::as_str).unwrap_or("worker");
+        let description = match role {
+            AgentRole::Worker => format!(
+                "Delegate an implementation task to a {child_name}. Labour is the implementation worker: it writes code/tests, runs checks, commits, and reports back. You remain the technical lead and must review the result."
+            ),
+            AgentRole::Manager => format!(
+                "Delegate a focused department objective to a {child_name}. Workers are technical leads: they design, decompose implementation to Labour, review it, and integrate."
+            ),
+            _ => format!(
+                "Delegate a focused objective to a {child_name}. The child agent runs synchronously and returns a summary."
+            ),
+        };
         tools.push(ToolSchema {
             name: "delegate".to_string(),
-            description: format!(
-                "Delegate a focused objective to a {}. The child agent runs synchronously and returns a summary.",
-                role.child_role()
-                    .map(AgentRole::as_str)
-                    .unwrap_or("worker")
-            ),
+            description,
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "role": {
                         "type": "string",
-                        "enum": ["manager", "worker", "labour"]
+                        "enum": [child_name]
                     },
                     "name": {"type": "string"},
                     "title": {
@@ -22166,7 +22195,7 @@ fn tool_schemas(
     if role == AgentRole::Manager && allow_delegation {
         tools.push(ToolSchema {
             name: "delegate_many".to_string(),
-            description: "Run 1-5 Workers in parallel. Each task must declare a non-overlapping write_scope when more than one task is provided.".to_string(),
+            description: "Run 1-5 Workers in parallel. Each Worker is a technical lead who decomposes implementation to Labour and reviews it. Each task must declare a non-overlapping write_scope when more than one task is provided.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -25302,9 +25331,25 @@ fn role_profile_note(role: AgentRole, spec: &AgentSpec) -> String {
                 "research. Use read/search/fetch_url and cite evidence; do not claim facts without sources."
                     .to_string()
             }
-            AgentProfile::Coding => {
-                "coding. Inspect the code, make focused changes, and run tests.".to_string()
-            }
+            AgentProfile::Coding => match role {
+                AgentRole::Worker => {
+                    "coding. Technical lead: design, decompose implementation to Labour, review \
+                     changes, and integrate. Do not perform bulk implementation yourself."
+                        .to_string()
+                }
+                AgentRole::Labour => {
+                    "coding. Implement the assigned task directly: write code and tests, run the \
+                     relevant checks, and commit a clean result."
+                        .to_string()
+                }
+                AgentRole::Leader | AgentRole::Manager => {
+                    "coding. Read and review; direction and coordination only, no bulk implementation."
+                        .to_string()
+                }
+                AgentRole::Verifier | AgentRole::Scout => {
+                    "coding. Read and review evidence; do not edit files.".to_string()
+                }
+            },
             AgentProfile::Verification => {
                 "verification. Review evidence and run checks; do not edit files.".to_string()
             }
@@ -25328,47 +25373,53 @@ fn role_prompt_parts(
     let charter = match role {
         AgentRole::Leader => {
             "You are the Leader agent of VerlinPark, a local multi-agent engineering \
-             system. You own the session plan and the final result. Keep a short plan with \
-             todo_write. Prefer a real team for non-trivial work: if the objective has multiple \
-             steps, files, or verification needs, submit a TeamPlan and use run_team_plan. Do the \
-             work directly only when it is genuinely small (for example a one-file edit or a quick \
-             inspection) or the user explicitly asks for no team. Do not use a team as ceremony \
-             for a tiny task. For a goal that spans multiple areas, delegate department-level \
-             objectives to Managers with delegate(role=\"manager\"). Give every Manager a distinct \
-             title (for example Discovery, Implementation, Quality) via the title field; each \
-             title defines that Manager's department role. Managers will split work and delegate \
-             to Workers; Workers may use Labour. Do not delegate directly to Workers or Labour. \
-             For a multi-department plan, call deliberate_team_plan first so Managers can review \
-             peer positions and agree on handoffs; then call run_team_plan to execute. Do not \
-             manually delegate the planned Managers unless you intentionally override the plan. \
-             Call team_status to inspect ready/blocked tasks and recent coordination. Use \
-             coordinate action=decision for cross-department choices, action=escalate when the \
-             user must decide, and action=unblock after resolving a reported blocker. You can \
-             still inspect and edit files yourself for small tasks. Review summaries, verify the \
-             final diff, and report the result."
+             system. You are the project and portfolio owner: you own the session plan, \
+             priorities, budget, cross-session direction, and the final result. Keep a short plan \
+             with todo_write. Prefer a real team for non-trivial work: if the objective has multiple \
+             steps, files, or verification needs, submit a TeamPlan and use run_team_plan. Do not \
+             perform bulk implementation yourself; a genuinely small inspection or an explicitly \
+             requested one-file fix is acceptable, but implementation belongs to Labour through a \
+             Worker. Do not use a team as ceremony for a tiny task. For a goal that spans multiple \
+             areas, delegate department-level objectives to Managers with delegate(role=\"manager\"). \
+             Give every Manager a distinct title (for example Discovery, Implementation, Quality) via \
+             the title field; each title defines that Manager's department role. Managers will split \
+             work and delegate to Workers; Workers lead implementation through Labour. Do not \
+             delegate directly to Workers or Labour. For a multi-department plan, call \
+             deliberate_team_plan first so Managers can review peer positions and agree on handoffs; \
+             then call run_team_plan to execute. Do not manually delegate the planned Managers unless \
+             you intentionally override the plan. Call team_status to inspect ready/blocked tasks and \
+             recent coordination. Use coordinate action=decision for cross-department choices, \
+             action=escalate when the user must decide, and action=unblock after resolving a reported \
+             blocker. Review summaries, verify the final diff, and report the result."
                 .to_string()
         }
-        AgentRole::Manager => "You are a department Manager, reporting to the Leader. You own one \
-             department of the team plan. You may read and search, but you must not edit files or \
-             run shell commands. Call team_status before splitting work and after a Worker \
-             returns. Split the objective into focused Worker tasks. For independent tasks, use \
-             delegate_many(tasks=[...]) with non-overlapping write_scope values so Workers run in \
-             parallel; otherwise use delegate(role=\"worker\"). Tell Workers to report blockers \
-             with coordinate action=blocker. Record handoffs and decisions with coordinate, and \
-             call coordinate action=unblock after resolving a blocker. Review the returned \
-             summaries, resolve gaps, then return a concise consolidated result. Do not delegate \
-             to Managers or Labour. Your department title and objective are in the run context."
+        AgentRole::Manager => "You are a department Manager, reporting to the Leader. You are the \
+             department architect: you own one department of the team plan, cross-Worker interface \
+             contracts, Worker plan/design review, and coordination. You may read and search, but you \
+             must not edit files, run shell commands, or perform bulk code. Call team_status before \
+             splitting work and after a Worker returns. Split the objective into focused Worker tasks. \
+             For independent tasks, use delegate_many(tasks=[...]) with non-overlapping write_scope \
+             values so Workers run in parallel; otherwise use delegate(role=\"worker\"). Workers are \
+             technical leads who decompose implementation to Labour and review it. Tell Workers to \
+             report blockers with coordinate action=blocker. Record handoffs and decisions with \
+             coordinate, and call coordinate action=unblock after resolving a blocker. Review Worker \
+             designs/interfaces and returned summaries, resolve gaps, then return a concise \
+             consolidated result. Do not delegate to Managers or Labour. Your department title and \
+             objective are in the run context."
             .to_string(),
-        AgentRole::Worker => "You are a Worker, reporting to a Manager. You own implementation in \
-             your task worktree. Inspect only what the task needs, make focused edits, and run the \
-             relevant checks. Use team_status only when upstream/blocked context is actually \
-             needed. Delegate small research or verification subtasks to Labour with \
-             delegate(role=\"labour\") when useful. If you cannot proceed, call coordinate \
-             action=blocker with the task id and a concrete reason; never silently stall. The \
-             runtime commits your worktree automatically when you return; do not run git \
-             add/commit and do not keep re-reading or re-checking a file once its acceptance is \
-             met. Record a final summary with coordinate action=note, then return immediately. \
-             Include evidence in your result. Do not delegate to Managers or Workers."
+        AgentRole::Worker => "You are a Worker, reporting to a Manager. You are the technical lead \
+             for your task or component: own the low-level design, decompose the implementation into \
+             Labour subtasks, define interfaces and acceptance criteria, review Labour changes, and \
+             integrate them. Delegate implementation to Labour with delegate(role=\"labour\"); do not \
+             perform bulk implementation yourself. Design docs, interface notes, and minimal \
+             scaffolding are acceptable, and you may run focused checks. Inspect only what the task \
+             needs. Use team_status only when upstream/blocked context is actually needed. If you \
+             cannot proceed, call coordinate action=blocker with the task id and a concrete reason; \
+             never silently stall. The runtime commits your worktree automatically when you return; \
+             do not run git add/commit and do not keep re-reading or re-checking a file once its \
+             acceptance is met. Record a final summary with coordinate action=note, then return \
+             immediately. Include review evidence and the Labour tasks you integrated. Do not \
+             delegate to Managers or Workers."
             .to_string(),
         AgentRole::Verifier => "You are a Verifier, reporting to a Manager. You are read-only: do \
              not edit files. Use team_status for upstream context. Inspect the task branch/diff \
@@ -25376,10 +25427,12 @@ fn role_prompt_parts(
              objective and evidence is sufficient. Then call submit_verdict with approved and \
              summary. You cannot delegate."
             .to_string(),
-        AgentRole::Labour => "You are Labour, reporting to a Worker. Execute the assigned subtask \
-             directly in the worktree and return a concise report. If you are blocked, use \
-             coordinate action=blocker with the task id and a concrete reason. You cannot delegate \
-             to other agents."
+        AgentRole::Labour => "You are Labour, reporting to a Worker. You are the implementation \
+             worker for one task: execute it directly in the worktree, write code and tests, run the \
+             relevant checks, commit your work, and return a concise report with evidence. If you are \
+             blocked, use coordinate action=blocker with the task id and a concrete reason. You cannot \
+             delegate to other agents, and you do not own a project identity. Do not silently stall \
+             or claim success without evidence."
             .to_string(),
         AgentRole::Scout => "You are Scout, a read-only exploration agent with a fresh context. \
              Answer the assigned objective by reading and searching the session worktree. You \
@@ -25803,11 +25856,59 @@ async fn build_prompt_sections(
     }
 
     use crate::instruction::{InstructionCandidate, InstructionSectionKey};
-    let mut candidates = Vec::with_capacity(7);
+    // S3: resolve the active project identity only for the v3 layout. A legacy
+    // session with no assignment, and every Labour/Verifier/Scout run, gets no
+    // identity section and therefore the pre-S3 prompt bytes.
+    let prompt_identity = engine
+        .prompt_identity_for_run(
+            &session.id,
+            spec.role.as_str(),
+            spec.title.as_deref(),
+            spec.department.as_deref(),
+        )
+        .await?;
+    let identity_section = match &prompt_identity {
+        Some(identity) => Some(crate::identity_prompt::render_identity_section(identity)?),
+        None => None,
+    };
+    let identity_memory = if include_memory {
+        match &prompt_identity {
+            Some(identity) => engine
+                .identity_memory_brief(&session.id, identity)
+                .await
+                .unwrap_or_default(),
+            None => String::new(),
+        }
+    } else {
+        String::new()
+    };
+    // Identity memory is optional. Never let it push the existing run-memory
+    // tail over the aggregate tail cap and fail a run that would otherwise
+    // succeed: omit this bounded brief instead. The identity head section is
+    // unaffected either way.
+    let identity_memory_section = if include_memory {
+        crate::identity_prompt::render_identity_memory_section(&identity_memory)
+    } else {
+        None
+    };
+    let identity_memory_section = identity_memory_section.filter(|section| {
+        section
+            .len()
+            .saturating_add(memory_brief.len())
+            .saturating_add(2)
+            <= crate::instruction::MAX_INSTRUCTION_TAIL_BYTES
+    });
+    let mut candidates = Vec::with_capacity(10);
     candidates.push(InstructionCandidate::new(
         InstructionSectionKey::CoreCharter,
         parts.core_charter,
     ));
+    if let Some(identity_section) = identity_section {
+        candidates.push(InstructionCandidate::new(
+            InstructionSectionKey::AgentIdentity,
+            identity_section,
+        ));
+    }
     if !parts.recipes.is_empty() {
         candidates.push(InstructionCandidate::new(
             InstructionSectionKey::CoreRecipes,
@@ -25842,6 +25943,12 @@ async fn build_prompt_sections(
         candidates.push(InstructionCandidate::new(
             InstructionSectionKey::RunTask,
             run_task,
+        ));
+    }
+    if let Some(identity_memory) = identity_memory_section {
+        candidates.push(InstructionCandidate::new(
+            InstructionSectionKey::AgentMemory,
+            identity_memory,
         ));
     }
     if include_memory && !memory_brief.is_empty() {
@@ -25933,9 +26040,18 @@ async fn build_prompt_sections(
             .await?;
         }
     }
-    Ok(crate::prompt_cache::PromptSections::from_materialized(
-        &materialized,
-    ))
+    let mut prompt_sections = crate::prompt_cache::PromptSections::from_materialized(&materialized);
+    if let (Some(identity), Some(section)) = (
+        prompt_identity.as_ref(),
+        materialized.section(InstructionSectionKey::AgentIdentity),
+    ) {
+        prompt_sections.identity = Some(crate::prompt_cache::PromptIdentityMarker {
+            identity_id: identity.id.clone(),
+            generation: identity.generation.max(1),
+            hash: section.hash.clone(),
+        });
+    }
+    Ok(prompt_sections)
 }
 
 /// Project the static bundle catalog into the protocol shape shared by

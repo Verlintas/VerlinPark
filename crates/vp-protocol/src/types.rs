@@ -2723,6 +2723,10 @@ pub struct SessionInstructionStateReport {
     pub head_hash: String,
     #[serde(default)]
     pub tail_hash: String,
+    /// Hash of this state's `agent/identity` section, when present. Text is
+    /// never returned by this RPC.
+    #[serde(default)]
+    pub identity_hash: Option<String>,
     #[serde(default)]
     pub sections: Vec<SessionInstructionSection>,
 }
@@ -2744,6 +2748,14 @@ pub struct SessionInstructionsReport {
     /// event. It can be compared with each state's `head_hash`.
     #[serde(default)]
     pub latest_stable_prefix_hash: Option<String>,
+    /// Latest project identity id/generation/hash from the prompt-prefix
+    /// event. Absent for legacy sessions and for Labour/Verifier/Scout runs.
+    #[serde(default)]
+    pub latest_identity_id: Option<String>,
+    #[serde(default)]
+    pub latest_identity_generation: Option<u64>,
+    #[serde(default)]
+    pub latest_identity_hash: Option<String>,
     #[serde(default)]
     pub states: Vec<SessionInstructionStateReport>,
     /// Bounded diagnostic surfaced by the last materialization attempt.
@@ -8181,6 +8193,17 @@ pub struct SessionCacheStatus {
     pub cache_epoch_core_sections: Vec<PromptSectionRef>,
     #[serde(default)]
     pub cache_epoch_project_sections: Vec<PromptSectionRef>,
+    /// Stable identity component for the current epoch, when the latest
+    /// prompt-prefix event was produced by an assigned Leader/Manager/Worker.
+    /// Legacy, v2, and Labour/Verifier/Scout runs leave these empty.
+    #[serde(default)]
+    pub cache_epoch_identity_hash: Option<String>,
+    #[serde(default)]
+    pub cache_epoch_identity_id: Option<String>,
+    #[serde(default)]
+    pub cache_epoch_identity_generation: Option<u64>,
+    #[serde(default)]
+    pub cache_epoch_identity_sections: Vec<PromptSectionRef>,
     /// Project-wide distinct sessions that have used the current epoch.
     #[serde(default)]
     pub cache_epoch_session_count: u64,
@@ -9121,6 +9144,14 @@ pub struct SessionCachePlanRole {
     pub volatile_hash: String,
     #[serde(default)]
     pub prefix_hash: String,
+    /// Stable `agent/identity` section metadata for this role. Empty/absent
+    /// for legacy sessions and Labour/Verifier/Scout plans.
+    #[serde(default)]
+    pub identity_hash: String,
+    #[serde(default)]
+    pub identity_id: Option<String>,
+    #[serde(default)]
+    pub identity_generation: Option<u64>,
     #[serde(default)]
     pub prompt_layout: u32,
     #[serde(default)]
@@ -9192,6 +9223,14 @@ pub struct SessionCacheWarmResult {
     pub project_hash: Option<String>,
     #[serde(default)]
     pub tools_hash: Option<String>,
+    /// Stable identity component included in the warmed head sections, when
+    /// the role has an active project identity assignment.
+    #[serde(default)]
+    pub identity_hash: Option<String>,
+    #[serde(default)]
+    pub identity_id: Option<String>,
+    #[serde(default)]
+    pub identity_generation: Option<u64>,
     /// Stable epoch covered by the warm request. A warm never changes it.
     #[serde(default)]
     pub cache_epoch: Option<String>,
@@ -15728,6 +15767,9 @@ mod tests {
             core_hash: Some("core".into()),
             project_hash: Some("project".into()),
             tools_hash: Some("tools".into()),
+            identity_hash: Some("i".repeat(64)),
+            identity_id: Some("agt-1".into()),
+            identity_generation: Some(2),
             cache_epoch: Some("e".repeat(64)),
             cache_epoch_unchanged: true,
             cache_epoch_reused_from_sessions: 2,
@@ -15796,6 +15838,38 @@ mod tests {
         .unwrap();
         assert_eq!(report.prompt_layout, 3);
         assert!(report.states.is_empty());
+        assert!(report.latest_identity_id.is_none());
+        assert!(report.latest_identity_generation.is_none());
+        assert!(report.latest_identity_hash.is_none());
+
+        let with_identity: SessionInstructionsReport = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "latest_identity_id": "agt-1",
+            "latest_identity_generation": 5,
+            "latest_identity_hash": "b".repeat(64),
+            "states": [{
+                "state_id": "ses-1",
+                "role": "worker",
+                "identity_hash": "b".repeat(64),
+                "sections": [{
+                    "key": "agent/identity",
+                    "hash": "b".repeat(64),
+                    "ordinal": 15,
+                    "tail": false,
+                    "chars": 900,
+                    "available": true
+                }]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(with_identity.latest_identity_id.as_deref(), Some("agt-1"));
+        assert_eq!(with_identity.latest_identity_generation, Some(5));
+        assert_eq!(
+            with_identity.states[0].identity_hash.as_deref(),
+            Some(with_identity.latest_identity_hash.as_deref().unwrap())
+        );
+        assert_eq!(with_identity.states[0].sections[0].ordinal, 15);
+        assert!(!with_identity.states[0].sections[0].tail);
 
         let full = SessionInstructionsReport {
             session_id: "ses-1".into(),
@@ -15803,6 +15877,9 @@ mod tests {
             latest_prefix_hash: Some("prefix".into()),
             latest_cache_epoch: Some("prefix".into()),
             latest_stable_prefix_hash: Some("stable".into()),
+            latest_identity_id: Some("agt-1".into()),
+            latest_identity_generation: Some(2),
+            latest_identity_hash: Some("b".repeat(64)),
             states: vec![SessionInstructionStateReport {
                 state_id: "ses-1".into(),
                 role: Some("leader".into()),
@@ -15810,6 +15887,7 @@ mod tests {
                 prompt_layout: 3,
                 head_hash: "head".into(),
                 tail_hash: "tail".into(),
+                identity_hash: Some("b".repeat(64)),
                 sections: vec![SessionInstructionSection {
                     key: "core/charter".into(),
                     hash: "a".repeat(64),
@@ -15900,6 +15978,9 @@ mod tests {
                 tools_hash: "tools".into(),
                 volatile_hash: "volatile".into(),
                 prefix_hash: "prefix".into(),
+                identity_hash: "identity".into(),
+                identity_id: Some("agt-1".into()),
+                identity_generation: Some(3),
                 prompt_layout: 2,
                 stable_prefix_hash: "stable".into(),
                 head_sections: Vec::new(),
@@ -15931,6 +16012,35 @@ mod tests {
         assert_eq!(minimal.roles[0].cache_breakpoints, 0);
         assert_eq!(minimal.roles[0].tool_count, 0);
         assert!(minimal.policy.is_none());
+        assert!(minimal.roles[0].identity_hash.is_empty());
+        assert!(minimal.roles[0].identity_id.is_none());
+        assert!(minimal.roles[0].identity_generation.is_none());
+
+        let identity_plan: SessionCachePlanResult = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "roles": [{
+                "role": "worker",
+                "provider": "x",
+                "model": "y",
+                "identity_hash": "b".repeat(64),
+                "identity_id": "agt-worker",
+                "identity_generation": 4,
+                "head_sections": [{
+                    "key": "agent/identity",
+                    "hash": "b".repeat(64),
+                    "ordinal": 15,
+                    "tail": false
+                }]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(identity_plan.roles[0].identity_generation, Some(4));
+        assert_eq!(
+            identity_plan.roles[0].identity_id.as_deref(),
+            Some("agt-worker")
+        );
+        assert_eq!(identity_plan.roles[0].identity_hash.len(), 64);
+        assert_eq!(identity_plan.roles[0].head_sections[0].ordinal, 15);
     }
 
     #[test]
@@ -20382,6 +20492,15 @@ mod cache_epoch_protocol_tests {
             cache_epoch_call_count: 12,
             cache_epoch_observed_input_tokens: 90_000,
             cache_epoch_observed_cache_read_tokens: 88_000,
+            cache_epoch_identity_hash: Some("b".repeat(64)),
+            cache_epoch_identity_id: Some("agt-1".into()),
+            cache_epoch_identity_generation: Some(3),
+            cache_epoch_identity_sections: vec![PromptSectionRef::new(
+                "agent/identity",
+                "b".repeat(64),
+                15,
+                false,
+            )],
             cache_epochs_seen: 1,
             prefix_reused_from_sessions: 2,
             cross_session_hit_tokens: 1_200,
@@ -20398,6 +20517,24 @@ mod cache_epoch_protocol_tests {
         assert_eq!(decoded, status);
         assert_eq!(decoded.cache_epoch_session_count, 3);
         assert_eq!(decoded.cross_session_hit_tokens, 1_200);
+        let expected_identity_hash = "b".repeat(64);
+        assert_eq!(
+            decoded.cache_epoch_identity_hash.as_deref(),
+            Some(expected_identity_hash.as_str())
+        );
+        assert_eq!(decoded.cache_epoch_identity_id.as_deref(), Some("agt-1"));
+        assert_eq!(decoded.cache_epoch_identity_generation, Some(3));
+        assert_eq!(decoded.cache_epoch_identity_sections.len(), 1);
+        assert_eq!(decoded.cache_epoch_identity_sections[0].ordinal, 15);
+
+        let legacy: SessionCacheStatus = serde_json::from_value(json!({
+            "session_id": "ses-legacy"
+        }))
+        .unwrap();
+        assert!(legacy.cache_epoch_identity_hash.is_none());
+        assert!(legacy.cache_epoch_identity_id.is_none());
+        assert!(legacy.cache_epoch_identity_generation.is_none());
+        assert!(legacy.cache_epoch_identity_sections.is_empty());
     }
 
     #[test]

@@ -21,7 +21,7 @@ use vp_protocol::remote::RemoteTestEvidence;
 use vp_protocol::types::{
     AcpAgent, AcpAgentConfig, AcpAgentListResult, AcpProbeResult, AcpTransport,
     AgentCoordinationReplayParams, AgentCoordinationReplayReport, AgentCoordinationWake,
-    AgentIdentitiesResult, AgentIdentityPolicy, AgentIdentityReplayParams,
+    AgentIdentitiesResult, AgentIdentity, AgentIdentityPolicy, AgentIdentityReplayParams,
     AgentIdentityReplayReport, AgentIdentityResult, AgentInboxListParams, AgentInboxListResult,
     AgentInboxMessageParams, AgentInboxReadResult, AgentInboxSendParams, AgentInboxSendResult,
     AgentMessage, AgentRecord, Approval, ApprovalAuditEvent, ApprovalAuditResult,
@@ -139,6 +139,7 @@ pub mod gate;
 pub mod gui;
 pub mod history;
 pub mod identity;
+pub mod identity_prompt;
 pub mod instruction;
 pub mod mcp;
 pub mod mcp_pins;
@@ -10863,6 +10864,14 @@ impl Engine {
             .as_ref()
             .map(|row| row.session_count)
             .unwrap_or(0);
+        let identity_sections = prefix_event
+            .as_ref()
+            .and_then(|event| event.payload.get("identity_sections"))
+            .and_then(|value| {
+                serde_json::from_value::<Vec<vp_protocol::types::PromptSectionRef>>(value.clone())
+                    .ok()
+            })
+            .unwrap_or_default();
 
         Ok(SessionCacheStatus {
             session_id: session_id.to_string(),
@@ -10890,6 +10899,16 @@ impl Engine {
                 .as_ref()
                 .map(|row| row.project_sections.clone())
                 .unwrap_or_default(),
+            cache_epoch_identity_hash: hash("identity_hash").filter(|value| !value.is_empty()),
+            cache_epoch_identity_id: hash("identity_id").filter(|value| !value.is_empty()),
+            cache_epoch_identity_generation: prefix_event.as_ref().and_then(|event| {
+                event
+                    .payload
+                    .get("identity_generation")
+                    .and_then(serde_json::Value::as_u64)
+                    .filter(|generation| *generation > 0)
+            }),
+            cache_epoch_identity_sections: identity_sections,
             cache_epoch_session_count: epoch_session_count,
             cache_epoch_call_count: epoch_aggregate
                 .as_ref()
@@ -11398,12 +11417,15 @@ impl Engine {
             .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
         let states = self.store.list_instruction_states_for_session(session_id)?;
         let agents = self.list_agents(session_id).await?;
-        let (latest_prefix_hash, latest_cache_epoch, latest_stable_prefix_hash) = {
+        let latest = {
             let prefixes = self
                 .recent_events_of_kind(session_id, "context.prompt_prefix", 1)
                 .await?;
             crate::instruction::latest_prompt_prefix(&prefixes)
         };
+        let latest_prefix_hash = latest.prefix_hash.clone();
+        let latest_cache_epoch = latest.cache_epoch.clone();
+        let latest_stable_prefix_hash = latest.stable_prefix_hash.clone();
         let rebuilt_events = self
             .recent_events_of_kind(session_id, "context.instruction.rebuilt", 200)
             .await?;
@@ -11477,6 +11499,10 @@ impl Engine {
                 prompt_layout: crate::instruction::PROMPT_LAYOUT_V3,
                 head_hash,
                 tail_hash,
+                identity_hash: rows
+                    .iter()
+                    .find(|row| row.key == crate::identity_prompt::IDENTITY_SECTION_KEY)
+                    .map(|row| row.hash.clone()),
                 sections,
             });
         }
@@ -11486,6 +11512,9 @@ impl Engine {
             latest_prefix_hash,
             latest_cache_epoch,
             latest_stable_prefix_hash,
+            latest_identity_id: latest.identity_id,
+            latest_identity_generation: latest.identity_generation,
+            latest_identity_hash: latest.identity_hash,
             states: reports,
             last_rebuilt: rebuilt_events.len() as u64,
         })
@@ -17768,6 +17797,158 @@ impl Engine {
             ))
         })
         .await?
+    }
+
+    // -----------------------------------------------------------------
+    // S3 identity prompts and role contracts
+    // -----------------------------------------------------------------
+
+    /// Resolve the project identity that drives one run.
+    ///
+    /// Only Leader, Manager, and Worker may have a prompt identity. Labour,
+    /// Verifier, and Scout return `None` even if a caller passes one of those
+    /// role names: they are task/session gates, not project employees. A legacy
+    /// session with no active assignment also returns `None`, preserving the
+    /// pre-S3 prompt and cache bytes exactly.
+    ///
+    /// Selection is deterministic: exact role, then exact title, then exact
+    /// department, then the oldest active assignment with an identity-id
+    /// tie-break. The lease's wall-clock expiry is not consulted here; the
+    /// persisted assignment status is authoritative, and S2 reclaims an expired
+    /// lease before another session can use it. This keeps a live session's
+    /// identity head section stable across runs.
+    pub async fn prompt_identity_for_run(
+        &self,
+        session_id: &str,
+        role: &str,
+        title: Option<&str>,
+        department: Option<&str>,
+    ) -> Result<Option<AgentIdentity>> {
+        let role = role.trim().to_ascii_lowercase();
+        if !crate::identity_prompt::identity_role_applies(&role) {
+            return Ok(None);
+        }
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let title = title.map(str::to_string);
+        let department = department.map(str::to_string);
+        tokio::task::spawn_blocking(move || {
+            let session = store
+                .get_session(&session_id)?
+                .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+            let assignments = store.list_session_agent_assignments(
+                Some(&session_id),
+                None,
+                None,
+                Some("active"),
+                None,
+            )?;
+            if assignments.is_empty() {
+                return Ok(None);
+            }
+            let mut identities = HashMap::new();
+            for assignment in &assignments {
+                if let Some(identity) = store.get_agent_identity(&assignment.identity_id)? {
+                    identities.insert(identity.id.clone(), identity);
+                }
+            }
+            let Some(assignment) = crate::identity_prompt::prefer_identity_assignment(
+                &assignments,
+                &identities,
+                &role,
+                title.as_deref(),
+                department.as_deref(),
+            ) else {
+                return Ok(None);
+            };
+            let Some(identity) = identities.get(&assignment.identity_id) else {
+                return Ok(None);
+            };
+            if identity.project_id != session.project_id
+                || !identity.role.eq_ignore_ascii_case(&role)
+                || identity.origin == "imported"
+                || !matches!(identity.status.as_str(), "active" | "idle")
+            {
+                return Ok(None);
+            }
+            Ok(Some(identity.clone()))
+        })
+        .await?
+    }
+
+    /// Bounded identity/department memory brief from existing project memory.
+    ///
+    /// S3 does not add the dedicated identity-memory table (S5). It reuses the
+    /// evidence-backed project memory store with a deterministic query derived
+    /// from trusted identity metadata and returns only a bounded brief. An empty
+    /// result omits the `agent/memory` tail section entirely. This read does not
+    /// mark memory as used; the ordinary run-memory brief retains that
+    /// accounting.
+    pub async fn identity_memory_brief(
+        &self,
+        session_id: &str,
+        identity: &AgentIdentity,
+    ) -> Result<String> {
+        if !crate::identity_prompt::identity_role_applies(&identity.role) {
+            return Ok(String::new());
+        }
+        let store = self.store.clone();
+        let lookup = session_id.to_string();
+        let session = tokio::task::spawn_blocking(move || store.get_session(&lookup))
+            .await??
+            .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+        if session.project_id != identity.project_id {
+            return Ok(String::new());
+        }
+        // The lexical memory lane treats whitespace-separated terms as an AND
+        // query. Identity metadata is usually multi-word ("Project Lead"), so
+        // use one distinctive scope token rather than requiring every metadata
+        // word to appear in a memory. This is a bounded best-effort brief, not
+        // a claim that the retrieved memory is complete.
+        let query = identity
+            .component
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                identity
+                    .department
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            })
+            .or_else(|| {
+                identity
+                    .title
+                    .as_deref()
+                    .and_then(|title| title.split_whitespace().next())
+            })
+            .unwrap_or(identity.role.as_str())
+            .to_string();
+        let matches = self
+            .memory_search(MemorySearchParams {
+                project_id: session.project_id,
+                query,
+                kind: None,
+                kinds: Vec::new(),
+                task_id: None,
+                department: identity.department.clone(),
+                paths: Vec::new(),
+                limit: Some(16),
+                include_stale: false,
+                max_chars: None,
+                lexical_only: true,
+            })
+            .await?
+            .memories;
+        if matches.is_empty() {
+            return Ok(String::new());
+        }
+        Ok(crate::memory::select_brief(
+            &matches,
+            crate::identity_prompt::IDENTITY_MEMORY_BRIEF_CHARS,
+        )
+        .text)
     }
 
     // -----------------------------------------------------------------

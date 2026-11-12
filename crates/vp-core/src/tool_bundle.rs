@@ -746,6 +746,12 @@ pub fn bundle_tool_names(kind: ToolBundleKind, role: &str, profile: &str) -> Vec
     let mut names = definition(kind).tools.to_vec();
     match kind {
         ToolBundleKind::Leader => {
+            if role == ROLE_MANAGER {
+                // Managers are read-only for workspace tools but own the
+                // delegation/coordination surface: Worker batches, ACP
+                // delegation, Scout, and blocker/task control.
+                names.push("delegate_many");
+            }
             if profile == PROFILE_CODING {
                 names.push("browser");
                 names.push("computer");
@@ -798,9 +804,10 @@ fn forbidden_for_read_only_role(role: &str, name: &str) -> bool {
     };
     match role {
         ROLE_MANAGER => {
-            spec.workspace_write
-                || spec.delegation
-                || matches!(name, "shell" | "process" | "browser" | "computer")
+            // Managers own authority operations (Worker/ACP delegation,
+            // delegation batches, Scout, task control) but never workspace
+            // writes, shell, process, or GUI execution.
+            spec.workspace_write || matches!(name, "shell" | "process" | "browser" | "computer")
         }
         ROLE_SCOUT => {
             spec.workspace_write
@@ -2435,7 +2442,7 @@ mod tests {
     }
 
     #[test]
-    fn manager_bundle_prunes_write_and_delegation_requests() {
+    fn manager_bundle_keeps_authority_delegation_and_prunes_workspace_writes() {
         let manager = bundle_tool_names(ToolBundleKind::Leader, "manager", "coding");
         for forbidden in [
             "write_file",
@@ -2444,15 +2451,24 @@ mod tests {
             "file_manage",
             "shell",
             "process",
-            "delegate",
-            "delegate_acp",
-            "scout",
             "browser",
             "computer",
         ] {
             assert!(
                 !manager.contains(&forbidden),
                 "Manager requested {forbidden}"
+            );
+        }
+        for authority in [
+            "delegate",
+            "delegate_many",
+            "delegate_acp",
+            "scout",
+            "task_control",
+        ] {
+            assert!(
+                manager.contains(&authority),
+                "Manager must retain authority tool {authority}"
             );
         }
         assert!(manager.contains(&"read_file"));
@@ -2853,7 +2869,7 @@ mod tests {
         let expected = [
             (ToolBundleKind::Leader, "leader", "generic", 47),
             (ToolBundleKind::Leader, "leader", "coding", 49),
-            (ToolBundleKind::Leader, "manager", "coding", 39),
+            (ToolBundleKind::Leader, "manager", "coding", 43),
             (ToolBundleKind::Coding, "worker", "coding", 38),
             (ToolBundleKind::Coding, "labour", "coding", 36),
             (ToolBundleKind::Coding, "worker", "research", 36),

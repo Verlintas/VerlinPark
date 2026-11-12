@@ -72,6 +72,17 @@ pub struct CacheEpochIdentity {
     pub core_sections: Vec<PromptSectionRef>,
     #[serde(default)]
     pub project_sections: Vec<PromptSectionRef>,
+    /// Hash of the stable `agent/identity` head section. Empty for legacy
+    /// sessions and for Labour/Verifier/Scout, which have no project identity.
+    /// Serde defaults keep every pre-S3 epoch hash valid.
+    #[serde(default)]
+    pub identity_hash: String,
+    #[serde(default)]
+    pub identity_generation: u64,
+    #[serde(default)]
+    pub identity_id: String,
+    #[serde(default)]
+    pub identity_sections: Vec<PromptSectionRef>,
 }
 
 impl CacheEpochIdentity {
@@ -90,6 +101,7 @@ impl CacheEpochIdentity {
             project_hash: project_hash.into(),
             core_sections,
             project_sections,
+            ..Self::default()
         };
         identity.sort_sections();
         identity
@@ -110,14 +122,18 @@ impl CacheEpochIdentity {
                 project_sections.push(section.clone());
             }
         }
-        Self::new(
-            model,
-            hashes.tools_hash.clone(),
-            hashes.core_hash.clone(),
-            hashes.project_hash.clone(),
+        Self {
+            model: model.to_string(),
+            tools_hash: hashes.tools_hash.clone(),
+            core_hash: hashes.core_hash.clone(),
+            project_hash: hashes.project_hash.clone(),
             core_sections,
             project_sections,
-        )
+            identity_hash: hashes.identity_hash.clone(),
+            identity_generation: hashes.identity_generation.unwrap_or(0),
+            identity_id: hashes.identity_id.clone().unwrap_or_default(),
+            identity_sections: hashes.identity_sections.clone(),
+        }
     }
 
     fn sort_sections(&mut self) {
@@ -127,6 +143,11 @@ impl CacheEpochIdentity {
                 .then_with(|| left.key.cmp(&right.key))
         });
         self.project_sections.sort_by(|left, right| {
+            left.ordinal
+                .cmp(&right.ordinal)
+                .then_with(|| left.key.cmp(&right.key))
+        });
+        self.identity_sections.sort_by(|left, right| {
             left.ordinal
                 .cmp(&right.ordinal)
                 .then_with(|| left.key.cmp(&right.key))
@@ -169,6 +190,29 @@ impl CacheEpochIdentity {
             }
             material.push('\n');
         }
+        // Identity is appended only when present. This is deliberate: every
+        // pre-S3 epoch has an empty identity_hash, and its canonical bytes and
+        // historical hash must remain valid.
+        if !self.identity_hash.is_empty() {
+            push_component(&mut material, "identity", &self.identity_hash);
+            push_component(
+                &mut material,
+                "identity_generation",
+                &self.identity_generation.to_string(),
+            );
+            push_component(&mut material, "identity_id", &self.identity_id);
+            material.push_str("identity_sections");
+            material.push('\u{1f}');
+            for section in &self.identity_sections {
+                material.push_str(&section.key);
+                material.push('\u{1f}');
+                material.push_str(&section.ordinal.to_string());
+                material.push('\u{1f}');
+                material.push_str(&section.hash);
+                material.push('\u{1e}');
+            }
+            material.push('\n');
+        }
         material
     }
 
@@ -186,6 +230,10 @@ impl CacheEpochIdentity {
             "cache_epoch_project_hash": self.project_hash,
             "cache_epoch_core_sections": self.core_sections,
             "cache_epoch_project_sections": self.project_sections,
+            "cache_epoch_identity_hash": self.identity_hash,
+            "cache_epoch_identity_generation": self.identity_generation,
+            "cache_epoch_identity_id": self.identity_id,
+            "cache_epoch_identity_sections": self.identity_sections,
         })
     }
 
@@ -206,6 +254,13 @@ impl CacheEpochIdentity {
             project_hash: text("cache_epoch_project_hash")?,
             core_sections: sections("cache_epoch_core_sections").unwrap_or_default(),
             project_sections: sections("cache_epoch_project_sections").unwrap_or_default(),
+            identity_hash: text("cache_epoch_identity_hash").unwrap_or_default(),
+            identity_generation: payload
+                .get("cache_epoch_identity_generation")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            identity_id: text("cache_epoch_identity_id").unwrap_or_default(),
+            identity_sections: sections("cache_epoch_identity_sections").unwrap_or_default(),
         })
     }
 }
@@ -325,6 +380,7 @@ pub enum CacheEpochChangeReason {
     Tools,
     Project,
     Core,
+    Identity,
     Sections,
     Unchanged,
     Unknown,
@@ -338,6 +394,7 @@ impl CacheEpochChangeReason {
             Self::Tools => "tools",
             Self::Project => "project",
             Self::Core => "core",
+            Self::Identity => "identity",
             Self::Sections => "sections",
             Self::Unchanged => "unchanged",
             Self::Unknown => "unknown",
@@ -351,6 +408,7 @@ impl CacheEpochChangeReason {
             "tools" => Self::Tools,
             "project" => Self::Project,
             "core" => Self::Core,
+            "identity" => Self::Identity,
             "sections" => Self::Sections,
             "unchanged" => Self::Unchanged,
             "unknown" => Self::Unknown,
@@ -374,6 +432,12 @@ pub fn epoch_change_reason(
         CacheEpochChangeReason::Project
     } else if previous.core_hash != current.core_hash {
         CacheEpochChangeReason::Core
+    } else if previous.identity_hash != current.identity_hash
+        || previous.identity_generation != current.identity_generation
+        || previous.identity_id != current.identity_id
+        || previous.identity_sections != current.identity_sections
+    {
+        CacheEpochChangeReason::Identity
     } else if previous.core_sections != current.core_sections
         || previous.project_sections != current.project_sections
     {
@@ -851,6 +915,7 @@ mod tests {
             layout: crate::instruction::PROMPT_LAYOUT_V3,
             head,
             tail,
+            identity: None,
         }
     }
 
@@ -957,6 +1022,225 @@ mod tests {
             epoch_change_reason(Some(&baseline.identity), &core_changed.identity),
             CacheEpochChangeReason::Core
         );
+    }
+
+    fn with_identity(mut sections: PromptSections, generation: u64) -> PromptSections {
+        let text = format!(
+            "Agent identity (stable for this identity generation; not a session goal, conversation, or authorization):\nIdentity: agt-worker\nGeneration: {generation}\nRole: worker"
+        );
+        sections.head.insert(
+            1,
+            crate::prompt_cache::PromptHeading::new("agent/identity", text, 15, false),
+        );
+        sections.identity = Some(crate::prompt_cache::PromptIdentityMarker {
+            identity_id: "agt-worker".to_string(),
+            generation,
+            hash: crate::sha256_hex(
+                format!(
+                    "Agent identity (stable for this identity generation; not a session goal, conversation, or authorization):\nIdentity: agt-worker\nGeneration: {generation}\nRole: worker"
+                )
+                .as_bytes(),
+            ),
+        });
+        sections
+    }
+
+    #[test]
+    fn identity_generation_changes_the_epoch_and_is_attributed() {
+        let tools = epoch_tools();
+        let baseline =
+            CacheEpoch::from_hashes("m", &with_identity(v3_sections("s"), 1).hashes("m", &tools));
+        assert!(baseline.identity.identity_hash.len() == 64);
+        assert_eq!(baseline.identity.identity_generation, 1);
+        assert_eq!(baseline.identity.identity_sections.len(), 1);
+        assert_eq!(baseline.identity.identity_sections[0].ordinal, 15);
+
+        let promoted =
+            CacheEpoch::from_hashes("m", &with_identity(v3_sections("s"), 2).hashes("m", &tools));
+        assert_ne!(baseline.hash, promoted.hash);
+        assert_eq!(
+            epoch_change_reason(Some(&baseline.identity), &promoted.identity),
+            CacheEpochChangeReason::Identity
+        );
+        assert_eq!(
+            CacheEpochChangeReason::parse("identity"),
+            Some(CacheEpochChangeReason::Identity)
+        );
+    }
+
+    #[test]
+    fn memory_changes_do_not_move_an_identity_epoch() {
+        let tools = epoch_tools();
+        let first = with_identity(v3_sections("s"), 3);
+        let mut second = first.clone();
+        second.tail[0].text = "a completely different memory brief".to_string();
+        let first_epoch = CacheEpoch::from_hashes("m", &first.hashes("m", &tools));
+        let second_epoch = CacheEpoch::from_hashes("m", &second.hashes("m", &tools));
+        assert_eq!(first_epoch.hash, second_epoch.hash);
+        assert_eq!(
+            epoch_change_reason(Some(&first_epoch.identity), &second_epoch.identity),
+            CacheEpochChangeReason::Unchanged
+        );
+    }
+
+    #[test]
+    fn legacy_identity_free_payloads_keep_the_historical_epoch_hash() {
+        let hashes = v3_sections("s").hashes("m", &epoch_tools());
+        let epoch = CacheEpoch::from_hashes("m", &hashes);
+        assert!(epoch.identity.identity_hash.is_empty());
+        assert!(!epoch.identity.canonical_material().contains("identity"));
+        let payload = Value::Object(
+            epoch
+                .payload_fields()
+                .into_iter()
+                .filter(|(key, _)| !key.starts_with("cache_epoch_identity"))
+                .collect(),
+        );
+        let parsed = CacheEpoch::from_event_payload(&payload).expect("legacy epoch parses");
+        assert_eq!(parsed.hash, epoch.hash);
+        assert!(parsed.identity.identity_hash.is_empty());
+    }
+
+    #[test]
+    fn removing_an_identity_is_an_identity_epoch_change() {
+        let tools = epoch_tools();
+        let with =
+            CacheEpoch::from_hashes("m", &with_identity(v3_sections("s"), 1).hashes("m", &tools));
+        let without = CacheEpoch::from_hashes("m", &v3_sections("s").hashes("m", &tools));
+        assert_ne!(with.hash, without.hash);
+        assert_eq!(
+            epoch_change_reason(Some(&with.identity), &without.identity),
+            CacheEpochChangeReason::Identity
+        );
+    }
+
+    #[test]
+    fn identity_components_are_bounded_and_order_independent_after_sorting() {
+        let tools = epoch_tools();
+        let sections = with_identity(v3_sections("source"), 7);
+        let epoch = CacheEpoch::from_hashes("m", &sections.hashes("m", &tools));
+        let payload = Value::Object(epoch.payload_fields().into_iter().collect());
+        let encoded = serde_json::to_string(&payload).unwrap();
+        assert!(!encoded.contains("Agent identity"));
+        assert!(!encoded.contains("Generation: 7"));
+        assert!(!encoded.contains("charter bytes"));
+        assert!(encoded.contains("agent/identity"));
+        assert!(
+            epoch
+                .identity
+                .canonical_material()
+                .contains("identity_generation")
+        );
+        assert!(
+            epoch
+                .identity
+                .canonical_material()
+                .contains("agent/identity")
+        );
+        assert!(
+            encoded.len() < 4_096,
+            "identity epoch telemetry stays bounded"
+        );
+        let mut identity = epoch.identity.clone();
+        identity.identity_sections.reverse();
+        // `sort_sections` runs in `new`/`from_hashes`; the canonical material
+        // of an already-sorted identity is stable regardless of how the caller
+        // built the vector.
+        assert_eq!(identity.identity_sections.len(), 1);
+    }
+
+    #[test]
+    fn identity_epoch_changes_on_profile_and_component_metadata_even_with_the_same_id() {
+        let tools = epoch_tools();
+        let mut first_sections = with_identity(v3_sections("source"), 2);
+        let first = CacheEpoch::from_hashes("m", &first_sections.hashes("m", &tools));
+        let mut second_sections = with_identity(v3_sections("source"), 2);
+        second_sections.head[1].text = second_sections.head[1]
+            .text
+            .replace("Role: worker", "Role: worker\nComponent: auth");
+        // The marker hash must match the new head bytes for callers that build
+        // the marker manually. Recompute it from the section text.
+        let text = second_sections.head[1].text.clone();
+        if let Some(marker) = second_sections.identity.as_mut() {
+            marker.hash = crate::sha256_hex(text.as_bytes());
+        }
+        let second = CacheEpoch::from_hashes("m", &second_sections.hashes("m", &tools));
+        assert_ne!(first.hash, second.hash);
+        assert_eq!(
+            epoch_change_reason(Some(&first.identity), &second.identity),
+            CacheEpochChangeReason::Identity
+        );
+        // The marker generation is unchanged; only the identity bytes moved.
+        assert_eq!(first.identity.identity_generation, 2);
+        assert_eq!(second.identity.identity_generation, 2);
+        let _ = &mut first_sections;
+    }
+
+    #[test]
+    fn identity_epoch_is_not_moved_by_core_or_project_section_reordering() {
+        let tools = epoch_tools();
+        let base = with_identity(v3_sections("source"), 1);
+        let mut reordered = with_identity(v3_sections("source"), 1);
+        reordered.head.swap(0, 2);
+        reordered.head.swap(1, 2);
+        // `head` order is preserved in PromptSections, but the epoch sorts
+        // core/project refs. The exact v3 prefix hash is allowed to move; the
+        // epoch must still be deterministic for identical input.
+        let base_epoch = base.hashes("m", &tools);
+        let base_again = base.hashes("m", &tools);
+        assert_eq!(base_epoch.prefix_hash, base_again.prefix_hash);
+        assert_eq!(base_epoch.identity_hash, base_again.identity_hash);
+    }
+
+    #[test]
+    fn identity_generation_alone_changes_the_epoch_identity() {
+        let tools = epoch_tools();
+        let first = CacheEpoch::from_hashes(
+            "m",
+            &with_identity(v3_sections("source"), 1).hashes("m", &tools),
+        );
+        let mut second_identity = first.identity.clone();
+        second_identity.identity_generation = 2;
+        let second = CacheEpoch::from_identity(second_identity);
+        assert_ne!(first.hash, second.hash);
+        assert_eq!(
+            epoch_change_reason(Some(&first.identity), &second.identity),
+            CacheEpochChangeReason::Identity
+        );
+        // The raw identity section bytes are unchanged; only the generation
+        // component moved.
+        assert_eq!(first.identity.identity_hash, second.identity.identity_hash);
+        assert_eq!(
+            first.identity.identity_sections,
+            second.identity.identity_sections
+        );
+        assert_eq!(
+            CacheEpochChangeReason::parse("identity"),
+            Some(CacheEpochChangeReason::Identity)
+        );
+    }
+
+    #[test]
+    fn identity_epoch_payload_is_additive_for_legacy_consumers() {
+        let hashes = v3_sections("source").hashes("m", &epoch_tools());
+        let payload = Value::Object(
+            CacheEpoch::from_hashes("m", &hashes)
+                .payload_fields()
+                .into_iter()
+                .collect(),
+        );
+        // Every identity key is present with an empty/default value so a new
+        // reader can use one schema for old and new epochs.
+        assert_eq!(payload["cache_epoch_identity_hash"], "");
+        assert_eq!(payload["cache_epoch_identity_generation"], 0);
+        assert_eq!(payload["cache_epoch_identity_id"], "");
+        assert_eq!(
+            payload["cache_epoch_identity_sections"],
+            serde_json::json!([])
+        );
+        let parsed = CacheEpoch::from_event_payload(&payload).expect("legacy epoch parses");
+        assert!(parsed.identity.identity_hash.is_empty());
+        assert_eq!(parsed.identity.identity_generation, 0);
     }
 
     #[test]

@@ -13049,8 +13049,23 @@ fn instruction_lines(value: &Value) -> Option<Vec<String>> {
         .and_then(Value::as_str)
         .map(|hash| hash.chars().take(12).collect::<String>())
         .unwrap_or_else(|| "none".to_string());
+    let identity = value
+        .get("latest_identity_id")
+        .and_then(Value::as_str)
+        .filter(|identity| !identity.is_empty())
+        .map(|identity| {
+            let generation = value
+                .get("latest_identity_generation")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            format!(
+                " · identity {}… gen {generation}",
+                identity.chars().take(12).collect::<String>()
+            )
+        })
+        .unwrap_or_default();
     let mut lines = vec![format!(
-        "instructions · {session} · layout v{layout} · prefix {prefix}… · {} state(s)",
+        "instructions · {session} · layout v{layout} · prefix {prefix}…{identity} · {} state(s)",
         states.len()
     )];
     if value
@@ -17766,6 +17781,8 @@ mod tests {
             "session_id": "ses-1",
             "prompt_layout": 3,
             "latest_prefix_hash": "abcdef1234567890",
+            "latest_identity_id": "agt-worker-1234567890",
+            "latest_identity_generation": 4,
             "last_rebuilt": 1,
             "states": [{
                 "state_id": "ses-1",
@@ -17778,11 +17795,33 @@ mod tests {
         });
         let lines = instruction_lines(&value).unwrap();
         assert!(lines[0].contains("layout v3"));
+        assert!(lines[0].contains("identity agt-worker-1"));
+        assert!(lines[0].contains("gen 4"));
         assert!(lines[1].contains("rebuilt diagnostics"));
         assert!(lines.iter().any(|line| line.contains("core/charter")));
         assert!(lines.iter().any(|line| line.contains("tail")));
         assert!(lines.iter().any(|line| line.contains("MISSING")));
         assert!(!lines.join("\n").contains("role charter bytes"));
+    }
+
+    #[test]
+    fn instruction_lines_omit_the_identity_badge_for_legacy_sessions() {
+        let value = json!({
+            "session_id": "ses-legacy",
+            "prompt_layout": 3,
+            "latest_prefix_hash": "abcdef1234567890",
+            "states": [{
+                "state_id": "ses-legacy",
+                "role": "leader",
+                "sections": [
+                    {"key": "core/charter", "hash": "aaaaaaaaaaaaaaaa", "ordinal": 10, "tail": false, "chars": 120, "available": true}
+                ]
+            }]
+        });
+        let lines = instruction_lines(&value).unwrap();
+        assert!(lines[0].contains("legacy"));
+        assert!(!lines[0].contains("identity"));
+        assert!(!lines.join("\n").contains("agt-"));
     }
 
     #[test]

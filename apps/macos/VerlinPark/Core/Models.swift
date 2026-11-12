@@ -4160,6 +4160,7 @@ struct SessionInstructionStateReport: Codable, Sendable, Identifiable, Equatable
     let promptLayout: Int
     let headHash: String
     let tailHash: String
+    let identityHash: String?
     let sections: [SessionInstructionSection]
 
     enum CodingKeys: String, CodingKey {
@@ -4169,6 +4170,7 @@ struct SessionInstructionStateReport: Codable, Sendable, Identifiable, Equatable
         case promptLayout = "prompt_layout"
         case headHash = "head_hash"
         case tailHash = "tail_hash"
+        case identityHash = "identity_hash"
         case sections
     }
 
@@ -4180,6 +4182,7 @@ struct SessionInstructionStateReport: Codable, Sendable, Identifiable, Equatable
         promptLayout = try container.decodeIfPresent(Int.self, forKey: .promptLayout) ?? 3
         headHash = try container.decodeIfPresent(String.self, forKey: .headHash) ?? ""
         tailHash = try container.decodeIfPresent(String.self, forKey: .tailHash) ?? ""
+        identityHash = try container.decodeIfPresent(String.self, forKey: .identityHash)
         sections = try container.decodeIfPresent([SessionInstructionSection].self, forKey: .sections) ?? []
     }
 
@@ -4199,6 +4202,9 @@ struct SessionInstructionsReport: Codable, Sendable, Equatable {
     let latestPrefixHash: String?
     let latestCacheEpoch: String?
     let latestStablePrefixHash: String?
+    let latestIdentityID: String?
+    let latestIdentityGeneration: Int?
+    let latestIdentityHash: String?
     let states: [SessionInstructionStateReport]
     let lastRebuilt: Int
 
@@ -4208,6 +4214,9 @@ struct SessionInstructionsReport: Codable, Sendable, Equatable {
         case latestPrefixHash = "latest_prefix_hash"
         case latestCacheEpoch = "latest_cache_epoch"
         case latestStablePrefixHash = "latest_stable_prefix_hash"
+        case latestIdentityID = "latest_identity_id"
+        case latestIdentityGeneration = "latest_identity_generation"
+        case latestIdentityHash = "latest_identity_hash"
         case states
         case lastRebuilt = "last_rebuilt"
     }
@@ -4222,6 +4231,12 @@ struct SessionInstructionsReport: Codable, Sendable, Equatable {
             String.self,
             forKey: .latestStablePrefixHash
         )
+        latestIdentityID = try container.decodeIfPresent(String.self, forKey: .latestIdentityID)
+        latestIdentityGeneration = try container.decodeIfPresent(
+            Int.self,
+            forKey: .latestIdentityGeneration
+        )
+        latestIdentityHash = try container.decodeIfPresent(String.self, forKey: .latestIdentityHash)
         states = try container.decodeIfPresent([SessionInstructionStateReport].self, forKey: .states) ?? []
         lastRebuilt = try container.decodeIfPresent(Int.self, forKey: .lastRebuilt) ?? 0
     }
@@ -5028,6 +5043,9 @@ struct SessionCacheWarmResult: Codable, Sendable {
     let cacheBreakpoints: Int?
     let cacheTTL: String?
     let automatic: Bool?
+    let identityHash: String?
+    let identityID: String?
+    let identityGeneration: Int?
     let inputTokens: Int?
     let outputTokens: Int?
     let cacheReadTokens: Int?
@@ -5048,6 +5066,9 @@ struct SessionCacheWarmResult: Codable, Sendable {
         case cacheBreakpoints = "cache_breakpoints"
         case cacheTTL = "cache_ttl"
         case automatic
+        case identityHash = "identity_hash"
+        case identityID = "identity_id"
+        case identityGeneration = "identity_generation"
         case inputTokens = "input_tokens"
         case outputTokens = "output_tokens"
         case cacheReadTokens = "cache_read_tokens"
@@ -5128,6 +5149,9 @@ struct SessionCachePlanRole: Codable, Sendable, Identifiable {
     let toolsHash: String
     let volatileHash: String
     let prefixHash: String
+    let identityHash: String?
+    let identityID: String?
+    let identityGeneration: Int?
     let coreChars: Int
     let projectChars: Int
     let stablePrefixChars: Int
@@ -5152,6 +5176,9 @@ struct SessionCachePlanRole: Codable, Sendable, Identifiable {
         case toolsHash = "tools_hash"
         case volatileHash = "volatile_hash"
         case prefixHash = "prefix_hash"
+        case identityHash = "identity_hash"
+        case identityID = "identity_id"
+        case identityGeneration = "identity_generation"
         case coreChars = "core_chars"
         case projectChars = "project_chars"
         case stablePrefixChars = "stable_prefix_chars"

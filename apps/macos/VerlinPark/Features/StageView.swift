@@ -2014,6 +2014,14 @@ private struct InstructionSectionsView: View {
                         .foregroundStyle(VPTheme.textTertiary)
                         .textSelection(.enabled)
                 }
+                if let identity = report.latestIdentityID, !identity.isEmpty {
+                    Text(
+                        "identity \(String(identity.prefix(10)))… gen \(report.latestIdentityGeneration ?? 0)"
+                    )
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(VPTheme.accent)
+                    .textSelection(.enabled)
+                }
                 if report.lastRebuilt > 0 {
                     Text("\(report.lastRebuilt) rebuilt")
                         .font(.system(size: 9, design: .monospaced))

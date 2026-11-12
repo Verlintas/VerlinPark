@@ -21122,7 +21122,7 @@ async fn tool_bundle_matrix_covers_standard_combinations_without_session_state()
     assert!(!leader.fallback);
     let manager = find("manager", "coding", None);
     assert_eq!(manager.bundle, "leader");
-    assert_eq!(manager.builtin_count, 32);
+    assert_eq!(manager.builtin_count, 36);
     assert_eq!(manager.mcp_count, 0);
     let worker_coding = find("worker", "coding", Some("implementation"));
     assert_eq!(worker_coding.bundle, "coding");
@@ -23427,4 +23427,892 @@ async fn manager_wait_propagates_to_the_top_level_and_stops_the_run() {
         .await
         .unwrap();
     assert_eq!(continuations.continuations.len(), 1);
+}
+
+#[tokio::test]
+async fn role_contract_prompts_make_worker_the_technical_lead_and_labour_the_implementer() {
+    let dir = TempDir::new().unwrap();
+    let (engine, _service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id.clone(), "role contract goal".into(), None)
+        .await
+        .unwrap();
+    let worker = help_spec(AgentRole::Worker, AgentProfile::Coding);
+    let worker_parts = role_prompt_parts(
+        AgentRole::Worker,
+        &project,
+        &session,
+        &worker,
+        "implement auth validation",
+    );
+    assert!(worker_parts.core_charter.contains("You are a Worker"));
+    assert!(worker_parts.core_charter.contains("technical lead"));
+    assert!(
+        worker_parts
+            .core_charter
+            .contains("delegate(role=\"labour\")")
+    );
+    assert!(worker_parts.core_charter.contains("low-level design"));
+    assert!(worker_parts.core_charter.contains("review"));
+    assert!(
+        worker_parts
+            .core_charter
+            .contains("bulk implementation yourself")
+    );
+
+    let labour = help_spec(AgentRole::Labour, AgentProfile::Coding);
+    let labour_parts = role_prompt_parts(
+        AgentRole::Labour,
+        &project,
+        &session,
+        &labour,
+        "write the auth handler",
+    );
+    assert!(labour_parts.core_charter.contains("You are Labour"));
+    assert!(labour_parts.core_charter.contains("implementation worker"));
+    assert!(labour_parts.core_charter.contains("cannot delegate"));
+    assert!(labour_parts.core_charter.contains("write code and tests"));
+
+    let manager = help_spec(AgentRole::Manager, AgentProfile::Generic);
+    let manager_parts = role_prompt_parts(
+        AgentRole::Manager,
+        &project,
+        &session,
+        &manager,
+        "own the platform department",
+    );
+    assert!(manager_parts.core_charter.contains("department architect"));
+    assert!(manager_parts.core_charter.contains("must not edit files"));
+    assert!(manager_parts.core_charter.contains("bulk code"));
+    assert!(manager_parts.core_charter.contains("delegate_many"));
+
+    let leader = help_spec(AgentRole::Leader, AgentProfile::Coding);
+    let leader_parts = role_prompt_parts(
+        AgentRole::Leader,
+        &project,
+        &session,
+        &leader,
+        "own the project",
+    );
+    assert!(
+        leader_parts
+            .core_charter
+            .contains("project and portfolio owner")
+    );
+    assert!(leader_parts.core_charter.contains("final result"));
+    assert!(leader_parts.core_charter.contains("bulk implementation"));
+    assert!(
+        leader_parts
+            .core_charter
+            .contains("implementation belongs to Labour")
+    );
+}
+
+#[tokio::test]
+async fn delegate_schema_exposes_only_the_child_role_and_leaf_roles_get_none() {
+    let dir = TempDir::new().unwrap();
+    let (_engine, service, _project) = test_service(&dir);
+    let config = service
+        .config
+        .read()
+        .unwrap()
+        .as_ref()
+        .expect("test service configured")
+        .clone();
+
+    let worker_tools = tool_schemas(&config, AgentRole::Worker, AgentProfile::Coding, true);
+    let worker_delegate = worker_tools
+        .iter()
+        .find(|tool| tool.name == "delegate")
+        .expect("Worker delegate schema");
+    assert_eq!(
+        worker_delegate.parameters["properties"]["role"]["enum"],
+        serde_json::json!(["labour"])
+    );
+    assert!(worker_delegate.description.contains("Labour"));
+    assert!(worker_delegate.description.contains("technical lead"));
+
+    let manager_tools = tool_schemas(&config, AgentRole::Manager, AgentProfile::Generic, true);
+    let manager_delegate = manager_tools
+        .iter()
+        .find(|tool| tool.name == "delegate")
+        .expect("Manager delegate schema");
+    assert_eq!(
+        manager_delegate.parameters["properties"]["role"]["enum"],
+        serde_json::json!(["worker"])
+    );
+    assert!(manager_delegate.description.contains("technical leads"));
+
+    let leader_tools = tool_schemas(&config, AgentRole::Leader, AgentProfile::Coding, true);
+    let leader_delegate = leader_tools
+        .iter()
+        .find(|tool| tool.name == "delegate")
+        .expect("Leader delegate schema");
+    assert_eq!(
+        leader_delegate.parameters["properties"]["role"]["enum"],
+        serde_json::json!(["manager"])
+    );
+
+    for (role, profile) in [
+        (AgentRole::Labour, AgentProfile::Coding),
+        (AgentRole::Verifier, AgentProfile::Verification),
+        (AgentRole::Scout, AgentProfile::Research),
+    ] {
+        let tools = tool_schemas(&config, role, profile, true);
+        assert!(
+            tools.iter().all(|tool| tool.name != "delegate"),
+            "{} must not advertise delegate",
+            role.as_str()
+        );
+        assert!(
+            role_tool_surface(role, profile)
+                .iter()
+                .all(|name| name != "delegate"),
+            "{} policy surface must not allow delegate",
+            role.as_str()
+        );
+    }
+    assert!(
+        role_tool_surface(AgentRole::Worker, AgentProfile::Coding)
+            .iter()
+            .any(|name| name == "delegate")
+    );
+    assert_eq!(AgentRole::Worker.child_role(), Some(AgentRole::Labour));
+    assert_eq!(AgentRole::Labour.child_role(), None);
+    assert_eq!(AgentRole::Verifier.child_role(), None);
+    assert_eq!(AgentRole::Scout.child_role(), None);
+}
+
+#[test]
+fn identity_roles_are_separate_from_the_task_scoped_roles() {
+    for role in ["leader", "manager", "worker"] {
+        assert!(crate::identity_prompt::identity_role_applies(role));
+    }
+    for role in ["labour", "verifier", "scout"] {
+        assert!(!crate::identity_prompt::identity_role_applies(role));
+    }
+    // The AgentRole enum itself is unchanged: Labour remains a task-scoped
+    // execution role, not a project identity.
+    assert_eq!(AgentRole::parse("labour"), Some(AgentRole::Labour));
+    assert_eq!(AgentRole::parse("scout"), Some(AgentRole::Scout));
+}
+
+async fn enable_identity_policy(engine: &Engine, project_id: &str) {
+    engine
+        .set_agent_identity_policy(
+            project_id,
+            vp_protocol::types::AgentIdentityPolicy {
+                enabled: true,
+                ..vp_protocol::types::AgentIdentityPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+}
+
+async fn project_identity(
+    engine: &Engine,
+    project_id: &str,
+    role: &str,
+    title: &str,
+    component: &str,
+) -> String {
+    engine
+        .create_agent_identity(vp_protocol::types::CreateAgentIdentityParams {
+            project_id: project_id.to_string(),
+            role: role.to_string(),
+            title: Some(title.to_string()),
+            department: Some("Platform".to_string()),
+            component: Some(component.to_string()),
+            profile: Some("coding".to_string()),
+            model: Some("test-model".to_string()),
+            ..vp_protocol::types::CreateAgentIdentityParams::default()
+        })
+        .await
+        .unwrap()
+        .identity
+        .id
+}
+
+async fn assign_identity(engine: &Engine, session_id: &str, identity_id: &str) {
+    engine
+        .assign_session_identity(vp_protocol::types::SessionAssignParams {
+            session_id: session_id.to_string(),
+            identity_id: identity_id.to_string(),
+            ..vp_protocol::types::SessionAssignParams::default()
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn assigned_manager_and_worker_get_identity_sections_but_task_roles_do_not() {
+    let dir = TempDir::new().unwrap();
+    let (engine, _service, project) = test_service(&dir);
+    enable_identity_policy(&engine, &project.id).await;
+    let manager = project_identity(
+        &engine,
+        &project.id,
+        "manager",
+        "Platform Manager",
+        "platform",
+    )
+    .await;
+    let worker = project_identity(&engine, &project.id, "worker", "Auth Tech Lead", "auth").await;
+    let session = engine
+        .create_session(project.id.clone(), "identity section goal".into(), None)
+        .await
+        .unwrap();
+    assign_identity(&engine, &session.id, &manager).await;
+    assign_identity(&engine, &session.id, &worker).await;
+
+    let mut manager_spec = help_spec(AgentRole::Manager, AgentProfile::Generic);
+    manager_spec.title = Some("Platform Manager".to_string());
+    manager_spec.department = Some("Platform".to_string());
+    let manager_sections = build_prompt_sections(
+        &engine,
+        &project,
+        &session,
+        &manager_spec,
+        None,
+        "own the platform department",
+        true,
+        InstructionBuildMode::Materialize,
+    )
+    .await
+    .unwrap();
+    let manager_identity = manager_sections
+        .exact_text(crate::identity_prompt::IDENTITY_SECTION_KEY)
+        .expect("manager identity section");
+    assert!(manager_identity.contains("Role: manager"));
+    assert!(manager_identity.contains("Title: Platform Manager"));
+    assert!(manager_identity.contains("Component: platform"));
+    assert!(manager_identity.contains("department architect"));
+    assert_eq!(
+        manager_sections
+            .identity
+            .as_ref()
+            .map(|marker| marker.generation),
+        Some(1)
+    );
+
+    let mut worker_spec = help_spec(AgentRole::Worker, AgentProfile::Coding);
+    worker_spec.department = Some("Platform".to_string());
+    let worker_sections = build_prompt_sections(
+        &engine,
+        &project,
+        &session,
+        &worker_spec,
+        None,
+        "implement auth",
+        true,
+        InstructionBuildMode::Materialize,
+    )
+    .await
+    .unwrap();
+    let worker_identity = worker_sections
+        .exact_text(crate::identity_prompt::IDENTITY_SECTION_KEY)
+        .expect("worker identity section");
+    assert!(worker_identity.contains("Role: worker"));
+    assert!(worker_identity.contains("Title: Auth Tech Lead"));
+    assert!(worker_identity.contains("technical lead"));
+    assert!(worker_identity.contains("Labour"));
+    assert!(!worker_identity.contains("implement auth"));
+    assert!(!worker_identity.contains("identity section goal"));
+    let scoped = engine
+        .session_instructions(&session.id, Some(&worker_spec.id))
+        .await
+        .unwrap();
+    assert_eq!(scoped.states.len(), 1);
+    assert_eq!(
+        scoped.states[0].state_id,
+        format!("{}#{}", session.id, worker_spec.id)
+    );
+    assert!(
+        scoped.states[0]
+            .sections
+            .iter()
+            .any(|section| section.key == "agent/identity" && !section.tail)
+    );
+    assert!(scoped.states[0].identity_hash.is_some());
+    let encoded = serde_json::to_string(&scoped).unwrap();
+    assert!(!encoded.contains("Auth Tech Lead"));
+    assert!(!encoded.contains("technical lead"));
+
+    for (role, profile) in [
+        (AgentRole::Labour, AgentProfile::Coding),
+        (AgentRole::Verifier, AgentProfile::Verification),
+        (AgentRole::Scout, AgentProfile::Research),
+    ] {
+        let spec = help_spec(role, profile);
+        let sections = build_prompt_sections(
+            &engine,
+            &project,
+            &session,
+            &spec,
+            None,
+            "task objective",
+            true,
+            InstructionBuildMode::Materialize,
+        )
+        .await
+        .unwrap();
+        assert!(
+            sections
+                .exact_text(crate::identity_prompt::IDENTITY_SECTION_KEY)
+                .is_none(),
+            "{} must not have an identity section",
+            role.as_str()
+        );
+        assert!(sections.identity.is_none());
+    }
+}
+
+#[tokio::test]
+async fn assigned_identity_memory_is_tail_only_and_warm_omits_it() {
+    let dir = TempDir::new().unwrap();
+    let (engine, _service, project) = test_service(&dir);
+    enable_identity_policy(&engine, &project.id).await;
+    let worker = project_identity(&engine, &project.id, "worker", "Auth Tech Lead", "auth").await;
+    let session = engine
+        .create_session(project.id.clone(), "memory scope goal".into(), None)
+        .await
+        .unwrap();
+    assign_identity(&engine, &session.id, &worker).await;
+    engine
+        .create_memory(
+            &session.id,
+            "decision",
+            "Auth boundary",
+            "The auth component validates tokens before routing and owns key rotation.",
+            vec!["auth".into()],
+        )
+        .await
+        .unwrap();
+
+    let spec = help_spec(AgentRole::Worker, AgentProfile::Coding);
+    let warm = build_prompt_sections(
+        &engine,
+        &project,
+        &session,
+        &spec,
+        None,
+        "implement auth",
+        false,
+        InstructionBuildMode::Preview,
+    )
+    .await
+    .unwrap();
+    assert!(
+        warm.exact_text(crate::identity_prompt::IDENTITY_SECTION_KEY)
+            .is_some()
+    );
+    assert!(warm.tail.is_empty());
+    assert!(
+        warm.exact_text(crate::identity_prompt::IDENTITY_MEMORY_SECTION_KEY)
+            .is_none()
+    );
+
+    let full = build_prompt_sections(
+        &engine,
+        &project,
+        &session,
+        &spec,
+        None,
+        "implement auth",
+        true,
+        InstructionBuildMode::Preview,
+    )
+    .await
+    .unwrap();
+    let memory = full
+        .exact_text(crate::identity_prompt::IDENTITY_MEMORY_SECTION_KEY)
+        .expect("identity memory tail");
+    assert!(memory.contains("Identity/department memory"));
+    assert!(memory.contains("auth component validates tokens"));
+    assert!(!full.render().contains("auth component validates tokens"));
+    assert!(full.stable_prefix().contains("Auth Tech Lead"));
+    assert!(!full.stable_prefix().contains("identity memory"));
+
+    let labour = help_spec(AgentRole::Labour, AgentProfile::Coding);
+    let labour_sections = build_prompt_sections(
+        &engine,
+        &project,
+        &session,
+        &labour,
+        None,
+        "implement auth",
+        true,
+        InstructionBuildMode::Preview,
+    )
+    .await
+    .unwrap();
+    assert!(
+        labour_sections
+            .exact_text(crate::identity_prompt::IDENTITY_SECTION_KEY)
+            .is_none()
+    );
+    assert!(
+        labour_sections
+            .exact_text(crate::identity_prompt::IDENTITY_MEMORY_SECTION_KEY)
+            .is_none()
+    );
+    assert!(
+        !labour_sections
+            .render()
+            .contains("auth component validates tokens")
+    );
+}
+
+#[tokio::test]
+async fn layout_v2_on_an_assigned_session_keeps_legacy_combined_bytes() {
+    let dir = TempDir::new().unwrap();
+    let (engine, _service, project) = test_service(&dir);
+    enable_identity_policy(&engine, &project.id).await;
+    let worker = project_identity(&engine, &project.id, "worker", "Auth Tech Lead", "auth").await;
+    let session = engine
+        .create_session(project.id.clone(), "v2 goal".into(), None)
+        .await
+        .unwrap();
+    assign_identity(&engine, &session.id, &worker).await;
+    engine
+        .set_session_prompt_layout(&session.id, 2)
+        .await
+        .unwrap();
+    let session = engine.store().get_session(&session.id).unwrap().unwrap();
+    let spec = help_spec(AgentRole::Worker, AgentProfile::Coding);
+    let sections = build_prompt_sections(
+        &engine,
+        &project,
+        &session,
+        &spec,
+        None,
+        "legacy task",
+        true,
+        InstructionBuildMode::Preview,
+    )
+    .await
+    .unwrap();
+    assert!(!sections.is_v3());
+    assert!(sections.head.is_empty());
+    assert!(sections.tail.is_empty());
+    assert!(sections.identity.is_none());
+    assert!(!sections.render().contains("Agent identity"));
+    assert!(
+        engine
+            .store()
+            .list_session_instructions(&session.id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn paused_identity_is_not_used_for_a_new_prompt_identity() {
+    let dir = TempDir::new().unwrap();
+    let (engine, _service, project) = test_service(&dir);
+    enable_identity_policy(&engine, &project.id).await;
+    let leader = project_identity(&engine, &project.id, "leader", "Project Lead", "project").await;
+    let session = engine
+        .create_session(project.id.clone(), "paused goal".into(), None)
+        .await
+        .unwrap();
+    assign_identity(&engine, &session.id, &leader).await;
+    let before = engine
+        .prompt_identity_for_run(&session.id, "leader", None, None)
+        .await
+        .unwrap();
+    assert!(before.is_some());
+    engine
+        .pause_agent_identity(vp_protocol::types::PauseAgentIdentityParams {
+            identity_id: leader,
+        })
+        .await
+        .unwrap();
+    let after = engine
+        .prompt_identity_for_run(&session.id, "leader", None, None)
+        .await
+        .unwrap();
+    assert!(after.is_none());
+}
+
+#[test]
+fn delegate_role_chain_is_worker_to_labour_and_leaf_roles_fail_closed() {
+    let labour = serde_json::json!({"role": "labour", "objective": "implement the handler"});
+    let worker = parse_delegate(&labour, AgentRole::Worker, AgentProfile::Coding, None)
+        .expect("Worker can delegate implementation to Labour");
+    assert_eq!(worker.0, AgentRole::Labour);
+
+    assert!(parse_delegate(&labour, AgentRole::Labour, AgentProfile::Coding, None).is_err());
+    assert!(
+        parse_delegate(
+            &labour,
+            AgentRole::Verifier,
+            AgentProfile::Verification,
+            None
+        )
+        .is_err()
+    );
+    assert!(parse_delegate(&labour, AgentRole::Scout, AgentProfile::Research, None).is_err());
+
+    let wrong = serde_json::json!({"role": "worker", "objective": "implement the handler"});
+    assert!(parse_delegate(&wrong, AgentRole::Worker, AgentProfile::Coding, None).is_err());
+    let manager = serde_json::json!({
+        "role": "manager",
+        "title": "Discovery",
+        "objective": "map the system"
+    });
+    assert!(parse_delegate(&manager, AgentRole::Leader, AgentProfile::Coding, None).is_ok());
+    assert!(parse_delegate(&manager, AgentRole::Worker, AgentProfile::Coding, None).is_err());
+}
+
+#[test]
+fn delegated_runs_receive_role_identity_sections_and_worker_can_delegate_to_labour() {
+    run_with_large_stack(|| async {
+        let dir = TempDir::new().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider: Arc<dyn Provider> = Arc::new(RecordingProvider {
+            requests: requests.clone(),
+            responses: Mutex::new(VecDeque::from(vec![
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_manager".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::json!({
+                            "role": "manager",
+                            "title": "Discovery",
+                            "objective": "handle the department"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_worker".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::json!({
+                            "role": "worker",
+                            "objective": "lead the readme implementation"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_labour".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::json!({
+                            "role": "labour",
+                            "objective": "read the readme"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_read".into(),
+                        name: "read_file".into(),
+                        arguments: r#"{"path":"README.md"}"#.into(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("labour done".into()),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("worker done".into()),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("manager done".into()),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("leader done".into()),
+                    StreamEvent::Done,
+                ],
+            ])),
+        });
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        enable_identity_policy(&engine, &project.id).await;
+        let leader =
+            project_identity(&engine, &project.id, "leader", "Project Lead", "project").await;
+        let manager =
+            project_identity(&engine, &project.id, "manager", "Discovery", "discovery").await;
+        let worker =
+            project_identity(&engine, &project.id, "worker", "Auth Tech Lead", "auth").await;
+        let session = engine
+            .create_session(project.id.clone(), "identity delegation".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test-model")
+            .await
+            .unwrap();
+        assign_identity(&engine, &session.id, &leader).await;
+        assign_identity(&engine, &session.id, &manager).await;
+        assign_identity(&engine, &session.id, &worker).await;
+        service
+            .start(&session.id, "delegate with identities")
+            .await
+            .unwrap();
+        let finished = wait_until_idle(&engine, &session).await;
+        assert_eq!(finished.status, "idle");
+
+        let captured = requests.lock().unwrap().clone();
+        assert!(captured.len() >= 8);
+        let identity_request = |role: &str| {
+            captured
+                .iter()
+                .find(|request| {
+                    request.system_sections.iter().any(|section| {
+                        section.kind == "identity"
+                            && section.text.contains(&format!("Role: {role}"))
+                    })
+                })
+                .unwrap_or_else(|| panic!("missing {role} identity request"))
+        };
+        let leader_request = identity_request("leader");
+        let manager_request = captured
+            .iter()
+            .filter(|request| {
+                request.system_sections.iter().any(|section| {
+                    section.kind == "identity" && section.text.contains("Role: manager")
+                })
+            })
+            .find(|request| request.tools.iter().any(|tool| tool.name == "delegate"))
+            .unwrap_or_else(|| {
+                let manager_requests = captured
+                    .iter()
+                    .filter(|request| {
+                        request.system_sections.iter().any(|section| {
+                            section.kind == "identity"
+                                && section.text.contains("Role: manager")
+                        })
+                    })
+                    .count();
+                panic!(
+                    "no delegating Manager request among {manager_requests} manager requests; tool sets: {:?}",
+                    captured
+                        .iter()
+                        .map(|request| request
+                            .tools
+                            .iter()
+                            .any(|tool| tool.name == "delegate"))
+                        .collect::<Vec<_>>()
+                )
+            });
+        let worker_request = identity_request("worker");
+        for (request, marker) in [
+            (leader_request, "project and portfolio owner"),
+            (manager_request, "department architect"),
+            (worker_request, "technical lead"),
+        ] {
+            let identity = request
+                .system_sections
+                .iter()
+                .find(|section| section.kind == "identity")
+                .expect("identity section");
+            assert!(identity.text.contains(marker));
+            assert!(!identity.text.contains("delegate with identities"));
+        }
+        assert!(
+            worker_request
+                .system
+                .as_deref()
+                .unwrap_or_default()
+                .contains("delegate(role=\"labour\")")
+        );
+        let worker_delegate = worker_request
+            .tools
+            .iter()
+            .find(|tool| tool.name == "delegate")
+            .expect("Worker delegate schema");
+        assert_eq!(
+            worker_delegate.parameters["properties"]["role"]["enum"],
+            serde_json::json!(["labour"])
+        );
+        let manager_delegate = manager_request
+            .tools
+            .iter()
+            .find(|tool| tool.name == "delegate")
+            .unwrap_or_else(|| {
+                panic!(
+                    "Manager delegate schema missing; manager system starts {:?}, tools {:?}",
+                    manager_request
+                        .system
+                        .as_deref()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(120)
+                        .collect::<String>(),
+                    manager_request
+                        .tools
+                        .iter()
+                        .map(|tool| tool.name.as_str())
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            manager_delegate.parameters["properties"]["role"]["enum"],
+            serde_json::json!(["worker"])
+        );
+        assert!(
+            manager_request
+                .tools
+                .iter()
+                .any(|tool| tool.name == "delegate_many"),
+            "Manager must retain delegate_many"
+        );
+        assert!(
+            manager_request
+                .tools
+                .iter()
+                .all(|tool| tool.name != "write_file" && tool.name != "shell")
+        );
+
+        let labour_request = captured
+            .iter()
+            .find(|request| {
+                request
+                    .system
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("You are Labour")
+                    && request
+                        .system_sections
+                        .iter()
+                        .all(|section| section.kind != "identity")
+            })
+            .expect("Labour request without identity");
+        assert!(
+            labour_request
+                .system
+                .as_deref()
+                .unwrap_or_default()
+                .contains("implementation worker")
+        );
+        assert!(
+            labour_request
+                .system
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cannot delegate")
+        );
+        assert!(
+            labour_request
+                .tools
+                .iter()
+                .all(|tool| tool.name != "delegate"),
+            "Labour must not advertise delegate"
+        );
+        assert!(
+            labour_request
+                .tail_sections
+                .iter()
+                .all(|section| section.kind != "agent/memory")
+        );
+
+        let report = engine
+            .session_instructions(&session.id, None)
+            .await
+            .unwrap();
+        let identity_states = report
+            .states
+            .iter()
+            .filter(|state| state.identity_hash.is_some())
+            .count();
+        assert!(
+            identity_states >= 3,
+            "expected leader/manager/worker identity states, got {identity_states}"
+        );
+        let encoded = serde_json::to_string(&report).unwrap();
+        assert!(!encoded.contains("Project Lead"));
+        assert!(!encoded.contains("Auth Tech Lead"));
+        assert!(!encoded.contains("Discovery"));
+    });
+}
+
+#[test]
+fn role_tool_surface_encodes_the_delegation_and_write_boundaries() {
+    let surface = |role, profile| {
+        role_tool_surface(role, profile)
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let leader = surface(AgentRole::Leader, AgentProfile::Coding);
+    let manager = surface(AgentRole::Manager, AgentProfile::Generic);
+    let worker = surface(AgentRole::Worker, AgentProfile::Coding);
+    let labour = surface(AgentRole::Labour, AgentProfile::Coding);
+    let verifier = surface(AgentRole::Verifier, AgentProfile::Verification);
+    let scout = surface(AgentRole::Scout, AgentProfile::Research);
+
+    for name in ["delegate", "delegate_acp", "scout"] {
+        assert!(leader.contains(name), "Leader should retain {name}");
+        assert!(manager.contains(name), "Manager should retain {name}");
+        assert!(!verifier.contains(name), "Verifier must not get {name}");
+        assert!(!scout.contains(name), "Scout must not get {name}");
+        assert!(!labour.contains(name), "Labour must not get {name}");
+    }
+    assert!(manager.contains("delegate_many"));
+    assert!(!worker.contains("delegate_many"));
+    assert!(!labour.contains("delegate_many"));
+    assert!(!verifier.contains("delegate_many"));
+    assert!(!scout.contains("delegate_many"));
+    assert!(worker.contains("delegate"));
+
+    for name in ["write_file", "edit_file", "apply_patch", "shell", "process"] {
+        assert!(
+            !manager.contains(name),
+            "Manager must not have workspace tool {name}"
+        );
+        assert!(
+            !scout.contains(name),
+            "Scout must not have workspace tool {name}"
+        );
+    }
+    for name in ["write_file", "edit_file", "apply_patch"] {
+        assert!(
+            !verifier.contains(name),
+            "Verifier must not have write tool {name}"
+        );
+    }
+    // The Verifier may run tests through shell/process; it still has no write
+    // or merge path, and the Verifier run uses a detached read-only clone.
+    assert!(verifier.contains("shell"));
+    assert!(verifier.contains("process"));
+    for name in ["write_file", "edit_file", "apply_patch", "shell"] {
+        assert!(worker.contains(name), "Worker needs {name}");
+        assert!(labour.contains(name), "Labour needs {name}");
+    }
+    assert!(worker.contains("team_status"));
+    assert!(labour.contains("team_status"));
+    assert!(labour.contains("coordinate"));
+    assert!(labour.contains("send_message"));
+    assert!(!labour.contains("task_control"));
+    assert!(manager.contains("task_control"));
+    assert!(leader.contains("submit_team_plan"));
+    assert!(!manager.contains("submit_team_plan"));
+    assert!(!worker.contains("submit_team_plan"));
+    assert!(!labour.contains("submit_verdict"));
+    assert!(verifier.contains("submit_verdict"));
+}
+
+#[test]
+fn worker_and_labour_identity_roles_stay_distinct_from_execution_roles() {
+    let worker_context = crate::identity_prompt::role_contract("worker").unwrap();
+    assert_eq!(worker_context.role, "worker");
+    assert!(worker_context.delegation.contains("Labour"));
+    let labour_contract = crate::identity_prompt::role_contract("labour");
+    assert!(labour_contract.is_none());
+    let verifier_contract = crate::identity_prompt::role_contract("verifier");
+    assert!(verifier_contract.is_none());
+    let scout_contract = crate::identity_prompt::role_contract("scout");
+    assert!(scout_contract.is_none());
+    assert_eq!(AgentRole::Worker.child_role(), Some(AgentRole::Labour));
+    assert_eq!(AgentRole::Labour.child_role(), None);
 }

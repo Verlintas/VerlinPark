@@ -9,8 +9,8 @@
 //!
 //! This module owns the deterministic side of the fix:
 //!
-//! - seven deterministic section keys with fixed ordinals; six are head
-//!   system sections, one (`tail/memory`) is a tail section;
+//! - a deterministic section vocabulary with fixed ordinals: eight head
+//!   sections and two tail sections (`agent/memory`, `tail/memory`);
 //! - a content-addressed blob table (`sha256(text)` -> text) shared across
 //!   sessions and agents;
 //! - a per-scope ordered state (`session_instruction_state`) that pins the
@@ -76,6 +76,10 @@ pub fn prompt_layout_name(value: u32) -> &'static str {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum InstructionSectionKey {
     CoreCharter,
+    /// Stable project-identity capsule (S3). Ordinal 15 keeps role/charter,
+    /// identity metadata, and the deterministic role contract before the
+    /// project sections. It is a head section so compaction can never drop it.
+    AgentIdentity,
     CoreRecipes,
     ProjectSources,
     ProjectSkills,
@@ -85,30 +89,37 @@ pub enum InstructionSectionKey {
     /// the head prefix and is recorded as a priced cache change.
     SessionContract,
     RunTask,
+    /// Bounded identity/department memory brief (S3). Tail-only; the dedicated
+    /// identity-memory table is S5, so this reuses existing project memory.
+    AgentMemory,
     TailMemory,
 }
 
 impl InstructionSectionKey {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 10] = [
         Self::CoreCharter,
+        Self::AgentIdentity,
         Self::CoreRecipes,
         Self::ProjectSources,
         Self::ProjectSkills,
         Self::SessionContext,
         Self::SessionContract,
         Self::RunTask,
+        Self::AgentMemory,
         Self::TailMemory,
     ];
 
     pub fn key(self) -> &'static str {
         match self {
             Self::CoreCharter => "core/charter",
+            Self::AgentIdentity => crate::identity_prompt::IDENTITY_SECTION_KEY,
             Self::CoreRecipes => "core/recipes",
             Self::ProjectSources => "project/sources",
             Self::ProjectSkills => "project/skills",
             Self::SessionContext => "session/context",
             Self::SessionContract => "session/contract",
             Self::RunTask => "run/task",
+            Self::AgentMemory => crate::identity_prompt::IDENTITY_MEMORY_SECTION_KEY,
             Self::TailMemory => "tail/memory",
         }
     }
@@ -116,12 +127,14 @@ impl InstructionSectionKey {
     pub fn ordinal(self) -> u32 {
         match self {
             Self::CoreCharter => 10,
+            Self::AgentIdentity => 15,
             Self::CoreRecipes => 20,
             Self::ProjectSources => 30,
             Self::ProjectSkills => 40,
             Self::SessionContext => 50,
             Self::SessionContract => 55,
             Self::RunTask => 60,
+            Self::AgentMemory => 65,
             Self::TailMemory => 90,
         }
     }
@@ -129,7 +142,7 @@ impl InstructionSectionKey {
     /// True when the section is sent after the conversation rather than in the
     /// head system prefix.
     pub fn tail(self) -> bool {
-        matches!(self, Self::TailMemory)
+        matches!(self, Self::AgentMemory | Self::TailMemory)
     }
 
     /// Parse an exact key. Unknown keys are rejected rather than accepted as a
@@ -149,13 +162,26 @@ impl InstructionSectionKey {
         )
     }
 
+    /// Identity sections are stable for one identity generation, not forever.
+    /// The materializer reuses verified existing bytes while the freshly
+    /// rendered candidate has the same hash; a generation/metadata change
+    /// produces a new candidate and moves the head on purpose. Missing or
+    /// corrupt bytes still rebuild with a bounded diagnostic.
+    pub fn generation_scoped(self) -> bool {
+        matches!(self, Self::AgentIdentity)
+    }
+
     /// Project sections are semi-stable: a source or skill edit is allowed to
     /// move the project component and therefore the cache epoch. They are
     /// regenerated on each materialization, then stored by content hash.
     pub fn regenerated(self) -> bool {
         matches!(
             self,
-            Self::ProjectSources | Self::ProjectSkills | Self::SessionContract | Self::TailMemory
+            Self::ProjectSources
+                | Self::ProjectSkills
+                | Self::SessionContract
+                | Self::AgentMemory
+                | Self::TailMemory
         )
     }
 
@@ -168,6 +194,8 @@ impl InstructionSectionKey {
 
     pub fn max_bytes(self) -> usize {
         match self {
+            Self::AgentIdentity => crate::identity_prompt::IDENTITY_SECTION_MAX_BYTES,
+            Self::AgentMemory => crate::identity_prompt::IDENTITY_MEMORY_MAX_BYTES,
             Self::TailMemory => MAX_INSTRUCTION_TAIL_BYTES,
             _ => MAX_INSTRUCTION_SECTION_BYTES,
         }
@@ -633,7 +661,13 @@ pub fn materialize(
 
         if let Some(existing) = existing {
             old_hash = Some(existing.hash.clone());
-            if candidate.key.pinned() {
+            if candidate.key.generation_scoped() && existing.hash != desired_hash {
+                // A new identity generation or metadata change is a deliberate
+                // head movement. It is not a generator drift: the freshly
+                // rendered candidate is the new authoritative identity bytes.
+                chosen_text = Some(candidate.text.clone());
+                chosen_hash = desired_hash.clone();
+            } else if candidate.key.pinned() || candidate.key.generation_scoped() {
                 match store.get_instruction_blob(&existing.hash) {
                     Ok(Some(blob)) if verify_blob(&blob) => {
                         chosen_text = Some(blob.text);
@@ -665,7 +699,7 @@ pub fn materialize(
                 chosen_hash = desired_hash.clone();
             }
         } else {
-            if had_state && candidate.key.pinned() {
+            if had_state && (candidate.key.pinned() || candidate.key.generation_scoped()) {
                 rebuilt_reason = Some(InstructionRebuildReason::MissingState);
             }
             chosen_text = Some(candidate.text.clone());
@@ -974,45 +1008,74 @@ pub fn states_from_events(events: &[Event]) -> Option<Vec<SessionInstructionStat
     Some(rows)
 }
 
-/// Latest `context.prompt_prefix` identity for the instructions RPC:
-/// `(prefix_hash, cache_epoch, stable_prefix_hash)`.
-pub fn latest_prompt_prefix(events: &[Event]) -> (Option<String>, Option<String>, Option<String>) {
+/// Latest `context.prompt_prefix` identity for the instructions RPC.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LatestPromptPrefix {
+    pub prefix_hash: Option<String>,
+    pub cache_epoch: Option<String>,
+    pub stable_prefix_hash: Option<String>,
+    pub identity_id: Option<String>,
+    pub identity_generation: Option<u64>,
+    pub identity_hash: Option<String>,
+}
+
+/// Latest prompt-prefix identity for one session.
+///
+/// The finalized-epoch filter matches the existing L1/L4 contract: a placeholder
+/// event still reports its prefix/stable hashes but never a cache epoch. The
+/// identity fields are additive and absent on legacy events.
+pub fn latest_prompt_prefix(events: &[Event]) -> LatestPromptPrefix {
     let latest = events
         .iter()
         .rev()
         .find(|event| event.kind == "context.prompt_prefix");
-    match latest {
-        Some(event) => {
-            let finalized_epoch = event
-                .payload
-                .get("cache_epoch_placeholder")
-                .and_then(Value::as_bool)
-                != Some(true)
-                && event
-                    .payload
-                    .get("cache_epoch_source")
-                    .and_then(Value::as_str)
-                    != Some("l1_placeholder");
-            (
-                event
-                    .payload
-                    .get("prefix_hash")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                event
-                    .payload
-                    .get("cache_epoch")
-                    .and_then(Value::as_str)
-                    .filter(|_| finalized_epoch)
-                    .map(str::to_string),
-                event
-                    .payload
-                    .get("stable_prefix_hash")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-            )
-        }
-        None => (None, None, None),
+    let Some(event) = latest else {
+        return LatestPromptPrefix::default();
+    };
+    let finalized_epoch = event
+        .payload
+        .get("cache_epoch_placeholder")
+        .and_then(Value::as_bool)
+        != Some(true)
+        && event
+            .payload
+            .get("cache_epoch_source")
+            .and_then(Value::as_str)
+            != Some("l1_placeholder");
+    LatestPromptPrefix {
+        prefix_hash: event
+            .payload
+            .get("prefix_hash")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        cache_epoch: event
+            .payload
+            .get("cache_epoch")
+            .and_then(Value::as_str)
+            .filter(|_| finalized_epoch)
+            .map(str::to_string),
+        stable_prefix_hash: event
+            .payload
+            .get("stable_prefix_hash")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        identity_id: event
+            .payload
+            .get("identity_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        identity_generation: event
+            .payload
+            .get("identity_generation")
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0),
+        identity_hash: event
+            .payload
+            .get("identity_hash")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
     }
 }
 
@@ -1060,12 +1123,20 @@ mod tests {
     fn candidates() -> Vec<InstructionCandidate> {
         vec![
             InstructionCandidate::new(InstructionSectionKey::CoreCharter, "charter v1"),
+            InstructionCandidate::new(
+                InstructionSectionKey::AgentIdentity,
+                "Agent identity (stable for this identity generation; not a session goal, conversation, or authorization):\nIdentity: agt-worker\nGeneration: 1\nRole: worker",
+            ),
             InstructionCandidate::new(InstructionSectionKey::CoreRecipes, "recipes v1"),
             InstructionCandidate::new(InstructionSectionKey::ProjectSources, "sources v1"),
             InstructionCandidate::new(InstructionSectionKey::ProjectSkills, "skills v1"),
             InstructionCandidate::new(InstructionSectionKey::SessionContext, "session context v1"),
             InstructionCandidate::new(InstructionSectionKey::SessionContract, "contract v1"),
             InstructionCandidate::new(InstructionSectionKey::RunTask, "task objective v1"),
+            InstructionCandidate::new(
+                InstructionSectionKey::AgentMemory,
+                "Identity/department memory:\nauth component memory v1",
+            ),
             InstructionCandidate::new(InstructionSectionKey::TailMemory, "memory v1"),
         ]
     }
@@ -1085,10 +1156,11 @@ mod tests {
             }),
             created_at: "2026-11-12T00:00:01Z".into(),
         };
-        let (prefix, epoch, stable) = latest_prompt_prefix(&[placeholder]);
-        assert_eq!(prefix, Some("a".repeat(64)));
-        assert!(epoch.is_none());
-        assert_eq!(stable, Some("b".repeat(64)));
+        let latest = latest_prompt_prefix(&[placeholder]);
+        assert_eq!(latest.prefix_hash, Some("a".repeat(64)));
+        assert!(latest.cache_epoch.is_none());
+        assert_eq!(latest.stable_prefix_hash, Some("b".repeat(64)));
+        assert!(latest.identity_id.is_none());
 
         let finalized = Event {
             session_id: "ses".into(),
@@ -1099,11 +1171,17 @@ mod tests {
                 "cache_epoch": "d".repeat(64),
                 "cache_epoch_source": "l4",
                 "cache_epoch_placeholder": false,
+                "identity_id": "agt-1",
+                "identity_generation": 4,
+                "identity_hash": "e".repeat(64),
             }),
             created_at: "2026-11-12T00:00:02Z".into(),
         };
-        let (_, epoch, _) = latest_prompt_prefix(&[finalized]);
-        assert_eq!(epoch, Some("d".repeat(64)));
+        let latest = latest_prompt_prefix(&[finalized]);
+        assert_eq!(latest.cache_epoch, Some("d".repeat(64)));
+        assert_eq!(latest.identity_id.as_deref(), Some("agt-1"));
+        assert_eq!(latest.identity_generation, Some(4));
+        assert_eq!(latest.identity_hash, Some("e".repeat(64)));
     }
 
     #[test]
@@ -1120,10 +1198,17 @@ mod tests {
         assert_eq!(ordinals, sorted, "ordinals must be declared in order");
         assert_eq!(InstructionSectionKey::SessionContract.ordinal(), 55);
         assert!(!InstructionSectionKey::SessionContract.tail());
+        assert_eq!(InstructionSectionKey::AgentIdentity.ordinal(), 15);
+        assert!(!InstructionSectionKey::AgentIdentity.tail());
+        assert!(InstructionSectionKey::AgentIdentity.generation_scoped());
+        assert!(!InstructionSectionKey::AgentIdentity.pinned());
+        assert_eq!(InstructionSectionKey::AgentMemory.ordinal(), 65);
+        assert!(InstructionSectionKey::AgentMemory.tail());
         assert_eq!(InstructionSectionKey::TailMemory.ordinal(), 90);
         assert!(InstructionSectionKey::TailMemory.tail());
         for key in InstructionSectionKey::ALL {
-            if key != InstructionSectionKey::TailMemory {
+            if key != InstructionSectionKey::TailMemory && key != InstructionSectionKey::AgentMemory
+            {
                 assert!(!key.tail(), "{} must be a head section", key.key());
             }
         }
@@ -1176,11 +1261,13 @@ mod tests {
         assert!(second.rebuilds.is_empty());
         for key in [
             InstructionSectionKey::CoreCharter,
+            InstructionSectionKey::AgentIdentity,
             InstructionSectionKey::CoreRecipes,
             InstructionSectionKey::ProjectSources,
             InstructionSectionKey::ProjectSkills,
             InstructionSectionKey::SessionContext,
             InstructionSectionKey::RunTask,
+            InstructionSectionKey::AgentMemory,
             InstructionSectionKey::TailMemory,
         ] {
             assert_eq!(first.exact_text(key), second.exact_text(key), "{key:?}");
@@ -1453,7 +1540,7 @@ mod tests {
         assert!(instruction_rows_match(&rows, &replay));
         assert_eq!(
             replay.iter().map(|row| row.ordinal).collect::<Vec<_>>(),
-            vec![10, 20, 30, 40, 50, 55, 60, 90]
+            vec![10, 15, 20, 30, 40, 50, 55, 60, 65, 90]
         );
         let mut drifted = event.clone();
         drifted.payload["sections"][0]["ordinal"] = serde_json::json!(99);
@@ -1480,6 +1567,107 @@ mod tests {
             assert!(!encoded.contains("memory v1"));
             assert_eq!(reference.hash.len(), 64);
         }
+    }
+
+    #[test]
+    fn identity_section_is_generation_scoped_and_stable_within_one_generation() {
+        let (_dir, store) = store();
+        let first = materialize(&store, "ses-1", &candidates(), true).unwrap();
+        let second = materialize(&store, "ses-1", &candidates(), true).unwrap();
+        assert_eq!(
+            first.exact_text(InstructionSectionKey::AgentIdentity),
+            second.exact_text(InstructionSectionKey::AgentIdentity)
+        );
+        assert!(!second.state_changed);
+        assert_eq!(
+            first
+                .section(InstructionSectionKey::AgentIdentity)
+                .unwrap()
+                .ordinal,
+            15
+        );
+        assert!(
+            !first
+                .section(InstructionSectionKey::AgentIdentity)
+                .unwrap()
+                .tail
+        );
+
+        let mut promoted = candidates();
+        promoted
+            .iter_mut()
+            .find(|candidate| candidate.key == InstructionSectionKey::AgentIdentity)
+            .unwrap()
+            .text =
+            "Agent identity:\nIdentity: agt-worker\nGeneration: 2\nRole: worker".to_string();
+        let third = materialize(&store, "ses-1", &promoted, true).unwrap();
+        assert_ne!(
+            first.exact_text(InstructionSectionKey::AgentIdentity),
+            third.exact_text(InstructionSectionKey::AgentIdentity)
+        );
+        assert_ne!(first.stable_prefix_hash(), third.stable_prefix_hash());
+        assert!(third.state_changed);
+        assert_eq!(
+            first.exact_text(InstructionSectionKey::CoreCharter),
+            third.exact_text(InstructionSectionKey::CoreCharter)
+        );
+    }
+
+    #[test]
+    fn identity_memory_change_moves_only_the_tail() {
+        let (_dir, store) = store();
+        let first = materialize(&store, "ses-1", &candidates(), true).unwrap();
+        let mut changed = candidates();
+        changed
+            .iter_mut()
+            .find(|candidate| candidate.key == InstructionSectionKey::AgentMemory)
+            .unwrap()
+            .text = "Identity/department memory:\nauth memory v2".to_string();
+        let second = materialize(&store, "ses-1", &changed, true).unwrap();
+        assert_eq!(first.head_text(), second.head_text());
+        assert_eq!(first.stable_prefix_hash(), second.stable_prefix_hash());
+        assert_ne!(first.tail_text(), second.tail_text());
+        assert_ne!(first.volatile_hash(), second.volatile_hash());
+    }
+
+    #[test]
+    fn missing_identity_blob_rebuilds_and_reports_a_diagnostic() {
+        let (_dir, store) = store();
+        let first = materialize(&store, "ses-1", &candidates(), true).unwrap();
+        let hash = first
+            .section(InstructionSectionKey::AgentIdentity)
+            .unwrap()
+            .hash
+            .clone();
+        assert!(store.delete_instruction_blob(&hash).unwrap());
+        let second = materialize(&store, "ses-1", &candidates(), true).unwrap();
+        assert_eq!(second.rebuilds.len(), 1);
+        assert_eq!(second.rebuilds[0].key, InstructionSectionKey::AgentIdentity);
+        assert_eq!(
+            second.rebuilds[0].reason,
+            InstructionRebuildReason::MissingBlob
+        );
+        assert_eq!(second.stable_prefix_hash(), first.stable_prefix_hash());
+    }
+
+    #[test]
+    fn identity_and_memory_sections_parse_from_the_canonical_keys() {
+        assert_eq!(
+            InstructionSectionKey::parse("agent/identity"),
+            Some(InstructionSectionKey::AgentIdentity)
+        );
+        assert_eq!(
+            InstructionSectionKey::parse("agent/memory"),
+            Some(InstructionSectionKey::AgentMemory)
+        );
+        assert_eq!(
+            InstructionSectionKey::AgentIdentity.key(),
+            crate::identity_prompt::IDENTITY_SECTION_KEY
+        );
+        assert_eq!(
+            InstructionSectionKey::AgentMemory.key(),
+            crate::identity_prompt::IDENTITY_MEMORY_SECTION_KEY
+        );
     }
 }
 
@@ -1664,5 +1852,272 @@ mod edge_tests {
         assert!(!payload.contains("roles"));
         assert!(!payload.contains("memory"));
         assert!(payload.len() < 512);
+    }
+}
+
+#[cfg(test)]
+mod identity_edge_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn store() -> (TempDir, Store) {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        (dir, store)
+    }
+
+    fn candidates(identity: &str, memory: &str) -> Vec<InstructionCandidate> {
+        vec![
+            InstructionCandidate::new(InstructionSectionKey::CoreCharter, "charter"),
+            InstructionCandidate::new(InstructionSectionKey::AgentIdentity, identity),
+            InstructionCandidate::new(InstructionSectionKey::SessionContext, "session"),
+            InstructionCandidate::new(InstructionSectionKey::AgentMemory, memory),
+            InstructionCandidate::new(InstructionSectionKey::TailMemory, "run memory"),
+        ]
+    }
+
+    #[test]
+    fn oversized_identity_section_fails_closed_before_any_write() {
+        let (_dir, store) = store();
+        let huge = "i".repeat(crate::identity_prompt::IDENTITY_SECTION_MAX_BYTES + 1);
+        let candidates = candidates(&huge, "memory");
+        let error = materialize(&store, "ses-1", &candidates, true).unwrap_err();
+        assert_eq!(error.kind, InstructionErrorKind::OversizeSection);
+        assert_eq!(error.key.as_deref(), Some("agent/identity"));
+        assert_eq!(error.tool_failure().code, ToolErrorCode::RESOURCE_LIMIT);
+        assert!(store.list_session_instructions("ses-1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn oversized_identity_memory_section_fails_closed() {
+        let (_dir, store) = store();
+        let huge = "m".repeat(crate::identity_prompt::IDENTITY_MEMORY_MAX_BYTES + 1);
+        let candidates = candidates("identity", &huge);
+        let error = materialize(&store, "ses-1", &candidates, true).unwrap_err();
+        assert_eq!(error.kind, InstructionErrorKind::OversizeSection);
+        assert_eq!(error.key.as_deref(), Some("agent/memory"));
+    }
+
+    #[test]
+    fn preview_with_identity_never_writes_blobs_or_state() {
+        let (_dir, store) = store();
+        let candidates = candidates("identity preview", "memory preview");
+        let previewed = preview("ses-1", &candidates, true).unwrap();
+        assert_eq!(previewed.head.len(), 3);
+        assert_eq!(previewed.tail.len(), 2);
+        assert_eq!(
+            previewed
+                .section(InstructionSectionKey::AgentIdentity)
+                .unwrap()
+                .ordinal,
+            15
+        );
+        assert!(
+            previewed
+                .section(InstructionSectionKey::AgentMemory)
+                .unwrap()
+                .tail
+        );
+        assert!(store.list_session_instructions("ses-1").unwrap().is_empty());
+        for reference in previewed
+            .head_refs()
+            .into_iter()
+            .chain(previewed.tail_refs())
+        {
+            assert!(
+                store
+                    .get_instruction_blob(&reference.hash)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let encoded = serde_json::to_string(&previewed.persisted).unwrap();
+        assert!(!encoded.contains("identity preview"));
+        assert!(!encoded.contains("memory preview"));
+    }
+
+    #[test]
+    fn malformed_identity_section_replay_fails_closed_without_partial_state() {
+        let event = Event {
+            session_id: "ses-1".to_string(),
+            seq: 1,
+            kind: "context.instruction".to_string(),
+            payload: serde_json::json!({
+                "state_id": "ses-1",
+                "layout": 3,
+                "sections": [{
+                    "key": "agent/identity",
+                    "hash": "a".repeat(64),
+                    "ordinal": 15,
+                    "tail": false
+                }, {
+                    "key": "agent/unknown",
+                    "hash": "b".repeat(64),
+                    "ordinal": 65,
+                    "tail": true
+                }]
+            }),
+            created_at: "2026-11-13T00:00:00Z".to_string(),
+        };
+        assert!(states_from_events(&[event]).is_none());
+    }
+
+    #[test]
+    fn identity_memory_and_run_memory_share_the_aggregate_tail_cap() {
+        let (_dir, store) = store();
+        let identity_memory = "i".repeat(crate::identity_prompt::IDENTITY_MEMORY_MAX_BYTES);
+        let run_memory = "r".repeat(MAX_INSTRUCTION_TAIL_BYTES);
+        let candidates = candidates("identity", &identity_memory)
+            .into_iter()
+            .map(|candidate| {
+                if candidate.key == InstructionSectionKey::TailMemory {
+                    InstructionCandidate::new(InstructionSectionKey::TailMemory, run_memory.clone())
+                } else {
+                    candidate
+                }
+            })
+            .collect::<Vec<_>>();
+        let error = materialize(&store, "ses-1", &candidates, true).unwrap_err();
+        assert_eq!(error.kind, InstructionErrorKind::OversizeTail);
+        assert!(store.list_session_instructions("ses-1").unwrap().is_empty());
+        // The identity head is still independently valid: the failure is the
+        // aggregate optional tail, not the stable identity capsule.
+        let head_only = candidates
+            .into_iter()
+            .filter(|candidate| !candidate.key.tail())
+            .collect::<Vec<_>>();
+        let warm = materialize(&store, "ses-1", &head_only, false).unwrap();
+        assert!(
+            warm.exact_text(InstructionSectionKey::AgentIdentity)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn warm_preserves_the_identity_head_and_verified_tail_state() {
+        let (_dir, store) = store();
+        let full = materialize(
+            &store,
+            "ses-1",
+            &candidates("identity v1", "memory v1"),
+            true,
+        )
+        .unwrap();
+        let head_only = candidates("identity v1", "memory v1")
+            .into_iter()
+            .filter(|candidate| !candidate.key.tail())
+            .collect::<Vec<_>>();
+        let warm = materialize(&store, "ses-1", &head_only, false).unwrap();
+        assert!(warm.tail.is_empty());
+        assert_eq!(
+            warm.exact_text(InstructionSectionKey::AgentIdentity),
+            full.exact_text(InstructionSectionKey::AgentIdentity)
+        );
+        assert_eq!(warm.stable_prefix_hash(), full.stable_prefix_hash());
+        let persisted = store.list_session_instructions("ses-1").unwrap();
+        assert!(persisted.iter().any(|row| row.key == "agent/identity"));
+        assert!(
+            persisted
+                .iter()
+                .any(|row| row.key == "agent/memory" && row.tail)
+        );
+        assert!(
+            persisted
+                .iter()
+                .any(|row| row.key == "tail/memory" && row.tail)
+        );
+    }
+
+    #[test]
+    fn replay_reconstructs_identity_sections_and_rejects_ordinal_drift() {
+        let (_dir, store) = store();
+        let materialized = materialize(
+            &store,
+            "ses-1",
+            &candidates("identity v2", "memory v2"),
+            true,
+        )
+        .unwrap();
+        let rows = store.list_session_instructions("ses-1").unwrap();
+        let event = Event {
+            session_id: "ses-1".to_string(),
+            seq: 1,
+            kind: "context.instruction".to_string(),
+            payload: serde_json::json!({
+                "state_id": "ses-1",
+                "layout": 3,
+                "sections": rows.iter().map(|row| serde_json::json!({
+                    "key": row.key,
+                    "hash": row.hash,
+                    "ordinal": row.ordinal,
+                    "tail": row.tail,
+                })).collect::<Vec<_>>(),
+            }),
+            created_at: "2026-11-13T00:00:00Z".to_string(),
+        };
+        let replay = states_from_events(std::slice::from_ref(&event)).unwrap();
+        assert!(instruction_rows_match(&rows, &replay));
+        assert!(
+            replay
+                .iter()
+                .any(|row| row.key == "agent/identity" && row.ordinal == 15 && !row.tail)
+        );
+        assert!(
+            replay
+                .iter()
+                .any(|row| row.key == "agent/memory" && row.ordinal == 65 && row.tail)
+        );
+        assert_eq!(
+            materialized
+                .section(InstructionSectionKey::AgentMemory)
+                .unwrap()
+                .ordinal,
+            65
+        );
+
+        let mut drifted = event;
+        let identity_index = drifted.payload["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|section| section["key"] == "agent/identity")
+            .unwrap();
+        drifted.payload["sections"][identity_index]["ordinal"] = serde_json::json!(16);
+        assert!(states_from_events(&[drifted]).is_none());
+    }
+
+    #[test]
+    fn identity_section_hash_is_not_the_same_as_the_memory_tail_hash() {
+        let (_dir, store) = store();
+        let materialized = materialize(
+            &store,
+            "ses-1",
+            &candidates("identity v1", "memory v1"),
+            true,
+        )
+        .unwrap();
+        let identity = materialized
+            .section(InstructionSectionKey::AgentIdentity)
+            .unwrap();
+        let memory = materialized
+            .section(InstructionSectionKey::AgentMemory)
+            .unwrap();
+        assert!(!identity.tail);
+        assert!(memory.tail);
+        assert_ne!(identity.hash, memory.hash);
+        assert_eq!(identity.ordinal, 15);
+        assert_eq!(memory.ordinal, 65);
+        assert!(
+            materialized
+                .head_refs()
+                .iter()
+                .all(|section| section.key != "agent/memory")
+        );
+        assert!(
+            materialized
+                .tail_refs()
+                .iter()
+                .all(|section| section.key != "agent/identity")
+        );
     }
 }

@@ -160,6 +160,9 @@ final class EfficiencyDashboardTests: XCTestCase {
           "cache_breakpoints": 4,
           "cache_ttl": "1h",
           "automatic": true,
+          "identity_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "identity_id": "agt-worker-1",
+          "identity_generation": 3,
           "input_tokens": 1000,
           "output_tokens": 2,
           "cache_read_tokens": 0,
@@ -178,6 +181,9 @@ final class EfficiencyDashboardTests: XCTestCase {
         XCTAssertEqual(result.cacheTTL, "1h")
         XCTAssertEqual(result.costUSD ?? 0, 0.003, accuracy: 0.000001)
         XCTAssertEqual(result.latencyMS, 240)
+        XCTAssertEqual(result.identityID, "agt-worker-1")
+        XCTAssertEqual(result.identityGeneration, 3)
+        XCTAssertEqual(result.identityHash, String(repeating: "d", count: 64))
     }
 
     func testCacheAuditDecodesFindingsAndEvidence() throws {
@@ -1108,6 +1114,9 @@ final class EfficiencyDashboardTests: XCTestCase {
           "prompt_layout": 3,
           "latest_prefix_hash": "prefix-123",
           "latest_cache_epoch": "prefix-123",
+          "latest_identity_id": "agt-worker-1",
+          "latest_identity_generation": 4,
+          "latest_identity_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
           "last_rebuilt": 1,
           "states": [
             {
@@ -1116,6 +1125,7 @@ final class EfficiencyDashboardTests: XCTestCase {
               "prompt_layout": 3,
               "head_hash": "head-123",
               "tail_hash": "tail-456",
+              "identity_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
               "sections": [
                 {"key": "core/charter", "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ordinal": 10, "tail": false, "chars": 100, "available": true},
                 {"key": "session/context", "hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "ordinal": 50, "tail": false, "chars": 80, "available": true},
@@ -1129,8 +1139,12 @@ final class EfficiencyDashboardTests: XCTestCase {
         XCTAssertEqual(report.sessionID, "ses-1")
         XCTAssertEqual(report.promptLayout, 3)
         XCTAssertEqual(report.lastRebuilt, 1)
+        XCTAssertEqual(report.latestIdentityID, "agt-worker-1")
+        XCTAssertEqual(report.latestIdentityGeneration, 4)
+        XCTAssertEqual(report.latestIdentityHash, String(repeating: "d", count: 64))
         let leader = try XCTUnwrap(report.leaderState)
         XCTAssertEqual(leader.role, "leader")
+        XCTAssertEqual(leader.identityHash, String(repeating: "d", count: 64))
         XCTAssertEqual(leader.headSections.count, 2)
         XCTAssertEqual(leader.tailSections.count, 1)
         XCTAssertEqual(leader.tailSections[0].key, "tail/memory")

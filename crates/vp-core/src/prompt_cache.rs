@@ -76,6 +76,20 @@ pub struct PromptSections {
     pub head: Vec<PromptHeading>,
     /// Ordered tail sections sent after the conversation. `tail/memory` only.
     pub tail: Vec<PromptHeading>,
+    /// Stable project-identity marker for S3. It is `None` for legacy sessions,
+    /// Labour/Verifier/Scout runs, and layout v2. The marker never contains
+    /// prompt text beyond metadata already present in the head section.
+    pub identity: Option<PromptIdentityMarker>,
+}
+
+/// Bounded identity metadata that travels with prompt-section hashes and cache
+/// telemetry. It contains no memory, inbox, session, or secret material.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PromptIdentityMarker {
+    pub identity_id: String,
+    pub generation: u64,
+    /// Hash of the rendered `agent/identity` section.
+    pub hash: String,
 }
 
 impl Default for PromptSections {
@@ -87,6 +101,7 @@ impl Default for PromptSections {
             layout: PROMPT_LAYOUT_V2,
             head: Vec::new(),
             tail: Vec::new(),
+            identity: None,
         }
     }
 }
@@ -104,6 +119,7 @@ impl PromptSections {
             layout: PROMPT_LAYOUT_V2,
             head: Vec::new(),
             tail: Vec::new(),
+            identity: None,
         }
     }
 
@@ -150,6 +166,7 @@ impl PromptSections {
             layout: PROMPT_LAYOUT_V3,
             head,
             tail,
+            identity: None,
         }
     }
 
@@ -251,6 +268,8 @@ impl PromptSections {
                         "core-stable"
                     } else if heading.key == InstructionSectionKey::SessionContext.key() {
                         "session"
+                    } else if heading.key == InstructionSectionKey::AgentIdentity.key() {
+                        "identity"
                     } else if heading.key == InstructionSectionKey::RunTask.key() {
                         "task"
                     } else {
@@ -365,6 +384,15 @@ pub struct PromptSectionHashes {
     pub head_sections: Vec<PromptSectionRef>,
     /// Ordered tail section references (key/hash/ordinal/tail=true).
     pub tail_sections: Vec<PromptSectionRef>,
+    /// Hash of the stable `agent/identity` head section, or empty for legacy,
+    /// Labour/Verifier/Scout, and layout-v2 prompts.
+    pub identity_hash: String,
+    pub identity_id: Option<String>,
+    pub identity_generation: Option<u64>,
+    /// Ordered identity head refs (at most one in S3). Kept separate from
+    /// `core_sections`/`project_sections` so the cache epoch can attribute an
+    /// identity generation change without reclassifying it as a project edit.
+    pub identity_sections: Vec<PromptSectionRef>,
     pub section_chars: std::collections::BTreeMap<String, u64>,
 }
 
@@ -413,6 +441,21 @@ impl PromptSectionHashes {
                 .collect::<Vec<_>>();
             let volatile_hash = v3_volatile_hash(sections);
             let prefix_hash = prefix_hash_v3(model, &tools_hash, &head_sections);
+            let identity_sections = head_sections
+                .iter()
+                .filter(|section| section.key == InstructionSectionKey::AgentIdentity.key())
+                .cloned()
+                .collect::<Vec<_>>();
+            let (identity_hash, identity_id, identity_generation) =
+                match (&sections.identity, identity_sections.first()) {
+                    (Some(marker), Some(section)) => (
+                        section.hash.clone(),
+                        Some(marker.identity_id.clone()),
+                        Some(marker.generation),
+                    ),
+                    (None, Some(section)) => (section.hash.clone(), None, None),
+                    _ => (String::new(), None, None),
+                };
             return Self {
                 core_hash,
                 project_hash,
@@ -424,6 +467,10 @@ impl PromptSectionHashes {
                 stable_prefix_hash,
                 head_sections,
                 tail_sections,
+                identity_hash,
+                identity_id,
+                identity_generation,
+                identity_sections,
                 section_chars: sections.section_chars(),
             };
         }
@@ -457,6 +504,10 @@ impl PromptSectionHashes {
             stable_prefix_hash,
             head_sections,
             tail_sections: Vec::new(),
+            identity_hash: String::new(),
+            identity_id: None,
+            identity_generation: None,
+            identity_sections: Vec::new(),
             section_chars: sections.section_chars(),
         }
     }
@@ -473,6 +524,10 @@ impl PromptSectionHashes {
             "stable_prefix_hash": self.stable_prefix_hash,
             "head_sections": self.head_sections,
             "tail_sections": self.tail_sections,
+            "identity_hash": self.identity_hash,
+            "identity_id": self.identity_id,
+            "identity_generation": self.identity_generation,
+            "identity_sections": self.identity_sections,
             "section_chars": self.section_chars,
         })
     }
@@ -486,6 +541,7 @@ impl PromptSectionHashes {
             tools_hash: self.tools_hash.clone(),
             volatile_hash: self.volatile_hash.clone(),
             prefix_hash: self.prefix_hash.clone(),
+            identity_hash: self.identity_hash.clone(),
             cache_epoch: String::new(),
             model: String::new(),
         }
@@ -607,6 +663,9 @@ pub struct CacheCallFingerprint {
     pub tools_hash: String,
     pub volatile_hash: String,
     pub prefix_hash: String,
+    /// Hash of the stable `agent/identity` section. Empty for legacy and
+    /// non-identity runs.
+    pub identity_hash: String,
     /// Finalized L4 epoch. Legacy events leave this empty; attribution then
     /// falls back to the prefix hash and never invents a cross-session reuse.
     pub cache_epoch: String,
@@ -626,6 +685,7 @@ impl CacheCallFingerprint {
             tools_hash: get("tools_hash").unwrap_or_default(),
             volatile_hash: get("volatile_hash").unwrap_or_default(),
             prefix_hash,
+            identity_hash: get("identity_hash").unwrap_or_default(),
             cache_epoch: get("cache_epoch").unwrap_or_default(),
             model: get("model").unwrap_or_default(),
         })
@@ -649,6 +709,7 @@ pub enum CacheMissReason {
     ModelChanged,
     ToolsChanged,
     ProjectChanged,
+    IdentityChanged,
     /// Same epoch, same tools/project, but the provider reported a low or zero
     /// cache hit. This is a provider/TTL observation, not local prefix churn.
     ProviderCacheMiss,
@@ -667,6 +728,7 @@ impl CacheMissReason {
             Self::ModelChanged => "model_changed",
             Self::ToolsChanged => "tools_changed",
             Self::ProjectChanged => "project_changed",
+            Self::IdentityChanged => "identity_changed",
             Self::ProviderCacheMiss => "provider_cache_miss",
             Self::TtlOrProviderMiss => "ttl_or_provider_miss",
             Self::CompactionReset => "compaction_reset",
@@ -682,6 +744,7 @@ impl CacheMissReason {
             "model_changed" => Self::ModelChanged,
             "tools_changed" => Self::ToolsChanged,
             "project_changed" => Self::ProjectChanged,
+            "identity_changed" => Self::IdentityChanged,
             "provider_cache_miss" => Self::ProviderCacheMiss,
             "ttl_or_provider_miss" => Self::TtlOrProviderMiss,
             "compaction_reset" => Self::CompactionReset,
@@ -695,7 +758,11 @@ impl CacheMissReason {
     pub fn is_prefix_change(self) -> bool {
         matches!(
             self,
-            Self::PrefixChanged | Self::ModelChanged | Self::ToolsChanged | Self::ProjectChanged
+            Self::PrefixChanged
+                | Self::ModelChanged
+                | Self::ToolsChanged
+                | Self::ProjectChanged
+                | Self::IdentityChanged
         )
     }
     /// True for reasons that indicate our own prefix bytes changed rather than
@@ -703,7 +770,11 @@ impl CacheMissReason {
     pub fn is_prefix_break(self) -> bool {
         matches!(
             self,
-            Self::PrefixChanged | Self::ToolsChanged | Self::ProjectChanged | Self::CompactionReset
+            Self::PrefixChanged
+                | Self::ToolsChanged
+                | Self::ProjectChanged
+                | Self::IdentityChanged
+                | Self::CompactionReset
         )
     }
 }
@@ -960,6 +1031,11 @@ impl CacheCallTracker {
                 Some(CacheMissReason::ToolsChanged)
             } else if last.project_hash != observation.fingerprint.project_hash {
                 Some(CacheMissReason::ProjectChanged)
+            } else if last.identity_hash != observation.fingerprint.identity_hash
+                && (!last.identity_hash.is_empty()
+                    || !observation.fingerprint.identity_hash.is_empty())
+            {
+                Some(CacheMissReason::IdentityChanged)
             } else if last.core_hash != observation.fingerprint.core_hash
                 || (last.prefix_hash != observation.fingerprint.prefix_hash
                     && last.cache_epoch == observation.fingerprint.cache_epoch)
@@ -2653,6 +2729,44 @@ mod tests {
     }
 
     #[test]
+    fn observe_call_attributes_identity_generation_changes() {
+        let base = sections().hashes("model", &[]).fingerprint();
+        let mut promoted = base.clone();
+        promoted.identity_hash = "a".repeat(64);
+        let mut tracker = CacheCallTracker::new(Some(base));
+        let messages = vec![ChatMessage::user("first")];
+        let telemetry = tracker.observe_call(observation(&promoted, &messages, 1_000, 0));
+        assert_eq!(
+            telemetry.miss_reason,
+            Some(CacheMissReason::IdentityChanged)
+        );
+        assert!(telemetry.miss_reason.unwrap().is_prefix_break());
+        assert_eq!(
+            CacheMissReason::parse("identity_changed"),
+            Some(CacheMissReason::IdentityChanged)
+        );
+        assert_eq!(
+            CacheMissReason::IdentityChanged.as_str(),
+            "identity_changed"
+        );
+    }
+
+    #[test]
+    fn removing_an_identity_is_attributed_as_an_identity_break() {
+        let base = sections().hashes("model", &[]).fingerprint();
+        let mut with_identity = base.clone();
+        with_identity.identity_hash = "a".repeat(64);
+        let mut tracker = CacheCallTracker::new(Some(with_identity));
+        let messages = vec![ChatMessage::user("first")];
+        let telemetry = tracker.observe_call(observation(&base, &messages, 1_000, 0));
+        assert_eq!(
+            telemetry.miss_reason,
+            Some(CacheMissReason::IdentityChanged)
+        );
+        assert!(telemetry.miss_reason.unwrap().is_prefix_change());
+    }
+
+    #[test]
     fn tracker_seeds_continuity_and_previous_input_from_a_persisted_event() {
         let messages = vec![ChatMessage::user("one"), ChatMessage::user("two")];
         let hashes = sections().hashes("model", &[]);
@@ -3055,5 +3169,200 @@ mod v3_tests {
                 &hashes.project_hash
             )
         );
+        assert!(hashes.identity_hash.is_empty());
+        assert!(hashes.identity_sections.is_empty());
+        assert!(hashes.identity_generation.is_none());
+    }
+
+    fn v3_identity_sections(generation: u64, memory: &str) -> PromptSections {
+        let candidates = vec![
+            InstructionCandidate::new(InstructionSectionKey::CoreCharter, "charter bytes"),
+            InstructionCandidate::new(
+                InstructionSectionKey::AgentIdentity,
+                format!(
+                    "Agent identity (stable for this identity generation; not a session goal, conversation, or authorization):\nIdentity: agt-worker\nGeneration: {generation}\nRole: worker"
+                ),
+            ),
+            InstructionCandidate::new(InstructionSectionKey::CoreRecipes, "recipe bytes"),
+            InstructionCandidate::new(InstructionSectionKey::ProjectSources, "source bytes"),
+            InstructionCandidate::new(InstructionSectionKey::ProjectSkills, "skill bytes"),
+            InstructionCandidate::new(InstructionSectionKey::SessionContext, "session bytes"),
+            InstructionCandidate::new(InstructionSectionKey::RunTask, "task bytes"),
+            InstructionCandidate::new(
+                InstructionSectionKey::AgentMemory,
+                format!("Identity/department memory:\n{memory}"),
+            ),
+            InstructionCandidate::new(InstructionSectionKey::TailMemory, "run memory"),
+        ];
+        let materialized = preview("ses-1", &candidates, true).unwrap();
+        let mut sections = PromptSections::from_materialized(&materialized);
+        let identity = materialized
+            .section(InstructionSectionKey::AgentIdentity)
+            .expect("identity section");
+        sections.identity = Some(PromptIdentityMarker {
+            identity_id: "agt-worker".to_string(),
+            generation,
+            hash: identity.hash.clone(),
+        });
+        sections
+    }
+
+    #[test]
+    fn identity_section_is_hashed_separately_and_does_not_change_core_or_project() {
+        let tools = vec![tool("read_file")];
+        let base = v3_identity_sections(1, "auth memory").hashes("model", &tools);
+        assert_eq!(base.identity_hash.len(), 64);
+        assert_eq!(base.identity_id.as_deref(), Some("agt-worker"));
+        assert_eq!(base.identity_generation, Some(1));
+        assert_eq!(base.identity_sections.len(), 1);
+        assert_eq!(base.identity_sections[0].key, "agent/identity");
+        assert_eq!(base.identity_sections[0].ordinal, 15);
+        assert!(!base.identity_sections[0].tail);
+        assert_eq!(
+            base.core_hash,
+            v3_sections("memory").hashes("model", &tools).core_hash
+        );
+        assert_eq!(
+            base.project_hash,
+            v3_sections("memory").hashes("model", &tools).project_hash
+        );
+        // The identity section is part of the ordered v3 prefix and therefore
+        // moves the prefix identity even though the core/project components do
+        // not change.
+        assert_ne!(
+            base.prefix_hash,
+            v3_sections("memory").hashes("model", &tools).prefix_hash
+        );
+    }
+
+    #[test]
+    fn identity_generation_and_memory_have_distinct_cache_effects() {
+        let tools = vec![tool("read_file")];
+        let first = v3_identity_sections(1, "memory one").hashes("model", &tools);
+        let same = v3_identity_sections(1, "memory two").hashes("model", &tools);
+        assert_eq!(first.prefix_hash, same.prefix_hash);
+        assert_eq!(first.stable_prefix_hash, same.stable_prefix_hash);
+        assert_eq!(first.identity_hash, same.identity_hash);
+        assert_eq!(first.identity_generation, same.identity_generation);
+        assert_ne!(first.volatile_hash, same.volatile_hash);
+        assert_eq!(first.tail_sections.len(), 2);
+        assert_eq!(first.tail_sections[0].key, "agent/memory");
+        assert_eq!(first.tail_sections[1].key, "tail/memory");
+
+        let promoted = v3_identity_sections(2, "memory one").hashes("model", &tools);
+        assert_ne!(first.prefix_hash, promoted.prefix_hash);
+        assert_ne!(first.identity_hash, promoted.identity_hash);
+        assert_eq!(promoted.identity_generation, Some(2));
+        assert_eq!(first.core_hash, promoted.core_hash);
+        assert_eq!(first.project_hash, promoted.project_hash);
+    }
+
+    #[test]
+    fn identity_provider_kind_is_explicit_and_keeps_breakpoint_budget() {
+        let sections = v3_identity_sections(1, "memory");
+        let provider = sections.provider_sections();
+        assert_eq!(
+            provider
+                .iter()
+                .filter(|section| section.kind == "identity")
+                .count(),
+            1
+        );
+        let identity = provider
+            .iter()
+            .find(|section| section.kind == "identity")
+            .unwrap();
+        assert!(identity.text.contains("Generation: 1"));
+        assert_eq!(
+            provider
+                .iter()
+                .filter(|section| section.kind == "core")
+                .count(),
+            1
+        );
+        assert_eq!(
+            provider
+                .iter()
+                .filter(|section| section.kind == "project")
+                .count(),
+            1
+        );
+        let policy = CachePolicy::default();
+        let plan = request_cache_plan("anthropic", &sections, 12, 4, &policy, "worker");
+        assert_eq!(plan.breakpoints, 4);
+        assert!(plan.core_breakpoint);
+        assert!(plan.project_breakpoint);
+        assert_eq!(sections.tail_sections().len(), 2);
+        assert_eq!(sections.tail_sections()[0].kind, "agent/memory");
+    }
+
+    #[test]
+    fn identity_render_and_section_chars_include_head_and_exclude_memory() {
+        let sections = v3_identity_sections(3, "auth memory bytes");
+        let rendered = sections.render();
+        assert!(rendered.contains("Agent identity"));
+        assert!(rendered.contains("Generation: 3"));
+        assert!(!rendered.contains("auth memory bytes"));
+        assert!(sections.stable_prefix().contains("Generation: 3"));
+        assert!(!sections.stable_prefix().contains("auth memory bytes"));
+        assert_eq!(sections.tail_sections().len(), 2);
+        assert!(sections.tail_sections().iter().all(|section| {
+            section.kind != "identity" && !section.text.contains("Generation: 3")
+        }));
+        let chars = sections.section_chars();
+        assert!(chars.contains_key("agent/identity"));
+        assert!(chars.contains_key("agent/memory"));
+        assert_eq!(
+            chars.get("agent/identity").copied().unwrap_or(0),
+            sections
+                .head
+                .iter()
+                .find(|heading| heading.key == "agent/identity")
+                .map(|heading| heading.text.chars().count() as u64)
+                .unwrap_or(0)
+        );
+        assert_eq!(
+            sections.identity.as_ref().map(|marker| marker.generation),
+            Some(3)
+        );
+        assert_eq!(
+            sections
+                .identity
+                .as_ref()
+                .map(|marker| marker.identity_id.as_str()),
+            Some("agt-worker")
+        );
+        let hashes = sections.hashes("model", &[tool("read_file")]);
+        assert_eq!(
+            hashes.identity_hash,
+            sections
+                .identity
+                .as_ref()
+                .map(|marker| marker.hash.clone())
+                .unwrap_or_default()
+        );
+    }
+
+    #[test]
+    fn identity_marker_is_absent_for_v2_and_tokenless_sections() {
+        let v2 = PromptSections::new("core", "project", "volatile");
+        assert!(v2.identity.is_none());
+        assert!(v2.hashes("model", &[]).identity_hash.is_empty());
+        let plain = v3_sections("memory");
+        assert!(plain.identity.is_none());
+        assert!(plain.hashes("model", &[]).identity_hash.is_empty());
+    }
+
+    #[test]
+    fn identity_prompt_text_never_appears_in_section_metadata() {
+        let sections = v3_identity_sections(7, "auth memory do-not-leak");
+        let hashes = sections.hashes("model", &[tool("read_file")]);
+        let encoded = serde_json::to_string(&hashes.payload()).unwrap();
+        assert!(!encoded.contains("Agent identity"));
+        assert!(!encoded.contains("auth memory"));
+        assert!(!encoded.contains("do-not-leak"));
+        assert!(!encoded.contains("Generation: 7"));
+        assert!(encoded.contains("agent/identity"));
+        assert!(encoded.contains(&hashes.identity_hash));
     }
 }
