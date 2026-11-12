@@ -919,6 +919,10 @@ private struct ContextPopoverView: View {
                         .foregroundStyle(.tertiary)
                 }
 
+                if let instructions = model.sessionInstructions {
+                    InstructionSectionsView(report: instructions)
+                }
+
                 if let governor = model.governorStatus,
                    governor.enabled || governor.planPresent
                 {
@@ -1979,5 +1983,82 @@ struct PreemptionBanner: View {
             }
         }
         return detail
+    }
+}
+
+/// Ordered instruction sections from `session.instructions`. This is a
+/// metadata-only cache view: keys, ordinals, character counts, and short
+/// hashes. Prompt text is never requested or rendered.
+private struct InstructionSectionsView: View {
+    let report: SessionInstructionsReport
+
+    private var leader: SessionInstructionStateReport? {
+        report.leaderState
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text("INSTRUCTION SECTIONS")
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(VPTheme.textTertiary)
+                Text("v\(report.promptLayout)")
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(VPTheme.accent)
+                if let prefix = report.latestPrefixHash, !prefix.isEmpty {
+                    Text("prefix \(String(prefix.prefix(12)))…")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(VPTheme.textTertiary)
+                        .textSelection(.enabled)
+                }
+                if report.lastRebuilt > 0 {
+                    Text("\(report.lastRebuilt) rebuilt")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(VPTheme.warning)
+                }
+                Spacer(minLength: 0)
+            }
+            if let leader, !leader.sections.isEmpty {
+                ForEach(leader.sections) { section in
+                    HStack(spacing: 8) {
+                        Text(String(format: "%3d", section.ordinal))
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(VPTheme.textTertiary)
+                        Text(section.tail ? "TAIL" : "HEAD")
+                            .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(section.tail ? VPTheme.warning : VPTheme.accent)
+                            .frame(width: 30, alignment: .leading)
+                        Text(section.key)
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(VPTheme.textSecondary)
+                        Text("\(section.chars) chars")
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(VPTheme.textTertiary)
+                        if section.available {
+                            Text("\(section.shortHash)…")
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundStyle(VPTheme.textTertiary)
+                                .textSelection(.enabled)
+                        } else {
+                            Text("MISSING BLOB")
+                                .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(VPTheme.danger)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                }
+                Text(
+                    "Section text stays in the daemon instruction store; this view shows hashes only."
+                )
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+            } else {
+                Text("No instruction state yet. It is materialized on the first run.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(8)
+        .background(VPTheme.surfaceRaised.opacity(0.35), in: RoundedRectangle(cornerRadius: 9))
     }
 }

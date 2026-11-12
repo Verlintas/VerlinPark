@@ -76,6 +76,12 @@ pub struct CachePolicy {
     /// `verifier`, `labour`, or `scout`; values are `5m` or `1h`.
     #[serde(default)]
     pub role_ttl: BTreeMap<String, String>,
+    /// Instruction/prompt layout used for newly created sessions. `3` is the
+    /// content-addressed section layout; `2` is the legacy combined layout and
+    /// remains available for rollback. Existing sessions keep their own
+    /// persisted layout regardless of this project default.
+    #[serde(default = "default_prompt_layout")]
+    pub prompt_layout: u32,
 }
 
 impl Default for CachePolicy {
@@ -87,7 +93,25 @@ impl Default for CachePolicy {
             warm_on_resume: false,
             compact_aware: default_cache_compact_aware(),
             role_ttl: BTreeMap::new(),
+            prompt_layout: default_prompt_layout(),
         }
+    }
+}
+
+pub fn default_prompt_layout() -> u32 {
+    3
+}
+
+/// Session-scoped prompt layout. Legacy sessions deserialize as `2`; a newly
+/// created session is written with the project default (normally `3`).
+pub fn default_session_prompt_layout() -> u32 {
+    2
+}
+
+pub fn normalize_prompt_layout(value: u32) -> u32 {
+    match value {
+        2 => 2,
+        _ => 3,
     }
 }
 
@@ -140,7 +164,19 @@ impl CachePolicy {
             roles.insert(role, ttl);
         }
         policy.role_ttl = roles;
+        if !matches!(policy.prompt_layout, 2 | 3) {
+            return Err(format!(
+                "prompt_layout must be 2 or 3, got {}",
+                policy.prompt_layout
+            ));
+        }
         Ok(policy)
+    }
+
+    /// Layout used for new sessions. Values outside `2|3` fail closed to the
+    /// current layout rather than silently enabling an unknown prompt shape.
+    pub fn session_prompt_layout(&self) -> u32 {
+        normalize_prompt_layout(self.prompt_layout)
     }
 
     /// TTL selected for one role. A missing override uses the project default.
@@ -1392,6 +1428,12 @@ pub struct Session {
     pub tokens_in: u64,
     #[serde(default)]
     pub tokens_out: u64,
+    /// Prompt layout persisted at session creation. `2` keeps the legacy
+    /// combined system prompt; `3` uses the content-addressed instruction
+    /// store. Legacy sessions decode as `2` so a daemon upgrade never changes
+    /// their prompt bytes.
+    #[serde(default = "default_session_prompt_layout")]
+    pub prompt_layout: u32,
     pub created_at: String,
 }
 
@@ -1403,6 +1445,157 @@ pub struct Event {
     pub kind: String,
     pub payload: Value,
     pub created_at: String,
+}
+
+/// One content-addressed instruction section body. The hash is
+/// `sha256(text)`; the text is never copied into cache telemetry, only into
+/// the store and an explicit export bundle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstructionBlob {
+    #[serde(default)]
+    pub hash: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+/// The ordered instruction state persisted for one instruction scope. The
+/// scope id is normally the session id for the Leader, or
+/// `<session_id>#<agent_id>` for a task-scoped agent. Keys remain deterministic
+/// (`core/charter`, `run/task`, ...) so the same schema is inspectable for
+/// every agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInstructionState {
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub hash: String,
+    #[serde(default)]
+    pub ordinal: u32,
+    #[serde(default)]
+    pub tail: bool,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+/// One ordered section reference recorded on `context.prompt_prefix` and
+/// `context.instruction` events. It contains no prompt text.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptSectionRef {
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub hash: String,
+    #[serde(default)]
+    pub ordinal: u32,
+    #[serde(default)]
+    pub tail: bool,
+}
+
+impl PromptSectionRef {
+    pub fn new(key: impl Into<String>, hash: impl Into<String>, ordinal: u32, tail: bool) -> Self {
+        Self {
+            key: key.into(),
+            hash: hash.into(),
+            ordinal,
+            tail,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionInstructionsParams {
+    pub session_id: String,
+    /// Optional exact agent id whose scoped instruction state should be
+    /// inspected. Omit to inspect every state attached to the session.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInstructionSection {
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub hash: String,
+    #[serde(default)]
+    pub ordinal: u32,
+    #[serde(default)]
+    pub tail: bool,
+    #[serde(default)]
+    pub chars: u64,
+    /// True when the referenced blob exists in the local store and its hash
+    /// verifies. Text is deliberately never returned by this RPC.
+    #[serde(default)]
+    pub available: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInstructionStateReport {
+    #[serde(default)]
+    pub state_id: String,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub prompt_layout: u32,
+    #[serde(default)]
+    pub head_hash: String,
+    #[serde(default)]
+    pub tail_hash: String,
+    #[serde(default)]
+    pub sections: Vec<SessionInstructionSection>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInstructionsReport {
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default = "default_prompt_layout")]
+    pub prompt_layout: u32,
+    /// Latest `context.prompt_prefix` hash observed for the session, if any.
+    #[serde(default)]
+    pub latest_prefix_hash: Option<String>,
+    /// L1 placeholder for L4's finalized cache epoch.
+    #[serde(default)]
+    pub latest_cache_epoch: Option<String>,
+    /// Hash of the exact ordered head text from the latest prompt-prefix
+    /// event. It can be compared with each state's `head_hash`.
+    #[serde(default)]
+    pub latest_stable_prefix_hash: Option<String>,
+    #[serde(default)]
+    pub states: Vec<SessionInstructionStateReport>,
+    /// Bounded diagnostic surfaced by the last materialization attempt.
+    #[serde(default)]
+    pub last_rebuilt: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetSessionPromptLayoutParams {
+    pub session_id: String,
+    pub prompt_layout: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SetSessionPromptLayoutResult {
+    pub session_id: String,
+    pub prompt_layout: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetProjectPromptLayoutParams {
+    pub project_id: String,
+    pub prompt_layout: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SetProjectPromptLayoutResult {
+    pub project_id: String,
+    pub prompt_layout: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7032,6 +7225,16 @@ pub struct SessionCachePlanRole {
     #[serde(default)]
     pub prefix_hash: String,
     #[serde(default)]
+    pub prompt_layout: u32,
+    #[serde(default)]
+    pub stable_prefix_hash: String,
+    #[serde(default)]
+    pub head_sections: Vec<PromptSectionRef>,
+    #[serde(default)]
+    pub tail_sections: Vec<PromptSectionRef>,
+    #[serde(default)]
+    pub section_chars: BTreeMap<String, u64>,
+    #[serde(default)]
     pub core_chars: u64,
     #[serde(default)]
     pub project_chars: u64,
@@ -8626,6 +8829,16 @@ pub struct SessionBundle {
     /// `output_ref` cannot resolve a local body.
     #[serde(default)]
     pub test_results: Vec<TestCacheEntry>,
+    /// Content-addressed instruction bodies referenced by
+    /// `session_instruction_state`. Older bundles decode as an empty list and
+    /// remain readable; a missing blob is rebuilt deterministically only on an
+    /// explicit run, never during archive import.
+    #[serde(default)]
+    pub instruction_blobs: Vec<InstructionBlob>,
+    /// Ordered per-scope instruction state. Imported archives are read-only;
+    /// these rows are preserved for inspection and never trigger generation.
+    #[serde(default)]
+    pub instructions: Vec<SessionInstructionState>,
 }
 
 /// Project policy for automatic crash resume. Manual `session.run.resume`
@@ -11743,6 +11956,102 @@ mod tests {
     }
 
     #[test]
+    fn instruction_protocol_types_default_and_round_trip() {
+        let legacy: Session = serde_json::from_value(json!({
+            "id": "ses-1",
+            "project_id": "prj-1",
+            "goal": "goal",
+            "status": "idle",
+            "created_at": "2026-11-12T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(legacy.prompt_layout, 2);
+
+        let report: SessionInstructionsReport = serde_json::from_value(json!({
+            "session_id": "ses-1"
+        }))
+        .unwrap();
+        assert_eq!(report.prompt_layout, 3);
+        assert!(report.states.is_empty());
+
+        let full = SessionInstructionsReport {
+            session_id: "ses-1".into(),
+            prompt_layout: 3,
+            latest_prefix_hash: Some("prefix".into()),
+            latest_cache_epoch: Some("prefix".into()),
+            latest_stable_prefix_hash: Some("stable".into()),
+            states: vec![SessionInstructionStateReport {
+                state_id: "ses-1".into(),
+                role: Some("leader".into()),
+                agent_id: None,
+                prompt_layout: 3,
+                head_hash: "head".into(),
+                tail_hash: "tail".into(),
+                sections: vec![SessionInstructionSection {
+                    key: "core/charter".into(),
+                    hash: "a".repeat(64),
+                    ordinal: 10,
+                    tail: false,
+                    chars: 120,
+                    available: true,
+                }],
+            }],
+            last_rebuilt: 1,
+        };
+        let encoded = serde_json::to_value(&full).unwrap();
+        let decoded: SessionInstructionsReport = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, full);
+        assert_eq!(decoded.states[0].sections[0].ordinal, 10);
+        assert!(decoded.states[0].sections[0].available);
+
+        let policy = CachePolicy::default();
+        assert_eq!(policy.prompt_layout, 3);
+        assert_eq!(policy.session_prompt_layout(), 3);
+        let legacy_policy = CachePolicy {
+            prompt_layout: 2,
+            ..CachePolicy::default()
+        };
+        assert_eq!(legacy_policy.session_prompt_layout(), 2);
+        let invalid = CachePolicy {
+            prompt_layout: 9,
+            ..CachePolicy::default()
+        };
+        assert!(invalid.normalized().is_err());
+        assert_eq!(legacy_policy.normalized().unwrap().prompt_layout, 2);
+    }
+
+    #[test]
+    fn session_bundle_decodes_legacy_without_instruction_fields() {
+        let bundle: SessionBundle = serde_json::from_value(json!({
+            "version": 1,
+            "exported_at": "2026-11-12T00:00:00Z",
+            "project": {
+                "id": "prj-1",
+                "name": "project",
+                "root": "/tmp/project",
+                "default_branch": "main",
+                "created_at": "2026-11-12T00:00:00Z"
+            },
+            "session": {
+                "id": "ses-1",
+                "project_id": "prj-1",
+                "goal": "goal",
+                "status": "imported",
+                "created_at": "2026-11-12T00:00:00Z"
+            },
+            "events": [],
+            "agents": [],
+            "messages": [],
+            "todos": [],
+            "merge_queue": []
+        }))
+        .unwrap();
+        assert!(bundle.instruction_blobs.is_empty());
+        assert!(bundle.instructions.is_empty());
+        assert_eq!(bundle.session.prompt_layout, 2);
+    }
+
+    #[test]
     fn cache_plan_result_round_trips_and_defaults_params() {
         let params: SessionCachePlanParams =
             serde_json::from_value(json!({"session_id": "ses-1"})).unwrap();
@@ -11768,6 +12077,11 @@ mod tests {
                 tools_hash: "tools".into(),
                 volatile_hash: "volatile".into(),
                 prefix_hash: "prefix".into(),
+                prompt_layout: 2,
+                stable_prefix_hash: "stable".into(),
+                head_sections: Vec::new(),
+                tail_sections: Vec::new(),
+                section_chars: std::collections::BTreeMap::new(),
                 core_chars: 100,
                 project_chars: 50,
                 stable_prefix_chars: 151,
@@ -13452,6 +13766,7 @@ mod context_checkpoint_bundle_tests {
                 base_commit: None,
                 tokens_in: 0,
                 tokens_out: 0,
+                prompt_layout: 2,
                 created_at: "2026-11-11T00:00:00Z".into(),
             },
             events: Vec::new(),
@@ -13500,6 +13815,8 @@ mod context_checkpoint_bundle_tests {
             }],
             supervised_processes: Vec::new(),
             test_results: Vec::new(),
+            instruction_blobs: Vec::new(),
+            instructions: Vec::new(),
         };
         let encoded = serde_json::to_string(&bundle).unwrap();
         let decoded: SessionBundle = serde_json::from_str(&encoded).unwrap();

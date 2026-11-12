@@ -64,7 +64,8 @@ use vp_protocol::types::{
     SessionContinuation, SessionContinuationCancelResult, SessionContinuationClaimInfo,
     SessionContinuationReclaimResult, SessionContinuationStatusResult, SessionContinuationsResult,
     SessionDeferResult, SessionDiff, SessionForkResult, SessionForkTreeNode, SessionForkTreeResult,
-    SessionImportResult, SessionLandResult, SessionLineageEntry, SessionLineageResult,
+    SessionImportResult, SessionInstructionSection, SessionInstructionStateReport,
+    SessionInstructionsReport, SessionLandResult, SessionLineageEntry, SessionLineageResult,
     SessionLogStatus, SessionPreemptionResult, SessionPriorityResult, SessionRehydrateResult,
     SessionReplayReport, SessionSkillActivationsResult, SessionStallsResult, SessionSteerResult,
     SessionSteeringCancelResult, SessionSteeringListResult, SessionTranscriptResult,
@@ -118,6 +119,7 @@ mod dashboard;
 pub mod forge;
 pub mod gui;
 pub mod history;
+pub mod instruction;
 pub mod mcp;
 pub mod memory;
 pub mod memory_embedding;
@@ -184,6 +186,7 @@ struct ReplayData {
     processes: Vec<vp_protocol::types::SupervisedProcess>,
     test_results: Vec<vp_protocol::test_cache::TestCacheEntry>,
     remote_test_evidence: Vec<RemoteTestEvidence>,
+    instructions: Vec<vp_protocol::types::SessionInstructionState>,
     events: Vec<Event>,
 }
 
@@ -4830,6 +4833,7 @@ impl Engine {
             "unlimited": session.unlimited,
             "budget_mode": if session.unlimited { "unlimited" } else { "limited" },
             "base_commit": session.base_commit,
+            "prompt_layout": session.prompt_layout,
             "created_at": session.created_at,
         });
         let _ = self
@@ -5963,6 +5967,7 @@ impl Engine {
             "unlimited": new_session.unlimited,
             "budget_mode": if new_session.unlimited { "unlimited" } else { "limited" },
             "base_commit": new_session.base_commit,
+            "prompt_layout": new_session.prompt_layout,
             "created_at": new_session.created_at,
             "forked_from_session_id": source.id,
             "forked_from_checkpoint_id": checkpoint.id,
@@ -10220,6 +10225,172 @@ impl Engine {
         })
     }
 
+    /// Bounded inspection of the ordered instruction state for one session.
+    ///
+    /// Returns exact keys, hashes, ordinals, tail flags, and character counts.
+    /// It never returns section text; the only exact-byte path is test-only in
+    /// `vp_core::instruction`. No provider call, worktree, or generation is
+    /// triggered by this read.
+    pub async fn session_instructions(
+        &self,
+        session_id: &str,
+        agent_id: Option<&str>,
+    ) -> Result<SessionInstructionsReport> {
+        let session = self
+            .store
+            .get_session(session_id)?
+            .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+        let states = self.store.list_instruction_states_for_session(session_id)?;
+        let agents = self.list_agents(session_id).await?;
+        let (latest_prefix_hash, latest_cache_epoch, latest_stable_prefix_hash) = {
+            let prefixes = self
+                .recent_events_of_kind(session_id, "context.prompt_prefix", 1)
+                .await?;
+            crate::instruction::latest_prompt_prefix(&prefixes)
+        };
+        let rebuilt_events = self
+            .recent_events_of_kind(session_id, "context.instruction.rebuilt", 200)
+            .await?;
+        let mut by_state: std::collections::BTreeMap<
+            String,
+            Vec<vp_protocol::types::SessionInstructionState>,
+        > = std::collections::BTreeMap::new();
+        for state in states {
+            by_state
+                .entry(state.session_id.clone())
+                .or_default()
+                .push(state);
+        }
+        let mut reports = Vec::with_capacity(by_state.len());
+        for (state_id, rows) in by_state {
+            let scoped_agent = crate::instruction::instruction_state_agent(&state_id, session_id);
+            if let Some(filter) = agent_id {
+                let matches_leader = filter == "leader" && state_id == session_id;
+                if scoped_agent.as_deref() != Some(filter) && !matches_leader {
+                    continue;
+                }
+            }
+            let role = scoped_agent
+                .as_deref()
+                .and_then(|agent_id| agents.iter().find(|agent| agent.id == agent_id))
+                .map(|agent| agent.role.clone())
+                .or_else(|| (state_id == session_id).then(|| "leader".to_string()));
+            let mut sections = Vec::with_capacity(rows.len());
+            let mut head_texts = Vec::new();
+            let mut tail_texts = Vec::new();
+            for row in &rows {
+                let blob = self.store.get_instruction_blob(&row.hash)?;
+                let available = blob
+                    .as_ref()
+                    .is_some_and(|blob| sha256_hex(blob.text.as_bytes()) == row.hash);
+                let chars = blob
+                    .as_ref()
+                    .filter(|_| available)
+                    .map(|blob| blob.text.chars().count() as u64)
+                    .unwrap_or(0);
+                if let Some(blob) = blob.filter(|_| available) {
+                    if row.tail {
+                        tail_texts.push(blob.text);
+                    } else {
+                        head_texts.push(blob.text);
+                    }
+                }
+                sections.push(SessionInstructionSection {
+                    key: row.key.clone(),
+                    hash: row.hash.clone(),
+                    ordinal: row.ordinal,
+                    tail: row.tail,
+                    chars,
+                    available,
+                });
+            }
+            let head_hash = if head_texts.is_empty() {
+                String::new()
+            } else {
+                sha256_hex(head_texts.join("\n\n").as_bytes())
+            };
+            let tail_hash = if tail_texts.is_empty() {
+                String::new()
+            } else {
+                sha256_hex(tail_texts.join("\n\n").as_bytes())
+            };
+            reports.push(SessionInstructionStateReport {
+                state_id,
+                role,
+                agent_id: scoped_agent,
+                prompt_layout: crate::instruction::PROMPT_LAYOUT_V3,
+                head_hash,
+                tail_hash,
+                sections,
+            });
+        }
+        Ok(SessionInstructionsReport {
+            session_id: session_id.to_string(),
+            prompt_layout: crate::instruction::normalize_prompt_layout(session.prompt_layout),
+            latest_prefix_hash,
+            latest_cache_epoch,
+            latest_stable_prefix_hash,
+            states: reports,
+            last_rebuilt: rebuilt_events.len() as u64,
+        })
+    }
+
+    /// Persist a session-scoped prompt layout override. A rollback to v2 keeps
+    /// the existing instruction state untouched so switching back to v3 reuses
+    /// the same bytes; no migration is destructive.
+    pub async fn set_session_prompt_layout(
+        &self,
+        session_id: &str,
+        prompt_layout: u32,
+    ) -> Result<vp_protocol::types::SetSessionPromptLayoutResult> {
+        if !matches!(prompt_layout, 2 | 3) {
+            anyhow::bail!("prompt_layout must be 2 or 3");
+        }
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let session = tokio::task::spawn_blocking({
+            let store = store.clone();
+            let id = id.clone();
+            move || store.get_session(&id)
+        })
+        .await??
+        .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+        if session.status == "imported" {
+            anyhow::bail!("imported sessions are read-only archives");
+        }
+        let event = tokio::task::spawn_blocking(move || {
+            store.set_session_prompt_layout_with_event(&id, prompt_layout)
+        })
+        .await??;
+        let _ = self.events.send(event);
+        Ok(vp_protocol::types::SetSessionPromptLayoutResult {
+            session_id: session_id.to_string(),
+            prompt_layout,
+        })
+    }
+
+    /// Set the project default for newly created sessions. Existing sessions
+    /// keep their persisted layout.
+    pub async fn set_project_prompt_layout(
+        &self,
+        project_id: &str,
+        prompt_layout: u32,
+    ) -> Result<vp_protocol::types::SetProjectPromptLayoutResult> {
+        if !matches!(prompt_layout, 2 | 3) {
+            anyhow::bail!("prompt_layout must be 2 or 3");
+        }
+        let mut policy = self.get_cache_policy(project_id).await?;
+        policy.prompt_layout = prompt_layout;
+        let policy = policy
+            .normalized()
+            .map_err(|message| anyhow!("invalid cache policy: {message}"))?;
+        self.set_cache_policy(project_id, policy).await?;
+        Ok(vp_protocol::types::SetProjectPromptLayoutResult {
+            project_id: project_id.to_string(),
+            prompt_layout,
+        })
+    }
+
     /// Deterministic cache audit over persisted events. No provider call and
     /// no TTL inference; findings are derived only from recorded telemetry.
     pub async fn session_cache_audit(
@@ -13209,6 +13380,7 @@ impl Engine {
                 &vp_protocol::now_rfc3339(),
             )?;
             let remote_test_evidence = store.list_remote_test_evidence_for_session(&id)?;
+            let instructions = store.list_instruction_states_for_session(&id)?;
             let events = store.list_all_events(&id)?;
             Ok(ReplayData {
                 session,
@@ -13238,6 +13410,7 @@ impl Engine {
                 processes,
                 test_results,
                 remote_test_evidence,
+                instructions,
                 events,
             })
         })
@@ -13877,6 +14050,16 @@ impl Engine {
                 data.session.unlimited, replay_unlimited
             ));
         }
+        let prompt_layout_matches = replay_session_prompt_layout(&data.events)
+            .map(|replay_layout| replay_layout == data.session.prompt_layout)
+            .unwrap_or(true);
+        if !prompt_layout_matches {
+            mismatches.push(format!(
+                "session prompt layout: projection={}, replay={:?}",
+                data.session.prompt_layout,
+                replay_session_prompt_layout(&data.events)
+            ));
+        }
 
         let (replay_in, replay_out) = data
             .events
@@ -14145,6 +14328,38 @@ impl Engine {
                 expected_test_results.len()
             ));
         }
+
+        let has_instruction_events = data
+            .events
+            .iter()
+            .any(|event| event.kind == "context.instruction");
+        let instructions_match = match crate::instruction::states_from_events(&data.events) {
+            Some(expected_instructions) => {
+                let matches = crate::instruction::instruction_rows_match(
+                    &data.instructions,
+                    &expected_instructions,
+                );
+                if !matches {
+                    mismatches.push(format!(
+                        "instruction state: projection={}, replay={}",
+                        data.instructions.len(),
+                        expected_instructions.len()
+                    ));
+                }
+                matches
+            }
+            None if has_instruction_events => {
+                mismatches.push("instruction state: malformed replay event".to_string());
+                false
+            }
+            None => {
+                // Legacy/imported archives may carry instruction rows without
+                // an instruction event stream. There is no replay authority in
+                // that case, so the projection is preserved rather than
+                // reported as drift.
+                true
+            }
+        };
 
         let expected_artifacts = Self::expected_artifacts(data);
         let projected_artifacts = data
@@ -14417,6 +14632,8 @@ impl Engine {
         }
 
         let consistent = status_matches
+            && prompt_layout_matches
+            && instructions_match
             && usage_matches
             && ledger_matches
             && mailbox_matches
@@ -14753,6 +14970,7 @@ impl Engine {
             status,
             priority,
             unlimited: Some(replay_session_unlimited(&data.events)),
+            prompt_layout: replay_session_prompt_layout(&data.events),
             tokens_in,
             tokens_out,
             cost_spent_usd,
@@ -14781,6 +14999,11 @@ impl Engine {
             remote_test_evidence: {
                 let expected = Self::expected_remote_test_evidence(data);
                 expected.filter(|rows| !rows.is_empty() || data.remote_test_evidence.is_empty())
+            },
+            instructions: match crate::instruction::states_from_events(&data.events) {
+                Some(rows) => Some(rows),
+                None if data.instructions.is_empty() => Some(Vec::new()),
+                None => None,
             },
             artifact_warnings,
         })
@@ -15116,6 +15339,28 @@ impl Engine {
             .plan
             .as_deref()
             .and_then(|plan| serde_json::from_str::<TeamPlan>(plan).ok());
+        let blob_store = store.clone();
+        let instruction_hashes = data
+            .instructions
+            .iter()
+            .map(|instruction| instruction.hash.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let instruction_blobs = tokio::task::spawn_blocking(move || {
+            let mut blobs = Vec::with_capacity(instruction_hashes.len());
+            for hash in instruction_hashes {
+                let blob = blob_store.get_instruction_blob(&hash)?.ok_or_else(|| {
+                    anyhow!("instruction state references missing blob {hash}; export refused")
+                })?;
+                if crate::instruction::hash_instruction_text(&blob.text) != hash {
+                    anyhow::bail!(
+                        "instruction blob {hash} does not match its text; export refused"
+                    );
+                }
+                blobs.push(blob);
+            }
+            Ok::<_, anyhow::Error>(blobs)
+        })
+        .await??;
         Ok(SessionBundle {
             version: 1,
             exported_at: vp_protocol::now_rfc3339(),
@@ -15147,6 +15392,8 @@ impl Engine {
             context_checkpoints: data.context_checkpoints,
             supervised_processes: data.processes,
             test_results: data.test_results,
+            instruction_blobs,
+            instructions: data.instructions,
         })
     }
 
@@ -18292,6 +18539,27 @@ fn replay_memory_conflicts(events: &[Event]) -> Vec<MemoryConflict> {
             .then_with(|| left.id.cmp(&right.id))
     });
     conflicts
+}
+
+fn replay_session_prompt_layout(events: &[Event]) -> Option<u32> {
+    events
+        .iter()
+        .rev()
+        .find_map(|event| match event.kind.as_str() {
+            "session.prompt_layout" => event
+                .payload
+                .get("prompt_layout")
+                .and_then(serde_json::Value::as_u64)
+                .map(|value| value as u32)
+                .filter(|value| matches!(value, 2 | 3)),
+            "session.created" => event
+                .payload
+                .get("prompt_layout")
+                .and_then(serde_json::Value::as_u64)
+                .map(|value| value as u32)
+                .filter(|value| matches!(value, 2 | 3)),
+            _ => None,
+        })
 }
 
 fn replay_session_unlimited(events: &[Event]) -> bool {

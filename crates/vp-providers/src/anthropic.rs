@@ -248,12 +248,28 @@ impl AnthropicProvider {
     ) -> Result<EventStream, ProviderError> {
         let api_key = self.api_key.as_ref().ok_or(ProviderError::MissingApiKey)?;
 
-        let messages: Vec<Value> = request
+        let mut messages: Vec<Value> = request
             .messages
             .iter()
             .filter(|message| message.role != "system")
             .filter_map(anthropic_message)
             .collect();
+        // Anthropic's `system` field is a top-level request parameter, so a v3
+        // tail system section cannot be expressed mid-history. Represent the
+        // memory brief as one stable user message prefixed `[memory]` after the
+        // exact prior conversation. The runtime records
+        // `provider_tail_system=false` for this provider. No earlier message or
+        // cache breakpoint is moved.
+        for section in request
+            .tail_sections
+            .iter()
+            .filter(|section| section.has_text())
+        {
+            messages.push(json!({
+                "role": "user",
+                "content": format!("[memory]\n\n{}", section.text),
+            }));
+        }
 
         let cache_ttl = request.cache.map(|cache| cache.ttl);
         let plan = request.cache.map(|cache| {
@@ -1214,5 +1230,21 @@ mod tests {
             Some(ProviderError::Preempted { reason, phase, .. })
                 if reason == "explicit" && phase == "provider"
         ));
+    }
+    #[tokio::test]
+    async fn tail_memory_falls_back_to_a_stable_user_message() {
+        let mut request = cache_request();
+        request.tail_sections = vec![crate::SystemSection::new("tail/memory", "MEMORY BRIEF")];
+        let (_server, body) = capture_body(request).await;
+        let messages = body["messages"].as_array().unwrap();
+        // The conversation stays exact and the memory brief is a final user
+        // message, never part of the top-level system blocks.
+        assert_eq!(messages.last().unwrap()["role"], json!("user"));
+        assert_eq!(
+            messages.last().unwrap()["content"],
+            json!("[memory]\n\nMEMORY BRIEF")
+        );
+        let system = body["system"].to_string();
+        assert!(!system.contains("MEMORY BRIEF"));
     }
 }

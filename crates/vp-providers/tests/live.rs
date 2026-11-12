@@ -40,6 +40,7 @@ fn request(model: String) -> ChatRequest {
         system: Some("You are a provider connectivity check. Be concise.".to_string()),
         system_stable_prefix: None,
         system_sections: Vec::new(),
+        tail_sections: Vec::new(),
         cache: None,
         max_tokens: Some(256),
         temperature: Some(0.0),

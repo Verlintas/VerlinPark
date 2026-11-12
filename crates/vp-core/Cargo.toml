@@ -53,6 +53,7 @@ flate2 = "1"
 
 [dev-dependencies]
 axum = { workspace = true }
+rusqlite = { workspace = true }
 tempfile = "3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 wiremock = "0.6"

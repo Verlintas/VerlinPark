@@ -89,6 +89,7 @@ final class AppModel {
     var usageLedger: UsageLedgerResult?
     var usageStatus: String?
     var sessionCacheStatus: SessionCacheStatus?
+    var sessionInstructions: SessionInstructionsReport?
     var governorStatus: GovernorSessionStatus?
     var governorStatusMessage: String?
     var efficiencyBusy = false
@@ -774,6 +775,7 @@ final class AppModel {
         efficiencyRefreshTask?.cancel()
         toolActivityRefreshTask?.cancel()
         sessionCacheStatus = nil
+        sessionInstructions = nil
         governorStatus = nil
         governorStatusMessage = nil
         toolOutputStatus = nil
@@ -3723,6 +3725,7 @@ final class AppModel {
             usageStatus = nil
             contextStatus = nil
             sessionCacheStatus = nil
+            sessionInstructions = nil
             governorStatus = nil
             governorStatusMessage = nil
             toolActivity = nil
@@ -3758,6 +3761,15 @@ final class AppModel {
             toolOutputStatus = status
         } catch {
             // Tool-output status is diagnostic; keep the project-level value.
+        }
+
+        do {
+            let instructions = try await core.sessionInstructions(sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            sessionInstructions = instructions
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            sessionInstructions = nil
         }
 
         do {

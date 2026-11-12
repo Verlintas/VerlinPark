@@ -265,6 +265,11 @@ fn session_from_created(event: &Event) -> Option<Session> {
             .map(str::to_string),
         tokens_in: 0,
         tokens_out: 0,
+        prompt_layout: payload
+            .get("prompt_layout")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value as u32)
+            .unwrap_or(2),
         created_at: payload
             .get("created_at")
             .and_then(serde_json::Value::as_str)

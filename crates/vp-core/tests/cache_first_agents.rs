@@ -173,6 +173,10 @@ async fn anthropic_agent_run_emits_four_breakpoints_and_cache_telemetry() {
         .await
         .unwrap();
     engine
+        .set_session_prompt_layout(&session.id, 2)
+        .await
+        .unwrap();
+    engine
         .create_leader_agent(&session.id, "claude-test")
         .await
         .unwrap();
@@ -267,6 +271,10 @@ async fn anthropic_one_hour_policy_reaches_the_wire_and_telemetry() {
         .await
         .unwrap();
     engine
+        .set_session_prompt_layout(&session.id, 2)
+        .await
+        .unwrap();
+    engine
         .create_leader_agent(&session.id, "claude-test")
         .await
         .unwrap();
@@ -345,6 +353,10 @@ async fn openai_compatible_agent_keeps_stable_sections_first_and_sorted_tools() 
     let service = AgentService::configured(engine.clone(), config);
     let session = engine
         .create_session(project_id, "openai cache".into(), None)
+        .await
+        .unwrap();
+    engine
+        .set_session_prompt_layout(&session.id, 2)
         .await
         .unwrap();
     engine

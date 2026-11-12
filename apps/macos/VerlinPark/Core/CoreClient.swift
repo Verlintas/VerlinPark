@@ -1120,6 +1120,35 @@ actor CoreClient {
         .decode(SessionCacheStatus.self)
     }
 
+    func sessionInstructions(
+        sessionID: String,
+        agentID: String? = nil
+    ) async throws -> SessionInstructionsReport {
+        var params: [String: JSONValue] = ["session_id": .string(sessionID)]
+        if let agentID {
+            params["agent_id"] = .string(agentID)
+        }
+        return try await request(
+            method: "session.instructions",
+            params: params
+        )
+        .decode(SessionInstructionsReport.self)
+    }
+
+    func setSessionPromptLayout(
+        sessionID: String,
+        layout: Int
+    ) async throws -> SessionInstructionsReport {
+        _ = try await request(
+            method: "session.prompt_layout.set",
+            params: [
+                "session_id": .string(sessionID),
+                "prompt_layout": .number(Double(layout)),
+            ]
+        )
+        return try await sessionInstructions(sessionID: sessionID)
+    }
+
     func budgetGovernor(
         sessionID: String,
         limit: Int = 20

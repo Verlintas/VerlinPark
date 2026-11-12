@@ -114,6 +114,12 @@ pub struct ChatRequest {
     /// support cache breakpoints use these exact boundaries; providers without
     /// explicit caching still receive the same combined `system` text.
     pub system_sections: Vec<SystemSection>,
+    /// Ordered tail sections sent after the conversation. The v3 layout uses
+    /// this for `tail/memory` only. Adapters that accept a trailing system
+    /// message send one; Anthropic uses a stable `[memory]` user message
+    /// because its `system` field is a top-level request parameter. This field
+    /// never rewrites prior conversation messages.
+    pub tail_sections: Vec<SystemSection>,
     /// Per-request cache policy. `None` preserves the legacy adapter behavior.
     pub cache: Option<PromptCacheConfig>,
     pub max_tokens: Option<u32>,
@@ -129,6 +135,7 @@ impl ChatRequest {
             system: None,
             system_stable_prefix: None,
             system_sections: Vec::new(),
+            tail_sections: Vec::new(),
             cache: None,
             max_tokens: None,
             temperature: None,

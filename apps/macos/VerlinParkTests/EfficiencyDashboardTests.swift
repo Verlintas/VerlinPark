@@ -867,4 +867,51 @@ final class EfficiencyDashboardTests: XCTestCase {
         XCTAssertTrue(result.truncated)
         XCTAssertEqual(result.nextBefore, "2026-11-11T00:00:00Z")
     }
+
+    func testSessionInstructionsDecodeOrderedSectionsWithoutText() throws {
+        let json = """
+        {
+          "session_id": "ses-1",
+          "prompt_layout": 3,
+          "latest_prefix_hash": "prefix-123",
+          "latest_cache_epoch": "prefix-123",
+          "last_rebuilt": 1,
+          "states": [
+            {
+              "state_id": "ses-1",
+              "role": "leader",
+              "prompt_layout": 3,
+              "head_hash": "head-123",
+              "tail_hash": "tail-456",
+              "sections": [
+                {"key": "core/charter", "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ordinal": 10, "tail": false, "chars": 100, "available": true},
+                {"key": "session/context", "hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "ordinal": 50, "tail": false, "chars": 80, "available": true},
+                {"key": "tail/memory", "hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "ordinal": 90, "tail": true, "chars": 20, "available": false}
+              ]
+            }
+          ]
+        }
+        """
+        let report = try JSONDecoder().decode(SessionInstructionsReport.self, from: Data(json.utf8))
+        XCTAssertEqual(report.sessionID, "ses-1")
+        XCTAssertEqual(report.promptLayout, 3)
+        XCTAssertEqual(report.lastRebuilt, 1)
+        let leader = try XCTUnwrap(report.leaderState)
+        XCTAssertEqual(leader.role, "leader")
+        XCTAssertEqual(leader.headSections.count, 2)
+        XCTAssertEqual(leader.tailSections.count, 1)
+        XCTAssertEqual(leader.tailSections[0].key, "tail/memory")
+        XCTAssertFalse(leader.tailSections[0].available)
+        XCTAssertEqual(leader.headSections[0].shortHash.count, 12)
+    }
+
+    func testSessionInstructionsDecodeEmptyPayloadWithLegacyDefaults() throws {
+        let report = try JSONDecoder().decode(
+            SessionInstructionsReport.self,
+            from: Data("{}".utf8)
+        )
+        XCTAssertEqual(report.promptLayout, 2)
+        XCTAssertTrue(report.states.isEmpty)
+        XCTAssertNil(report.leaderState)
+    }
 }

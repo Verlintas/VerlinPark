@@ -1035,6 +1035,7 @@ mod tests {
             base_commit: None,
             tokens_in: 0,
             tokens_out: 0,
+            prompt_layout: 2,
             created_at: now_rfc3339(),
         };
         store.insert_session_snapshot(&session).unwrap();

@@ -108,6 +108,17 @@ impl OpenAiCompatibleProvider {
             }
         }
         messages.extend(request.messages.iter().map(openai_message));
+        // A v3 tail section (memory) is deliberately placed after the exact
+        // prior conversation. It is a small suffix miss, never a change to an
+        // earlier message. OpenAI-compatible servers accept a trailing system
+        // message; the core telemetry records this capability for the request.
+        for section in request
+            .tail_sections
+            .iter()
+            .filter(|section| section.has_text())
+        {
+            messages.push(json!({"role": "system", "content": section.text}));
+        }
 
         let mut body = json!({
             "model": request.model,
@@ -776,6 +787,33 @@ mod tests {
         assert!(body.get("cache_control").is_none());
         assert!(!body.to_string().contains("cache_control"));
         assert!(!body.to_string().contains("\"ttl\""));
+    }
+
+    #[tokio::test]
+    async fn tail_memory_is_a_trailing_system_message_after_the_conversation() {
+        let mut request = ChatRequest::new(
+            "test-model",
+            vec![
+                ChatMessage::user("first prompt"),
+                ChatMessage::assistant_tool_calls("", Vec::new()),
+                ChatMessage::user("second prompt"),
+            ],
+        );
+        request.system_sections = vec![crate::SystemSection::new("core", "CORE")];
+        request.system = Some("CORE".to_string());
+        request.tail_sections = vec![crate::SystemSection::new("tail/memory", "MEMORY BRIEF")];
+        let (_server, body) = capture_openai_body(request).await;
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], json!("system"));
+        assert_eq!(messages[0]["content"], json!("CORE"));
+        assert_eq!(messages[1]["content"], json!("first prompt"));
+        assert_eq!(messages[2]["role"], json!("assistant"));
+        assert_eq!(messages[3]["content"], json!("second prompt"));
+        assert_eq!(messages[4]["role"], json!("system"));
+        assert_eq!(messages[4]["content"], json!("MEMORY BRIEF"));
+        // Prior conversation messages are unchanged by the tail section.
+        assert!(!messages[1]["content"].as_str().unwrap().contains("MEMORY"));
+        assert!(!messages[3]["content"].as_str().unwrap().contains("MEMORY"));
     }
 
     #[tokio::test]

@@ -344,6 +344,7 @@ fn persists_cache_policy_and_records_it_in_the_manifest() {
         warm_on_resume: true,
         compact_aware: false,
         role_ttl: std::collections::BTreeMap::from([("worker".to_string(), "5m".to_string())]),
+        prompt_layout: 3,
     };
     policy = policy.normalized().unwrap();
     store.set_cache_policy(&project.id, &policy).unwrap();
@@ -379,6 +380,7 @@ fn cache_policy_survives_reopening_the_database() {
             warm_on_resume: true,
             compact_aware: false,
             role_ttl: std::collections::BTreeMap::from([("worker".to_string(), "5m".to_string())]),
+            prompt_layout: 2,
         };
         store.set_cache_policy(&project.id, &policy).unwrap();
         project.id
@@ -11862,6 +11864,8 @@ fn context_checkpoint_bundle_validation_checks_session_and_project() {
         context_checkpoints: vec![checkpoint.clone()],
         supervised_processes: Vec::new(),
         test_results: Vec::new(),
+        instruction_blobs: Vec::new(),
+        instructions: Vec::new(),
     };
     validate_session_bundle(&bundle).unwrap();
     bundle.context_checkpoints[0].project_id = "other-project".into();
@@ -12117,6 +12121,8 @@ fn importing_a_projection_only_bundle_synthesizes_checkpoint_events() {
         context_checkpoints: vec![checkpoint.clone()],
         supervised_processes: Vec::new(),
         test_results: Vec::new(),
+        instruction_blobs: Vec::new(),
+        instructions: Vec::new(),
     };
     let imported = Store::open(data.path().join("imported")).unwrap();
     imported.import_session_bundle(&bundle).unwrap();
@@ -13953,6 +13959,8 @@ fn bundle_import_preserves_supervised_process_lifecycle_rows() {
         context_checkpoints: Vec::new(),
         supervised_processes: vec![row.clone()],
         test_results: Vec::new(),
+        instruction_blobs: Vec::new(),
+        instructions: Vec::new(),
     };
     validate_session_bundle(&bundle).unwrap();
     let data = TempDir::new().unwrap();
@@ -14012,6 +14020,8 @@ fn supervised_process_bundle_validation_rejects_wrong_session() {
         context_checkpoints: Vec::new(),
         supervised_processes: vec![row],
         test_results: Vec::new(),
+        instruction_blobs: Vec::new(),
+        instructions: Vec::new(),
     };
     let error = validate_session_bundle(&bundle).unwrap_err();
     assert!(error.to_string().contains("belongs to session"), "{error}");
@@ -16069,4 +16079,238 @@ fn gui_action_retention_stats_without_a_cutoff_report_keep_forever_shape() {
     let empty = store.gui_action_retention_stats("missing", None).unwrap();
     assert_eq!(empty.total, 0);
     assert!(empty.oldest_at.is_none());
+}
+
+#[test]
+fn instruction_blobs_are_content_addressed_and_deduplicated() {
+    let (_data, store, _repo) = test_store();
+    let first = store.put_instruction_blob("role charter bytes").unwrap();
+    let second = store.put_instruction_blob("role charter bytes").unwrap();
+    assert_eq!(first.hash, second.hash);
+    assert_eq!(first.text, "role charter bytes");
+    let stored = store.get_instruction_blob(&first.hash).unwrap().unwrap();
+    assert_eq!(stored.text, first.text);
+    assert_eq!(stored.created_at, first.created_at);
+    assert!(store.delete_instruction_blob(&first.hash).unwrap());
+    assert!(store.get_instruction_blob(&first.hash).unwrap().is_none());
+}
+
+#[test]
+fn instruction_blob_size_is_hard_bounded() {
+    let (_data, store, _repo) = test_store();
+    let huge = "x".repeat(MAX_INSTRUCTION_BLOB_BYTES + 1);
+    assert!(store.put_instruction_blob(&huge).is_err());
+}
+
+#[test]
+fn instruction_state_is_ordered_and_scoped_per_agent() {
+    let (_data, store, _repo) = test_store();
+    let leader = vec![
+        SessionInstructionState {
+            session_id: "ses-1".into(),
+            key: "session/context".into(),
+            hash: "a".repeat(64),
+            ordinal: 50,
+            tail: false,
+            updated_at: "2026-11-12T00:00:00Z".into(),
+        },
+        SessionInstructionState {
+            session_id: "ses-1".into(),
+            key: "core/charter".into(),
+            hash: "b".repeat(64),
+            ordinal: 10,
+            tail: false,
+            updated_at: "2026-11-12T00:00:00Z".into(),
+        },
+    ];
+    store
+        .replace_session_instructions("ses-1", &leader)
+        .unwrap();
+    let worker = vec![SessionInstructionState {
+        session_id: "ses-1#worker-7".into(),
+        key: "run/task".into(),
+        hash: "c".repeat(64),
+        ordinal: 60,
+        tail: false,
+        updated_at: "2026-11-12T00:00:01Z".into(),
+    }];
+    store
+        .replace_session_instructions("ses-1#worker-7", &worker)
+        .unwrap();
+    let leader_rows = store.list_session_instructions("ses-1").unwrap();
+    assert_eq!(
+        leader_rows
+            .iter()
+            .map(|row| row.key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["core/charter", "session/context"]
+    );
+    let all = store.list_instruction_states_for_session("ses-1").unwrap();
+    assert_eq!(all.len(), 3);
+    assert!(all.iter().any(|row| row.session_id == "ses-1#worker-7"));
+    // Replacing a scope deletes rows that are no longer present.
+    store
+        .replace_session_instructions("ses-1", &leader[..1])
+        .unwrap();
+    let replaced = store.list_session_instructions("ses-1").unwrap();
+    assert_eq!(replaced.len(), 1);
+    assert_eq!(replaced[0].key, "session/context");
+}
+
+#[test]
+fn new_sessions_use_the_project_prompt_layout_default() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("layout"))
+        .unwrap();
+    let session = store.create_session(&project.id, "new session").unwrap();
+    assert_eq!(session.prompt_layout, 3);
+    let mut policy = store.get_cache_policy(&project.id).unwrap();
+    policy.prompt_layout = 2;
+    store.set_cache_policy(&project.id, &policy).unwrap();
+    let legacy = store.create_session(&project.id, "legacy layout").unwrap();
+    assert_eq!(legacy.prompt_layout, 2);
+    assert_eq!(
+        store
+            .get_session(&legacy.id)
+            .unwrap()
+            .unwrap()
+            .prompt_layout,
+        2
+    );
+    let event = store
+        .set_session_prompt_layout_with_event(&session.id, 2)
+        .unwrap();
+    assert_eq!(event.kind, "session.prompt_layout");
+    assert_eq!(
+        store
+            .get_session(&session.id)
+            .unwrap()
+            .unwrap()
+            .prompt_layout,
+        2
+    );
+}
+
+#[test]
+fn bundle_import_preserves_instruction_state_and_rejects_missing_blobs() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("instruction-bundle"))
+        .unwrap();
+    let source = store
+        .create_session(&project.id, "bundle instructions")
+        .unwrap();
+    let mut session = source.clone();
+    session.id = "ses-instruction-bundle".into();
+    let blob = store.put_instruction_blob("charter").unwrap();
+    let bundle = SessionBundle {
+        version: 1,
+        exported_at: now_rfc3339(),
+        project: project.clone(),
+        session: session.clone(),
+        events: Vec::new(),
+        agents: Vec::new(),
+        messages: Vec::new(),
+        team_plan: None,
+        todos: Vec::new(),
+        approvals: Vec::new(),
+        merge_queue: Vec::new(),
+        agent_messages: Vec::new(),
+        artifacts: Vec::new(),
+        usage: Vec::new(),
+        memories: Vec::new(),
+        memory_conflicts: Vec::new(),
+        questions: Vec::new(),
+        tasks: Vec::new(),
+        steering: Vec::new(),
+        continuations: Vec::new(),
+        recoveries: Vec::new(),
+        programs: Vec::new(),
+        program_milestones: Vec::new(),
+        program_events: Vec::new(),
+        session_runs: Vec::new(),
+        run_steps: Vec::new(),
+        run_checkpoints: Vec::new(),
+        context_checkpoints: Vec::new(),
+        supervised_processes: Vec::new(),
+        test_results: Vec::new(),
+        instruction_blobs: vec![blob.clone()],
+        instructions: vec![SessionInstructionState {
+            session_id: session.id.clone(),
+            key: "core/charter".into(),
+            hash: blob.hash.clone(),
+            ordinal: 10,
+            tail: false,
+            updated_at: now_rfc3339(),
+        }],
+    };
+    store.import_session_bundle(&bundle).unwrap();
+    assert_eq!(
+        store.list_session_instructions(&session.id).unwrap().len(),
+        1
+    );
+    assert_eq!(
+        store
+            .get_instruction_blob(&blob.hash)
+            .unwrap()
+            .unwrap()
+            .text,
+        "charter"
+    );
+
+    let mut missing = bundle.clone();
+    missing.session.id = "ses-missing-blob".into();
+    missing.instructions[0].session_id = "ses-missing-blob".into();
+    missing.instructions[0].hash = "d".repeat(64);
+    missing.instruction_blobs.clear();
+    assert!(store.import_session_bundle(&missing).is_err());
+}
+
+#[test]
+fn bundle_import_rejects_a_corrupt_instruction_blob() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("corrupt-blob"))
+        .unwrap();
+    let session = store.create_session(&project.id, "corrupt blob").unwrap();
+    let bundle = SessionBundle {
+        version: 1,
+        exported_at: now_rfc3339(),
+        project,
+        session,
+        events: Vec::new(),
+        agents: Vec::new(),
+        messages: Vec::new(),
+        team_plan: None,
+        todos: Vec::new(),
+        approvals: Vec::new(),
+        merge_queue: Vec::new(),
+        agent_messages: Vec::new(),
+        artifacts: Vec::new(),
+        usage: Vec::new(),
+        memories: Vec::new(),
+        memory_conflicts: Vec::new(),
+        questions: Vec::new(),
+        tasks: Vec::new(),
+        steering: Vec::new(),
+        continuations: Vec::new(),
+        recoveries: Vec::new(),
+        programs: Vec::new(),
+        program_milestones: Vec::new(),
+        program_events: Vec::new(),
+        session_runs: Vec::new(),
+        run_steps: Vec::new(),
+        run_checkpoints: Vec::new(),
+        context_checkpoints: Vec::new(),
+        supervised_processes: Vec::new(),
+        test_results: Vec::new(),
+        instruction_blobs: vec![InstructionBlob {
+            hash: "0".repeat(64),
+            text: "not the hash".into(),
+            created_at: now_rfc3339(),
+        }],
+        instructions: Vec::new(),
+    };
+    assert!(store.import_session_bundle(&bundle).is_err());
 }

@@ -10743,6 +10743,10 @@ async fn stable_system_prefix_precedes_run_context_and_is_hashed() {
         .create_session(project.id.clone(), "cache the prefix".into(), None)
         .await
         .unwrap();
+    engine
+        .set_session_prompt_layout(&session.id, 2)
+        .await
+        .unwrap();
     service
         .start(&session.id, "cache the prefix")
         .await
@@ -10822,10 +10826,18 @@ async fn stable_prompt_prefix_is_shared_across_sessions() {
         .create_session(project.id.clone(), "first session".into(), None)
         .await
         .unwrap();
+    engine
+        .set_session_prompt_layout(&first.id, 2)
+        .await
+        .unwrap();
     service.start(&first.id, "first session").await.unwrap();
     let _ = wait_until_idle(&engine, &first).await;
     let second = engine
         .create_session(project.id.clone(), "second session".into(), None)
+        .await
+        .unwrap();
+    engine
+        .set_session_prompt_layout(&second.id, 2)
         .await
         .unwrap();
     service.start(&second.id, "second session").await.unwrap();
@@ -10922,6 +10934,10 @@ async fn prompt_sections_keep_core_project_and_volatile_boundaries() {
         .unwrap();
     let session = engine
         .create_session(project.id.clone(), "section boundaries".into(), None)
+        .await
+        .unwrap();
+    engine
+        .set_session_prompt_layout(&session.id, 2)
         .await
         .unwrap();
     engine
@@ -11361,6 +11377,10 @@ async fn cache_warm_makes_one_explicit_stable_section_call_and_records_usage() {
         .await
         .unwrap();
     engine
+        .set_session_prompt_layout(&session.id, 2)
+        .await
+        .unwrap();
+    engine
         .create_leader_agent(&session.id, "test")
         .await
         .unwrap();
@@ -11492,6 +11512,10 @@ async fn warm_on_resume_is_opt_in_and_adds_one_stable_section_call() {
     let config = service.config.read().unwrap().as_ref().unwrap().clone();
     let session = engine
         .create_session(project.id.clone(), "resume warm".into(), None)
+        .await
+        .unwrap();
+    engine
+        .set_session_prompt_layout(&session.id, 2)
         .await
         .unwrap();
     engine
@@ -19949,4 +19973,713 @@ fn test_context() -> ToolContext {
         process_supervisor: None,
         test_cache: None,
     }
+}
+
+fn request_head_text(request: &ChatRequest) -> String {
+    request
+        .system_sections
+        .iter()
+        .map(|section| format!("{}:{}", section.kind, section.text))
+        .collect::<Vec<_>>()
+        .join("\u{1e}")
+}
+
+fn request_tail_text(request: &ChatRequest) -> String {
+    request
+        .tail_sections
+        .iter()
+        .map(|section| format!("{}:{}", section.kind, section.text))
+        .collect::<Vec<_>>()
+        .join("\u{1e}")
+}
+
+#[tokio::test]
+async fn v3_head_sections_are_byte_identical_across_follow_up_prompts() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::TextDelta("first answer".into()),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("second answer".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "stable session goal".into(), None)
+        .await
+        .unwrap();
+    assert_eq!(session.prompt_layout, 3);
+    service.start(&session.id, "first prompt").await.unwrap();
+    wait_until_idle(&engine, &session).await;
+    service.start(&session.id, "second prompt").await.unwrap();
+    wait_until_idle(&engine, &session).await;
+
+    let captured = requests.lock().unwrap().clone();
+    assert_eq!(captured.len(), 2);
+    let first = &captured[0];
+    let second = &captured[1];
+    assert_eq!(request_head_text(first), request_head_text(second));
+    assert_eq!(request_tail_text(first), "");
+    assert_eq!(request_tail_text(second), "");
+    for request in [first, second] {
+        let head = request_head_text(request);
+        assert!(head.contains("Session goal: 'stable session goal'"));
+        assert!(!head.contains("Objective: first prompt"));
+        assert!(!head.contains("Objective: second prompt"));
+        assert!(!head.contains("first prompt"));
+        assert!(!head.contains("second prompt"));
+        assert!(!head.contains("Task objective"));
+    }
+    assert_eq!(first.messages.last().unwrap().content, "first prompt");
+    assert_eq!(second.messages.last().unwrap().content, "second prompt");
+    assert!(
+        second
+            .messages
+            .iter()
+            .any(|message| message.content == "first prompt")
+    );
+    assert!(
+        second
+            .messages
+            .iter()
+            .any(|message| message.content == "first answer")
+    );
+
+    let prefixes = engine
+        .recent_events_of_kind(&session.id, "context.prompt_prefix", 10)
+        .await
+        .unwrap();
+    assert_eq!(prefixes.len(), 2);
+    let first_prefix = &prefixes[0].payload;
+    let second_prefix = &prefixes[1].payload;
+    assert_eq!(first_prefix["prompt_layout"], 3);
+    assert_eq!(first_prefix["prefix_hash"], second_prefix["prefix_hash"]);
+    assert_eq!(
+        first_prefix["stable_prefix_hash"],
+        second_prefix["stable_prefix_hash"]
+    );
+    let head_keys = first_prefix["head_sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|section| section["key"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(head_keys[0], "core/charter");
+    assert!(head_keys.contains(&"session/context".to_string()));
+    assert!(!head_keys.contains(&"run/task".to_string()));
+    assert!(first_prefix["tail_sections"].as_array().unwrap().is_empty());
+    assert!(!first_prefix.to_string().contains("first prompt"));
+    assert!(!first_prefix.to_string().contains("stable session goal"));
+
+    let instructions = engine
+        .session_instructions(&session.id, None)
+        .await
+        .unwrap();
+    assert_eq!(instructions.prompt_layout, 3);
+    assert_eq!(instructions.states.len(), 1);
+    let leader = &instructions.states[0];
+    assert_eq!(leader.role.as_deref(), Some("leader"));
+    assert_eq!(leader.sections.len(), head_keys.len());
+    assert!(leader.sections.iter().all(|section| !section.tail));
+    assert!(leader.sections.iter().all(|section| section.available));
+    // The RPC exposes hashes and sizes only.
+    let encoded = serde_json::to_string(&instructions).unwrap();
+    assert!(!encoded.contains("stable session goal"));
+    assert!(!encoded.contains("You are the Leader"));
+}
+
+#[tokio::test]
+async fn v3_memory_is_tail_only_and_never_moves_the_head_prefix() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::TextDelta("before memory".into()),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("after memory".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "memory isolation".into(), None)
+        .await
+        .unwrap();
+    service.start(&session.id, "first run").await.unwrap();
+    wait_until_idle(&engine, &session).await;
+    engine
+        .create_memory_as(
+            &session.id,
+            "leader",
+            "Leader",
+            "fact",
+            "Memory brief marker",
+            "The project uses the internal artifact registry for release notes.",
+            vec!["release".into()],
+        )
+        .await
+        .unwrap();
+    service.start(&session.id, "second run").await.unwrap();
+    wait_until_idle(&engine, &session).await;
+
+    let captured = requests.lock().unwrap().clone();
+    assert_eq!(captured.len(), 2);
+    let first = &captured[0];
+    let second = &captured[1];
+    assert_eq!(request_head_text(first), request_head_text(second));
+    assert_eq!(request_tail_text(first), "");
+    assert!(request_tail_text(second).contains("tail/memory:"));
+    assert!(request_tail_text(second).contains("internal artifact registry"));
+    assert!(!request_head_text(second).contains("internal artifact registry"));
+
+    let prefixes = engine
+        .recent_events_of_kind(&session.id, "context.prompt_prefix", 10)
+        .await
+        .unwrap();
+    let first_prefix = &prefixes[0].payload;
+    let second_prefix = &prefixes[1].payload;
+    assert_eq!(first_prefix["prefix_hash"], second_prefix["prefix_hash"]);
+    assert_eq!(
+        first_prefix["head_sections"],
+        second_prefix["head_sections"]
+    );
+    assert_ne!(
+        first_prefix["volatile_hash"],
+        second_prefix["volatile_hash"]
+    );
+    assert_eq!(
+        second_prefix["tail_sections"][0]["key"].as_str(),
+        Some("tail/memory")
+    );
+    assert!(first_prefix["tail_sections"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn legacy_v2_sessions_keep_the_combined_system_prompt() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("legacy answer".into()),
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "legacy layout".into(), None)
+        .await
+        .unwrap();
+    engine
+        .set_session_prompt_layout(&session.id, 2)
+        .await
+        .unwrap();
+    service.start(&session.id, "legacy prompt").await.unwrap();
+    wait_until_idle(&engine, &session).await;
+
+    let captured = requests.lock().unwrap().clone();
+    assert_eq!(captured.len(), 1);
+    let request = &captured[0];
+    assert!(
+        request
+            .system_sections
+            .iter()
+            .any(|section| section.kind == "volatile"
+                && section.text.contains("Objective: legacy prompt"))
+    );
+    assert!(
+        request
+            .system_sections
+            .iter()
+            .all(|section| section.kind != "instruction")
+    );
+    assert!(
+        engine
+            .store()
+            .list_session_instructions(&session.id)
+            .unwrap()
+            .is_empty()
+    );
+    let prefix = engine
+        .recent_events_of_kind(&session.id, "context.prompt_prefix", 1)
+        .await
+        .unwrap();
+    assert_eq!(prefix[0].payload["prompt_layout"], 2);
+}
+
+#[tokio::test]
+async fn instruction_state_replays_and_repairs_from_events() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("done".into()),
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "replay instructions".into(), None)
+        .await
+        .unwrap();
+    service.start(&session.id, "replay prompt").await.unwrap();
+    wait_until_idle(&engine, &session).await;
+    let before = engine
+        .store()
+        .list_session_instructions(&session.id)
+        .unwrap();
+    assert!(!before.is_empty());
+    let report = engine.replay_session(&session.id).await.unwrap();
+    assert!(report.consistent, "{:?}", report.mismatches);
+
+    // Simulate a projection loss; replay must detect drift and repair it from
+    // the `context.instruction` event without regenerating prompt text.
+    let instruction_events = engine
+        .recent_events_of_kind(&session.id, "context.instruction", 10)
+        .await
+        .unwrap();
+    assert!(!instruction_events.is_empty());
+    assert!(
+        !instruction_events[0].payload["sections"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "instruction state event must carry the ordered sections: {}",
+        instruction_events[0].payload
+    );
+    let all_events = engine
+        .list_events(session.id.clone(), 0, 1_000)
+        .await
+        .unwrap();
+    assert!(
+        crate::instruction::states_from_events(&all_events).is_some(),
+        "instruction event payload must replay"
+    );
+    engine
+        .store()
+        .replace_session_instructions(&session.id, &[])
+        .unwrap();
+    assert!(
+        engine
+            .store()
+            .list_session_instructions(&session.id)
+            .unwrap()
+            .is_empty()
+    );
+    let drift = engine.replay_session(&session.id).await.unwrap();
+    assert!(!drift.consistent);
+    assert!(
+        drift
+            .mismatches
+            .iter()
+            .any(|mismatch| mismatch.starts_with("instruction state:"))
+    );
+    engine.repair_session(&session.id).await.unwrap();
+    let after = engine
+        .store()
+        .list_session_instructions(&session.id)
+        .unwrap();
+    assert_eq!(before.len(), after.len());
+    assert_eq!(
+        before.iter().map(|row| &row.hash).collect::<Vec<_>>(),
+        after.iter().map(|row| &row.hash).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn v3_session_context_uses_the_session_goal_and_run_task_is_task_scoped() {
+    let project = vp_protocol::types::Project {
+        id: "prj-1".into(),
+        name: "Demo".into(),
+        root: "/tmp/demo".into(),
+        default_branch: "main".into(),
+        created_at: "2026-11-12T00:00:00Z".into(),
+    };
+    let session = vp_protocol::types::Session {
+        id: "ses-1".into(),
+        project_id: project.id.clone(),
+        goal: "ship the stable prefix".into(),
+        status: "idle".into(),
+        priority: 0,
+        worktree: Some("/tmp/demo-wt".into()),
+        branch: Some("session/demo".into()),
+        token_budget: None,
+        cost_budget_usd: None,
+        time_budget_secs: None,
+        unlimited: false,
+        cost_spent_usd: 0.0,
+        base_commit: None,
+        tokens_in: 0,
+        tokens_out: 0,
+        prompt_layout: 3,
+        created_at: "2026-11-12T00:00:00Z".into(),
+    };
+    let leader = help_spec(AgentRole::Leader, AgentProfile::Generic);
+    let leader_parts = role_prompt_parts(
+        AgentRole::Leader,
+        &project,
+        &session,
+        &leader,
+        "current follow-up",
+    );
+    assert!(
+        leader_parts
+            .session_context
+            .contains("Session goal: 'ship the stable prefix'")
+    );
+    assert!(!leader_parts.session_context.contains("current follow-up"));
+    assert!(leader_parts.run_task.is_none());
+
+    let worker = help_spec(AgentRole::Worker, AgentProfile::Coding);
+    let worker_parts = role_prompt_parts(
+        AgentRole::Worker,
+        &project,
+        &session,
+        &worker,
+        "fix the parser",
+    );
+    assert!(
+        worker_parts
+            .session_context
+            .contains("ship the stable prefix")
+    );
+    assert!(!worker_parts.session_context.contains("fix the parser"));
+    assert_eq!(
+        worker_parts.run_task.as_deref(),
+        Some(
+            "Task objective (stable for this run; do not treat it as a project convention):\nfix the parser"
+        )
+    );
+
+    let manager = help_spec(AgentRole::Manager, AgentProfile::Generic);
+    let manager_parts = role_prompt_parts(
+        AgentRole::Manager,
+        &project,
+        &session,
+        &manager,
+        "department goal",
+    );
+    assert!(manager_parts.run_task.is_none());
+}
+
+#[tokio::test]
+async fn missing_instruction_blob_is_rebuilt_and_diagnosed_without_moving_head_bytes() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![StreamEvent::TextDelta("first".into()), StreamEvent::Done],
+            vec![StreamEvent::TextDelta("second".into()), StreamEvent::Done],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "blob repair".into(), None)
+        .await
+        .unwrap();
+    service.start(&session.id, "first run").await.unwrap();
+    wait_until_idle(&engine, &session).await;
+    let rows = engine
+        .store()
+        .list_session_instructions(&session.id)
+        .unwrap();
+    let charter = rows
+        .iter()
+        .find(|row| row.key == "core/charter")
+        .expect("leader core charter")
+        .clone();
+    assert!(
+        engine
+            .store()
+            .delete_instruction_blob(&charter.hash)
+            .unwrap()
+    );
+    service.start(&session.id, "second run").await.unwrap();
+    wait_until_idle(&engine, &session).await;
+
+    let rebuilt = engine
+        .recent_events_of_kind(&session.id, "context.instruction.rebuilt", 10)
+        .await
+        .unwrap();
+    assert_eq!(rebuilt.len(), 1);
+    assert_eq!(rebuilt[0].payload["key"], "core/charter");
+    assert_eq!(rebuilt[0].payload["reason"], "missing_blob");
+    assert_eq!(rebuilt[0].payload["old_hash"], charter.hash);
+    assert_eq!(rebuilt[0].payload["new_hash"], charter.hash);
+    let restored = engine
+        .store()
+        .get_instruction_blob(&charter.hash)
+        .unwrap()
+        .unwrap();
+    assert!(restored.text.contains("Role charter:"));
+
+    let captured = requests.lock().unwrap().clone();
+    assert_eq!(captured.len(), 2);
+    assert_eq!(
+        request_head_text(&captured[0]),
+        request_head_text(&captured[1])
+    );
+}
+
+#[tokio::test]
+async fn v3_warm_sends_head_only_and_preserves_the_verified_tail_state() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![StreamEvent::TextDelta("run".into()), StreamEvent::Done],
+            vec![StreamEvent::TextDelta("warm".into()), StreamEvent::Done],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "warm v3".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_memory_as(
+            &session.id,
+            "leader",
+            "Leader",
+            "fact",
+            "Warm memory marker",
+            "Warm must not send this memory in the stable prefix.",
+            vec![],
+        )
+        .await
+        .unwrap();
+    service.start(&session.id, "first run").await.unwrap();
+    wait_until_idle(&engine, &session).await;
+    let before = engine
+        .store()
+        .list_session_instructions(&session.id)
+        .unwrap();
+    assert!(before.iter().any(|row| row.tail));
+
+    let warm = service.warm_cache_now(&session.id, None).await.unwrap();
+    assert!(warm.warmed);
+    {
+        let captured = requests.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert!(captured[1].tail_sections.is_empty());
+        assert!(!request_head_text(&captured[1]).contains("Warm must not send"));
+        assert!(
+            !captured[1]
+                .messages
+                .iter()
+                .any(|message| { message.content.contains("Warm must not send this memory") })
+        );
+    }
+    let after = engine
+        .store()
+        .list_session_instructions(&session.id)
+        .unwrap();
+    assert!(after.iter().any(|row| row.tail));
+    assert_eq!(
+        before.iter().map(|row| &row.hash).collect::<Vec<_>>(),
+        after.iter().map(|row| &row.hash).collect::<Vec<_>>()
+    );
+    let events = engine
+        .recent_events_of_kind(&session.id, "context.instruction", 20)
+        .await
+        .unwrap();
+    let latest = events.last().unwrap();
+    let keys = latest.payload["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|section| section["key"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(keys.contains(&"tail/memory"));
+}
+
+#[test]
+fn v3_task_agents_receive_run_task_and_isolated_instruction_state() {
+    run_with_large_stack(|| async {
+        let dir = TempDir::new().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider: Arc<dyn Provider> = Arc::new(RecordingProvider {
+            requests: requests.clone(),
+            responses: Mutex::new(VecDeque::from(vec![
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_manager".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::json!({
+                            "role": "manager",
+                            "title": "Discovery",
+                            "objective": "handle the department"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_worker".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::json!({
+                            "role": "worker",
+                            "objective": "inspect the readme"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_labour".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::json!({
+                            "role": "labour",
+                            "objective": "read the readme"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_read".into(),
+                        name: "read_file".into(),
+                        arguments: r#"{"path":"README.md"}"#.into(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("labour done".into()),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("worker done".into()),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("manager done".into()),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("leader done".into()),
+                    StreamEvent::Done,
+                ],
+            ])),
+        });
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        let session = engine
+            .create_session(project.id, "scoped delegation".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+        service
+            .start(&session.id, "scoped delegation")
+            .await
+            .unwrap();
+        wait_until_idle(&engine, &session).await;
+
+        let captured = requests.lock().unwrap().clone();
+        assert!(captured.len() >= 4);
+        let role_of = |request: &ChatRequest| {
+            request
+                .system_sections
+                .iter()
+                .find_map(|section| {
+                    section
+                        .text
+                        .lines()
+                        .find(|line| line.starts_with("Agent: "))
+                        .map(str::to_string)
+                })
+                .unwrap_or_default()
+        };
+        let leader_request = captured
+            .iter()
+            .find(|request| role_of(request).ends_with("(leader)"))
+            .expect("leader request");
+        assert!(
+            !leader_request
+                .system_sections
+                .iter()
+                .any(|section| section.kind == "task")
+        );
+        assert!(
+            !leader_request
+                .system_sections
+                .iter()
+                .any(|section| section.text.contains("Task objective"))
+        );
+        for role in ["manager", "worker", "labour"] {
+            let request = captured
+                .iter()
+                .find(|request| role_of(request).ends_with(&format!("({role})")))
+                .unwrap_or_else(|| panic!("{role} request"));
+            let task = request
+                .system_sections
+                .iter()
+                .find(|section| section.kind == "task");
+            if role == "manager" {
+                assert!(task.is_none(), "Manager objective must stay volatile");
+                assert!(!request_head_text(request).contains("Task objective"));
+            } else {
+                let task = task.unwrap_or_else(|| panic!("{role} run/task section"));
+                assert!(task.text.contains("Task objective"));
+                assert!(task.text.contains(if role == "worker" {
+                    "inspect the readme"
+                } else {
+                    "read the readme"
+                }));
+            }
+            assert!(request_head_text(request).contains("Session goal: 'scoped delegation'"));
+        }
+
+        let agents = engine.list_agents(&session.id).await.unwrap();
+        let worker = agents
+            .iter()
+            .find(|agent| agent.role == "worker")
+            .expect("worker agent");
+        let worker_scope = format!("{}#{}", session.id, worker.id);
+        let worker_state = engine
+            .store()
+            .list_session_instructions(&worker_scope)
+            .unwrap();
+        assert!(worker_state.iter().any(|row| row.key == "run/task"));
+        let leader_state = engine
+            .store()
+            .list_session_instructions(&session.id)
+            .unwrap();
+        assert!(!leader_state.iter().any(|row| row.key == "run/task"));
+        let report = engine
+            .session_instructions(&session.id, Some(&worker.id))
+            .await
+            .unwrap();
+        assert_eq!(report.states.len(), 1);
+        assert_eq!(
+            report.states[0].agent_id.as_deref(),
+            Some(worker.id.as_str())
+        );
+        assert_eq!(report.states[0].role.as_deref(), Some("worker"));
+        assert!(
+            report.states[0]
+                .sections
+                .iter()
+                .any(|section| section.key == "run/task" && !section.tail)
+        );
+    });
 }

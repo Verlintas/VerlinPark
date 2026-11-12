@@ -14,27 +14,81 @@
 //! the agent loop and protocol projections can share one deterministic model.
 
 use serde_json::Value;
-use vp_protocol::types::{CachePolicy, SessionCacheCall};
+use vp_protocol::types::{CachePolicy, PromptSectionRef, SessionCacheCall};
 use vp_providers::{
     CacheBreakpointPlan, CacheTtl, ChatMessage, PromptCacheConfig, SystemSection,
     plan_cache_breakpoints,
 };
 
+use crate::instruction::{
+    InstructionSectionKey, MaterializedInstructions, PROMPT_LAYOUT_V2, PROMPT_LAYOUT_V3,
+    normalize_prompt_layout,
+};
 use crate::sha256_hex;
 
 pub const PROMPT_SECTION_VERSION: u32 = 2;
+/// Prompt identity version emitted by the v3 instruction layout. It is
+/// deliberately distinct from the wire `context.prompt_prefix.version` field
+/// for backwards compatibility with older clients.
+pub const PROMPT_SECTION_VERSION_V3: u32 = 3;
 
 pub const CORE_SECTION: &str = "core";
 pub const PROJECT_SECTION: &str = "project";
 pub const VOLATILE_SECTION: &str = "volatile";
+pub const TAIL_MEMORY_SECTION: &str = "tail/memory";
+
+/// One ordered head/tail section with its exact text. The key is the stable
+/// instruction key (`core/charter`, `run/task`, ...); the text is never copied
+/// into telemetry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptHeading {
+    pub key: String,
+    pub text: String,
+    pub ordinal: u32,
+    pub tail: bool,
+}
+
+impl PromptHeading {
+    pub fn new(key: impl Into<String>, text: impl Into<String>, ordinal: u32, tail: bool) -> Self {
+        Self {
+            key: key.into(),
+            text: text.into(),
+            ordinal,
+            tail,
+        }
+    }
+}
 
 /// Deterministic system-prompt sections. `render()` is the backward-compatible
 /// combined `system` string; adapters receive the exact boundaries separately.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// Layout v2 populates only `core`, `project`, and `volatile`. Layout v3
+/// populates `head`/`tail` in deterministic ordinal order, while `core` and
+/// `project` remain joined compatibility views for older telemetry and tools.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptSections {
     pub core: String,
     pub project: String,
     pub volatile: String,
+    /// `2` (legacy combined) or `3` (ordered instruction store).
+    pub layout: u32,
+    /// Ordered head sections sent before the conversation.
+    pub head: Vec<PromptHeading>,
+    /// Ordered tail sections sent after the conversation. `tail/memory` only.
+    pub tail: Vec<PromptHeading>,
+}
+
+impl Default for PromptSections {
+    fn default() -> Self {
+        Self {
+            core: String::new(),
+            project: String::new(),
+            volatile: String::new(),
+            layout: PROMPT_LAYOUT_V2,
+            head: Vec::new(),
+            tail: Vec::new(),
+        }
+    }
 }
 
 impl PromptSections {
@@ -47,7 +101,60 @@ impl PromptSections {
             core: core.into(),
             project: project.into(),
             volatile: volatile.into(),
+            layout: PROMPT_LAYOUT_V2,
+            head: Vec::new(),
+            tail: Vec::new(),
         }
+    }
+
+    /// Build the v3 view from a materialized instruction scope. The
+    /// compatibility `core`/`project` fields are joined views; they are never
+    /// sent ahead of the ordered head sections.
+    pub fn from_materialized(materialized: &MaterializedInstructions) -> Self {
+        let head = materialized
+            .head
+            .iter()
+            .map(|section| {
+                PromptHeading::new(
+                    section.key.key(),
+                    section.text.clone(),
+                    section.ordinal,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        let tail = materialized
+            .tail
+            .iter()
+            .map(|section| {
+                PromptHeading::new(
+                    section.key.key(),
+                    section.text.clone(),
+                    section.ordinal,
+                    true,
+                )
+            })
+            .collect::<Vec<_>>();
+        let core = join_headings(
+            head.iter()
+                .filter(|heading| heading.key.starts_with("core/")),
+        );
+        let project = join_headings(
+            head.iter()
+                .filter(|heading| heading.key.starts_with("project/")),
+        );
+        Self {
+            core,
+            project,
+            volatile: String::new(),
+            layout: PROMPT_LAYOUT_V3,
+            head,
+            tail,
+        }
+    }
+
+    pub fn is_v3(&self) -> bool {
+        normalize_prompt_layout(self.layout) == PROMPT_LAYOUT_V3
     }
 
     pub fn has_core(&self) -> bool {
@@ -62,9 +169,18 @@ impl PromptSections {
         !self.volatile.is_empty()
     }
 
-    /// Combined compatibility string. Stable sections always come first; the
-    /// volatile section is never moved ahead of them.
+    pub fn has_tail(&self) -> bool {
+        self.tail.iter().any(|heading| !heading.text.is_empty())
+    }
+
+    /// Combined compatibility string. In v2 the stable sections always come
+    /// first and the volatile section is never moved ahead of them. In v3 the
+    /// head sections are joined in ordinal order; tail memory is deliberately
+    /// excluded.
     pub fn render(&self) -> String {
+        if self.is_v3() {
+            return join_headings(self.head.iter());
+        }
         let mut rendered = String::new();
         if self.has_core() {
             rendered.push_str(&self.core);
@@ -85,8 +201,13 @@ impl PromptSections {
     }
 
     /// The stable prefix marker retained for older adapters and for the
-    /// Anthropic legacy fallback. It is `core + project`, never volatile.
+    /// Anthropic legacy fallback. In v2 it is `core + project`, never volatile.
+    /// In v3 it is every ordered head section, including session/run context,
+    /// because those are stable for the scope and precede the conversation.
     pub fn stable_prefix(&self) -> String {
+        if self.is_v3() {
+            return join_headings(self.head.iter());
+        }
         let mut stable = String::new();
         if self.has_core() {
             stable.push_str(&self.core);
@@ -100,7 +221,45 @@ impl PromptSections {
         stable
     }
 
+    /// Head sections for the provider. V2 keeps its three historical section
+    /// kinds. V3 maps exact keys to breakpoint-safe provider kinds: only the
+    /// last core section and the last project section carry the explicit
+    /// `core`/`project` kind so the Anthropic four-breakpoint cap is preserved.
     pub fn provider_sections(&self) -> Vec<SystemSection> {
+        if self.is_v3() {
+            let last_core = self
+                .head
+                .iter()
+                .rposition(|heading| heading.key.starts_with("core/"));
+            let last_project = self
+                .head
+                .iter()
+                .rposition(|heading| heading.key.starts_with("project/"));
+            return self
+                .head
+                .iter()
+                .enumerate()
+                .filter(|(_, heading)| !heading.text.is_empty())
+                .map(|(index, heading)| {
+                    let kind = if Some(index) == last_project {
+                        PROJECT_SECTION
+                    } else if heading.key.starts_with("project/") {
+                        "project-stable"
+                    } else if Some(index) == last_core {
+                        CORE_SECTION
+                    } else if heading.key.starts_with("core/") {
+                        "core-stable"
+                    } else if heading.key == InstructionSectionKey::SessionContext.key() {
+                        "session"
+                    } else if heading.key == InstructionSectionKey::RunTask.key() {
+                        "task"
+                    } else {
+                        "instruction"
+                    };
+                    SystemSection::new(kind, heading.text.clone())
+                })
+                .collect();
+        }
         let mut sections = Vec::with_capacity(3);
         if self.has_core() {
             sections.push(SystemSection::new(CORE_SECTION, self.core.clone()));
@@ -114,9 +273,73 @@ impl PromptSections {
         sections
     }
 
+    /// Tail sections. V3 returns memory only; the provider adapter decides
+    /// whether it can be a trailing system message or must be a `[memory]`
+    /// user message.
+    pub fn tail_sections(&self) -> Vec<SystemSection> {
+        self.tail
+            .iter()
+            .filter(|heading| !heading.text.is_empty())
+            .map(|heading| SystemSection::new(heading.key.clone(), heading.text.clone()))
+            .collect()
+    }
+
+    pub fn section_chars(&self) -> std::collections::BTreeMap<String, u64> {
+        if self.is_v3() {
+            return self
+                .head
+                .iter()
+                .chain(self.tail.iter())
+                .map(|heading| (heading.key.clone(), heading.text.chars().count() as u64))
+                .collect();
+        }
+        let mut chars = std::collections::BTreeMap::new();
+        if !self.core.is_empty() {
+            chars.insert(CORE_SECTION.to_string(), self.core.chars().count() as u64);
+        }
+        if !self.project.is_empty() {
+            chars.insert(
+                PROJECT_SECTION.to_string(),
+                self.project.chars().count() as u64,
+            );
+        }
+        if !self.volatile.is_empty() {
+            chars.insert(
+                VOLATILE_SECTION.to_string(),
+                self.volatile.chars().count() as u64,
+            );
+        }
+        chars
+    }
+
     pub fn hashes(&self, model: &str, tools: &[vp_providers::ToolSchema]) -> PromptSectionHashes {
         PromptSectionHashes::compute(self, model, tools)
     }
+
+    /// Test-only exact bytes for one heading, used to assert byte identity and
+    /// tail isolation without exposing prompt text through telemetry.
+    #[cfg(test)]
+    pub fn exact_text(&self, key: &str) -> Option<&str> {
+        self.head
+            .iter()
+            .chain(self.tail.iter())
+            .find(|heading| heading.key == key)
+            .map(|heading| heading.text.as_str())
+    }
+}
+
+fn join_headings<'a>(headings: impl Iterator<Item = &'a PromptHeading>) -> String {
+    let mut rendered = String::new();
+    for heading in headings {
+        if heading.text.is_empty() {
+            continue;
+        }
+        if !rendered.is_empty() {
+            rendered.push_str("\n\n");
+        }
+        rendered.push_str(&heading.text);
+    }
+    rendered
 }
 
 /// Component hashes recorded on every prompt-prefix and cache event. They are
@@ -128,10 +351,21 @@ pub struct PromptSectionHashes {
     pub tools_hash: String,
     pub volatile_hash: String,
     pub stable_system_hash: String,
-    /// Hash of `(version, model, tools, core, project)`. Volatile content is
-    /// intentionally excluded so memory changes cannot invalidate the shared
-    /// prefix.
+    /// Hash of `(version, model, tools, core, project)` in v2, or the ordered
+    /// `(layout, model, tools, key/hash)` identity in v3. Volatile content and
+    /// tail memory are intentionally excluded so memory changes cannot
+    /// invalidate the shared head prefix.
     pub prefix_hash: String,
+    /// `2` or `3`; the persisted layout that produced these hashes.
+    pub prompt_layout: u32,
+    /// Hash of the exact ordered head text. In v2 this equals
+    /// `stable_system_hash`; in v3 it includes session/run context.
+    pub stable_prefix_hash: String,
+    /// Ordered head section references (key/hash/ordinal/tail=false).
+    pub head_sections: Vec<PromptSectionRef>,
+    /// Ordered tail section references (key/hash/ordinal/tail=true).
+    pub tail_sections: Vec<PromptSectionRef>,
+    pub section_chars: std::collections::BTreeMap<String, u64>,
 }
 
 impl PromptSectionHashes {
@@ -146,9 +380,71 @@ impl PromptSectionHashes {
         let tools_hash = sha256_hex(tool_bundle.as_bytes());
         let core_hash = sha256_hex(sections.core.as_bytes());
         let project_hash = sha256_hex(sections.project.as_bytes());
+        let stable_prefix = sections.stable_prefix();
+        let stable_system_hash = sha256_hex(stable_prefix.as_bytes());
+        let stable_prefix_hash = stable_system_hash.clone();
+        if sections.is_v3() {
+            let head_sections = sections
+                .head
+                .iter()
+                .filter(|heading| !heading.text.is_empty())
+                .map(|heading| {
+                    PromptSectionRef::new(
+                        heading.key.clone(),
+                        sha256_hex(heading.text.as_bytes()),
+                        heading.ordinal,
+                        false,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let tail_sections = sections
+                .tail
+                .iter()
+                .filter(|heading| !heading.text.is_empty())
+                .map(|heading| {
+                    PromptSectionRef::new(
+                        heading.key.clone(),
+                        sha256_hex(heading.text.as_bytes()),
+                        heading.ordinal,
+                        true,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let volatile_hash = v3_volatile_hash(sections);
+            let prefix_hash = prefix_hash_v3(model, &tools_hash, &head_sections);
+            return Self {
+                core_hash,
+                project_hash,
+                tools_hash,
+                volatile_hash,
+                stable_system_hash,
+                prefix_hash,
+                prompt_layout: PROMPT_LAYOUT_V3,
+                stable_prefix_hash,
+                head_sections,
+                tail_sections,
+                section_chars: sections.section_chars(),
+            };
+        }
         let volatile_hash = sha256_hex(sections.volatile.as_bytes());
-        let stable_system_hash = sha256_hex(sections.stable_prefix().as_bytes());
         let prefix_hash = prefix_hash_from_parts(model, &tools_hash, &core_hash, &project_hash);
+        let mut head_sections = Vec::new();
+        if sections.has_core() {
+            head_sections.push(PromptSectionRef::new(
+                CORE_SECTION,
+                core_hash.clone(),
+                10,
+                false,
+            ));
+        }
+        if sections.has_project() {
+            head_sections.push(PromptSectionRef::new(
+                PROJECT_SECTION,
+                project_hash.clone(),
+                20,
+                false,
+            ));
+        }
         Self {
             core_hash,
             project_hash,
@@ -156,6 +452,11 @@ impl PromptSectionHashes {
             volatile_hash,
             stable_system_hash,
             prefix_hash,
+            prompt_layout: PROMPT_LAYOUT_V2,
+            stable_prefix_hash,
+            head_sections,
+            tail_sections: Vec::new(),
+            section_chars: sections.section_chars(),
         }
     }
 
@@ -167,6 +468,11 @@ impl PromptSectionHashes {
             "volatile_hash": self.volatile_hash,
             "stable_system_hash": self.stable_system_hash,
             "prefix_hash": self.prefix_hash,
+            "prompt_layout": self.prompt_layout,
+            "stable_prefix_hash": self.stable_prefix_hash,
+            "head_sections": self.head_sections,
+            "tail_sections": self.tail_sections,
+            "section_chars": self.section_chars,
         })
     }
 
@@ -196,6 +502,46 @@ pub fn prefix_hash_from_parts(
         format!("{PROMPT_SECTION_VERSION}\n{model}\n{tools_hash}\n{core_hash}\n{project_hash}")
             .as_bytes(),
     )
+}
+
+/// Ordered v3 prefix identity. The key name and ordinal travel with each hash
+/// so a section reorder or key rename cannot accidentally reuse a provider
+/// cache entry that represents different bytes.
+pub fn prefix_hash_v3(model: &str, tools_hash: &str, head_sections: &[PromptSectionRef]) -> String {
+    let mut material = format!("{PROMPT_SECTION_VERSION_V3}\n{model}\n{tools_hash}\n");
+    for section in head_sections {
+        material.push_str(&section.key);
+        material.push('\u{1f}');
+        material.push_str(&section.ordinal.to_string());
+        material.push('\u{1f}');
+        material.push_str(&section.hash);
+        material.push('\u{1e}');
+    }
+    sha256_hex(material.as_bytes())
+}
+
+/// Volatile identity for v3: session/run head content plus tail memory. It
+/// changes when a task or memory update changes, without changing the head
+/// prefix hash.
+fn v3_volatile_hash(sections: &PromptSections) -> String {
+    let mut material = String::new();
+    for heading in sections
+        .head
+        .iter()
+        .filter(|heading| matches!(heading.key.as_str(), "session/context" | "run/task"))
+    {
+        material.push_str(&heading.key);
+        material.push('\u{1f}');
+        material.push_str(&sha256_hex(heading.text.as_bytes()));
+        material.push('\u{1f}');
+    }
+    for heading in &sections.tail {
+        material.push_str(&heading.key);
+        material.push('\u{1f}');
+        material.push_str(&sha256_hex(heading.text.as_bytes()));
+        material.push('\u{1f}');
+    }
+    sha256_hex(material.as_bytes())
 }
 
 /// Map a project policy and role to the provider request policy.
@@ -1075,5 +1421,166 @@ mod tests {
             assert_eq!(CacheMissReason::parse(reason.as_str()), Some(reason));
         }
         assert_eq!(CacheMissReason::parse("provider_said_no"), None);
+    }
+}
+
+#[cfg(test)]
+mod v3_tests {
+    use super::*;
+    use crate::instruction::{
+        InstructionCandidate, InstructionSectionKey, PROMPT_LAYOUT_V3, preview,
+    };
+    use vp_providers::ToolSchema;
+
+    fn tool(name: &str) -> ToolSchema {
+        ToolSchema {
+            name: name.to_string(),
+            description: format!("{name} tool"),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    fn v3_sections(memory: &str) -> PromptSections {
+        let candidates = vec![
+            InstructionCandidate::new(InstructionSectionKey::CoreCharter, "charter bytes"),
+            InstructionCandidate::new(InstructionSectionKey::CoreRecipes, "recipe bytes"),
+            InstructionCandidate::new(InstructionSectionKey::ProjectSources, "source bytes"),
+            InstructionCandidate::new(InstructionSectionKey::ProjectSkills, "skill bytes"),
+            InstructionCandidate::new(InstructionSectionKey::SessionContext, "session bytes"),
+            InstructionCandidate::new(InstructionSectionKey::RunTask, "task bytes"),
+            InstructionCandidate::new(InstructionSectionKey::TailMemory, memory),
+        ];
+        let materialized = preview("ses-1", &candidates, true).unwrap();
+        PromptSections::from_materialized(&materialized)
+    }
+
+    #[test]
+    fn v3_renders_head_only_and_keeps_tail_out_of_the_prefix() {
+        let sections = v3_sections("memory bytes");
+        assert!(sections.is_v3());
+        assert_eq!(sections.layout, PROMPT_LAYOUT_V3);
+        assert!(sections.render().contains("charter bytes"));
+        assert!(sections.render().contains("task bytes"));
+        assert!(!sections.render().contains("memory bytes"));
+        assert_eq!(sections.stable_prefix(), sections.render());
+        assert_eq!(sections.tail_sections().len(), 1);
+        assert_eq!(sections.tail_sections()[0].kind, "tail/memory");
+        assert_eq!(sections.tail_sections()[0].text, "memory bytes");
+    }
+
+    #[test]
+    fn v3_hashing_excludes_memory_and_records_ordered_sections() {
+        let tools = vec![tool("read_file")];
+        let first = v3_sections("memory one").hashes("model", &tools);
+        let second = v3_sections("memory two").hashes("model", &tools);
+        assert_eq!(first.prompt_layout, 3);
+        assert_eq!(first.prefix_hash, second.prefix_hash);
+        assert_eq!(first.stable_prefix_hash, second.stable_prefix_hash);
+        assert_eq!(first.head_sections, second.head_sections);
+        assert_eq!(first.head_sections.len(), 6);
+        assert_eq!(first.tail_sections.len(), 1);
+        assert_eq!(first.tail_sections[0].key, "tail/memory");
+        assert_ne!(first.volatile_hash, second.volatile_hash);
+        assert_eq!(first.section_chars.get("core/charter"), Some(&13));
+        assert_eq!(first.section_chars.get("tail/memory"), Some(&10));
+        let keys = first
+            .head_sections
+            .iter()
+            .map(|section| section.key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec![
+                "core/charter",
+                "core/recipes",
+                "project/sources",
+                "project/skills",
+                "session/context",
+                "run/task",
+            ]
+        );
+        assert!(first.head_sections.iter().all(|section| !section.tail));
+        assert!(first.tail_sections.iter().all(|section| section.tail));
+    }
+
+    #[test]
+    fn v3_project_change_moves_the_prefix_and_a_prompt_does_not() {
+        let tools = vec![tool("read_file")];
+        let base = v3_sections("memory");
+        let mut changed_project = v3_sections("memory");
+        changed_project.head[2].text = "different source bytes".to_string();
+        let base_hash = base.hashes("model", &tools);
+        let project_hash = changed_project.hashes("model", &tools);
+        assert_ne!(base_hash.prefix_hash, project_hash.prefix_hash);
+        assert_eq!(base_hash.head_sections[0], project_hash.head_sections[0]);
+
+        // A user prompt is not represented in PromptSections at all; adding a
+        // user message cannot change the head hash.
+        let messages_before = vec![ChatMessage::user("first prompt")];
+        let messages_after = vec![
+            ChatMessage::user("first prompt"),
+            ChatMessage::assistant_tool_calls("", Vec::new()),
+            ChatMessage::user("second prompt"),
+        ];
+        assert_eq!(
+            conversation_generation(&base_hash.prefix_hash, &messages_before),
+            conversation_generation(&base_hash.prefix_hash, &messages_before)
+        );
+        assert_ne!(
+            conversation_generation(&base_hash.prefix_hash, &messages_before),
+            conversation_generation(&base_hash.prefix_hash, &messages_after)
+        );
+        assert_eq!(
+            base_hash.prefix_hash,
+            base.hashes("model", &tools).prefix_hash
+        );
+    }
+
+    #[test]
+    fn v3_provider_sections_keep_one_core_and_one_project_breakpoint_kind() {
+        let sections = v3_sections("memory");
+        let provider = sections.provider_sections();
+        assert_eq!(provider.len(), 6);
+        assert_eq!(
+            provider
+                .iter()
+                .filter(|section| section.kind == "core")
+                .count(),
+            1
+        );
+        assert_eq!(
+            provider
+                .iter()
+                .filter(|section| section.kind == "project")
+                .count(),
+            1
+        );
+        assert_eq!(provider.last().unwrap().kind, "task");
+        let policy = CachePolicy::default();
+        let plan = request_cache_plan("anthropic", &sections, 12, 4, &policy, "leader");
+        assert_eq!(plan.breakpoints, 4);
+        assert!(plan.core_breakpoint);
+        assert!(plan.project_breakpoint);
+        let openai = request_cache_plan("openai-compatible", &sections, 12, 4, &policy, "leader");
+        assert_eq!(openai.breakpoints, 0);
+    }
+
+    #[test]
+    fn v2_hashing_keeps_the_legacy_prefix_identity() {
+        let sections = PromptSections::new("core", "project", "volatile");
+        let hashes = sections.hashes("model", &[tool("read_file")]);
+        assert_eq!(hashes.prompt_layout, 2);
+        assert_eq!(hashes.head_sections.len(), 2);
+        assert!(hashes.tail_sections.is_empty());
+        assert_eq!(hashes.stable_prefix_hash, hashes.stable_system_hash);
+        assert_eq!(
+            hashes.prefix_hash,
+            prefix_hash_from_parts(
+                "model",
+                &hashes.tools_hash,
+                &hashes.core_hash,
+                &hashes.project_hash
+            )
+        );
     }
 }

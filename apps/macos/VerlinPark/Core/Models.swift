@@ -2828,6 +2828,9 @@ struct Session: Codable, Identifiable, Hashable, Sendable {
     let baseCommit: String?
     let tokensIn: Int
     let tokensOut: Int
+    /// Persisted prompt layout: 2 is the legacy combined prompt, 3 is the
+    /// content-addressed instruction store. Optional for older daemons.
+    let promptLayout: Int?
     let createdAt: String
 
     enum CodingKeys: String, CodingKey {
@@ -2846,6 +2849,7 @@ struct Session: Codable, Identifiable, Hashable, Sendable {
         case baseCommit = "base_commit"
         case tokensIn = "tokens_in"
         case tokensOut = "tokens_out"
+        case promptLayout = "prompt_layout"
         case createdAt = "created_at"
     }
 
@@ -2865,6 +2869,7 @@ struct Session: Codable, Identifiable, Hashable, Sendable {
         baseCommit: String?,
         tokensIn: Int,
         tokensOut: Int,
+        promptLayout: Int? = nil,
         createdAt: String
     ) {
         self.id = id
@@ -2882,6 +2887,7 @@ struct Session: Codable, Identifiable, Hashable, Sendable {
         self.baseCommit = baseCommit
         self.tokensIn = tokensIn
         self.tokensOut = tokensOut
+        self.promptLayout = promptLayout
         self.createdAt = createdAt
     }
 
@@ -2902,6 +2908,7 @@ struct Session: Codable, Identifiable, Hashable, Sendable {
         baseCommit = try container.decodeIfPresent(String.self, forKey: .baseCommit)
         tokensIn = try container.decodeIfPresent(Int.self, forKey: .tokensIn) ?? 0
         tokensOut = try container.decodeIfPresent(Int.self, forKey: .tokensOut) ?? 0
+        promptLayout = try container.decodeIfPresent(Int.self, forKey: .promptLayout)
         createdAt = try container.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
     }
 
@@ -4001,6 +4008,130 @@ struct SessionCacheStatus: Codable, Sendable {
         lastFirstTokenMS = int("last_first_token_ms", "first_token_ms")
         recentCalls = (try? container.decode([SessionCacheCall].self, forKey: CacheKey("recent_calls"))) ?? []
         policy = try? container.decode(SessionCachePolicy.self, forKey: CacheKey("policy"))
+    }
+}
+
+/// One ordered instruction section reported by `session.instructions`.
+/// Contains no prompt text; only the content hash and metadata.
+struct SessionInstructionSection: Codable, Sendable, Identifiable, Equatable {
+    var id: String {
+        "\(ordinal)-\(key)"
+    }
+
+    let key: String
+    let hash: String
+    let ordinal: Int
+    let tail: Bool
+    let chars: Int
+    let available: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case key
+        case hash
+        case ordinal
+        case tail
+        case chars
+        case available
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        key = try container.decodeIfPresent(String.self, forKey: .key) ?? ""
+        hash = try container.decodeIfPresent(String.self, forKey: .hash) ?? ""
+        ordinal = try container.decodeIfPresent(Int.self, forKey: .ordinal) ?? 0
+        tail = try container.decodeIfPresent(Bool.self, forKey: .tail) ?? false
+        chars = try container.decodeIfPresent(Int.self, forKey: .chars) ?? 0
+        available = try container.decodeIfPresent(Bool.self, forKey: .available) ?? false
+    }
+
+    var shortHash: String {
+        String(hash.prefix(12))
+    }
+}
+
+/// One per-agent instruction scope. The Leader uses the session id; task
+/// agents use `<session>#<agent>`.
+struct SessionInstructionStateReport: Codable, Sendable, Identifiable, Equatable {
+    var id: String {
+        stateID
+    }
+
+    let stateID: String
+    let role: String?
+    let agentID: String?
+    let promptLayout: Int
+    let headHash: String
+    let tailHash: String
+    let sections: [SessionInstructionSection]
+
+    enum CodingKeys: String, CodingKey {
+        case stateID = "state_id"
+        case role
+        case agentID = "agent_id"
+        case promptLayout = "prompt_layout"
+        case headHash = "head_hash"
+        case tailHash = "tail_hash"
+        case sections
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        stateID = try container.decodeIfPresent(String.self, forKey: .stateID) ?? ""
+        role = try container.decodeIfPresent(String.self, forKey: .role)
+        agentID = try container.decodeIfPresent(String.self, forKey: .agentID)
+        promptLayout = try container.decodeIfPresent(Int.self, forKey: .promptLayout) ?? 3
+        headHash = try container.decodeIfPresent(String.self, forKey: .headHash) ?? ""
+        tailHash = try container.decodeIfPresent(String.self, forKey: .tailHash) ?? ""
+        sections = try container.decodeIfPresent([SessionInstructionSection].self, forKey: .sections) ?? []
+    }
+
+    var headSections: [SessionInstructionSection] {
+        sections.filter { !$0.tail }
+    }
+
+    var tailSections: [SessionInstructionSection] {
+        sections.filter(\.tail)
+    }
+}
+
+/// Bounded, text-free view of the content-addressed instruction store.
+struct SessionInstructionsReport: Codable, Sendable, Equatable {
+    let sessionID: String
+    let promptLayout: Int
+    let latestPrefixHash: String?
+    let latestCacheEpoch: String?
+    let latestStablePrefixHash: String?
+    let states: [SessionInstructionStateReport]
+    let lastRebuilt: Int
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case promptLayout = "prompt_layout"
+        case latestPrefixHash = "latest_prefix_hash"
+        case latestCacheEpoch = "latest_cache_epoch"
+        case latestStablePrefixHash = "latest_stable_prefix_hash"
+        case states
+        case lastRebuilt = "last_rebuilt"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = try container.decodeIfPresent(String.self, forKey: .sessionID) ?? ""
+        promptLayout = try container.decodeIfPresent(Int.self, forKey: .promptLayout) ?? 2
+        latestPrefixHash = try container.decodeIfPresent(String.self, forKey: .latestPrefixHash)
+        latestCacheEpoch = try container.decodeIfPresent(String.self, forKey: .latestCacheEpoch)
+        latestStablePrefixHash = try container.decodeIfPresent(
+            String.self,
+            forKey: .latestStablePrefixHash
+        )
+        states = try container.decodeIfPresent([SessionInstructionStateReport].self, forKey: .states) ?? []
+        lastRebuilt = try container.decodeIfPresent(Int.self, forKey: .lastRebuilt) ?? 0
+    }
+
+    var leaderState: SessionInstructionStateReport? {
+        states.first { state in
+            state.agentID == nil
+        } ?? states.first
     }
 }
 

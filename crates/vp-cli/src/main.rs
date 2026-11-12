@@ -2220,6 +2220,18 @@ enum Command {
     },
     /// Show session cache-read telemetry and the prompt-prefix generation.
     Cache { session: String },
+    /// Show the ordered content-addressed instruction sections and hashes.
+    /// Section text is never printed.
+    Instructions {
+        session: String,
+        /// Inspect one task-scoped agent state instead of every state.
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    /// Set the session prompt layout: 2 (legacy combined) or 3 (instruction
+    /// store). Existing instruction state is preserved for rollback.
+    #[command(name = "prompt-layout")]
+    PromptLayout { session: String, layout: u32 },
     /// Explicitly warm the session's stable prompt prefix and tool bundle.
     /// Audit cache telemetry for breakpoint, churn, and cost-leak patterns.
     #[command(name = "cache-audit")]
@@ -2264,6 +2276,10 @@ enum Command {
         /// Per-role TTL override, for example `worker=1h`. Repeatable.
         #[arg(long = "role-ttl", value_name = "ROLE=TTL")]
         role_ttl: Vec<String>,
+        /// Prompt layout for newly created sessions: 2 (legacy) or 3
+        /// (instruction store). Existing sessions keep their own layout.
+        #[arg(long)]
+        prompt_layout: Option<u32>,
     },
     /// Show the validated team plan.
     TeamPlan { session: String },
@@ -7234,6 +7250,25 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Cache { session } => {
             rpc(&discovery, "session.cache", json!({"session_id": session})).await?
         }
+        Command::Instructions { session, agent } => {
+            rpc(
+                &discovery,
+                "session.instructions",
+                json!({"session_id": session, "agent_id": agent}),
+            )
+            .await?
+        }
+        Command::PromptLayout { session, layout } => {
+            if !matches!(layout, 2 | 3) {
+                bail!("prompt layout must be 2 or 3, got {layout}");
+            }
+            rpc(
+                &discovery,
+                "session.prompt_layout.set",
+                json!({"session_id": session, "prompt_layout": layout}),
+            )
+            .await?
+        }
         Command::CacheAudit { session } => {
             rpc(
                 &discovery,
@@ -7274,6 +7309,7 @@ async fn run(cli: Cli) -> Result<()> {
             warm_on_resume,
             no_compact_aware,
             role_ttl,
+            prompt_layout,
         } => {
             // Read-modify-write preserves role overrides that the operator did
             // not mention instead of silently clearing them.
@@ -7299,6 +7335,15 @@ async fn run(cli: Cli) -> Result<()> {
                     Value::String(value.trim().to_string()),
                 );
             }
+            let prompt_layout = prompt_layout.unwrap_or_else(|| {
+                existing["policy"]["prompt_layout"]
+                    .as_u64()
+                    .map(|value| value as u32)
+                    .unwrap_or(3)
+            });
+            if !matches!(prompt_layout, 2 | 3) {
+                bail!("--prompt-layout must be 2 or 3, got {prompt_layout}");
+            }
             rpc(
                 &discovery,
                 "project.cache_policy.set",
@@ -7311,6 +7356,7 @@ async fn run(cli: Cli) -> Result<()> {
                         "warm_on_resume": warm_on_resume,
                         "compact_aware": !no_compact_aware,
                         "role_ttl": roles,
+                        "prompt_layout": prompt_layout,
                     }
                 }),
             )
@@ -11375,7 +11421,87 @@ fn media_transcode_lines(value: &Value) -> Option<Vec<String>> {
     Some(lines)
 }
 
+fn instruction_lines(value: &Value) -> Option<Vec<String>> {
+    value.get("prompt_layout")?;
+    let states = value.get("states")?.as_array()?;
+    let session = value
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or("session");
+    let layout = value
+        .get("prompt_layout")
+        .and_then(Value::as_u64)
+        .unwrap_or(2);
+    let prefix = value
+        .get("latest_prefix_hash")
+        .and_then(Value::as_str)
+        .map(|hash| hash.chars().take(12).collect::<String>())
+        .unwrap_or_else(|| "none".to_string());
+    let mut lines = vec![format!(
+        "instructions · {session} · layout v{layout} · prefix {prefix}… · {} state(s)",
+        states.len()
+    )];
+    if value
+        .get("last_rebuilt")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        > 0
+    {
+        lines.push(format!(
+            "rebuilt diagnostics in window: {}",
+            value
+                .get("last_rebuilt")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        ));
+    }
+    for state in states {
+        let state_id = state
+            .get("state_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let role = state
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("task-scoped");
+        lines.push(format!("  {state_id} · {role}"));
+        let Some(sections) = state.get("sections").and_then(Value::as_array) else {
+            continue;
+        };
+        for section in sections {
+            let ordinal = section.get("ordinal").and_then(Value::as_u64).unwrap_or(0);
+            let tail = section
+                .get("tail")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let key = section.get("key").and_then(Value::as_str).unwrap_or("?");
+            let hash = section
+                .get("hash")
+                .and_then(Value::as_str)
+                .map(|hash| hash.chars().take(12).collect::<String>())
+                .unwrap_or_default();
+            let chars = section.get("chars").and_then(Value::as_u64).unwrap_or(0);
+            let available = section
+                .get("available")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            lines.push(format!(
+                "    {ordinal:>3} {:<4} {key:<18} {chars:>7} chars  {hash}…{}",
+                if tail { "tail" } else { "head" },
+                if available { "" } else { "  MISSING" }
+            ));
+        }
+    }
+    Some(lines)
+}
+
 fn print_human(value: &Value) {
+    if let Some(lines) = instruction_lines(value) {
+        for line in lines {
+            println!("{line}");
+        }
+        return;
+    }
     if let Some(lines) = forge_preflight_lines(value) {
         for line in lines {
             println!("{line}");
@@ -14464,6 +14590,76 @@ mod tests {
     }
 
     #[test]
+    fn instructions_command_parses_session_and_agent() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let cli =
+                    Cli::try_parse_from(["vp", "instructions", "ses-123", "--agent", "worker-7"])
+                        .unwrap();
+                match cli.command {
+                    Command::Instructions { session, agent } => {
+                        assert_eq!(session, "ses-123");
+                        assert_eq!(agent.as_deref(), Some("worker-7"));
+                    }
+                    other => panic!("expected instructions command, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn prompt_layout_command_parses_explicit_layout() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from(["vp", "prompt-layout", "ses-123", "2"]).unwrap();
+                match cli.command {
+                    Command::PromptLayout { session, layout } => {
+                        assert_eq!(session, "ses-123");
+                        assert_eq!(layout, 2);
+                    }
+                    other => panic!("expected prompt-layout command, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn instruction_lines_render_ordered_metadata_without_text() {
+        let value = json!({
+            "session_id": "ses-1",
+            "prompt_layout": 3,
+            "latest_prefix_hash": "abcdef1234567890",
+            "last_rebuilt": 1,
+            "states": [{
+                "state_id": "ses-1",
+                "role": "leader",
+                "sections": [
+                    {"key": "core/charter", "hash": "aaaaaaaaaaaaaaaa", "ordinal": 10, "tail": false, "chars": 120, "available": true},
+                    {"key": "tail/memory", "hash": "bbbbbbbbbbbbbbbb", "ordinal": 90, "tail": true, "chars": 20, "available": false}
+                ]
+            }]
+        });
+        let lines = instruction_lines(&value).unwrap();
+        assert!(lines[0].contains("layout v3"));
+        assert!(lines[1].contains("rebuilt diagnostics"));
+        assert!(lines.iter().any(|line| line.contains("core/charter")));
+        assert!(lines.iter().any(|line| line.contains("tail")));
+        assert!(lines.iter().any(|line| line.contains("MISSING")));
+        assert!(!lines.join("\n").contains("role charter bytes"));
+    }
+
+    #[test]
+    fn instruction_lines_do_not_hijack_unrelated_states_arrays() {
+        assert!(instruction_lines(&json!({"states": []})).is_none());
+    }
+
+    #[test]
     fn cache_audit_parses_a_session() {
         std::thread::Builder::new()
             .stack_size(32 * 1024 * 1024)
@@ -14569,6 +14765,7 @@ mod tests {
                         warm_on_resume,
                         no_compact_aware,
                         role_ttl,
+                        prompt_layout,
                     } => {
                         assert_eq!(project, "prj-1");
                         assert!(disabled);
@@ -14577,6 +14774,7 @@ mod tests {
                         assert!(warm_on_resume);
                         assert!(!no_compact_aware);
                         assert_eq!(role_ttl, vec!["worker=1h".to_string()]);
+                        assert_eq!(prompt_layout, None);
                     }
                     other => panic!("expected cache-policy-set command, got {other:?}"),
                 }

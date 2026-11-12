@@ -88,35 +88,36 @@ use vp_protocol::types::{
     SessionContextParams, SessionContinuationCancelParams, SessionContinuationReclaimParams,
     SessionContinuationStatusParams, SessionContinuationsParams, SessionDeferParams,
     SessionDiffParams, SessionExportParams, SessionForkParams, SessionForkTreeParams,
-    SessionImportParams, SessionLineageParams, SessionListResult, SessionLogParams,
-    SessionMergeForkParams, SessionPauseParams, SessionPauseResult, SessionPlanResumeParams,
-    SessionPlanResumeResult, SessionPreemptParams, SessionPreemptionParams, SessionResumeParams,
-    SessionResumeResult, SessionRunCancelParams, SessionRunDetailParams, SessionRunPolicyParams,
-    SessionRunResumeParams, SessionRunsParams, SessionSkillActivationsParams, SessionStallsParams,
-    SessionSteerParams, SessionSteeringCancelParams, SessionSteeringParams, SessionTodosParams,
-    SessionTodosResult, SessionTranscriptParams, SetArtifactPolicyParams, SetCachePolicyParams,
+    SessionImportParams, SessionInstructionsParams, SessionLineageParams, SessionListResult,
+    SessionLogParams, SessionMergeForkParams, SessionPauseParams, SessionPauseResult,
+    SessionPlanResumeParams, SessionPlanResumeResult, SessionPreemptParams,
+    SessionPreemptionParams, SessionResumeParams, SessionResumeResult, SessionRunCancelParams,
+    SessionRunDetailParams, SessionRunPolicyParams, SessionRunResumeParams, SessionRunsParams,
+    SessionSkillActivationsParams, SessionStallsParams, SessionSteerParams,
+    SessionSteeringCancelParams, SessionSteeringParams, SessionTodosParams, SessionTodosResult,
+    SessionTranscriptParams, SetArtifactPolicyParams, SetCachePolicyParams,
     SetCheckpointPolicyParams, SetContextCheckpointPolicyParams, SetCriticalPathPolicyParams,
     SetIntegrationPolicyParams, SetMailboxPolicyParams, SetMemoryPolicyParams,
     SetPreemptionPolicyParams, SetProcessPolicyParams, SetProjectBudgetParams,
-    SetSessionPriorityParams, SetSessionRunPolicyParams, SetSessionUnlimitedParams,
-    SetShellPolicyParams, SetSourceCollectionParams, SetSourceEmbeddingPolicyParams,
-    SetSourceLabelsParams, SetSourceRetrievalPolicyParams, SetTaskSchedulerPolicyParams,
-    SetToolOutputPolicyParams, SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult,
-    SkillCreateParams, SkillEnabledParams, SkillIdParams, SkillImportParams, SkillListParams,
-    SkillUpdateParams, SourceActionParams, SourceCollectionsParams, SourceCreateFileParams,
-    SourceCreateNoteParams, SourceCreateUrlParams, SourceEmbeddingPolicyParams,
-    SourceEmbeddingReindexParams, SourceEmbeddingStatusParams, SourceGetParams, SourceImportParams,
-    SourceIndexRebuildParams, SourceIndexStatusParams, SourceListParams,
-    SourceRetrievalPolicyParams, SourceSearchParams, SubscribeParams, TaskActionParams,
-    TaskActionResult, TaskDispatchParams, TaskDispatchResult, TaskQueueParams,
-    TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult, TerminalCloseParams,
-    TerminalOpenParams, TerminalReadParams, TerminalResizeParams, TerminalWriteParams,
-    ToolActivityParams, ToolOutputAuditParams, ToolOutputListParams, ToolOutputPolicyParams,
-    ToolOutputPolicyResult, ToolOutputPruneParams, ToolOutputStatusParams, UpdateAcpAgentParams,
-    UpdateCheckParams, UpdateDownloadParams, UpdateMcpServerParams, UpdateModelPresetParams,
-    UpdateSourceMetadataParams, UsageLedgerParams, WorkspaceFileParams, WorkspaceGrepParams,
-    WorkspaceListParams, WorkspaceSearchParams, WorkspaceTreeParams, WorkspaceWriteParams,
-    WorktreePolicyParams,
+    SetProjectPromptLayoutParams, SetSessionPriorityParams, SetSessionPromptLayoutParams,
+    SetSessionRunPolicyParams, SetSessionUnlimitedParams, SetShellPolicyParams,
+    SetSourceCollectionParams, SetSourceEmbeddingPolicyParams, SetSourceLabelsParams,
+    SetSourceRetrievalPolicyParams, SetTaskSchedulerPolicyParams, SetToolOutputPolicyParams,
+    SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult, SkillCreateParams,
+    SkillEnabledParams, SkillIdParams, SkillImportParams, SkillListParams, SkillUpdateParams,
+    SourceActionParams, SourceCollectionsParams, SourceCreateFileParams, SourceCreateNoteParams,
+    SourceCreateUrlParams, SourceEmbeddingPolicyParams, SourceEmbeddingReindexParams,
+    SourceEmbeddingStatusParams, SourceGetParams, SourceImportParams, SourceIndexRebuildParams,
+    SourceIndexStatusParams, SourceListParams, SourceRetrievalPolicyParams, SourceSearchParams,
+    SubscribeParams, TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult,
+    TaskQueueParams, TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult,
+    TerminalCloseParams, TerminalOpenParams, TerminalReadParams, TerminalResizeParams,
+    TerminalWriteParams, ToolActivityParams, ToolOutputAuditParams, ToolOutputListParams,
+    ToolOutputPolicyParams, ToolOutputPolicyResult, ToolOutputPruneParams, ToolOutputStatusParams,
+    UpdateAcpAgentParams, UpdateCheckParams, UpdateDownloadParams, UpdateMcpServerParams,
+    UpdateModelPresetParams, UpdateSourceMetadataParams, UsageLedgerParams, WorkspaceFileParams,
+    WorkspaceGrepParams, WorkspaceListParams, WorkspaceSearchParams, WorkspaceTreeParams,
+    WorkspaceWriteParams, WorktreePolicyParams,
 };
 use vp_protocol::types::{
     ComputerLeaseInfo, ComputerLeaseListResult, ComputerLeaseReleaseParams,
@@ -2896,6 +2897,43 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 Ok(params) => match state
                     .engine
                     .set_context_checkpoint_policy(&params.project_id, &params.policy)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "session.instructions" => match parse_params::<SessionInstructionsParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .session_instructions(&params.session_id, params.agent_id.as_deref())
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.prompt_layout.set" => {
+            match parse_params::<SetSessionPromptLayoutParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .set_session_prompt_layout(&params.session_id, params.prompt_layout)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "project.prompt_layout.set" => {
+            match parse_params::<SetProjectPromptLayoutParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .set_project_prompt_layout(&params.project_id, params.prompt_layout)
                     .await
                 {
                     Ok(result) => RpcResponse::success(id, result),

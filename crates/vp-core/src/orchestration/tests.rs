@@ -59,6 +59,7 @@ fn session() -> Session {
         base_commit: None,
         tokens_in: 0,
         tokens_out: 0,
+        prompt_layout: 2,
         created_at: "2026-01-01T00:00:00Z".to_string(),
     }
 }

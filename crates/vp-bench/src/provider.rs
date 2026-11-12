@@ -872,6 +872,7 @@ mod tests {
             system: Some(system.to_string()),
             system_stable_prefix: None,
             system_sections: Vec::new(),
+            tail_sections: Vec::new(),
             cache: None,
             max_tokens: Some(128),
             temperature: Some(0.0),
