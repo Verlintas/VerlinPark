@@ -4,10 +4,15 @@ use futures_util::{StreamExt, stream};
 use serde_json::{Value, json};
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::canonical::{
+    ProviderCacheCapabilities, ProviderWire, TailSystemCapability,
+    looks_like_tail_system_rejection, openai_wire_messages,
+};
 use crate::{
-    ChatMessage, ChatRequest, EventStream, Provider, ProviderError, StreamEvent, ToolCall,
-    openai_usage, provider_client, provider_error_from_stream,
+    ChatRequest, EventStream, Provider, ProviderError, StreamEvent, ToolCall, openai_usage,
+    provider_client, provider_error_from_stream,
 };
 
 /// Adapter for OpenAI's chat completions API and compatible endpoints:
@@ -17,6 +22,11 @@ pub struct OpenAiCompatibleProvider {
     base_url: String,
     api_key: Option<String>,
     client: reqwest::Client,
+    /// Prompt-layout capability, never a routing decision. The default is the
+    /// OpenAI-compatible trailing-system form; a server that rejects it is
+    /// downgraded to the stable `[memory]` user fallback for later calls.
+    capabilities: ProviderCacheCapabilities,
+    tail_system_fallback_used: AtomicBool,
 }
 
 impl OpenAiCompatibleProvider {
@@ -30,6 +40,8 @@ impl OpenAiCompatibleProvider {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key,
             client: provider_client(),
+            capabilities: ProviderCacheCapabilities::openai_compatible(),
+            tail_system_fallback_used: AtomicBool::new(false),
         }
     }
 
@@ -37,8 +49,26 @@ impl OpenAiCompatibleProvider {
         Self::new(id, base_url, None)
     }
 
+    /// Force the tail-memory shape for a server with unusual role rules. This
+    /// is a prompt-layout capability, not model routing.
+    pub fn with_tail_system_capability(mut self, capability: TailSystemCapability) -> Self {
+        self.capabilities.tail_system = capability;
+        self
+    }
+
     fn endpoint(&self) -> String {
         format!("{}/chat/completions", self.base_url)
+    }
+
+    fn effective_capabilities(&self) -> ProviderCacheCapabilities {
+        if self.tail_system_fallback_used.load(Ordering::Relaxed) {
+            ProviderCacheCapabilities::new(
+                ProviderWire::OpenAiCompatible,
+                TailSystemCapability::Unsupported,
+            )
+        } else {
+            self.capabilities
+        }
     }
 
     async fn send_body(
@@ -66,6 +96,10 @@ impl Provider for OpenAiCompatibleProvider {
         &self.id
     }
 
+    fn cache_capabilities(&self) -> ProviderCacheCapabilities {
+        self.effective_capabilities()
+    }
+
     async fn stream_chat(&self, request: ChatRequest) -> Result<EventStream, ProviderError> {
         self.stream_chat_inner(request, None).await
     }
@@ -85,92 +119,45 @@ impl OpenAiCompatibleProvider {
         request: ChatRequest,
         preempt: Option<crate::PreemptToken>,
     ) -> Result<EventStream, ProviderError> {
-        let mut messages = Vec::with_capacity(request.messages.len() + 4);
-        if !request
-            .system_sections
-            .iter()
-            .any(crate::SystemSection::has_text)
-        {
-            if let Some(system) = request.system {
-                messages.push(json!({"role": "system", "content": system}));
-            }
-        } else {
-            // Stable content comes first and keeps its exact section boundary.
-            // The volatile run context and memory brief are later system
-            // messages so an OpenAI-compatible server's automatic prefix
-            // cache can reuse the stable prefix across turns.
-            for section in request
-                .system_sections
-                .iter()
-                .filter(|section| section.has_text())
-            {
-                messages.push(json!({"role": "system", "content": section.text}));
-            }
-        }
-        messages.extend(request.messages.iter().map(openai_message));
-        // A v3 tail section (memory) is deliberately placed after the exact
-        // prior conversation. It is a small suffix miss, never a change to an
-        // earlier message. OpenAI-compatible servers accept a trailing system
-        // message; the core telemetry records this capability for the request.
-        for section in request
-            .tail_sections
-            .iter()
-            .filter(|section| section.has_text())
-        {
-            messages.push(json!({"role": "system", "content": section.text}));
-        }
-
-        let mut body = json!({
-            "model": request.model,
-            "messages": messages,
-            "stream": true,
-            "stream_options": {"include_usage": true},
-        });
-        if let Some(max_tokens) = request.max_tokens {
-            body["max_tokens"] = json!(max_tokens);
-        }
-        if let Some(temperature) = request.temperature {
-            body["temperature"] = json!(temperature);
-        }
-        if !request.tools.is_empty() {
-            // Tool definitions are part of the prefix. Sort by name so a
-            // registry iteration-order change cannot silently move the cache
-            // boundary or make equivalent runs non-comparable.
-            let mut tools = request.tools.iter().collect::<Vec<_>>();
-            tools.sort_by(|left, right| left.name.cmp(&right.name));
-            body["tools"] = json!(
-                tools
-                    .iter()
-                    .map(|tool| json!({
-                        "type": "function",
-                        "function": {
-                            "name": tool.name,
-                            "description": tool.description,
-                            "parameters": tool.parameters,
-                        }
-                    }))
-                    .collect::<Vec<_>>()
-            );
-            body["tool_choice"] = json!("auto");
-        }
-
-        let response = match self.send_body(&body, preempt.as_ref()).await {
-            Ok(response) => response,
-            Err(ProviderError::Api {
-                status: 400,
-                body: _,
-            }) if body.get("stream_options").is_some() => {
-                // Some OpenAI-compatible servers reject optional stream
-                // metadata; fall back once so older local servers still work.
-                if let Some(object) = body.as_object_mut() {
-                    object.remove("stream_options");
+        let mut capabilities = self.effective_capabilities();
+        let mut strip_stream_options = false;
+        let mut tail_fallback_attempted = false;
+        let response = loop {
+            let body = openai_body(&request, capabilities, strip_stream_options);
+            match self.send_body(&body, preempt.as_ref()).await {
+                Ok(response) => break response,
+                Err(ProviderError::Api {
+                    status,
+                    body: error_body,
+                }) if status == 400
+                    && !strip_stream_options
+                    && body.get("stream_options").is_some()
+                    && !looks_like_tail_system_rejection(status, &error_body) =>
+                {
+                    // Some OpenAI-compatible servers reject optional stream
+                    // metadata; fall back once so older local servers still
+                    // work. The message bytes are unchanged.
+                    strip_stream_options = true;
                 }
-                match self.send_body(&body, preempt.as_ref()).await {
-                    Ok(response) => response,
-                    Err(error) => return Err(error),
+                Err(ProviderError::Api {
+                    status,
+                    body: error_body,
+                }) if !tail_fallback_attempted
+                    && capabilities.tail_system.accepts_system()
+                    && looks_like_tail_system_rejection(status, &error_body) =>
+                {
+                    // A server rejected a mid-history system message. Rebuild
+                    // with the stable `[memory]` user fallback. The request
+                    // never rewrites earlier content; only the memory anchor's
+                    // role changes, and the capability is downgraded for later
+                    // calls so the runtime telemetry is honest.
+                    self.tail_system_fallback_used
+                        .store(true, Ordering::Relaxed);
+                    capabilities = self.effective_capabilities();
+                    tail_fallback_attempted = true;
                 }
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
         };
 
         if response
@@ -295,30 +282,48 @@ impl OpenAiCompatibleProvider {
     }
 }
 
-fn openai_message(message: &ChatMessage) -> Value {
-    let mut value = json!({
-        "role": message.role,
-        "content": message.content,
+fn openai_body(
+    request: &ChatRequest,
+    capabilities: ProviderCacheCapabilities,
+    strip_stream_options: bool,
+) -> Value {
+    let messages = openai_wire_messages(request, capabilities);
+    let mut body = json!({
+        "model": request.model,
+        "messages": messages,
+        "stream": true,
     });
-    if let Some(tool_calls) = &message.tool_calls {
-        value["tool_calls"] = json!(
-            tool_calls
+    if !strip_stream_options {
+        body["stream_options"] = json!({"include_usage": true});
+    }
+    if let Some(max_tokens) = request.max_tokens {
+        body["max_tokens"] = json!(max_tokens);
+    }
+    if let Some(temperature) = request.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    if !request.tools.is_empty() {
+        // Tool definitions are part of the prefix. Sort by name so a registry
+        // iteration-order change cannot silently move the cache boundary or
+        // make equivalent runs non-comparable.
+        let mut tools = request.tools.iter().collect::<Vec<_>>();
+        tools.sort_by(|left, right| left.name.cmp(&right.name));
+        body["tools"] = json!(
+            tools
                 .iter()
-                .map(|call| json!({
-                    "id": call.id,
+                .map(|tool| json!({
                     "type": "function",
                     "function": {
-                        "name": call.name,
-                        "arguments": call.arguments,
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
                     }
                 }))
                 .collect::<Vec<_>>()
         );
+        body["tool_choice"] = json!("auto");
     }
-    if let Some(tool_call_id) = &message.tool_call_id {
-        value["tool_call_id"] = json!(tool_call_id);
-    }
-    value
+    body
 }
 
 /// A deterministic in-memory provider used by tests and dry runs.

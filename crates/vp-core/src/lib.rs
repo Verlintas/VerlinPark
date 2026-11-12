@@ -113,6 +113,7 @@ pub mod computer;
 pub mod console;
 pub mod context;
 pub mod continuation;
+pub mod conversation;
 pub mod critical_path;
 pub mod daemon_agent;
 mod dashboard;
@@ -10050,6 +10051,7 @@ impl Engine {
     pub async fn session_cache_status(&self, session_id: &str) -> Result<SessionCacheStatus> {
         const CACHE_CALL_SCAN_LIMIT: u32 = 2_000;
         const RECENT_CALLS: usize = 20;
+        const RECENT_BREAKS: usize = 20;
         let ledger = self.usage_ledger(session_id).await?;
         let prefix_event = self
             .latest_event_of_kind(session_id, "context.prompt_prefix")
@@ -10060,11 +10062,15 @@ impl Engine {
         let cache_events = self
             .recent_events_of_kind(session_id, "context.cache", CACHE_CALL_SCAN_LIMIT)
             .await?;
+        let break_events = self
+            .recent_events_of_kind(session_id, "context.cache_break", 500)
+            .await?;
         let compaction_events = self
             .recent_events_of_kind(session_id, "context.compaction", CACHE_CALL_SCAN_LIMIT)
             .await?;
         let aggregate =
             crate::prompt_cache::aggregate_cache_events(&cache_events, &compaction_events);
+        let continuity = crate::conversation::aggregate_continuity(&cache_events, &break_events);
 
         let prompt_prefix = prefix_event
             .as_ref()
@@ -10153,6 +10159,12 @@ impl Engine {
             .take(RECENT_CALLS)
             .map(|event| crate::prompt_cache::cache_call_record(&event.payload, &event.created_at))
             .collect::<Vec<_>>();
+        let recent_breaks = break_events
+            .iter()
+            .rev()
+            .take(RECENT_BREAKS)
+            .map(|event| crate::prompt_cache::cache_break_record(&event.payload, &event.created_at))
+            .collect::<Vec<_>>();
         let session_store = self.store.clone();
         let lookup_id = session_id.to_string();
         let project_id = tokio::task::spawn_blocking(move || session_store.get_session(&lookup_id))
@@ -10227,6 +10239,21 @@ impl Engine {
             last_first_token_ms: last_cache
                 .and_then(|event| event.payload.get("first_token_ms"))
                 .and_then(serde_json::Value::as_u64),
+            last_message_prefix_hash: continuity.last_message_prefix_hash,
+            last_previous_message_prefix_hash: continuity.last_previous_message_prefix_hash,
+            last_append_only: continuity.last_append_only,
+            append_only_calls: continuity.append_only_calls,
+            non_append_only_calls: continuity.non_append_only_calls,
+            last_message_count: continuity.last_message_count,
+            last_tail_memory_mode: continuity.last_tail_memory_mode,
+            provider_tail_system: continuity.provider_tail_system,
+            last_tail_system_capability: continuity.last_tail_system_capability,
+            cache_break_counts: continuity.break_reason_counts,
+            recent_breaks,
+            last_cache_break_at: continuity.last_break_at,
+            last_message_sequence_issue_count: continuity.last_message_sequence_issue_count,
+            last_message_sequence_issues: continuity.last_message_sequence_issues,
+            message_sequence_issue_counts: continuity.message_sequence_issue_counts,
             recent_calls,
             miss_reason_counts: aggregate.miss_reason_counts,
             ttl_counts: aggregate.ttl_counts,
@@ -10238,6 +10265,40 @@ impl Engine {
             compaction_invalidation_tokens: aggregate.compaction_invalidation_tokens,
             compaction_invalidation_estimated_usd: aggregate.compaction_invalidation_estimated_usd,
             policy,
+        })
+    }
+
+    /// Bounded read-only structural break history for one session. It scans
+    /// `context.cache_break` and the ordinary `context.cache` window to report
+    /// append-only counts, never message text, and never calls a provider.
+    pub async fn session_cache_breaks(
+        &self,
+        session_id: &str,
+        limit: Option<u32>,
+    ) -> Result<vp_protocol::types::SessionCacheBreaksResult> {
+        const SCAN_LIMIT: u32 = 2_000;
+        let limit = limit.unwrap_or(50).clamp(1, 200) as usize;
+        let break_events = self
+            .recent_events_of_kind(session_id, "context.cache_break", SCAN_LIMIT)
+            .await?;
+        let cache_events = self
+            .recent_events_of_kind(session_id, "context.cache", SCAN_LIMIT)
+            .await?;
+        let continuity = crate::conversation::aggregate_continuity(&cache_events, &break_events);
+        let total_breaks = break_events.len() as u64;
+        let breaks = break_events
+            .iter()
+            .rev()
+            .take(limit)
+            .map(|event| crate::prompt_cache::cache_break_record(&event.payload, &event.created_at))
+            .collect::<Vec<_>>();
+        Ok(vp_protocol::types::SessionCacheBreaksResult {
+            session_id: session_id.to_string(),
+            append_only_calls: continuity.append_only_calls,
+            non_append_only_calls: continuity.non_append_only_calls,
+            total_breaks,
+            truncated: total_breaks > breaks.len() as u64,
+            breaks,
         })
     }
 
@@ -10423,6 +10484,9 @@ impl Engine {
         let compaction_events = self
             .recent_events_of_kind(session_id, "context.compaction", LIMIT)
             .await?;
+        let break_events = self
+            .recent_events_of_kind(session_id, "context.cache_break", LIMIT)
+            .await?;
         let session_store = self.store.clone();
         let lookup_id = session_id.to_string();
         let project_id = tokio::task::spawn_blocking(move || session_store.get_session(&lookup_id))
@@ -10450,6 +10514,7 @@ impl Engine {
             &cache_events,
             &prefix_events,
             &compaction_events,
+            &break_events,
         ))
     }
 

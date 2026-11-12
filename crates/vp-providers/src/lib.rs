@@ -8,6 +8,7 @@
 
 pub mod anthropic;
 pub mod cache;
+pub mod canonical;
 pub mod openai;
 pub mod preempt;
 
@@ -23,6 +24,12 @@ pub use anthropic::AnthropicProvider;
 pub use cache::{
     CacheBreakpointPlan, CacheTtl, PromptCacheConfig, SystemSection,
     looks_like_cache_ttl_rejection, plan_cache_breakpoints,
+};
+pub use canonical::{
+    CacheBreakReason, CanonicalRequest, ContinuityReport, MessagePrefixSnapshot,
+    MessageSequenceIssue, ProviderCacheCapabilities, ProviderWire, TailSectionMode,
+    TailSystemCapability, audit_message_sequence, canonical_json, canonical_request,
+    canonical_tools_hash, verify_append_only,
 };
 pub use openai::OpenAiCompatibleProvider;
 pub use preempt::{
@@ -317,6 +324,13 @@ async fn sleep_preemptible(delay: std::time::Duration, preempt: Option<&PreemptT
 #[async_trait]
 pub trait Provider: Send + Sync {
     fn id(&self) -> &str;
+
+    /// Prompt-layout capabilities for canonical cache accounting. This never
+    /// affects model routing. The default infers from the provider id and uses
+    /// the conservative `[memory]` user fallback for unknown servers.
+    fn cache_capabilities(&self) -> ProviderCacheCapabilities {
+        ProviderCacheCapabilities::infer(self.id())
+    }
 
     async fn stream_chat(&self, request: ChatRequest) -> Result<EventStream, ProviderError>;
 

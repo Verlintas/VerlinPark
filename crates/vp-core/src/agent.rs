@@ -14042,48 +14042,58 @@ async fn warm_prompt_cache(
     ));
     let hit_ratio =
         vp_protocol::types::cache_hit_ratio(input_tokens, usage.cache_read, usage.cache_write);
-    if let Err(error) = emit(
-        engine,
-        &session.id,
-        spec,
-        "context.cache",
-        serde_json::json!({
-            "input_tokens": input_tokens,
-            "cache_read_tokens": usage.cache_read,
-            "cache_write_tokens": usage.cache_write,
-            "output_tokens": output_tokens,
-            "cache_hit_ratio": hit_ratio,
-            "cache_read_ratio": if input_tokens == 0 {
-                0.0
-            } else {
-                (usage.cache_read as f64 / input_tokens as f64).clamp(0.0, 1.0)
-            },
-            "cache_write_ratio": if input_tokens == 0 {
-                0.0
-            } else {
-                (usage.cache_write as f64 / input_tokens as f64).clamp(0.0, 1.0)
-            },
-            "cache_breakpoints": plan.breakpoints,
-            "cache_ttl": plan.ttl.as_str(),
-            "cache_ttl_explicit": plan.ttl_explicit,
-            "cache_automatic": plan.automatic,
-            "first_token_ms": first_token_ms,
-            "core_hash": hashes.core_hash,
-            "project_hash": hashes.project_hash,
-            "tools_hash": hashes.tools_hash,
-            "volatile_hash": hashes.volatile_hash,
-            "prompt_prefix_hash": hashes.prefix_hash,
-            "cache_generation": hashes.prefix_hash,
-            "estimated_savings_usd": savings,
-            "miss_reason": serde_json::Value::Null,
-            "estimated": estimated,
-            "warm": true,
-            "warm_source": source,
-            "model": model,
-        }),
-    )
-    .await
+    // Warm calls are real provider calls, so they carry the same canonical
+    // fields. They are excluded from conversation continuity aggregation
+    // because they intentionally send only the stable prefix.
+    let mut warm_tracker = crate::conversation::MessagePrefixTracker::default();
+    let warm_observation = crate::conversation::CanonicalCallObservation::new(
+        &request,
+        config.provider.cache_capabilities(),
+        &hashes.tools_hash,
+        &mut warm_tracker,
+    );
+    let warm_canonical = crate::conversation::canonical_payload(&warm_observation);
+    let mut warm_payload = serde_json::json!({
+        "input_tokens": input_tokens,
+        "cache_read_tokens": usage.cache_read,
+        "cache_write_tokens": usage.cache_write,
+        "output_tokens": output_tokens,
+        "cache_hit_ratio": hit_ratio,
+        "cache_read_ratio": if input_tokens == 0 {
+            0.0
+        } else {
+            (usage.cache_read as f64 / input_tokens as f64).clamp(0.0, 1.0)
+        },
+        "cache_write_ratio": if input_tokens == 0 {
+            0.0
+        } else {
+            (usage.cache_write as f64 / input_tokens as f64).clamp(0.0, 1.0)
+        },
+        "cache_breakpoints": plan.breakpoints,
+        "cache_ttl": plan.ttl.as_str(),
+        "cache_ttl_explicit": plan.ttl_explicit,
+        "cache_automatic": plan.automatic,
+        "first_token_ms": first_token_ms,
+        "core_hash": hashes.core_hash,
+        "project_hash": hashes.project_hash,
+        "tools_hash": hashes.tools_hash,
+        "volatile_hash": hashes.volatile_hash,
+        "prompt_prefix_hash": hashes.prefix_hash,
+        "cache_generation": hashes.prefix_hash,
+        "estimated_savings_usd": savings,
+        "miss_reason": serde_json::Value::Null,
+        "estimated": estimated,
+        "warm": true,
+        "warm_source": source,
+        "model": model,
+    });
+    if let (Some(target), Some(fields)) = (warm_payload.as_object_mut(), warm_canonical.as_object())
     {
+        for (key, value) in fields {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+    if let Err(error) = emit(engine, &session.id, spec, "context.cache", warm_payload).await {
         tracing::warn!(%error, "could not persist cache warm telemetry");
     }
     let result = SessionCacheWarmResult {
@@ -14853,6 +14863,22 @@ async fn run_loop_body(
         InstructionBuildMode::Materialize,
     )
     .await?;
+    // Tail memory is appended to history once, at the position where it was
+    // first seen, and is never reinserted ahead of newer messages. Without this
+    // anchor a freshly rebuilt memory brief would move every turn and break the
+    // provider prefix after the previous prompt. The anchor is a stable system
+    // message; Anthropic projects it to a `[memory]` user message because its
+    // `system` field is top-level.
+    let memory_anchor = ensure_memory_anchor(
+        engine,
+        session,
+        spec,
+        &sections,
+        conversation,
+        conversation_ids,
+        top_level,
+    )
+    .await?;
     let system = sections.render();
     // Retained for older adapters and the Anthropic legacy fallback. It never
     // contains volatile run context or memory.
@@ -14894,6 +14920,7 @@ async fn run_loop_body(
         spec.role.as_str(),
     );
     let cache_config = crate::prompt_cache::prompt_cache_config(&cache_policy, spec.role.as_str());
+    let provider_capabilities = config.provider.cache_capabilities();
     emit(
         engine,
         &session.id,
@@ -14908,9 +14935,12 @@ async fn run_loop_body(
                 &spec.id,
                 spec.role == AgentRole::Leader,
             ),
-            "provider_tail_system": crate::instruction::provider_accepts_tail_system(
-                &config.provider_name
-            ),
+            "provider_tail_system": provider_capabilities.tail_system.accepts_system(),
+            "provider_wire": provider_capabilities.wire.as_str(),
+            "tail_system_capability": provider_capabilities.tail_system.as_str(),
+            "canonical_version": vp_providers::canonical::CANONICAL_VERSION,
+            "memory_anchor": memory_anchor,
+            "cache_break_events": crate::conversation::CACHE_BREAK_EVENT,
             "model": model_name,
             "tool_bundle": frozen_bundle.selection.kind.as_str(),
             "tool_bundle_hash": frozen_bundle.bundle_hash,
@@ -14982,10 +15012,41 @@ async fn run_loop_body(
             .get("warm")
             .and_then(serde_json::Value::as_bool)
             != Some(true)
+            && cache_event_belongs_to(&event.payload, spec)
     });
     let mut cache_tracker = crate::prompt_cache::CacheCallTracker::from_event(
         latest_agent_cache_event.map(|event| &event.payload),
     );
+    let mut message_tracker = crate::conversation::MessagePrefixTracker::from_event(
+        latest_agent_cache_event.map(|event| &event.payload),
+    );
+    let run_capabilities = config.provider.cache_capabilities();
+    if let Some(payload) = crate::conversation::capability_change_payload(
+        run_capabilities,
+        latest_agent_cache_event.map(|event| &event.payload),
+        &config.provider_name,
+    ) && let Err(error) = emit(
+        engine,
+        &session.id,
+        spec,
+        "context.cache_capability",
+        payload,
+    )
+    .await
+    {
+        tracing::warn!(%error, "could not persist provider cache capability telemetry");
+    }
+    // A compaction that happened after the last provider call (manual compact,
+    // or an automatic compaction at the end of a previous run) makes the next
+    // observation a reset, not a generic edit. Event sequence numbers are
+    // per-session and monotonic, so this comparison is exact.
+    if let Some(compaction) = engine
+        .latest_event_of_kind(&session.id, "context.compacted")
+        .await?
+        && latest_agent_cache_event.is_none_or(|cache| compaction.seq > cache.seq)
+    {
+        message_tracker.mark_compaction();
+    }
     if resumed && cache_policy.warm_on_resume && !budget.exhausted() {
         // Explicit policy opt-in only. The default is false, so a normal run
         // still makes exactly one provider call per turn.
@@ -15129,6 +15190,7 @@ async fn run_loop_body(
                 // conversation prefix is not. The next call is attributed to
                 // the reset rather than to a provider TTL guess.
                 cache_tracker.mark_compaction();
+                message_tracker.mark_compaction();
             }
             let compaction_after = crate::run_journal::journal_cursors(engine, &session.id)
                 .await?
@@ -15383,6 +15445,36 @@ async fn run_loop_body(
             request.max_tokens = Some(output_budget.min(u32::MAX as u64) as u32);
         }
         let _scope_lease = scope_lease;
+        // Canonical continuity is computed from the exact request that will be
+        // sent, before the provider call. A structural break is recorded now;
+        // a provider-side miss is only knowable after usage arrives. Neither
+        // path ever rewrites history.
+        let provider_capabilities = config.provider.cache_capabilities();
+        let observation = crate::conversation::CanonicalCallObservation::new(
+            &request,
+            provider_capabilities,
+            &prompt_hashes.tools_hash,
+            &mut message_tracker,
+        );
+        if let Some(reason) = observation.report.reason {
+            let payload = crate::conversation::cache_break_payload(
+                &observation,
+                reason,
+                &config.provider_name,
+                &request.model,
+            );
+            if let Err(error) = emit(
+                engine,
+                &session.id,
+                spec,
+                crate::conversation::CACHE_BREAK_EVENT,
+                payload,
+            )
+            .await
+            {
+                tracing::warn!(%error, "could not persist cache break telemetry");
+            }
+        }
         let model_step = journal.model_intent(engine, turn + 1, &request).await?;
         let stream_turn = consume_stream(
             engine,
@@ -15495,57 +15587,89 @@ async fn run_loop_body(
                     prices.cache_read,
                     prices.cache_write,
                 ));
-            if input_tokens > 0
-                && let Err(error) = emit(
-                    engine,
-                    &session.id,
-                    spec,
-                    "context.cache",
-                    serde_json::json!({
-                        "input_tokens": input_tokens,
-                        "cache_read_tokens": cache_read_tokens,
-                        "cache_write_tokens": cache_write_tokens,
-                        "output_tokens": output_tokens,
-                        "cache_hit_ratio": vp_protocol::types::cache_hit_ratio(
-                            input_tokens,
-                            cache_read_tokens,
-                            cache_write_tokens,
-                        ),
-                        "cache_read_ratio": if input_tokens == 0 {
-                            0.0
-                        } else {
-                            (cache_read_tokens as f64 / input_tokens as f64).clamp(0.0, 1.0)
-                        },
-                        "cache_write_ratio": if input_tokens == 0 {
-                            0.0
-                        } else {
-                            (cache_write_tokens as f64 / input_tokens as f64).clamp(0.0, 1.0)
-                        },
-                        "cache_breakpoints": cache_plan.breakpoints,
-                        "cache_ttl": cache_plan.ttl.as_str(),
-                        "cache_ttl_explicit": cache_plan.ttl_explicit,
-                        "cache_automatic": cache_plan.automatic,
-                        "first_token_ms": stream_turn.first_token_ms,
-                        "core_hash": prompt_hashes.core_hash,
-                        "project_hash": prompt_hashes.project_hash,
-                        "tools_hash": prompt_hashes.tools_hash,
-                        "tool_bundle": frozen_bundle.selection.kind.as_str(),
-                        "tool_bundle_hash": frozen_bundle.bundle_hash,
-                        "tool_bundle_tool_count": frozen_bundle.builtin_count(),
-                        "tool_bundle_mcp_count": frozen_bundle.mcp_count(),
-                        "volatile_hash": prompt_hashes.volatile_hash,
-                        "prompt_prefix_hash": prefix_hash,
-                        "cache_generation": prefix_hash,
-                        "estimated_savings_usd": savings,
-                        "miss_reason": miss_reason.map(|reason| reason.as_str()),
-                        "estimated": estimated,
-                        "warm": false,
-                        "model": request.model,
-                    }),
-                )
-                .await
-            {
-                tracing::warn!(%error, "could not persist context cache telemetry");
+            if input_tokens > 0 {
+                let provider_cache_miss = observation.report.append_only
+                    && observation.report.had_previous
+                    && cache_read_tokens == 0;
+                let mut payload = serde_json::json!({
+                    "input_tokens": input_tokens,
+                    "cache_read_tokens": cache_read_tokens,
+                    "cache_write_tokens": cache_write_tokens,
+                    "output_tokens": output_tokens,
+                    "cache_hit_ratio": vp_protocol::types::cache_hit_ratio(
+                        input_tokens,
+                        cache_read_tokens,
+                        cache_write_tokens,
+                    ),
+                    "cache_read_ratio": if input_tokens == 0 {
+                        0.0
+                    } else {
+                        (cache_read_tokens as f64 / input_tokens as f64).clamp(0.0, 1.0)
+                    },
+                    "cache_write_ratio": if input_tokens == 0 {
+                        0.0
+                    } else {
+                        (cache_write_tokens as f64 / input_tokens as f64).clamp(0.0, 1.0)
+                    },
+                    "cache_breakpoints": cache_plan.breakpoints,
+                    "cache_ttl": cache_plan.ttl.as_str(),
+                    "cache_ttl_explicit": cache_plan.ttl_explicit,
+                    "cache_automatic": cache_plan.automatic,
+                    "first_token_ms": stream_turn.first_token_ms,
+                    "core_hash": prompt_hashes.core_hash,
+                    "project_hash": prompt_hashes.project_hash,
+                    "tools_hash": prompt_hashes.tools_hash,
+                    "tool_bundle": frozen_bundle.selection.kind.as_str(),
+                    "tool_bundle_hash": frozen_bundle.bundle_hash,
+                    "tool_bundle_tool_count": frozen_bundle.builtin_count(),
+                    "tool_bundle_mcp_count": frozen_bundle.mcp_count(),
+                    "volatile_hash": prompt_hashes.volatile_hash,
+                    "prompt_prefix_hash": prefix_hash,
+                    "cache_generation": prefix_hash,
+                    "estimated_savings_usd": savings,
+                    "miss_reason": miss_reason.map(|reason| reason.as_str()),
+                    "estimated": estimated,
+                    "warm": false,
+                    "model": request.model,
+                });
+                let canonical_fields = crate::conversation::canonical_payload(&observation);
+                if let (Some(target), Some(fields)) =
+                    (payload.as_object_mut(), canonical_fields.as_object())
+                {
+                    for (key, value) in fields {
+                        target.insert(key.clone(), value.clone());
+                    }
+                }
+                if provider_cache_miss && let Some(object) = payload.as_object_mut() {
+                    object.insert(
+                        "cache_break_reason".into(),
+                        serde_json::json!("provider_cache_miss"),
+                    );
+                }
+                if let Err(error) = emit(engine, &session.id, spec, "context.cache", payload).await
+                {
+                    tracing::warn!(%error, "could not persist context cache telemetry");
+                }
+                if provider_cache_miss {
+                    let miss_payload = crate::conversation::provider_miss_payload(
+                        &observation,
+                        &config.provider_name,
+                        &request.model,
+                        input_tokens,
+                        cache_read_tokens,
+                    );
+                    if let Err(error) = emit(
+                        engine,
+                        &session.id,
+                        spec,
+                        crate::conversation::CACHE_BREAK_EVENT,
+                        miss_payload,
+                    )
+                    .await
+                    {
+                        tracing::warn!(%error, "could not persist provider cache miss telemetry");
+                    }
+                }
             }
             let actual_usage = input_tokens.saturating_add(output_tokens);
             let cost_exceeded = if let Some(reservation) = cost_reservation.take() {
@@ -23972,6 +24096,91 @@ enum InstructionBuildMode {
     Materialize,
     /// Read-only preview: no blob or state writes, no events.
     Preview,
+}
+
+/// Append the stable memory anchor once per distinct brief.
+///
+/// The anchor is a real conversation message, not a request-time suffix. A
+/// helper that reinserted the current memory brief before every provider call
+/// would move bytes after the previous prompt and invalidate the cached tail.
+/// Appending it once keeps the memory tail-only (it never changes the head or
+/// an earlier message) while preserving exact-prefix continuity. A changed
+/// brief appends a newer anchor; older anchors remain as honest history and can
+/// only disappear through compaction, which is recorded as a cache reset.
+async fn ensure_memory_anchor(
+    engine: &Engine,
+    session: &Session,
+    spec: &AgentSpec,
+    sections: &crate::prompt_cache::PromptSections,
+    conversation: &mut Vec<ChatMessage>,
+    conversation_ids: &mut Vec<Option<String>>,
+    top_level: bool,
+) -> Result<Option<Value>> {
+    let Some(section) = sections
+        .tail_sections()
+        .into_iter()
+        .find(|section| section.kind == crate::prompt_cache::TAIL_MEMORY_SECTION)
+    else {
+        return Ok(None);
+    };
+    let Some(content) = crate::conversation::memory_anchor_content(&section) else {
+        return Ok(None);
+    };
+    if crate::conversation::memory_anchor_is_current(conversation, &content) {
+        let position = conversation.len().saturating_sub(1);
+        let payload =
+            crate::conversation::memory_anchor_payload(&content, false, position, sections.layout);
+        if let Err(error) = emit(
+            engine,
+            &session.id,
+            spec,
+            crate::conversation::MEMORY_ANCHOR_EVENT,
+            payload.clone(),
+        )
+        .await
+        {
+            tracing::warn!(%error, "could not persist memory anchor telemetry");
+        }
+        return Ok(Some(payload));
+    }
+    let message_id = if top_level {
+        let stored = engine
+            .append_message(&session.id, "system", &content, serde_json::json!([]), None)
+            .await?;
+        Some(stored.id)
+    } else {
+        None
+    };
+    conversation.push(ChatMessage::system(content.clone()));
+    conversation_ids.push(message_id);
+    let position = conversation.len().saturating_sub(1);
+    let payload =
+        crate::conversation::memory_anchor_payload(&content, true, position, sections.layout);
+    if let Err(error) = emit(
+        engine,
+        &session.id,
+        spec,
+        crate::conversation::MEMORY_ANCHOR_EVENT,
+        payload.clone(),
+    )
+    .await
+    {
+        tracing::warn!(%error, "could not persist memory anchor telemetry");
+    }
+    Ok(Some(payload))
+}
+
+/// `true` when a persisted cache event describes this agent. Older events may
+/// predate the `agent_id` field; a matching role is the best available seed,
+/// and a mismatch is never used to fabricate continuity.
+fn cache_event_belongs_to(payload: &Value, spec: &AgentSpec) -> bool {
+    if let Some(agent_id) = payload.get("agent_id").and_then(Value::as_str) {
+        return agent_id == spec.id;
+    }
+    payload
+        .get("agent_role")
+        .and_then(Value::as_str)
+        .is_some_and(|role| role == spec.role.as_str())
 }
 
 /// Build the exact prompt for one run.

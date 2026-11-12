@@ -9,9 +9,10 @@ use crate::cache::{
     CacheBreakpointPlan, CacheTtl, SystemSection, looks_like_cache_ttl_rejection,
     plan_cache_breakpoints,
 };
+use crate::canonical::{ProviderCacheCapabilities, anthropic_wire_messages};
 use crate::{
-    ChatMessage, ChatRequest, EventStream, Provider, ProviderError, StreamEvent, ToolCall,
-    ToolSchema, provider_client, provider_error_from_stream,
+    ChatRequest, EventStream, Provider, ProviderError, StreamEvent, ToolCall, ToolSchema,
+    provider_client, provider_error_from_stream,
 };
 
 /// Anthropic Messages API adapter.
@@ -43,37 +44,6 @@ impl AnthropicProvider {
     fn endpoint(&self) -> String {
         format!("{}/messages", self.base_url)
     }
-}
-
-fn anthropic_message(message: &ChatMessage) -> Option<Value> {
-    if message.role == "tool" {
-        let tool_use_id = message.tool_call_id.clone().unwrap_or_default();
-        return Some(json!({
-            "role": "user",
-            "content": [{
-                "type": "tool_result",
-                "tool_use_id": tool_use_id,
-                "content": message.content,
-            }]
-        }));
-    }
-    if let Some(tool_calls) = &message.tool_calls {
-        let mut blocks = Vec::with_capacity(tool_calls.len() + 1);
-        if !message.content.is_empty() {
-            blocks.push(json!({"type": "text", "text": message.content}));
-        }
-        for call in tool_calls {
-            let input: Value = serde_json::from_str(&call.arguments).unwrap_or_else(|_| json!({}));
-            blocks.push(json!({
-                "type": "tool_use",
-                "id": call.id,
-                "name": call.name,
-                "input": input,
-            }));
-        }
-        return Some(json!({"role": "assistant", "content": blocks}));
-    }
-    Some(json!({"role": message.role, "content": message.content}))
 }
 
 fn anthropic_system(system: String, stable_prefix: Option<&str>) -> Value {
@@ -185,6 +155,27 @@ fn anthropic_system_sections(sections: &[SystemSection], plan: &CacheBreakpointP
     json!(blocks)
 }
 
+/// Convert every non-empty string content block to the single-text-block array
+/// shape before an explicit tail breakpoint is placed. Without this, the last
+/// message would be sent as an array with a marker on one turn and a plain
+/// string on the next (when it is no longer last), changing the serialization
+/// of an already-sent message. The array shape is stable; only marker metadata
+/// moves.
+fn normalize_text_content_blocks(messages: &mut [Value]) {
+    for message in messages {
+        let Some(content) = message.get_mut("content") else {
+            continue;
+        };
+        let Value::String(text) = content else {
+            continue;
+        };
+        if text.is_empty() {
+            continue;
+        }
+        *content = json!([{"type": "text", "text": text}]);
+    }
+}
+
 /// Place an explicit cache breakpoint on the last cacheable message block.
 /// This is the documented fallback when request-level automatic caching is
 /// disabled or unsupported by a compatible gateway. It never changes message
@@ -227,6 +218,10 @@ impl Provider for AnthropicProvider {
         &self.id
     }
 
+    fn cache_capabilities(&self) -> ProviderCacheCapabilities {
+        ProviderCacheCapabilities::anthropic()
+    }
+
     async fn stream_chat(&self, request: ChatRequest) -> Result<EventStream, ProviderError> {
         self.stream_chat_inner(request, None).await
     }
@@ -248,28 +243,8 @@ impl AnthropicProvider {
     ) -> Result<EventStream, ProviderError> {
         let api_key = self.api_key.as_ref().ok_or(ProviderError::MissingApiKey)?;
 
-        let mut messages: Vec<Value> = request
-            .messages
-            .iter()
-            .filter(|message| message.role != "system")
-            .filter_map(anthropic_message)
-            .collect();
-        // Anthropic's `system` field is a top-level request parameter, so a v3
-        // tail system section cannot be expressed mid-history. Represent the
-        // memory brief as one stable user message prefixed `[memory]` after the
-        // exact prior conversation. The runtime records
-        // `provider_tail_system=false` for this provider. No earlier message or
-        // cache breakpoint is moved.
-        for section in request
-            .tail_sections
-            .iter()
-            .filter(|section| section.has_text())
-        {
-            messages.push(json!({
-                "role": "user",
-                "content": format!("[memory]\n\n{}", section.text),
-            }));
-        }
+        let messages: Vec<Value> =
+            anthropic_wire_messages(&request, ProviderCacheCapabilities::anthropic());
 
         let cache_ttl = request.cache.map(|cache| cache.ttl);
         let plan = request.cache.map(|cache| {
@@ -320,6 +295,7 @@ impl AnthropicProvider {
                 && plan.tail_message
                 && let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut)
             {
+                normalize_text_content_blocks(messages);
                 mark_last_message_cache_control(messages, plan.ttl);
             }
         } else {

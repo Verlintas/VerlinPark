@@ -22,9 +22,11 @@ pub fn audit_cache_events(
     cache_events: &[Event],
     prefix_events: &[Event],
     compaction_events: &[Event],
+    break_events: &[Event],
 ) -> SessionCacheAuditResult {
     let mut findings = Vec::new();
     let aggregate = prompt_cache::aggregate_cache_events(cache_events, compaction_events);
+    let continuity = crate::conversation::aggregate_continuity(cache_events, break_events);
     let calls_checked = aggregate.calls;
     let warm_calls_checked = aggregate.warm_calls;
     let calls_with_read = cache_events
@@ -239,6 +241,134 @@ pub fn audit_cache_events(
         }
     }
 
+    // 11. A non-append-only history is a local byte change, not a provider TTL
+    //     guess. Report the bounded reason counts and the latest index. No
+    //     message content is available or reported.
+    let structural_breaks = continuity
+        .break_reason_counts
+        .iter()
+        .filter(|bucket| {
+            bucket.calls > 0
+                && !matches!(
+                    bucket.key.as_str(),
+                    "first_call" | "compaction_reset" | "provider_cache_miss"
+                )
+        })
+        .map(|bucket| format!("{}={}", bucket.key, bucket.calls))
+        .collect::<Vec<_>>();
+    if continuity.non_append_only_calls > 0 && !structural_breaks.is_empty() {
+        let latest = break_events.iter().rev().find(|event| {
+            event
+                .payload
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|reason| {
+                    !matches!(
+                        reason,
+                        "first_call" | "compaction_reset" | "provider_cache_miss"
+                    )
+                })
+        });
+        let mut evidence = BTreeMap::from([
+            (
+                "non_append_only_calls".to_string(),
+                continuity.non_append_only_calls.into(),
+            ),
+            (
+                "append_only_calls".to_string(),
+                continuity.append_only_calls.into(),
+            ),
+            ("reasons".to_string(), structural_breaks.join(",").into()),
+        ]);
+        if let Some(event) = latest {
+            if let Some(index) = event
+                .payload
+                .get("first_differing_index")
+                .and_then(serde_json::Value::as_u64)
+            {
+                evidence.insert("first_differing_index".to_string(), index.into());
+            }
+            if let Some(role) = event
+                .payload
+                .get("first_differing_role")
+                .and_then(serde_json::Value::as_str)
+            {
+                evidence.insert("first_differing_role".to_string(), role.into());
+            }
+            if let Some(tool_call_id) = event
+                .payload
+                .get("first_differing_tool_call_id")
+                .and_then(serde_json::Value::as_str)
+            {
+                evidence.insert(
+                    "first_differing_tool_call_id".to_string(),
+                    tool_call_id.into(),
+                );
+            }
+            evidence.insert("at".to_string(), event.created_at.clone().into());
+        }
+        findings.push(finding(
+            "non_append_only_history",
+            "warning",
+            format!(
+                "{} provider call(s) did not extend the previous canonical message list; local breaks were {}",
+                continuity.non_append_only_calls,
+                structural_breaks.join(", ")
+            ),
+            evidence,
+        ));
+    }
+
+    // 12. A miss on an otherwise append-only list is provider-side. Keep it
+    //     separate from local churn so an operator does not edit stable bytes
+    //     to chase an eviction that had nothing to do with them.
+    let provider_misses = continuity
+        .break_reason_counts
+        .iter()
+        .find(|bucket| bucket.key == "provider_cache_miss")
+        .map(|bucket| bucket.calls)
+        .unwrap_or(0);
+    if provider_misses > 0 && structural_breaks.is_empty() {
+        findings.push(finding(
+            "provider_evicted_append_only_prefix",
+            "info",
+            format!(
+                "{provider_misses} append-only call(s) reported no cache reads; the message chain was unchanged, so this is a provider-side miss rather than local prefix churn"
+            ),
+            BTreeMap::from([
+                ("provider_misses".to_string(), provider_misses.into()),
+                (
+                    "append_only_calls".to_string(),
+                    continuity.append_only_calls.into(),
+                ),
+            ]),
+        ));
+    }
+
+    // 13. Legacy events have no canonical identity. Say so instead of claiming
+    //     continuity or a break that cannot be proven.
+    let calls_without_continuity = cache_events
+        .iter()
+        .filter(|event| {
+            event
+                .payload
+                .get("warm")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+                && event.payload.get("message_prefix_hash").is_none()
+        })
+        .count() as u64;
+    if calls_without_continuity > 0 {
+        findings.push(finding(
+            "legacy_events_without_continuity",
+            "info",
+            format!(
+                "{calls_without_continuity} cache event(s) predate canonical message hashes; append-only continuity cannot be proven for them"
+            ),
+            BTreeMap::from([("calls".to_string(), calls_without_continuity.into())]),
+        ));
+    }
+
     findings.sort_by(|left, right| {
         severity_rank(&left.severity)
             .cmp(&severity_rank(&right.severity))
@@ -366,11 +496,101 @@ mod tests {
             &events,
             &[],
             &[],
+            &[],
         );
         assert!(result.clean);
-        assert!(result.findings.is_empty());
+        assert_eq!(codes(&result), vec!["legacy_events_without_continuity"]);
         assert_eq!(result.calls_checked, 2);
         assert!(result.hit_ratio > 0.5);
+    }
+
+    #[test]
+    fn canonical_events_do_not_report_a_legacy_gap() {
+        let events = vec![cache(serde_json::json!({
+            "input_tokens": 1000,
+            "cache_read_tokens": 600,
+            "cache_breakpoints": 4,
+            "cache_ttl": "5m",
+            "message_prefix_hash": "chain",
+            "append_only": true
+        }))];
+        let result = audit_cache_events(
+            "ses-1",
+            Some("openai-compatible"),
+            Some(&CachePolicy::default()),
+            &events,
+            &[],
+            &[],
+            &[],
+        );
+        assert!(result.findings.is_empty());
+        assert!(result.clean);
+    }
+
+    #[test]
+    fn non_append_only_history_is_a_warning_without_content() {
+        let cache_events = vec![cache(serde_json::json!({
+            "input_tokens": 1000,
+            "cache_read_tokens": 0,
+            "message_prefix_hash": "chain-2",
+            "append_only": false,
+            "cache_break_reason": "message_edited"
+        }))];
+        let breaks = vec![event(
+            "context.cache_break",
+            serde_json::json!({
+                "reason": "message_edited",
+                "first_differing_index": 2,
+                "first_differing_role": "assistant",
+                "first_differing_tool_call_id": "call_1"
+            }),
+        )];
+        let result = audit_cache_events(
+            "ses-1",
+            Some("openai-compatible"),
+            None,
+            &cache_events,
+            &[],
+            &[],
+            &breaks,
+        );
+        let finding = result
+            .findings
+            .iter()
+            .find(|finding| finding.code == "non_append_only_history")
+            .unwrap();
+        assert_eq!(finding.severity, "warning");
+        assert_eq!(finding.evidence["first_differing_index"], 2);
+        assert_eq!(finding.evidence["first_differing_role"], "assistant");
+        assert!(!finding.message.contains("call_1"));
+        assert!(!result.clean);
+    }
+
+    #[test]
+    fn provider_miss_on_an_append_only_prefix_is_informational() {
+        let cache_events = vec![cache(serde_json::json!({
+            "input_tokens": 1000,
+            "cache_read_tokens": 0,
+            "message_prefix_hash": "chain-2",
+            "append_only": true
+        }))];
+        let breaks = vec![event(
+            "context.cache_break",
+            serde_json::json!({"reason": "provider_cache_miss"}),
+        )];
+        let result = audit_cache_events(
+            "ses-1",
+            Some("deepseek"),
+            None,
+            &cache_events,
+            &[],
+            &[],
+            &breaks,
+        );
+        let codes = codes(&result);
+        assert!(codes.contains(&"provider_evicted_append_only_prefix"));
+        assert!(!codes.contains(&"non_append_only_history"));
+        assert!(result.clean);
     }
 
     #[test]
@@ -378,7 +598,7 @@ mod tests {
         let events = vec![cache(
             serde_json::json!({"cache_breakpoints": 5, "at": "x"}),
         )];
-        let result = audit_cache_events("ses-1", Some("anthropic"), None, &events, &[], &[]);
+        let result = audit_cache_events("ses-1", Some("anthropic"), None, &events, &[], &[], &[]);
         let finding = result
             .findings
             .iter()
@@ -402,7 +622,7 @@ mod tests {
                 }))
             })
             .collect::<Vec<_>>();
-        let result = audit_cache_events("ses-1", Some("anthropic"), None, &events, &[], &[]);
+        let result = audit_cache_events("ses-1", Some("anthropic"), None, &events, &[], &[], &[]);
         let codes = codes(&result);
         assert!(codes.contains(&"cache_writes_without_reads"));
         assert!(codes.contains(&"low_cache_hit_ratio"));
@@ -419,7 +639,7 @@ mod tests {
                 serde_json::json!({"project_hash": "p2", "tools_hash": "t2", "cache_read_tokens": 1}),
             ),
         ];
-        let result = audit_cache_events("ses-1", None, None, &events, &[], &[]);
+        let result = audit_cache_events("ses-1", None, None, &events, &[], &[], &[]);
         let codes = codes(&result);
         assert!(codes.contains(&"project_prefix_churn"));
         assert!(codes.contains(&"tool_bundle_churn"));
@@ -433,7 +653,7 @@ mod tests {
             "cache_read_tokens": 0,
             "cache_write_tokens": 100
         }))];
-        let result = audit_cache_events("ses-1", Some("anthropic"), None, &events, &[], &[]);
+        let result = audit_cache_events("ses-1", Some("anthropic"), None, &events, &[], &[], &[]);
         let codes = codes(&result);
         assert!(codes.contains(&"missing_component_hashes"));
         assert!(codes.contains(&"one_hour_ttl_without_reads"));
@@ -468,6 +688,7 @@ mod tests {
             &cache_events,
             &[],
             &compactions,
+            &[],
         );
         let codes = codes(&result);
         assert!(codes.contains(&"warm_without_followup"));
@@ -482,7 +703,7 @@ mod tests {
             enabled: false,
             ..Default::default()
         };
-        let result = audit_cache_events("ses-1", None, Some(&policy), &events, &[], &[]);
+        let result = audit_cache_events("ses-1", None, Some(&policy), &events, &[], &[], &[]);
         let codes = codes(&result);
         assert!(codes.contains(&"disabled_policy_emitted_breakpoints"));
         assert!(!result.clean);
@@ -501,6 +722,7 @@ mod tests {
             None,
             &cache_events,
             &prefix_events,
+            &[],
             &[],
         );
         let finding = result

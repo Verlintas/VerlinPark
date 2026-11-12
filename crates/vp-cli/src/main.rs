@@ -2236,6 +2236,14 @@ enum Command {
     /// Audit cache telemetry for breakpoint, churn, and cost-leak patterns.
     #[command(name = "cache-audit")]
     CacheAudit { session: String },
+    /// Show bounded append-only cache-break history (never message text).
+    #[command(name = "cache-breaks")]
+    CacheBreaks {
+        session: String,
+        /// Newest-first cap (1-200).
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
     /// Preview per-role prompt-cache plans and component hashes without a
     /// provider call.
     #[command(name = "cache-plan")]
@@ -7319,6 +7327,14 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await?
         }
+        Command::CacheBreaks { session, limit } => {
+            rpc(
+                &discovery,
+                "session.cache.breaks",
+                json!({"session_id": session, "limit": limit}),
+            )
+            .await?
+        }
         Command::CachePlan { session, role } => {
             rpc(
                 &discovery,
@@ -12316,6 +12332,51 @@ fn print_human(value: &Value) {
             Some(last_call) => println!("  last call        {last_call}"),
             None => println!("  last call        never"),
         }
+        if value.get("append_only_calls").is_some() {
+            println!(
+                "  append-only      {} ({} append · {} break{})",
+                value["last_append_only"].as_bool().unwrap_or(false),
+                value["append_only_calls"].as_u64().unwrap_or(0),
+                value["non_append_only_calls"].as_u64().unwrap_or(0),
+                value["last_tail_memory_mode"]
+                    .as_str()
+                    .map(|mode| format!(" · tail {mode}"))
+                    .unwrap_or_default()
+            );
+            println!(
+                "  message chain    {} · previous {} · {} messages",
+                short_hash(&value["last_message_prefix_hash"]),
+                short_hash(&value["last_previous_message_prefix_hash"]),
+                value["last_message_count"].as_u64().unwrap_or(0)
+            );
+            if let Some(capability) = value["last_tail_system_capability"].as_str() {
+                println!(
+                    "  provider tail    system {} · capability {capability}",
+                    value["provider_tail_system"].as_bool().unwrap_or(false)
+                );
+            }
+            let breaks = value["recent_breaks"].as_array();
+            if let Some(breaks) = breaks.filter(|breaks| !breaks.is_empty()) {
+                println!("  breaks           {} recent", breaks.len());
+                for entry in breaks.iter().take(5) {
+                    let index = entry["first_differing_index"]
+                        .as_u64()
+                        .map(|index| format!(" at #{index}"))
+                        .unwrap_or_default();
+                    let role = entry["first_differing_role"]
+                        .as_str()
+                        .map(|role| format!(" · {role}"))
+                        .unwrap_or_default();
+                    println!(
+                        "    {:<20} {}{}{}",
+                        entry["reason"].as_str().unwrap_or("unknown"),
+                        entry["at"].as_str().unwrap_or(""),
+                        index,
+                        role
+                    );
+                }
+            }
+        }
         if let Some(policy) = value.get("policy").filter(|policy| policy.is_object()) {
             println!(
                 "  policy           enabled {} · ttl {} · automatic {} · warm-on-resume {} · compact-aware {}",
@@ -12324,6 +12385,47 @@ fn print_human(value: &Value) {
                 policy["automatic_caching"].as_bool().unwrap_or(true),
                 policy["warm_on_resume"].as_bool().unwrap_or(false),
                 policy["compact_aware"].as_bool().unwrap_or(true)
+            );
+        }
+        return;
+    }
+    if let Some(session_id) = value.get("session_id").and_then(Value::as_str)
+        && value.get("total_breaks").is_some()
+        && value.get("breaks").is_some()
+    {
+        println!(
+            "cache breaks  {session_id}  ({} append · {} break · {} recorded{})",
+            value["append_only_calls"].as_u64().unwrap_or(0),
+            value["non_append_only_calls"].as_u64().unwrap_or(0),
+            value["total_breaks"].as_u64().unwrap_or(0),
+            if value["truncated"].as_bool().unwrap_or(false) {
+                " · truncated"
+            } else {
+                ""
+            }
+        );
+        for entry in value["breaks"].as_array().into_iter().flatten() {
+            let index = entry["first_differing_index"]
+                .as_u64()
+                .map(|index| format!(" at #{index}"))
+                .unwrap_or_default();
+            let role = entry["first_differing_role"]
+                .as_str()
+                .map(|role| format!(" · {role}"))
+                .unwrap_or_default();
+            let tool = entry["first_differing_tool_call_id"]
+                .as_str()
+                .map(|tool| format!(" · {tool}"))
+                .unwrap_or_default();
+            println!(
+                "  {:<20} {} · {}→{} msgs{}{}{}",
+                entry["reason"].as_str().unwrap_or("unknown"),
+                entry["at"].as_str().unwrap_or(""),
+                entry["previous_message_count"].as_u64().unwrap_or(0),
+                entry["message_count"].as_u64().unwrap_or(0),
+                index,
+                role,
+                tool
             );
         }
         return;

@@ -7028,6 +7028,45 @@ pub struct SessionCacheStatus {
     /// Latest first-token latency for a cache-observed call.
     #[serde(default)]
     pub last_first_token_ms: Option<u64>,
+    /// Append-only continuity for the latest ordinary provider call.
+    #[serde(default)]
+    pub last_message_prefix_hash: Option<String>,
+    #[serde(default)]
+    pub last_previous_message_prefix_hash: Option<String>,
+    #[serde(default)]
+    pub last_append_only: bool,
+    #[serde(default)]
+    pub append_only_calls: u64,
+    #[serde(default)]
+    pub non_append_only_calls: u64,
+    /// Conversation message count of the latest ordinary call.
+    #[serde(default)]
+    pub last_message_count: u64,
+    /// How the latest call placed tail memory (`none`, `trailing_system`,
+    /// `trailing_user`, `embedded`).
+    #[serde(default)]
+    pub last_tail_memory_mode: Option<String>,
+    /// Whether the provider accepts a mid-history system message.
+    #[serde(default)]
+    pub provider_tail_system: Option<bool>,
+    #[serde(default)]
+    pub last_tail_system_capability: Option<String>,
+    /// Counting buckets for structural cache breaks and provider-side misses.
+    #[serde(default)]
+    pub cache_break_counts: Vec<CacheCountBucket>,
+    /// Bounded newest-first structural break records.
+    #[serde(default)]
+    pub recent_breaks: Vec<SessionCacheBreak>,
+    #[serde(default)]
+    pub last_cache_break_at: Option<String>,
+    /// Deterministic tool-call/tool-result ordering observations from the
+    /// latest ordinary call and the bounded window.
+    #[serde(default)]
+    pub last_message_sequence_issue_count: u64,
+    #[serde(default)]
+    pub last_message_sequence_issues: Vec<String>,
+    #[serde(default)]
+    pub message_sequence_issue_counts: Vec<CacheCountBucket>,
     /// Bounded newest-first list of per-call cache records.
     #[serde(default)]
     pub recent_calls: Vec<SessionCacheCall>,
@@ -7078,6 +7117,46 @@ pub struct CacheSavingsBucket {
     pub estimated_savings_usd: f64,
 }
 
+/// One bounded `context.cache_break` observation. It records why the canonical
+/// message list stopped being append-only, but never message text: only the
+/// first differing index, its role, and a tool-call id when that message is a
+/// tool result or tool-call turn.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCacheBreak {
+    #[serde(default)]
+    pub at: String,
+    /// `first_call`, `system_changed`, `tool_bundle_changed`, `message_edited`,
+    /// `message_reordered`, `compaction_reset`, `provider_cache_miss`, or
+    /// `unknown`.
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub agent_name: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub first_differing_index: Option<u64>,
+    #[serde(default)]
+    pub first_differing_role: Option<String>,
+    #[serde(default)]
+    pub first_differing_tool_call_id: Option<String>,
+    #[serde(default)]
+    pub previous_message_count: u64,
+    #[serde(default)]
+    pub message_count: u64,
+    #[serde(default)]
+    pub previous_message_prefix_hash: Option<String>,
+    #[serde(default)]
+    pub message_prefix_hash: Option<String>,
+    /// True when this event came from an explicit cache-warm request.
+    #[serde(default)]
+    pub warm: bool,
+}
+
 impl Default for SessionCacheCall {
     fn default() -> Self {
         Self {
@@ -7100,6 +7179,20 @@ impl Default for SessionCacheCall {
             tool_bundle_hash: None,
             volatile_hash: None,
             prompt_prefix_hash: None,
+            canonical_version: 0,
+            previous_message_prefix_hash: None,
+            message_prefix_hash: None,
+            append_only: false,
+            message_count: 0,
+            head_prefix_hash: None,
+            tail_prefix_hash: None,
+            request_prefix_hash: None,
+            tail_memory_mode: None,
+            provider_tail_system: None,
+            tail_system_capability: None,
+            cache_break_reason: None,
+            message_sequence_issue_count: 0,
+            message_sequence_issues: Vec::new(),
             estimated_savings_usd: 0.0,
             miss_reason: None,
             warm: false,
@@ -7150,6 +7243,41 @@ pub struct SessionCacheCall {
     pub volatile_hash: Option<String>,
     #[serde(default)]
     pub prompt_prefix_hash: Option<String>,
+    /// Canonical conversation continuity for this call. These fields are
+    /// additive; older events decode with empty/default values.
+    #[serde(default)]
+    pub canonical_version: u32,
+    #[serde(default)]
+    pub previous_message_prefix_hash: Option<String>,
+    #[serde(default)]
+    pub message_prefix_hash: Option<String>,
+    #[serde(default)]
+    pub append_only: bool,
+    #[serde(default)]
+    pub message_count: u64,
+    #[serde(default)]
+    pub head_prefix_hash: Option<String>,
+    #[serde(default)]
+    pub tail_prefix_hash: Option<String>,
+    #[serde(default)]
+    pub request_prefix_hash: Option<String>,
+    #[serde(default)]
+    pub tail_memory_mode: Option<String>,
+    #[serde(default)]
+    pub provider_tail_system: Option<bool>,
+    #[serde(default)]
+    pub tail_system_capability: Option<String>,
+    /// Structural break reason recorded by the runtime before this call, if
+    /// any. `provider_cache_miss` is post-call and means the provider did not
+    /// reuse an otherwise append-only prefix.
+    #[serde(default)]
+    pub cache_break_reason: Option<String>,
+    /// Deterministic tool-call/tool-result ordering observations. Diagnostic
+    /// only; the runtime never reorders messages.
+    #[serde(default)]
+    pub message_sequence_issue_count: u64,
+    #[serde(default)]
+    pub message_sequence_issues: Vec<String>,
     #[serde(default)]
     pub estimated_savings_usd: f64,
     #[serde(default)]
@@ -7341,6 +7469,32 @@ pub struct SessionCacheWarmResult {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionCacheParams {
     pub session_id: String,
+}
+
+/// Read-only structural cache-break history. It never calls a provider and
+/// never returns message text.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionCacheBreaksParams {
+    pub session_id: String,
+    /// Newest-first cap. Defaults to 50, maximum 200.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionCacheBreaksResult {
+    pub session_id: String,
+    #[serde(default)]
+    pub append_only_calls: u64,
+    #[serde(default)]
+    pub non_append_only_calls: u64,
+    /// Total break events in the scanned window before the cap.
+    #[serde(default)]
+    pub total_breaks: u64,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub breaks: Vec<SessionCacheBreak>,
 }
 
 /// Read-only tool-bundle inspection. It never calls a provider, starts a run,
@@ -12181,8 +12335,14 @@ mod tests {
         assert!(legacy.recent_calls.is_empty());
         assert!(legacy.policy.is_none());
         assert_eq!(legacy.last_breakpoints, 0);
+        assert!(!legacy.last_append_only);
+        assert_eq!(legacy.append_only_calls, 0);
+        assert_eq!(legacy.non_append_only_calls, 0);
+        assert!(legacy.recent_breaks.is_empty());
+        assert!(legacy.last_message_prefix_hash.is_none());
+        assert!(legacy.provider_tail_system.is_none());
 
-        let current: SessionCacheStatus = serde_json::from_value(json!({
+        let mut current_value = json!({
             "session_id": "ses-1",
             "input_tokens": 1000,
             "cache_read_tokens": 600,
@@ -12221,8 +12381,70 @@ mod tests {
             "compaction_invalidation_tokens": 900,
             "compaction_invalidation_estimated_usd": 0.0027,
             "policy": {"ttl": "1h", "warm_on_resume": true}
-        }))
-        .unwrap();
+        });
+        let continuity = json!({
+            "last_message_prefix_hash": "message-chain",
+            "last_previous_message_prefix_hash": "previous-chain",
+            "last_append_only": true,
+            "append_only_calls": 4,
+            "non_append_only_calls": 1,
+            "last_message_count": 12,
+            "last_tail_memory_mode": "embedded",
+            "provider_tail_system": true,
+            "last_tail_system_capability": "supported",
+            "cache_break_counts": [{"key": "first_call", "calls": 1}],
+            "recent_breaks": [{
+                "at": "2026-11-11T00:00:00Z",
+                "reason": "message_reordered",
+                "first_differing_index": 3,
+                "first_differing_role": "assistant",
+                "first_differing_tool_call_id": "call_1",
+                "previous_message_count": 8,
+                "message_count": 9,
+                "previous_message_prefix_hash": "previous-chain",
+                "message_prefix_hash": "message-chain"
+            }],
+            "last_cache_break_at": "2026-11-11T00:00:00Z"
+        });
+        if let (Some(target), Some(extra)) = (current_value.as_object_mut(), continuity.as_object())
+        {
+            target.extend(extra.clone());
+        }
+        if let Some(call) = current_value
+            .get_mut("recent_calls")
+            .and_then(Value::as_array_mut)
+            .and_then(|calls| calls.first_mut())
+            .and_then(Value::as_object_mut)
+        {
+            call.insert("message_prefix_hash".into(), json!("message-chain"));
+            call.insert(
+                "previous_message_prefix_hash".into(),
+                json!("previous-chain"),
+            );
+            call.insert("append_only".into(), json!(true));
+            call.insert("message_count".into(), json!(9));
+            call.insert("canonical_version".into(), json!(1));
+            call.insert("tail_memory_mode".into(), json!("embedded"));
+            call.insert("provider_tail_system".into(), json!(true));
+            call.insert("cache_break_reason".into(), json!("message_reordered"));
+            call.insert("message_sequence_issue_count".into(), json!(1));
+            call.insert(
+                "message_sequence_issues".into(),
+                json!(["tool_result_reordered"]),
+            );
+        }
+        if let Some(target) = current_value.as_object_mut() {
+            target.insert("last_message_sequence_issue_count".into(), json!(1));
+            target.insert(
+                "last_message_sequence_issues".into(),
+                json!(["tool_result_reordered"]),
+            );
+            target.insert(
+                "message_sequence_issue_counts".into(),
+                json!([{"key": "tool_result_reordered", "calls": 1}]),
+            );
+        }
+        let current: SessionCacheStatus = serde_json::from_value(current_value).unwrap();
         assert_eq!(current.cache_calls, 3);
         assert_eq!(current.last_breakpoints, 4);
         assert_eq!(current.last_cache_ttl.as_deref(), Some("1h"));
@@ -12241,6 +12463,105 @@ mod tests {
         assert_eq!(current.compaction_resets, 1);
         assert_eq!(current.compaction_invalidation_tokens, 900);
         assert_eq!(current.policy.as_ref().unwrap().ttl, "1h");
+        assert_eq!(
+            current.last_message_prefix_hash.as_deref(),
+            Some("message-chain")
+        );
+        assert_eq!(
+            current.last_previous_message_prefix_hash.as_deref(),
+            Some("previous-chain")
+        );
+        assert!(current.last_append_only);
+        assert_eq!(current.append_only_calls, 4);
+        assert_eq!(current.non_append_only_calls, 1);
+        assert_eq!(current.last_message_count, 12);
+        assert_eq!(current.last_tail_memory_mode.as_deref(), Some("embedded"));
+        assert_eq!(current.provider_tail_system, Some(true));
+        assert_eq!(
+            current.last_tail_system_capability.as_deref(),
+            Some("supported")
+        );
+        assert_eq!(current.cache_break_counts[0].key, "first_call");
+        assert_eq!(current.recent_breaks.len(), 1);
+        assert_eq!(current.recent_breaks[0].reason, "message_reordered");
+        assert_eq!(current.recent_breaks[0].first_differing_index, Some(3));
+        assert_eq!(
+            current.recent_breaks[0]
+                .first_differing_tool_call_id
+                .as_deref(),
+            Some("call_1")
+        );
+        assert!(current.recent_calls[0].append_only);
+        assert_eq!(current.recent_calls[0].message_count, 9);
+        assert_eq!(current.recent_calls[0].canonical_version, 1);
+        assert_eq!(current.last_message_sequence_issue_count, 1);
+        assert_eq!(
+            current.last_message_sequence_issues,
+            vec!["tool_result_reordered"]
+        );
+        assert_eq!(current.message_sequence_issue_counts[0].calls, 1);
+        assert_eq!(current.recent_calls[0].message_sequence_issue_count, 1);
+        assert_eq!(
+            current.recent_calls[0].message_sequence_issues,
+            vec!["tool_result_reordered"]
+        );
+    }
+
+    #[test]
+    fn session_cache_breaks_result_is_additive_and_bounded() {
+        let legacy: SessionCacheBreaksResult =
+            serde_json::from_value(json!({"session_id": "ses-1"})).unwrap();
+        assert_eq!(legacy.session_id, "ses-1");
+        assert_eq!(legacy.total_breaks, 0);
+        assert!(!legacy.truncated);
+        assert!(legacy.breaks.is_empty());
+        let current: SessionCacheBreaksResult = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "append_only_calls": 4,
+            "non_append_only_calls": 1,
+            "total_breaks": 2,
+            "truncated": true,
+            "breaks": [{
+                "reason": "compaction_reset",
+                "previous_message_count": 8,
+                "message_count": 2
+            }]
+        }))
+        .unwrap();
+        assert_eq!(current.append_only_calls, 4);
+        assert_eq!(current.breaks[0].reason, "compaction_reset");
+        assert!(current.truncated);
+        let encoded = serde_json::to_value(&current).unwrap();
+        assert_eq!(encoded["breaks"][0]["message_count"], 2);
+    }
+
+    #[test]
+    fn session_cache_break_decodes_legacy_and_all_reasons() {
+        let legacy: SessionCacheBreak = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(legacy, SessionCacheBreak::default());
+        assert_eq!(legacy.reason, "");
+        assert_eq!(legacy.message_count, 0);
+
+        for reason in [
+            "first_call",
+            "system_changed",
+            "tool_bundle_changed",
+            "message_edited",
+            "message_reordered",
+            "compaction_reset",
+            "provider_cache_miss",
+            "unknown",
+        ] {
+            let decoded: SessionCacheBreak = serde_json::from_value(json!({
+                "reason": reason,
+                "message_count": 2,
+                "previous_message_count": 1,
+            }))
+            .unwrap();
+            assert_eq!(decoded.reason, reason);
+            assert_eq!(decoded.message_count, 2);
+            assert_eq!(decoded.previous_message_count, 1);
+        }
     }
 
     #[test]

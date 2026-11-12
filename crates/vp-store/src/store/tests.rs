@@ -769,6 +769,89 @@ fn creates_and_filters_project_memories() {
 }
 
 #[test]
+fn round_trips_system_memory_anchors_in_conversation_order() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("anchors"))
+        .unwrap();
+    let session = store.create_session(&project.id, "anchors").unwrap();
+    store
+        .append_message(
+            &session.id,
+            "user",
+            "first prompt",
+            &serde_json::json!([]),
+            None,
+        )
+        .unwrap();
+    let (anchor, event) = store
+        .append_message_with_event(
+            &session.id,
+            "system",
+            "Run memory (retrieved for this session):\nrelease registry",
+            &serde_json::json!([]),
+            None,
+        )
+        .unwrap();
+    assert_eq!(event.kind, "message.created");
+    assert_eq!(event.payload["role"], serde_json::json!("system"));
+    assert_eq!(
+        event.payload["content"],
+        serde_json::json!("Run memory (retrieved for this session):\nrelease registry")
+    );
+    store
+        .append_message(
+            &session.id,
+            "assistant",
+            "answer",
+            &serde_json::json!([]),
+            None,
+        )
+        .unwrap();
+    // A second, changed brief appends a new anchor instead of moving the old
+    // one. That is the append-only memory contract.
+    store
+        .append_message(
+            &session.id,
+            "system",
+            "Run memory (retrieved for this session):\nworkspace cache",
+            &serde_json::json!([]),
+            None,
+        )
+        .unwrap();
+    store
+        .append_message(
+            &session.id,
+            "user",
+            "second prompt",
+            &serde_json::json!([]),
+            None,
+        )
+        .unwrap();
+
+    let messages = store.list_messages(&session.id).unwrap();
+    let roles = messages
+        .iter()
+        .map(|message| message.role.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(roles, vec!["user", "system", "assistant", "system", "user"]);
+    assert_eq!(messages[1].id, anchor.id);
+    assert!(messages[1].content.contains("release registry"));
+    assert!(messages[3].content.contains("workspace cache"));
+    assert_eq!(messages[0].content, "first prompt");
+    assert_eq!(messages[2].content, "answer");
+
+    let events = store.list_events(&session.id, 1, 100).unwrap();
+    let created = events
+        .iter()
+        .filter(|event| event.kind == "message.created")
+        .count();
+    // `append_message` is the store-only helper used for fixtures; the anchor
+    // was written through the event-backed path that the runtime uses.
+    assert_eq!(created, 1);
+}
+
+#[test]
 fn searches_messages_with_fts_prefix_and_like_fallback() {
     let (_data, store, repo) = test_store();
     let project = store

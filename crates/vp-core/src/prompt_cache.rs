@@ -806,11 +806,80 @@ pub fn cache_call_record(payload: &Value, created_at: &str) -> SessionCacheCall 
         tool_bundle_hash: text("tool_bundle_hash"),
         volatile_hash: text("volatile_hash"),
         prompt_prefix_hash: text("prompt_prefix_hash"),
+        canonical_version: payload
+            .get("canonical_version")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32,
+        previous_message_prefix_hash: text("previous_message_prefix_hash")
+            .filter(|hash| !hash.is_empty()),
+        message_prefix_hash: text("message_prefix_hash"),
+        append_only: payload
+            .get("append_only")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        message_count: u64("message_count"),
+        head_prefix_hash: text("head_prefix_hash"),
+        tail_prefix_hash: text("tail_prefix_hash"),
+        request_prefix_hash: text("request_prefix_hash"),
+        tail_memory_mode: text("tail_memory_mode"),
+        provider_tail_system: payload.get("provider_tail_system").and_then(Value::as_bool),
+        tail_system_capability: text("tail_system_capability"),
+        cache_break_reason: text("cache_break_reason"),
+        message_sequence_issue_count: payload
+            .get("message_sequence_issue_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| {
+                payload
+                    .get("message_sequence_issues")
+                    .and_then(Value::as_array)
+                    .map_or(0, |issues| issues.len() as u64)
+            }),
+        message_sequence_issues: payload
+            .get("message_sequence_issues")
+            .and_then(Value::as_array)
+            .map(|issues| {
+                issues
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
         estimated_savings_usd: payload
             .get("estimated_savings_usd")
             .and_then(Value::as_f64)
             .unwrap_or(0.0),
         miss_reason: text("miss_reason"),
+        warm: payload
+            .get("warm")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }
+}
+
+/// Decode one bounded `context.cache_break` event for the protocol projection.
+pub fn cache_break_record(
+    payload: &Value,
+    created_at: &str,
+) -> vp_protocol::types::SessionCacheBreak {
+    use vp_protocol::types::SessionCacheBreak;
+    let text = |key: &str| payload.get(key).and_then(Value::as_str).map(str::to_string);
+    let u64 = |key: &str| payload.get(key).and_then(Value::as_u64).unwrap_or(0);
+    SessionCacheBreak {
+        at: created_at.to_string(),
+        reason: text("reason").unwrap_or_else(|| "unknown".to_string()),
+        agent_name: text("agent_name"),
+        role: text("agent_role").or_else(|| text("role")),
+        model: text("model"),
+        provider: text("provider"),
+        first_differing_index: payload.get("first_differing_index").and_then(Value::as_u64),
+        first_differing_role: text("first_differing_role"),
+        first_differing_tool_call_id: text("first_differing_tool_call_id"),
+        previous_message_count: u64("previous_message_count"),
+        message_count: u64("message_count"),
+        previous_message_prefix_hash: text("previous_message_prefix_hash")
+            .filter(|hash| !hash.is_empty()),
+        message_prefix_hash: text("message_prefix_hash"),
         warm: payload
             .get("warm")
             .and_then(Value::as_bool)
@@ -1264,6 +1333,20 @@ mod tests {
             "estimated_savings_usd": 0.25,
             "miss_reason": "ttl_or_provider_miss",
             "warm": false,
+            "canonical_version": 1,
+            "previous_message_prefix_hash": "previous",
+            "message_prefix_hash": "chain",
+            "append_only": true,
+            "message_count": 7,
+            "head_prefix_hash": "head",
+            "tail_prefix_hash": "tail",
+            "request_prefix_hash": "request",
+            "tail_memory_mode": "embedded",
+            "provider_tail_system": true,
+            "tail_system_capability": "supported",
+            "cache_break_reason": "message_edited",
+            "message_sequence_issue_count": 2,
+            "message_sequence_issues": ["orphan_tool_result", "unanswered_tool_call"],
         });
         let record = cache_call_record(&payload, "now");
         assert_eq!(record.cache_breakpoints, 4);
@@ -1271,6 +1354,52 @@ mod tests {
         assert_eq!(record.miss_reason.as_deref(), Some("ttl_or_provider_miss"));
         assert_eq!(record.estimated_savings_usd, 0.25);
         assert_eq!(record.first_token_ms, Some(321));
+        assert_eq!(record.canonical_version, 1);
+        assert_eq!(
+            record.previous_message_prefix_hash.as_deref(),
+            Some("previous")
+        );
+        assert_eq!(record.message_prefix_hash.as_deref(), Some("chain"));
+        assert!(record.append_only);
+        assert_eq!(record.message_count, 7);
+        assert_eq!(record.tail_memory_mode.as_deref(), Some("embedded"));
+        assert_eq!(record.provider_tail_system, Some(true));
+        assert_eq!(record.cache_break_reason.as_deref(), Some("message_edited"));
+        assert_eq!(record.message_sequence_issue_count, 2);
+        assert_eq!(record.message_sequence_issues.len(), 2);
+        assert_eq!(record.request_prefix_hash.as_deref(), Some("request"));
+    }
+
+    #[test]
+    fn cache_break_record_tolerates_legacy_payloads() {
+        let record = cache_break_record(&serde_json::json!({}), "now");
+        assert_eq!(record.reason, "unknown");
+        assert_eq!(record.message_count, 0);
+        assert!(record.first_differing_index.is_none());
+        let record = cache_break_record(
+            &serde_json::json!({
+                "reason": "tool_bundle_changed",
+                "agent_name": "Leader",
+                "agent_role": "leader",
+                "provider": "deepseek",
+                "model": "deepseek-flash",
+                "previous_message_count": 9,
+                "message_count": 10,
+                "previous_message_prefix_hash": "previous",
+                "message_prefix_hash": "chain",
+                "warm": false
+            }),
+            "now",
+        );
+        assert_eq!(record.reason, "tool_bundle_changed");
+        assert_eq!(record.role.as_deref(), Some("leader"));
+        assert_eq!(record.provider.as_deref(), Some("deepseek"));
+        assert_eq!(record.previous_message_count, 9);
+        assert_eq!(record.message_count, 10);
+        assert_eq!(
+            record.previous_message_prefix_hash.as_deref(),
+            Some("previous")
+        );
     }
 
     fn event(kind: &str, payload: serde_json::Value) -> vp_protocol::types::Event {

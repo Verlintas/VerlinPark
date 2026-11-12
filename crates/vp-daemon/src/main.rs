@@ -80,12 +80,13 @@ use vp_protocol::types::{
     ProjectListResult, ProjectUsageParams, PromptParams, PromptResult, QuestionListParams,
     RehydrateSessionParams, ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult,
     ResolveMergeParams, ResolveMergeResult, RetryMergeParams, RetryMergeResult,
-    SchedulerStatusParams, SearchParams, ServerInfo, SessionCacheAuditParams, SessionCacheParams,
-    SessionCachePlanParams, SessionCacheWarmParams, SessionCheckpointDeleteParams,
-    SessionCheckpointDiffParams, SessionCheckpointListParams, SessionCheckpointParams,
-    SessionCheckpointPruneParams, SessionCheckpointRestoreParams, SessionCheckpointStatsParams,
-    SessionCitationAuditParams, SessionCitationsParams, SessionCompactParams, SessionCompareParams,
-    SessionContextParams, SessionContinuationCancelParams, SessionContinuationReclaimParams,
+    SchedulerStatusParams, SearchParams, ServerInfo, SessionCacheAuditParams,
+    SessionCacheBreaksParams, SessionCacheParams, SessionCachePlanParams, SessionCacheWarmParams,
+    SessionCheckpointDeleteParams, SessionCheckpointDiffParams, SessionCheckpointListParams,
+    SessionCheckpointParams, SessionCheckpointPruneParams, SessionCheckpointRestoreParams,
+    SessionCheckpointStatsParams, SessionCitationAuditParams, SessionCitationsParams,
+    SessionCompactParams, SessionCompareParams, SessionContextParams,
+    SessionContinuationCancelParams, SessionContinuationReclaimParams,
     SessionContinuationStatusParams, SessionContinuationsParams, SessionDeferParams,
     SessionDiffParams, SessionExportParams, SessionForkParams, SessionForkTreeParams,
     SessionImportParams, SessionInstructionsParams, SessionLineageParams, SessionListResult,
@@ -2952,6 +2953,17 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         },
         "session.cache.audit" => match parse_params::<SessionCacheAuditParams>(request.params) {
             Ok(params) => match state.engine.session_cache_audit(&params.session_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.cache.breaks" => match parse_params::<SessionCacheBreaksParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .session_cache_breaks(&params.session_id, params.limit)
+                .await
+            {
                 Ok(result) => RpcResponse::success(id, result),
                 Err(error) => internal_error(id, error),
             },
