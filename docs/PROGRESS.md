@@ -1,7 +1,7 @@
 # VerlinPark 进度
 
 > 最后更新：2026-11-12
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark + task contracts/intent authorization/MCP schema pins 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark + task contracts/intent authorization/MCP schema pins + effect receipts/postconditions 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
@@ -101,6 +101,66 @@
 - read-only path access 不受 `write_scope` 限制；现有 path jail/role policy 仍生效。
 - MCP pin 只检测 advertised schema/description 变化，不检测 schema 不变时的恶意运行时行为。
 - 没有 C2 effect receipts、C3 durable gates、C4 version pinning 或 S1–S8 identities；这些仍按计划分阶段。
+
+---
+
+## 2026-11-12 Contracted execution C2: effect receipts and postconditions
+
+C2 已实现并合入 `d78d253`，ADR-0194。Rust **3,458 passed / 0 failed / 6 ignored**，Swift **487 passed**（355 app + 132 helper），clippy/swiftformat/xcodebuild 通过。
+
+### Effect receipts
+
+- `effect_receipts`：`intent | done | failed | unknown`，字段含 attempt、canonical target、request_hash、provider_key、external_id、response_hash、bounded evidence_json。
+- 部分唯一索引 `(session_id, COALESCE(task_id,''), tool, target, request_hash) WHERE state IN ('intent','done','unknown')`：同一逻辑 effect 幂等，failed 仍保留 attempt。
+- `begin_effect` 与 run-journal step/tool intent 同事务；settlement 与 step、tool completion、receipt、`effect.*`、`tool.finished` 同事务。
+- `done` terminal，replay 直接返回 evidence，不重新执行；`unknown` 阻止 auto-retry、merge queue 和 `session.land`，必须 `effect.reconcile`；`failed` 只允许新 attempt 或显式 reconcile。
+- daemon restart 后 stale `intent` 由 sweep（`VERLINPARK_EFFECT_SWEEP_SECS`，默认 30s）标为 `unknown`，永不自动重试。
+
+### Postcondition probes
+
+| Family | Probe | State / limit |
+|---|---|---|
+| `write_file` / `edit_file` | exists + SHA-256 vs after-hash | done；mismatch unknown；missing failed |
+| `apply_patch` | 每个 changed path 的 exists/absent + after_sha256 | ≥33 paths → unknown |
+| `file_manage` | mkdir/delete/move/copy postcondition | done/failed |
+| `run_project_task` | ok/exit_code + bounded output hash | done/failed；local evidence |
+| Worker/session commit | `git rev-parse` | done |
+| Integrator/land | post-lease HEAD/branch | done |
+| `git push` | command completion + commit/branch | network ambiguous → unknown |
+| forge PR/MR | response URL/change | timeout/5xx/conflict → unknown |
+| `remote_write` | helper post-write SHA-256 | helper evidence，不独立 re-stat |
+| `remote_exec`/`remote_git`/`remote_worktree` | none | unknown |
+| remote bundle integration | verified import + queue identity | done；local merge 另记 |
+| mutating `local_http` | status + body hash | 2xx/3xx done，4xx failed，5xx/timeout unknown；不声称 remote exactly-once |
+| `fetch_url` GET | optional `track_read_http` | 默认不记 |
+| raw `shell` | explicit `effect_probe` only | 否则 unknown |
+| MCP call / dynamic MCP | none | unknown；inspection 不记 |
+| deploy/webhook | no producer | 仅 target kind |
+
+### Merge/reconcile
+
+- `enqueue_merge_with_source` 在创建 queue row 前检查 task + session 的 unresolved receipts；错误为 typed `EffectBlocked` / `EFFECT_UNKNOWN`。
+- `process_merge_entry_fenced` 在 integration lease 下再次检查；不 unsettled 时把 entry 标为 failed（`effect_unsettled`），不改变 branch。
+- `session.land` 同样 gate。
+- `effect.reconcile` 只接受 `done|failed`；done 需要 hash/commit/external id/HTTP status/至少 8 字符 note；reconciled done terminal。
+- double push/PR 测试验证 exact request 只调用一次 `gh pr create`、只发一个 `session.pr_opened`。
+
+### 策略与界面
+
+- `EffectPolicy`：enabled 默认 true、`unknown_blocks_merge` 默认 true、stale grace 120s、shell `external_only`、`track_mutating_http` 默认 true、`track_read_http` 默认 false、`track_mcp_mutations` 默认 true、`track_workspace_writes` 默认 true。
+- RPC：`session.effects`、`effect.reconcile`、`effect.sweep`、`project.effect_policy.get/set`。
+- CLI：`vp effects`、`vp effect-reconcile`、`vp effect-policy`、`vp effect-policy-set`、`vp effect-sweep`。
+- Swift：`SessionEffectsReport`/`EffectReceiptView`、`CoreClient.sessionEffects`/`reconcileEffect`、`AppModel.sessionEffects`、Stage `EffectBadge`、Efficiency `EffectReceiptsSection`。
+- replay/repair/db-rebuild/bundle import 重建 receipts；`SessionReplayReport.effects_match`、`SessionBundle.effects` additive。
+
+### 限制
+
+- Receipts 是本地证据，不是 provider/remote exactly-once。
+- Remote write 信任 helper 的 post-write hash，没有独立 re-stat。
+- `git push` 默认以 command completion 为准；ambiguous transport failure 为 unknown，需对 remote reconcile。
+- Mutating shell/MCP 可能产生 unknown 并阻塞 merge，直到 operator reconcile；`unknown_blocks_merge=false` 是显式观察模式。
+- Settled receipt retention/GC 尚未实现；查询有界但存储会增长。
+- Browser/computer GUI 仍由 GUI lease/action timeline 管，不走 effect receipts。
 
 ---
 

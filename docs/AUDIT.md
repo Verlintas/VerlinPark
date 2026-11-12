@@ -31,6 +31,20 @@ Limits:
 - C1 does not add C2 effect receipts, so `git push`, PR/MR creation, remote writes, deploys, and webhooks still lack settled/unknown receipts. That is the next gap.
 - Contract policy defaults to `enforce`; out-of-contract path/URL/shell/MCP calls escalate rather than silently passing. Teams that need observation first can set `advisory`.
 
+## 0.4 2026-11-12 Contracted execution C2
+
+C2 is implemented and merged at `d78d253` (ADR-0194): `effect_receipts` with `intent|done|failed|unknown`, atomic begin/settle with tool/run-journal events, postcondition probes for workspace writes/commits/merges/push/PR/remote/HTTP, `unknown` blocking retry/merge/landing, explicit `effect.reconcile`, and a default-on `EffectPolicy` with a 120s stale-intent sweep. Rust 3,458 passed; Swift 487 passed; clippy/swiftformat/xcodebuild passed.
+
+Limits:
+
+- Receipts are **local evidence**, not provider or remote exactly-once. A `done` receipt means the local probe observed the postcondition; a remote service may still have deduplicated or not.
+- Remote writes trust the helper's post-write hash; there is no independent re-stat.
+- `git push` uses command completion by default; ambiguous transport failures become `unknown` and require reconciliation against the remote.
+- Mutating shell/MCP calls without a reliable local probe become `unknown` and can block merge until an operator reconciles. `unknown_blocks_merge=false` is an explicit observation mode, not the default.
+- Settled receipt retention/GC is not implemented; storage can grow.
+- Browser/computer GUI actions remain governed by the GUI lease/action timeline, not effect receipts.
+- C3 durable external gates, C4 version pinning, C5 reliability, and C6+ failure attribution are still planned.
+
 ## 0. 2026-10-30 跟进
 
 第一轮硬化已完成（同一 `main` 线，提交见仓库历史）：

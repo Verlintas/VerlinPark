@@ -489,8 +489,8 @@ should wait until the identity/role contracts and Worker workspace phases
 | Task | Status | Evidence |
 |---|---|---|
 | C1 TaskContract + intent + MCP pins | **implemented** | `2647e67`, ADR-0193, 3,418 Rust / 483 Swift tests |
-| C2 EffectReceipts | planned | next |
-| C3 Durable external gates | planned | |
+| C2 EffectReceipts | **implemented** | `d78d253`, ADR-0194, 3,458 Rust / 487 Swift tests |
+| C3 Durable external gates | planned | next |
 | C4 Version pinning + controller replay | planned | |
 | C5 Reliability + OTel | planned | |
 | C6 Failure attribution | planned | |
