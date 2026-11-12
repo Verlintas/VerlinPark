@@ -6757,6 +6757,10 @@ pub struct AgentInfo {
     pub context_window: Option<u64>,
     #[serde(default)]
     pub approval_mode: ApprovalMode,
+    /// Static tool-bundle matrix. Additive in protocol v1; older clients that
+    /// do not know the field ignore it.
+    #[serde(default)]
+    pub tool_bundles: Vec<ToolBundleCatalogRow>,
 }
 
 fn default_context_calibration() -> f64 {
@@ -6992,6 +6996,18 @@ pub struct SessionCacheStatus {
     pub project_hash: Option<String>,
     #[serde(default)]
     pub tools_hash: Option<String>,
+    /// Latest frozen built-in tool bundle name (`leader`, `coding`, `research`,
+    /// `verification`, `minimal`, or `full`).
+    #[serde(default)]
+    pub tool_bundle: Option<String>,
+    /// Hash of the selected built-in bundle before dynamic MCP schemas.
+    #[serde(default)]
+    pub tool_bundle_hash: Option<String>,
+    /// Built-in and dynamic MCP tool counts from the latest prompt prefix.
+    #[serde(default)]
+    pub tool_bundle_tool_count: Option<u64>,
+    #[serde(default)]
+    pub tool_bundle_mcp_count: Option<u64>,
     #[serde(default)]
     pub volatile_hash: Option<String>,
     /// Best-effort estimate of the system-prompt and tool-schema preamble.
@@ -7080,6 +7096,8 @@ impl Default for SessionCacheCall {
             core_hash: None,
             project_hash: None,
             tools_hash: None,
+            tool_bundle: None,
+            tool_bundle_hash: None,
             volatile_hash: None,
             prompt_prefix_hash: None,
             estimated_savings_usd: 0.0,
@@ -7123,6 +7141,11 @@ pub struct SessionCacheCall {
     pub project_hash: Option<String>,
     #[serde(default)]
     pub tools_hash: Option<String>,
+    /// Frozen bundle name and built-in bundle hash for this call.
+    #[serde(default)]
+    pub tool_bundle: Option<String>,
+    #[serde(default)]
+    pub tool_bundle_hash: Option<String>,
     #[serde(default)]
     pub volatile_hash: Option<String>,
     #[serde(default)]
@@ -7242,6 +7265,21 @@ pub struct SessionCachePlanRole {
     pub stable_prefix_chars: u64,
     #[serde(default)]
     pub tool_count: usize,
+    /// Frozen bundle selected for the role and optional task kind.
+    #[serde(default)]
+    pub tool_bundle: String,
+    #[serde(default)]
+    pub tool_bundle_hash: String,
+    #[serde(default)]
+    pub tool_bundle_tool_count: usize,
+    #[serde(default)]
+    pub tool_bundle_mcp_count: usize,
+    #[serde(default)]
+    pub tool_bundle_target_limit: Option<usize>,
+    #[serde(default)]
+    pub tool_bundle_within_target: Option<bool>,
+    #[serde(default)]
+    pub tool_bundle_fallback: bool,
     #[serde(default)]
     pub system_tokens_estimate: u64,
     #[serde(default)]
@@ -7303,6 +7341,332 @@ pub struct SessionCacheWarmResult {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionCacheParams {
     pub session_id: String,
+}
+
+/// Read-only tool-bundle inspection. It never calls a provider, starts a run,
+/// or creates a worktree.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ToolBundleParams {
+    pub session_id: String,
+    /// Roles to inspect. Empty means every role currently present in the
+    /// session, plus the Leader.
+    #[serde(default)]
+    pub roles: Vec<String>,
+    /// Optional plan task kind used to partition a Worker/Labour bundle. When
+    /// omitted, the agent's stored plan task kind is used if one exists.
+    #[serde(default)]
+    pub task_kind: Option<String>,
+    /// Include per-tool metadata rows. Defaults to true; schemas are never
+    /// returned.
+    #[serde(default)]
+    pub include_tools: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolBundleWarningInfo {
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub message: String,
+}
+
+/// One bounded per-tool row. It contains hashes and counts, never schema text.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolBundleToolInfo {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub workspace_write: bool,
+    #[serde(default)]
+    pub delegation: bool,
+    #[serde(default)]
+    pub schema_hash: String,
+    #[serde(default)]
+    pub description_chars: u64,
+    #[serde(default)]
+    pub parameter_fields: u64,
+}
+
+/// Latest observed `context.prompt_prefix` for one role, if any. It is derived
+/// from persisted events, not recomputed from current configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolBundleLastRun {
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub agent_name: Option<String>,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub bundle: String,
+    #[serde(default)]
+    pub bundle_hash: String,
+    #[serde(default)]
+    pub tools_hash: String,
+    #[serde(default)]
+    pub tool_count: u64,
+    #[serde(default)]
+    pub mcp_tool_count: u64,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolBundleCategoryCount {
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub tools: usize,
+    #[serde(default)]
+    pub schema_bytes: u64,
+}
+
+/// One role's frozen bundle. `requested` is the explicit template; `tools` is
+/// what the runtime actually produced after role policy and delegation rules.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolBundleRoleResult {
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub profile: String,
+    #[serde(default)]
+    pub task_kind: Option<String>,
+    #[serde(default)]
+    pub bundle: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub fallback: bool,
+    #[serde(default)]
+    pub bundle_hash: String,
+    #[serde(default)]
+    pub tools_hash: String,
+    #[serde(default)]
+    pub requested: Vec<String>,
+    #[serde(default)]
+    pub omitted: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<ToolBundleWarningInfo>,
+    #[serde(default)]
+    pub builtin_count: usize,
+    #[serde(default)]
+    pub mcp_count: usize,
+    #[serde(default)]
+    pub total_count: usize,
+    /// Exact canonical schema bytes and a diagnostic token estimate.
+    #[serde(default)]
+    pub schema_bytes: u64,
+    #[serde(default)]
+    pub estimated_tool_tokens: u64,
+    #[serde(default)]
+    pub target_limit: Option<usize>,
+    #[serde(default)]
+    pub within_target: Option<bool>,
+    #[serde(default)]
+    pub categories: Vec<ToolBundleCategoryCount>,
+    #[serde(default)]
+    pub tools: Vec<ToolBundleToolInfo>,
+    #[serde(default)]
+    pub last_run: Option<ToolBundleLastRun>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolBundleCatalogRow {
+    #[serde(default)]
+    pub bundle: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub target_limit: Option<usize>,
+    #[serde(default)]
+    pub requested_count: usize,
+    #[serde(default)]
+    pub representative_role: String,
+    #[serde(default)]
+    pub representative_profile: String,
+    #[serde(default)]
+    pub allows_dynamic_mcp: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolBundleResult {
+    pub session_id: String,
+    #[serde(default)]
+    pub roles: Vec<ToolBundleRoleResult>,
+    #[serde(default)]
+    pub catalog: Vec<ToolBundleCatalogRow>,
+}
+
+/// Static bundle matrix for `tool_bundle.catalog` / `vp tool-bundles`. No
+/// session is needed and no provider call is made.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolBundleCatalogResult {
+    #[serde(default)]
+    pub bundles: Vec<ToolBundleCatalogRow>,
+    /// Programming-error findings from the static matrix audit. Empty in a
+    /// healthy build.
+    #[serde(default)]
+    pub warnings: Vec<ToolBundleWarningInfo>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ToolBundleMatrixParams {
+    /// Task kinds to evaluate. Empty uses the built-in deterministic set:
+    /// no kind, implementation, verification, research, trivial, unknown.
+    #[serde(default)]
+    pub task_kinds: Vec<String>,
+}
+
+/// One actual role/profile/task-kind combination, resolved against the live
+/// tool registry. This is the test-gated partition as the runtime would build
+/// it, not the static request list.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolBundleMatrixRow {
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub profile: String,
+    #[serde(default)]
+    pub task_kind: Option<String>,
+    #[serde(default)]
+    pub bundle: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub fallback: bool,
+    #[serde(default)]
+    pub bundle_hash: String,
+    #[serde(default)]
+    pub tools_hash: String,
+    #[serde(default)]
+    pub builtin_count: usize,
+    #[serde(default)]
+    pub mcp_count: usize,
+    #[serde(default)]
+    pub total_count: usize,
+    #[serde(default)]
+    pub schema_bytes: u64,
+    #[serde(default)]
+    pub estimated_tool_tokens: u64,
+    #[serde(default)]
+    pub requested_count: usize,
+    #[serde(default)]
+    pub omitted_count: usize,
+    #[serde(default)]
+    pub target_limit: Option<usize>,
+    #[serde(default)]
+    pub within_target: Option<bool>,
+    #[serde(default)]
+    pub warning_count: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolBundleMatrixResult {
+    #[serde(default)]
+    pub task_kinds: Vec<String>,
+    #[serde(default)]
+    pub rows: Vec<ToolBundleMatrixRow>,
+    #[serde(default)]
+    pub warnings: Vec<ToolBundleWarningInfo>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ToolBundleHistoryParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Newest-first cap. Defaults to 50 and is clamped to 200.
+    #[serde(default)]
+    pub limit: Option<u64>,
+}
+
+/// One persisted `context.prompt_prefix` observation. History is derived from
+/// the event stream and never recomputed from current configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolBundleHistoryEntry {
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub agent_name: Option<String>,
+    #[serde(default)]
+    pub bundle: String,
+    #[serde(default)]
+    pub bundle_hash: String,
+    #[serde(default)]
+    pub tools_hash: String,
+    #[serde(default)]
+    pub tool_count: u64,
+    #[serde(default)]
+    pub mcp_tool_count: u64,
+    #[serde(default)]
+    pub task_kind: Option<String>,
+    #[serde(default)]
+    pub fallback: bool,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolBundleHistoryResult {
+    pub session_id: String,
+    #[serde(default)]
+    pub entries: Vec<ToolBundleHistoryEntry>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ToolBundleDiffParams {
+    pub from_bundle: String,
+    pub to_bundle: String,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub task_kind: Option<String>,
+}
+
+/// Deterministic diff between two bundle previews for one role/profile. Tool
+/// lists are sorted and bounded; no schema text is returned.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolBundleDiffResult {
+    pub from_bundle: String,
+    pub to_bundle: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub profile: String,
+    #[serde(default)]
+    pub task_kind: Option<String>,
+    #[serde(default)]
+    pub from_hash: String,
+    #[serde(default)]
+    pub to_hash: String,
+    #[serde(default)]
+    pub from_count: usize,
+    #[serde(default)]
+    pub to_count: usize,
+    #[serde(default)]
+    pub added: Vec<String>,
+    #[serde(default)]
+    pub removed: Vec<String>,
+    #[serde(default)]
+    pub shared: Vec<String>,
+    #[serde(default)]
+    pub changed: bool,
+    #[serde(default)]
+    pub warnings: Vec<ToolBundleWarningInfo>,
 }
 
 /// Bounded per-tool activity rows derived from the append-only
@@ -12086,6 +12450,13 @@ mod tests {
                 project_chars: 50,
                 stable_prefix_chars: 151,
                 tool_count: 20,
+                tool_bundle: "leader".into(),
+                tool_bundle_hash: "bundle".into(),
+                tool_bundle_tool_count: 46,
+                tool_bundle_mcp_count: 2,
+                tool_bundle_target_limit: Some(48),
+                tool_bundle_within_target: Some(true),
+                tool_bundle_fallback: false,
                 system_tokens_estimate: 200,
                 tool_tokens_estimate: 400,
             }],
@@ -12101,6 +12472,226 @@ mod tests {
         assert_eq!(minimal.roles[0].cache_breakpoints, 0);
         assert_eq!(minimal.roles[0].tool_count, 0);
         assert!(minimal.policy.is_none());
+    }
+
+    #[test]
+    fn tool_bundle_params_default_to_all_session_roles() {
+        let params: ToolBundleParams =
+            serde_json::from_value(json!({"session_id": "ses-1"})).unwrap();
+        assert_eq!(params.session_id, "ses-1");
+        assert!(params.roles.is_empty());
+        assert!(params.task_kind.is_none());
+        assert!(params.include_tools.is_none());
+        let explicit: ToolBundleParams = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "roles": ["worker"],
+            "task_kind": "trivial",
+            "include_tools": false
+        }))
+        .unwrap();
+        assert_eq!(explicit.roles, vec!["worker".to_string()]);
+        assert_eq!(explicit.task_kind.as_deref(), Some("trivial"));
+        assert_eq!(explicit.include_tools, Some(false));
+    }
+
+    #[test]
+    fn tool_bundle_result_round_trips_and_decodes_minimal_payloads() {
+        let result = ToolBundleResult {
+            session_id: "ses-1".into(),
+            roles: vec![ToolBundleRoleResult {
+                role: "worker".into(),
+                profile: "coding".into(),
+                task_kind: Some("trivial".into()),
+                bundle: "minimal".into(),
+                title: "Minimal".into(),
+                reason: "task_kind".into(),
+                fallback: false,
+                bundle_hash: "bundle".into(),
+                tools_hash: "tools".into(),
+                requested: vec!["read_file".into(), "write_file".into()],
+                omitted: vec!["apply_patch".into()],
+                warnings: vec![ToolBundleWarningInfo {
+                    code: "tool_bundle_omitted".into(),
+                    message: "missing apply_patch".into(),
+                }],
+                builtin_count: 6,
+                mcp_count: 0,
+                total_count: 6,
+                schema_bytes: 4096,
+                estimated_tool_tokens: 1024,
+                target_limit: Some(12),
+                within_target: Some(true),
+                categories: vec![ToolBundleCategoryCount {
+                    category: "files".into(),
+                    tools: 1,
+                    schema_bytes: 512,
+                }],
+                tools: vec![ToolBundleToolInfo {
+                    name: "read_file".into(),
+                    category: "files".into(),
+                    workspace_write: false,
+                    delegation: false,
+                    schema_hash: "schema".into(),
+                    description_chars: 120,
+                    parameter_fields: 2,
+                }],
+                last_run: Some(ToolBundleLastRun {
+                    agent_id: Some("agt-1".into()),
+                    agent_name: Some("Worker".into()),
+                    role: "worker".into(),
+                    bundle: "minimal".into(),
+                    bundle_hash: "bundle".into(),
+                    tools_hash: "tools".into(),
+                    tool_count: 6,
+                    mcp_tool_count: 0,
+                    created_at: "2026-11-12T00:00:00Z".into(),
+                }),
+            }],
+            catalog: vec![ToolBundleCatalogRow {
+                bundle: "minimal".into(),
+                title: "Minimal".into(),
+                summary: "small".into(),
+                target_limit: Some(12),
+                requested_count: 6,
+                representative_role: "worker".into(),
+                representative_profile: "coding".into(),
+                allows_dynamic_mcp: false,
+            }],
+        };
+        let encoded = serde_json::to_value(&result).unwrap();
+        let decoded: ToolBundleResult = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, result);
+
+        let minimal: ToolBundleResult =
+            serde_json::from_value(json!({"session_id": "ses-1"})).unwrap();
+        assert!(minimal.roles.is_empty());
+        assert!(minimal.catalog.is_empty());
+        let role: ToolBundleRoleResult = serde_json::from_value(json!({"role": "leader"})).unwrap();
+        assert_eq!(role.role, "leader");
+        assert_eq!(role.bundle, "");
+        assert_eq!(role.builtin_count, 0);
+        assert!(role.last_run.is_none());
+        assert!(role.warnings.is_empty());
+    }
+
+    #[test]
+    fn tool_bundle_catalog_result_decodes_and_agent_info_defaults() {
+        let result: ToolBundleCatalogResult = serde_json::from_value(json!({
+            "bundles": [{
+                "bundle": "leader",
+                "title": "Leader",
+                "summary": "orchestration",
+                "target_limit": 48,
+                "requested_count": 46,
+                "representative_role": "leader",
+                "representative_profile": "generic",
+                "allows_dynamic_mcp": true
+            }],
+            "warnings": [{"code": "w", "message": "m"}]
+        }))
+        .unwrap();
+        assert_eq!(result.bundles.len(), 1);
+        assert_eq!(result.bundles[0].target_limit, Some(48));
+        assert_eq!(result.warnings[0].code, "w");
+        let empty: ToolBundleCatalogResult = serde_json::from_value(json!({})).unwrap();
+        assert!(empty.bundles.is_empty());
+        assert!(empty.warnings.is_empty());
+        let info: AgentInfo = serde_json::from_value(json!({"configured": false})).unwrap();
+        assert!(info.tool_bundles.is_empty());
+        assert_eq!(info.approval_mode, ApprovalMode::default());
+    }
+
+    #[test]
+    fn tool_bundle_history_and_diff_decode_with_defaults() {
+        let history: ToolBundleHistoryResult = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "entries": [{
+                "seq": 4,
+                "role": "worker",
+                "bundle": "minimal",
+                "bundle_hash": "hash",
+                "tools_hash": "tools",
+                "tool_count": 6,
+                "mcp_tool_count": 0,
+                "task_kind": "trivial",
+                "fallback": false,
+                "reason": "task_kind",
+                "created_at": "now"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(history.entries[0].seq, 4);
+        assert_eq!(history.entries[0].bundle, "minimal");
+        assert_eq!(history.entries[0].task_kind.as_deref(), Some("trivial"));
+        let empty: ToolBundleHistoryResult =
+            serde_json::from_value(json!({"session_id": "ses-1"})).unwrap();
+        assert!(empty.entries.is_empty());
+
+        let diff: ToolBundleDiffResult = serde_json::from_value(json!({
+            "from_bundle": "leader",
+            "to_bundle": "minimal",
+            "added": ["a"],
+            "removed": ["b"],
+            "shared": ["c"],
+            "changed": true
+        }))
+        .unwrap();
+        assert_eq!(diff.from_count, 0);
+        assert!(diff.changed);
+        assert_eq!(diff.added, vec!["a"]);
+        assert!(diff.warnings.is_empty());
+        let params: ToolBundleDiffParams = serde_json::from_value(json!({
+            "from_bundle": "leader",
+            "to_bundle": "minimal"
+        }))
+        .unwrap();
+        assert!(params.role.is_none());
+        assert!(params.task_kind.is_none());
+        let history_params: ToolBundleHistoryParams = serde_json::from_value(json!({
+            "session_id": "ses-1"
+        }))
+        .unwrap();
+        assert!(history_params.role.is_none());
+        assert!(history_params.limit.is_none());
+    }
+
+    #[test]
+    fn cache_status_decodes_legacy_payload_without_bundle_fields() {
+        let status: SessionCacheStatus = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "input_tokens": 100,
+            "cache_read_tokens": 80
+        }))
+        .unwrap();
+        assert!(status.tool_bundle.is_none());
+        assert!(status.tool_bundle_hash.is_none());
+        assert!(status.tool_bundle_tool_count.is_none());
+        assert!(status.tool_bundle_mcp_count.is_none());
+        let call: SessionCacheCall = serde_json::from_value(json!({
+            "at": "now",
+            "tool_bundle": "leader",
+            "tool_bundle_hash": "hash"
+        }))
+        .unwrap();
+        assert_eq!(call.tool_bundle.as_deref(), Some("leader"));
+        assert_eq!(call.tool_bundle_hash.as_deref(), Some("hash"));
+    }
+
+    #[test]
+    fn cache_plan_role_decodes_legacy_payload_without_bundle_fields() {
+        let role: SessionCachePlanRole = serde_json::from_value(json!({
+            "role": "leader",
+            "provider": "deepseek",
+            "model": "deepseek-flash"
+        }))
+        .unwrap();
+        assert_eq!(role.tool_bundle, "");
+        assert_eq!(role.tool_bundle_hash, "");
+        assert_eq!(role.tool_bundle_tool_count, 0);
+        assert_eq!(role.tool_bundle_mcp_count, 0);
+        assert_eq!(role.tool_bundle_target_limit, None);
+        assert_eq!(role.tool_bundle_within_target, None);
+        assert!(!role.tool_bundle_fallback);
     }
 
     #[test]

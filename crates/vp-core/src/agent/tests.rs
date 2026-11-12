@@ -177,6 +177,7 @@ fn help_spec(role: AgentRole, profile: AgentProfile) -> AgentSpec {
         department: None,
         profile,
         allow_delegation: false,
+        task_kind: None,
         auto_approve: false,
         worktree: PathBuf::from("/tmp/help-worktree"),
         branch: "help".to_string(),
@@ -923,6 +924,124 @@ impl Provider for RoundtableProvider {
     }
 }
 
+/// Deterministic provider for the plan bundle test. It branches on the
+/// advertised tool set instead of guessing from prompt text, which also proves
+/// the schema partition is stable for the whole run.
+struct BundlePlanProvider {
+    requests: Arc<Mutex<Vec<ChatRequest>>>,
+    leader_calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl Provider for BundlePlanProvider {
+    fn id(&self) -> &str {
+        "bundle-plan"
+    }
+
+    async fn stream_chat(&self, request: ChatRequest) -> Result<EventStream, ProviderError> {
+        self.requests.lock().unwrap().push(request.clone());
+        let names = request
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let last_role = request.messages.last().map(|message| message.role.as_str());
+        let last_content = request
+            .messages
+            .last()
+            .map(|message| message.content.as_str())
+            .unwrap_or_default();
+        let events = if names.contains("submit_verdict") {
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "bundle_verdict".into(),
+                    name: "submit_verdict".into(),
+                    arguments: serde_json::json!({
+                        "approved": true,
+                        "summary": "the trivial task wrote the expected file"
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ]
+        } else if names.contains("submit_team_plan") {
+            let call = self
+                .leader_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                let plan = serde_json::json!({
+                    "goal": "run a trivial bundle task",
+                    "departments": [{
+                        "name": "impl",
+                        "manager_title": "Implementation",
+                        "profile": "coding",
+                        "objective": "make the tiny change"
+                    }],
+                    "tasks": [{
+                        "id": "T1",
+                        "department": "impl",
+                        "title": "Tiny change",
+                        "kind": "trivial",
+                        "deps": [],
+                        "acceptance": ["bundle-note.txt contains hello"],
+                        "write_scope": ["bundle-note.txt"]
+                    }]
+                });
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "bundle_plan".into(),
+                        name: "submit_team_plan".into(),
+                        arguments: plan.to_string(),
+                    }),
+                    StreamEvent::Done,
+                ]
+            } else if call == 1 && last_role == Some("tool") {
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "bundle_run".into(),
+                        name: "run_team_plan".into(),
+                        arguments: "{}".into(),
+                    }),
+                    StreamEvent::Done,
+                ]
+            } else {
+                vec![
+                    StreamEvent::TextDelta("bundle plan complete".into()),
+                    StreamEvent::Done,
+                ]
+            }
+        } else if names.contains("write_file") {
+            if last_role == Some("tool") {
+                vec![
+                    StreamEvent::TextDelta("trivial task complete".into()),
+                    StreamEvent::Done,
+                ]
+            } else {
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "bundle_write".into(),
+                        name: "write_file".into(),
+                        arguments: serde_json::json!({
+                            "path": "bundle-note.txt",
+                            "content": "hello from the minimal bundle\n"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ]
+            }
+        } else {
+            vec![
+                StreamEvent::TextDelta(format!("unexpected bundle: {last_content}")),
+                StreamEvent::Done,
+            ]
+        };
+        Ok(Box::pin(futures_util::stream::iter(
+            events.into_iter().map(Ok),
+        )))
+    }
+}
+
 fn init_repo(path: &Path) {
     for args in [
         vec!["init", "-q"],
@@ -953,7 +1072,7 @@ async fn runs_tool_call_and_final_message() {
         .start(&session.id, "inspect the repo")
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let _ = wait_until_idle(&engine, &session).await;
     let events = engine
         .list_events(session.id.clone(), 0, 100)
         .await
@@ -1452,6 +1571,7 @@ async fn records_merge_conflicts_in_the_queue() {
         department: Some("impl".into()),
         profile: AgentProfile::Coding,
         allow_delegation: true,
+        task_kind: None,
         auto_approve: false,
         worktree: task.path.clone(),
         branch: task.branch.clone(),
@@ -1528,6 +1648,7 @@ async fn retries_a_conflicted_merge_after_rebase() {
         department: Some("impl".into()),
         profile: AgentProfile::Coding,
         allow_delegation: true,
+        task_kind: None,
         auto_approve: false,
         worktree: task.path.clone(),
         branch: task.branch.clone(),
@@ -1626,6 +1747,7 @@ async fn auto_resolves_a_conflicted_merge_with_an_agent() {
         department: Some("impl".into()),
         profile: AgentProfile::Coding,
         allow_delegation: true,
+        task_kind: None,
         auto_approve: false,
         worktree: task.path.clone(),
         branch: task.branch.clone(),
@@ -1763,6 +1885,7 @@ async fn auto_resolver_policy_resolves_pending_conflicts() {
         department: Some("impl".into()),
         profile: AgentProfile::Coding,
         allow_delegation: true,
+        task_kind: None,
         auto_approve: false,
         worktree: task.path.clone(),
         branch: task.branch.clone(),
@@ -3077,7 +3200,7 @@ async fn submits_a_team_plan_and_applies_manager_profiles() {
         .await
         .unwrap();
     service.start(&session.id, "research").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let _ = wait_until_idle(&engine, &session).await;
 
     let stored = engine.get_team_plan(&session.id).await.unwrap().unwrap();
     assert_eq!(stored.departments[0].manager_title, "Sources");
@@ -4041,6 +4164,7 @@ fn plan_budget_scope_includes_the_project_pool() {
         department: None,
         profile: AgentProfile::Coding,
         allow_delegation: false,
+        task_kind: None,
         auto_approve: false,
         worktree: PathBuf::from("/tmp"),
         branch: "task".into(),
@@ -4754,6 +4878,7 @@ async fn mailbox_tools_send_read_and_publish() {
         department: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
+        task_kind: None,
         auto_approve: false,
         worktree: PathBuf::from(session.worktree.clone().unwrap()),
         branch: session.branch.clone().unwrap(),
@@ -4847,6 +4972,7 @@ async fn coordination_tool_records_blockers_and_team_status_reads_the_board() {
         department: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
+        task_kind: None,
         auto_approve: false,
         worktree: worktree.clone(),
         branch: branch.clone(),
@@ -6611,9 +6737,31 @@ async fn cancels_a_slow_provider_stream() {
         .await
         .unwrap();
     service.start(&session.id, "cancel me").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait until the run is active before cancelling. Under a loaded test
+    // harness a fixed sleep can race the spawned run.
+    for _ in 0..200 {
+        let active = engine
+            .list_events(session.id.clone(), 0, 20)
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "agent.turn_started");
+        if active {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert!(service.cancel(&session.id));
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    for _ in 0..200 {
+        let sessions = engine
+            .list_sessions(Some(session.project_id.clone()))
+            .await
+            .unwrap();
+        if sessions[0].status == "cancelled" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let events = engine
         .list_events(session.id.clone(), 0, 100)
         .await
@@ -7698,6 +7846,7 @@ async fn prepared_summary_cache_invalidates_on_every_key_component() {
         department: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
+        task_kind: None,
         auto_approve: false,
         worktree: PathBuf::from("."),
         branch: "test".into(),
@@ -7826,6 +7975,7 @@ async fn structured_state_honors_an_explicit_task_id() {
         department: Some("impl".into()),
         profile: AgentProfile::Coding,
         allow_delegation: false,
+        task_kind: None,
         auto_approve: false,
         worktree: PathBuf::from("."),
         branch: "test".into(),
@@ -7866,6 +8016,7 @@ async fn structured_state_without_a_plan_uses_the_session_goal() {
         department: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
+        task_kind: None,
         auto_approve: false,
         worktree: PathBuf::from("."),
         branch: "test".into(),
@@ -7900,6 +8051,7 @@ async fn agent_shaping_uses_the_project_tool_output_policy() {
         department: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
+        task_kind: None,
         auto_approve: false,
         worktree: PathBuf::from("."),
         branch: "test".into(),
@@ -7961,6 +8113,7 @@ async fn error_failure_contract_survives_output_spill_shaping() {
         department: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
+        task_kind: None,
         auto_approve: false,
         worktree: PathBuf::from("."),
         branch: "test".into(),
@@ -8069,6 +8222,7 @@ async fn spills_large_tool_results_and_pages_them_with_read_tool_output() {
         department: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
+        task_kind: None,
         auto_approve: false,
         worktree: PathBuf::from("."),
         branch: "test".into(),
@@ -8222,6 +8376,7 @@ async fn prepare_failure_is_distinct_from_compaction_failure() {
         department: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
+        task_kind: None,
         auto_approve: false,
         worktree: PathBuf::from("."),
         branch: "test".into(),
@@ -8388,6 +8543,7 @@ async fn prepared_summary_is_invalidated_by_a_real_plan_revision() {
         department: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
+        task_kind: None,
         auto_approve: false,
         worktree: PathBuf::from("."),
         branch: "test".into(),
@@ -8551,6 +8707,7 @@ async fn compaction_fallback_preserves_the_authoritative_plan_state() {
         department: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
+        task_kind: None,
         auto_approve: false,
         worktree: PathBuf::from("."),
         branch: "test".into(),
@@ -8675,6 +8832,7 @@ async fn prepared_summary_is_reused_once_at_the_threshold() {
         department: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
+        task_kind: None,
         auto_approve: false,
         worktree: PathBuf::from("."),
         branch: "test".into(),
@@ -8850,6 +9008,7 @@ async fn prepared_summary_is_invalidated_by_model_and_plan_changes() {
         department: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
+        task_kind: None,
         auto_approve: false,
         worktree: PathBuf::from("."),
         branch: "test".into(),
@@ -9367,6 +9526,7 @@ async fn trims_older_messages_when_summarization_fails() {
         department: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
+        task_kind: None,
         auto_approve: false,
         worktree: PathBuf::from("."),
         branch: "test".into(),
@@ -9479,6 +9639,7 @@ async fn compaction_counts_system_and_tool_tokens() {
         department: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
+        task_kind: None,
         auto_approve: false,
         worktree: PathBuf::from("."),
         branch: "test".into(),
@@ -9586,6 +9747,7 @@ async fn compaction_applies_context_calibration() {
         department: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
+        task_kind: None,
         auto_approve: false,
         worktree: PathBuf::from("."),
         branch: "test".into(),
@@ -11546,6 +11708,7 @@ async fn warm_on_resume_is_opt_in_and_adds_one_stable_section_call() {
         department: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
+        task_kind: None,
         auto_approve: false,
         worktree: worktree.clone(),
         branch: "main".into(),
@@ -12458,6 +12621,15 @@ async fn exposes_runtime_budget_search_and_artifact_tools() {
             .unwrap()
             .contains("read_file")
     );
+    assert_eq!(search.payload["structured"]["bundle"], "leader");
+    let read_file = search.payload["structured"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "read_file")
+        .expect("read_file search result");
+    assert_eq!(read_file["in_bundle"], true);
+    assert_eq!(read_file["category"], "files");
     let browser_search = events
         .iter()
         .find(|event| {
@@ -12471,6 +12643,23 @@ async fn exposes_runtime_budget_search_and_artifact_tools() {
             .as_str()
             .unwrap()
             .contains("browser")
+    );
+    let browser = browser_search.payload["structured"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "browser")
+        .expect("browser search result");
+    assert_eq!(
+        browser["in_bundle"], false,
+        "a generic Leader bundle does not advertise GUI tools"
+    );
+    assert_eq!(browser_search.payload["structured"]["bundle"], "leader");
+    assert!(
+        browser_search.payload["structured"]["outside_bundle"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1
     );
     let artifact = events
         .iter()
@@ -12536,6 +12725,7 @@ async fn task_detail_and_control_wrappers_are_event_backed() {
         department: Some("impl".into()),
         profile: AgentProfile::Coding,
         allow_delegation: true,
+        task_kind: None,
         auto_approve: false,
         worktree: PathBuf::from(session.worktree.clone().unwrap()),
         branch: session.branch.clone().unwrap(),
@@ -15855,6 +16045,7 @@ async fn stale_integration_owner_aborts_before_touching_the_session_branch() {
         department: Some("impl".into()),
         profile: AgentProfile::Coding,
         allow_delegation: true,
+        task_kind: None,
         auto_approve: false,
         worktree: task.path.clone(),
         branch: task.branch.clone(),
@@ -19957,6 +20148,1125 @@ async fn parallel_tool_run_preemption_still_aborts_every_tool() {
     assert!(first.2.load(Ordering::SeqCst) && second.2.load(Ordering::SeqCst));
 }
 
+#[tokio::test]
+async fn frozen_tool_bundle_matches_the_role_matrix_and_stays_stable() {
+    let dir = TempDir::new().unwrap();
+    let (_engine, service, _project) = test_service(&dir);
+    let config = service.config.read().unwrap().as_ref().unwrap().clone();
+    let no_mcp: Vec<McpToolBinding> = Vec::new();
+
+    let mut leader = help_spec(AgentRole::Leader, AgentProfile::Coding);
+    leader.allow_delegation = true;
+    let leader_bundle = frozen_tool_bundle(&config, &leader, &no_mcp);
+    assert_eq!(
+        leader_bundle.kind(),
+        crate::tool_bundle::ToolBundleKind::Leader
+    );
+    assert!(leader_bundle.builtin_count() <= crate::tool_bundle::LEADER_TOOL_LIMIT);
+    assert_eq!(leader_bundle.builtin_count(), 48);
+    assert!(leader_bundle.contains("submit_team_plan"));
+    assert!(leader_bundle.contains("delegate"));
+    assert!(leader_bundle.contains("browser"));
+    assert!(leader_bundle.contains("computer"));
+    assert!(!leader_bundle.contains("submit_verdict"));
+    assert!(leader_bundle.within_target() == Some(true));
+    assert_eq!(leader_bundle.bundle_hash.len(), 64);
+    assert_eq!(leader_bundle.tools_hash.len(), 64);
+
+    let mut second = help_spec(AgentRole::Leader, AgentProfile::Coding);
+    second.allow_delegation = true;
+    let second_bundle = frozen_tool_bundle(&config, &second, &no_mcp);
+    assert_eq!(leader_bundle.tool_names(), second_bundle.tool_names());
+    assert_eq!(leader_bundle.bundle_hash, second_bundle.bundle_hash);
+    assert_eq!(leader_bundle.tools_hash, second_bundle.tools_hash);
+
+    let mut coding = help_spec(AgentRole::Worker, AgentProfile::Coding);
+    coding.allow_delegation = true;
+    coding.task_kind = Some("implementation".into());
+    let coding_bundle = frozen_tool_bundle(&config, &coding, &no_mcp);
+    assert_eq!(
+        coding_bundle.kind(),
+        crate::tool_bundle::ToolBundleKind::Coding
+    );
+    assert!(coding_bundle.builtin_count() <= crate::tool_bundle::CODING_TOOL_LIMIT);
+    assert!(coding_bundle.contains("write_file"));
+    assert!(coding_bundle.contains("delegate"));
+    assert!(coding_bundle.contains("run_project_task"));
+    assert!(coding_bundle.contains("browser"));
+    for forbidden in [
+        "submit_team_plan",
+        "todo_write",
+        "submit_verdict",
+        "task_control",
+    ] {
+        assert!(
+            !coding_bundle.contains(forbidden),
+            "coding Worker must not advertise {forbidden}"
+        );
+    }
+
+    let mut labour = help_spec(AgentRole::Labour, AgentProfile::Coding);
+    labour.allow_delegation = false;
+    labour.task_kind = Some("implementation".into());
+    let labour_bundle = frozen_tool_bundle(&config, &labour, &no_mcp);
+    assert!(!labour_bundle.contains("delegate"));
+
+    let mut verification = help_spec(AgentRole::Verifier, AgentProfile::Verification);
+    verification.task_kind = Some("review".into());
+    let verification_bundle = frozen_tool_bundle(&config, &verification, &no_mcp);
+    assert_eq!(
+        verification_bundle.kind(),
+        crate::tool_bundle::ToolBundleKind::Verification
+    );
+    assert!(verification_bundle.contains("submit_verdict"));
+    for forbidden in [
+        "write_file",
+        "edit_file",
+        "apply_patch",
+        "delegate",
+        "todo_write",
+    ] {
+        assert!(!verification_bundle.contains(forbidden));
+    }
+
+    let mut research = help_spec(AgentRole::Worker, AgentProfile::Research);
+    research.task_kind = Some("research".into());
+    let research_bundle = frozen_tool_bundle(&config, &research, &no_mcp);
+    assert_eq!(
+        research_bundle.kind(),
+        crate::tool_bundle::ToolBundleKind::Research
+    );
+    assert!(research_bundle.contains("web_search"));
+    assert!(!research_bundle.contains("shell"));
+    assert!(!research_bundle.contains("write_file"));
+
+    let mut minimal = help_spec(AgentRole::Worker, AgentProfile::Coding);
+    minimal.task_kind = Some("trivial".into());
+    let minimal_bundle = frozen_tool_bundle(&config, &minimal, &no_mcp);
+    assert_eq!(
+        minimal_bundle.kind(),
+        crate::tool_bundle::ToolBundleKind::Minimal
+    );
+    assert_eq!(minimal_bundle.builtin_count(), 6);
+    assert!(minimal_bundle.within_target() == Some(true));
+
+    let mut unknown = help_spec(AgentRole::Worker, AgentProfile::Coding);
+    unknown.task_kind = Some("not-a-real-kind".into());
+    let unknown_bundle = frozen_tool_bundle(&config, &unknown, &no_mcp);
+    assert_eq!(
+        unknown_bundle.kind(),
+        crate::tool_bundle::ToolBundleKind::Full
+    );
+    assert!(unknown_bundle.selection.fallback);
+    assert!(unknown_bundle.builtin_count() > minimal_bundle.builtin_count());
+}
+
+#[tokio::test]
+async fn leader_run_advertises_the_partitioned_bundle_and_telemetry() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_read".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"README.md"}"#.into(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("leader done".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "bundle leader".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service.start(&session.id, "bundle leader").await.unwrap();
+    let _ = wait_until_idle(&engine, &session).await;
+
+    let names = {
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        let names = recorded[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>();
+        assert!(names.len() <= crate::tool_bundle::LEADER_TOOL_LIMIT);
+        for required in [
+            "read_file",
+            "delegate",
+            "submit_team_plan",
+            "todo_write",
+            "tool_help",
+        ] {
+            assert!(names.contains(&required.to_string()), "missing {required}");
+        }
+        assert!(!names.contains(&"submit_verdict".to_string()));
+        for request in recorded.iter() {
+            let turn_names = request
+                .tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(turn_names, names, "tool schemas must not churn per turn");
+        }
+        let frozen_hash = crate::tool_bundle::canonical_tools_hash(&recorded[0].tools);
+        let second_hash = crate::tool_bundle::canonical_tools_hash(&recorded[1].tools);
+        assert_eq!(frozen_hash, second_hash);
+        names
+    };
+
+    let events = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    let prefix = events
+        .iter()
+        .find(|event| event.kind == "context.prompt_prefix")
+        .expect("prompt prefix");
+    assert_eq!(prefix.payload["tool_bundle"], "leader");
+    assert_eq!(prefix.payload["tool_bundle_frozen"], true);
+    assert_eq!(prefix.payload["tool_bundle_within_target"], true);
+    assert_eq!(prefix.payload["tool_bundle_fallback"], false);
+    assert_eq!(prefix.payload["tool_bundle_tool_count"], names.len());
+    assert!(
+        prefix.payload["tool_bundle_hash"]
+            .as_str()
+            .is_some_and(|hash| hash.len() == 64)
+    );
+    assert!(
+        prefix.payload["tool_bundle_mcp_count"]
+            .as_u64()
+            .is_some_and(|count| count == 0)
+    );
+    let cache = events
+        .iter()
+        .find(|event| event.kind == "context.cache")
+        .expect("cache telemetry");
+    assert_eq!(cache.payload["tool_bundle"], "leader");
+    assert!(cache.payload["tool_bundle_hash"].as_str().is_some());
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "context.tool_bundle")
+            .count(),
+        1,
+        "the manifest is emitted once per run, not per turn"
+    );
+    let manifest = events
+        .iter()
+        .find(|event| event.kind == "context.tool_bundle")
+        .expect("tool bundle manifest");
+    assert_eq!(manifest.payload["bundle"], "leader");
+    assert_eq!(manifest.payload["frozen"], true);
+    assert_eq!(manifest.payload["builtin_count"], names.len());
+    assert_eq!(
+        manifest.payload["tools"].as_array().unwrap().len(),
+        names.len()
+    );
+    assert!(!manifest.payload.to_string().contains("description for"));
+    for tool in manifest.payload["tools"].as_array().unwrap() {
+        assert!(tool["schema_hash"].as_str().unwrap().len() == 64);
+        assert!(tool["category"].as_str().is_some());
+    }
+}
+
+#[tokio::test]
+async fn tool_bundle_now_reports_minimal_worker_and_catalog_without_a_run() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "bundle inspect".into(), None)
+        .await
+        .unwrap();
+    let leader_id = engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let worker = engine
+        .create_agent(
+            &session.id,
+            "worker",
+            "Preview Worker",
+            None,
+            Some(leader_id),
+            "test",
+        )
+        .await
+        .unwrap();
+    engine
+        .set_agent_profile(&worker.id, "coding")
+        .await
+        .unwrap();
+    let result = service
+        .tool_bundle_now(&session.id, &["worker".to_string()], Some("trivial"), true)
+        .await
+        .unwrap();
+    assert_eq!(result.roles.len(), 1);
+    let worker = &result.roles[0];
+    assert_eq!(worker.role, "worker");
+    assert_eq!(worker.bundle, "minimal");
+    assert_eq!(worker.builtin_count, 6);
+    assert_eq!(
+        worker.target_limit,
+        Some(crate::tool_bundle::MINIMAL_TOOL_LIMIT)
+    );
+    assert_eq!(worker.within_target, Some(true));
+    assert!(!worker.fallback);
+    assert_eq!(worker.tools.len(), 6);
+    assert!(worker.last_run.is_none());
+    for tool in &worker.tools {
+        assert!(
+            tool.category != "unbundled",
+            "missing metadata for {}",
+            tool.name
+        );
+    }
+    assert_eq!(result.catalog.len(), 6);
+    let leader = result
+        .catalog
+        .iter()
+        .find(|row| row.bundle == "leader")
+        .unwrap();
+    assert_eq!(leader.target_limit, Some(48));
+
+    let snapshot = service
+        .tool_bundle_now(&session.id, &[], None, false)
+        .await
+        .unwrap();
+    assert!(snapshot.roles.iter().any(|role| role.role == "leader"));
+    assert!(snapshot.roles.iter().all(|role| role.tools.is_empty()));
+    let default_leader = snapshot
+        .roles
+        .iter()
+        .find(|role| role.role == "leader")
+        .unwrap();
+    assert_eq!(default_leader.bundle, "leader");
+    assert_eq!(default_leader.builtin_count, 46);
+}
+
+#[tokio::test]
+async fn cache_plan_reports_the_frozen_bundle_for_each_role() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "bundle plan".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let plan = service
+        .cache_plan_now(&session.id, &["leader".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(plan.roles.len(), 1);
+    let leader = &plan.roles[0];
+    assert_eq!(leader.tool_bundle, "leader");
+    assert_eq!(leader.tool_bundle_tool_count, 46);
+    assert_eq!(leader.tool_bundle_within_target, Some(true));
+    assert!(!leader.tool_bundle_fallback);
+    assert_eq!(leader.tool_bundle_hash.len(), 64);
+    assert!(leader.tool_count >= leader.tool_bundle_tool_count);
+}
+
+#[tokio::test]
+async fn verifier_dispatch_denies_a_manual_write_outside_role_policy() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_manager".into(),
+                    name: "delegate".into(),
+                    arguments: serde_json::json!({
+                        "role": "manager",
+                        "title": "Quality",
+                        "objective": "review the change"
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_worker".into(),
+                    name: "delegate".into(),
+                    arguments: serde_json::json!({
+                        "role": "worker",
+                        "objective": "write verified.txt",
+                        "write_scope": ["verified.txt"]
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_write".into(),
+                    name: "write_file".into(),
+                    arguments: serde_json::json!({
+                        "path": "verified.txt",
+                        "content": "approved change\n"
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("worker wrote".into()),
+                StreamEvent::Done,
+            ],
+            // The Verifier manually requests a write. The schema is absent and
+            // role policy must reject the dispatch before approval or disk I/O.
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_verifier_write".into(),
+                    name: "write_file".into(),
+                    arguments: serde_json::json!({
+                        "path": "verifier-write.txt",
+                        "content": "must not exist\n"
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_verdict".into(),
+                    name: "submit_verdict".into(),
+                    arguments: serde_json::json!({
+                        "approved": false,
+                        "summary": "do not merge yet"
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("manager done".into()),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("leader done".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "verifier bundle".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let approver_engine = engine.clone();
+    let approver_session = session.id.clone();
+    let approver = tokio::spawn(async move {
+        for _ in 0..150 {
+            if let Ok(approvals) = approver_engine
+                .list_approvals(Some(approver_session.clone()))
+                .await
+            {
+                for approval in approvals.iter().filter(|a| a.status == "pending") {
+                    let _ = approver_engine.resolve_approval(&approval.id, true).await;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    service.start(&session.id, "verifier bundle").await.unwrap();
+    for _ in 0..150 {
+        let agents = engine.list_agents(&session.id).await.unwrap();
+        if agents.iter().any(|agent| {
+            agent.role == "verifier" && matches!(agent.status.as_str(), "idle" | "failed")
+        }) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    approver.abort();
+
+    let events = engine
+        .list_events(session.id.clone(), 0, 400)
+        .await
+        .unwrap();
+    let denied = events
+        .iter()
+        .find(|event| {
+            event.kind == "tool.finished"
+                && event.payload["agent_role"] == "verifier"
+                && event.payload["name"] == "write_file"
+        })
+        .expect("verifier write attempt is recorded");
+    assert_eq!(denied.payload["is_error"], true);
+    assert!(
+        denied.payload["output"]
+            .as_str()
+            .is_some_and(|output| output.contains("not available to verifier")),
+        "{}",
+        denied.payload["output"]
+    );
+    assert!(
+        !events.iter().any(|event| {
+            event.kind == "approval.requested"
+                && event.payload["agent_role"] == "verifier"
+                && event.payload["tool"] == "write_file"
+        }),
+        "role denial must not ask the user for approval"
+    );
+    // The verifier's detached clone never receives the file either.
+    let verifier = engine
+        .list_agents(&session.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|agent| agent.role == "verifier")
+        .expect("verifier");
+    if let Some(worktree) = verifier.worktree {
+        assert!(
+            !std::path::Path::new(&worktree)
+                .join("verifier-write.txt")
+                .exists()
+        );
+    }
+}
+
+#[tokio::test]
+async fn plan_task_kind_selects_minimal_coding_and_verification_bundles_at_runtime() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(BundlePlanProvider {
+        requests: requests.clone(),
+        leader_calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "bundle plan runtime".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service
+        .start(&session.id, "bundle plan runtime")
+        .await
+        .unwrap();
+    let _ = wait_until_idle(&engine, &session).await;
+
+    let worktree = session.worktree.clone().unwrap();
+    assert!(
+        std::path::Path::new(&worktree)
+            .join("bundle-note.txt")
+            .exists(),
+        "the minimal bundle must still be able to write the one-file task"
+    );
+    {
+        let recorded = requests.lock().unwrap();
+        assert!(!recorded.is_empty());
+        let leader_requests = recorded
+            .iter()
+            .filter(|request| {
+                request
+                    .tools
+                    .iter()
+                    .any(|tool| tool.name == "submit_team_plan")
+            })
+            .collect::<Vec<_>>();
+        assert!(!leader_requests.is_empty());
+        for request in &leader_requests {
+            let names = request
+                .tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>();
+            assert!(names.len() <= crate::tool_bundle::LEADER_TOOL_LIMIT);
+            assert!(!names.contains(&"submit_verdict".to_string()));
+        }
+        let worker_requests = recorded
+            .iter()
+            .filter(|request| {
+                request.tools.iter().any(|tool| tool.name == "write_file")
+                    && !request
+                        .tools
+                        .iter()
+                        .any(|tool| tool.name == "submit_team_plan")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(worker_requests.len(), 2, "write turn plus final text turn");
+        for request in &worker_requests {
+            let names = request
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(names.len(), 6, "trivial task must use the minimal bundle");
+            assert_eq!(
+                names,
+                vec![
+                    "edit_file",
+                    "list_dir",
+                    "read_file",
+                    "read_tool_output",
+                    "shell",
+                    "write_file",
+                ]
+            );
+        }
+        let verifier_requests = recorded
+            .iter()
+            .filter(|request| {
+                request
+                    .tools
+                    .iter()
+                    .any(|tool| tool.name == "submit_verdict")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(verifier_requests.len(), 1);
+        let verifier_names = verifier_requests[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(!verifier_names.contains(&"write_file"));
+        assert!(!verifier_names.contains(&"edit_file"));
+        assert!(!verifier_names.contains(&"delegate"));
+        assert!(verifier_names.contains(&"shell"));
+    }
+
+    let events = engine
+        .list_events(session.id.clone(), 0, 400)
+        .await
+        .unwrap();
+    let worker_prefix = events
+        .iter()
+        .find(|event| {
+            event.kind == "context.prompt_prefix" && event.payload["agent_role"] == "worker"
+        })
+        .expect("worker prompt prefix");
+    assert_eq!(worker_prefix.payload["tool_bundle"], "minimal");
+    assert_eq!(worker_prefix.payload["tool_bundle_tool_count"], 6);
+    assert_eq!(worker_prefix.payload["tool_bundle_within_target"], true);
+    let verifier_prefix = events
+        .iter()
+        .find(|event| {
+            event.kind == "context.prompt_prefix" && event.payload["agent_role"] == "verifier"
+        })
+        .expect("verifier prompt prefix");
+    assert_eq!(verifier_prefix.payload["tool_bundle"], "verification");
+    assert!(
+        verifier_prefix.payload["tool_bundle_tool_count"]
+            .as_u64()
+            .unwrap_or(0)
+            < crate::tool_bundle::LEADER_TOOL_LIMIT as u64
+    );
+    let leader_prefix = events
+        .iter()
+        .filter(|event| {
+            event.kind == "context.prompt_prefix" && event.payload["agent_role"] == "leader"
+        })
+        .count();
+    assert!(leader_prefix >= 1);
+}
+
+#[tokio::test]
+async fn bundle_catalog_is_exposed_through_agent_info_without_warnings() {
+    let dir = TempDir::new().unwrap();
+    let (_engine, service, _project) = test_service(&dir);
+    let catalog = service.tool_bundle_catalog();
+    assert_eq!(catalog.bundles.len(), 6);
+    assert!(catalog.warnings.is_empty(), "{:?}", catalog.warnings);
+    let names = catalog
+        .bundles
+        .iter()
+        .map(|row| row.bundle.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![
+            "leader",
+            "coding",
+            "research",
+            "verification",
+            "minimal",
+            "full"
+        ]
+    );
+    let info = service.info();
+    assert_eq!(info.tool_bundles.len(), 6);
+    assert_eq!(info.tool_bundles[4].bundle, "minimal");
+    assert_eq!(info.tool_bundles[4].target_limit, Some(12));
+}
+
+#[tokio::test]
+async fn leader_bundle_hash_is_stable_across_sessions_and_runs() {
+    let dir = TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::new()),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let mut prefix_hashes = Vec::new();
+    for goal in ["bundle session one", "bundle session two"] {
+        let session = engine
+            .create_session(project.id.clone(), goal.into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+        service.start(&session.id, goal).await.unwrap();
+        let _ = wait_until_idle(&engine, &session).await;
+        let events = engine
+            .list_events(session.id.clone(), 0, 200)
+            .await
+            .unwrap();
+        let prefix = events
+            .iter()
+            .find(|event| event.kind == "context.prompt_prefix")
+            .expect("prompt prefix");
+        assert_eq!(prefix.payload["tool_bundle"], "leader");
+        prefix_hashes.push(
+            prefix.payload["tool_bundle_hash"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+    assert_eq!(prefix_hashes[0], prefix_hashes[1]);
+    let recorded = requests.lock().unwrap();
+    assert_eq!(recorded.len(), 2);
+    assert_eq!(
+        crate::tool_bundle::canonical_tools_hash(&recorded[0].tools),
+        crate::tool_bundle::canonical_tools_hash(&recorded[1].tools)
+    );
+    assert_eq!(
+        recorded[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>(),
+        recorded[1]
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn tool_bundle_matrix_covers_standard_combinations_without_session_state() {
+    let dir = TempDir::new().unwrap();
+    let (_engine, service, _project) = test_service(&dir);
+    let matrix = service.tool_bundle_matrix(&[]).unwrap();
+    assert_eq!(matrix.task_kinds.len(), 6);
+    assert!(matrix.warnings.is_empty(), "{:?}", matrix.warnings);
+    assert_eq!(matrix.rows.len(), 10 * 6);
+    let find = |role: &str, profile: &str, kind: Option<&str>| {
+        matrix
+            .rows
+            .iter()
+            .find(|row| {
+                row.role == role && row.profile == profile && row.task_kind.as_deref() == kind
+            })
+            .unwrap_or_else(|| panic!("missing row {role}/{profile}/{kind:?}"))
+    };
+    let leader = find("leader", "generic", None);
+    assert_eq!(leader.bundle, "leader");
+    assert_eq!(leader.builtin_count, 46);
+    assert_eq!(leader.within_target, Some(true));
+    assert!(!leader.fallback);
+    let manager = find("manager", "coding", None);
+    assert_eq!(manager.bundle, "leader");
+    assert_eq!(manager.builtin_count, 31);
+    assert_eq!(manager.mcp_count, 0);
+    let worker_coding = find("worker", "coding", Some("implementation"));
+    assert_eq!(worker_coding.bundle, "coding");
+    assert_eq!(worker_coding.builtin_count, 37);
+    assert_eq!(worker_coding.within_target, Some(true));
+    let worker_minimal = find("worker", "coding", Some("trivial"));
+    assert_eq!(worker_minimal.bundle, "minimal");
+    assert_eq!(worker_minimal.builtin_count, 6);
+    let worker_research = find("worker", "research", Some("research"));
+    assert_eq!(worker_research.bundle, "research");
+    assert_eq!(worker_research.builtin_count, 33);
+    let verifier = find("verifier", "verification", Some("implementation"));
+    assert_eq!(verifier.bundle, "verification");
+    assert_eq!(verifier.builtin_count, 38);
+    let unknown = find("worker", "coding", Some("unknown-task-kind"));
+    assert_eq!(unknown.bundle, "full");
+    assert!(unknown.fallback);
+    let labour = find("labour", "coding", Some("implementation"));
+    assert_eq!(labour.bundle, "coding");
+    assert_eq!(labour.builtin_count, 36);
+    let scout = find("scout", "research", None);
+    assert_eq!(scout.bundle, "research");
+    assert_eq!(scout.builtin_count, 20);
+    assert_eq!(scout.requested_count, 33);
+    assert_eq!(scout.omitted_count, 13);
+    assert!(scout.omitted_count > 0, "Scout has role-only omissions");
+    for row in &matrix.rows {
+        assert_eq!(row.bundle_hash.len(), 64);
+        assert_eq!(row.tools_hash.len(), 64);
+        assert_eq!(row.total_count, row.builtin_count + row.mcp_count);
+        assert_eq!(
+            row.requested_count,
+            row.builtin_count + row.omitted_count,
+            "{row:?}"
+        );
+    }
+    let custom = service
+        .tool_bundle_matrix(&["trivial".to_string(), "custom-unknown".to_string()])
+        .unwrap();
+    assert_eq!(custom.task_kinds, vec!["trivial", "custom-unknown"]);
+    assert_eq!(custom.rows.len(), 10 * 2);
+    assert!(
+        custom
+            .rows
+            .iter()
+            .filter(|row| row.task_kind.as_deref() == Some("custom-unknown"))
+            .all(|row| row.bundle == "full" || row.role != "worker")
+    );
+}
+
+#[tokio::test]
+async fn tool_bundle_history_is_bounded_newest_first_and_role_filtered() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "bundle history".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    for prompt in ["bundle history one", "bundle history two"] {
+        service.start(&session.id, prompt).await.unwrap();
+        let _ = wait_until_idle(&engine, &session).await;
+    }
+    let history = service
+        .tool_bundle_history(&session.id, Some("leader"), Some(50))
+        .await
+        .unwrap();
+    assert_eq!(history.entries.len(), 2);
+    assert!(history.entries[0].seq > history.entries[1].seq);
+    for entry in &history.entries {
+        assert_eq!(entry.role, "leader");
+        assert_eq!(entry.bundle, "leader");
+        assert_eq!(entry.bundle_hash.len(), 64);
+        assert_eq!(entry.tools_hash.len(), 64);
+        assert_eq!(entry.tool_count, 46);
+        assert!(!entry.fallback);
+        assert!(!entry.created_at.is_empty());
+    }
+    let worker = service
+        .tool_bundle_history(&session.id, Some("worker"), None)
+        .await
+        .unwrap();
+    assert!(worker.entries.is_empty());
+    let capped = service
+        .tool_bundle_history(&session.id, None, Some(1))
+        .await
+        .unwrap();
+    assert_eq!(capped.entries.len(), 1);
+    assert_eq!(capped.entries[0].seq, history.entries[0].seq);
+    assert!(
+        service
+            .tool_bundle_history(&session.id, Some("nope"), None)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn tool_bundle_diff_is_deterministic_and_bounded() {
+    let dir = TempDir::new().unwrap();
+    let (_engine, service, _project) = test_service(&dir);
+    let diff = service
+        .tool_bundle_diff("leader", "minimal", Some("leader"), Some("generic"), None)
+        .unwrap();
+    assert_eq!(diff.from_bundle, "leader");
+    assert_eq!(diff.to_bundle, "minimal");
+    assert_eq!(diff.from_count, 46);
+    assert_eq!(diff.to_count, 6);
+    assert!(diff.changed);
+    assert!(diff.added.is_empty());
+    assert_eq!(diff.removed.len(), 40);
+    assert_eq!(diff.shared.len(), 6);
+    let mut sorted = diff.removed.clone();
+    sorted.sort();
+    assert_eq!(diff.removed, sorted);
+    assert_ne!(diff.from_hash, diff.to_hash);
+    let again = service
+        .tool_bundle_diff("leader", "minimal", Some("leader"), Some("generic"), None)
+        .unwrap();
+    assert_eq!(diff, again);
+
+    let reverse = service
+        .tool_bundle_diff("minimal", "leader", Some("leader"), Some("generic"), None)
+        .unwrap();
+    assert!(reverse.added.contains(&"delegate".to_string()));
+    assert!(reverse.removed.is_empty());
+    assert_eq!(reverse.shared, diff.shared);
+
+    let coding = service
+        .tool_bundle_diff(
+            "minimal",
+            "coding",
+            Some("worker"),
+            Some("coding"),
+            Some("implementation"),
+        )
+        .unwrap();
+    assert!(coding.added.contains(&"grep".to_string()));
+    assert!(coding.added.contains(&"delegate".to_string()));
+    assert!(coding.shared.contains(&"write_file".to_string()));
+
+    assert!(
+        service
+            .tool_bundle_diff("leader", "does-not-exist", None, None, None)
+            .is_err()
+    );
+    assert!(
+        service
+            .tool_bundle_diff("leader", "minimal", Some("nope"), None, None)
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn dynamic_mcp_tools_are_sorted_frozen_and_manifested() {
+    let dir = TempDir::new().unwrap();
+    let script = dir.path().join("ordered_mcp_server.py");
+    std::fs::write(
+        &script,
+        r#"
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    message = json.loads(line)
+    if "id" not in message:
+        continue
+    method = message.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": "2024-11-05", "capabilities": {}, "serverInfo": {"name": "mock", "version": "1"}}
+    elif method == "tools/list":
+        result = {"tools": [
+            {"name": "zeta", "description": "Zeta tool", "inputSchema": {"type": "object"}},
+            {"name": "alpha", "description": "Alpha tool", "inputSchema": {"type": "object"}}
+        ]}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": message.get("id"), "result": result}), flush=True)
+"#,
+    )
+    .unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(RecordingProvider {
+        requests: requests.clone(),
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "mcp_read".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"README.md"}"#.into(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("mcp turn two".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    engine
+        .store()
+        .add_mcp_server(&vp_protocol::types::McpServerConfig {
+            name: "mock".into(),
+            transport: Default::default(),
+            command: "python3".into(),
+            args: vec![script.to_string_lossy().to_string()],
+            env: Default::default(),
+            url: None,
+            headers: Default::default(),
+            enabled: true,
+        })
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "ordered mcp".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service.start(&session.id, "use ordered mcp").await.unwrap();
+    let _ = wait_until_idle(&engine, &session).await;
+
+    {
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        let names = recorded[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>();
+        let alpha = names
+            .iter()
+            .position(|name| name == "mcp_mock_alpha")
+            .unwrap();
+        let zeta = names
+            .iter()
+            .position(|name| name == "mcp_mock_zeta")
+            .unwrap();
+        assert!(alpha < zeta, "MCP tools must be name-sorted");
+        let first_mcp = names
+            .iter()
+            .position(|name| name.starts_with("mcp_"))
+            .unwrap();
+        assert!(
+            names[..first_mcp]
+                .iter()
+                .all(|name| !name.starts_with("mcp_")),
+            "MCP tools are appended once after built-ins"
+        );
+        assert_eq!(first_mcp, 46);
+        assert_eq!(&names[first_mcp..], ["mcp_mock_alpha", "mcp_mock_zeta"]);
+        assert_eq!(
+            recorded[0]
+                .tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>(),
+            recorded[1]
+                .tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>(),
+            "MCP schemas must not churn between turns"
+        );
+    }
+
+    let events = engine
+        .list_events(session.id.clone(), 0, 250)
+        .await
+        .unwrap();
+    let prefix = events
+        .iter()
+        .find(|event| event.kind == "context.prompt_prefix")
+        .expect("prompt prefix");
+    assert_eq!(prefix.payload["tool_bundle"], "leader");
+    assert_eq!(prefix.payload["tool_bundle_mcp_count"], 2);
+    assert_eq!(prefix.payload["tool_bundle_tool_count"], 46);
+    assert_eq!(prefix.payload["tool_count"], 48);
+    let manifest = events
+        .iter()
+        .find(|event| event.kind == "context.tool_bundle")
+        .expect("bundle manifest");
+    assert_eq!(manifest.payload["mcp_count"], 2);
+    let mcp_tools = manifest.payload["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|tool| tool["name"].as_str().unwrap_or("").starts_with("mcp_"))
+        .collect::<Vec<_>>();
+    assert_eq!(mcp_tools.len(), 2);
+    assert!(mcp_tools.iter().all(|tool| tool["category"] == "mcp"));
+}
+
+#[tokio::test]
+async fn cache_plan_uses_the_stored_plan_task_kind_for_a_worker() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "cache plan task kind".into(), None)
+        .await
+        .unwrap();
+    let plan = TeamPlan {
+        goal: "trivial cache plan".into(),
+        departments: vec![PlanDepartment {
+            name: "impl".into(),
+            manager_title: "Implementation".into(),
+            profile: "coding".into(),
+            objective: "make the tiny change".into(),
+            token_budget: None,
+            cost_budget_usd: None,
+        }],
+        tasks: vec![PlanTask {
+            id: "T1".into(),
+            department: "impl".into(),
+            title: "Tiny".into(),
+            kind: "trivial".into(),
+            priority: 0,
+            profile: None,
+            deps: Vec::new(),
+            write_scope: vec!["note.txt".into()],
+            acceptance: vec!["note.txt exists".into()],
+            token_budget: None,
+            cost_budget_usd: None,
+        }],
+    };
+    engine.set_team_plan(&session.id, &plan).await.unwrap();
+    let leader_id = engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let worker = engine
+        .create_agent(
+            &session.id,
+            "worker",
+            "Planned Worker",
+            None,
+            Some(leader_id),
+            "test",
+        )
+        .await
+        .unwrap();
+    engine
+        .set_agent_profile(&worker.id, "coding")
+        .await
+        .unwrap();
+    engine
+        .set_agent_task(&worker.id, Some("T1".into()), Some("impl".into()))
+        .await
+        .unwrap();
+    let plan_result = service
+        .cache_plan_now(&session.id, &["worker".to_string()])
+        .await
+        .unwrap();
+    let worker_plan = &plan_result.roles[0];
+    assert_eq!(worker_plan.role, "worker");
+    assert_eq!(worker_plan.tool_bundle, "minimal");
+    assert_eq!(worker_plan.tool_bundle_tool_count, 6);
+    assert_eq!(worker_plan.tool_bundle_mcp_count, 0);
+    assert_eq!(worker_plan.tool_bundle_target_limit, Some(12));
+    assert_eq!(worker_plan.tool_bundle_within_target, Some(true));
+    assert!(!worker_plan.tool_bundle_fallback);
+    let encoded = serde_json::to_value(&plan_result).unwrap();
+    assert_eq!(encoded["roles"][0]["tool_bundle"], "minimal");
+    assert_eq!(encoded["roles"][0]["tool_bundle_tool_count"], 6);
+}
 fn test_context() -> ToolContext {
     ToolContext {
         root: std::path::PathBuf::from("/tmp"),

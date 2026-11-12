@@ -2253,6 +2253,48 @@ enum Command {
         #[arg(long)]
         role: Option<String>,
     },
+    /// List the static tool-bundle matrix without a session.
+    #[command(name = "tool-bundles")]
+    ToolBundles {
+        /// Evaluate every standard role/profile/task-kind combination against
+        /// the configured registry instead of printing the static catalog.
+        #[arg(long)]
+        matrix: bool,
+        /// Task kinds to evaluate with --matrix. Repeatable; defaults to the
+        /// built-in deterministic set.
+        #[arg(long)]
+        task_kind: Vec<String>,
+        /// Diff two bundles as FROM,TO, for example leader,minimal.
+        #[arg(long, value_name = "FROM,TO")]
+        diff: Option<String>,
+        /// Role used with --diff. Defaults to leader.
+        #[arg(long)]
+        role: Option<String>,
+        /// Profile used with --diff. Defaults to the role preview profile.
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Inspect the frozen tool bundle for a session. Read-only: it does not
+    /// call a provider or start a run.
+    #[command(name = "tool-bundle")]
+    ToolBundle {
+        session: String,
+        /// Role to inspect. Repeatable; defaults to every agent in the session
+        /// plus the leader.
+        #[arg(long)]
+        role: Vec<String>,
+        /// Plan task kind used to partition a Worker/Labour bundle, for
+        /// example implementation, verification, research, or trivial.
+        #[arg(long)]
+        task_kind: Option<String>,
+        /// Include per-tool names and schema hashes.
+        #[arg(long)]
+        tools: bool,
+        /// Show the bounded persisted bundle-observation history instead of
+        /// the current preview.
+        #[arg(long)]
+        history: bool,
+    },
     /// Show the project's prompt-cache policy.
     CachePolicy { project: String },
     /// Update the project's prompt-cache policy.
@@ -7293,6 +7335,71 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await?
         }
+        Command::ToolBundles {
+            matrix,
+            task_kind,
+            diff,
+            role,
+            profile,
+        } => {
+            if let Some(diff) = diff {
+                let Some((from_bundle, to_bundle)) = diff.split_once(',') else {
+                    bail!("--diff expects FROM,TO");
+                };
+                rpc(
+                    &discovery,
+                    "tool_bundle.diff",
+                    json!({
+                        "from_bundle": from_bundle.trim(),
+                        "to_bundle": to_bundle.trim(),
+                        "role": role,
+                        "profile": profile,
+                        "task_kind": task_kind.first(),
+                    }),
+                )
+                .await?
+            } else {
+                let method = if matrix {
+                    "tool_bundle.matrix"
+                } else {
+                    "tool_bundle.catalog"
+                };
+                rpc(
+                    &discovery,
+                    method,
+                    json!({"task_kinds": if matrix { task_kind } else { Vec::new() } }),
+                )
+                .await?
+            }
+        }
+        Command::ToolBundle {
+            session,
+            role,
+            task_kind,
+            tools,
+            history,
+        } => {
+            if history {
+                rpc(
+                    &discovery,
+                    "session.tool_bundle.history",
+                    json!({"session_id": session, "role": role.first()}),
+                )
+                .await?
+            } else {
+                rpc(
+                    &discovery,
+                    "session.tool_bundle",
+                    json!({
+                        "session_id": session,
+                        "roles": role,
+                        "task_kind": task_kind,
+                        "include_tools": tools,
+                    }),
+                )
+                .await?
+            }
+        }
         Command::CachePolicy { project } => {
             rpc(
                 &discovery,
@@ -11495,6 +11602,283 @@ fn instruction_lines(value: &Value) -> Option<Vec<String>> {
     Some(lines)
 }
 
+fn tool_bundle_lines(value: &Value) -> Option<Vec<String>> {
+    if let Some(entries) = value.get("entries").and_then(Value::as_array)
+        && let Some(session_id) = value.get("session_id").and_then(Value::as_str)
+        && entries.iter().all(|entry| entry.get("bundle").is_some())
+    {
+        let mut lines = vec![format!("tool bundle history  {session_id}")];
+        if entries.is_empty() {
+            lines.push("  no persisted bundle observations".to_string());
+        }
+        for entry in entries {
+            lines.push(format!(
+                "  seq {:<6} {:<10} {:<13} {:>3} tools · {} mcp · {} · {}{}",
+                entry["seq"].as_u64().unwrap_or(0),
+                entry["role"].as_str().unwrap_or("?"),
+                entry["bundle"].as_str().unwrap_or("?"),
+                entry["tool_count"].as_u64().unwrap_or(0),
+                entry["mcp_tool_count"].as_u64().unwrap_or(0),
+                entry["created_at"].as_str().unwrap_or(""),
+                short_hash(&entry["bundle_hash"]),
+                if entry["fallback"].as_bool().unwrap_or(false) {
+                    " fallback"
+                } else {
+                    ""
+                }
+            ));
+        }
+        return Some(lines);
+    }
+    if value.get("from_bundle").is_some()
+        && value.get("to_bundle").is_some()
+        && value.get("added").is_some()
+    {
+        let mut lines = vec![format!(
+            "tool bundle diff  {} → {}",
+            value["from_bundle"].as_str().unwrap_or("?"),
+            value["to_bundle"].as_str().unwrap_or("?")
+        )];
+        lines.push(format!(
+            "  role {} · profile {} · task kind {}",
+            value["role"].as_str().unwrap_or("?"),
+            value["profile"].as_str().unwrap_or("?"),
+            value["task_kind"].as_str().unwrap_or("—")
+        ));
+        lines.push(format!(
+            "  {} → {} tools · changed {}",
+            value["from_count"].as_u64().unwrap_or(0),
+            value["to_count"].as_u64().unwrap_or(0),
+            value["changed"].as_bool().unwrap_or(false)
+        ));
+        for (label, key) in [
+            ("added", "added"),
+            ("removed", "removed"),
+            ("shared", "shared"),
+        ] {
+            if let Some(items) = value[key].as_array().filter(|items| !items.is_empty()) {
+                lines.push(format!(
+                    "  {label:<8} {}",
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+        for warning in value["warnings"].as_array().into_iter().flatten() {
+            lines.push(format!(
+                "  [{}] {}",
+                warning["code"].as_str().unwrap_or("warning"),
+                warning["message"].as_str().unwrap_or("")
+            ));
+        }
+        return Some(lines);
+    }
+    if let Some(rows) = value.get("rows").and_then(Value::as_array)
+        && value.get("task_kinds").and_then(Value::as_array).is_some()
+        && rows.iter().all(|row| row.get("bundle_hash").is_some())
+    {
+        let mut lines = vec!["tool bundle matrix".to_string()];
+        lines.push(format!(
+            "  {:<10} {:<13} {:<18} {:<13} {:>7} {:>8} {:>7} {}",
+            "role", "profile", "task kind", "bundle", "tools", "target", "omitted", "status"
+        ));
+        for row in rows {
+            let task_kind = row["task_kind"].as_str().unwrap_or("—");
+            let target = row["target_limit"]
+                .as_u64()
+                .map(|limit| format!("{limit}"))
+                .unwrap_or_else(|| "—".to_string());
+            let status = match row["within_target"].as_bool() {
+                Some(true) => "ok",
+                Some(false) => "OVER",
+                None => {
+                    if row["fallback"].as_bool().unwrap_or(false) {
+                        "fallback"
+                    } else {
+                        "ok"
+                    }
+                }
+            };
+            lines.push(format!(
+                "  {:<10} {:<13} {:<18} {:<13} {:>7} {:>8} {:>7} {}",
+                row["role"].as_str().unwrap_or("?"),
+                row["profile"].as_str().unwrap_or("?"),
+                task_kind,
+                row["bundle"].as_str().unwrap_or("?"),
+                row["builtin_count"].as_u64().unwrap_or(0),
+                target,
+                row["omitted_count"].as_u64().unwrap_or(0),
+                status
+            ));
+        }
+        for warning in value["warnings"].as_array().into_iter().flatten() {
+            lines.push(format!(
+                "  [{}] {}",
+                warning["code"].as_str().unwrap_or("warning"),
+                warning["message"].as_str().unwrap_or("")
+            ));
+        }
+        return Some(lines);
+    }
+    if let Some(bundles) = value.get("bundles").and_then(Value::as_array)
+        && bundles
+            .iter()
+            .all(|row| row.get("requested_count").is_some())
+    {
+        let mut lines = vec!["tool bundles".to_string()];
+        for row in bundles {
+            let target = row["target_limit"]
+                .as_u64()
+                .map(|limit| format!("/{limit}"))
+                .unwrap_or_default();
+            lines.push(format!(
+                "  {:<12} requested {}{target} · {} mcp · {}/{}",
+                row["bundle"].as_str().unwrap_or("?"),
+                row["requested_count"].as_u64().unwrap_or(0),
+                if row["allows_dynamic_mcp"].as_bool().unwrap_or(false) {
+                    "appends"
+                } else {
+                    "no"
+                },
+                row["representative_role"].as_str().unwrap_or("?"),
+                row["representative_profile"].as_str().unwrap_or("?")
+            ));
+            if let Some(summary) = row["summary"].as_str() {
+                lines.push(format!("               {summary}"));
+            }
+        }
+        for warning in value["warnings"].as_array().into_iter().flatten() {
+            lines.push(format!(
+                "  [{}] {}",
+                warning["code"].as_str().unwrap_or("warning"),
+                warning["message"].as_str().unwrap_or("")
+            ));
+        }
+        return Some(lines);
+    }
+    let session_id = value.get("session_id")?.as_str()?;
+    let roles = value.get("roles")?.as_array()?;
+    if !value.get("catalog")?.as_array().is_some() {
+        return None;
+    }
+    if !roles
+        .iter()
+        .any(|role| role.get("bundle").is_some() && role.get("bundle_hash").is_some())
+    {
+        return None;
+    }
+    let mut lines = vec![format!("tool bundle  {session_id}")];
+    for role in roles {
+        let role_name = role["role"].as_str().unwrap_or("?");
+        let bundle = role["bundle"].as_str().unwrap_or("?");
+        let target = role["target_limit"]
+            .as_u64()
+            .map(|limit| format!("/{limit}"))
+            .unwrap_or_default();
+        let within = match role["within_target"].as_bool() {
+            Some(true) => "ok",
+            Some(false) => "OVER TARGET",
+            None => "no target",
+        };
+        lines.push(format!(
+            "  {role_name:<9} {bundle:<12} {}{target} tools · {within} · {} mcp",
+            role["builtin_count"].as_u64().unwrap_or(0),
+            role["mcp_count"].as_u64().unwrap_or(0)
+        ));
+        lines.push(format!(
+            "            profile {} · task kind {} · {}",
+            role["profile"].as_str().unwrap_or("?"),
+            role["task_kind"].as_str().unwrap_or("—"),
+            role["reason"].as_str().unwrap_or("?")
+        ));
+        lines.push(format!(
+            "            bundle {} · tools {} · {} schema bytes · ~{} tokens",
+            short_hash(&role["bundle_hash"]),
+            short_hash(&role["tools_hash"]),
+            role["schema_bytes"].as_u64().unwrap_or(0),
+            role["estimated_tool_tokens"].as_u64().unwrap_or(0)
+        ));
+        if let Some(last) = role.get("last_run").filter(|last| !last.is_null()) {
+            lines.push(format!(
+                "            last run {} · {} tools · {} mcp · {}",
+                last["bundle"].as_str().unwrap_or("?"),
+                last["tool_count"].as_u64().unwrap_or(0),
+                last["mcp_tool_count"].as_u64().unwrap_or(0),
+                last["created_at"].as_str().unwrap_or("")
+            ));
+        }
+        if let Some(omitted) = role["omitted"].as_array().filter(|items| !items.is_empty()) {
+            lines.push(format!(
+                "            omitted {}",
+                omitted
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        for warning in role["warnings"].as_array().into_iter().flatten() {
+            lines.push(format!(
+                "            [{}] {}",
+                warning["code"].as_str().unwrap_or("warning"),
+                warning["message"].as_str().unwrap_or("")
+            ));
+        }
+        if let Some(categories) = role["categories"]
+            .as_array()
+            .filter(|categories| !categories.is_empty())
+        {
+            let rendered = categories
+                .iter()
+                .map(|category| {
+                    format!(
+                        "{} {}",
+                        category["category"].as_str().unwrap_or("?"),
+                        category["tools"].as_u64().unwrap_or(0)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
+            lines.push(format!("            categories {rendered}"));
+        }
+        if let Some(tools) = role["tools"].as_array().filter(|tools| !tools.is_empty()) {
+            let mut line = String::from("            tools ");
+            let mut first = true;
+            for tool in tools {
+                if !first {
+                    line.push_str(", ");
+                }
+                first = false;
+                line.push_str(tool["name"].as_str().unwrap_or("?"));
+            }
+            lines.push(line);
+        }
+    }
+    if let Some(catalog) = value.get("catalog").and_then(Value::as_array) {
+        lines.push("  catalog".to_string());
+        for row in catalog {
+            let target = row["target_limit"]
+                .as_u64()
+                .map(|limit| format!("/{limit}"))
+                .unwrap_or_default();
+            lines.push(format!(
+                "    {:<12} requested {}{target} · {} mcp",
+                row["bundle"].as_str().unwrap_or("?"),
+                row["requested_count"].as_u64().unwrap_or(0),
+                if row["allows_dynamic_mcp"].as_bool().unwrap_or(false) {
+                    "appends"
+                } else {
+                    "no"
+                }
+            ));
+        }
+    }
+    Some(lines)
+}
+
 fn print_human(value: &Value) {
     if let Some(lines) = instruction_lines(value) {
         for line in lines {
@@ -11775,6 +12159,12 @@ fn print_human(value: &Value) {
                     .join(" ");
                 println!("             evidence: {rendered}");
             }
+        }
+        return;
+    }
+    if let Some(lines) = tool_bundle_lines(value) {
+        for line in lines {
+            println!("{line}");
         }
         return;
     }
@@ -14673,6 +15063,313 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn tool_bundle_accepts_repeated_roles_and_task_kind() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "tool-bundle",
+                    "ses-123",
+                    "--role",
+                    "worker",
+                    "--role",
+                    "verifier",
+                    "--task-kind",
+                    "trivial",
+                    "--tools",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::ToolBundle {
+                        session,
+                        role,
+                        task_kind,
+                        tools,
+                        history,
+                    } => {
+                        assert_eq!(session, "ses-123");
+                        assert_eq!(role, vec!["worker".to_string(), "verifier".to_string()]);
+                        assert_eq!(task_kind.as_deref(), Some("trivial"));
+                        assert!(tools);
+                        assert!(!history);
+                    }
+                    other => panic!("expected tool-bundle command, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn tool_bundles_plural_takes_no_arguments() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from(["vp", "tool-bundles"]).unwrap();
+                match cli.command {
+                    Command::ToolBundles {
+                        matrix,
+                        task_kind,
+                        diff,
+                        ..
+                    } => {
+                        assert!(!matrix);
+                        assert!(task_kind.is_empty());
+                        assert!(diff.is_none());
+                    }
+                    other => panic!("expected tool-bundles command, got {other:?}"),
+                }
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "tool-bundles",
+                    "--matrix",
+                    "--task-kind",
+                    "trivial",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::ToolBundles {
+                        matrix, task_kind, ..
+                    } => {
+                        assert!(matrix);
+                        assert_eq!(task_kind, vec!["trivial".to_string()]);
+                    }
+                    other => panic!("expected matrix tool-bundles command, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn tool_bundles_catalog_view_lists_matrix_and_warnings() {
+        let value = json!({
+            "bundles": [
+                {
+                    "bundle": "leader",
+                    "title": "Leader",
+                    "summary": "orchestration",
+                    "target_limit": 48,
+                    "requested_count": 46,
+                    "representative_role": "leader",
+                    "representative_profile": "generic",
+                    "allows_dynamic_mcp": true
+                },
+                {
+                    "bundle": "minimal",
+                    "title": "Minimal",
+                    "summary": "tiny",
+                    "target_limit": 12,
+                    "requested_count": 6,
+                    "representative_role": "worker",
+                    "representative_profile": "coding",
+                    "allows_dynamic_mcp": false
+                }
+            ],
+            "warnings": []
+        });
+        let lines = tool_bundle_lines(&value).expect("catalog view");
+        let text = lines.join("\n");
+        assert!(text.contains("tool bundles"));
+        assert!(text.contains("leader"));
+        assert!(text.contains("requested 46/48"));
+        assert!(text.contains("minimal"));
+        assert!(text.contains("requested 6/12"));
+    }
+
+    #[test]
+    fn tool_bundle_history_and_diff_flags_parse() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "tool-bundle",
+                    "ses-123",
+                    "--history",
+                    "--role",
+                    "worker",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::ToolBundle { history, role, .. } => {
+                        assert!(history);
+                        assert_eq!(role, vec!["worker".to_string()]);
+                    }
+                    other => panic!("expected tool-bundle history, got {other:?}"),
+                }
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "tool-bundles",
+                    "--diff",
+                    "leader,minimal",
+                    "--role",
+                    "leader",
+                    "--profile",
+                    "generic",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::ToolBundles {
+                        diff,
+                        role,
+                        profile,
+                        ..
+                    } => {
+                        assert_eq!(diff.as_deref(), Some("leader,minimal"));
+                        assert_eq!(role.as_deref(), Some("leader"));
+                        assert_eq!(profile.as_deref(), Some("generic"));
+                    }
+                    other => panic!("expected tool-bundles diff, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn tool_bundle_history_view_lists_observations() {
+        let value = json!({
+            "session_id": "ses-1",
+            "entries": [{
+                "seq": 12,
+                "role": "worker",
+                "agent_id": "agt-1",
+                "agent_name": "Worker",
+                "bundle": "minimal",
+                "bundle_hash": "hash",
+                "tools_hash": "tools",
+                "tool_count": 6,
+                "mcp_tool_count": 0,
+                "task_kind": "trivial",
+                "fallback": false,
+                "reason": "task_kind",
+                "created_at": "2026-11-12T00:00:00Z"
+            }]
+        });
+        let text = tool_bundle_lines(&value).expect("history view").join("\n");
+        assert!(text.contains("tool bundle history"));
+        assert!(text.contains("minimal"));
+        assert!(text.contains("worker"));
+        let empty = json!({"session_id": "ses-1", "entries": []});
+        let text = tool_bundle_lines(&empty).expect("empty history").join("\n");
+        assert!(text.contains("no persisted bundle observations"));
+    }
+
+    #[test]
+    fn tool_bundle_diff_view_lists_added_removed_and_shared() {
+        let value = json!({
+            "from_bundle": "leader",
+            "to_bundle": "minimal",
+            "role": "leader",
+            "profile": "generic",
+            "task_kind": null,
+            "from_hash": "a",
+            "to_hash": "b",
+            "from_count": 46,
+            "to_count": 6,
+            "added": [],
+            "removed": ["delegate", "shell"],
+            "shared": ["read_file", "write_file"],
+            "changed": true,
+            "warnings": []
+        });
+        let text = tool_bundle_lines(&value).expect("diff view").join("\n");
+        assert!(text.contains("tool bundle diff  leader → minimal"));
+        assert!(text.contains("46 → 6 tools"));
+        assert!(text.contains("removed"));
+        assert!(text.contains("delegate, shell"));
+        assert!(text.contains("shared"));
+    }
+
+    #[test]
+    fn tool_bundle_matrix_view_lists_runtime_rows() {
+        let value = json!({
+            "task_kinds": ["", "trivial"],
+            "rows": [{
+                "role": "worker",
+                "profile": "coding",
+                "task_kind": "trivial",
+                "bundle": "minimal",
+                "reason": "task_kind",
+                "fallback": false,
+                "bundle_hash": "hash",
+                "tools_hash": "tools",
+                "builtin_count": 6,
+                "mcp_count": 0,
+                "total_count": 6,
+                "requested_count": 6,
+                "omitted_count": 0,
+                "target_limit": 12,
+                "within_target": true,
+                "warning_count": 0
+            }],
+            "warnings": []
+        });
+        let lines = tool_bundle_lines(&value).expect("matrix view");
+        let text = lines.join("\n");
+        assert!(text.contains("tool bundle matrix"));
+        assert!(text.contains("minimal"));
+        assert!(text.contains("worker"));
+        assert!(text.contains("trivial"));
+    }
+
+    #[test]
+    fn tool_bundle_human_view_lists_bundles_and_catalog_without_schemas() {
+        let value = json!({
+            "session_id": "ses-1",
+            "roles": [{
+                "role": "worker",
+                "profile": "coding",
+                "task_kind": "trivial",
+                "bundle": "minimal",
+                "title": "Minimal",
+                "reason": "task_kind",
+                "fallback": false,
+                "bundle_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "tools_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "requested": ["read_file", "write_file"],
+                "omitted": ["apply_patch"],
+                "warnings": [],
+                "builtin_count": 6,
+                "mcp_count": 0,
+                "total_count": 6,
+                "target_limit": 12,
+                "within_target": true,
+                "tools": [
+                    {"name": "read_file", "category": "files"},
+                    {"name": "write_file", "category": "files"}
+                ],
+                "last_run": {
+                    "bundle": "minimal",
+                    "tool_count": 6,
+                    "mcp_tool_count": 0,
+                    "created_at": "2026-11-12T00:00:00Z"
+                }
+            }],
+            "catalog": [{
+                "bundle": "minimal",
+                "requested_count": 6,
+                "target_limit": 12,
+                "allows_dynamic_mcp": false
+            }]
+        });
+        let lines = tool_bundle_lines(&value).expect("tool bundle view");
+        let text = lines.join("\n");
+        assert!(text.contains("tool bundle  ses-1"));
+        assert!(text.contains("worker"));
+        assert!(text.contains("minimal"));
+        assert!(text.contains("6/12 tools"));
+        assert!(text.contains("omitted apply_patch"));
+        assert!(text.contains("read_file, write_file"));
+        assert!(!text.contains("description for"));
     }
 
     #[test]

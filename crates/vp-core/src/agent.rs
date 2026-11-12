@@ -33,7 +33,10 @@ use vp_protocol::types::{
     SessionCheckpointRestoreResult, SessionCompactResult, SessionForkResult,
     SessionMergeForkResult, SessionPreemptResult, SessionPreemptionResult, SessionRunCancelResult,
     SessionRunResumeResult, Skill, SourceCitation, SourceSearchHit, StallRecoveryMode,
-    StoredMessage, TeamPlan, TodoItem,
+    StoredMessage, TeamPlan, TodoItem, ToolBundleCatalogResult, ToolBundleCatalogRow,
+    ToolBundleCategoryCount, ToolBundleDiffResult, ToolBundleHistoryEntry, ToolBundleHistoryResult,
+    ToolBundleLastRun, ToolBundleMatrixResult, ToolBundleMatrixRow, ToolBundleResult,
+    ToolBundleRoleResult, ToolBundleToolInfo, ToolBundleWarningInfo,
 };
 use vp_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, OpenAiCompatibleProvider, Provider, ProviderError,
@@ -1411,6 +1414,10 @@ struct AgentSpec {
     task_id: Option<String>,
     department: Option<String>,
     profile: AgentProfile,
+    /// Plan task kind that selects the frozen tool bundle for a Worker or
+    /// Labour run. `None` means the legacy full bundle for task agents and the
+    /// role bundle for Leader/Manager/Verifier/Scout.
+    task_kind: Option<String>,
     allow_delegation: bool,
     /// Skip routine tool prompts for an explicitly authorized internal run.
     /// Host-level operations are still denied, and the shell sandbox applies.
@@ -2478,6 +2485,7 @@ impl AgentService {
                 capacity: self.capacity.snapshot(),
                 context_window: Some(config.context_window),
                 approval_mode: config.approval_mode,
+                tool_bundles: tool_bundle_catalog_rows(),
             },
             None => AgentInfo {
                 configured: false,
@@ -2488,8 +2496,105 @@ impl AgentService {
                 capacity: self.capacity.snapshot(),
                 context_window: None,
                 approval_mode: ApprovalMode::default(),
+                tool_bundles: tool_bundle_catalog_rows(),
             },
         }
+    }
+
+    /// Static tool-bundle catalog for Settings and `vp tool-bundles`. It reads
+    /// no session state and never calls a provider.
+    pub fn tool_bundle_catalog(&self) -> ToolBundleCatalogResult {
+        ToolBundleCatalogResult {
+            bundles: tool_bundle_catalog_rows(),
+            warnings: tool_bundle_warnings(),
+        }
+    }
+
+    /// Evaluate the real bundle matrix against the configured tool registry.
+    /// This is a read-only planning view: no session, worktree, provider call,
+    /// or event is created. The row set is bounded to the standard roles and
+    /// at most eight requested task kinds.
+    pub fn tool_bundle_matrix(&self, task_kinds: &[String]) -> Result<ToolBundleMatrixResult> {
+        let config = self.configured_agent()?;
+        let mut kinds = if task_kinds.is_empty() {
+            vec![
+                String::new(),
+                "implementation".to_string(),
+                "verification".to_string(),
+                "research".to_string(),
+                "trivial".to_string(),
+                "unknown-task-kind".to_string(),
+            ]
+        } else {
+            task_kinds
+                .iter()
+                .map(|kind| kind.trim().to_string())
+                .filter(|kind| kind.len() <= 80)
+                .take(8)
+                .collect::<Vec<_>>()
+        };
+        if kinds.is_empty() {
+            kinds.push(String::new());
+        }
+        let combinations = [
+            (AgentRole::Leader, AgentProfile::Generic),
+            (AgentRole::Leader, AgentProfile::Coding),
+            (AgentRole::Manager, AgentProfile::Coding),
+            (AgentRole::Worker, AgentProfile::Coding),
+            (AgentRole::Worker, AgentProfile::Research),
+            (AgentRole::Worker, AgentProfile::Verification),
+            (AgentRole::Worker, AgentProfile::Generic),
+            (AgentRole::Labour, AgentProfile::Coding),
+            (AgentRole::Verifier, AgentProfile::Verification),
+            (AgentRole::Scout, AgentProfile::Research),
+        ];
+        let no_mcp: Vec<McpToolBinding> = Vec::new();
+        let mut rows = Vec::with_capacity(combinations.len() * kinds.len());
+        for (role, profile) in combinations {
+            for kind in &kinds {
+                let task_kind = (!kind.is_empty()).then(|| kind.clone());
+                let spec = preview_spec(role, profile, task_kind);
+                let frozen = frozen_tool_bundle(&config, &spec, &no_mcp);
+                let builtin_count = frozen.builtin_count();
+                let mcp_count = frozen.mcp_count();
+                let total_count = frozen.tool_count();
+                let schema_bytes = frozen.schema_bytes();
+                let estimated_tool_tokens = frozen.estimated_tokens();
+                let requested_count = if frozen.selection.kind.is_partitioned() {
+                    frozen.requested.len()
+                } else {
+                    builtin_count
+                };
+                let omitted_count = frozen.omitted.len();
+                let within_target = frozen.within_target();
+                let warning_count = frozen.warnings.len();
+                rows.push(ToolBundleMatrixRow {
+                    role: role.as_str().to_string(),
+                    profile: profile.as_str().to_string(),
+                    task_kind: frozen.selection.task_kind.clone(),
+                    bundle: frozen.selection.kind.as_str().to_string(),
+                    reason: frozen.selection.reason.to_string(),
+                    fallback: frozen.selection.fallback,
+                    bundle_hash: frozen.bundle_hash,
+                    tools_hash: frozen.tools_hash,
+                    builtin_count,
+                    mcp_count,
+                    total_count,
+                    schema_bytes,
+                    estimated_tool_tokens,
+                    requested_count,
+                    omitted_count,
+                    target_limit: frozen.target_limit,
+                    within_target,
+                    warning_count,
+                });
+            }
+        }
+        Ok(ToolBundleMatrixResult {
+            task_kinds: kinds,
+            rows,
+            warnings: tool_bundle_warnings(),
+        })
     }
 
     pub async fn probe(&self) -> Result<AgentProbeResult> {
@@ -2957,6 +3062,7 @@ impl AgentService {
             department: None,
             profile: AgentProfile::Generic,
             allow_delegation: false,
+            task_kind: None,
             auto_approve: true,
             worktree: PathBuf::from(&session.worktree.clone().unwrap_or_default()),
             branch: session_branch.clone(),
@@ -2976,6 +3082,7 @@ impl AgentService {
             department: None,
             profile,
             allow_delegation: false,
+            task_kind: None,
             auto_approve: true,
             worktree: remote_worktree.path.clone(),
             branch: remote_worktree.branch.clone(),
@@ -3529,6 +3636,7 @@ impl AgentService {
             department: None,
             profile: AgentProfile::Generic,
             allow_delegation: false,
+            task_kind: None,
             auto_approve: true,
             worktree: session_worktree.clone(),
             branch: session_branch.clone(),
@@ -3548,6 +3656,7 @@ impl AgentService {
             department: None,
             profile,
             allow_delegation: false,
+            task_kind: None,
             auto_approve: true,
             worktree: agent_worktree.clone(),
             branch: entry.branch.clone(),
@@ -3630,6 +3739,7 @@ impl AgentService {
             department: None,
             profile,
             allow_delegation: true,
+            task_kind: None,
             auto_approve: false,
             worktree: agent_worktree,
             branch: entry.branch.clone(),
@@ -3885,6 +3995,7 @@ impl AgentService {
             department: None,
             profile: AgentProfile::Coding,
             allow_delegation: false,
+            task_kind: None,
             auto_approve: true,
             worktree: worker_worktree.clone(),
             branch: entry.branch.clone(),
@@ -4136,6 +4247,7 @@ impl AgentService {
             department: None,
             profile: AgentProfile::Generic,
             allow_delegation: false,
+            task_kind: None,
             auto_approve: true,
             worktree: session_worktree.clone(),
             branch: session_branch.clone(),
@@ -4155,6 +4267,7 @@ impl AgentService {
             department: None,
             profile: AgentProfile::Coding,
             allow_delegation: false,
+            task_kind: None,
             auto_approve: true,
             worktree: worker_worktree.clone(),
             branch: entry.branch.clone(),
@@ -7409,7 +7522,8 @@ impl AgentService {
                 .iter()
                 .find(|agent| agent.role == role.as_str())
                 .cloned();
-            let spec = stable_agent_spec(&session, agent, role);
+            let task_kind = plan_task_kind_for_agent(&self.engine, &session.id, &agent).await;
+            let spec = stable_agent_spec(&session, agent, role, task_kind);
             let sections = build_prompt_sections(
                 &self.engine,
                 &project,
@@ -7420,13 +7534,9 @@ impl AgentService {
                 InstructionBuildMode::Preview,
             )
             .await?;
-            let mut tools = tool_schemas(&config, spec.role, spec.profile, spec.allow_delegation);
-            tools.extend(
-                collect_dynamic_mcp_tools(&self.engine, spec.role)
-                    .await
-                    .iter()
-                    .map(|binding| binding.schema.clone()),
-            );
+            let dynamic_mcp = collect_dynamic_mcp_tools(&self.engine, spec.role).await;
+            let frozen_bundle = frozen_tool_bundle(&config, &spec, &dynamic_mcp);
+            let tools = frozen_bundle.tools.clone();
             let system = sections.render();
             let hashes = sections.hashes(&model_for(&config, spec.role), &tools);
             let plan = crate::prompt_cache::request_cache_plan(
@@ -7463,6 +7573,13 @@ impl AgentService {
                 project_chars: sections.project.chars().count() as u64,
                 stable_prefix_chars: sections.stable_prefix().chars().count() as u64,
                 tool_count: tools.len(),
+                tool_bundle: frozen_bundle.selection.kind.as_str().to_string(),
+                tool_bundle_hash: frozen_bundle.bundle_hash.clone(),
+                tool_bundle_tool_count: frozen_bundle.builtin_count(),
+                tool_bundle_mcp_count: frozen_bundle.mcp_count(),
+                tool_bundle_target_limit: frozen_bundle.target_limit,
+                tool_bundle_within_target: frozen_bundle.within_target(),
+                tool_bundle_fallback: frozen_bundle.selection.fallback,
                 system_tokens_estimate: estimate_context_tokens(&system),
                 tool_tokens_estimate: serde_json::to_string(&tools)
                     .map(|schema| estimate_context_tokens(&schema))
@@ -7474,6 +7591,415 @@ impl AgentService {
             provider: config.provider_name,
             policy: Some(policy),
             roles: plans,
+        })
+    }
+
+    /// Read-only tool-bundle inspection for one session. It reports the frozen
+    /// bundle the next run would use for each role, the exact built-in and MCP
+    /// counts, the canonical hashes, and the latest observed prefix event. It
+    /// never calls a provider, creates a worktree, or starts a run.
+    pub async fn tool_bundle_now(
+        &self,
+        session_id: &str,
+        roles: &[String],
+        task_kind: Option<&str>,
+        include_tools: bool,
+    ) -> Result<ToolBundleResult> {
+        let config = self
+            .config
+            .read()
+            .ok()
+            .and_then(|config| config.as_ref().cloned())
+            .ok_or_else(|| anyhow!("agent provider is not configured"))?;
+        let (session, _project) =
+            load_session_project(self.engine.store().clone(), session_id).await?;
+        let agents = self.engine.list_agents(session_id).await?;
+        let mut requested = if roles.is_empty() {
+            let mut names = agents
+                .iter()
+                .map(|agent| agent.role.clone())
+                .collect::<Vec<_>>();
+            names.push(AgentRole::Leader.as_str().to_string());
+            names
+        } else {
+            roles.to_vec()
+        };
+        let mut seen = HashSet::new();
+        requested.retain(|name| {
+            let normalized = name.trim().to_ascii_lowercase();
+            !normalized.is_empty() && seen.insert(normalized)
+        });
+        if requested.is_empty() {
+            requested.push(AgentRole::Leader.as_str().to_string());
+        }
+        let plan = self.engine.get_team_plan(&session.id).await.ok().flatten();
+        let recent_prefixes = self
+            .engine
+            .recent_events_of_kind(session_id, "context.prompt_prefix", 400)
+            .await?;
+        let explicit_task_kind = task_kind
+            .map(str::trim)
+            .filter(|kind| !kind.is_empty())
+            .map(str::to_string);
+        let mut results = Vec::with_capacity(requested.len());
+        for name in requested {
+            let role = AgentRole::parse(name.trim().to_ascii_lowercase().as_str())
+                .ok_or_else(|| anyhow!("unknown tool-bundle role: {name}"))?;
+            let agent = agents
+                .iter()
+                .find(|agent| agent.role == role.as_str())
+                .cloned();
+            let profile = agent
+                .as_ref()
+                .and_then(|agent| agent.profile.as_deref())
+                .and_then(AgentProfile::parse)
+                .unwrap_or_else(|| default_profile_for_preview(role));
+            let inferred_kind = agent.as_ref().and_then(|agent| {
+                let task_id = agent.task_id.as_ref()?;
+                plan.as_ref()?
+                    .tasks
+                    .iter()
+                    .find(|task| task.id == *task_id)
+                    .map(|task| task.kind.clone())
+            });
+            let task_kind = explicit_task_kind.clone().or(inferred_kind);
+            let spec = stable_agent_spec(&session, agent, role, task_kind);
+            let dynamic_mcp = collect_dynamic_mcp_tools(&self.engine, spec.role).await;
+            let frozen = frozen_tool_bundle(&config, &spec, &dynamic_mcp);
+            let tools = if include_tools {
+                frozen
+                    .tools
+                    .iter()
+                    .map(|tool| {
+                        let spec = crate::tool_bundle::catalog_entry(&tool.name);
+                        ToolBundleToolInfo {
+                            name: tool.name.clone(),
+                            category: frozen.category_for(&tool.name).to_string(),
+                            workspace_write: spec.is_some_and(|spec| spec.workspace_write),
+                            delegation: spec.is_some_and(|spec| spec.delegation),
+                            schema_hash: crate::tool_bundle::tool_schema_hash(tool),
+                            description_chars: tool.description.chars().count() as u64,
+                            parameter_fields: tool
+                                .parameters
+                                .get("properties")
+                                .and_then(serde_json::Value::as_object)
+                                .map_or(0, serde_json::Map::len)
+                                as u64,
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let last_run = recent_prefixes
+                .iter()
+                .rev()
+                .find(|event| {
+                    event
+                        .payload
+                        .get("agent_role")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(role.as_str())
+                        && event.payload.get("tool_bundle").is_some()
+                })
+                .map(|event| ToolBundleLastRun {
+                    agent_id: event
+                        .payload
+                        .get("agent_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    agent_name: event
+                        .payload
+                        .get("agent_name")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    role: event
+                        .payload
+                        .get("agent_role")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(role.as_str())
+                        .to_string(),
+                    bundle: event
+                        .payload
+                        .get("tool_bundle")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    bundle_hash: event
+                        .payload
+                        .get("tool_bundle_hash")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    tools_hash: event
+                        .payload
+                        .get("tools_hash")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    tool_count: event
+                        .payload
+                        .get("tool_count")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    mcp_tool_count: event
+                        .payload
+                        .get("tool_bundle_mcp_count")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    created_at: event.created_at.clone(),
+                });
+            results.push(ToolBundleRoleResult {
+                role: role.as_str().to_string(),
+                profile: profile.as_str().to_string(),
+                task_kind: frozen.selection.task_kind.clone(),
+                bundle: frozen.selection.kind.as_str().to_string(),
+                title: crate::tool_bundle::definition(frozen.selection.kind)
+                    .title
+                    .to_string(),
+                reason: frozen.selection.reason.to_string(),
+                fallback: frozen.selection.fallback,
+                bundle_hash: frozen.bundle_hash.clone(),
+                tools_hash: frozen.tools_hash.clone(),
+                requested: frozen.requested.clone(),
+                omitted: frozen.omitted.clone(),
+                warnings: frozen
+                    .warnings
+                    .iter()
+                    .map(|warning| ToolBundleWarningInfo {
+                        code: warning.code.to_string(),
+                        message: warning.message.clone(),
+                    })
+                    .collect(),
+                builtin_count: frozen.builtin_count(),
+                mcp_count: frozen.mcp_count(),
+                total_count: frozen.tool_count(),
+                schema_bytes: frozen.schema_bytes(),
+                estimated_tool_tokens: frozen.estimated_tokens(),
+                target_limit: frozen.target_limit,
+                within_target: frozen.within_target(),
+                categories: frozen
+                    .category_counts()
+                    .into_iter()
+                    .map(|count| ToolBundleCategoryCount {
+                        category: count.category.to_string(),
+                        tools: count.tools,
+                        schema_bytes: count.schema_bytes,
+                    })
+                    .collect(),
+                tools,
+                last_run,
+            });
+        }
+        let catalog = crate::tool_bundle::catalog_entries()
+            .into_iter()
+            .map(|entry| ToolBundleCatalogRow {
+                bundle: entry.kind.as_str().to_string(),
+                title: entry.title.to_string(),
+                summary: entry.summary.to_string(),
+                target_limit: entry.target_limit,
+                requested_count: entry.requested_count,
+                representative_role: entry.representative_role.to_string(),
+                representative_profile: entry.representative_profile.to_string(),
+                allows_dynamic_mcp: entry.allows_dynamic_mcp,
+            })
+            .collect();
+        Ok(ToolBundleResult {
+            session_id: session.id,
+            roles: results,
+            catalog,
+        })
+    }
+
+    /// Bounded history of persisted tool-bundle observations for a session.
+    /// It reads `context.prompt_prefix` events only; it never reconstructs a
+    /// historical schema or claims that the current registry matches the run.
+    pub async fn tool_bundle_history(
+        &self,
+        session_id: &str,
+        role: Option<&str>,
+        limit: Option<u64>,
+    ) -> Result<ToolBundleHistoryResult> {
+        let (session, _project) =
+            load_session_project(self.engine.store().clone(), session_id).await?;
+        let role = match role {
+            Some(role) => Some(
+                AgentRole::parse(role.trim().to_ascii_lowercase().as_str())
+                    .ok_or_else(|| anyhow!("unknown tool-bundle role: {role}"))?,
+            ),
+            None => None,
+        };
+        let limit = limit.unwrap_or(50).clamp(1, 200) as usize;
+        let events = self
+            .engine
+            .recent_events_of_kind(session_id, "context.prompt_prefix", 2_000)
+            .await?;
+        let entries = events
+            .iter()
+            .rev()
+            .filter(|event| event.payload.get("tool_bundle").is_some())
+            .filter(|event| {
+                role.is_none_or(|role| {
+                    event
+                        .payload
+                        .get("agent_role")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(role.as_str())
+                })
+            })
+            .take(limit)
+            .map(|event| ToolBundleHistoryEntry {
+                seq: event.seq,
+                role: event
+                    .payload
+                    .get("agent_role")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                agent_id: event
+                    .payload
+                    .get("agent_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                agent_name: event
+                    .payload
+                    .get("agent_name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                bundle: event
+                    .payload
+                    .get("tool_bundle")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                bundle_hash: event
+                    .payload
+                    .get("tool_bundle_hash")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                tools_hash: event
+                    .payload
+                    .get("tools_hash")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                tool_count: event
+                    .payload
+                    .get("tool_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                mcp_tool_count: event
+                    .payload
+                    .get("tool_bundle_mcp_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                task_kind: event
+                    .payload
+                    .get("tool_bundle_task_kind")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                fallback: event
+                    .payload
+                    .get("tool_bundle_fallback")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                reason: event
+                    .payload
+                    .get("tool_bundle_reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                created_at: event.created_at.clone(),
+            })
+            .collect();
+        Ok(ToolBundleHistoryResult {
+            session_id: session.id,
+            entries,
+        })
+    }
+
+    /// Deterministic preview diff between two named bundles for one role and
+    /// profile. Empty bundles yield an empty list; unknown names fail closed.
+    pub fn tool_bundle_diff(
+        &self,
+        from_bundle: &str,
+        to_bundle: &str,
+        role: Option<&str>,
+        profile: Option<&str>,
+        task_kind: Option<&str>,
+    ) -> Result<ToolBundleDiffResult> {
+        let config = self.configured_agent()?;
+        let from_kind = crate::tool_bundle::ToolBundleKind::parse(from_bundle)
+            .ok_or_else(|| anyhow!("unknown tool bundle: {from_bundle}"))?;
+        let to_kind = crate::tool_bundle::ToolBundleKind::parse(to_bundle)
+            .ok_or_else(|| anyhow!("unknown tool bundle: {to_bundle}"))?;
+        let role = AgentRole::parse(role.unwrap_or(AgentRole::Leader.as_str()))
+            .ok_or_else(|| anyhow!("unknown tool-bundle role"))?;
+        let profile = match profile {
+            Some(profile) => AgentProfile::parse(profile)
+                .ok_or_else(|| anyhow!("unknown tool-bundle profile: {profile}"))?,
+            None => default_profile_for_preview(role),
+        };
+        let task_kind = task_kind
+            .map(str::trim)
+            .filter(|kind| !kind.is_empty())
+            .map(str::to_string);
+        let spec = preview_spec(role, profile, task_kind.clone());
+        let from = frozen_tool_bundle_for_kind(&config, &spec, from_kind);
+        let to = frozen_tool_bundle_for_kind(&config, &spec, to_kind);
+        let from_names = from
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let to_names = to
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let added = to_names
+            .difference(&from_names)
+            .cloned()
+            .collect::<Vec<_>>();
+        let removed = from_names
+            .difference(&to_names)
+            .cloned()
+            .collect::<Vec<_>>();
+        let shared = from_names
+            .intersection(&to_names)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut warnings = from
+            .warnings
+            .iter()
+            .chain(to.warnings.iter())
+            .map(|warning| ToolBundleWarningInfo {
+                code: warning.code.to_string(),
+                message: warning.message.clone(),
+            })
+            .collect::<Vec<_>>();
+        warnings.sort_by(|left, right| {
+            left.code
+                .cmp(&right.code)
+                .then_with(|| left.message.cmp(&right.message))
+        });
+        warnings.dedup();
+        Ok(ToolBundleDiffResult {
+            from_bundle: from_kind.as_str().to_string(),
+            to_bundle: to_kind.as_str().to_string(),
+            role: role.as_str().to_string(),
+            profile: profile.as_str().to_string(),
+            task_kind: spec.task_kind.clone(),
+            from_hash: from.tools_hash.clone(),
+            to_hash: to.tools_hash.clone(),
+            from_count: from.tool_count(),
+            to_count: to.tool_count(),
+            added,
+            removed,
+            shared,
+            changed: from.tools_hash != to.tools_hash,
+            warnings,
         })
     }
 
@@ -7514,11 +8040,10 @@ impl AgentService {
         let result = async {
             let agents = self.engine.list_agents(session_id).await?;
             let agent = agents.into_iter().find(|agent| agent.role == role.as_str());
-            let spec = stable_agent_spec(&session, agent, role);
-            // Warm only the stable head sections. Memory, the user prompt, and
-            // conversation history are deliberately excluded. Warming may
-            // materialize blobs/state, but it never makes an extra provider
-            // call unless the operator explicitly requested this warm.
+            let task_kind = plan_task_kind_for_agent(&self.engine, &session.id, &agent).await;
+            let spec = stable_agent_spec(&session, agent, role, task_kind);
+            // Warm only the stable sections. Memory, objective, and
+            // conversation history are deliberately excluded.
             let sections = build_prompt_sections(
                 &self.engine,
                 &project,
@@ -7529,13 +8054,9 @@ impl AgentService {
                 InstructionBuildMode::Materialize,
             )
             .await?;
-            let mut tools = tool_schemas(&config, spec.role, spec.profile, spec.allow_delegation);
-            tools.extend(
-                collect_dynamic_mcp_tools(&self.engine, spec.role)
-                    .await
-                    .iter()
-                    .map(|binding| binding.schema.clone()),
-            );
+            let dynamic_mcp = collect_dynamic_mcp_tools(&self.engine, spec.role).await;
+            let frozen_bundle = frozen_tool_bundle(&config, &spec, &dynamic_mcp);
+            let tools = frozen_bundle.tools.clone();
             let budget = SessionBudget::new(
                 session.token_budget,
                 session.tokens_in + session.tokens_out,
@@ -7629,6 +8150,7 @@ impl AgentService {
                 department: None,
                 profile,
                 allow_delegation: true,
+                task_kind: None,
                 auto_approve: false,
                 worktree: worktree.clone(),
                 branch: branch.clone(),
@@ -7639,13 +8161,9 @@ impl AgentService {
             };
             let system =
                 role_system_prompt(spec.role, &project, &session, &spec, &session.goal).render();
-            let mut tools = tool_schemas(&config, spec.role, spec.profile, spec.allow_delegation);
-            tools.extend(
-                collect_dynamic_mcp_tools(&self.engine, spec.role)
-                    .await
-                    .iter()
-                    .map(|binding| binding.schema.clone()),
-            );
+            let dynamic_mcp = collect_dynamic_mcp_tools(&self.engine, spec.role).await;
+            let frozen_bundle = frozen_tool_bundle(&config, &spec, &dynamic_mcp);
+            let tools = frozen_bundle.tools.clone();
             let model_name = model_for(&config, spec.role);
             let calibration = load_context_calibration(&self.engine, session_id, &model_name).await;
             let system_tokens = estimate_context_tokens(&system);
@@ -7821,6 +8339,7 @@ impl AgentService {
             department: None,
             profile,
             allow_delegation: true,
+            task_kind: None,
             auto_approve: false,
             worktree: worktree.clone(),
             branch: branch.clone(),
@@ -7830,17 +8349,13 @@ impl AgentService {
             base_commit: session.base_commit.clone().unwrap_or_default(),
         };
         let system = role_system_prompt(spec.role, project, session, &spec, &session.goal).render();
-        let mut tools = tool_schemas(config, spec.role, spec.profile, spec.allow_delegation);
-        tools.extend(
-            collect_dynamic_mcp_tools(&self.engine, spec.role)
-                .await
-                .iter()
-                .map(|binding| binding.schema.clone()),
-        );
+        let dynamic_mcp = collect_dynamic_mcp_tools(&self.engine, spec.role).await;
+        let frozen_bundle = frozen_tool_bundle(config, &spec, &dynamic_mcp);
+        let tools = frozen_bundle.tools.clone();
         let prefix_hash = crate::sha256_hex(
             format!(
                 "{system}\n{}",
-                serde_json::to_string(&tools).unwrap_or_default()
+                crate::tool_bundle::canonical_tools_json(&tools)
             )
             .as_bytes(),
         );
@@ -8776,6 +9291,7 @@ async fn run_plan_resume(
         department: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
+        task_kind: None,
         auto_approve: false,
         worktree: worktree.clone(),
         branch: session_branch.clone(),
@@ -9118,6 +9634,7 @@ async fn run_agent(
         department: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
+        task_kind: None,
         auto_approve: false,
         worktree: worktree.clone(),
         branch: session_branch.clone(),
@@ -9609,6 +10126,7 @@ fn remote_integrator_spec(
         department: None,
         profile: AgentProfile::Generic,
         allow_delegation: false,
+        task_kind: None,
         auto_approve: true,
         worktree: worktree.to_path_buf(),
         branch: branch.to_string(),
@@ -10531,6 +11049,7 @@ async fn verify_worker(
         department: worker_spec.department.clone(),
         profile: AgentProfile::Verification,
         allow_delegation: false,
+        task_kind: None,
         auto_approve,
         worktree: checkout_path.clone(),
         branch: verifier_branch,
@@ -11331,6 +11850,7 @@ async fn delegate_acp(
         department: parent_spec.department.clone(),
         profile: AgentProfile::Coding,
         allow_delegation: false,
+        task_kind: None,
         auto_approve: acp_agent.auto_approve,
         worktree: info.path.clone(),
         branch: info.branch.clone(),
@@ -14338,14 +14858,12 @@ async fn run_loop_body(
     // contains volatile run context or memory.
     let stable_prefix = sections.stable_prefix();
     // The tool bundle is frozen for the run. Skill activation is enforced at
-    // execution time, not by filtering schemas mid-run.
+    // execution time, not by filtering schemas mid-run, and dynamic MCP schemas
+    // are sorted and appended exactly once. This is the prefix that every
+    // provider call in the run receives unchanged.
     let dynamic_mcp_tools = collect_dynamic_mcp_tools(engine, spec.role).await;
-    let mut tools = tool_schemas(config, spec.role, spec.profile, spec.allow_delegation);
-    tools.extend(
-        dynamic_mcp_tools
-            .iter()
-            .map(|binding| binding.schema.clone()),
-    );
+    let frozen_bundle = frozen_tool_bundle(config, spec, &dynamic_mcp_tools);
+    let tools = frozen_bundle.tools.clone();
     let system_tokens = estimate_context_tokens(&system);
     let tool_tokens = serde_json::to_string(&tools)
         .map(|schema| estimate_context_tokens(&schema))
@@ -14394,7 +14912,18 @@ async fn run_loop_body(
                 &config.provider_name
             ),
             "model": model_name,
-            "tool_bundle_hash": prompt_hashes.tools_hash,
+            "tool_bundle": frozen_bundle.selection.kind.as_str(),
+            "tool_bundle_hash": frozen_bundle.bundle_hash,
+            "tool_bundle_reason": frozen_bundle.selection.reason,
+            "tool_bundle_fallback": frozen_bundle.selection.fallback,
+            "tool_bundle_tool_count": frozen_bundle.builtin_count(),
+            "tool_bundle_mcp_count": frozen_bundle.mcp_count(),
+            "tool_bundle_total_tool_count": frozen_bundle.tool_count(),
+            "tool_bundle_target_limit": frozen_bundle.target_limit,
+            "tool_bundle_within_target": frozen_bundle.within_target(),
+            "tool_bundle_omitted": &frozen_bundle.omitted,
+            "tool_bundle_warnings": frozen_bundle.warnings.iter().map(|warning| warning.payload()).collect::<Vec<_>>(),
+            "tool_bundle_frozen": true,
             "stable_system_hash": prompt_hashes.stable_system_hash,
             "stable_prefix_hash": prompt_hashes.stable_prefix_hash,
             "core_hash": prompt_hashes.core_hash,
@@ -14426,6 +14955,17 @@ async fn run_loop_body(
             "system_tokens_estimate": system_tokens,
             "tool_tokens_estimate": tool_tokens,
         }),
+    )
+    .await?;
+    // Durable per-run manifest. It is separate from `context.prompt_prefix`
+    // so cache/prefix readers can stay small while an operator can inspect the
+    // exact frozen tool list without a provider call.
+    emit(
+        engine,
+        &session.id,
+        spec,
+        "context.tool_bundle",
+        frozen_bundle.manifest_payload(),
     )
     .await?;
     // Seed miss attribution from the latest persisted ordinary agent call.
@@ -14989,6 +15529,10 @@ async fn run_loop_body(
                         "core_hash": prompt_hashes.core_hash,
                         "project_hash": prompt_hashes.project_hash,
                         "tools_hash": prompt_hashes.tools_hash,
+                        "tool_bundle": frozen_bundle.selection.kind.as_str(),
+                        "tool_bundle_hash": frozen_bundle.bundle_hash,
+                        "tool_bundle_tool_count": frozen_bundle.builtin_count(),
+                        "tool_bundle_mcp_count": frozen_bundle.mcp_count(),
                         "volatile_hash": prompt_hashes.volatile_hash,
                         "prompt_prefix_hash": prefix_hash,
                         "cache_generation": prefix_hash,
@@ -15984,7 +16528,7 @@ async fn run_loop_body(
                     }),
                 )
                 .await?;
-                match run_tool_search(config, engine, spec, input.clone()).await {
+                match run_tool_search(config, engine, spec, &frozen_bundle, input.clone()).await {
                     Ok(output) => output,
                     Err(error) => ToolOutput::error(format!("tool search error: {error}")),
                 }
@@ -16533,6 +17077,7 @@ async fn run_loop_body(
                                     },
                                     department: spec.department.clone(),
                                     profile: child_profile,
+                                    task_kind: spec.task_kind.clone(),
                                     allow_delegation: role.child_role().is_some(),
                                     auto_approve: false,
                                     worktree: child_worktree,
@@ -17716,6 +18261,7 @@ async fn run_tool_search(
     config: &AgentConfig,
     engine: &Engine,
     spec: &AgentSpec,
+    frozen_bundle: &crate::tool_bundle::FrozenToolBundle,
     input: Value,
 ) -> Result<ToolOutput> {
     let query = input
@@ -17734,10 +18280,15 @@ async fn run_tool_search(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let mut results = Vec::new();
-    // Mirror the exact tool bundle advertised to this role, including
-    // special-cased tools such as `browser` that are not in the registry.
-    // `tool_search` itself is omitted so a generic query does not return the
-    // discovery tool as its own result.
+    // Search the full role-allowed surface, not only the frozen advertisement.
+    // That is the documented recovery path when a named bundle is too small:
+    // an out-of-bundle result is marked `in_bundle=false` and can still be
+    // called because role policy remains the authorization gate.
+    let advertised = frozen_bundle
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<std::collections::HashSet<_>>();
     for tool in tool_schemas(config, spec.role, spec.profile, spec.allow_delegation)
         .into_iter()
         .filter(|tool| tool.name != "tool_search")
@@ -17746,11 +18297,17 @@ async fn run_tool_search(
         if score <= 0.0 {
             continue;
         }
+        let category = crate::tool_bundle::catalog_entry(&tool.name)
+            .map(|entry| entry.category.as_str())
+            .unwrap_or("unbundled");
         let mut value = json!({
             "name": tool.name,
             "kind": "builtin",
             "description": tool.description.chars().take(400).collect::<String>(),
             "callable": true,
+            "in_bundle": advertised.contains(tool.name.as_str()),
+            "bundle": frozen_bundle.selection.kind.as_str(),
+            "category": category,
             "score": score,
         });
         if include_schema {
@@ -17781,6 +18338,9 @@ async fn run_tool_search(
                 "tool_name": tool.name,
                 "description": tool.description.chars().take(400).collect::<String>(),
                 "callable": mcp_callable,
+                "in_bundle": advertised.contains(exposed.as_str()),
+                "bundle": frozen_bundle.selection.kind.as_str(),
+                "category": "mcp",
                 "score": score,
             });
             if include_schema {
@@ -17802,7 +18362,7 @@ async fn run_tool_search(
         .iter()
         .map(|result| {
             format!(
-                "{} · {}{} · {}",
+                "{} · {}{}{} · {}",
                 result["name"].as_str().unwrap_or("?"),
                 result["kind"].as_str().unwrap_or("tool"),
                 if result["kind"] == "mcp" {
@@ -17812,6 +18372,11 @@ async fn run_tool_search(
                         .unwrap_or_default()
                 } else {
                     String::new()
+                },
+                if result["in_bundle"].as_bool().unwrap_or(false) {
+                    ""
+                } else {
+                    " [outside frozen bundle; callable if role policy allows]"
                 },
                 result["description"].as_str().unwrap_or("")
             )
@@ -17834,6 +18399,10 @@ async fn run_tool_search(
             "tools": results,
             "count": results.len(),
             "mcp_callable": mcp_callable,
+            "bundle": frozen_bundle.selection.kind.as_str(),
+            "bundle_hash": frozen_bundle.bundle_hash,
+            "advertised_count": advertised.len(),
+            "outside_bundle": results.iter().filter(|result| !result["in_bundle"].as_bool().unwrap_or(false)).count(),
         }),
     ))
 }
@@ -20500,6 +21069,7 @@ async fn run_scout(
         department: parent.department.clone(),
         profile: AgentProfile::Research,
         allow_delegation: false,
+        task_kind: None,
         auto_approve: false,
         worktree: worktree.clone(),
         branch: parent.session_branch.clone(),
@@ -21003,6 +21573,7 @@ async fn run_parallel_workers(
             department: spec.department.clone(),
             profile: task.profile,
             allow_delegation: true,
+            task_kind: None,
             auto_approve: false,
             worktree: info.path,
             branch: info.branch,
@@ -22180,6 +22751,7 @@ async fn ensure_plan_manager(
         department: Some(department.name.clone()),
         profile,
         allow_delegation: false,
+        task_kind: None,
         auto_approve: false,
         worktree: session_worktree.clone(),
         branch: session_branch.clone(),
@@ -22612,6 +23184,9 @@ async fn execute_team_plan(
                 department: Some(task.department.clone()),
                 profile,
                 allow_delegation: true,
+                // The plan task kind is the deterministic bundle selector for
+                // this Worker. It is frozen for the run, including retries.
+                task_kind: Some(task.kind.clone()),
                 auto_approve: false,
                 worktree: info.path,
                 branch: info.branch,
@@ -23319,10 +23894,43 @@ fn role_system_prompt(
     }
 }
 
+/// Preview profile when no agent row exists yet. The bundle matrix still
+/// constrains the role, so this only affects which optional surfaces appear.
+fn default_profile_for_preview(role: AgentRole) -> AgentProfile {
+    match role {
+        AgentRole::Leader | AgentRole::Manager | AgentRole::Worker | AgentRole::Labour => {
+            AgentProfile::Generic
+        }
+        AgentRole::Verifier => AgentProfile::Verification,
+        AgentRole::Scout => AgentProfile::Research,
+    }
+}
+
+/// Resolve a plan task kind for a stored agent so a read-only cache preview
+/// reports the same bundle the next run will use. Missing plans and taskless
+/// agents return `None`, which preserves the legacy full fallback.
+async fn plan_task_kind_for_agent(
+    engine: &Engine,
+    session_id: &str,
+    agent: &Option<AgentRecord>,
+) -> Option<String> {
+    let task_id = agent.as_ref()?.task_id.as_ref()?;
+    let plan = engine.get_team_plan(session_id).await.ok().flatten()?;
+    plan.tasks
+        .into_iter()
+        .find(|task| task.id == *task_id)
+        .map(|task| task.kind)
+}
+
 /// Build the stable synthetic spec used by cache preview/warm. It uses the
 /// recorded agent row when one exists, otherwise the role's default name and a
 /// generic profile. No worktree is created or modified.
-fn stable_agent_spec(session: &Session, agent: Option<AgentRecord>, role: AgentRole) -> AgentSpec {
+fn stable_agent_spec(
+    session: &Session,
+    agent: Option<AgentRecord>,
+    role: AgentRole,
+    task_kind: Option<String>,
+) -> AgentSpec {
     let profile = agent
         .as_ref()
         .and_then(|agent| agent.profile.as_deref())
@@ -23346,6 +23954,7 @@ fn stable_agent_spec(session: &Session, agent: Option<AgentRecord>, role: AgentR
         task_id: None,
         department: None,
         profile,
+        task_kind,
         allow_delegation: role.child_role().is_some(),
         auto_approve: false,
         worktree: worktree.clone(),
@@ -23565,6 +24174,105 @@ async fn build_prompt_sections(
     Ok(crate::prompt_cache::PromptSections::from_materialized(
         &materialized,
     ))
+}
+
+/// Project the static bundle catalog into the protocol shape shared by
+/// `agent.info`, `tool_bundle.catalog`, and `session.tool_bundle`.
+fn tool_bundle_catalog_rows() -> Vec<ToolBundleCatalogRow> {
+    crate::tool_bundle::catalog_entries()
+        .into_iter()
+        .map(|entry| ToolBundleCatalogRow {
+            bundle: entry.kind.as_str().to_string(),
+            title: entry.title.to_string(),
+            summary: entry.summary.to_string(),
+            target_limit: entry.target_limit,
+            requested_count: entry.requested_count,
+            representative_role: entry.representative_role.to_string(),
+            representative_profile: entry.representative_profile.to_string(),
+            allows_dynamic_mcp: entry.allows_dynamic_mcp,
+        })
+        .collect()
+}
+
+fn tool_bundle_warnings() -> Vec<ToolBundleWarningInfo> {
+    crate::tool_bundle::audit_matrix()
+        .into_iter()
+        .map(|warning| ToolBundleWarningInfo {
+            code: warning.code.to_string(),
+            message: warning.message,
+        })
+        .collect()
+}
+
+/// Synthetic spec for the read-only bundle matrix. It uses no real worktree
+/// and is never executed; only `frozen_tool_bundle` consumes it.
+fn preview_spec(role: AgentRole, profile: AgentProfile, task_kind: Option<String>) -> AgentSpec {
+    AgentSpec {
+        id: format!("preview-{}", role.as_str()),
+        role,
+        name: role.default_name().to_string(),
+        depth: 0,
+        parent_name: None,
+        title: None,
+        task_id: None,
+        department: None,
+        profile,
+        task_kind,
+        allow_delegation: role.child_role().is_some(),
+        auto_approve: false,
+        worktree: PathBuf::new(),
+        branch: String::new(),
+        session_worktree: PathBuf::new(),
+        session_branch: String::new(),
+        write_scope: Vec::new(),
+        base_commit: String::new(),
+    }
+}
+
+/// Deterministic tool-bundle selection for one run. The role decides the
+/// surface family; a known plan task kind partitions Worker/Labour work. The
+/// result is computed once and frozen for the whole run.
+fn tool_bundle_selection(spec: &AgentSpec) -> crate::tool_bundle::ToolBundleSelection {
+    crate::tool_bundle::select_bundle(
+        spec.role.as_str(),
+        spec.profile.as_str(),
+        spec.task_kind.as_deref(),
+    )
+}
+
+/// Build the exact tool prefix the provider will see: role policy first, then
+/// the named bundle filter, then dynamic MCP schemas sorted and appended once.
+/// This is the only production path that constructs provider tool schemas.
+fn frozen_tool_bundle(
+    config: &AgentConfig,
+    spec: &AgentSpec,
+    mcp: &[McpToolBinding],
+) -> crate::tool_bundle::FrozenToolBundle {
+    let available = tool_schemas(config, spec.role, spec.profile, spec.allow_delegation);
+    let mcp_schemas = mcp
+        .iter()
+        .map(|binding| binding.schema.clone())
+        .collect::<Vec<_>>();
+    crate::tool_bundle::freeze(tool_bundle_selection(spec), available, mcp_schemas)
+}
+
+/// Preview an explicitly named bundle without changing the role-derived
+/// selection. Used by `tool_bundle.diff`; never used to start a run.
+fn frozen_tool_bundle_for_kind(
+    config: &AgentConfig,
+    spec: &AgentSpec,
+    kind: crate::tool_bundle::ToolBundleKind,
+) -> crate::tool_bundle::FrozenToolBundle {
+    let available = tool_schemas(config, spec.role, spec.profile, spec.allow_delegation);
+    let selection = crate::tool_bundle::ToolBundleSelection::new(
+        kind,
+        spec.role.as_str(),
+        spec.profile.as_str(),
+        spec.task_kind.clone(),
+        "explicit_preview",
+        kind == crate::tool_bundle::ToolBundleKind::Full,
+    );
+    crate::tool_bundle::freeze(selection, available, Vec::new())
 }
 
 /// Legacy fingerprint retained for tests that assert the historical

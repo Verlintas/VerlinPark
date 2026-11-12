@@ -149,6 +149,7 @@ pub mod sources;
 pub mod terminal;
 pub mod test_cache;
 pub mod textdiff;
+pub mod tool_bundle;
 pub mod tool_output;
 pub mod tooling;
 pub mod update;
@@ -10192,6 +10193,21 @@ impl Engine {
             core_hash: hash("core_hash"),
             project_hash: hash("project_hash"),
             tools_hash: hash("tools_hash"),
+            tool_bundle: hash("tool_bundle"),
+            tool_bundle_hash: hash("tool_bundle_hash"),
+            tool_bundle_tool_count: prefix_event.as_ref().and_then(|event| {
+                event
+                    .payload
+                    .get("tool_bundle_tool_count")
+                    .or_else(|| event.payload.get("tool_count"))
+                    .and_then(serde_json::Value::as_u64)
+            }),
+            tool_bundle_mcp_count: prefix_event.as_ref().and_then(|event| {
+                event
+                    .payload
+                    .get("tool_bundle_mcp_count")
+                    .and_then(serde_json::Value::as_u64)
+            }),
             volatile_hash: hash("volatile_hash"),
             preamble_tokens_estimate,
             last_call_at,

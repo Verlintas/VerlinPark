@@ -112,7 +112,8 @@ use vp_protocol::types::{
     SubscribeParams, TaskActionParams, TaskActionResult, TaskDispatchParams, TaskDispatchResult,
     TaskQueueParams, TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult,
     TerminalCloseParams, TerminalOpenParams, TerminalReadParams, TerminalResizeParams,
-    TerminalWriteParams, ToolActivityParams, ToolOutputAuditParams, ToolOutputListParams,
+    TerminalWriteParams, ToolActivityParams, ToolBundleDiffParams, ToolBundleHistoryParams,
+    ToolBundleMatrixParams, ToolBundleParams, ToolOutputAuditParams, ToolOutputListParams,
     ToolOutputPolicyParams, ToolOutputPolicyResult, ToolOutputPruneParams, ToolOutputStatusParams,
     UpdateAcpAgentParams, UpdateCheckParams, UpdateDownloadParams, UpdateMcpServerParams,
     UpdateModelPresetParams, UpdateSourceMetadataParams, UsageLedgerParams, WorkspaceFileParams,
@@ -2960,6 +2961,56 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             Ok(params) => match state
                 .agent
                 .cache_plan_now(&params.session_id, &params.roles)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "tool_bundle.catalog" => RpcResponse::success(id, state.agent.tool_bundle_catalog()),
+        "tool_bundle.matrix" => match parse_params::<ToolBundleMatrixParams>(request.params) {
+            Ok(params) => match state.agent.tool_bundle_matrix(&params.task_kinds) {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "tool_bundle.diff" => match parse_params::<ToolBundleDiffParams>(request.params) {
+            Ok(params) => match state.agent.tool_bundle_diff(
+                &params.from_bundle,
+                &params.to_bundle,
+                params.role.as_deref(),
+                params.profile.as_deref(),
+                params.task_kind.as_deref(),
+            ) {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.tool_bundle.history" => {
+            match parse_params::<ToolBundleHistoryParams>(request.params) {
+                Ok(params) => match state
+                    .agent
+                    .tool_bundle_history(&params.session_id, params.role.as_deref(), params.limit)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "session.tool_bundle" => match parse_params::<ToolBundleParams>(request.params) {
+            Ok(params) => match state
+                .agent
+                .tool_bundle_now(
+                    &params.session_id,
+                    &params.roles,
+                    params.task_kind.as_deref(),
+                    params.include_tools.unwrap_or(true),
+                )
                 .await
             {
                 Ok(result) => RpcResponse::success(id, result),

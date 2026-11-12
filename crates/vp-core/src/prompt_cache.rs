@@ -374,10 +374,11 @@ impl PromptSectionHashes {
         model: &str,
         tools: &[vp_providers::ToolSchema],
     ) -> Self {
-        let mut sorted = tools.to_vec();
-        sorted.sort_by(|left, right| left.name.cmp(&right.name));
-        let tool_bundle = serde_json::to_string(&sorted).unwrap_or_default();
-        let tools_hash = sha256_hex(tool_bundle.as_bytes());
+        // Canonical schema serialization is owned by `tool_bundle`: tools are
+        // name-sorted, parameter objects are recursively key-sorted, and every
+        // selected schema is deduplicated. Session data is never included, so
+        // the same bundle produces the same bytes in another session.
+        let tools_hash = crate::tool_bundle::canonical_tools_hash(tools);
         let core_hash = sha256_hex(sections.core.as_bytes());
         let project_hash = sha256_hex(sections.project.as_bytes());
         let stable_prefix = sections.stable_prefix();
@@ -801,6 +802,8 @@ pub fn cache_call_record(payload: &Value, created_at: &str) -> SessionCacheCall 
         core_hash: text("core_hash"),
         project_hash: text("project_hash"),
         tools_hash: text("tools_hash"),
+        tool_bundle: text("tool_bundle"),
+        tool_bundle_hash: text("tool_bundle_hash"),
         volatile_hash: text("volatile_hash"),
         prompt_prefix_hash: text("prompt_prefix_hash"),
         estimated_savings_usd: payload
