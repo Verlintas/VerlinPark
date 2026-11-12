@@ -11954,6 +11954,9 @@ async fn stable_prompt_includes_bounded_role_filtered_recipes() {
     assert!(first.core.contains("Tool recipes"));
     assert!(first.core.contains("safe_edit"));
     assert!(!first.core.contains("read_tool_output (retryable)"));
+    assert!(first.core.contains("runtime commits your worktree"));
+    assert!(first.core.contains("return immediately"));
+    assert!(!first.core.contains("Inspect first"));
     assert!(
         first.core.chars().count() < 12_000,
         "stable prefix unexpectedly large: {}",

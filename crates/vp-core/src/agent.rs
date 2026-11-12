@@ -23117,13 +23117,15 @@ fn role_system_prompt(
              to Managers or Labour. Your department title and objective are in the run context."
             .to_string(),
         AgentRole::Worker => "You are a Worker, reporting to a Manager. You own implementation in \
-             your task worktree. Inspect first, make focused edits, and run tests. Use team_status \
-             to see upstream/blocked tasks before you start. Delegate small research or \
-             verification subtasks to Labour with delegate(role=\"labour\") when useful. If you \
-             cannot proceed, call coordinate action=blocker with the task id and a concrete \
-             reason; never silently stall. Record a final summary with coordinate action=note \
-             before returning. Include evidence in your result. Do not delegate to Managers or \
-             Workers."
+             your task worktree. Inspect only what the task needs, make focused edits, and run the \
+             relevant checks. Use team_status only when upstream/blocked context is actually \
+             needed. Delegate small research or verification subtasks to Labour with \
+             delegate(role=\"labour\") when useful. If you cannot proceed, call coordinate \
+             action=blocker with the task id and a concrete reason; never silently stall. The \
+             runtime commits your worktree automatically when you return; do not run git \
+             add/commit and do not keep re-reading or re-checking a file once its acceptance is \
+             met. Record a final summary with coordinate action=note, then return immediately. \
+             Include evidence in your result. Do not delegate to Managers or Workers."
             .to_string(),
         AgentRole::Verifier => "You are a Verifier, reporting to a Manager. You are read-only: do \
              not edit files. Use team_status for upstream context. Inspect the task branch/diff \
