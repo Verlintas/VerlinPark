@@ -112,6 +112,16 @@ impl AcpTransportArg {
 }
 
 #[derive(Debug, Subcommand)]
+enum DaemonAgentAction {
+    /// Write ~/Library/LaunchAgents/com.verlinpark.daemon.plist and bootstrap it.
+    Install,
+    /// Boot the job out and remove the user plist.
+    Uninstall,
+    /// Report installed/loaded/disabled/running state without starting anything.
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
 enum Command {
     /// Check that the daemon is reachable.
     Ping,
@@ -127,6 +137,26 @@ enum Command {
     Bench {
         #[command(subcommand)]
         command: vp_bench::cli::BenchCommand,
+    },
+    /// Explicitly install, remove, or inspect the user LaunchAgent for verlinpadd.
+    DaemonAgent {
+        #[command(subcommand)]
+        action: DaemonAgentAction,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long, global = true)]
+        yes: bool,
+        /// Print the plist and audit commands without writing or calling launchctl.
+        #[arg(long, global = true)]
+        dry_run: bool,
+        /// Override the daemon data directory recorded in the plist.
+        #[arg(long, global = true)]
+        data_dir: Option<std::path::PathBuf>,
+        /// Absolute path to verlinpadd (defaults to the sibling of vp or PATH).
+        #[arg(long, global = true)]
+        binary: Option<std::path::PathBuf>,
+        /// Replace an existing not-loaded plist. Never overrides a running job.
+        #[arg(long, global = true)]
+        force: bool,
     },
     /// List configured external ACP agents.
     AcpAgents,
@@ -1379,9 +1409,39 @@ enum Command {
         /// Additional sensitive title/app pattern (repeatable).
         #[arg(long = "sensitive-title")]
         sensitive_title: Vec<String>,
+        /// Manager-style GUI action timeline retention in days; 0 keeps forever.
+        #[arg(long)]
+        timeline_retention_days: Option<u32>,
         /// Replace the additional sensitive lists instead of appending.
         #[arg(long)]
         replace_sensitive: bool,
+    },
+    /// Show bounded audit rows for previous GUI timeline prunes.
+    GuiTimelineAudit {
+        project: String,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
+    /// Show GUI action timeline counts and the retention cutoff.
+    GuiTimelineStatus {
+        project: String,
+        /// Override the project policy for this read.
+        #[arg(long)]
+        older_than_days: Option<u32>,
+    },
+    /// Prune old `gui.action` timeline events for a project (bounded, audited).
+    GuiTimelinePrune {
+        project: String,
+        /// Override the project policy for this call; 0 is rejected.
+        #[arg(long)]
+        older_than_days: Option<u32>,
+        #[arg(long, default_value_t = 1000)]
+        limit: u32,
+        #[arg(long)]
+        dry_run: bool,
+        /// Confirm a destructive non-dry-run prune.
+        #[arg(long)]
+        yes: bool,
     },
     /// Show the project's shell permission policy.
     ShellPolicy { project: String },
@@ -1892,6 +1952,15 @@ enum Command {
         max_output_bytes: Option<u64>,
         #[arg(long)]
         max_output_lines: Option<u64>,
+        /// Restart a still-running-at-boot process when its old pid is gone.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        restart_on_boot: Option<bool>,
+        /// Consecutive boot-restart attempts allowed (0..=10).
+        #[arg(long)]
+        restart_max_attempts: Option<u32>,
+        /// Base exponential backoff in seconds (0..=300).
+        #[arg(long)]
+        restart_backoff_secs: Option<u64>,
     },
     /// List durable supervised processes for a session.
     Processes {
@@ -1921,6 +1990,15 @@ enum Command {
         /// Follow deadline in seconds; default 300.
         #[arg(long, default_value_t = 300)]
         timeout_secs: u64,
+    },
+    /// Explicitly retry a blocked/lost supervised process under the same
+    /// sandbox, env sidecar, and bounded attempt policy.
+    ProcessRestart {
+        session: String,
+        process: String,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
     },
     /// Stop a durable supervised process (SIGTERM, bounded wait, SIGKILL).
     ProcessStop {
@@ -2520,7 +2598,18 @@ enum Command {
         include_integration: Option<bool>,
         #[arg(long)]
         failed_retention_secs: Option<u64>,
+        /// Extra environment variable name included in the cache key (repeatable).
+        #[arg(long = "extra-env")]
+        extra_env: Vec<String>,
+        /// Extra worktree-relative file included in the cache key (repeatable).
+        #[arg(long = "extra-path")]
+        extra_path: Vec<String>,
+        /// Replace the extra env/path lists instead of appending.
+        #[arg(long)]
+        replace_extra_scopes: bool,
     },
+    /// Preview operator-declared external cache scopes without running a task.
+    TestCacheScopes { project: String },
     /// Prune cached test-result metadata by age, expiry, or kind.
     TestCachePrune {
         project: String,
@@ -3504,6 +3593,83 @@ async fn run(cli: Cli) -> Result<()> {
         }
         return Ok(());
     }
+    if let Command::DaemonAgent {
+        action,
+        yes,
+        dry_run,
+        data_dir,
+        binary,
+        force,
+    } = &cli.command
+    {
+        let paths = vp_core::daemon_agent::DaemonAgentPaths::from_env(
+            data_dir.clone().or_else(|| cli.data_dir.clone()),
+            binary.clone(),
+        )?;
+        let runner = vp_core::daemon_agent::SystemLaunchctl;
+        let agent = vp_core::daemon_agent::DaemonAgent::new(paths, &runner);
+        match action {
+            DaemonAgentAction::Status => {
+                let status = agent.status();
+                if cli.json {
+                    print_json(&serde_json::to_value(status)?)?;
+                } else {
+                    println!(
+                        "{}  state={}  installed={}  loaded={}  disabled={}  running={}  pid={}  supervised={}",
+                        status.label,
+                        status.state,
+                        status.installed,
+                        status.loaded,
+                        status.disabled,
+                        status.running,
+                        status
+                            .pid
+                            .map(|pid| pid.to_string())
+                            .unwrap_or_else(|| "-".into()),
+                        status.supervised
+                    );
+                    if !status.detail.is_empty() {
+                        println!("{}", status.detail);
+                    }
+                    println!("plist: {}", status.plist_path);
+                }
+            }
+            DaemonAgentAction::Install => {
+                let confirmed =
+                    *yes || confirm_cli_action("Install the user LaunchAgent for verlinpadd?")?;
+                let mutation = agent.install(confirmed, *dry_run, *force)?;
+                if cli.json {
+                    print_json(&serde_json::to_value(&mutation)?)?;
+                } else {
+                    println!("{} {}", mutation.action, mutation.label);
+                    println!("plist: {}", mutation.plist_path);
+                    println!("{}", mutation.detail);
+                    for command in &mutation.commands {
+                        println!("  {command}");
+                    }
+                    if let Some(plist) = &mutation.plist {
+                        println!("\n{plist}");
+                    }
+                }
+            }
+            DaemonAgentAction::Uninstall => {
+                let confirmed =
+                    *yes || confirm_cli_action("Uninstall the user LaunchAgent for verlinpadd?")?;
+                let mutation = agent.uninstall(confirmed, *dry_run)?;
+                if cli.json {
+                    print_json(&serde_json::to_value(&mutation)?)?;
+                } else {
+                    println!("{} {}", mutation.action, mutation.label);
+                    println!("plist: {}", mutation.plist_path);
+                    println!("{}", mutation.detail);
+                    for command in &mutation.commands {
+                        println!("  {command}");
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
     let discovery = read_discovery(cli.data_dir.as_deref())?;
     let want_tool_activity_csv = matches!(&cli.command, Command::ToolActivity { csv: true, .. });
     let value = match cli.command {
@@ -3549,6 +3715,9 @@ async fn run(cli: Cli) -> Result<()> {
             unreachable!("backup-anchor-import is handled before discovery")
         }
         Command::Bench { .. } => unreachable!("bench is handled before discovery"),
+        Command::DaemonAgent { .. } => {
+            unreachable!("daemon-agent is handled before discovery")
+        }
         Command::ToolCodes { .. } => unreachable!("tool-codes is handled before discovery"),
         Command::Ping => {
             let result = rpc(&discovery, "ping", json!({})).await?;
@@ -5410,6 +5579,7 @@ async fn run(cli: Cli) -> Result<()> {
             sensitive_mode,
             sensitive_bundle,
             sensitive_title,
+            timeline_retention_days,
             replace_sensitive,
         } => {
             let current = rpc(&discovery, "gui.policy.get", json!({"project_id": project})).await?;
@@ -5425,6 +5595,9 @@ async fn run(cli: Cli) -> Result<()> {
             }
             if let Some(sensitive_mode) = sensitive_mode {
                 policy["sensitive_mode"] = json!(sensitive_mode);
+            }
+            if let Some(days) = timeline_retention_days {
+                policy["timeline_retention_days"] = json!(days);
             }
             if replace_sensitive {
                 policy["sensitive_bundles"] = json!([]);
@@ -5452,6 +5625,54 @@ async fn run(cli: Cli) -> Result<()> {
                 &discovery,
                 "gui.policy.set",
                 json!({"project_id": project, "policy": policy}),
+            )
+            .await?
+        }
+        Command::GuiTimelineAudit { project, limit } => {
+            rpc(
+                &discovery,
+                "gui.timeline.audit",
+                json!({"project_id": project, "limit": limit}),
+            )
+            .await?
+        }
+        Command::GuiTimelineStatus {
+            project,
+            older_than_days,
+        } => {
+            rpc(
+                &discovery,
+                "gui.timeline.retention",
+                json!({
+                    "project_id": project,
+                    "older_than_days": older_than_days,
+                }),
+            )
+            .await?
+        }
+        Command::GuiTimelinePrune {
+            project,
+            older_than_days,
+            limit,
+            dry_run,
+            yes,
+        } => {
+            let confirmed = dry_run
+                || yes
+                || confirm_cli_action("Prune old gui.action events for this project?")?;
+            if !confirmed {
+                bail!("GUI timeline prune requires explicit confirmation");
+            }
+            rpc(
+                &discovery,
+                "gui.timeline.prune",
+                json!({
+                    "project_id": project,
+                    "older_than_days": older_than_days,
+                    "limit": limit,
+                    "dry_run": dry_run,
+                    "confirm": confirmed,
+                }),
             )
             .await?
         }
@@ -6222,6 +6443,9 @@ async fn run(cli: Cli) -> Result<()> {
             idle_ttl_secs,
             max_output_bytes,
             max_output_lines,
+            restart_on_boot,
+            restart_max_attempts,
+            restart_backoff_secs,
         } => {
             let current = rpc(
                 &discovery,
@@ -6244,6 +6468,15 @@ async fn run(cli: Cli) -> Result<()> {
             }
             if let Some(value) = max_output_lines {
                 policy["max_output_lines"] = json!(value);
+            }
+            if let Some(value) = restart_on_boot {
+                policy["restart_on_boot"] = json!(value);
+            }
+            if let Some(value) = restart_max_attempts {
+                policy["restart_max_attempts"] = json!(value);
+            }
+            if let Some(value) = restart_backoff_secs {
+                policy["restart_backoff_secs"] = json!(value);
             }
             rpc(
                 &discovery,
@@ -6330,6 +6563,26 @@ async fn run(cli: Cli) -> Result<()> {
                 )
                 .await?
             }
+        }
+        Command::ProcessRestart {
+            session,
+            process,
+            yes,
+        } => {
+            let confirmed = yes || confirm_cli_action("Retry this supervised process now?")?;
+            if !confirmed {
+                bail!("process restart requires explicit confirmation");
+            }
+            rpc(
+                &discovery,
+                "session.process.restart",
+                json!({
+                    "session_id": session,
+                    "process_id": process,
+                    "confirm": true,
+                }),
+            )
+            .await?
         }
         Command::ProcessStop {
             session,
@@ -7803,6 +8056,9 @@ async fn run(cli: Cli) -> Result<()> {
             reuse_lint,
             include_integration,
             failed_retention_secs,
+            extra_env,
+            extra_path,
+            replace_extra_scopes,
         } => {
             let current = rpc(
                 &discovery,
@@ -7836,11 +8092,41 @@ async fn run(cli: Cli) -> Result<()> {
                 if let Some(value) = failed_retention_secs {
                     object.insert("failed_retention_secs".into(), json!(value));
                 }
+                if replace_extra_scopes {
+                    object.insert("extra_env".into(), json!([]));
+                    object.insert("extra_paths".into(), json!([]));
+                }
+                if !extra_env.is_empty() {
+                    let mut values = object
+                        .get("extra_env")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    values.extend(extra_env.iter().cloned().map(Value::String));
+                    object.insert("extra_env".into(), json!(values));
+                }
+                if !extra_path.is_empty() {
+                    let mut values = object
+                        .get("extra_paths")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    values.extend(extra_path.iter().cloned().map(Value::String));
+                    object.insert("extra_paths".into(), json!(values));
+                }
             }
             rpc(
                 &discovery,
                 "test_cache.policy.set",
                 json!({"project_id": project, "policy": policy}),
+            )
+            .await?
+        }
+        Command::TestCacheScopes { project } => {
+            rpc(
+                &discovery,
+                "test_cache.scope.preview",
+                json!({"project_id": project}),
             )
             .await?
         }
@@ -9118,6 +9404,21 @@ fn print_backup_anchor(value: &Value) {
             );
         }
     }
+}
+
+/// Line-oriented confirmation for destructive/privileged local operations.
+/// EOF, a blank line, or anything other than `y`/`yes` is a refusal. The CLI
+/// never reads from a keyboard for a background command.
+fn confirm_cli_action(prompt: &str) -> Result<bool> {
+    eprint!("{prompt} [y/N] ");
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    let read = std::io::stdin().read_line(&mut line)?;
+    if read == 0 {
+        return Ok(false);
+    }
+    let answer = line.trim().to_ascii_lowercase();
+    Ok(answer == "y" || answer == "yes")
 }
 
 fn print_json(value: &Value) -> Result<()> {
@@ -13982,7 +14283,7 @@ mod tests {
     #[test]
     fn session_operation_id_flags_parse() {
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 let cli = Cli::try_parse_from([
                     "vp",
@@ -14042,7 +14343,7 @@ mod tests {
     #[test]
     fn lsp_command_parses_project() {
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 let cli = Cli::try_parse_from(["vp", "lsp", "proj-1"]).unwrap();
                 match cli.command {
@@ -14102,7 +14403,7 @@ mod tests {
         // The full CLI command tree is large; parse on a test thread with more
         // stack than libtest's default rather than relying on runner defaults.
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 let cli = Cli::try_parse_from(["vp", "metrics", "--prometheus"]).unwrap();
                 match cli.command {
@@ -14118,7 +14419,7 @@ mod tests {
     #[test]
     fn bench_command_parses_without_daemon_discovery() {
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 let cli = Cli::try_parse_from([
                     "vp",
@@ -14148,7 +14449,7 @@ mod tests {
     #[test]
     fn cache_command_parses_session_and_json_flag() {
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 let cli = Cli::try_parse_from(["vp", "cache", "ses-123", "--json"]).unwrap();
                 assert!(cli.json);
@@ -14165,7 +14466,7 @@ mod tests {
     #[test]
     fn cache_audit_parses_a_session() {
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 let cli = Cli::try_parse_from(["vp", "cache-audit", "ses-123"]).unwrap();
                 match cli.command {
@@ -14181,7 +14482,7 @@ mod tests {
     #[test]
     fn cache_plan_accepts_repeated_roles() {
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 let cli = Cli::try_parse_from([
                     "vp",
@@ -14209,7 +14510,7 @@ mod tests {
     #[test]
     fn cache_warm_accepts_both_spellings() {
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 let direct =
                     Cli::try_parse_from(["vp", "cache-warm", "ses-123", "--role", "worker"])
@@ -14244,7 +14545,7 @@ mod tests {
     #[test]
     fn cache_policy_set_parses_ttl_and_compaction_flags() {
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 let cli = Cli::try_parse_from([
                     "vp",
@@ -14293,7 +14594,7 @@ mod durable_run_cli_tests {
     #[test]
     fn durable_run_commands_parse() {
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 let cli = Cli::try_parse_from([
                     "vp",
@@ -14364,7 +14665,7 @@ mod durable_run_cli_tests {
     #[test]
     fn tool_output_cli_flags_parse_additively() {
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 let cli = Cli::try_parse_from([
                     "vp",
@@ -14411,7 +14712,7 @@ mod hybrid_memory_cli_tests {
     fn parse_cli(args: &[&str]) -> Cli {
         let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(move || Cli::try_parse_from(args).unwrap())
             .unwrap()
             .join()
@@ -14421,7 +14722,7 @@ mod hybrid_memory_cli_tests {
     #[test]
     fn hybrid_memory_commands_and_policy_flags_parse() {
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 let cli = Cli::try_parse_from(["vp", "memory-embeddings", "proj-1"]).unwrap();
                 match cli.command {
@@ -14735,7 +15036,7 @@ mod context_checkpoint_cli_tests {
     #[test]
     fn context_checkpoint_commands_parse() {
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 let cli =
                     Cli::try_parse_from(["vp", "context-checkpoints", "ses-1", "--limit", "12"])
@@ -15243,7 +15544,7 @@ mod source_embedding_cli_tests {
     fn parse(args: &[&str]) -> Cli {
         let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(move || Cli::try_parse_from(args).unwrap())
             .unwrap()
             .join()
@@ -15274,7 +15575,7 @@ mod source_embedding_cli_tests {
         }
         assert!(
             std::thread::Builder::new()
-                .stack_size(16 * 1024 * 1024)
+                .stack_size(32 * 1024 * 1024)
                 .spawn(|| {
                     Cli::try_parse_from([
                         "vp",
@@ -15449,7 +15750,7 @@ mod source_embedding_cli_tests {
         }
         assert!(
             std::thread::Builder::new()
-                .stack_size(16 * 1024 * 1024)
+                .stack_size(32 * 1024 * 1024)
                 .spawn(|| {
                     Cli::try_parse_from([
                         "vp",
@@ -15638,7 +15939,7 @@ mod process_command_tests {
         // generous stack so this test is not sensitive to the default 2 MiB
         // libtest thread size.
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 let cli = Cli::try_parse_from(["vp", "processes", "ses-1"]).unwrap();
                 match cli.command {
@@ -15724,7 +16025,7 @@ mod process_command_tests {
     #[test]
     fn clap_parses_process_policy_commands() {
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 let cli = Cli::try_parse_from(["vp", "process-policy", "prj-1"]).unwrap();
                 match cli.command {
@@ -15745,6 +16046,12 @@ mod process_command_tests {
                     "65536",
                     "--max-output-lines",
                     "2000",
+                    "--restart-on-boot",
+                    "true",
+                    "--restart-max-attempts",
+                    "2",
+                    "--restart-backoff-secs",
+                    "30",
                 ])
                 .unwrap();
                 match cli.command {
@@ -15755,6 +16062,9 @@ mod process_command_tests {
                         idle_ttl_secs,
                         max_output_bytes,
                         max_output_lines,
+                        restart_on_boot,
+                        restart_max_attempts,
+                        restart_backoff_secs,
                     } => {
                         assert_eq!(project, "prj-1");
                         assert_eq!(idle_sweep_enabled, Some(false));
@@ -15762,6 +16072,9 @@ mod process_command_tests {
                         assert_eq!(idle_ttl_secs, Some(900));
                         assert_eq!(max_output_bytes, Some(65536));
                         assert_eq!(max_output_lines, Some(2000));
+                        assert_eq!(restart_on_boot, Some(true));
+                        assert_eq!(restart_max_attempts, Some(2));
+                        assert_eq!(restart_backoff_secs, Some(30));
                     }
                     other => panic!("expected process-policy-set, got {other:?}"),
                 }
@@ -15976,7 +16289,7 @@ mod governor_cli_tests {
             .map(|arg| (*arg).to_string())
             .collect::<Vec<_>>();
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(move || Cli::try_parse_from(args).unwrap())
             .unwrap()
             .join()
@@ -16182,7 +16495,7 @@ mod remote_integration_cli_tests {
     #[test]
     fn remote_integration_commands_parse_explicit_confirmation_and_bounds() {
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(parse_remote_integration_commands)
             .unwrap()
             .join()
@@ -16386,7 +16699,7 @@ mod remote_integration_cli_tests {
     #[test]
     fn backup_signing_flags_parse() {
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 let cli = Cli::try_parse_from([
                     "vp",
@@ -16540,7 +16853,7 @@ mod remote_integration_cli_tests {
     #[test]
     fn preemption_commands_and_flags_parse() {
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 let cli =
                     Cli::try_parse_from(["vp", "preempt", "ses-1", "--reason", "rotate the run"])
@@ -16613,7 +16926,7 @@ mod test_cache_cli_tests {
     #[test]
     fn parses_test_cache_commands_additively() {
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 let cli = Cli::try_parse_from([
                     "vp",
@@ -16792,7 +17105,7 @@ mod approval_optimizer_cli_tests {
     fn parse(args: &[&str]) -> Cli {
         let args = args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
         std::thread::Builder::new()
-            .stack_size(8 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(move || Cli::try_parse_from(args).unwrap())
             .unwrap()
             .join()
@@ -16930,7 +17243,7 @@ mod governor_fairness_cli_tests {
             .map(|arg| (*arg).to_string())
             .collect::<Vec<_>>();
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(move || Cli::try_parse_from(args).unwrap())
             .unwrap()
             .join()
@@ -17251,7 +17564,7 @@ mod governor_fairness_cli_tests {
     #[test]
     fn archive_and_media_commands_parse() {
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 let cli = Cli::try_parse_from([
                     "vp",
@@ -17706,7 +18019,7 @@ mod forge_cli_tests {
     #[test]
     fn pr_command_accepts_an_explicit_bitbucket_provider() {
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 let cli =
                     Cli::try_parse_from(["vp", "pr", "ses-1", "--provider", "bitbucket"]).unwrap();
@@ -17744,7 +18057,7 @@ mod forge_cli_tests {
     #[test]
     fn pr_command_rejects_unknown_providers_before_rpc() {
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 let error = Cli::try_parse_from(["vp", "pr", "ses-1", "--provider", "sourcehut"])
                     .unwrap_err();
@@ -17758,7 +18071,7 @@ mod forge_cli_tests {
     #[test]
     fn forge_status_command_parses_optional_project() {
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 let cli = Cli::try_parse_from(["vp", "forge", "status"]).unwrap();
                 match cli.command {
@@ -17785,7 +18098,7 @@ mod forge_cli_tests {
     #[test]
     fn forge_check_command_parses_project_and_provider() {
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 let cli = Cli::try_parse_from([
                     "vp",
@@ -17940,7 +18253,7 @@ mod remote_bootstrap_test_cli_tests {
     #[test]
     fn remote_bootstrap_and_test_commands_parse_bounds() {
         std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(parse_remote_bootstrap_test_commands)
             .unwrap()
             .join()
@@ -18209,5 +18522,199 @@ mod remote_bootstrap_test_cli_tests {
         let text = remote_test_lines(&status).unwrap().join("\n");
         assert!(text.contains("remote test evidence for prj-1"));
         assert!(text.contains("never bypasses"));
+    }
+}
+
+#[cfg(test)]
+mod i5_cli_tests {
+    use super::*;
+
+    #[test]
+    fn clap_parses_daemon_agent_lifecycle_flags() {
+        let cli = Cli::try_parse_from([
+            "vp",
+            "daemon-agent",
+            "install",
+            "--yes",
+            "--dry-run",
+            "--force",
+            "--data-dir",
+            "/tmp/vp-data",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::DaemonAgent {
+                action,
+                yes,
+                dry_run,
+                force,
+                data_dir,
+                ..
+            } => {
+                assert!(matches!(action, DaemonAgentAction::Install));
+                assert!(yes && dry_run && force);
+                assert_eq!(
+                    data_dir.as_deref(),
+                    Some(std::path::Path::new("/tmp/vp-data"))
+                );
+            }
+            other => panic!("expected daemon-agent, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["vp", "daemon-agent", "status"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::DaemonAgent {
+                action: DaemonAgentAction::Status,
+                ..
+            }
+        ));
+        let cli = Cli::try_parse_from(["vp", "daemon-agent", "uninstall", "--yes"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::DaemonAgent {
+                action: DaemonAgentAction::Uninstall,
+                yes: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn clap_parses_gui_retention_and_external_cache_scopes() {
+        let cli = Cli::try_parse_from([
+            "vp",
+            "gui-timeline-status",
+            "proj-1",
+            "--older-than-days",
+            "14",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::GuiTimelineStatus {
+                project,
+                older_than_days,
+            } => {
+                assert_eq!(project, "proj-1");
+                assert_eq!(older_than_days, Some(14));
+            }
+            other => panic!("expected gui-timeline-status, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from([
+            "vp",
+            "gui-timeline-prune",
+            "proj-1",
+            "--older-than-days",
+            "30",
+            "--limit",
+            "25",
+            "--dry-run",
+            "--yes",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::GuiTimelinePrune {
+                project,
+                older_than_days,
+                limit,
+                dry_run,
+                yes,
+            } => {
+                assert_eq!(project, "proj-1");
+                assert_eq!(older_than_days, Some(30));
+                assert_eq!(limit, 25);
+                assert!(dry_run);
+                assert!(yes);
+            }
+            other => panic!("expected gui-timeline-prune, got {other:?}"),
+        }
+        let cli =
+            Cli::try_parse_from(["vp", "gui-timeline-audit", "proj-1", "--limit", "12"]).unwrap();
+        match cli.command {
+            Command::GuiTimelineAudit { project, limit } => {
+                assert_eq!(project, "proj-1");
+                assert_eq!(limit, 12);
+            }
+            other => panic!("expected gui-timeline-audit, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["vp", "test-cache-scopes", "proj-1"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::TestCacheScopes { project } if project == "proj-1"
+        ));
+        let cli = Cli::try_parse_from([
+            "vp",
+            "test-cache-policy-set",
+            "proj-1",
+            "--extra-env",
+            "MY_INPUT",
+            "--extra-env",
+            "OTHER_INPUT",
+            "--extra-path",
+            "config/local.env",
+            "--replace-extra-scopes",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::TestCachePolicySet {
+                project,
+                extra_env,
+                extra_path,
+                replace_extra_scopes,
+                ..
+            } => {
+                assert_eq!(project, "proj-1");
+                assert_eq!(extra_env, vec!["MY_INPUT", "OTHER_INPUT"]);
+                assert_eq!(extra_path, vec!["config/local.env"]);
+                assert!(replace_extra_scopes);
+            }
+            other => panic!("expected test-cache-policy-set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_explicit_process_restart() {
+        let cli =
+            Cli::try_parse_from(["vp", "process-restart", "ses-1", "psup_1", "--yes"]).unwrap();
+        match cli.command {
+            Command::ProcessRestart {
+                session,
+                process,
+                yes,
+            } => {
+                assert_eq!(session, "ses-1");
+                assert_eq!(process, "psup_1");
+                assert!(yes);
+            }
+            other => panic!("expected process-restart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_process_restart_policy_flags() {
+        let cli = Cli::try_parse_from([
+            "vp",
+            "process-policy-set",
+            "proj-1",
+            "--restart-on-boot",
+            "true",
+            "--restart-max-attempts",
+            "4",
+            "--restart-backoff-secs",
+            "15",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::ProcessPolicySet {
+                restart_on_boot,
+                restart_max_attempts,
+                restart_backoff_secs,
+                ..
+            } => {
+                assert_eq!(restart_on_boot, Some(true));
+                assert_eq!(restart_max_attempts, Some(4));
+                assert_eq!(restart_backoff_secs, Some(15));
+            }
+            other => panic!("expected process-policy-set, got {other:?}"),
+        }
     }
 }

@@ -55,6 +55,36 @@ pub const MAX_TOOL_OUTPUT_BLOB_BYTES: usize = 32 * 1024 * 1024;
 /// corrupt or hand-edited row.
 pub const MAX_MEMORY_INDEX_BLOB_BYTES: usize = 64 * 1024 * 1024;
 
+/// Bounded outcome of a `gui.action` retention prune. The core layer maps this
+/// to the protocol result; no event payload or screen content is included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuiTimelinePruneOutcome {
+    pub project_id: String,
+    pub retention_days: u32,
+    pub cutoff: String,
+    pub dry_run: bool,
+    pub pruned: u64,
+    pub remaining: u64,
+    pub sessions: u64,
+    pub skipped_sessions: u64,
+    pub skipped_events: u64,
+    pub other_kinds_touched: u64,
+    pub limit: u32,
+    pub truncated: bool,
+    pub reason: String,
+    pub affected_sessions: Vec<String>,
+}
+
+/// Read-only GUI timeline counts used by the retention status RPC. A cutoff of
+/// `None` means the project keeps events forever and `eligible` is zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuiActionRetentionStats {
+    pub total: u64,
+    pub eligible: u64,
+    pub oldest_at: Option<String>,
+    pub newest_at: Option<String>,
+}
+
 pub fn tool_output_line_count(content: &str) -> u64 {
     if content.is_empty() {
         0
@@ -1635,6 +1665,9 @@ impl Store {
                 idle_ttl_secs       INTEGER NOT NULL DEFAULT 3600,
                 max_output_bytes    INTEGER NOT NULL DEFAULT 1048576,
                 max_output_lines    INTEGER NOT NULL DEFAULT 20000,
+                restart_on_boot     INTEGER NOT NULL DEFAULT 0,
+                restart_max_attempts INTEGER NOT NULL DEFAULT 3,
+                restart_backoff_secs INTEGER NOT NULL DEFAULT 5,
                 updated_at          TEXT NOT NULL
             );
 
@@ -2922,6 +2955,8 @@ impl Store {
                 retention_deadline  TEXT,
                 idle_ttl_secs       INTEGER NOT NULL DEFAULT 3600,
                 last_access_at      TEXT NOT NULL,
+                restart_attempts    INTEGER NOT NULL DEFAULT 0,
+                restart_blocked_reason TEXT,
                 detail              TEXT
             );
 
@@ -3624,6 +3659,37 @@ impl Store {
         ensure_column(&conn, "merge_queue", "remote_test_evidence_id", "TEXT")?;
         ensure_column(&conn, "merge_queue", "remote_test_digest", "TEXT")?;
         ensure_column(&conn, "merge_queue", "remote_test_status", "TEXT")?;
+
+        ensure_column(
+            &conn,
+            "project_process_policies",
+            "restart_on_boot",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &conn,
+            "project_process_policies",
+            "restart_max_attempts",
+            "INTEGER NOT NULL DEFAULT 3",
+        )?;
+        ensure_column(
+            &conn,
+            "project_process_policies",
+            "restart_backoff_secs",
+            "INTEGER NOT NULL DEFAULT 5",
+        )?;
+        ensure_column(
+            &conn,
+            "supervised_processes",
+            "restart_attempts",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &conn,
+            "supervised_processes",
+            "restart_blocked_reason",
+            "TEXT",
+        )?;
         ensure_column(&conn, "plan_tasks", "next_attempt_at", "TEXT")?;
         ensure_column(&conn, "approvals", "approval_risk", "TEXT")?;
         ensure_column(&conn, "approvals", "approval_reason", "TEXT")?;
@@ -3952,7 +4018,8 @@ impl Store {
         let stored = conn
             .query_row(
                 "SELECT idle_sweep_enabled, max_processes, idle_ttl_secs,
-                        max_output_bytes, max_output_lines
+                        max_output_bytes, max_output_lines, restart_on_boot,
+                        restart_max_attempts, restart_backoff_secs
                  FROM project_process_policies WHERE project_id = ?1",
                 params![project_id],
                 |row| {
@@ -3962,6 +4029,9 @@ impl Store {
                         idle_ttl_secs: row.get::<_, i64>(2)?.max(1) as u64,
                         max_output_bytes: row.get::<_, i64>(3)?.max(1) as u64,
                         max_output_lines: row.get::<_, i64>(4)?.max(1) as u64,
+                        restart_on_boot: row.get::<_, i64>(5)? != 0,
+                        restart_max_attempts: row.get::<_, i64>(6)?.clamp(0, 10) as u32,
+                        restart_backoff_secs: row.get::<_, i64>(7)?.clamp(0, 300) as u64,
                     })
                 },
             )
@@ -3985,14 +4055,18 @@ impl Store {
         conn.execute(
             "INSERT INTO project_process_policies
              (project_id, idle_sweep_enabled, max_processes, idle_ttl_secs,
-              max_output_bytes, max_output_lines, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+              max_output_bytes, max_output_lines, restart_on_boot,
+              restart_max_attempts, restart_backoff_secs, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(project_id) DO UPDATE SET
                 idle_sweep_enabled = excluded.idle_sweep_enabled,
                 max_processes = excluded.max_processes,
                 idle_ttl_secs = excluded.idle_ttl_secs,
                 max_output_bytes = excluded.max_output_bytes,
                 max_output_lines = excluded.max_output_lines,
+                restart_on_boot = excluded.restart_on_boot,
+                restart_max_attempts = excluded.restart_max_attempts,
+                restart_backoff_secs = excluded.restart_backoff_secs,
                 updated_at = excluded.updated_at",
             params![
                 project_id,
@@ -4001,6 +4075,9 @@ impl Store {
                 policy.idle_ttl_secs as i64,
                 policy.max_output_bytes as i64,
                 policy.max_output_lines as i64,
+                if policy.restart_on_boot { 1 } else { 0 },
+                i64::from(policy.restart_max_attempts),
+                policy.restart_backoff_secs as i64,
                 now_rfc3339()
             ],
         )?;
@@ -13157,6 +13234,9 @@ impl Store {
             event_kind,
             "process.started"
                 | "process.adopted"
+                | "process.restarting"
+                | "process.restarted"
+                | "process.restart_blocked"
                 | "process.exited"
                 | "process.lost"
                 | "process.unknown"
@@ -13232,7 +13312,10 @@ impl Store {
         let Some(state) = state else {
             return Ok(None);
         };
-        if matches!(state.as_str(), "starting" | "running" | "unknown") {
+        if matches!(
+            state.as_str(),
+            "starting" | "running" | "restarting" | "unknown"
+        ) {
             return Err(anyhow!(
                 "refusing to prune a live supervised process: {process_id} ({state})"
             ));
@@ -13272,7 +13355,8 @@ impl Store {
                         exit_code, signal, output_path, output_bytes, output_lines,
                         total_output_bytes, output_rotations, max_output_bytes,
                         max_output_lines, owner_instance,
-                        retention_deadline, idle_ttl_secs, last_access_at, detail
+                        retention_deadline, idle_ttl_secs, last_access_at,
+                    restart_attempts, restart_blocked_reason, detail
                  FROM supervised_processes
                  WHERE session_id = ?1 AND id = ?2",
                 params![session_id, process_id],
@@ -13295,10 +13379,11 @@ impl Store {
                     exit_code, signal, output_path, output_bytes, output_lines,
                     total_output_bytes, output_rotations, max_output_bytes,
                     max_output_lines, owner_instance,
-                    retention_deadline, idle_ttl_secs, last_access_at, detail
+                    retention_deadline, idle_ttl_secs, last_access_at,
+                    restart_attempts, restart_blocked_reason, detail
              FROM supervised_processes
              WHERE session_id = ?1
-               AND (?2 = 1 OR state IN ('starting', 'running', 'unknown'))
+               AND (?2 = 1 OR state IN ('starting', 'running', 'restarting', 'unknown'))
              ORDER BY started_at DESC, id DESC
              LIMIT ?3",
         )?;
@@ -13323,18 +13408,35 @@ impl Store {
                     exit_code, signal, output_path, output_bytes, output_lines,
                     total_output_bytes, output_rotations, max_output_bytes,
                     max_output_lines, owner_instance,
-                    retention_deadline, idle_ttl_secs, last_access_at, detail
+                    retention_deadline, idle_ttl_secs, last_access_at,
+                    restart_attempts, restart_blocked_reason, detail
              FROM supervised_processes
-             WHERE state IN ('starting', 'running', 'unknown')
+             WHERE state IN ('starting', 'running', 'restarting', 'unknown')
              ORDER BY started_at, id",
         )?;
         let rows = statement.query_map([], map_supervised_process)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Running/starting/unknown rows for the idle sweep.
+    /// Running/starting/unknown rows for the idle sweep. A row in `restarting`
+    /// has no live process and is intentionally excluded.
     pub fn list_live_supervised_processes(&self) -> Result<Vec<SupervisedProcess>> {
-        self.list_unfinished_supervised_processes()
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT id, session_id, name, command, argv, cwd, worktree,
+                    env_hash, command_hash, state, pid, pgid, nonce,
+                    started_at, process_started_at, heartbeat_at, finished_at,
+                    exit_code, signal, output_path, output_bytes, output_lines,
+                    total_output_bytes, output_rotations, max_output_bytes,
+                    max_output_lines, owner_instance,
+                    retention_deadline, idle_ttl_secs, last_access_at,
+                    restart_attempts, restart_blocked_reason, detail
+             FROM supervised_processes
+             WHERE state IN ('starting', 'running', 'unknown')
+             ORDER BY started_at, id",
+        )?;
+        let rows = statement.query_map([], map_supervised_process)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Terminal rows whose retention deadline has passed.
@@ -13347,9 +13449,10 @@ impl Store {
                     exit_code, signal, output_path, output_bytes, output_lines,
                     total_output_bytes, output_rotations, max_output_bytes,
                     max_output_lines, owner_instance,
-                    retention_deadline, idle_ttl_secs, last_access_at, detail
+                    retention_deadline, idle_ttl_secs, last_access_at,
+                    restart_attempts, restart_blocked_reason, detail
              FROM supervised_processes
-             WHERE state IN ('exited', 'stopped', 'lost')
+             WHERE state IN ('exited', 'stopped', 'lost', 'blocked')
                AND retention_deadline IS NOT NULL
                AND retention_deadline <= ?1
              ORDER BY retention_deadline, id",
@@ -13362,7 +13465,7 @@ impl Store {
         let conn = self.lock()?;
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM supervised_processes
-             WHERE session_id = ?1 AND state IN ('starting', 'running', 'unknown')",
+             WHERE session_id = ?1 AND state IN ('starting', 'running', 'restarting', 'unknown')",
             params![session_id],
             |row| row.get(0),
         )?;
@@ -17274,6 +17377,369 @@ impl Store {
         }
         actions.reverse();
         Ok(actions)
+    }
+
+    /// Count `gui.action` rows and how many are strictly older than `cutoff`.
+    /// The query joins sessions only for project scoping; no payload is read.
+    pub fn gui_action_retention_stats(
+        &self,
+        project_id: &str,
+        cutoff: Option<&str>,
+    ) -> Result<GuiActionRetentionStats> {
+        let conn = self.lock()?;
+        let (total, oldest_at, newest_at): (i64, Option<String>, Option<String>) = conn.query_row(
+            "SELECT COUNT(*), MIN(e.created_at), MAX(e.created_at)
+                 FROM events e JOIN sessions s ON s.id = e.session_id
+                 WHERE s.project_id = ?1 AND e.type = 'gui.action'",
+            params![project_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let eligible = match cutoff {
+            Some(cutoff) => conn.query_row(
+                "SELECT COUNT(*)
+                 FROM events e JOIN sessions s ON s.id = e.session_id
+                 WHERE s.project_id = ?1 AND e.type = 'gui.action'
+                   AND julianday(e.created_at) < julianday(?2)",
+                params![project_id, cutoff],
+                |row| row.get::<_, i64>(0),
+            )?,
+            None => 0,
+        };
+        Ok(GuiActionRetentionStats {
+            total: total.max(0) as u64,
+            eligible: eligible.max(0) as u64,
+            oldest_at,
+            newest_at,
+        })
+    }
+
+    /// Bounded audit rows for `gui.timeline_pruned` events. Only the count,
+    /// cutoff, and retention days are returned; no pruned payload is read.
+    pub fn gui_timeline_prune_audit(
+        &self,
+        project_id: &str,
+        limit: u32,
+    ) -> Result<(Vec<vp_protocol::types::GuiTimelinePrunedInfo>, u64)> {
+        let limit = limit.clamp(1, 1_000);
+        let conn = self.lock()?;
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM events e JOIN sessions s ON s.id = e.session_id
+             WHERE s.project_id = ?1 AND e.type = 'gui.timeline_pruned'",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+        let mut statement = conn.prepare(
+            "SELECT e.session_id, e.seq, e.payload, e.created_at
+             FROM events e JOIN sessions s ON s.id = e.session_id
+             WHERE s.project_id = ?1 AND e.type = 'gui.timeline_pruned'
+             ORDER BY e.created_at DESC, e.seq DESC
+             LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![project_id, i64::from(limit)], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut entries = Vec::new();
+        for row in rows {
+            let (session_id, seq, payload, created_at) = row?;
+            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap_or_default();
+            entries.push(vp_protocol::types::GuiTimelinePrunedInfo {
+                session_id,
+                seq: seq.max(0) as u64,
+                retention_days: payload
+                    .get("retention_days")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+                    .min(u64::from(u32::MAX)) as u32,
+                cutoff: payload
+                    .get("cutoff")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                pruned: payload
+                    .get("pruned")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                created_at,
+            });
+        }
+        Ok((entries, total.max(0) as u64))
+    }
+
+    /// Bounded, audited retention prune for the GUI action timeline.
+    ///
+    /// Only `events.type = 'gui.action'` rows are eligible. A per-session JSONL
+    /// mirror is rewritten in the same critical section as the SQLite delete
+    /// so `session.log_status` does not report drift from normal retention. A
+    /// session whose mirror cannot be read or atomically rewritten is skipped
+    /// before deletion: retention never guesses. The appended
+    /// `gui.timeline_pruned` audit event is the only new event and carries
+    /// counts, a cutoff, and the project id, never screen content.
+    pub fn prune_gui_action_events(
+        &self,
+        project_id: &str,
+        cutoff: &str,
+        retention_days: u32,
+        limit: u32,
+        dry_run: bool,
+    ) -> Result<GuiTimelinePruneOutcome> {
+        let limit = limit.clamp(1, 10_000);
+        let cutoff_parsed = OffsetDateTime::parse(cutoff, &Rfc3339)
+            .with_context(|| format!("invalid GUI retention cutoff: {cutoff}"))?;
+        let cutoff = cutoff_parsed
+            .format(&Rfc3339)
+            .context("formatting GUI retention cutoff")?;
+        let conn = self.lock()?;
+        let mut candidate_statement = conn.prepare(
+            "SELECT e.session_id, e.seq
+             FROM events e JOIN sessions s ON s.id = e.session_id
+             WHERE s.project_id = ?1 AND e.type = 'gui.action'
+               AND julianday(e.created_at) < julianday(?2)
+             ORDER BY e.created_at ASC, e.session_id ASC, e.seq ASC
+             LIMIT ?3",
+        )?;
+        let candidates = candidate_statement
+            .query_map(params![project_id, cutoff, i64::from(limit)], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(candidate_statement);
+        let total_eligible: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM events e JOIN sessions s ON s.id = e.session_id
+             WHERE s.project_id = ?1 AND e.type = 'gui.action'
+               AND julianday(e.created_at) < julianday(?2)",
+            params![project_id, cutoff],
+            |row| row.get(0),
+        )?;
+        let remaining_before: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM events e JOIN sessions s ON s.id = e.session_id
+             WHERE s.project_id = ?1 AND e.type = 'gui.action'",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+        drop(conn);
+        let truncated = total_eligible > candidates.len() as i64;
+        if dry_run {
+            let mut sessions = candidates
+                .iter()
+                .map(|(session, _)| session.clone())
+                .collect::<Vec<_>>();
+            sessions.sort();
+            sessions.dedup();
+            return Ok(GuiTimelinePruneOutcome {
+                project_id: project_id.to_string(),
+                retention_days,
+                cutoff,
+                dry_run: true,
+                pruned: candidates.len() as u64,
+                remaining: remaining_before.max(0) as u64,
+                sessions: sessions.len() as u64,
+                skipped_sessions: 0,
+                skipped_events: 0,
+                other_kinds_touched: 0,
+                limit,
+                truncated,
+                reason: "dry run: no event or mirror was changed".to_string(),
+                affected_sessions: sessions.into_iter().take(32).collect(),
+            });
+        }
+        let mut grouped: std::collections::BTreeMap<String, Vec<u64>> =
+            std::collections::BTreeMap::new();
+        for (session_id, seq) in candidates {
+            grouped.entry(session_id).or_default().push(seq);
+        }
+        let mut pruned = 0u64;
+        let mut skipped_sessions = 0u64;
+        let mut skipped_events = 0u64;
+        let mut affected = Vec::new();
+        for (session_id, seqs) in grouped {
+            match self.prune_gui_actions_for_session(
+                &session_id,
+                &seqs,
+                project_id,
+                &cutoff,
+                retention_days,
+            ) {
+                Ok(count) => {
+                    pruned += count;
+                    if count > 0 {
+                        affected.push(session_id);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, session_id = %session_id, "GUI timeline prune skipped a session");
+                    skipped_sessions += 1;
+                    skipped_events += seqs.len() as u64;
+                }
+            }
+        }
+        let remaining = remaining_before.saturating_sub(pruned as i64).max(0) as u64;
+        affected.sort();
+        Ok(GuiTimelinePruneOutcome {
+            project_id: project_id.to_string(),
+            retention_days,
+            cutoff,
+            dry_run: false,
+            pruned,
+            remaining,
+            sessions: affected.len() as u64,
+            skipped_sessions,
+            skipped_events,
+            other_kinds_touched: 0,
+            limit,
+            truncated,
+            reason: "gui.action retention prune".to_string(),
+            affected_sessions: affected.into_iter().take(32).collect(),
+        })
+    }
+
+    fn prune_gui_actions_for_session(
+        &self,
+        session_id: &str,
+        seqs: &[u64],
+        project_id: &str,
+        cutoff: &str,
+        retention_days: u32,
+    ) -> Result<u64> {
+        if seqs.is_empty() {
+            return Ok(0);
+        }
+        validate_storage_id("session", session_id)?;
+        let mirror_path = self
+            .data_dir
+            .join("sessions")
+            .join(session_id)
+            .join("events.jsonl");
+        // Lock order is database then mirror, matching every append path that
+        // commits an event and then appends its mirror line. Reversing it here
+        // would deadlock against a concurrent lifecycle event.
+        let mut conn = self.lock()?;
+        let _guard = self
+            .mirror_lock
+            .lock()
+            .map_err(|_| anyhow!("event mirror mutex poisoned"))?;
+        let mirror_text = std::fs::read_to_string(&mirror_path).ok();
+        let mirror_present = mirror_text.is_some();
+        let mut mirror_events = match &mirror_text {
+            Some(text) => {
+                let mut events = Vec::new();
+                for line in text.lines() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let event = serde_json::from_str::<Event>(line)
+                        .with_context(|| format!("parsing event mirror {session_id}"))?;
+                    events.push(event);
+                }
+                events.sort_by_key(|event| event.seq);
+                events
+            }
+            None => Vec::new(),
+        };
+        let removed = seqs
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        mirror_events.retain(|event| !(event.kind == "gui.action" && removed.contains(&event.seq)));
+
+        let tx = conn.transaction()?;
+        let mut removed_rows = Vec::new();
+        for seq in seqs {
+            let row = tx
+                .query_row(
+                    "SELECT payload, created_at FROM events
+                     WHERE session_id = ?1 AND seq = ?2 AND type = 'gui.action'",
+                    params![session_id, *seq as i64],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            let Some((payload, created_at)) = row else {
+                continue;
+            };
+            removed_rows.push((*seq, payload, created_at));
+        }
+        if removed_rows.is_empty() {
+            tx.rollback()?;
+            return Ok(0);
+        }
+        let audit = insert_event_tx(
+            &tx,
+            session_id,
+            "gui.timeline_pruned",
+            serde_json::json!({
+                "project_id": project_id,
+                "retention_days": retention_days,
+                "cutoff": cutoff,
+                "pruned": removed_rows.len() as u64,
+                "kind": "gui.action",
+            }),
+        )?;
+        for (seq, _, _) in &removed_rows {
+            tx.execute(
+                "DELETE FROM events
+                 WHERE session_id = ?1 AND seq = ?2 AND type = 'gui.action'",
+                params![session_id, *seq as i64],
+            )?;
+        }
+        mirror_events.push(audit.clone());
+        mirror_events.sort_by_key(|event| event.seq);
+        let new_mirror = mirror_events
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()?
+            .join("\n")
+            + "\n";
+        let previous_mirror = mirror_text;
+        let rewrite = (|| -> Result<()> {
+            if !mirror_present {
+                // Imported/legacy sessions may have no JSONL mirror. Retention
+                // still prunes the authoritative table; it never fabricates a
+                // partial mirror that would look complete.
+                return Ok(());
+            }
+            let dir = mirror_path
+                .parent()
+                .ok_or_else(|| anyhow!("event mirror path has no parent"))?;
+            paths::ensure_private_dir(dir)?;
+            let temp = dir.join(format!(".events.jsonl.prune-{}", Uuid::now_v7().simple()));
+            {
+                let mut file = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&temp)
+                    .context("creating pruned event mirror")?;
+                file.write_all(new_mirror.as_bytes())?;
+                file.flush()?;
+            }
+            paths::ensure_private_file(&temp)?;
+            std::fs::rename(&temp, &mirror_path)
+                .with_context(|| format!("replacing event mirror {}", mirror_path.display()))?;
+            Ok(())
+        })();
+        if let Err(error) = rewrite {
+            tx.rollback()?;
+            return Err(error);
+        }
+        match tx.commit() {
+            Ok(()) => Ok(removed_rows.len() as u64),
+            Err(error) => {
+                // Best-effort restore: the mirror rename happened first, so a
+                // failed commit must not leave a mirror that is missing rows
+                // the database still retains.
+                if let Some(previous) = previous_mirror {
+                    let _ = std::fs::write(&mirror_path, previous);
+                }
+                Err(error.into())
+            }
+        }
     }
 
     /// Newest events of one kind, oldest-first in the returned vector. Used by
@@ -25122,7 +25588,14 @@ fn validate_supervised_process_row(process: &SupervisedProcess) -> Result<()> {
     }
     if !matches!(
         process.state.as_str(),
-        "starting" | "running" | "exited" | "stopped" | "lost" | "unknown"
+        "starting"
+            | "running"
+            | "restarting"
+            | "exited"
+            | "stopped"
+            | "lost"
+            | "unknown"
+            | "blocked"
     ) {
         return Err(anyhow!(
             "invalid supervised process state: {}",
@@ -25183,7 +25656,9 @@ fn map_supervised_process(row: &rusqlite::Row<'_>) -> rusqlite::Result<Supervise
         retention_deadline: row.get(27)?,
         idle_ttl_secs: row.get::<_, i64>(28)?.max(1) as u64,
         last_access_at: row.get(29)?,
-        detail: row.get(30)?,
+        restart_attempts: row.get::<_, i64>(30)?.max(0) as u32,
+        restart_blocked_reason: row.get(31)?,
+        detail: row.get(32)?,
     })
 }
 
@@ -25195,10 +25670,11 @@ fn insert_supervised_process_tx(tx: &Transaction<'_>, process: &SupervisedProces
           heartbeat_at, finished_at, exit_code, signal, output_path, output_bytes,
           output_lines, total_output_bytes, output_rotations, max_output_bytes,
           max_output_lines, owner_instance,
-          retention_deadline, idle_ttl_secs, last_access_at, detail)
+          retention_deadline, idle_ttl_secs, last_access_at, restart_attempts,
+          restart_blocked_reason, detail)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                  ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26,
-                 ?27, ?28, ?29, ?30, ?31)",
+                 ?27, ?28, ?29, ?30, ?31, ?32, ?33)",
         params![
             process.id,
             process.session_id,
@@ -25230,6 +25706,8 @@ fn insert_supervised_process_tx(tx: &Transaction<'_>, process: &SupervisedProces
             process.retention_deadline,
             process.idle_ttl_secs as i64,
             process.last_access_at,
+            i64::from(process.restart_attempts),
+            process.restart_blocked_reason,
             process.detail,
         ],
     )?;
@@ -25247,8 +25725,8 @@ fn update_supervised_process_tx(tx: &Transaction<'_>, process: &SupervisedProces
             total_output_bytes = ?22, output_rotations = ?23,
             max_output_bytes = ?24, max_output_lines = ?25, owner_instance = ?26,
             retention_deadline = ?27, idle_ttl_secs = ?28, last_access_at = ?29,
-            detail = ?30
-         WHERE id = ?1 AND session_id = ?31",
+            restart_attempts = ?30, restart_blocked_reason = ?31, detail = ?32
+         WHERE id = ?1 AND session_id = ?33",
         params![
             process.id,
             process.name,
@@ -25279,6 +25757,8 @@ fn update_supervised_process_tx(tx: &Transaction<'_>, process: &SupervisedProces
             process.retention_deadline,
             process.idle_ttl_secs as i64,
             process.last_access_at,
+            i64::from(process.restart_attempts),
+            process.restart_blocked_reason,
             process.detail,
             process.session_id,
         ],

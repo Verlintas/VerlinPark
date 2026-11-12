@@ -376,6 +376,7 @@ struct GuiStagePopover: View {
 struct GuiPolicyCard: View {
     @Environment(AppModel.self) private var model
     let project: Project
+    @State private var confirmingPrune = false
 
     var body: some View {
         @Bindable var model = model
@@ -409,6 +410,11 @@ struct GuiPolicyCard: View {
                 policyField("Grace (s)", value: $model.guiGraceSecs, range: 0 ... 600)
                 policyField("Wait (ms)", value: $model.guiWaitMs, range: 0 ... 60000)
                 policyField("Status TTL (s)", value: $model.guiStatusTtlSecs, range: 5 ... 600)
+                policyField(
+                    "Timeline days",
+                    value: $model.guiTimelineRetentionDays,
+                    range: 0 ... 3650
+                )
                 Spacer()
             }
 
@@ -421,6 +427,52 @@ struct GuiPolicyCard: View {
                     title: "Extra sensitive app/window patterns · one per line",
                     text: $model.guiSensitiveTitlesText
                 )
+            }
+
+            HStack(spacing: 8) {
+                Button("Prune timeline preview") {
+                    Task { await model.pruneGuiTimeline(dryRun: true) }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.guiTimelinePruneBusy || model.guiTimelineRetentionDays == 0)
+                Button("Prune old actions") {
+                    confirmingPrune = true
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.guiTimelinePruneBusy || model.guiTimelineRetentionDays == 0)
+                if let result = model.guiTimelinePruneResult {
+                    Text(
+                        "\(result.pruned) pruned · \(result.remaining) remain"
+                            + (result.truncated ? " · bounded batch" : "")
+                    )
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                }
+            }
+
+            if let retention = model.guiTimelineRetention {
+                HStack(spacing: 10) {
+                    Text(
+                        retention.keepForever
+                            ? "\(retention.total) action event(s) · keep forever"
+                            : "\(retention.total) action event(s) · \(retention.eligible) older than \(retention.retentionDays)d"
+                    )
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    if let oldest = retention.oldestAt {
+                        Text("oldest \(oldest.prefix(19))")
+                            .font(.system(size: 8.5, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                    }
+                    if let audit = model.guiTimelineAudit, audit.total > 0 {
+                        Text("\(audit.total) prune batch(es)")
+                            .font(.system(size: 8.5, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                    }
+                    Spacer()
+                }
             }
 
             HStack(spacing: 8) {
@@ -456,8 +508,20 @@ struct GuiPolicyCard: View {
         }
         .vpHoverLift(scale: 1.003, lift: 1)
         .vpAppear(index: 0)
+        .alert("Prune old GUI actions?", isPresented: $confirmingPrune) {
+            Button("Cancel", role: .cancel) {}
+            Button("Prune", role: .destructive) {
+                Task { await model.pruneGuiTimeline(dryRun: false) }
+            }
+        } message: {
+            Text(
+                "This permanently removes gui.action events older than the retention window. "
+                    + "Other event kinds and the audit record are kept."
+            )
+        }
         .task(id: project.id) {
             await model.loadGuiPolicy()
+            await model.loadGuiTimelineRetention()
         }
     }
 
@@ -474,7 +538,7 @@ struct GuiPolicyCard: View {
                 "\(value.wrappedValue)",
                 value: value,
                 in: range,
-                step: range.upperBound > 1000 ? 500 : 1
+                step: range.upperBound == 3650 ? 1 : (range.upperBound > 1000 ? 500 : 1)
             )
             .font(.system(size: 9, design: .monospaced))
         }

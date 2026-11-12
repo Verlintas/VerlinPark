@@ -120,6 +120,13 @@ final class AppModel {
     var guiSensitiveMode: GuiSensitiveMode = .deny
     var guiSensitiveBundlesText = ""
     var guiSensitiveTitlesText = ""
+    var guiTimelineRetentionDays = 30
+    var guiTimelinePruneResult: GuiTimelinePruneResult?
+    var guiTimelineRetention: GuiTimelineRetentionResult?
+    var guiTimelineAudit: GuiTimelineAuditResult?
+    var guiTimelinePruneBusy = false
+    var daemonAgentStatus: DaemonAgentStatus?
+    var daemonAgentBusy = false
     var guiPolicyBusy = false
     var guiPolicyStatus: String?
     var guiStatus: GuiStatusResult?
@@ -146,6 +153,9 @@ final class AppModel {
     var testCacheReuseLint = true
     var testCacheIncludeIntegration = false
     var testCacheFailedRetentionText = "900"
+    var testCacheExtraEnvText = ""
+    var testCacheExtraPathsText = ""
+    var testCacheScopePreview: TestCacheScopePreview?
     var testCacheBusy = false
     var testCacheStatus: String?
     var testImpactResult: TestCacheImpactResult?
@@ -938,7 +948,12 @@ final class AppModel {
             guiSensitiveMode = .deny
             guiSensitiveBundlesText = ""
             guiSensitiveTitlesText = ""
+            guiTimelineRetentionDays = 30
+            guiTimelinePruneResult = nil
+            guiTimelineRetention = nil
+            guiTimelineAudit = nil
             guiPolicyStatus = nil
+            daemonAgentStatus = nil
             guiStatus = nil
             guiTimeline = []
             guiStatusError = nil
@@ -4118,6 +4133,9 @@ final class AppModel {
             testCacheStats = stats
             testCachePolicy = stats.policy
             applyTestCachePolicy(stats.policy)
+            testCacheScopePreview = try? await core.testCacheScopePreview(
+                projectID: projectID
+            )
             if includeEntries {
                 let result = try await core.testCacheEntries(
                     projectID: projectID,
@@ -4144,6 +4162,8 @@ final class AppModel {
         testCacheReuseLint = policy.reuseLint
         testCacheIncludeIntegration = policy.includeIntegration
         testCacheFailedRetentionText = String(policy.failedRetentionSecs)
+        testCacheExtraEnvText = policy.extraEnv.joined(separator: "\n")
+        testCacheExtraPathsText = policy.extraPaths.joined(separator: "\n")
     }
 
     func saveTestCachePolicy() async {
@@ -4193,7 +4213,15 @@ final class AppModel {
                     maxOutputBytes: maxOutputBytes,
                     reuseLint: testCacheReuseLint,
                     includeIntegration: testCacheIncludeIntegration,
-                    failedRetentionSecs: failedRetention
+                    failedRetentionSecs: failedRetention,
+                    extraEnv: testCacheExtraEnvText
+                        .split(whereSeparator: \.isNewline)
+                        .map { $0.trimmingCharacters(in: .whitespaces) }
+                        .filter { !$0.isEmpty },
+                    extraPaths: testCacheExtraPathsText
+                        .split(whereSeparator: \.isNewline)
+                        .map { $0.trimmingCharacters(in: .whitespaces) }
+                        .filter { !$0.isEmpty }
                 )
             )
             guard projectID == selectedProjectID else { return }
@@ -4369,6 +4397,7 @@ final class AppModel {
             guiSensitiveMode = .deny
             guiSensitiveBundlesText = ""
             guiSensitiveTitlesText = ""
+            guiTimelineRetentionDays = 30
             guiPolicyStatus = nil
             return
         }
@@ -4400,6 +4429,10 @@ final class AppModel {
             guiPolicyStatus = "Status cache TTL must be between 5 and 600 seconds."
             return
         }
+        guard guiTimelineRetentionDays >= 0, guiTimelineRetentionDays <= 3650 else {
+            guiPolicyStatus = "Timeline retention must be 0 (forever) or 1-3650 days."
+            return
+        }
         let bundles = guiSensitiveBundlesText
             .split(whereSeparator: \.isNewline)
             .map { $0.trimmingCharacters(in: .whitespaces) }
@@ -4419,7 +4452,8 @@ final class AppModel {
                     statusTtlSecs: guiStatusTtlSecs,
                     sensitiveMode: guiSensitiveMode,
                     sensitiveBundles: bundles,
-                    sensitiveTitles: titles
+                    sensitiveTitles: titles,
+                    timelineRetentionDays: guiTimelineRetentionDays
                 )
             )
             guard projectID == selectedProjectID else { return }
@@ -4441,6 +4475,7 @@ final class AppModel {
         guiSensitiveMode = .deny
         guiSensitiveBundlesText = ""
         guiSensitiveTitlesText = ""
+        guiTimelineRetentionDays = 30
         await saveGuiPolicy()
     }
 
@@ -4452,7 +4487,61 @@ final class AppModel {
         guiSensitiveMode = policy.sensitiveMode
         guiSensitiveBundlesText = policy.sensitiveBundles.joined(separator: "\n")
         guiSensitiveTitlesText = policy.sensitiveTitles.joined(separator: "\n")
+        guiTimelineRetentionDays = policy.timelineRetentionDays
         guiPolicyStatus = status
+    }
+
+    func pruneGuiTimeline(dryRun: Bool) async {
+        guard let projectID = selectedProjectID else {
+            guiPolicyStatus = "Select a project first."
+            return
+        }
+        guiTimelinePruneBusy = true
+        defer { guiTimelinePruneBusy = false }
+        do {
+            guiTimelinePruneResult = try await core.guiTimelinePrune(
+                projectID: projectID,
+                olderThanDays: guiTimelineRetentionDays == 0 ? nil : guiTimelineRetentionDays,
+                dryRun: dryRun,
+                confirm: !dryRun
+            )
+            if let result = guiTimelinePruneResult {
+                guiPolicyStatus = result.dryRun
+                    ? "Dry run: \(result.pruned) event(s) would be pruned"
+                    : "Pruned \(result.pruned) gui.action event(s); \(result.remaining) remain"
+            }
+            await loadGuiTimeline()
+            await loadGuiTimelineRetention()
+        } catch {
+            guiPolicyStatus = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    func loadGuiTimelineRetention() async {
+        guard let projectID = selectedProjectID else {
+            guiTimelineRetention = nil
+            return
+        }
+        do {
+            guiTimelineRetention = try await core.guiTimelineRetention(
+                projectID: projectID
+            )
+            guiTimelineAudit = try? await core.guiTimelineAudit(projectID: projectID)
+        } catch {
+            guiTimelineRetention = nil
+            guiTimelineAudit = nil
+        }
+    }
+
+    func loadDaemonAgentStatus() async {
+        daemonAgentBusy = true
+        defer { daemonAgentBusy = false }
+        do {
+            daemonAgentStatus = try await core.daemonAgentStatus()
+        } catch {
+            daemonAgentStatus = nil
+        }
     }
 
     func loadGuiStatus() async {

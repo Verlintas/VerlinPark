@@ -10,6 +10,8 @@ struct TestCachePolicy: Codable, Hashable, Sendable {
     var reuseLint: Bool
     var includeIntegration: Bool
     var failedRetentionSecs: Int
+    var extraEnv: [String]
+    var extraPaths: [String]
 
     static let `default` = TestCachePolicy(
         enabled: true,
@@ -18,7 +20,9 @@ struct TestCachePolicy: Codable, Hashable, Sendable {
         maxOutputBytes: 256 * 1024,
         reuseLint: true,
         includeIntegration: false,
-        failedRetentionSecs: 900
+        failedRetentionSecs: 900,
+        extraEnv: [],
+        extraPaths: []
     )
 
     enum CodingKeys: String, CodingKey {
@@ -29,6 +33,8 @@ struct TestCachePolicy: Codable, Hashable, Sendable {
         case reuseLint = "reuse_lint"
         case includeIntegration = "include_integration"
         case failedRetentionSecs = "failed_retention_secs"
+        case extraEnv = "extra_env"
+        case extraPaths = "extra_paths"
     }
 
     init(
@@ -38,7 +44,9 @@ struct TestCachePolicy: Codable, Hashable, Sendable {
         maxOutputBytes: Int,
         reuseLint: Bool,
         includeIntegration: Bool,
-        failedRetentionSecs: Int
+        failedRetentionSecs: Int,
+        extraEnv: [String] = [],
+        extraPaths: [String] = []
     ) {
         self.enabled = enabled
         self.maxEntries = maxEntries
@@ -47,6 +55,8 @@ struct TestCachePolicy: Codable, Hashable, Sendable {
         self.reuseLint = reuseLint
         self.includeIntegration = includeIntegration
         self.failedRetentionSecs = failedRetentionSecs
+        self.extraEnv = extraEnv
+        self.extraPaths = extraPaths
     }
 
     init(from decoder: Decoder) throws {
@@ -61,6 +71,8 @@ struct TestCachePolicy: Codable, Hashable, Sendable {
             ?? false
         failedRetentionSecs = try container.decodeIfPresent(Int.self, forKey: .failedRetentionSecs)
             ?? 900
+        extraEnv = try container.decodeIfPresent([String].self, forKey: .extraEnv) ?? []
+        extraPaths = try container.decodeIfPresent([String].self, forKey: .extraPaths) ?? []
     }
 }
 
@@ -376,5 +388,53 @@ enum TestCacheFormat {
         return value
             .replacingOccurrences(of: "T", with: " ")
             .replacingOccurrences(of: "Z", with: "Z")
+    }
+}
+
+struct TestCacheScopeEntry: Codable, Hashable, Sendable {
+    var kind: String
+    var label: String
+    var present: Bool
+    var bytes: Int
+    var complete: Bool
+    var note: String?
+
+    enum CodingKeys: String, CodingKey {
+        case kind
+        case label
+        case present
+        case bytes
+        case complete
+        case note
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try container.decodeIfPresent(String.self, forKey: .kind) ?? "path"
+        label = try container.decodeIfPresent(String.self, forKey: .label) ?? ""
+        present = try container.decodeIfPresent(Bool.self, forKey: .present) ?? false
+        bytes = try container.decodeIfPresent(Int.self, forKey: .bytes) ?? 0
+        complete = try container.decodeIfPresent(Bool.self, forKey: .complete) ?? false
+        note = try container.decodeIfPresent(String.self, forKey: .note)
+    }
+}
+
+struct TestCacheScopePreview: Codable, Hashable, Sendable {
+    var projectId: String
+    var enabled: Bool
+    var extraEnv: Int
+    var extraPaths: Int
+    var complete: Bool
+    var notes: [String]
+    var entries: [TestCacheScopeEntry]
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case enabled
+        case extraEnv = "extra_env"
+        case extraPaths = "extra_paths"
+        case complete
+        case notes
+        case entries
     }
 }

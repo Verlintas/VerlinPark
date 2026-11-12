@@ -49,8 +49,8 @@ use vp_protocol::types::{
     OrchestrationPreviewAction, OrchestrationPreviewResult, OrchestrationRecoveriesResult,
     OrchestrationRecovery, OrchestrationSessionSummary, OrchestrationSnapshot,
     PlanRevisionDetailResult, PlanRevisionInfo, PreemptionOverviewResult, PreemptionPolicy,
-    PreemptionRecord, ProcessListResult, ProcessLogsResult, ProcessPolicy, ProcessStopResult,
-    ProcessSupervisorStatus, Program, ProgramActionParams, ProgramCreateParams,
+    PreemptionRecord, ProcessListResult, ProcessLogsResult, ProcessPolicy, ProcessRestartResult,
+    ProcessStopResult, ProcessSupervisorStatus, Program, ProgramActionParams, ProgramCreateParams,
     ProgramDeleteParams, ProgramListResult, ProgramMilestone, ProgramMilestoneActionParams,
     ProgramMilestoneCreateParams, ProgramMilestoneListResult, ProgramMilestoneUpdateParams,
     ProgramPolicy, ProgramReplayReport, ProgramStatus, ProgramStatusParams, ProgramStatusResult,
@@ -113,6 +113,7 @@ pub mod console;
 pub mod context;
 pub mod continuation;
 pub mod critical_path;
+pub mod daemon_agent;
 mod dashboard;
 pub mod forge;
 pub mod gui;
@@ -678,6 +679,38 @@ fn selection_source_id(source: crate::forge::ForgeSelectionSource) -> &'static s
         crate::forge::ForgeSelectionSource::Explicit => "explicit",
         crate::forge::ForgeSelectionSource::Environment => "environment",
         crate::forge::ForgeSelectionSource::Detected => "detected",
+    }
+}
+
+/// RFC3339 UTC cutoff used by GUI timeline retention. `days` is validated by
+/// the caller; saturating arithmetic avoids a panic on an absurd policy.
+fn gui_retention_cutoff(days: u32) -> Result<String> {
+    let cutoff = time::OffsetDateTime::now_utc()
+        .checked_sub(time::Duration::days(i64::from(days)))
+        .ok_or_else(|| anyhow!("GUI retention cutoff is out of range"))?;
+    cutoff
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("formatting GUI retention cutoff")
+}
+
+fn gui_prune_result(
+    outcome: vp_store::store::GuiTimelinePruneOutcome,
+) -> vp_protocol::types::GuiTimelinePruneResult {
+    vp_protocol::types::GuiTimelinePruneResult {
+        project_id: outcome.project_id,
+        retention_days: outcome.retention_days,
+        cutoff: outcome.cutoff,
+        dry_run: outcome.dry_run,
+        pruned: outcome.pruned,
+        remaining: outcome.remaining,
+        sessions: outcome.sessions,
+        skipped_sessions: outcome.skipped_sessions,
+        skipped_events: outcome.skipped_events,
+        other_kinds_touched: outcome.other_kinds_touched,
+        limit: outcome.limit,
+        truncated: outcome.truncated,
+        reason: outcome.reason,
+        affected_sessions: outcome.affected_sessions,
     }
 }
 
@@ -1326,6 +1359,142 @@ impl Engine {
         let session_id = session_id.map(str::to_string);
         tokio::task::spawn_blocking(move || store.recent_gui_actions(session_id.as_deref(), limit))
             .await?
+    }
+
+    /// Bounded audit history for GUI timeline prunes. Entries contain counts
+    /// and cutoffs only; pruned action payloads are gone and are never
+    /// reconstructed.
+    pub async fn gui_timeline_audit(
+        &self,
+        project_id: &str,
+        limit: Option<u32>,
+    ) -> Result<vp_protocol::types::GuiTimelineAuditResult> {
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let limit = limit.unwrap_or(50).clamp(1, 1_000);
+        let (entries, total) =
+            tokio::task::spawn_blocking(move || store.gui_timeline_prune_audit(&project, limit))
+                .await??;
+        Ok(vp_protocol::types::GuiTimelineAuditResult {
+            project_id: project_id.to_string(),
+            entries,
+            total,
+            limit,
+        })
+    }
+
+    /// Read-only retention stats for the GUI action timeline. It performs one
+    /// COUNT/MIN/MAX query and never reads payloads or mirrors.
+    pub async fn gui_timeline_retention(
+        &self,
+        project_id: &str,
+        older_than_days: Option<u32>,
+    ) -> Result<vp_protocol::types::GuiTimelineRetentionResult> {
+        let policy = self.get_gui_policy(project_id).await?;
+        let days = older_than_days.unwrap_or(policy.timeline_retention_days);
+        if days > vp_protocol::types::GuiPolicy::MAX_TIMELINE_RETENTION_DAYS {
+            anyhow::bail!(
+                "older_than_days must be 0..={}",
+                vp_protocol::types::GuiPolicy::MAX_TIMELINE_RETENTION_DAYS
+            );
+        }
+        let cutoff = if days == 0 {
+            None
+        } else {
+            Some(gui_retention_cutoff(days)?)
+        };
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let cutoff_for_query = cutoff.clone();
+        let stats = tokio::task::spawn_blocking(move || {
+            store.gui_action_retention_stats(&project, cutoff_for_query.as_deref())
+        })
+        .await??;
+        Ok(vp_protocol::types::GuiTimelineRetentionResult {
+            project_id: project_id.to_string(),
+            retention_days: days,
+            keep_forever: days == 0,
+            cutoff,
+            total: stats.total,
+            eligible: stats.eligible,
+            oldest_at: stats.oldest_at,
+            newest_at: stats.newest_at,
+        })
+    }
+
+    /// Explicit, bounded prune of the GUI action timeline for one project.
+    /// `older_than_days = 0` means "use the project policy"; an explicit
+    /// `Some(0)` from an RPC is rejected before reaching this method because
+    /// pruning everything is not a retention operation.
+    pub async fn prune_gui_timeline(
+        &self,
+        project_id: &str,
+        older_than_days: Option<u32>,
+        dry_run: bool,
+        limit: Option<u32>,
+    ) -> Result<vp_protocol::types::GuiTimelinePruneResult> {
+        let policy = self.get_gui_policy(project_id).await?;
+        let days = older_than_days.unwrap_or(policy.timeline_retention_days);
+        if days == 0 {
+            anyhow::bail!(
+                "GUI timeline retention is 0 (keep forever); set a positive retention or pass older_than_days"
+            );
+        }
+        if days > vp_protocol::types::GuiPolicy::MAX_TIMELINE_RETENTION_DAYS {
+            anyhow::bail!(
+                "older_than_days must be 1..={}",
+                vp_protocol::types::GuiPolicy::MAX_TIMELINE_RETENTION_DAYS
+            );
+        }
+        let cutoff = gui_retention_cutoff(days)?;
+        let store = self.store.clone();
+        let project = project_id.to_string();
+        let outcome = tokio::task::spawn_blocking(move || {
+            store.prune_gui_action_events(&project, &cutoff, days, limit.unwrap_or(1_000), dry_run)
+        })
+        .await??;
+        Ok(gui_prune_result(outcome))
+    }
+
+    /// Daemon sweep: apply each project's `timeline_retention_days` with a
+    /// bounded batch. `0` keeps events forever and is skipped. Errors are
+    /// returned per project so the daemon can log without stopping other
+    /// projects; a partial prune is never reported as complete.
+    pub async fn sweep_gui_timeline_retention(
+        &self,
+        limit_per_project: u32,
+    ) -> Result<Vec<vp_protocol::types::GuiTimelinePruneResult>> {
+        let store = self.store.clone();
+        let projects = tokio::task::spawn_blocking(move || store.list_projects()).await??;
+        let mut results = Vec::new();
+        for project in projects {
+            let policy = self.get_gui_policy(&project.id).await?;
+            if policy.timeline_retention_days == 0 {
+                continue;
+            }
+            match self
+                .prune_gui_timeline(
+                    &project.id,
+                    Some(policy.timeline_retention_days),
+                    false,
+                    Some(limit_per_project),
+                )
+                .await
+            {
+                Ok(result) if result.pruned > 0 || result.skipped_events > 0 => {
+                    results.push(result)
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        project_id = %project.id,
+                        "GUI timeline retention sweep failed for project"
+                    );
+                }
+            }
+        }
+        Ok(results)
     }
 
     /// Unified GUI status for Manage Dash, the CLI, and `gui.status`. The
@@ -16649,6 +16818,22 @@ impl Engine {
                 "stopped by operator",
             )
             .await
+    }
+
+    /// Explicit operator retry for a non-live supervised process. The
+    /// supervisor still revalidates identity and reuses the boot-restart env,
+    /// cwd, sandbox, and bounded attempt machinery.
+    pub async fn session_process_restart(
+        &self,
+        session_id: &str,
+        process_id: &str,
+        confirm: bool,
+    ) -> Result<ProcessRestartResult> {
+        let supervisor = Arc::clone(&self.process_supervisor);
+        let session = session_id.to_string();
+        let process = process_id.to_string();
+        tokio::task::spawn_blocking(move || supervisor.request_restart(&session, &process, confirm))
+            .await?
     }
 
     pub async fn workspace_tree(&self, session_id: &str) -> Result<WorkspaceTreeResult> {

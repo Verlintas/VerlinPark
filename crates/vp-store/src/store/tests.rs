@@ -12185,6 +12185,7 @@ fn gui_policy_defaults_round_trips_and_normalizes() {
         sensitive_mode: vp_protocol::types::GuiSensitiveMode::RequireApproval,
         sensitive_bundles: vec![" COM.Example.Vault ".into(), "".into()],
         sensitive_titles: vec![" My Vault ".into()],
+        timeline_retention_days: 45,
     };
     store.set_gui_policy(&project.id, &policy).unwrap();
     let loaded = store.get_gui_policy(&project.id).unwrap();
@@ -12228,6 +12229,7 @@ fn project_manifest_carries_the_gui_policy() {
         sensitive_mode: vp_protocol::types::GuiSensitiveMode::Deny,
         sensitive_bundles: vec!["com.example.Secret".into()],
         sensitive_titles: vec!["Secret Vault".into()],
+        timeline_retention_days: 14,
     };
     store.set_gui_policy(&project.id, &policy).unwrap();
     store.record_project_manifest().unwrap();
@@ -13743,6 +13745,8 @@ fn supervised_row(session: &str, root: &std::path::Path, id: &str) -> Supervised
         retention_deadline: None,
         idle_ttl_secs: 3_600,
         last_access_at: now_rfc3339(),
+        restart_attempts: 0,
+        restart_blocked_reason: None,
         detail: None,
     }
 }
@@ -14024,6 +14028,9 @@ fn process_policy_round_trips_and_validates() {
     assert!(default.idle_sweep_enabled);
     assert_eq!(default.max_processes, 8);
     assert_eq!(default.idle_ttl_secs, 3_600);
+    assert!(!default.restart_on_boot);
+    assert_eq!(default.restart_max_attempts, 3);
+    assert_eq!(default.restart_backoff_secs, 5);
 
     let policy = ProcessPolicy {
         idle_sweep_enabled: false,
@@ -14031,6 +14038,9 @@ fn process_policy_round_trips_and_validates() {
         idle_ttl_secs: 900,
         max_output_bytes: 65_536,
         max_output_lines: 2_000,
+        restart_on_boot: true,
+        restart_max_attempts: 4,
+        restart_backoff_secs: 15,
     };
     store.set_process_policy(&project.id, &policy).unwrap();
     assert_eq!(store.get_process_policy(&project.id).unwrap(), policy);
@@ -14551,6 +14561,8 @@ fn test_cache_policy_round_trips_manifest_and_legacy_defaults() {
         reuse_lint: false,
         include_integration: true,
         failed_retention_secs: 180,
+        extra_env: vec!["MY_TEST_INPUT".into()],
+        extra_paths: vec!["config/local.env".into()],
     };
     store.set_test_cache_policy(&project.id, &policy).unwrap();
     assert_eq!(store.get_test_cache_policy(&project.id).unwrap(), policy);
@@ -15831,4 +15843,230 @@ fn remote_test_evidence_is_event_backed_and_attaches_without_verifier_changes() 
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn gui_action_retention_uses_a_strict_cutoff_and_only_gui_actions() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("gui retention"))
+        .unwrap();
+    let session = store.create_session(&project.id, "gui retention").unwrap();
+    let events = vec![
+        Event {
+            session_id: session.id.clone(),
+            seq: 1,
+            kind: "gui.action".into(),
+            payload: serde_json::json!({"action": "old"}),
+            created_at: "2025-12-31T23:59:59Z".into(),
+        },
+        Event {
+            session_id: session.id.clone(),
+            seq: 2,
+            kind: "gui.action".into(),
+            payload: serde_json::json!({"action": "boundary"}),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        },
+        Event {
+            session_id: session.id.clone(),
+            seq: 3,
+            kind: "message".into(),
+            payload: serde_json::json!({"content": "keep"}),
+            created_at: "2025-12-01T00:00:00Z".into(),
+        },
+    ];
+    store.replace_events(&session.id, &events).unwrap();
+    let dry = store
+        .prune_gui_action_events(&project.id, "2026-01-01T00:00:00Z", 30, 10, true)
+        .unwrap();
+    assert_eq!(dry.pruned, 1);
+    assert!(dry.dry_run);
+    assert_eq!(store.list_all_events(&session.id).unwrap().len(), 3);
+    let pruned = store
+        .prune_gui_action_events(&project.id, "2026-01-01T00:00:00Z", 30, 10, false)
+        .unwrap();
+    assert_eq!(pruned.pruned, 1);
+    assert_eq!(pruned.other_kinds_touched, 0);
+    let remaining = store.list_all_events(&session.id).unwrap();
+    assert!(
+        !remaining
+            .iter()
+            .any(|event| event.payload["action"] == serde_json::json!("old"))
+    );
+    assert!(
+        remaining
+            .iter()
+            .any(|event| event.payload["action"] == serde_json::json!("boundary"))
+    );
+    assert!(
+        remaining
+            .iter()
+            .any(|event| event.kind == "message" && event.payload["content"] == "keep")
+    );
+    assert!(
+        remaining
+            .iter()
+            .any(|event| event.kind == "gui.timeline_pruned")
+    );
+    let second = store
+        .prune_gui_action_events(&project.id, "2026-01-01T00:00:00Z", 30, 10, false)
+        .unwrap();
+    assert_eq!(second.pruned, 0);
+    assert_eq!(second.remaining, 1);
+}
+
+#[test]
+fn supervised_restart_fields_round_trip_and_restarting_is_not_live() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("restart fields"))
+        .unwrap();
+    let session = store.create_session(&project.id, "restart fields").unwrap();
+    let mut row = supervised_row(&session.id, repo.path(), "psup_restart");
+    row.restart_attempts = 2;
+    row.restart_blocked_reason = None;
+    row.state = "restarting".to_string();
+    store
+        .insert_supervised_process_with_event(&session.id, &row, "process.starting")
+        .unwrap();
+    let stored = store
+        .get_supervised_process(&session.id, "psup_restart")
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.restart_attempts, 2);
+    assert!(stored.restart_blocked_reason.is_none());
+    assert_eq!(store.list_live_supervised_processes().unwrap().len(), 0);
+    assert_eq!(
+        store.list_unfinished_supervised_processes().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        store
+            .count_active_supervised_processes(&session.id)
+            .unwrap(),
+        1
+    );
+
+    row.state = "blocked".to_string();
+    row.restart_attempts = 3;
+    row.restart_blocked_reason = Some("restart_attempts_exhausted".to_string());
+    row.finished_at = Some(now_rfc3339());
+    row.retention_deadline = Some(now_rfc3339());
+    let event = store
+        .update_supervised_process_with_event(&row, "process.restart_blocked")
+        .unwrap();
+    assert_eq!(event.kind, "process.restart_blocked");
+    let stored = store
+        .get_supervised_process(&session.id, "psup_restart")
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, "blocked");
+    assert_eq!(
+        stored.restart_blocked_reason.as_deref(),
+        Some("restart_attempts_exhausted")
+    );
+    assert_eq!(
+        store
+            .count_active_supervised_processes(&session.id)
+            .unwrap(),
+        0
+    );
+    let pruned = store
+        .prune_supervised_process_with_event(&session.id, "psup_restart", "test cleanup")
+        .unwrap();
+    assert!(pruned.is_some());
+}
+
+#[test]
+fn gui_retention_stats_and_audit_are_project_scoped() {
+    let (_data, store, repo) = test_store();
+    let first = store
+        .add_project(repo.path().to_str().unwrap(), Some("gui stats a"))
+        .unwrap();
+    let second_root = repo.path().join("second");
+    std::fs::create_dir_all(&second_root).unwrap();
+    let second = store
+        .add_project(second_root.to_str().unwrap(), Some("gui stats b"))
+        .unwrap();
+    let first_session = store.create_session(&first.id, "first").unwrap();
+    let second_session = store.create_session(&second.id, "second").unwrap();
+    store
+        .replace_events(
+            &first_session.id,
+            &[Event {
+                session_id: first_session.id.clone(),
+                seq: 1,
+                kind: "gui.action".into(),
+                payload: serde_json::json!({"action": "old"}),
+                created_at: "2026-01-01T00:00:00Z".into(),
+            }],
+        )
+        .unwrap();
+    store
+        .replace_events(
+            &second_session.id,
+            &[Event {
+                session_id: second_session.id.clone(),
+                seq: 1,
+                kind: "gui.action".into(),
+                payload: serde_json::json!({"action": "other"}),
+                created_at: "2026-01-01T00:00:00Z".into(),
+            }],
+        )
+        .unwrap();
+    let stats = store
+        .gui_action_retention_stats(&first.id, Some("2026-02-01T00:00:00Z"))
+        .unwrap();
+    assert_eq!(stats.total, 1);
+    assert_eq!(stats.eligible, 1);
+    assert_eq!(stats.oldest_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+    let pruned = store
+        .prune_gui_action_events(&first.id, "2026-02-01T00:00:00Z", 30, 10, false)
+        .unwrap();
+    assert_eq!(pruned.pruned, 1);
+    let (entries, total) = store.gui_timeline_prune_audit(&first.id, 10).unwrap();
+    assert_eq!(total, 1);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].pruned, 1);
+    assert_eq!(entries[0].retention_days, 30);
+    assert_eq!(entries[0].session_id, first_session.id);
+    let (other_entries, other_total) = store.gui_timeline_prune_audit(&second.id, 10).unwrap();
+    assert_eq!(other_total, 0);
+    assert!(other_entries.is_empty());
+    assert_eq!(
+        store
+            .gui_action_retention_stats(&second.id, Some("2026-02-01T00:00:00Z"))
+            .unwrap()
+            .total,
+        1
+    );
+}
+
+#[test]
+fn gui_action_retention_stats_without_a_cutoff_report_keep_forever_shape() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("gui keep"))
+        .unwrap();
+    let session = store.create_session(&project.id, "keep").unwrap();
+    store
+        .replace_events(
+            &session.id,
+            &[Event {
+                session_id: session.id.clone(),
+                seq: 1,
+                kind: "gui.action".into(),
+                payload: serde_json::json!({"action": "kept"}),
+                created_at: "2020-01-01T00:00:00Z".into(),
+            }],
+        )
+        .unwrap();
+    let stats = store.gui_action_retention_stats(&project.id, None).unwrap();
+    assert_eq!(stats.total, 1);
+    assert_eq!(stats.eligible, 0);
+    assert_eq!(stats.oldest_at.as_deref(), Some("2020-01-01T00:00:00Z"));
+    assert_eq!(stats.newest_at.as_deref(), Some("2020-01-01T00:00:00Z"));
+    let empty = store.gui_action_retention_stats("missing", None).unwrap();
+    assert_eq!(empty.total, 0);
+    assert!(empty.oldest_at.is_none());
 }

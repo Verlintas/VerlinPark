@@ -267,6 +267,7 @@ async fn gui_policy_survives_manifest_and_database_rebuild() {
         sensitive_mode: GuiSensitiveMode::RequireApproval,
         sensitive_bundles: vec!["com.example.Vault".into()],
         sensitive_titles: vec!["Vault".into()],
+        timeline_retention_days: 14,
     };
     let saved = engine
         .set_gui_policy(&project, policy.clone())
@@ -745,4 +746,457 @@ async fn gui_status_uses_the_computer_status_cache_across_repeated_polls() {
     assert!(second.computer.cache_age_ms.is_some());
     assert_eq!(second.lease_surface, "gui");
     assert_eq!(second.policy.status_ttl_secs, 60);
+}
+
+fn historical_event(
+    session_id: &str,
+    seq: u64,
+    kind: &str,
+    payload: serde_json::Value,
+    days_ago: i64,
+) -> vp_protocol::types::Event {
+    let created = time::OffsetDateTime::now_utc() - time::Duration::days(days_ago);
+    vp_protocol::types::Event {
+        session_id: session_id.to_string(),
+        seq,
+        kind: kind.to_string(),
+        payload,
+        created_at: created
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap(),
+    }
+}
+
+fn gui_action_event(
+    session_id: &str,
+    seq: u64,
+    action: &str,
+    days_ago: i64,
+) -> vp_protocol::types::Event {
+    historical_event(
+        session_id,
+        seq,
+        "gui.action",
+        serde_json::json!({
+            "id": format!("gui_{seq}"),
+            "session_id": session_id,
+            "agent_id": "agent-1",
+            "agent_name": "Agent",
+            "surface": "computer",
+            "action": action,
+            "sensitive_target": false,
+            "snapshot_generation": 1,
+            "lease_generation": 1,
+            "queued_ms": 0,
+            "latency_ms": 4,
+            "result": "ok",
+            "occurred_at": format!("2026-01-01T00:00:0{seq}Z"),
+        }),
+        days_ago,
+    )
+}
+
+fn write_mirror(data: &Path, session_id: &str, events: &[vp_protocol::types::Event]) {
+    let dir = data.join("sessions").join(session_id);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut content = String::new();
+    for event in events {
+        content.push_str(&serde_json::to_string(event).unwrap());
+        content.push('\n');
+    }
+    std::fs::write(dir.join("events.jsonl"), content).unwrap();
+}
+
+#[tokio::test]
+async fn gui_timeline_retention_prunes_only_old_gui_actions_and_audits() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let store = Store::open(data.path()).unwrap();
+    let engine = Engine::new(store.clone());
+    let (project, sessions) = project_and_sessions(&engine, repo.path(), "retention", 1).await;
+    let session = &sessions[0];
+    let events = vec![
+        gui_action_event(session, 1, "old-gui", 40),
+        historical_event(
+            session,
+            2,
+            "message",
+            serde_json::json!({"content": "old message"}),
+            60,
+        ),
+        gui_action_event(session, 3, "new-gui", 1),
+    ];
+    store.replace_events(session, &events).unwrap();
+    write_mirror(data.path(), session, &events);
+    let result = engine
+        .prune_gui_timeline(&project, Some(30), false, Some(100))
+        .await
+        .unwrap();
+    assert_eq!(result.pruned, 1, "result={result:?}");
+    assert_eq!(result.other_kinds_touched, 0);
+    assert_eq!(result.sessions, 1);
+    assert!(!result.dry_run);
+    let remaining = store.list_all_events(session).unwrap();
+    assert!(!remaining.iter().any(|event| event.kind == "gui.action"
+        && event.payload.get("action").and_then(|value| value.as_str()) == Some("old-gui")));
+    assert!(remaining.iter().any(|event| event.kind == "gui.action"
+        && event.payload.get("action").and_then(|value| value.as_str()) == Some("new-gui")));
+    assert!(remaining.iter().any(|event| {
+        event.kind == "message"
+            && event
+                .payload
+                .get("content")
+                .and_then(|value| value.as_str())
+                == Some("old message")
+    }));
+    let audit = remaining
+        .iter()
+        .find(|event| event.kind == "gui.timeline_pruned")
+        .expect("audit event");
+    assert_eq!(audit.payload["kind"], serde_json::json!("gui.action"));
+    assert_eq!(audit.payload["pruned"], serde_json::json!(1));
+    let status = engine.session_log_status(session).await.unwrap();
+    assert!(status.matches, "status={status:?}");
+    let timeline = engine.gui_timeline(Some(session), 10).await.unwrap();
+    assert_eq!(timeline.len(), 1);
+    assert_eq!(timeline[0].action, "new-gui");
+    let audit = engine.gui_timeline_audit(&project, Some(10)).await.unwrap();
+    assert_eq!(audit.total, 1);
+    assert_eq!(audit.entries.len(), 1);
+    assert_eq!(audit.entries[0].pruned, 1);
+    assert_eq!(audit.entries[0].retention_days, 30);
+    assert!(!audit.entries[0].cutoff.is_empty());
+    assert_eq!(audit.entries[0].session_id, *session);
+    assert!(!serde_json::to_string(&audit).unwrap().contains("old-gui"));
+}
+
+#[tokio::test]
+async fn gui_timeline_retention_is_bounded_dry_run_safe_and_policy_driven() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let store = Store::open(data.path()).unwrap();
+    let engine = Engine::new(store.clone());
+    let (project, sessions) =
+        project_and_sessions(&engine, repo.path(), "retention bound", 1).await;
+    let session = &sessions[0];
+    let events = vec![
+        historical_event(
+            session,
+            1,
+            "gui.action",
+            serde_json::json!({"action": "a"}),
+            50,
+        ),
+        historical_event(
+            session,
+            2,
+            "gui.action",
+            serde_json::json!({"action": "b"}),
+            45,
+        ),
+        historical_event(
+            session,
+            3,
+            "gui.action",
+            serde_json::json!({"action": "c"}),
+            40,
+        ),
+    ];
+    store.replace_events(session, &events).unwrap();
+    write_mirror(data.path(), session, &events);
+    let dry = engine
+        .prune_gui_timeline(&project, Some(30), true, Some(10))
+        .await
+        .unwrap();
+    assert_eq!(dry.pruned, 3);
+    assert!(dry.dry_run);
+    assert_eq!(store.list_all_events(session).unwrap().len(), 3);
+    let first = engine
+        .prune_gui_timeline(&project, Some(30), false, Some(1))
+        .await
+        .unwrap();
+    assert_eq!(first.pruned, 1);
+    assert!(first.truncated, "result={first:?}");
+    assert_eq!(first.limit, 1);
+    let second = engine
+        .prune_gui_timeline(&project, Some(30), false, Some(10))
+        .await
+        .unwrap();
+    assert_eq!(second.pruned, 2);
+    assert!(!second.truncated);
+    assert!(
+        engine
+            .gui_timeline(Some(session), 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let mut policy = engine.get_gui_policy(&project).await.unwrap();
+    assert_eq!(policy.timeline_retention_days, 30);
+    policy.timeline_retention_days = 0;
+    engine.set_gui_policy(&project, policy).await.unwrap();
+    let old = historical_event(
+        session,
+        4,
+        "gui.action",
+        serde_json::json!({"action": "forever"}),
+        500,
+    );
+    store
+        .replace_events(session, std::slice::from_ref(&old))
+        .unwrap();
+    write_mirror(data.path(), session, std::slice::from_ref(&old));
+    let sweep = engine.sweep_gui_timeline_retention(100).await.unwrap();
+    assert!(
+        sweep.is_empty(),
+        "keep-forever projects are skipped: {sweep:?}"
+    );
+}
+
+#[tokio::test]
+async fn gui_timeline_retention_rejects_zero_explicit_days_and_unreadable_mirror() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let store = Store::open(data.path()).unwrap();
+    let engine = Engine::new(store.clone());
+    let (project, sessions) =
+        project_and_sessions(&engine, repo.path(), "retention mirror", 1).await;
+    let session = &sessions[0];
+    let events = vec![historical_event(
+        session,
+        1,
+        "gui.action",
+        serde_json::json!({"action": "x"}),
+        90,
+    )];
+    store.replace_events(session, &events).unwrap();
+    let dir = data.path().join("sessions").join(session);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("events.jsonl"), b"{not-json}\n").unwrap();
+    let result = engine
+        .prune_gui_timeline(&project, Some(30), false, Some(10))
+        .await
+        .unwrap();
+    assert_eq!(result.pruned, 0);
+    assert_eq!(result.skipped_sessions, 1);
+    assert_eq!(result.skipped_events, 1);
+    assert_eq!(store.list_all_events(session).unwrap().len(), 1);
+    let error = engine
+        .prune_gui_timeline(&project, Some(0), false, None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("keep forever"), "{error}");
+}
+
+#[tokio::test]
+async fn gui_timeline_retention_status_counts_only_eligible_actions() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let store = Store::open(data.path()).unwrap();
+    let engine = Engine::new(store.clone());
+    let (project, sessions) =
+        project_and_sessions(&engine, repo.path(), "retention stats", 1).await;
+    let session = &sessions[0];
+    let events = vec![
+        gui_action_event(session, 1, "old", 40),
+        gui_action_event(session, 2, "new", 1),
+    ];
+    store.replace_events(session, &events).unwrap();
+    let status = engine
+        .gui_timeline_retention(&project, Some(30))
+        .await
+        .unwrap();
+    assert_eq!(status.total, 2);
+    assert_eq!(status.eligible, 1);
+    assert!(!status.keep_forever);
+    assert!(status.cutoff.is_some());
+    assert!(status.oldest_at.is_some() && status.newest_at.is_some());
+    let forever = engine
+        .gui_timeline_retention(&project, Some(0))
+        .await
+        .unwrap();
+    assert!(forever.keep_forever);
+    assert!(forever.cutoff.is_none());
+    assert_eq!(forever.eligible, 0);
+    assert_eq!(forever.total, 2);
+    let error = engine
+        .gui_timeline_retention(&project, Some(u32::MAX))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("older_than_days"), "{error}");
+}
+
+#[tokio::test]
+async fn gui_retention_sweep_skips_keep_forever_projects_and_is_bounded() {
+    let data = TempDir::new().unwrap();
+    let repo_a = TempDir::new().unwrap();
+    let repo_b = TempDir::new().unwrap();
+    init_repo(repo_a.path());
+    init_repo(repo_b.path());
+    let store = Store::open(data.path()).unwrap();
+    let engine = Engine::new(store.clone());
+    let (project_a, sessions_a) = project_and_sessions(&engine, repo_a.path(), "sweep a", 1).await;
+    let (project_b, sessions_b) = project_and_sessions(&engine, repo_b.path(), "sweep b", 1).await;
+    let events_a = vec![
+        gui_action_event(&sessions_a[0], 1, "a-old", 90),
+        gui_action_event(&sessions_a[0], 2, "a-new", 1),
+    ];
+    store.replace_events(&sessions_a[0], &events_a).unwrap();
+    let events_b = vec![gui_action_event(&sessions_b[0], 1, "b-old", 90)];
+    store.replace_events(&sessions_b[0], &events_b).unwrap();
+    let mut policy = engine.get_gui_policy(&project_a).await.unwrap();
+    policy.timeline_retention_days = 30;
+    engine.set_gui_policy(&project_a, policy).await.unwrap();
+    let mut keep = engine.get_gui_policy(&project_b).await.unwrap();
+    keep.timeline_retention_days = 0;
+    engine.set_gui_policy(&project_b, keep).await.unwrap();
+
+    let sweep = engine.sweep_gui_timeline_retention(100).await.unwrap();
+    assert_eq!(sweep.len(), 1, "keep-forever project is skipped: {sweep:?}");
+    assert_eq!(sweep[0].project_id, project_a);
+    assert_eq!(sweep[0].pruned, 1);
+    let remaining_a = store.list_all_events(&sessions_a[0]).unwrap();
+    assert!(
+        !remaining_a.iter().any(|event| event.kind == "gui.action"
+            && event.payload["action"] == serde_json::json!("a-old"))
+    );
+    assert!(
+        remaining_a.iter().any(|event| event.kind == "gui.action"
+            && event.payload["action"] == serde_json::json!("a-new"))
+    );
+    let remaining_b = store.list_all_events(&sessions_b[0]).unwrap();
+    assert!(
+        remaining_b.iter().any(|event| event.kind == "gui.action"
+            && event.payload["action"] == serde_json::json!("b-old"))
+    );
+
+    let mut bounded = engine.get_gui_policy(&project_a).await.unwrap();
+    bounded.timeline_retention_days = 30;
+    engine.set_gui_policy(&project_a, bounded).await.unwrap();
+    let more = vec![
+        gui_action_event(&sessions_a[0], 3, "a-old-2", 80),
+        gui_action_event(&sessions_a[0], 4, "a-old-3", 70),
+    ];
+    store.replace_events(&sessions_a[0], &more).unwrap();
+    let limited = engine.sweep_gui_timeline_retention(1).await.unwrap();
+    assert_eq!(limited[0].pruned, 1);
+    assert!(limited[0].truncated, "sweep must report a bounded batch");
+    let follow_up = engine.sweep_gui_timeline_retention(10).await.unwrap();
+    assert_eq!(follow_up[0].pruned, 1);
+}
+
+#[tokio::test]
+async fn gui_retention_rejects_an_oversized_window_and_clamps_audit_limits() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let store = Store::open(data.path()).unwrap();
+    let engine = Engine::new(store.clone());
+    let (project, sessions) =
+        project_and_sessions(&engine, repo.path(), "retention limits", 1).await;
+    let session = &sessions[0];
+    let events = vec![gui_action_event(session, 1, "limit", 90)];
+    store.replace_events(session, &events).unwrap();
+    let error = engine
+        .prune_gui_timeline(
+            &project,
+            Some(vp_protocol::types::GuiPolicy::MAX_TIMELINE_RETENTION_DAYS + 1),
+            true,
+            Some(10),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("older_than_days"), "{error}");
+    let pruned = engine
+        .prune_gui_timeline(&project, Some(30), false, Some(10))
+        .await
+        .unwrap();
+    assert_eq!(pruned.pruned, 1);
+    let audit = engine.gui_timeline_audit(&project, Some(0)).await.unwrap();
+    assert_eq!(audit.limit, 1);
+    assert_eq!(audit.entries.len(), 1);
+    let audit = engine
+        .gui_timeline_audit(&project, Some(99_999))
+        .await
+        .unwrap();
+    assert_eq!(audit.limit, 1000);
+    let missing = engine
+        .gui_timeline_audit("missing-project", None)
+        .await
+        .unwrap();
+    assert_eq!(missing.total, 0);
+    assert!(missing.entries.is_empty());
+}
+
+#[tokio::test]
+async fn gui_retention_dry_run_writes_no_audit_or_delete() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let store = Store::open(data.path()).unwrap();
+    let engine = Engine::new(store.clone());
+    let (project, sessions) =
+        project_and_sessions(&engine, repo.path(), "retention dry audit", 1).await;
+    let session = &sessions[0];
+    let events = vec![gui_action_event(session, 1, "dry", 90)];
+    store.replace_events(session, &events).unwrap();
+    let result = engine
+        .prune_gui_timeline(&project, Some(30), true, Some(10))
+        .await
+        .unwrap();
+    assert!(result.dry_run);
+    assert_eq!(result.pruned, 1);
+    let after = store.list_all_events(session).unwrap();
+    assert_eq!(after.len(), 1);
+    assert!(
+        !after
+            .iter()
+            .any(|event| event.kind == "gui.timeline_pruned")
+    );
+    let audit = engine.gui_timeline_audit(&project, None).await.unwrap();
+    assert_eq!(audit.total, 0);
+}
+
+#[tokio::test]
+async fn gui_retention_does_not_remove_other_kinds_from_the_mirror() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let store = Store::open(data.path()).unwrap();
+    let engine = Engine::new(store.clone());
+    let (project, sessions) =
+        project_and_sessions(&engine, repo.path(), "retention no mirror", 1).await;
+    let session = &sessions[0];
+    let events = vec![gui_action_event(session, 1, "no-mirror", 90)];
+    store.replace_events(session, &events).unwrap();
+    let result = engine
+        .prune_gui_timeline(&project, Some(30), false, Some(10))
+        .await
+        .unwrap();
+    assert_eq!(result.pruned, 1);
+    assert_eq!(result.skipped_sessions, 0);
+    let mirror = data
+        .path()
+        .join("sessions")
+        .join(session)
+        .join("events.jsonl");
+    let mirror_text = std::fs::read_to_string(&mirror).unwrap();
+    assert!(
+        !mirror_text.contains("no-mirror"),
+        "the pruned gui.action line must be removed from the mirror"
+    );
+    assert!(
+        mirror_text.contains("session.created"),
+        "retention must never remove another event kind from the mirror"
+    );
+    let audit = engine.gui_timeline_audit(&project, None).await.unwrap();
+    assert_eq!(audit.total, 1);
 }

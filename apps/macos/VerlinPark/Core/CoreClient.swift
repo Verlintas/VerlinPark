@@ -557,6 +557,54 @@ actor CoreClient {
             .policy
     }
 
+    func daemonAgentStatus() async throws -> DaemonAgentStatus {
+        try await request(method: "daemon.agent.status", params: [:])
+            .decode(DaemonAgentStatus.self)
+    }
+
+    func guiTimelineAudit(projectID: String, limit: Int = 50) async throws -> GuiTimelineAuditResult {
+        try await request(
+            method: "gui.timeline.audit",
+            params: [
+                "project_id": .string(projectID),
+                "limit": .number(Double(limit)),
+            ]
+        )
+        .decode(GuiTimelineAuditResult.self)
+    }
+
+    func guiTimelineRetention(
+        projectID: String,
+        olderThanDays: Int? = nil
+    ) async throws -> GuiTimelineRetentionResult {
+        var params: [String: JSONValue] = ["project_id": .string(projectID)]
+        if let olderThanDays {
+            params["older_than_days"] = .number(Double(olderThanDays))
+        }
+        return try await request(method: "gui.timeline.retention", params: params)
+            .decode(GuiTimelineRetentionResult.self)
+    }
+
+    func guiTimelinePrune(
+        projectID: String,
+        olderThanDays: Int?,
+        limit: Int = 1000,
+        dryRun: Bool,
+        confirm: Bool = false
+    ) async throws -> GuiTimelinePruneResult {
+        var params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "limit": .number(Double(limit)),
+            "dry_run": .bool(dryRun),
+            "confirm": .bool(confirm),
+        ]
+        if let olderThanDays {
+            params["older_than_days"] = .number(Double(olderThanDays))
+        }
+        return try await request(method: "gui.timeline.prune", params: params)
+            .decode(GuiTimelinePruneResult.self)
+    }
+
     func guiStatus(projectID: String?) async throws -> GuiStatusResult {
         var params: [String: JSONValue] = [:]
         if let projectID {
@@ -1245,6 +1293,14 @@ actor CoreClient {
         }
         return try await request(method: "tool_output.audit", params: params)
             .decode(ToolOutputAuditResult.self)
+    }
+
+    func testCacheScopePreview(projectID: String) async throws -> TestCacheScopePreview {
+        try await request(
+            method: "test_cache.scope.preview",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(TestCacheScopePreview.self)
     }
 
     func testCacheStats(projectID: String) async throws -> TestCacheStats {

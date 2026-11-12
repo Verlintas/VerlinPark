@@ -38,11 +38,27 @@ use crate::tools::{ToolContext, safe_existing_path, sandboxed_command};
 pub const PROCESS_STARTING_EVENT: &str = "process.starting";
 pub const PROCESS_STARTED_EVENT: &str = "process.started";
 pub const PROCESS_ADOPTED_EVENT: &str = "process.adopted";
+pub const PROCESS_RESTARTING_EVENT: &str = "process.restarting";
+pub const PROCESS_RESTARTED_EVENT: &str = "process.restarted";
+pub const PROCESS_RESTART_BLOCKED_EVENT: &str = "process.restart_blocked";
 pub const PROCESS_EXITED_EVENT: &str = "process.exited";
 pub const PROCESS_LOST_EVENT: &str = "process.lost";
 pub const PROCESS_UNKNOWN_EVENT: &str = "process.unknown";
 pub const PROCESS_STOPPED_EVENT: &str = "process.stopped";
 pub const PROCESS_PRUNED_EVENT: &str = "process.pruned";
+
+/// Stable machine-readable boot-restart block reasons. They are persisted on
+/// the row and emitted in `process.restart_blocked`; no command output or
+/// environment value is ever included.
+pub const RESTART_BLOCKED_ATTEMPTS: &str = "restart_attempts_exhausted";
+pub const RESTART_BLOCKED_POLICY_OFF: &str = "restart_policy_disabled";
+pub const RESTART_BLOCKED_IDENTITY: &str = "identity_unverified";
+pub const RESTART_BLOCKED_ENV: &str = "restart_env_unavailable";
+pub const RESTART_BLOCKED_WORKTREE: &str = "restart_worktree_unavailable";
+pub const RESTART_BLOCKED_CWD: &str = "restart_cwd_unavailable";
+pub const RESTART_BLOCKED_START: &str = "restart_spawn_failed";
+
+const MAX_ENV_FILE_BYTES: u64 = 64 * 1024;
 
 /// Per-session active-process cap. It matches the historical per-worktree cap.
 pub const MAX_PROCESSES_PER_SESSION: u32 = 8;
@@ -114,6 +130,12 @@ pub struct ReconcileReport {
     pub unknown: usize,
     pub skipped_imported: usize,
     pub skipped_live: usize,
+    /// Rows that entered `restarting` and were scheduled for a bounded respawn.
+    /// The actual spawn is asynchronous, so this is a scheduling count.
+    pub restart_scheduled: usize,
+    /// Rows blocked synchronously because restart policy was off, attempts were
+    /// exhausted, or identity evidence was ambiguous.
+    pub restart_blocked: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -287,6 +309,10 @@ impl ProcessSupervisor {
             vp_store::paths::ensure_private_file(&output_path)?;
             drop(file);
         }
+        // Explicit environment values are operational state, not event data.
+        // A 0600 sidecar lets an opted-in boot restart reconstruct the exact
+        // spawn without persisting any value in SQLite or the event stream.
+        write_process_env_file(&process_dir.join("env.json"), &spec.env)?;
 
         let name = spec
             .name
@@ -370,6 +396,8 @@ impl ProcessSupervisor {
             retention_deadline: None,
             idle_ttl_secs: spec.idle_ttl_secs,
             last_access_at: started_at.clone(),
+            restart_attempts: 0,
+            restart_blocked_reason: None,
             detail: None,
         };
         // Write the intent row before spawning so a crash cannot leave an
@@ -778,9 +806,42 @@ impl ProcessSupervisor {
                 report.skipped_imported += 1;
                 continue;
             }
+            let policy = self.store.get_process_policy(&session.project_id)?;
+            if row.state == "restarting" {
+                // The daemon stopped during a bounded restart window. Continue
+                // only if the project still opts in; otherwise block instead of
+                // silently respawning after a policy change.
+                if policy.restart_on_boot {
+                    if self.schedule_boot_restart(row, &policy, false)? {
+                        report.restart_scheduled += 1;
+                    } else {
+                        report.restart_blocked += 1;
+                    }
+                } else {
+                    self.block_restart(
+                        &mut row,
+                        RESTART_BLOCKED_POLICY_OFF,
+                        "restart policy was disabled before the retry window closed",
+                    )?;
+                    report.restart_blocked += 1;
+                }
+                continue;
+            }
+            if row.state == "unknown" {
+                report.unknown += 1;
+                continue;
+            }
             if row.pid.is_none() {
-                self.finalize_unobserved(&mut row, "lost", "process never recorded a pid")?;
-                report.lost += 1;
+                if row.state == "running" && policy.restart_on_boot {
+                    if self.schedule_boot_restart(row, &policy, false)? {
+                        report.restart_scheduled += 1;
+                    } else {
+                        report.restart_blocked += 1;
+                    }
+                } else {
+                    self.finalize_unobserved(&mut row, "lost", "process never recorded a pid")?;
+                    report.lost += 1;
+                }
                 continue;
             }
             match verify_row_identity(&row) {
@@ -800,34 +861,501 @@ impl ProcessSupervisor {
                     report.adopted += 1;
                 }
                 Evidence::Absent => {
-                    self.finalize_unobserved(
-                        &mut row,
-                        "lost",
-                        "process was already gone at daemon restart; exit status is not observable",
-                    )?;
-                    report.lost += 1;
+                    if policy.restart_on_boot {
+                        if self.schedule_boot_restart(row, &policy, false)? {
+                            report.restart_scheduled += 1;
+                        } else {
+                            report.restart_blocked += 1;
+                        }
+                    } else {
+                        self.finalize_unobserved(
+                            &mut row,
+                            "lost",
+                            "process was already gone at daemon restart; exit status is not observable",
+                        )?;
+                        report.lost += 1;
+                    }
                 }
                 Evidence::PidReused => {
-                    self.finalize_unobserved(
-                        &mut row,
-                        "lost",
-                        "pid was reused; refusing to adopt the new process",
-                    )?;
-                    report.lost += 1;
+                    if policy.restart_on_boot {
+                        // The recorded pid now belongs to an unrelated process;
+                        // the original child is definitively gone, so a fresh
+                        // nonce is safe.
+                        if self.schedule_boot_restart(row, &policy, false)? {
+                            report.restart_scheduled += 1;
+                        } else {
+                            report.restart_blocked += 1;
+                        }
+                    } else {
+                        self.finalize_unobserved(
+                            &mut row,
+                            "lost",
+                            "pid was reused; refusing to adopt the new process",
+                        )?;
+                        report.lost += 1;
+                    }
                 }
                 Evidence::Partial(reason) => {
-                    row.state = "unknown".to_string();
-                    row.owner_instance = self.instance.clone();
-                    row.heartbeat_at = vp_protocol::now_rfc3339();
-                    row.detail = Some(reason);
-                    self.store
-                        .update_supervised_process_with_event(&row, PROCESS_UNKNOWN_EVENT)?;
-                    self.spawn_reattach_monitor(row.clone());
-                    report.unknown += 1;
+                    if policy.restart_on_boot {
+                        let detail = format!(
+                            "refusing to restart over ambiguous identity evidence: {reason}"
+                        );
+                        self.block_restart(&mut row, RESTART_BLOCKED_IDENTITY, &detail)?;
+                        report.restart_blocked += 1;
+                    } else {
+                        row.state = "unknown".to_string();
+                        row.owner_instance = self.instance.clone();
+                        row.heartbeat_at = vp_protocol::now_rfc3339();
+                        row.detail = Some(reason);
+                        self.store
+                            .update_supervised_process_with_event(&row, PROCESS_UNKNOWN_EVENT)?;
+                        self.spawn_reattach_monitor(row.clone());
+                        report.unknown += 1;
+                    }
                 }
             }
         }
         Ok(report)
+    }
+
+    /// Enter `restarting` and schedule one bounded respawn attempt. Returns
+    /// `true` when a task was scheduled, `false` when the row is blocked
+    /// immediately (policy off or attempts exhausted). The caller must never
+    /// interpret `false` as success.
+    fn schedule_boot_restart(
+        self: &Arc<Self>,
+        mut row: SupervisedProcess,
+        policy: &vp_protocol::types::ProcessPolicy,
+        explicit: bool,
+    ) -> Result<bool> {
+        if !policy.restart_on_boot && !explicit {
+            self.block_restart(
+                &mut row,
+                RESTART_BLOCKED_POLICY_OFF,
+                "boot restart is disabled by the project process policy",
+            )?;
+            return Ok(false);
+        }
+        if row.restart_attempts >= policy.restart_max_attempts {
+            let detail = format!(
+                "boot restart attempts exhausted ({}/{}); the row will not be respawned",
+                row.restart_attempts, policy.restart_max_attempts
+            );
+            self.block_restart(&mut row, RESTART_BLOCKED_ATTEMPTS, &detail)?;
+            return Ok(false);
+        }
+        row.restart_attempts = row.restart_attempts.saturating_add(1);
+        row.state = "restarting".to_string();
+        row.pid = None;
+        row.pgid = None;
+        row.owner_instance = self.instance.clone();
+        row.heartbeat_at = vp_protocol::now_rfc3339();
+        row.restart_blocked_reason = None;
+        row.finished_at = None;
+        row.detail = Some(if explicit {
+            format!(
+                "explicit restart requested (attempt {}/{})",
+                row.restart_attempts, policy.restart_max_attempts
+            )
+        } else {
+            format!(
+                "boot restart scheduled (attempt {}/{})",
+                row.restart_attempts, policy.restart_max_attempts
+            )
+        });
+        self.store
+            .update_supervised_process_with_event(&row, PROCESS_RESTARTING_EVENT)?;
+        let supervisor = Arc::clone(self);
+        let policy = policy.clone();
+        tokio::spawn(async move {
+            supervisor.run_boot_restart(row, policy, explicit).await;
+        });
+        Ok(true)
+    }
+
+    /// Bounded asynchronous restart loop. It never runs in the daemon's startup
+    /// critical path, never restarts a row that an operator stopped while the
+    /// backoff was running, and stops permanently once attempts are exhausted.
+    async fn run_boot_restart(
+        self: Arc<Self>,
+        mut row: SupervisedProcess,
+        policy: vp_protocol::types::ProcessPolicy,
+        explicit: bool,
+    ) {
+        loop {
+            let delay = policy.restart_backoff(row.restart_attempts);
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            let current = match self.store.get_supervised_process(&row.session_id, &row.id) {
+                Ok(Some(current)) => current,
+                Ok(None) => return,
+                Err(error) => {
+                    tracing::warn!(%error, process_id = %row.id, "failed to reload restart row");
+                    return;
+                }
+            };
+            if current.state != "restarting" || current.restart_attempts != row.restart_attempts {
+                // An operator stop/prune or another reconciler won the race.
+                return;
+            }
+            match self.respawn_boot_row(&current).await {
+                Ok(restarted) => {
+                    tracing::info!(
+                        process_id = %restarted.id,
+                        attempt = restarted.restart_attempts,
+                        "restarted supervised process after daemon boot"
+                    );
+                    return;
+                }
+                Err((reason, message)) => {
+                    if current.restart_attempts >= policy.restart_max_attempts {
+                        let mut blocked = current;
+                        if let Err(error) = self.block_restart(&mut blocked, &reason, &message) {
+                            tracing::warn!(%error, "failed to persist blocked restart row");
+                        }
+                        return;
+                    }
+                    row = current;
+                    row.restart_attempts = row.restart_attempts.saturating_add(1);
+                    row.state = "restarting".to_string();
+                    row.heartbeat_at = vp_protocol::now_rfc3339();
+                    row.detail = Some(if explicit {
+                        format!(
+                            "explicit restart attempt failed ({reason}); retrying ({}/{})",
+                            row.restart_attempts, policy.restart_max_attempts
+                        )
+                    } else {
+                        format!(
+                            "boot restart attempt failed ({reason}); retrying ({}/{})",
+                            row.restart_attempts, policy.restart_max_attempts
+                        )
+                    });
+                    if let Err(error) = self
+                        .store
+                        .update_supervised_process_with_event(&row, PROCESS_RESTARTING_EVENT)
+                    {
+                        tracing::warn!(%error, "failed to record restart retry");
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    fn block_restart(&self, row: &mut SupervisedProcess, reason: &str, detail: &str) -> Result<()> {
+        let now = vp_protocol::now_rfc3339();
+        row.state = "blocked".to_string();
+        row.pid = None;
+        row.pgid = None;
+        row.heartbeat_at = now.clone();
+        row.finished_at = Some(now);
+        row.retention_deadline = Some(self.retention_deadline());
+        row.restart_blocked_reason = Some(reason.to_string());
+        row.detail = Some(bounded_reason(detail));
+        self.store
+            .update_supervised_process_with_event(row, PROCESS_RESTART_BLOCKED_EVENT)?;
+        Ok(())
+    }
+
+    /// Explicit operator retry for a row that is not live. This is not a
+    /// hidden restart path: it requires confirmation, refuses `running`,
+    /// `starting`, `restarting`, and ambiguous `unknown` rows, resets the
+    /// attempt counter, and still goes through the same env/cwd/identity checks
+    /// and bounded retry loop. It may run even when `restart_on_boot` is off
+    /// because the operator asked for this row explicitly.
+    pub fn request_restart(
+        self: &Arc<Self>,
+        session_id: &str,
+        process_id: &str,
+        confirmed: bool,
+    ) -> Result<vp_protocol::types::ProcessRestartResult> {
+        if !confirmed {
+            bail!("process restart requires explicit confirmation");
+        }
+        let mut row = self.get(session_id, process_id)?;
+        if matches!(row.state.as_str(), "starting" | "running" | "restarting") {
+            bail!("refusing to restart {} while it is {}", row.id, row.state);
+        }
+        if row.state == "unknown" {
+            match verify_row_identity(&row) {
+                Evidence::Absent | Evidence::PidReused => {}
+                Evidence::Match => bail!(
+                    "refusing to restart {}: its original process is still alive",
+                    row.id
+                ),
+                Evidence::Partial(_) => bail!(
+                    "refusing to restart {}: identity evidence is incomplete",
+                    row.id
+                ),
+            }
+        }
+        let policy = self.policy_for_session(session_id);
+        if policy.restart_max_attempts == 0 {
+            bail!("process restart is disabled: restart_max_attempts is 0");
+        }
+        row.restart_attempts = 0;
+        row.restart_blocked_reason = None;
+        row.finished_at = None;
+        let scheduled = self.schedule_boot_restart(row.clone(), &policy, true)?;
+        let row = self.get(session_id, process_id)?;
+        Ok(vp_protocol::types::ProcessRestartResult {
+            detail: if scheduled {
+                "explicit restart scheduled".to_string()
+            } else {
+                "explicit restart was blocked by policy".to_string()
+            },
+            process: row,
+            scheduled,
+        })
+    }
+
+    /// Reconstruct the original spawn under the current sandbox/policy and
+    /// replace the row identity with a fresh nonce. The explicit environment
+    /// comes only from the 0600 sidecar; values never enter SQLite or events.
+    async fn respawn_boot_row(
+        self: &Arc<Self>,
+        row: &SupervisedProcess,
+    ) -> std::result::Result<SupervisedProcess, (String, String)> {
+        let session = self
+            .store
+            .get_session(&row.session_id)
+            .map_err(|error| {
+                (
+                    RESTART_BLOCKED_WORKTREE.to_string(),
+                    format!("restart session lookup failed: {error}"),
+                )
+            })?
+            .ok_or_else(|| {
+                (
+                    RESTART_BLOCKED_WORKTREE.to_string(),
+                    "restart session no longer exists".to_string(),
+                )
+            })?;
+        if session.status == "imported" {
+            return Err((
+                RESTART_BLOCKED_POLICY_OFF.to_string(),
+                "imported sessions are read-only archives".to_string(),
+            ));
+        }
+        let project = self
+            .store
+            .get_project(&session.project_id)
+            .map_err(|error| {
+                (
+                    RESTART_BLOCKED_WORKTREE.to_string(),
+                    format!("restart project lookup failed: {error}"),
+                )
+            })?
+            .ok_or_else(|| {
+                (
+                    RESTART_BLOCKED_WORKTREE.to_string(),
+                    "restart project no longer exists".to_string(),
+                )
+            })?;
+        let env_path = self.process_env_path(&row.session_id, &row.id);
+        let env = read_process_env_file(&env_path).map_err(|error| {
+            (
+                RESTART_BLOCKED_ENV.to_string(),
+                format!("restart environment sidecar is unavailable: {error}"),
+            )
+        })?;
+        let worktree = PathBuf::from(&row.worktree)
+            .canonicalize()
+            .map_err(|error| {
+                (
+                    RESTART_BLOCKED_WORKTREE.to_string(),
+                    format!("restart worktree is unavailable: {error}"),
+                )
+            })?;
+        if !worktree.is_dir() {
+            return Err((
+                RESTART_BLOCKED_WORKTREE.to_string(),
+                "restart worktree is not a directory".to_string(),
+            ));
+        }
+        let cwd = PathBuf::from(&row.cwd).canonicalize().map_err(|error| {
+            (
+                RESTART_BLOCKED_CWD.to_string(),
+                format!("restart cwd is unavailable: {error}"),
+            )
+        })?;
+        if !cwd.starts_with(&worktree) || !cwd.is_dir() {
+            return Err((
+                RESTART_BLOCKED_CWD.to_string(),
+                "restart cwd is outside the worktree or not a directory".to_string(),
+            ));
+        }
+        let output_path = if row.output_path.trim().is_empty() {
+            let dir = self.process_root().join(&row.session_id).join(&row.id);
+            vp_store::paths::ensure_private_dir(&dir).map_err(|error| {
+                (
+                    RESTART_BLOCKED_START.to_string(),
+                    format!("restart output directory failed: {error}"),
+                )
+            })?;
+            dir.join("output.log")
+        } else {
+            PathBuf::from(&row.output_path)
+        };
+        if let Some(parent) = output_path.parent() {
+            vp_store::paths::ensure_private_dir(parent).map_err(|error| {
+                (
+                    RESTART_BLOCKED_START.to_string(),
+                    format!("restart output directory failed: {error}"),
+                )
+            })?;
+        }
+        let shell_policy = self.store.get_shell_policy(&project.id).map_err(|error| {
+            (
+                RESTART_BLOCKED_START.to_string(),
+                format!("restart shell policy lookup failed: {error}"),
+            )
+        })?;
+        let mut secret_roots = crate::agent::shell_secret_roots(&self.data_dir);
+        secret_roots.extend(shell_policy.read_deny.iter().map(PathBuf::from));
+        let context = ToolContext {
+            root: worktree.clone(),
+            project_root: PathBuf::from(&project.root),
+            sandbox_root: self
+                .data_dir
+                .join("sandbox")
+                .join(&row.session_id)
+                .join(format!("restart-{}", row.id)),
+            secret_roots,
+            network_allowed: shell_policy.network != "deny",
+            home: std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default(),
+            restrict_home: shell_policy.restrict_home,
+            read_jail: shell_policy.read_jail,
+            git_branch: session.branch.clone(),
+            remote: None,
+            session_id: Some(row.session_id.clone()),
+            process_supervisor: Some(Arc::clone(self)),
+            test_cache: None,
+        };
+        let mut command = sandboxed_command(&context).await.map_err(|error| {
+            (
+                RESTART_BLOCKED_START.to_string(),
+                format!("restart sandbox setup failed: {error}"),
+            )
+        })?;
+        command
+            .stdin(Stdio::null())
+            .current_dir(&cwd)
+            .kill_on_drop(false);
+        for (key, value) in &env {
+            command.env(key, value);
+        }
+        let env_hash = effective_env_hash(&command, &env);
+        let nonce = Uuid::now_v7().simple().to_string();
+        let command_hash = spawn_command_hash(
+            &row.command,
+            &cwd,
+            &env_hash,
+            context.network_allowed,
+            context.restrict_home,
+            context.read_jail,
+            context.git_branch.as_deref(),
+        );
+        command
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg(format!("{}\nexit $?", row.command))
+            .arg("verlinpark-process")
+            .arg(format!("--verlinpark-nonce={nonce}"))
+            .arg(format!("--verlinpark-command-hash={command_hash}"));
+        let stdout_file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&output_path)
+            .map_err(|error| {
+                (
+                    RESTART_BLOCKED_START.to_string(),
+                    format!("restart output file failed: {error}"),
+                )
+            })?;
+        let stderr_file = stdout_file.try_clone().map_err(|error| {
+            (
+                RESTART_BLOCKED_START.to_string(),
+                format!("restart output file clone failed: {error}"),
+            )
+        })?;
+        command
+            .stdout(Stdio::from(stdout_file))
+            .stderr(Stdio::from(stderr_file))
+            .env(ENV_SUPERVISOR, "1")
+            .env(ENV_PROCESS_ID, &row.id)
+            .env(ENV_PROCESS_NONCE, &nonce)
+            .env(ENV_COMMAND_HASH, &command_hash);
+        let child = command.spawn().map_err(|error| {
+            (
+                RESTART_BLOCKED_START.to_string(),
+                format!("restart spawn failed: {error}"),
+            )
+        })?;
+        let pid = child.id().map(i64::from);
+        let pgid = pid;
+        let process_started_at = pid.and_then(|pid| process_start_time(pid as i32));
+        let mut restarted = row.clone();
+        restarted.command_hash = command_hash.clone();
+        restarted.env_hash = env_hash;
+        restarted.state = "running".to_string();
+        restarted.pid = pid;
+        restarted.pgid = pgid;
+        restarted.nonce = nonce;
+        restarted.process_started_at = process_started_at;
+        restarted.heartbeat_at = vp_protocol::now_rfc3339();
+        restarted.last_access_at = restarted.heartbeat_at.clone();
+        restarted.finished_at = None;
+        restarted.exit_code = None;
+        restarted.signal = None;
+        restarted.owner_instance = self.instance.clone();
+        restarted.retention_deadline = None;
+        restarted.output_path = output_path.to_string_lossy().to_string();
+        restarted.restart_blocked_reason = None;
+        restarted.detail = Some(format!(
+            "restarted after daemon boot (attempt {})",
+            restarted.restart_attempts
+        ));
+        if let Err(error) = self
+            .store
+            .update_supervised_process_with_event(&restarted, PROCESS_RESTARTED_EVENT)
+        {
+            let _ = kill_group(pid.map(|value| value as i32), libc::SIGKILL);
+            return Err((
+                RESTART_BLOCKED_START.to_string(),
+                format!("recording restart event failed: {error}"),
+            ));
+        }
+        self.install_child(restarted.clone(), child);
+        Ok(restarted)
+    }
+
+    fn process_env_path(&self, session_id: &str, process_id: &str) -> PathBuf {
+        self.process_root()
+            .join(session_id)
+            .join(process_id)
+            .join("env.json")
+    }
+
+    fn install_child(self: &Arc<Self>, row: SupervisedProcess, child: tokio::process::Child) {
+        let slot: ChildSlot = Arc::new(StdMutex::new(Some(child)));
+        if let Ok(mut children) = self.children.lock() {
+            children.insert(row.id.clone(), Arc::clone(&slot));
+        }
+        if let Ok(mut trackers) = self.output_trackers.lock() {
+            trackers.insert(
+                row.id.clone(),
+                OutputTracker {
+                    offset: 0,
+                    lines: row.output_lines,
+                    total_bytes: row.total_output_bytes,
+                },
+            );
+        }
+        self.spawn_child_monitor(row, slot);
     }
 
     /// Stop live processes idle beyond their per-row TTL and prune terminal rows
@@ -965,6 +1493,8 @@ impl ProcessSupervisor {
             exited: count("exited"),
             stopped: count("stopped"),
             lost: count("lost"),
+            restarting: count("restarting"),
+            blocked: count("blocked"),
             output_bytes: self.store.supervised_process_output_bytes()?,
         })
     }
@@ -1290,7 +1820,62 @@ impl ProcessSupervisor {
 }
 
 fn is_terminal(state: &str) -> bool {
-    matches!(state, "exited" | "stopped" | "lost")
+    matches!(state, "exited" | "stopped" | "lost" | "blocked")
+}
+
+fn bounded_reason(reason: &str) -> String {
+    reason.chars().take(300).collect()
+}
+
+/// Persist the explicit spawn environment next to the daemon-owned output log.
+/// The file is 0600 and is never read by tools, events, or status calls. Its
+/// only consumer is an opted-in boot restart, which needs the exact values to
+/// reproduce the original process.
+fn write_process_env_file(path: &Path, env: &BTreeMap<String, String>) -> Result<()> {
+    let encoded = serde_json::to_vec(env).context("serializing process environment")?;
+    if encoded.len() as u64 > MAX_ENV_FILE_BYTES {
+        bail!("process environment exceeds the 64 KiB sidecar limit");
+    }
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("creating process environment sidecar {}", path.display()))?;
+    file.write_all(&encoded)?;
+    file.flush()?;
+    vp_store::paths::ensure_private_file(path)?;
+    Ok(())
+}
+
+fn read_process_env_file(path: &Path) -> Result<BTreeMap<String, String>> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("reading process environment metadata {}", path.display()))?;
+    if metadata.len() > MAX_ENV_FILE_BYTES {
+        bail!("process environment sidecar exceeds the 64 KiB limit");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            bail!("process environment sidecar is not private (mode must be 0600)");
+        }
+    }
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("reading process environment sidecar {}", path.display()))?;
+    let env: BTreeMap<String, String> =
+        serde_json::from_slice(&bytes).context("parsing process environment sidecar")?;
+    if env.len() > MAX_EXPLICIT_ENV_ENTRIES {
+        bail!("process environment sidecar exceeds the entry limit");
+    }
+    for (key, value) in &env {
+        if !valid_env_key(key) || key.starts_with("VERLINPARK_") {
+            bail!("process environment sidecar contains an invalid or reserved name");
+        }
+        if value.len() > MAX_ENV_VALUE_BYTES || value.contains('\0') {
+            bail!("process environment sidecar contains an oversized or invalid value");
+        }
+    }
+    Ok(env)
 }
 
 fn validate_start_spec(spec: &StartSpec) -> Result<()> {
@@ -1722,6 +2307,9 @@ pub fn processes_from_events(events: &[Event]) -> Option<Vec<SupervisedProcess>>
             PROCESS_STARTING_EVENT
             | PROCESS_STARTED_EVENT
             | PROCESS_ADOPTED_EVENT
+            | PROCESS_RESTARTING_EVENT
+            | PROCESS_RESTARTED_EVENT
+            | PROCESS_RESTART_BLOCKED_EVENT
             | PROCESS_EXITED_EVENT
             | PROCESS_LOST_EVENT
             | PROCESS_UNKNOWN_EVENT
@@ -1784,6 +2372,8 @@ pub fn processes_match(projected: &[SupervisedProcess], expected: &[SupervisedPr
             || projected.owner_instance != expected.owner_instance
             || projected.retention_deadline != expected.retention_deadline
             || projected.idle_ttl_secs != expected.idle_ttl_secs
+            || projected.restart_attempts != expected.restart_attempts
+            || projected.restart_blocked_reason != expected.restart_blocked_reason
             || projected.detail != expected.detail
         {
             return false;
@@ -1795,13 +2385,15 @@ pub fn processes_match(projected: &[SupervisedProcess], expected: &[SupervisedPr
 /// Convert a set of status counts into a compact diagnostic row.
 pub fn status_line(status: &ProcessSupervisorStatus) -> String {
     format!(
-        "processes: {} running, {} starting, {} unknown, {} exited, {} stopped, {} lost, {} bytes",
+        "processes: {} running, {} starting, {} restarting, {} unknown, {} exited, {} stopped, {} lost, {} blocked, {} bytes",
         status.running,
         status.starting,
+        status.restarting,
         status.unknown,
         status.exited,
         status.stopped,
         status.lost,
+        status.blocked,
         status.output_bytes
     )
 }
@@ -1840,6 +2432,8 @@ pub fn process_summary(row: &SupervisedProcess) -> serde_json::Value {
         "rotations": row.output_rotations,
         "owner_instance": row.owner_instance,
         "retention_deadline": row.retention_deadline,
+        "restart_attempts": row.restart_attempts,
+        "restart_blocked_reason": row.restart_blocked_reason,
     })
 }
 
@@ -1955,6 +2549,8 @@ mod tests {
             retention_deadline: None,
             idle_ttl_secs: 3_600,
             last_access_at: now_minus(1),
+            restart_attempts: 0,
+            restart_blocked_reason: None,
             detail: None,
         }
     }
@@ -2936,6 +3532,8 @@ mod supervisor_safety_tests {
             retention_deadline: Some("2099-01-01T00:00:00Z".to_string()),
             idle_ttl_secs: 3_600,
             last_access_at: vp_protocol::now_rfc3339(),
+            restart_attempts: 0,
+            restart_blocked_reason: None,
             detail: None,
         }
     }
@@ -3415,6 +4013,8 @@ mod reattach_monitor_tests {
             retention_deadline: None,
             idle_ttl_secs: 3_600,
             last_access_at: vp_protocol::now_rfc3339(),
+            restart_attempts: 0,
+            restart_blocked_reason: None,
             detail: None,
         }
     }
@@ -3561,6 +4161,9 @@ mod process_policy_tests {
                     idle_ttl_secs: 60,
                     max_output_bytes: 8_192,
                     max_output_lines: 100,
+                    restart_on_boot: false,
+                    restart_max_attempts: 3,
+                    restart_backoff_secs: 5,
                 },
             )
             .unwrap();
@@ -3651,5 +4254,724 @@ mod process_policy_tests {
             .stop(&session, &row.id, Some("KILL"), Some(1), "cleanup")
             .await
             .unwrap();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fake_row(
+        session: &str,
+        root: &Path,
+        id: &str,
+        state: &str,
+        pid: Option<i64>,
+    ) -> SupervisedProcess {
+        SupervisedProcess {
+            id: id.to_string(),
+            session_id: session.to_string(),
+            name: "fake".to_string(),
+            command: "sleep 30".to_string(),
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "sleep 30".to_string(),
+            ],
+            cwd: root.to_string_lossy().to_string(),
+            worktree: root.to_string_lossy().to_string(),
+            env_hash: "env".to_string(),
+            command_hash: "command".to_string(),
+            state: state.to_string(),
+            pid,
+            pgid: pid,
+            nonce: "nonce".to_string(),
+            started_at: now_minus(10),
+            process_started_at: Some("Mon Jan 1 00:00:00 2001".to_string()),
+            heartbeat_at: now_minus(1),
+            finished_at: None,
+            exit_code: None,
+            signal: None,
+            output_path: String::new(),
+            output_bytes: 0,
+            output_lines: 0,
+            total_output_bytes: 0,
+            output_rotations: 0,
+            max_output_bytes: 1_048_576,
+            max_output_lines: 20_000,
+            owner_instance: "dead-instance:1".to_string(),
+            retention_deadline: None,
+            idle_ttl_secs: 3_600,
+            last_access_at: now_minus(1),
+            restart_attempts: 0,
+            restart_blocked_reason: None,
+            detail: None,
+        }
+    }
+
+    async fn wait_for_state(
+        supervisor: &ProcessSupervisor,
+        session: &str,
+        id: &str,
+        state: &str,
+        timeout: Duration,
+    ) -> SupervisedProcess {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let row = supervisor.get(session, id).unwrap();
+            if row.state == state {
+                return row;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "process did not reach {state}: {}",
+                row.state
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    fn restart_policy(attempts: u32) -> vp_protocol::types::ProcessPolicy {
+        vp_protocol::types::ProcessPolicy {
+            restart_on_boot: true,
+            restart_max_attempts: attempts,
+            restart_backoff_secs: 0,
+            ..vp_protocol::types::ProcessPolicy::default()
+        }
+    }
+
+    /// Turn a stopped row into a `running` row whose pid is definitively gone
+    /// but whose private env sidecar still exists.
+    fn make_dead_running_row(store: &Store, row: &SupervisedProcess) -> SupervisedProcess {
+        let mut dead = row.clone();
+        dead.state = "running".to_string();
+        dead.pid = Some(999_999);
+        dead.pgid = Some(999_999);
+        dead.process_started_at = Some("Mon Jan 1 00:00:00 2001".to_string());
+        dead.finished_at = None;
+        dead.exit_code = None;
+        dead.signal = None;
+        dead.retention_deadline = None;
+        dead.restart_attempts = 0;
+        dead.restart_blocked_reason = None;
+        dead.detail = None;
+        store
+            .update_supervised_process_with_event(&dead, PROCESS_STARTED_EVENT)
+            .unwrap();
+        dead
+    }
+
+    #[tokio::test]
+    async fn boot_restart_respawns_opted_in_row_with_new_nonce_and_no_secret_event() {
+        let (worktree, data, store, project, session) = setup();
+        store
+            .set_process_policy(&project, &restart_policy(2))
+            .unwrap();
+        let supervisor = Arc::new(ProcessSupervisor::new(store.clone()));
+        let context = context(worktree.path(), data.path(), &store, &session);
+        let mut env = BTreeMap::new();
+        env.insert(
+            "TEST_RESTART_SECRET".to_string(),
+            "do-not-log-this".to_string(),
+        );
+        let row = supervisor
+            .start(
+                &session,
+                &context,
+                &StartSpec {
+                    command: "sleep 30".to_string(),
+                    name: Some("boot-restart".to_string()),
+                    env,
+                    ..StartSpec::default()
+                },
+            )
+            .await
+            .unwrap();
+        supervisor
+            .stop(&session, &row.id, Some("KILL"), Some(1), "prepare dead row")
+            .await
+            .unwrap();
+        let dead = make_dead_running_row(&store, &row);
+        let old_nonce = dead.nonce.clone();
+
+        let restarted = Arc::new(ProcessSupervisor::new(store.clone()));
+        let report = restarted.reconcile().await.unwrap();
+        assert_eq!(report.restart_scheduled, 1, "report={report:?}");
+        let running = wait_for_state(
+            &restarted,
+            &session,
+            &dead.id,
+            "running",
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_ne!(running.nonce, old_nonce);
+        assert_eq!(running.restart_attempts, 1);
+        assert!(running.pid.is_some());
+        let events = store.list_all_events(&session).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == PROCESS_RESTARTING_EVENT)
+        );
+        let restarted_event = events
+            .iter()
+            .find(|event| event.kind == PROCESS_RESTARTED_EVENT)
+            .expect("process.restarted event");
+        let serialized = serde_json::to_string(&restarted_event.payload).unwrap();
+        assert!(!serialized.contains("do-not-log-this"));
+        let replay = processes_from_events(&events).expect("replay");
+        assert!(processes_match(
+            &replay,
+            &store.list_supervised_processes(&session, true, 50).unwrap()
+        ));
+        restarted
+            .stop(&session, &dead.id, Some("KILL"), Some(1), "cleanup")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn boot_restart_is_off_by_default_and_does_not_respawn() {
+        let (worktree, data, store, project, session) = setup();
+        assert!(!store.get_process_policy(&project).unwrap().restart_on_boot);
+        let supervisor = Arc::new(ProcessSupervisor::new(store.clone()));
+        let context = context(worktree.path(), data.path(), &store, &session);
+        let row = supervisor
+            .start(
+                &session,
+                &context,
+                &StartSpec {
+                    command: "sleep 30".to_string(),
+                    ..StartSpec::default()
+                },
+            )
+            .await
+            .unwrap();
+        supervisor
+            .stop(&session, &row.id, Some("KILL"), Some(1), "prepare dead row")
+            .await
+            .unwrap();
+        make_dead_running_row(&store, &row);
+        let restarted = Arc::new(ProcessSupervisor::new(store.clone()));
+        let report = restarted.reconcile().await.unwrap();
+        assert_eq!(report.restart_scheduled, 0, "report={report:?}");
+        assert_eq!(report.lost, 1, "report={report:?}");
+        let dead = restarted.get(&session, &row.id).unwrap();
+        assert_eq!(dead.state, "lost");
+        let events = store.list_all_events(&session).unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.kind == PROCESS_RESTARTED_EVENT)
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_restart_exhaustion_blocks_with_typed_reason() {
+        let (worktree, data, store, project, session) = setup();
+        store
+            .set_process_policy(&project, &restart_policy(1))
+            .unwrap();
+        let supervisor = Arc::new(ProcessSupervisor::new(store.clone()));
+        let context = context(worktree.path(), data.path(), &store, &session);
+        let row = supervisor
+            .start(
+                &session,
+                &context,
+                &StartSpec {
+                    command: "sleep 30".to_string(),
+                    ..StartSpec::default()
+                },
+            )
+            .await
+            .unwrap();
+        supervisor
+            .stop(&session, &row.id, Some("KILL"), Some(1), "prepare dead row")
+            .await
+            .unwrap();
+        let mut dead = make_dead_running_row(&store, &row);
+        dead.restart_attempts = 1;
+        store
+            .update_supervised_process_with_event(&dead, PROCESS_STARTED_EVENT)
+            .unwrap();
+        let restarted = Arc::new(ProcessSupervisor::new(store.clone()));
+        let report = restarted.reconcile().await.unwrap();
+        assert_eq!(report.restart_scheduled, 0, "report={report:?}");
+        assert_eq!(report.restart_blocked, 1, "report={report:?}");
+        let blocked = restarted.get(&session, &row.id).unwrap();
+        assert_eq!(blocked.state, "blocked");
+        assert_eq!(
+            blocked.restart_blocked_reason.as_deref(),
+            Some(RESTART_BLOCKED_ATTEMPTS)
+        );
+        assert!(blocked.retention_deadline.is_some());
+        let events = store.list_all_events(&session).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == PROCESS_RESTART_BLOCKED_EVENT)
+        );
+        assert!(processes_from_events(&events).is_some());
+    }
+
+    #[tokio::test]
+    async fn boot_restart_refuses_ambiguous_identity_evidence() {
+        let (worktree, data, store, project, session) = setup();
+        store
+            .set_process_policy(&project, &restart_policy(3))
+            .unwrap();
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 10"])
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i64;
+        let mut row = fake_row(
+            &session,
+            worktree.path(),
+            "psup_ambiguous",
+            "running",
+            Some(pid),
+        );
+        row.process_started_at = process_start_time(pid as i32);
+        row.nonce = "wrong-nonce".to_string();
+        store
+            .insert_supervised_process_with_event(&session, &row, PROCESS_STARTED_EVENT)
+            .unwrap();
+        let supervisor = Arc::new(ProcessSupervisor::new(store.clone()));
+        let report = supervisor.reconcile().await.unwrap();
+        assert_eq!(report.restart_scheduled, 0, "report={report:?}");
+        assert_eq!(report.restart_blocked, 1, "report={report:?}");
+        let blocked = supervisor.get(&session, &row.id).unwrap();
+        assert_eq!(blocked.state, "blocked");
+        assert_eq!(
+            blocked.restart_blocked_reason.as_deref(),
+            Some(RESTART_BLOCKED_IDENTITY)
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = data;
+    }
+
+    #[tokio::test]
+    async fn boot_restart_retries_a_transient_failure_then_blocks() {
+        let (worktree, data, store, project, session) = setup();
+        store
+            .set_process_policy(&project, &restart_policy(2))
+            .unwrap();
+        let supervisor = Arc::new(ProcessSupervisor::new(store.clone()));
+        let context = context(worktree.path(), data.path(), &store, &session);
+        let row = supervisor
+            .start(
+                &session,
+                &context,
+                &StartSpec {
+                    command: "sleep 30".to_string(),
+                    ..StartSpec::default()
+                },
+            )
+            .await
+            .unwrap();
+        supervisor
+            .stop(&session, &row.id, Some("KILL"), Some(1), "prepare dead row")
+            .await
+            .unwrap();
+        // The env sidecar exists, but the recorded cwd is removed before boot,
+        // so every respawn attempt fails for a typed, non-secret reason.
+        let dead = make_dead_running_row(&store, &row);
+        std::fs::remove_dir_all(worktree.path()).unwrap();
+        let restarted = Arc::new(ProcessSupervisor::new(store.clone()));
+        let report = restarted.reconcile().await.unwrap();
+        assert_eq!(report.restart_scheduled, 1, "report={report:?}");
+        let blocked = wait_for_state(
+            &restarted,
+            &session,
+            &dead.id,
+            "blocked",
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(blocked.restart_attempts, 2);
+        assert_eq!(
+            blocked.restart_blocked_reason.as_deref(),
+            Some(RESTART_BLOCKED_WORKTREE)
+        );
+        let events = store.list_all_events(&session).unwrap();
+        let retries = events
+            .iter()
+            .filter(|event| event.kind == PROCESS_RESTARTING_EVENT)
+            .count();
+        assert_eq!(retries, 2, "one event per attempted spawn");
+        let status = restarted.status().unwrap();
+        assert_eq!(status.blocked, 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_restart_requires_confirmation_refuses_live_rows_and_resets_attempts() {
+        let (worktree, data, store, project, session) = setup();
+        // Deliberately leave restart_on_boot off: an explicit operator retry is
+        // allowed, but it is never inferred from policy or a timer. Zero
+        // backoff keeps the test deterministic.
+        let mut policy = restart_policy(3);
+        policy.restart_on_boot = false;
+        store.set_process_policy(&project, &policy).unwrap();
+        assert!(!store.get_process_policy(&project).unwrap().restart_on_boot);
+        let supervisor = Arc::new(ProcessSupervisor::new(store.clone()));
+        let context = context(worktree.path(), data.path(), &store, &session);
+        let row = supervisor
+            .start(
+                &session,
+                &context,
+                &StartSpec {
+                    command: "sleep 30".to_string(),
+                    env: BTreeMap::from([("RESTART_TEST".to_string(), "v".to_string())]),
+                    ..StartSpec::default()
+                },
+            )
+            .await
+            .unwrap();
+        let error = supervisor
+            .request_restart(&session, &row.id, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("confirmation"), "{error}");
+        let error = supervisor
+            .request_restart(&session, &row.id, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("while it is running"), "{error}");
+        supervisor
+            .stop(&session, &row.id, Some("KILL"), Some(1), "prepare dead row")
+            .await
+            .unwrap();
+        let mut dead = make_dead_running_row(&store, &row);
+        dead.state = "blocked".to_string();
+        dead.restart_attempts = 3;
+        dead.restart_blocked_reason = Some(RESTART_BLOCKED_ATTEMPTS.to_string());
+        store
+            .update_supervised_process_with_event(&dead, PROCESS_STOPPED_EVENT)
+            .unwrap();
+        let result = supervisor.request_restart(&session, &row.id, true).unwrap();
+        assert!(result.scheduled);
+        assert_eq!(result.process.state, "restarting");
+        assert_eq!(result.process.restart_attempts, 1);
+        assert!(result.process.restart_blocked_reason.is_none());
+        let running = wait_for_state(
+            &supervisor,
+            &session,
+            &row.id,
+            "running",
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(running.pid.is_some());
+        let events = store.list_all_events(&session).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == PROCESS_RESTARTED_EVENT),
+            "explicit retry must emit process.restarted"
+        );
+        supervisor
+            .stop(&session, &row.id, Some("KILL"), Some(1), "cleanup")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn boot_restart_allows_a_reused_pid_but_not_partial_identity() {
+        let (worktree, data, store, project, session) = setup();
+        store
+            .set_process_policy(&project, &restart_policy(2))
+            .unwrap();
+        let supervisor = Arc::new(ProcessSupervisor::new(store.clone()));
+        let context = context(worktree.path(), data.path(), &store, &session);
+        let row = supervisor
+            .start(
+                &session,
+                &context,
+                &StartSpec {
+                    command: "sleep 30".to_string(),
+                    ..StartSpec::default()
+                },
+            )
+            .await
+            .unwrap();
+        supervisor
+            .stop(
+                &session,
+                &row.id,
+                Some("KILL"),
+                Some(1),
+                "prepare reused pid",
+            )
+            .await
+            .unwrap();
+        let mut dead = make_dead_running_row(&store, &row);
+        // PID 1 is alive, but the recorded start time cannot match it. That is
+        // definitively the original child being gone, not an ambiguous match.
+        dead.pid = Some(std::process::id() as i64);
+        dead.pgid = dead.pid;
+        dead.process_started_at = Some("Mon Jan 1 00:00:00 2001".to_string());
+        store
+            .update_supervised_process_with_event(&dead, PROCESS_STARTED_EVENT)
+            .unwrap();
+        let restarted = Arc::new(ProcessSupervisor::new(store.clone()));
+        let report = restarted.reconcile().await.unwrap();
+        assert_eq!(report.restart_scheduled, 1, "report={report:?}");
+        let running = wait_for_state(
+            &restarted,
+            &session,
+            &row.id,
+            "running",
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_ne!(running.pid, Some(std::process::id() as i64));
+        restarted
+            .stop(&session, &row.id, Some("KILL"), Some(1), "cleanup")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_restart_without_env_sidecar_blocks_with_env_reason() {
+        let (worktree, data, store, project, session) = setup();
+        let mut policy = restart_policy(1);
+        policy.restart_on_boot = false;
+        store.set_process_policy(&project, &policy).unwrap();
+        let mut row = fake_row(
+            &session,
+            worktree.path(),
+            "psup_manual_no_env",
+            "lost",
+            None,
+        );
+        row.restart_attempts = 0;
+        store
+            .insert_supervised_process_with_event(&session, &row, PROCESS_STARTED_EVENT)
+            .unwrap();
+        let supervisor = Arc::new(ProcessSupervisor::new(store.clone()));
+        let result = supervisor.request_restart(&session, &row.id, true).unwrap();
+        assert!(result.scheduled);
+        let blocked = wait_for_state(
+            &supervisor,
+            &session,
+            &row.id,
+            "blocked",
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(
+            blocked.restart_blocked_reason.as_deref(),
+            Some(RESTART_BLOCKED_ENV)
+        );
+        assert_eq!(blocked.restart_attempts, 1);
+        let status = supervisor.status().unwrap();
+        assert_eq!(status.blocked, 1);
+        assert!(status_line(&status).contains("1 blocked"));
+        let _ = data;
+    }
+
+    #[tokio::test]
+    async fn explicit_restart_with_zero_attempt_budget_is_refused() {
+        let (worktree, data, store, project, session) = setup();
+        store
+            .set_process_policy(
+                &project,
+                &vp_protocol::types::ProcessPolicy {
+                    restart_max_attempts: 0,
+                    ..vp_protocol::types::ProcessPolicy::default()
+                },
+            )
+            .unwrap();
+        let supervisor = Arc::new(ProcessSupervisor::new(store.clone()));
+        let context = context(worktree.path(), data.path(), &store, &session);
+        let row = supervisor
+            .start(
+                &session,
+                &context,
+                &StartSpec {
+                    command: "sleep 30".to_string(),
+                    ..StartSpec::default()
+                },
+            )
+            .await
+            .unwrap();
+        supervisor
+            .stop(&session, &row.id, Some("KILL"), Some(1), "prepare dead row")
+            .await
+            .unwrap();
+        let mut dead = make_dead_running_row(&store, &row);
+        dead.state = "blocked".to_string();
+        dead.finished_at = Some(vp_protocol::now_rfc3339());
+        store
+            .update_supervised_process_with_event(&dead, PROCESS_RESTART_BLOCKED_EVENT)
+            .unwrap();
+        let error = supervisor
+            .request_restart(&session, &row.id, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("disabled"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn process_status_counts_restarting_rows() {
+        let (worktree, _data, store, project, session) = setup();
+        store
+            .set_process_policy(&project, &restart_policy(3))
+            .unwrap();
+        let mut row = fake_row(
+            &session,
+            worktree.path(),
+            "psup_restarting",
+            "restarting",
+            None,
+        );
+        row.restart_attempts = 1;
+        store
+            .insert_supervised_process_with_event(&session, &row, PROCESS_STARTED_EVENT)
+            .unwrap();
+        let supervisor = ProcessSupervisor::new(store.clone());
+        let status = supervisor.status().unwrap();
+        assert_eq!(status.restarting, 1);
+        assert_eq!(status.running, 0);
+        assert!(status_line(&status).contains("1 restarting"));
+    }
+
+    #[tokio::test]
+    async fn boot_restart_without_env_sidecar_blocks_instead_of_guessing() {
+        let (worktree, data, store, project, session) = setup();
+        store
+            .set_process_policy(&project, &restart_policy(1))
+            .unwrap();
+        let mut row = fake_row(
+            &session,
+            worktree.path(),
+            "psup_no_env",
+            "running",
+            Some(999_999),
+        );
+        row.restart_attempts = 0;
+        store
+            .insert_supervised_process_with_event(&session, &row, PROCESS_STARTED_EVENT)
+            .unwrap();
+        let supervisor = Arc::new(ProcessSupervisor::new(store.clone()));
+        let report = supervisor.reconcile().await.unwrap();
+        assert_eq!(report.restart_scheduled, 1, "report={report:?}");
+        let blocked = wait_for_state(
+            &supervisor,
+            &session,
+            &row.id,
+            "blocked",
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(
+            blocked.restart_blocked_reason.as_deref(),
+            Some(RESTART_BLOCKED_ENV)
+        );
+        assert!(blocked.detail.unwrap_or_default().contains("sidecar"));
+        let _ = data;
+    }
+
+    #[tokio::test]
+    async fn restarting_row_with_policy_off_blocks_on_next_boot() {
+        let (worktree, data, store, project, session) = setup();
+        store
+            .set_process_policy(&project, &restart_policy(3))
+            .unwrap();
+        let policy = store.get_process_policy(&project).unwrap();
+        let mut row = fake_row(
+            &session,
+            worktree.path(),
+            "psup_pending",
+            "running",
+            Some(999_999),
+        );
+        row.state = "restarting".to_string();
+        row.restart_attempts = 1;
+        store
+            .insert_supervised_process_with_event(&session, &row, PROCESS_STARTED_EVENT)
+            .unwrap();
+        let mut disabled = policy;
+        disabled.restart_on_boot = false;
+        store.set_process_policy(&project, &disabled).unwrap();
+        let supervisor = Arc::new(ProcessSupervisor::new(store.clone()));
+        let report = supervisor.reconcile().await.unwrap();
+        assert_eq!(report.restart_blocked, 1, "report={report:?}");
+        let blocked = supervisor.get(&session, &row.id).unwrap();
+        assert_eq!(blocked.state, "blocked");
+        assert_eq!(
+            blocked.restart_blocked_reason.as_deref(),
+            Some(RESTART_BLOCKED_POLICY_OFF)
+        );
+        let _ = data;
+    }
+}
+
+#[cfg(test)]
+mod i5_status_tests {
+    use super::*;
+
+    #[test]
+    fn status_line_reports_restarting_and_blocked_buckets() {
+        let status = ProcessSupervisorStatus {
+            instance: "test".to_string(),
+            running: 1,
+            starting: 0,
+            unknown: 0,
+            exited: 0,
+            stopped: 0,
+            lost: 0,
+            restarting: 2,
+            blocked: 3,
+            output_bytes: 0,
+        };
+        let line = status_line(&status);
+        assert!(line.contains("2 restarting"));
+        assert!(line.contains("3 blocked"));
+    }
+
+    #[test]
+    fn process_summary_is_secret_free_and_includes_restart_state() {
+        let row = SupervisedProcess {
+            id: "psup_summary".to_string(),
+            session_id: "ses_summary".to_string(),
+            name: "summary".to_string(),
+            command: "sleep 30".to_string(),
+            argv: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+            cwd: "/tmp".to_string(),
+            worktree: "/tmp".to_string(),
+            env_hash: "env".to_string(),
+            command_hash: "command".to_string(),
+            state: "blocked".to_string(),
+            pid: None,
+            pgid: None,
+            nonce: "nonce".to_string(),
+            started_at: "2026-11-12T00:00:00Z".to_string(),
+            process_started_at: None,
+            heartbeat_at: "2026-11-12T00:00:01Z".to_string(),
+            finished_at: Some("2026-11-12T00:00:02Z".to_string()),
+            exit_code: None,
+            signal: None,
+            output_path: String::new(),
+            output_bytes: 0,
+            output_lines: 0,
+            total_output_bytes: 0,
+            output_rotations: 0,
+            max_output_bytes: 1_048_576,
+            max_output_lines: 20_000,
+            owner_instance: "test:1".to_string(),
+            retention_deadline: None,
+            idle_ttl_secs: 3_600,
+            last_access_at: "2026-11-12T00:00:01Z".to_string(),
+            restart_attempts: 3,
+            restart_blocked_reason: Some(RESTART_BLOCKED_ATTEMPTS.to_string()),
+            detail: Some("attempts exhausted".to_string()),
+        };
+        let value = process_summary(&row);
+        assert_eq!(value["restart_attempts"], serde_json::json!(3));
+        assert_eq!(
+            value["restart_blocked_reason"],
+            serde_json::json!(RESTART_BLOCKED_ATTEMPTS)
+        );
+        assert!(!value.to_string().contains("nonce"));
     }
 }

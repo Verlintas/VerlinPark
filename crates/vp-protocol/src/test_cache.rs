@@ -82,7 +82,31 @@ pub struct TestCachePolicy {
     /// always reported as failures, never as passes.
     #[serde(default = "default_failed_retention_secs")]
     pub failed_retention_secs: u64,
+    /// Explicit environment variable names whose values participate in the
+    /// cache key. Values are hashed only; they are never stored in a row,
+    /// event, CLI output, or log. Only names from this list are read; the
+    /// automatic build-environment subset is unchanged.
+    #[serde(default)]
+    pub extra_env: Vec<String>,
+    /// Explicit worktree-relative files whose content participates in the
+    /// cache key. This covers inputs that are ignored by Git or live outside
+    /// the profile's dependency closure. An unreadable, missing, escaping, or
+    /// oversized input disables reuse for the run instead of risking a false
+    /// pass.
+    #[serde(default)]
+    pub extra_paths: Vec<String>,
 }
+
+/// Hard bounds for operator-declared external cache scopes. A policy that
+/// exceeds them is rejected or normalized; an individual input that exceeds a
+/// content bound fails closed at key-computation time.
+pub const MAX_TEST_CACHE_EXTRA_ENV: usize = 32;
+pub const MAX_TEST_CACHE_EXTRA_ENV_NAME_CHARS: usize = 128;
+pub const MAX_TEST_CACHE_EXTRA_PATHS: usize = 64;
+pub const MAX_TEST_CACHE_EXTRA_PATH_CHARS: usize = 512;
+pub const MAX_TEST_CACHE_EXTRA_ENV_VALUE_BYTES: usize = 8 * 1024;
+pub const MAX_TEST_CACHE_EXTRA_PATH_BYTES: u64 = 8 * 1024 * 1024;
+pub const MAX_TEST_CACHE_EXTRA_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 
 impl Default for TestCachePolicy {
     fn default() -> Self {
@@ -94,6 +118,8 @@ impl Default for TestCachePolicy {
             reuse_lint: true,
             include_integration: false,
             failed_retention_secs: default_failed_retention_secs(),
+            extra_env: Vec::new(),
+            extra_paths: Vec::new(),
         }
     }
 }
@@ -115,6 +141,8 @@ impl TestCachePolicy {
             MIN_TEST_CACHE_FAILED_RETENTION_SECS,
             HARD_MAX_TEST_CACHE_FAILED_RETENTION_SECS,
         );
+        self.extra_env = normalize_scope_names(self.extra_env);
+        self.extra_paths = normalize_scope_paths(self.extra_paths);
         self
     }
 
@@ -147,6 +175,32 @@ impl TestCachePolicy {
                 "failed_retention_secs must be {MIN_TEST_CACHE_FAILED_RETENTION_SECS}..={HARD_MAX_TEST_CACHE_FAILED_RETENTION_SECS}"
             ));
         }
+        if self.extra_env.len() > MAX_TEST_CACHE_EXTRA_ENV {
+            return Err(format!(
+                "extra_env supports at most {MAX_TEST_CACHE_EXTRA_ENV} names"
+            ));
+        }
+        for name in &self.extra_env {
+            if !valid_scope_env_name(name) {
+                return Err(format!(
+                    "extra_env name is invalid or reserved: {}",
+                    bounded_scope_label(name)
+                ));
+            }
+        }
+        if self.extra_paths.len() > MAX_TEST_CACHE_EXTRA_PATHS {
+            return Err(format!(
+                "extra_paths supports at most {MAX_TEST_CACHE_EXTRA_PATHS} paths"
+            ));
+        }
+        for path in &self.extra_paths {
+            if !valid_scope_path(path) {
+                return Err(format!(
+                    "extra_paths must be worktree-relative file paths: {}",
+                    bounded_scope_label(path)
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -168,6 +222,13 @@ impl TestCachePolicy {
 
 fn default_key_version() -> u32 {
     TEST_CACHE_KEY_VERSION
+}
+
+/// Bounded, non-secret label for validation diagnostics. Environment names and
+/// relative paths are configuration, not values; still bound them so a hostile
+/// manifest cannot flood an error line.
+fn bounded_scope_label(value: &str) -> String {
+    value.chars().take(80).collect()
 }
 
 /// One stored test result. `output_ref` is an opaque handle into the existing
@@ -390,6 +451,76 @@ pub struct TestCacheClearResult {
     pub cleared: u64,
     pub remaining: u64,
     pub affected_sessions: u64,
+}
+
+/// Normalize an explicit environment-name list deterministically: trim, drop
+/// empties, sort, deduplicate, and take the hard cap. Environment names remain
+/// case-sensitive because macOS/Linux treat them that way.
+pub fn normalize_scope_names(names: Vec<String>) -> Vec<String> {
+    let mut values = names
+        .into_iter()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .take(MAX_TEST_CACHE_EXTRA_ENV)
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
+}
+
+/// Normalize an explicit worktree-relative path list. `./` prefixes and
+/// duplicate separators are removed. [`valid_scope_path`] performs the
+/// rejection checks at policy-set time; normalization never widens a path.
+pub fn normalize_scope_paths(paths: Vec<String>) -> Vec<String> {
+    let mut values = paths
+        .into_iter()
+        .map(|path| {
+            let mut value = path.trim().replace('\\', "/");
+            while value.starts_with("./") {
+                value = value.trim_start_matches("./").to_string();
+            }
+            while value.contains("//") {
+                value = value.replace("//", "/");
+            }
+            value.trim_end_matches('/').to_string()
+        })
+        .filter(|path| !path.is_empty())
+        .take(MAX_TEST_CACHE_EXTRA_PATHS)
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
+}
+
+/// True when `name` is a syntactically valid environment name. Only names are
+/// persisted; values are read at key time and hashed, never stored.
+pub fn valid_scope_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= MAX_TEST_CACHE_EXTRA_ENV_NAME_CHARS
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        && name
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+        && !name.starts_with("VERLINPARK_")
+}
+
+/// True when `path` is a safe worktree-relative file path. Absolute paths,
+/// parent traversal, NUL, and Git metadata are rejected. The runtime still
+/// canonicalizes and re-checks the path before reading it so a symlink cannot
+/// escape the worktree.
+pub fn valid_scope_path(path: &str) -> bool {
+    if path.is_empty()
+        || path.chars().count() > MAX_TEST_CACHE_EXTRA_PATH_CHARS
+        || path.starts_with('/')
+        || path.contains('\0')
+        || path.split('/').any(|part| part == ".." || part == ".git")
+    {
+        return false;
+    }
+    true
 }
 
 /// Test-impact map provenance sources. A target always carries exactly one
@@ -762,4 +893,129 @@ mod tests {
         assert!(clear.confirm);
         assert!(clear.session_id.is_none());
     }
+
+    #[test]
+    fn scope_preview_round_trips_without_values() {
+        let result = TestCacheScopePreviewResult {
+            project_id: "prj-1".into(),
+            enabled: true,
+            extra_env: 1,
+            extra_paths: 1,
+            complete: false,
+            notes: vec!["missing path".into()],
+            entries: vec![
+                TestCacheScopeEntry {
+                    kind: "env".into(),
+                    label: "MY_INPUT".into(),
+                    present: true,
+                    bytes: 4,
+                    complete: true,
+                    note: None,
+                },
+                TestCacheScopeEntry {
+                    kind: "path".into(),
+                    label: "config/local.env".into(),
+                    present: false,
+                    bytes: 0,
+                    complete: false,
+                    note: Some("unreadable".into()),
+                },
+            ],
+        };
+        let decoded: TestCacheScopePreviewResult =
+            serde_json::from_value(serde_json::to_value(&result).unwrap()).unwrap();
+        assert_eq!(decoded, result);
+        let params: TestCacheScopePreviewParams =
+            serde_json::from_value(serde_json::json!({"project_id": "prj-1"})).unwrap();
+        assert_eq!(params.project_id, "prj-1");
+    }
+
+    #[test]
+    fn external_scope_defaults_and_validation_are_bounded() {
+        let policy: TestCachePolicy = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(policy.extra_env.is_empty());
+        assert!(policy.extra_paths.is_empty());
+        assert!(policy.validate().is_ok());
+        assert!(valid_scope_env_name("MY_INPUT"));
+        assert!(!valid_scope_env_name("VERLINPARK_SECRET"));
+        assert!(!valid_scope_env_name("bad-name"));
+        assert!(!valid_scope_env_name(""));
+        assert!(valid_scope_path("config/local.env"));
+        assert!(!valid_scope_path("/etc/passwd"));
+        assert!(!valid_scope_path("../outside"));
+        assert!(!valid_scope_path(".git/config"));
+        assert!(!valid_scope_path("a/../../b"));
+        let normalized = TestCachePolicy {
+            extra_env: vec![" B ".into(), "A".into(), "A".into(), "".into()],
+            extra_paths: vec!["./config/a".into(), "config//b/".into(), "config/a".into()],
+            ..TestCachePolicy::default()
+        }
+        .normalized();
+        assert_eq!(normalized.extra_env, vec!["A", "B"]);
+        assert_eq!(normalized.extra_paths, vec!["config/a", "config/b"]);
+        let invalid = TestCachePolicy {
+            extra_env: vec!["VERLINPARK_PROCESS_NONCE".into()],
+            ..TestCachePolicy::default()
+        };
+        assert!(invalid.validate().is_err());
+        let invalid = TestCachePolicy {
+            extra_paths: vec!["../escape".into()],
+            ..TestCachePolicy::default()
+        };
+        assert!(invalid.validate().is_err());
+        let too_many = TestCachePolicy {
+            extra_env: (0..=MAX_TEST_CACHE_EXTRA_ENV)
+                .map(|index| format!("INPUT_{index}"))
+                .collect(),
+            ..TestCachePolicy::default()
+        };
+        assert!(too_many.validate().is_err());
+        let normalized = TestCachePolicy {
+            extra_env: (0..MAX_TEST_CACHE_EXTRA_ENV + 5)
+                .map(|index| format!("INPUT_{index}"))
+                .collect(),
+            extra_paths: (0..MAX_TEST_CACHE_EXTRA_PATHS + 5)
+                .map(|index| format!("config/{index}"))
+                .collect(),
+            ..TestCachePolicy::default()
+        }
+        .normalized();
+        assert_eq!(normalized.extra_env.len(), MAX_TEST_CACHE_EXTRA_ENV);
+        assert_eq!(normalized.extra_paths.len(), MAX_TEST_CACHE_EXTRA_PATHS);
+    }
+}
+
+/// One configured external cache input. Values and file content are never
+/// included; only presence, byte count, and a bounded diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestCacheScopeEntry {
+    /// `env` or `path`.
+    pub kind: String,
+    pub label: String,
+    pub present: bool,
+    #[serde(default)]
+    pub bytes: u64,
+    pub complete: bool,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TestCacheScopePreviewParams {
+    pub project_id: String,
+}
+
+/// Read-only preview of operator-declared external cache scopes. `complete`
+/// false means the next `run_project_task` will disable reuse until the input
+/// is fixed; no test command is executed by this call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestCacheScopePreviewResult {
+    pub project_id: String,
+    pub enabled: bool,
+    pub extra_env: usize,
+    pub extra_paths: usize,
+    pub complete: bool,
+    #[serde(default)]
+    pub notes: Vec<String>,
+    pub entries: Vec<TestCacheScopeEntry>,
 }

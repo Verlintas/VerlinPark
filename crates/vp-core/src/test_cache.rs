@@ -33,7 +33,8 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use vp_protocol::test_cache::{
     HARD_MAX_IMPACT_TARGETS, IMPACT_SOURCE_HISTORY, IMPACT_SOURCE_LEXICAL, IMPACT_SOURCE_LSP,
-    IMPACT_SOURCE_PROFILE, TEST_CACHE_KEY_VERSION, TestCacheEntry, TestCachePolicy,
+    IMPACT_SOURCE_PROFILE, MAX_TEST_CACHE_EXTRA_ENV_VALUE_BYTES, MAX_TEST_CACHE_EXTRA_PATH_BYTES,
+    MAX_TEST_CACHE_EXTRA_TOTAL_BYTES, TEST_CACHE_KEY_VERSION, TestCacheEntry, TestCachePolicy,
     TestCacheProvenance, TestCacheStats, TestImpactMap, TestImpactTarget,
 };
 use vp_store::Store;
@@ -455,6 +456,325 @@ pub struct InputFingerprint {
     pub notes: Vec<String>,
 }
 
+/// Resolved operator-declared external inputs. The hash covers the configured
+/// names/paths themselves plus the observed values/content, so adding an unset
+/// variable or removing a path still invalidates a previous key. No value is
+/// ever stored or rendered; only digests and bounded notes leave this struct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalScopeStatus {
+    /// `env` or `path`.
+    pub kind: String,
+    /// Environment variable name or worktree-relative path. Never a value.
+    pub label: String,
+    pub present: bool,
+    pub bytes: u64,
+    pub complete: bool,
+    /// Bounded, non-secret diagnostic for this entry.
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExternalScopeMaterial {
+    pub hash: String,
+    pub env_names: usize,
+    pub paths: usize,
+    pub bytes: u64,
+    pub complete: bool,
+    pub notes: Vec<String>,
+    /// Per-entry metadata for the scopes preview. Values and file content are
+    /// never retained here.
+    pub statuses: Vec<ExternalScopeStatus>,
+}
+
+impl ExternalScopeMaterial {
+    pub fn empty() -> Self {
+        Self {
+            hash: external_scope_digest(&[]),
+            complete: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// Resolve `TestCachePolicy.extra_env` and `extra_paths` for one worktree.
+///
+/// - A missing environment variable is a valid state and is hashed as `unset`;
+///   setting it later invalidates the key.
+/// - A non-Unicode value, unreadable path, symlink escape, missing file,
+///   non-file path, or content bound is `complete=false`. The caller must
+///   disable reuse rather than risk a false pass.
+pub fn resolve_external_scope_material(
+    root: &Path,
+    policy: &TestCachePolicy,
+) -> ExternalScopeMaterial {
+    let mut notes = Vec::new();
+    let mut complete = true;
+    let mut entries = Vec::new();
+    let mut statuses = Vec::new();
+    let mut env_names = policy.extra_env.clone();
+    env_names.sort();
+    env_names.dedup();
+    for name in &env_names {
+        match std::env::var(name) {
+            Ok(value) => {
+                if value.len() > MAX_TEST_CACHE_EXTRA_ENV_VALUE_BYTES {
+                    complete = false;
+                    if notes.len() < 8 {
+                        notes.push(format!(
+                            "extra_env {name} exceeds {MAX_TEST_CACHE_EXTRA_ENV_VALUE_BYTES} bytes; cache reuse disabled"
+                        ));
+                    }
+                    entries.push(format!("env:{name}:oversized"));
+                    statuses.push(ExternalScopeStatus {
+                        kind: "env".to_string(),
+                        label: name.clone(),
+                        present: true,
+                        bytes: value.len() as u64,
+                        complete: false,
+                        note: Some("value exceeds the 8 KiB scope limit".to_string()),
+                    });
+                } else {
+                    entries.push(format!("env:{name}:value:{}", digest_hex(value.as_bytes())));
+                    statuses.push(ExternalScopeStatus {
+                        kind: "env".to_string(),
+                        label: name.clone(),
+                        present: true,
+                        bytes: value.len() as u64,
+                        complete: true,
+                        note: None,
+                    });
+                }
+            }
+            Err(std::env::VarError::NotPresent) => {
+                entries.push(format!("env:{name}:unset"));
+                statuses.push(ExternalScopeStatus {
+                    kind: "env".to_string(),
+                    label: name.clone(),
+                    present: false,
+                    bytes: 0,
+                    complete: true,
+                    note: Some("unset; setting it later invalidates the key".to_string()),
+                });
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                complete = false;
+                if notes.len() < 8 {
+                    notes.push(format!(
+                        "extra_env {name} is not valid Unicode; cache reuse disabled"
+                    ));
+                }
+                entries.push(format!("env:{name}:invalid"));
+                statuses.push(ExternalScopeStatus {
+                    kind: "env".to_string(),
+                    label: name.clone(),
+                    present: false,
+                    bytes: 0,
+                    complete: false,
+                    note: Some("value is not valid Unicode".to_string()),
+                });
+            }
+        }
+    }
+    let mut paths = policy.extra_paths.clone();
+    paths.sort();
+    paths.dedup();
+    let canonical_root = root.canonicalize().ok();
+    let mut total_bytes = 0u64;
+    let mut path_count = 0usize;
+    for path in &paths {
+        if !vp_protocol::test_cache::valid_scope_path(path) {
+            complete = false;
+            if notes.len() < 8 {
+                notes.push(format!(
+                    "extra_paths entry is not a safe worktree-relative path: {}",
+                    bounded_path_label(path)
+                ));
+            }
+            entries.push(format!("path:{path}:invalid"));
+            statuses.push(ExternalScopeStatus {
+                kind: "path".to_string(),
+                label: path.clone(),
+                present: false,
+                bytes: 0,
+                complete: false,
+                note: Some("not a safe worktree-relative path".to_string()),
+            });
+            continue;
+        }
+        let Some(root) = canonical_root.as_ref() else {
+            complete = false;
+            notes.push("worktree root is not canonicalizable; cache reuse disabled".to_string());
+            break;
+        };
+        let candidate = root.join(path);
+        let canonical = match candidate.canonicalize() {
+            Ok(path) => path,
+            Err(error) => {
+                complete = false;
+                if notes.len() < 8 {
+                    notes.push(format!(
+                        "extra_paths {path} is unreadable: {error}; cache reuse disabled"
+                    ));
+                }
+                entries.push(format!("path:{path}:unreadable"));
+                statuses.push(ExternalScopeStatus {
+                    kind: "path".to_string(),
+                    label: path.clone(),
+                    present: false,
+                    bytes: 0,
+                    complete: false,
+                    note: Some("unreadable".to_string()),
+                });
+                continue;
+            }
+        };
+        if !canonical.starts_with(root) {
+            complete = false;
+            if notes.len() < 8 {
+                notes.push(format!(
+                    "extra_paths {path} escapes the worktree; cache reuse disabled"
+                ));
+            }
+            entries.push(format!("path:{path}:escape"));
+            statuses.push(ExternalScopeStatus {
+                kind: "path".to_string(),
+                label: path.clone(),
+                present: false,
+                bytes: 0,
+                complete: false,
+                note: Some("symlink escapes the worktree".to_string()),
+            });
+            continue;
+        }
+        let metadata = match std::fs::metadata(&canonical) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                complete = false;
+                if notes.len() < 8 {
+                    notes.push(format!(
+                        "extra_paths {path} is unreadable: {error}; cache reuse disabled"
+                    ));
+                }
+                entries.push(format!("path:{path}:unreadable"));
+                statuses.push(ExternalScopeStatus {
+                    kind: "path".to_string(),
+                    label: path.clone(),
+                    present: false,
+                    bytes: 0,
+                    complete: false,
+                    note: Some("unreadable".to_string()),
+                });
+                continue;
+            }
+        };
+        if !metadata.is_file() {
+            complete = false;
+            if notes.len() < 8 {
+                notes.push(format!(
+                    "extra_paths {path} is not a regular file; cache reuse disabled"
+                ));
+            }
+            entries.push(format!("path:{path}:not_file"));
+            statuses.push(ExternalScopeStatus {
+                kind: "path".to_string(),
+                label: path.clone(),
+                present: true,
+                bytes: metadata.len(),
+                complete: false,
+                note: Some("not a regular file".to_string()),
+            });
+            continue;
+        }
+        if metadata.len() > MAX_TEST_CACHE_EXTRA_PATH_BYTES {
+            complete = false;
+            if notes.len() < 8 {
+                notes.push(format!(
+                    "extra_paths {path} exceeds {MAX_TEST_CACHE_EXTRA_PATH_BYTES} bytes; cache reuse disabled"
+                ));
+            }
+            entries.push(format!("path:{path}:oversized"));
+            statuses.push(ExternalScopeStatus {
+                kind: "path".to_string(),
+                label: path.clone(),
+                present: true,
+                bytes: metadata.len(),
+                complete: false,
+                note: Some("exceeds the 8 MiB per-file limit".to_string()),
+            });
+            continue;
+        }
+        total_bytes = total_bytes.saturating_add(metadata.len());
+        if total_bytes > MAX_TEST_CACHE_EXTRA_TOTAL_BYTES {
+            complete = false;
+            notes.push(format!(
+                "extra_paths exceed {MAX_TEST_CACHE_EXTRA_TOTAL_BYTES} total bytes; cache reuse disabled"
+            ));
+            break;
+        }
+        match std::fs::read(&canonical) {
+            Ok(content) => {
+                path_count += 1;
+                entries.push(format!(
+                    "path:{path}:{}:{}",
+                    content.len(),
+                    digest_hex(&content)
+                ));
+                statuses.push(ExternalScopeStatus {
+                    kind: "path".to_string(),
+                    label: path.clone(),
+                    present: true,
+                    bytes: content.len() as u64,
+                    complete: true,
+                    note: None,
+                });
+            }
+            Err(error) => {
+                complete = false;
+                if notes.len() < 8 {
+                    notes.push(format!(
+                        "extra_paths {path} is unreadable: {error}; cache reuse disabled"
+                    ));
+                }
+                entries.push(format!("path:{path}:unreadable"));
+                statuses.push(ExternalScopeStatus {
+                    kind: "path".to_string(),
+                    label: path.clone(),
+                    present: false,
+                    bytes: 0,
+                    complete: false,
+                    note: Some("unreadable".to_string()),
+                });
+            }
+        }
+    }
+    ExternalScopeMaterial {
+        hash: external_scope_digest(&entries),
+        env_names: env_names.len(),
+        paths: path_count,
+        bytes: total_bytes,
+        complete,
+        notes,
+        statuses,
+    }
+}
+
+fn external_scope_digest(entries: &[String]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"test-cache-external-scopes-v1\n");
+    hasher.update((entries.len() as u64).to_le_bytes());
+    let mut sorted = entries.to_vec();
+    sorted.sort();
+    for entry in sorted {
+        hasher.update((entry.len() as u64).to_le_bytes());
+        hasher.update(entry.as_bytes());
+    }
+    digest_hex(&hasher.finalize())
+}
+
+fn bounded_path_label(path: &str) -> String {
+    path.chars().take(120).collect()
+}
+
 /// Hash every non-ignored file in the worktree plus explicit changed and
 /// dependency paths. The walk is sorted, bounded, and fails closed: if any
 /// candidate is unreadable or a bound is reached, `complete=false` disables
@@ -711,6 +1031,9 @@ pub struct TestCacheKeyMaterial {
     pub inputs_hash: String,
     pub impact_generation: String,
     pub tool_version: String,
+    /// Digest of operator-declared external environment names and worktree
+    /// paths. `empty()` when the project declares no external scopes.
+    pub external_scopes_hash: String,
 }
 
 impl TestCacheKeyMaterial {
@@ -730,7 +1053,16 @@ impl TestCacheKeyMaterial {
             inputs_hash: inputs_hash.to_string(),
             impact_generation: impact_generation.to_string(),
             tool_version: test_cache_tool_version().to_string(),
+            external_scopes_hash: ExternalScopeMaterial::empty().hash,
         }
+    }
+
+    /// Attach the resolved external-scope digest. Keeping this separate from
+    /// `resolved` lets existing callers stay explicit about whether they
+    /// resolved scopes or intentionally have none.
+    pub fn with_external_scopes(mut self, material: &ExternalScopeMaterial) -> Self {
+        self.external_scopes_hash = material.hash.clone();
+        self
     }
 }
 
@@ -759,6 +1091,7 @@ pub fn compute_cache_key(material: &TestCacheKeyMaterial) -> String {
     write_field(&mut hasher, &material.inputs_hash);
     write_field(&mut hasher, &material.impact_generation);
     write_field(&mut hasher, &material.tool_version);
+    write_field(&mut hasher, &material.external_scopes_hash);
     format!(
         "v{TEST_CACHE_KEY_VERSION}:{}",
         hasher
@@ -1343,6 +1676,46 @@ impl crate::Engine {
         tokio::task::spawn_blocking(move || access.stats(&now)).await?
     }
 
+    /// Read-only preview of `extra_env`/`extra_paths`. It resolves the same
+    /// material the key builder uses, so an operator sees the exact
+    /// fail-closed reasons without executing a test command or reading content.
+    pub async fn preview_test_cache_scopes(
+        &self,
+        project_id: &str,
+    ) -> Result<vp_protocol::test_cache::TestCacheScopePreviewResult> {
+        let store = self.store().clone();
+        let project = project_id.to_string();
+        let (policy, root) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let project_row = store
+                .get_project(&project)?
+                .ok_or_else(|| anyhow::anyhow!("project not found: {project}"))?;
+            let policy = store.get_test_cache_policy(&project)?;
+            Ok::<_, anyhow::Error>((policy, PathBuf::from(project_row.root)))
+        })
+        .await??;
+        let material = resolve_external_scope_material(&root, &policy);
+        Ok(vp_protocol::test_cache::TestCacheScopePreviewResult {
+            project_id: project_id.to_string(),
+            enabled: policy.enabled,
+            extra_env: material.env_names,
+            extra_paths: material.paths,
+            complete: material.complete,
+            notes: material.notes,
+            entries: material
+                .statuses
+                .into_iter()
+                .map(|status| vp_protocol::test_cache::TestCacheScopeEntry {
+                    kind: status.kind,
+                    label: status.label,
+                    present: status.present,
+                    bytes: status.bytes,
+                    complete: status.complete,
+                    note: status.note,
+                })
+                .collect(),
+        })
+    }
+
     pub async fn list_test_cache_entries(
         &self,
         params: vp_protocol::test_cache::TestCacheEntriesParams,
@@ -1541,6 +1914,7 @@ mod tests {
             inputs_hash: "inputs".into(),
             impact_generation: "impact".into(),
             tool_version: test_cache_tool_version().into(),
+            external_scopes_hash: ExternalScopeMaterial::empty().hash,
         }
     }
 
@@ -2272,5 +2646,259 @@ mod tests {
     #[allow(dead_code)]
     fn full_source() -> &'static str {
         IMPACT_SOURCE_FULL
+    }
+
+    #[test]
+    fn external_paths_change_the_key_and_fail_closed() {
+        let root = TempDir::new().unwrap();
+        std::fs::create_dir_all(root.path().join("config")).unwrap();
+        let input = root.path().join("config/local.env");
+        std::fs::write(&input, b"first").unwrap();
+        let policy = TestCachePolicy {
+            extra_paths: vec!["config/local.env".into()],
+            ..TestCachePolicy::default()
+        };
+        let first = resolve_external_scope_material(root.path(), &policy);
+        assert!(first.complete, "{first:?}");
+        assert_eq!(first.paths, 1);
+        let base = material("scope").with_external_scopes(&first);
+        let first_key = compute_cache_key(&base);
+        std::fs::write(&input, b"second").unwrap();
+        let second = resolve_external_scope_material(root.path(), &policy);
+        assert!(second.complete);
+        assert_ne!(
+            first_key,
+            compute_cache_key(&material("scope").with_external_scopes(&second))
+        );
+
+        let missing = TestCachePolicy {
+            extra_paths: vec!["config/missing.env".into()],
+            ..TestCachePolicy::default()
+        };
+        let missing = resolve_external_scope_material(root.path(), &missing);
+        assert!(!missing.complete);
+        assert!(missing.notes.iter().any(|note| note.contains("unreadable")));
+
+        let directory = TestCachePolicy {
+            extra_paths: vec!["config".into()],
+            ..TestCachePolicy::default()
+        };
+        let directory = resolve_external_scope_material(root.path(), &directory);
+        assert!(!directory.complete);
+        assert!(
+            directory
+                .notes
+                .iter()
+                .any(|note| note.contains("regular file"))
+        );
+
+        let oversized = root.path().join("config/oversized.bin");
+        let file = std::fs::File::create(&oversized).unwrap();
+        file.set_len(MAX_TEST_CACHE_EXTRA_PATH_BYTES + 1).unwrap();
+        let policy = TestCachePolicy {
+            extra_paths: vec!["config/oversized.bin".into()],
+            ..TestCachePolicy::default()
+        };
+        let oversized = resolve_external_scope_material(root.path(), &policy);
+        assert!(!oversized.complete);
+        assert!(oversized.notes.iter().any(|note| note.contains("exceeds")));
+
+        let outside = TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret"), b"outside").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                outside.path().join("secret"),
+                root.path().join("config/leak"),
+            )
+            .unwrap();
+            let policy = TestCachePolicy {
+                extra_paths: vec!["config/leak".into()],
+                ..TestCachePolicy::default()
+            };
+            let escaped = resolve_external_scope_material(root.path(), &policy);
+            assert!(!escaped.complete);
+            assert!(escaped.notes.iter().any(|note| note.contains("escapes")));
+        }
+    }
+
+    #[test]
+    fn external_env_values_are_hashed_and_never_stored() {
+        let name = format!("VP_TEST_CACHE_SCOPE_{}", std::process::id());
+        unsafe { std::env::set_var(&name, "super-secret-value") };
+        let root = TempDir::new().unwrap();
+        let policy = TestCachePolicy {
+            extra_env: vec![name.clone()],
+            ..TestCachePolicy::default()
+        };
+        let set = resolve_external_scope_material(root.path(), &policy);
+        assert!(set.complete, "{set:?}");
+        assert_eq!(set.env_names, 1);
+        let set_key = compute_cache_key(&material("env").with_external_scopes(&set));
+        let rendered = format!("{set:?}");
+        assert!(!rendered.contains("super-secret-value"));
+        assert_eq!(set.hash.len(), 64);
+        assert!(set.hash.chars().all(|ch| ch.is_ascii_hexdigit()));
+        unsafe { std::env::remove_var(&name) };
+        let unset = resolve_external_scope_material(root.path(), &policy);
+        assert!(unset.complete);
+        assert_ne!(
+            set_key,
+            compute_cache_key(&material("env").with_external_scopes(&unset))
+        );
+        unsafe { std::env::set_var(&name, "x".repeat(MAX_TEST_CACHE_EXTRA_ENV_VALUE_BYTES + 1)) };
+        let oversized = resolve_external_scope_material(root.path(), &policy);
+        assert!(!oversized.complete);
+        assert!(oversized.notes.iter().any(|note| note.contains("exceeds")));
+        unsafe { std::env::remove_var(&name) };
+    }
+
+    #[test]
+    fn external_scope_order_and_duplicates_do_not_change_the_hash() {
+        let root = TempDir::new().unwrap();
+        std::fs::create_dir_all(root.path().join("config")).unwrap();
+        std::fs::write(root.path().join("config/a"), b"a").unwrap();
+        std::fs::write(root.path().join("config/b"), b"b").unwrap();
+        let first = TestCachePolicy {
+            extra_paths: vec!["config/a".into(), "config/b".into()],
+            ..TestCachePolicy::default()
+        };
+        let second = TestCachePolicy {
+            extra_paths: vec!["config/b".into(), "config/a".into(), "config/a".into()],
+            ..TestCachePolicy::default()
+        };
+        assert_eq!(
+            resolve_external_scope_material(root.path(), &first).hash,
+            resolve_external_scope_material(root.path(), &second).hash
+        );
+    }
+
+    #[test]
+    fn external_scope_total_bytes_bound_fails_closed() {
+        let root = TempDir::new().unwrap();
+        std::fs::create_dir_all(root.path().join("config")).unwrap();
+        let mut paths = Vec::new();
+        for index in 0..9 {
+            let name = format!("config/part-{index}.bin");
+            let file = std::fs::File::create(root.path().join(&name)).unwrap();
+            file.set_len(MAX_TEST_CACHE_EXTRA_PATH_BYTES).unwrap();
+            paths.push(name);
+        }
+        let policy = TestCachePolicy {
+            extra_paths: paths,
+            ..TestCachePolicy::default()
+        };
+        let material = resolve_external_scope_material(root.path(), &policy);
+        assert!(!material.complete);
+        assert!(
+            material
+                .notes
+                .iter()
+                .any(|note| note.contains("total bytes"))
+        );
+    }
+
+    #[test]
+    fn external_scope_preview_reports_presence_without_values() {
+        let root = TempDir::new().unwrap();
+        std::fs::write(root.path().join("local.env"), b"MODE=one").unwrap();
+        let name = format!("VP_TEST_CACHE_PREVIEW_{}", std::process::id());
+        unsafe { std::env::set_var(&name, "secret-value") };
+        let policy = TestCachePolicy {
+            extra_env: vec![name.clone()],
+            extra_paths: vec!["local.env".into(), "missing.env".into()],
+            ..TestCachePolicy::default()
+        };
+        let material = resolve_external_scope_material(root.path(), &policy);
+        assert!(!material.complete);
+        let env = material
+            .statuses
+            .iter()
+            .find(|status| status.kind == "env" && status.label == name)
+            .expect("env status");
+        assert!(env.present);
+        assert!(env.complete);
+        assert_eq!(env.bytes, "secret-value".len() as u64);
+        assert!(!format!("{env:?}").contains("secret-value"));
+        let file = material
+            .statuses
+            .iter()
+            .find(|status| status.kind == "path" && status.label == "local.env")
+            .expect("path status");
+        assert!(file.present && file.complete);
+        let missing = material
+            .statuses
+            .iter()
+            .find(|status| status.kind == "path" && status.label == "missing.env")
+            .expect("missing status");
+        assert!(!missing.present && !missing.complete);
+        assert!(missing.note.is_some());
+        unsafe { std::env::remove_var(&name) };
+    }
+
+    #[tokio::test]
+    async fn test_cache_scope_preview_reports_unset_env_without_failing() {
+        let data = TempDir::new().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        let worktree = TempDir::new().unwrap();
+        let project = store
+            .add_project(worktree.path().to_str().unwrap(), None)
+            .unwrap();
+        let engine = crate::Engine::new(store.clone());
+        let name = format!("VP_TEST_CACHE_UNSET_{}", std::process::id());
+        unsafe { std::env::remove_var(&name) };
+        store
+            .set_test_cache_policy(
+                &project.id,
+                &TestCachePolicy {
+                    extra_env: vec![name.clone()],
+                    ..TestCachePolicy::default()
+                },
+            )
+            .unwrap();
+        let preview = engine.preview_test_cache_scopes(&project.id).await.unwrap();
+        assert!(preview.complete, "an unset variable is a valid state");
+        assert_eq!(preview.extra_env, 1);
+        assert_eq!(preview.entries.len(), 1);
+        assert_eq!(preview.entries[0].label, name);
+        assert!(!preview.entries[0].present);
+        assert!(preview.entries[0].complete);
+        assert!(preview.entries[0].note.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_cache_scope_preview_is_read_only_and_project_scoped() {
+        let data = TempDir::new().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        let worktree = TempDir::new().unwrap();
+        std::fs::write(worktree.path().join("local.env"), b"one").unwrap();
+        let project = store
+            .add_project(worktree.path().to_str().unwrap(), None)
+            .unwrap();
+        let engine = crate::Engine::new(store.clone());
+        store
+            .set_test_cache_policy(
+                &project.id,
+                &TestCachePolicy {
+                    extra_paths: vec!["local.env".into()],
+                    ..TestCachePolicy::default()
+                },
+            )
+            .unwrap();
+        let preview = engine.preview_test_cache_scopes(&project.id).await.unwrap();
+        assert!(preview.enabled);
+        assert!(preview.complete);
+        assert_eq!(preview.extra_env, 0);
+        assert_eq!(preview.extra_paths, 1);
+        assert_eq!(preview.entries.len(), 1);
+        assert_eq!(preview.entries[0].label, "local.env");
+        assert!(preview.entries[0].present);
+        assert_eq!(preview.project_id, project.id);
+        let error = engine
+            .preview_test_cache_scopes("missing")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("project not found"), "{error}");
     }
 }

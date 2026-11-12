@@ -36,7 +36,7 @@ use vp_protocol::scaling::{
 };
 use vp_protocol::test_cache::{
     SetTestCachePolicyParams, TestCacheClearParams, TestCacheEntriesParams, TestCacheImpactParams,
-    TestCachePolicyParams, TestCachePruneParams, TestCacheStatsParams,
+    TestCachePolicyParams, TestCachePruneParams, TestCacheScopePreviewParams, TestCacheStatsParams,
 };
 use vp_protocol::types::{
     AcpAgentConfig, AcpAgentIdParams, AcpProbeParams, AddAcpAgentParams, AddMcpServerParams,
@@ -76,16 +76,16 @@ use vp_protocol::types::{
     MemoryVerifyParams, MergeQueueListParams, MergeQueueListResult, OpenPullRequestParams,
     PingResult, PreemptionOverviewParams, PreemptionPolicyParams, PreemptionPolicyResult,
     ProcessListParams, ProcessLogsParams, ProcessPolicyParams, ProcessPolicyResult,
-    ProcessStopParams, ProjectBudgetParams, ProjectForkForestParams, ProjectListResult,
-    ProjectUsageParams, PromptParams, PromptResult, QuestionListParams, RehydrateSessionParams,
-    ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams,
-    ResolveMergeResult, RetryMergeParams, RetryMergeResult, SchedulerStatusParams, SearchParams,
-    ServerInfo, SessionCacheAuditParams, SessionCacheParams, SessionCachePlanParams,
-    SessionCacheWarmParams, SessionCheckpointDeleteParams, SessionCheckpointDiffParams,
-    SessionCheckpointListParams, SessionCheckpointParams, SessionCheckpointPruneParams,
-    SessionCheckpointRestoreParams, SessionCheckpointStatsParams, SessionCitationAuditParams,
-    SessionCitationsParams, SessionCompactParams, SessionCompareParams, SessionContextParams,
-    SessionContinuationCancelParams, SessionContinuationReclaimParams,
+    ProcessRestartParams, ProcessStopParams, ProjectBudgetParams, ProjectForkForestParams,
+    ProjectListResult, ProjectUsageParams, PromptParams, PromptResult, QuestionListParams,
+    RehydrateSessionParams, ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult,
+    ResolveMergeParams, ResolveMergeResult, RetryMergeParams, RetryMergeResult,
+    SchedulerStatusParams, SearchParams, ServerInfo, SessionCacheAuditParams, SessionCacheParams,
+    SessionCachePlanParams, SessionCacheWarmParams, SessionCheckpointDeleteParams,
+    SessionCheckpointDiffParams, SessionCheckpointListParams, SessionCheckpointParams,
+    SessionCheckpointPruneParams, SessionCheckpointRestoreParams, SessionCheckpointStatsParams,
+    SessionCitationAuditParams, SessionCitationsParams, SessionCompactParams, SessionCompareParams,
+    SessionContextParams, SessionContinuationCancelParams, SessionContinuationReclaimParams,
     SessionContinuationStatusParams, SessionContinuationsParams, SessionDeferParams,
     SessionDiffParams, SessionExportParams, SessionForkParams, SessionForkTreeParams,
     SessionImportParams, SessionLineageParams, SessionListResult, SessionLogParams,
@@ -120,8 +120,10 @@ use vp_protocol::types::{
 };
 use vp_protocol::types::{
     ComputerLeaseInfo, ComputerLeaseListResult, ComputerLeaseReleaseParams,
-    ComputerLeaseReleaseResult, ComputerLeaseSweepResult, ComputerStatusParams, DaemonInstanceInfo,
-    GuiPolicyParams, GuiPolicyResult, GuiTimelineParams, GuiTimelineResult, RuntimeLeaseAuditInfo,
+    ComputerLeaseReleaseResult, ComputerLeaseSweepResult, ComputerStatusParams,
+    DaemonAgentStatusParams, DaemonAgentStatusResult, DaemonInstanceInfo, GuiPolicyParams,
+    GuiPolicyResult, GuiTimelineAuditParams, GuiTimelineParams, GuiTimelinePruneParams,
+    GuiTimelineResult, GuiTimelineRetentionParams, RuntimeLeaseAuditInfo,
     RuntimeLeaseHistoryParams, RuntimeLeaseHistoryResult, RuntimeLeaseInfo, RuntimeLeaseListResult,
     RuntimeLeaseSweepResult, SetGuiPolicyParams,
 };
@@ -219,6 +221,8 @@ async fn run() -> Result<()> {
                 adopted = report.adopted,
                 lost = report.lost,
                 unknown = report.unknown,
+                restart_scheduled = report.restart_scheduled,
+                restart_blocked = report.restart_blocked,
                 skipped_imported = report.skipped_imported,
                 "reconciled durable supervised processes"
             );
@@ -266,6 +270,7 @@ async fn run() -> Result<()> {
     spawn_browser_sweeper(state.engine.clone());
     spawn_computer_sweeper(state.engine.clone());
     spawn_gui_grace_sweeper(state.engine.clone());
+    spawn_gui_timeline_retention_sweeper(state.engine.clone());
     spawn_task_stall_sweeper(state.engine.clone());
     spawn_stall_recovery_reconciler(state.agent.clone());
     spawn_process_sweeper(state.engine.clone());
@@ -2220,6 +2225,17 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             },
             Err(response) => response_with_id(id, response),
         },
+        "session.process.restart" => match parse_params::<ProcessRestartParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .session_process_restart(&params.session_id, &params.process_id, params.confirm)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
         "process.policy.get" => match parse_params::<ProcessPolicyParams>(request.params) {
             Ok(params) => match state.engine.get_process_policy(&params.project_id).await {
                 Ok(policy) => RpcResponse::success(
@@ -2477,6 +2493,77 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 Ok(status) => RpcResponse::success(id, status),
                 Err(error) => internal_error(id, error),
             },
+            Err(response) => response_with_id(id, response),
+        },
+        "gui.timeline.audit" => match parse_params::<GuiTimelineAuditParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .gui_timeline_audit(&params.project_id, params.limit)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "gui.timeline.retention" => {
+            match parse_params::<GuiTimelineRetentionParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .gui_timeline_retention(&params.project_id, params.older_than_days)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "gui.timeline.prune" => match parse_params::<GuiTimelinePruneParams>(request.params) {
+            Ok(params) if !params.dry_run.unwrap_or(false) && !params.confirm => {
+                RpcResponse::error(
+                    id,
+                    vp_protocol::rpc::RpcError::new(
+                        vp_protocol::rpc::codes::INVALID_PARAMS,
+                        "gui.timeline.prune requires confirm=true for a non-dry-run prune",
+                    ),
+                )
+            }
+            Ok(params) => match state
+                .engine
+                .prune_gui_timeline(
+                    &params.project_id,
+                    params.older_than_days,
+                    params.dry_run.unwrap_or(false),
+                    params.limit,
+                )
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "daemon.agent.status" => match parse_params::<DaemonAgentStatusParams>(request.params) {
+            Ok(_) => {
+                let data_dir = state.data_dir.clone();
+                let status = tokio::task::spawn_blocking(move || {
+                    let paths =
+                        vp_core::daemon_agent::DaemonAgentPaths::from_env(Some(data_dir), None)?;
+                    let runner = vp_core::daemon_agent::SystemLaunchctl;
+                    Ok::<_, anyhow::Error>(
+                        vp_core::daemon_agent::DaemonAgent::new(paths, &runner).status(),
+                    )
+                })
+                .await;
+                match status {
+                    Ok(Ok(status)) => {
+                        RpcResponse::success(id, DaemonAgentStatusResult { ..status })
+                    }
+                    Ok(Err(error)) => internal_error(id, error),
+                    Err(error) => internal_error(id, anyhow::anyhow!(error)),
+                }
+            }
             Err(response) => response_with_id(id, response),
         },
         "gui.timeline" => match parse_params::<GuiTimelineParams>(request.params) {
@@ -3944,6 +4031,19 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             },
             Err(response) => response_with_id(id, response),
         },
+        "test_cache.scope.preview" => {
+            match parse_params::<TestCacheScopePreviewParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .preview_test_cache_scopes(&params.project_id)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "test_cache.policy.get" => match parse_params::<TestCachePolicyParams>(request.params) {
             Ok(params) => match state.engine.get_test_cache_policy(&params.project_id).await {
                 Ok(policy) => RpcResponse::success(
@@ -4608,6 +4708,43 @@ fn spawn_approval_sweeper(engine: Engine) {
                 Ok(0) => {}
                 Ok(expired) => tracing::info!(expired, "approval attention sweep"),
                 Err(error) => tracing::warn!(%error, "approval attention sweep failed"),
+            }
+        }
+    });
+}
+
+fn spawn_gui_timeline_retention_sweeper(engine: Engine) {
+    let interval_secs = std::env::var("VERLINPARK_GUI_RETENTION_SWEEP_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value >= 60)
+        .unwrap_or(6 * 3_600);
+    let batch = std::env::var("VERLINPARK_GUI_RETENTION_BATCH")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(1_000)
+        .clamp(1, 10_000);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match engine.sweep_gui_timeline_retention(batch).await {
+                Ok(results) if !results.is_empty() => {
+                    let pruned = results.iter().map(|result| result.pruned).sum::<u64>();
+                    let skipped = results
+                        .iter()
+                        .map(|result| result.skipped_events)
+                        .sum::<u64>();
+                    tracing::info!(
+                        projects = results.len(),
+                        pruned,
+                        skipped,
+                        "GUI timeline retention sweep"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "GUI timeline retention sweep failed"),
             }
         }
     });

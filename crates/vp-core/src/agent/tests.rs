@@ -1,4 +1,5 @@
 use super::*;
+use crate::tools::AgentTool;
 use async_trait::async_trait;
 use std::collections::VecDeque;
 use std::path::Path;
@@ -19776,4 +19777,173 @@ async fn a_tool_deadline_aborts_a_hanging_local_http_request_and_continues() {
     assert!(events.iter().any(|event| {
         event.kind == "agent.message" && event.payload["text"] == "http deadline recovered"
     }));
+}
+
+struct ParallelFakeTool {
+    name: &'static str,
+    delay: std::time::Duration,
+    completed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct ParallelDropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for ParallelDropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl crate::tools::AgentTool for ParallelFakeTool {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn description(&self) -> &'static str {
+        "parallel deadline test tool"
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+
+    async fn execute(
+        &self,
+        _context: &ToolContext,
+        _input: serde_json::Value,
+    ) -> anyhow::Result<ToolOutput> {
+        let _flag = ParallelDropFlag(self.dropped.clone());
+        if !self.delay.is_zero() {
+            tokio::time::sleep(self.delay).await;
+        }
+        self.completed.store(true, Ordering::SeqCst);
+        Ok(ToolOutput::ok(format!("{}:done", self.name)))
+    }
+}
+
+fn parallel_fake(
+    name: &'static str,
+    delay: std::time::Duration,
+) -> (
+    std::sync::Arc<ParallelFakeTool>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    (
+        std::sync::Arc::new(ParallelFakeTool {
+            name,
+            delay,
+            completed: completed.clone(),
+            dropped: dropped.clone(),
+        }),
+        completed,
+        dropped,
+    )
+}
+
+#[tokio::test]
+async fn parallel_tool_deadline_aborts_only_the_slow_tool_and_drops_its_work() {
+    let run = crate::preemption::Token::disabled();
+    let fast = parallel_fake("fast_read", std::time::Duration::ZERO);
+    let slow = parallel_fake("slow_read", std::time::Duration::from_secs(5));
+    let fast_token =
+        crate::preemption::Token::tool_child(&run, Some(std::time::Duration::from_secs(2)));
+    let slow_token =
+        crate::preemption::Token::tool_child(&run, Some(std::time::Duration::from_millis(100)));
+    let started = Instant::now();
+    let (fast_result, slow_result) = tokio::join!(
+        run_tool_with_token_deadline(&fast_token, "fast_read", async {
+            fast.0.execute(&test_context(), serde_json::json!({})).await
+        }),
+        run_tool_with_token_deadline(&slow_token, "slow_read", async {
+            slow.0.execute(&test_context(), serde_json::json!({})).await
+        }),
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "slow tool was not aborted promptly: {elapsed:?}"
+    );
+    assert!(!fast_result.0.is_error);
+    assert!(fast_result.0.content.contains("fast_read:done"));
+    assert!(fast.1.load(Ordering::SeqCst));
+    assert!(slow_result.0.is_error);
+    assert!(
+        slow_result.0.content.contains("DEADLINE_EXCEEDED"),
+        "{}",
+        slow_result.0.content
+    );
+    let snapshot = slow_result.1.expect("typed deadline snapshot");
+    assert_eq!(snapshot.reason, crate::preemption::Reason::ToolDeadline);
+    assert_eq!(snapshot.phase, crate::preemption::Phase::Tool);
+    assert!(!slow.1.load(Ordering::SeqCst), "slow work completed");
+    assert!(slow.2.load(Ordering::SeqCst), "slow work was not dropped");
+    assert!(!run.is_preempted());
+    assert!(!fast_token.is_preempted());
+}
+
+#[tokio::test]
+async fn parallel_tool_run_preemption_still_aborts_every_tool() {
+    let run = crate::preemption::Token::disabled();
+    let first = parallel_fake("first_read", std::time::Duration::from_secs(5));
+    let second = parallel_fake("second_read", std::time::Duration::from_secs(5));
+    let first_token =
+        crate::preemption::Token::tool_child(&run, Some(std::time::Duration::from_secs(30)));
+    let second_token =
+        crate::preemption::Token::tool_child(&run, Some(std::time::Duration::from_secs(30)));
+    let trigger = run.clone();
+    let preemptor = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        trigger.trigger(
+            crate::preemption::Reason::Explicit,
+            crate::preemption::Phase::Tool,
+            false,
+        );
+    });
+    let (first_result, second_result) = tokio::join!(
+        run_tool_with_token_deadline(&first_token, "first_read", async {
+            first
+                .0
+                .execute(&test_context(), serde_json::json!({}))
+                .await
+        }),
+        run_tool_with_token_deadline(&second_token, "second_read", async {
+            second
+                .0
+                .execute(&test_context(), serde_json::json!({}))
+                .await
+        }),
+    );
+    preemptor.await.unwrap();
+    assert!(first_result.0.is_error && second_result.0.is_error);
+    assert!(first_result.0.content.contains("PREEMPTED"));
+    assert!(second_result.0.content.contains("PREEMPTED"));
+    assert_eq!(
+        first_result.1.expect("first snapshot").reason,
+        crate::preemption::Reason::Explicit
+    );
+    assert!(!first.1.load(Ordering::SeqCst));
+    assert!(!second.1.load(Ordering::SeqCst));
+    assert!(first.2.load(Ordering::SeqCst) && second.2.load(Ordering::SeqCst));
+}
+
+fn test_context() -> ToolContext {
+    ToolContext {
+        root: std::path::PathBuf::from("/tmp"),
+        project_root: std::path::PathBuf::from("/tmp"),
+        sandbox_root: std::path::PathBuf::from("/tmp"),
+        secret_roots: Vec::new(),
+        network_allowed: false,
+        home: std::path::PathBuf::from("/tmp"),
+        restrict_home: false,
+        read_jail: false,
+        git_branch: None,
+        remote: None,
+        session_id: None,
+        process_supervisor: None,
+        test_cache: None,
+    }
 }

@@ -940,6 +940,15 @@ pub struct GuiPolicy {
     /// built-in sensitive list.
     #[serde(default)]
     pub sensitive_titles: Vec<String>,
+    /// Retain `gui.action` timeline events for this many days. `0` keeps them
+    /// forever. Only `gui.action` events are eligible; the daemon never prunes
+    /// another event kind for timeline retention. Default 30 days.
+    #[serde(default = "default_gui_timeline_retention_days")]
+    pub timeline_retention_days: u32,
+}
+
+fn default_gui_timeline_retention_days() -> u32 {
+    30
 }
 
 impl Default for GuiPolicy {
@@ -951,6 +960,7 @@ impl Default for GuiPolicy {
             sensitive_mode: GuiSensitiveMode::Deny,
             sensitive_bundles: Vec::new(),
             sensitive_titles: Vec::new(),
+            timeline_retention_days: default_gui_timeline_retention_days(),
         }
     }
 }
@@ -986,8 +996,16 @@ impl GuiPolicy {
             .filter(|value| !value.is_empty())
             .take(Self::MAX_SENSITIVE_ENTRIES)
             .collect();
+        self.timeline_retention_days = self
+            .timeline_retention_days
+            .min(Self::MAX_TIMELINE_RETENTION_DAYS);
         self
     }
+
+    /// `0` means keep forever. A non-zero policy is clamped to the documented
+    /// maximum; validation rejects an out-of-range explicit update instead of
+    /// silently changing it.
+    pub const MAX_TIMELINE_RETENTION_DAYS: u32 = 3_650;
 
     pub fn validate(&self) -> std::result::Result<(), String> {
         if self.grace_secs > Self::MAX_GRACE_SECS {
@@ -1005,6 +1023,12 @@ impl GuiPolicy {
                 "gui status_ttl_secs must be between {} and {}",
                 Self::MIN_STATUS_TTL_SECS,
                 Self::MAX_STATUS_TTL_SECS
+            ));
+        }
+        if self.timeline_retention_days > Self::MAX_TIMELINE_RETENTION_DAYS {
+            return Err(format!(
+                "gui timeline_retention_days must be 0..={}",
+                Self::MAX_TIMELINE_RETENTION_DAYS
             ));
         }
         for (name, values) in [
@@ -1141,6 +1165,127 @@ pub struct GuiTimelineResult {
     pub actions: Vec<GuiActionInfo>,
     pub limit: u32,
 }
+
+/// Read-only GUI action retention statistics. `keep_forever` is true when the
+/// effective policy is `0`; `cutoff` is absent in that case and `eligible` is
+/// zero. No event payload or screen content is returned.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GuiTimelineRetentionResult {
+    pub project_id: String,
+    pub retention_days: u32,
+    pub keep_forever: bool,
+    #[serde(default)]
+    pub cutoff: Option<String>,
+    pub total: u64,
+    pub eligible: u64,
+    #[serde(default)]
+    pub oldest_at: Option<String>,
+    #[serde(default)]
+    pub newest_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GuiTimelinePrunedInfo {
+    pub session_id: String,
+    pub seq: u64,
+    pub retention_days: u32,
+    pub cutoff: String,
+    pub pruned: u64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GuiTimelineAuditParams {
+    pub project_id: String,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GuiTimelineAuditResult {
+    pub project_id: String,
+    pub entries: Vec<GuiTimelinePrunedInfo>,
+    pub total: u64,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GuiTimelineRetentionParams {
+    pub project_id: String,
+    #[serde(default)]
+    pub older_than_days: Option<u32>,
+}
+
+/// Explicit operator request to prune the GUI action timeline. `older_than_days`
+/// overrides the project policy for this call; `0` is rejected because an
+/// explicit prune of everything is never a retention operation.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GuiTimelinePruneParams {
+    pub project_id: String,
+    #[serde(default)]
+    pub older_than_days: Option<u32>,
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+    /// Explicit confirmation for a non-dry-run prune. A false value is
+    /// rejected by the daemon; the automatic sweep bypasses this RPC.
+    #[serde(default)]
+    pub confirm: bool,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// Outcome of a bounded `gui.action` retention prune. Only `gui.action` events
+/// are eligible; `other_kinds_touched` stays zero and is reported for audit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GuiTimelinePruneResult {
+    pub project_id: String,
+    pub retention_days: u32,
+    /// RFC3339 UTC cutoff. Events strictly older than this are eligible.
+    pub cutoff: String,
+    pub dry_run: bool,
+    pub pruned: u64,
+    pub remaining: u64,
+    pub sessions: u64,
+    /// Sessions skipped because their mirror was being rewritten or unreadable.
+    /// A skipped row is never deleted from SQLite.
+    pub skipped_sessions: u64,
+    pub skipped_events: u64,
+    pub other_kinds_touched: u64,
+    pub limit: u32,
+    pub truncated: bool,
+    pub reason: String,
+    /// Bounded sample of pruned session ids, no event payloads.
+    #[serde(default)]
+    pub affected_sessions: Vec<String>,
+}
+
+/// Daemon LaunchAgent supervision status. `state` is one of `not_installed`,
+/// `installed`, `loaded`, `disabled`, `running`, or `unknown`. The status call
+/// never spawns the daemon and never writes the plist.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonAgentStatusResult {
+    pub label: String,
+    pub plist_path: String,
+    pub installed: bool,
+    /// The launchd service is loaded for the current user.
+    pub loaded: bool,
+    /// The label is present in `launchctl print-disabled` as disabled.
+    pub disabled: bool,
+    /// `launchctl print` reported a running process for this label.
+    pub running: bool,
+    /// The running pid belongs to this installation and matches discovery.
+    pub supervised: bool,
+    #[serde(default)]
+    pub pid: Option<u32>,
+    pub state: String,
+    pub detail: String,
+    /// True when `launchctl` was queried successfully. False means the state is
+    /// `unknown`; no negative conclusion is drawn from a failed query.
+    pub launchctl_available: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DaemonAgentStatusParams {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IntegrationPolicy {
@@ -2795,11 +2940,13 @@ pub struct ConsoleCloseResult {
 /// A durable process supervised by the daemon.
 ///
 /// Lifecycle transitions are event-backed (`process.starting`,
-/// `process.started`, `process.adopted`, `process.exited`, `process.lost`,
-/// `process.unknown`, `process.stopped`, `process.pruned`). Heartbeat,
-/// last-access, and output byte/line counters are operational observation state
-/// and are not replay content; the columns are updated without an event so a
-/// chatty build cannot flood the event log. Output bodies never enter events.
+/// `process.started`, `process.adopted`, `process.restarting`,
+/// `process.restarted`, `process.restart_blocked`, `process.exited`,
+/// `process.lost`, `process.unknown`, `process.stopped`, `process.pruned`).
+/// Heartbeat, last-access, and output byte/line counters are operational
+/// observation state and are not replay content; the columns are updated
+/// without an event so a chatty build cannot flood the event log. Output bodies
+/// never enter events.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SupervisedProcess {
     pub id: String,
@@ -2820,7 +2967,8 @@ pub struct SupervisedProcess {
     /// SHA-256 over the immutable spawn description. The same value is placed
     /// in the child environment and re-read for restart adoption.
     pub command_hash: String,
-    /// `starting`, `running`, `exited`, `stopped`, `lost`, or `unknown`.
+    /// `starting`, `running`, `restarting`, `exited`, `stopped`, `lost`,
+    /// `unknown`, or `blocked`.
     pub state: String,
     #[serde(default)]
     pub pid: Option<i64>,
@@ -2867,6 +3015,15 @@ pub struct SupervisedProcess {
     pub idle_ttl_secs: u64,
     #[serde(default)]
     pub last_access_at: String,
+    /// Consecutive boot-restart attempts for this row. It is incremented by the
+    /// startup reconciler before a respawn and is bounded by the project policy
+    /// so a crashing command cannot create an unbounded restart loop.
+    #[serde(default)]
+    pub restart_attempts: u32,
+    /// Stable machine-readable reason a row entered `blocked`. `None` for a
+    /// row that was never blocked by boot-restart policy.
+    #[serde(default)]
+    pub restart_blocked_reason: Option<String>,
     #[serde(default)]
     pub detail: Option<String>,
 }
@@ -2903,6 +3060,19 @@ pub struct ProcessPolicy {
     /// Per-process retained log line cap.
     #[serde(default = "default_process_output_lines")]
     pub max_output_lines: u64,
+    /// Opt in to restarting a supervised process that was `running` when the
+    /// daemon stopped but whose original process is gone at the next boot.
+    /// Default false: a restart is explicit policy, never a silent behavior.
+    #[serde(default)]
+    pub restart_on_boot: bool,
+    /// Consecutive boot-restart attempts allowed for one row. Once exhausted,
+    /// the row becomes `blocked` and is never respawned automatically.
+    #[serde(default = "default_process_restart_max_attempts")]
+    pub restart_max_attempts: u32,
+    /// Base exponential backoff between boot-restart attempts. Attempt N
+    /// waits `base * 2^(N-1)`, capped by the daemon's hard ceiling.
+    #[serde(default = "default_process_restart_backoff_secs")]
+    pub restart_backoff_secs: u64,
 }
 
 fn default_process_idle_sweep() -> bool {
@@ -2917,6 +3087,17 @@ fn default_process_policy_idle_ttl() -> u64 {
     3_600
 }
 
+fn default_process_restart_max_attempts() -> u32 {
+    3
+}
+
+fn default_process_restart_backoff_secs() -> u64 {
+    5
+}
+
+pub const MAX_PROCESS_RESTART_ATTEMPTS: u32 = 10;
+pub const MAX_PROCESS_RESTART_BACKOFF_SECS: u64 = 300;
+
 impl Default for ProcessPolicy {
     fn default() -> Self {
         Self {
@@ -2925,6 +3106,9 @@ impl Default for ProcessPolicy {
             idle_ttl_secs: default_process_policy_idle_ttl(),
             max_output_bytes: default_process_output_bytes(),
             max_output_lines: default_process_output_lines(),
+            restart_on_boot: false,
+            restart_max_attempts: default_process_restart_max_attempts(),
+            restart_backoff_secs: default_process_restart_backoff_secs(),
         }
     }
 }
@@ -2943,7 +3127,30 @@ impl ProcessPolicy {
         if !(100..=1_000_000).contains(&self.max_output_lines) {
             return Err("max_output_lines must be 100..1000000".to_string());
         }
+        if self.restart_max_attempts > MAX_PROCESS_RESTART_ATTEMPTS {
+            return Err(format!(
+                "restart_max_attempts must be 0..={MAX_PROCESS_RESTART_ATTEMPTS}"
+            ));
+        }
+        if self.restart_backoff_secs > MAX_PROCESS_RESTART_BACKOFF_SECS {
+            return Err(format!(
+                "restart_backoff_secs must be 0..={MAX_PROCESS_RESTART_BACKOFF_SECS}"
+            ));
+        }
         Ok(())
+    }
+
+    /// Effective exponential backoff for one attempt (1-based). The value is
+    /// bounded by the policy's hard ceiling so a crashed process can never
+    /// create an unbounded or integer-overflowing wait.
+    pub fn restart_backoff(&self, attempt: u32) -> std::time::Duration {
+        let exponent = attempt.saturating_sub(1).min(8);
+        let multiplier = 1u64 << exponent;
+        let secs = self
+            .restart_backoff_secs
+            .saturating_mul(multiplier)
+            .min(MAX_PROCESS_RESTART_BACKOFF_SECS);
+        std::time::Duration::from_secs(secs)
     }
 
     /// Clamp a process request to this project's limits. A caller may always
@@ -3338,6 +3545,25 @@ pub struct ProcessStopResult {
     pub waited_ms: u64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProcessRestartParams {
+    pub session_id: String,
+    pub process_id: String,
+    /// Explicit operator confirmation. A false value is rejected; this action
+    /// is never an automatic retry path.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProcessRestartResult {
+    /// The row after entering `restarting`. `scheduled` is false only when the
+    /// row was blocked immediately (for example, an exhausted attempt budget).
+    pub process: SupervisedProcess,
+    pub scheduled: bool,
+    pub detail: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProcessSupervisorStatus {
     pub instance: String,
@@ -3353,6 +3579,12 @@ pub struct ProcessSupervisorStatus {
     pub stopped: u32,
     #[serde(default)]
     pub lost: u32,
+    /// Rows inside an opted-in boot-restart backoff window.
+    #[serde(default)]
+    pub restarting: u32,
+    /// Rows whose boot restart was refused or exhausted.
+    #[serde(default)]
+    pub blocked: u32,
     #[serde(default)]
     pub output_bytes: u64,
 }
@@ -14035,8 +14267,101 @@ mod process_supervisor_protocol_tests {
             retention_deadline: None,
             idle_ttl_secs: 3_600,
             last_access_at: "2026-11-11T00:00:01Z".to_string(),
+            restart_attempts: 0,
+            restart_blocked_reason: None,
             detail: None,
         }
+    }
+
+    #[test]
+    fn gui_retention_audit_prune_and_scope_preview_decode_additively() {
+        let prune: GuiTimelinePruneParams = serde_json::from_value(json!({
+            "project_id": "prj-1",
+            "limit": 10
+        }))
+        .unwrap();
+        assert!(!prune.confirm);
+        assert_eq!(prune.limit, Some(10));
+        let audit = GuiTimelineAuditResult {
+            project_id: "prj-1".to_string(),
+            entries: vec![GuiTimelinePrunedInfo {
+                session_id: "ses-1".to_string(),
+                seq: 4,
+                retention_days: 30,
+                cutoff: "2026-10-13T00:00:00Z".to_string(),
+                pruned: 2,
+                created_at: "2026-11-12T00:00:00Z".to_string(),
+            }],
+            total: 1,
+            limit: 50,
+        };
+        let decoded: GuiTimelineAuditResult =
+            serde_json::from_value(serde_json::to_value(&audit).unwrap()).unwrap();
+        assert_eq!(decoded, audit);
+        let params: GuiTimelineAuditParams =
+            serde_json::from_value(json!({"project_id": "prj-1"})).unwrap();
+        assert!(params.limit.is_none());
+        let preview: crate::test_cache::TestCacheScopePreviewResult =
+            serde_json::from_value(json!({
+                "project_id": "prj-1",
+                "enabled": true,
+                "extra_env": 0,
+                "extra_paths": 0,
+                "complete": true,
+                "entries": []
+            }))
+            .unwrap();
+        assert!(preview.entries.is_empty());
+        let retention: GuiTimelineRetentionParams =
+            serde_json::from_value(json!({"project_id": "prj-1"})).unwrap();
+        assert!(retention.older_than_days.is_none());
+    }
+
+    #[test]
+    fn process_restart_and_daemon_agent_results_round_trip() {
+        let result = ProcessRestartResult {
+            process: row(),
+            scheduled: true,
+            detail: "explicit restart scheduled".to_string(),
+        };
+        let decoded: ProcessRestartResult =
+            serde_json::from_value(serde_json::to_value(&result).unwrap()).unwrap();
+        assert_eq!(decoded, result);
+        let params: ProcessRestartParams = serde_json::from_value(json!({
+            "session_id": "ses_1",
+            "process_id": "psup_1"
+        }))
+        .unwrap();
+        assert!(!params.confirm);
+        let status = DaemonAgentStatusResult {
+            label: "com.verlinpark.daemon".to_string(),
+            plist_path: "/Users/me/Library/LaunchAgents/com.verlinpark.daemon.plist".to_string(),
+            installed: true,
+            loaded: true,
+            disabled: false,
+            running: true,
+            supervised: true,
+            pid: Some(42),
+            state: "running".to_string(),
+            detail: "launchd reports pid 42".to_string(),
+            launchctl_available: true,
+        };
+        let decoded: DaemonAgentStatusResult =
+            serde_json::from_value(serde_json::to_value(&status).unwrap()).unwrap();
+        assert_eq!(decoded, status);
+        let retention = GuiTimelineRetentionResult {
+            project_id: "prj-1".to_string(),
+            retention_days: 30,
+            keep_forever: false,
+            cutoff: Some("2026-10-13T00:00:00Z".to_string()),
+            total: 4,
+            eligible: 1,
+            oldest_at: Some("2026-01-01T00:00:00Z".to_string()),
+            newest_at: Some("2026-11-01T00:00:00Z".to_string()),
+        };
+        let decoded: GuiTimelineRetentionResult =
+            serde_json::from_value(serde_json::to_value(&retention).unwrap()).unwrap();
+        assert_eq!(decoded, retention);
     }
 
     #[test]
@@ -14191,6 +14516,80 @@ mod process_policy_protocol_tests {
     }
 
     #[test]
+    fn process_policy_restart_defaults_are_off_and_bounded() {
+        let policy: ProcessPolicy = serde_json::from_value(json!({})).unwrap();
+        assert!(!policy.restart_on_boot);
+        assert_eq!(policy.restart_max_attempts, 3);
+        assert_eq!(policy.restart_backoff_secs, 5);
+        let invalid = ProcessPolicy {
+            restart_max_attempts: MAX_PROCESS_RESTART_ATTEMPTS + 1,
+            ..ProcessPolicy::default()
+        };
+        assert!(invalid.validate().is_err());
+        let invalid = ProcessPolicy {
+            restart_backoff_secs: MAX_PROCESS_RESTART_BACKOFF_SECS + 1,
+            ..ProcessPolicy::default()
+        };
+        assert!(invalid.validate().is_err());
+        let policy = ProcessPolicy {
+            restart_backoff_secs: 5,
+            ..ProcessPolicy::default()
+        };
+        assert_eq!(policy.restart_backoff(1), std::time::Duration::from_secs(5));
+        assert_eq!(
+            policy.restart_backoff(2),
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(
+            policy.restart_backoff(99),
+            std::time::Duration::from_secs(300)
+        );
+        assert_eq!(policy.restart_backoff(0), std::time::Duration::from_secs(5));
+        let zero = ProcessPolicy {
+            restart_backoff_secs: 0,
+            ..ProcessPolicy::default()
+        };
+        assert_eq!(zero.restart_backoff(3), std::time::Duration::from_secs(0));
+        let legacy: ProcessPolicy = serde_json::from_value(json!({
+            "idle_sweep_enabled": true,
+            "max_processes": 4
+        }))
+        .unwrap();
+        assert!(!legacy.restart_on_boot);
+    }
+
+    #[test]
+    fn gui_timeline_retention_defaults_and_normalization_are_bounded() {
+        let policy: GuiPolicy = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(policy.timeline_retention_days, 30);
+        assert_eq!(policy.normalized().timeline_retention_days, 30);
+        let forever = GuiPolicy {
+            timeline_retention_days: 0,
+            ..GuiPolicy::default()
+        };
+        assert_eq!(forever.clone().normalized().timeline_retention_days, 0);
+        let huge = GuiPolicy {
+            timeline_retention_days: 100_000,
+            ..GuiPolicy::default()
+        };
+        assert_eq!(
+            huge.normalized().timeline_retention_days,
+            GuiPolicy::MAX_TIMELINE_RETENTION_DAYS
+        );
+        let invalid = GuiPolicy {
+            timeline_retention_days: GuiPolicy::MAX_TIMELINE_RETENTION_DAYS + 1,
+            ..GuiPolicy::default()
+        };
+        assert!(invalid.validate().is_err());
+        assert!(forever.validate().is_ok());
+        let legacy: GuiPolicy = serde_json::from_value(json!({
+            "grace_secs": 20
+        }))
+        .unwrap();
+        assert_eq!(legacy.timeline_retention_days, 30);
+    }
+
+    #[test]
     fn process_policy_result_round_trips() {
         let result = ProcessPolicyResult {
             project_id: "prj-1".to_string(),
@@ -14200,6 +14599,9 @@ mod process_policy_protocol_tests {
                 idle_ttl_secs: 600,
                 max_output_bytes: 8_192,
                 max_output_lines: 500,
+                restart_on_boot: false,
+                restart_max_attempts: 3,
+                restart_backoff_secs: 5,
             },
         };
         let decoded: ProcessPolicyResult =

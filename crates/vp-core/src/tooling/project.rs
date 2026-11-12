@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use crate::test_cache::{
     TestCacheKeyMaterial, build_impact_map, compute_cache_key, compute_input_fingerprint,
     full_impact_generation, impact_targets_as_affected, incomplete_input_note, profile_hash,
-    spill_cache_output,
+    resolve_external_scope_material, spill_cache_output,
 };
 use crate::tools::{
     AgentTool, ToolContext, ToolOutput, run_sandboxed_shell_captured, safe_existing_path,
@@ -281,6 +281,10 @@ impl AgentTool for RunProjectTask {
         let policy_allows_kind = policy
             .as_ref()
             .is_some_and(|policy| policy.allows_kind(kind));
+        let external_scopes = policy
+            .as_ref()
+            .map(|policy| resolve_external_scope_material(&context.root, policy))
+            .unwrap_or_else(crate::test_cache::ExternalScopeMaterial::empty);
         let mut impact_map: Option<vp_protocol::test_cache::TestImpactMap> = None;
         let mut impact_generation_value = full_impact_generation(&profile_digest);
         let mut impact_available = true;
@@ -498,6 +502,19 @@ impl AgentTool for RunProjectTask {
                         ..TestCacheProvenance::miss(String::new())
                     };
                 }
+            } else if !external_scopes.complete {
+                cacheable = false;
+                let note = external_scopes.notes.first().cloned().unwrap_or_else(|| {
+                    "an external cache input is unavailable; reuse is disabled".to_string()
+                });
+                warnings.extend(external_scopes.notes.iter().cloned());
+                provenance = TestCacheProvenance {
+                    decision: "uncacheable".to_string(),
+                    inputs_hash: Some(fingerprint.hash.clone()),
+                    impact_generation: Some(impact_generation_value.clone()),
+                    note,
+                    ..TestCacheProvenance::miss(String::new())
+                };
             } else {
                 inputs_hash = Some(fingerprint.hash.clone());
                 let material = TestCacheKeyMaterial::resolved(
@@ -506,12 +523,17 @@ impl AgentTool for RunProjectTask {
                     &profile_digest,
                     &fingerprint.hash,
                     &impact_generation_value,
-                );
+                )
+                .with_external_scopes(&external_scopes);
                 cache_key = Some(compute_cache_key(&material));
                 provenance.inputs_hash = inputs_hash.clone();
                 provenance.impact_generation = Some(impact_generation_value.clone());
                 provenance.cache_key = cache_key.clone();
                 provenance.key_version = vp_protocol::test_cache::TEST_CACHE_KEY_VERSION;
+                provenance.note = format!(
+                    "{} external env name(s), {} external path(s) included in the key",
+                    external_scopes.env_names, external_scopes.paths
+                );
             }
         }
 
@@ -3112,5 +3134,117 @@ Test Case 'ATests.testFoo' failed (0.01 seconds).\n";
         assert!(!output.is_error, "{}", output.content);
         let text = std::fs::read_to_string(dir.path().join("a.txt")).unwrap();
         assert_eq!(text, "one\r\nTWO\r\nthree\r\n");
+    }
+
+    #[tokio::test]
+    async fn run_project_task_external_scopes_invalidate_and_fail_closed() {
+        use std::sync::Arc;
+        use vp_store::Store;
+
+        let data = TempDir::new().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        let worktree = TempDir::new().unwrap();
+        let project = store
+            .add_project(worktree.path().to_str().unwrap(), None)
+            .unwrap();
+        let session = store
+            .create_session(&project.id, "external scope cache")
+            .unwrap();
+        std::fs::write(
+            worktree.path().join("Makefile"),
+            "test:\n\t@echo x >> runs.log\n",
+        )
+        .unwrap();
+        std::fs::write(worktree.path().join(".gitignore"), "runs.log\nlocal.env\n").unwrap();
+        std::fs::write(worktree.path().join("local.env"), "MODE=one\n").unwrap();
+        let env_name = format!("VP_RUN_PROJECT_SCOPE_{}", std::process::id());
+        unsafe { std::env::set_var(&env_name, "first") };
+        store
+            .set_test_cache_policy(
+                &project.id,
+                &vp_protocol::test_cache::TestCachePolicy {
+                    enabled: true,
+                    extra_env: vec![env_name.clone()],
+                    extra_paths: vec!["local.env".into()],
+                    ..vp_protocol::test_cache::TestCachePolicy::default()
+                },
+            )
+            .unwrap();
+        let access = Arc::new(crate::test_cache::TestCacheAccess::new(
+            store.clone(),
+            project.id.clone(),
+        ));
+        let context = ToolContext {
+            root: worktree.path().to_path_buf(),
+            project_root: worktree.path().to_path_buf(),
+            sandbox_root: data.path().join("sandbox"),
+            secret_roots: Vec::new(),
+            network_allowed: false,
+            home: worktree.path().join("home"),
+            restrict_home: false,
+            read_jail: false,
+            git_branch: None,
+            remote: None,
+            session_id: Some(session.id.clone()),
+            process_supervisor: None,
+            test_cache: Some(access),
+        };
+        let run = |context: ToolContext| async move {
+            RunProjectTask
+                .execute(&context, json!({"kind": "test"}))
+                .await
+                .unwrap()
+        };
+        let first = run(context.clone()).await;
+        assert_eq!(first.structured.as_ref().unwrap()["cache_hit"], false);
+        let second = run(context.clone()).await;
+        assert_eq!(second.structured.as_ref().unwrap()["cache_hit"], true);
+        assert_eq!(
+            std::fs::read_to_string(worktree.path().join("runs.log"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        std::fs::write(worktree.path().join("local.env"), "MODE=two\n").unwrap();
+        let path_changed = run(context.clone()).await;
+        assert_eq!(
+            path_changed.structured.as_ref().unwrap()["cache_hit"],
+            false,
+            "{}",
+            path_changed.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.path().join("runs.log"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+        unsafe { std::env::set_var(&env_name, "second") };
+        let env_changed = run(context.clone()).await;
+        assert_eq!(env_changed.structured.as_ref().unwrap()["cache_hit"], false);
+        assert_eq!(
+            std::fs::read_to_string(worktree.path().join("runs.log"))
+                .unwrap()
+                .lines()
+                .count(),
+            3
+        );
+        std::fs::remove_file(worktree.path().join("local.env")).unwrap();
+        let missing = run(context.clone()).await;
+        assert_eq!(missing.structured.as_ref().unwrap()["cache_hit"], false);
+        assert_eq!(
+            missing.structured.as_ref().unwrap()["cache"]["decision"],
+            "uncacheable"
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.path().join("runs.log"))
+                .unwrap()
+                .lines()
+                .count(),
+            4
+        );
+        unsafe { std::env::remove_var(&env_name) };
     }
 }

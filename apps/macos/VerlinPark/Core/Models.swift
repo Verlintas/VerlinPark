@@ -83,6 +83,7 @@ struct GuiPolicy: Codable, Hashable, Sendable {
     var sensitiveMode: GuiSensitiveMode
     var sensitiveBundles: [String]
     var sensitiveTitles: [String]
+    var timelineRetentionDays: Int
 
     static let standard = GuiPolicy(
         graceSecs: 45,
@@ -90,7 +91,8 @@ struct GuiPolicy: Codable, Hashable, Sendable {
         statusTtlSecs: 30,
         sensitiveMode: .deny,
         sensitiveBundles: [],
-        sensitiveTitles: []
+        sensitiveTitles: [],
+        timelineRetentionDays: 30
     )
 
     enum CodingKeys: String, CodingKey {
@@ -100,6 +102,7 @@ struct GuiPolicy: Codable, Hashable, Sendable {
         case sensitiveMode = "sensitive_mode"
         case sensitiveBundles = "sensitive_bundles"
         case sensitiveTitles = "sensitive_titles"
+        case timelineRetentionDays = "timeline_retention_days"
     }
 
     init(
@@ -108,7 +111,8 @@ struct GuiPolicy: Codable, Hashable, Sendable {
         statusTtlSecs: Int,
         sensitiveMode: GuiSensitiveMode,
         sensitiveBundles: [String],
-        sensitiveTitles: [String]
+        sensitiveTitles: [String],
+        timelineRetentionDays: Int = 30
     ) {
         self.graceSecs = graceSecs
         self.waitMs = waitMs
@@ -116,6 +120,7 @@ struct GuiPolicy: Codable, Hashable, Sendable {
         self.sensitiveMode = sensitiveMode
         self.sensitiveBundles = sensitiveBundles
         self.sensitiveTitles = sensitiveTitles
+        self.timelineRetentionDays = timelineRetentionDays
     }
 
     init(from decoder: Decoder) throws {
@@ -132,6 +137,144 @@ struct GuiPolicy: Codable, Hashable, Sendable {
         }
         sensitiveBundles = try container.decodeIfPresent([String].self, forKey: .sensitiveBundles) ?? []
         sensitiveTitles = try container.decodeIfPresent([String].self, forKey: .sensitiveTitles) ?? []
+        timelineRetentionDays = try container.decodeIfPresent(
+            Int.self,
+            forKey: .timelineRetentionDays
+        ) ?? 30
+    }
+}
+
+struct GuiTimelinePrunedInfo: Codable, Hashable, Sendable {
+    var sessionId: String
+    var seq: Int
+    var retentionDays: Int
+    var cutoff: String
+    var pruned: Int
+    var createdAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case seq
+        case retentionDays = "retention_days"
+        case cutoff
+        case pruned
+        case createdAt = "created_at"
+    }
+}
+
+struct GuiTimelineAuditResult: Codable, Hashable, Sendable {
+    var projectId: String
+    var entries: [GuiTimelinePrunedInfo]
+    var total: Int
+    var limit: Int
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case entries
+        case total
+        case limit
+    }
+}
+
+struct GuiTimelineRetentionResult: Codable, Hashable, Sendable {
+    var projectId: String
+    var retentionDays: Int
+    var keepForever: Bool
+    var cutoff: String?
+    var total: Int
+    var eligible: Int
+    var oldestAt: String?
+    var newestAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case retentionDays = "retention_days"
+        case keepForever = "keep_forever"
+        case cutoff
+        case total
+        case eligible
+        case oldestAt = "oldest_at"
+        case newestAt = "newest_at"
+    }
+}
+
+struct GuiTimelinePruneResult: Codable, Hashable, Sendable {
+    var projectId: String
+    var retentionDays: Int
+    var cutoff: String
+    var dryRun: Bool
+    var pruned: Int
+    var remaining: Int
+    var sessions: Int
+    var skippedSessions: Int
+    var skippedEvents: Int
+    var otherKindsTouched: Int
+    var limit: Int
+    var truncated: Bool
+    var reason: String
+    var affectedSessions: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case retentionDays = "retention_days"
+        case cutoff
+        case dryRun = "dry_run"
+        case pruned
+        case remaining
+        case sessions
+        case skippedSessions = "skipped_sessions"
+        case skippedEvents = "skipped_events"
+        case otherKindsTouched = "other_kinds_touched"
+        case limit
+        case truncated
+        case reason
+        case affectedSessions = "affected_sessions"
+    }
+}
+
+struct DaemonAgentStatus: Codable, Hashable, Sendable {
+    var label: String
+    var plistPath: String
+    var installed: Bool
+    var loaded: Bool
+    var disabled: Bool
+    var running: Bool
+    var supervised: Bool
+    var pid: Int?
+    var state: String
+    var detail: String
+    var launchctlAvailable: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case label
+        case plistPath = "plist_path"
+        case installed
+        case loaded
+        case disabled
+        case running
+        case supervised
+        case pid
+        case state
+        case detail
+        case launchctlAvailable = "launchctl_available"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        label = try container.decodeIfPresent(String.self, forKey: .label) ?? "com.verlinpark.daemon"
+        plistPath = try container.decodeIfPresent(String.self, forKey: .plistPath) ?? ""
+        installed = try container.decodeIfPresent(Bool.self, forKey: .installed) ?? false
+        loaded = try container.decodeIfPresent(Bool.self, forKey: .loaded) ?? false
+        disabled = try container.decodeIfPresent(Bool.self, forKey: .disabled) ?? false
+        running = try container.decodeIfPresent(Bool.self, forKey: .running) ?? false
+        supervised = try container.decodeIfPresent(Bool.self, forKey: .supervised) ?? false
+        pid = try container.decodeIfPresent(Int.self, forKey: .pid)
+        state = try container.decodeIfPresent(String.self, forKey: .state) ?? "unknown"
+        detail = try container.decodeIfPresent(String.self, forKey: .detail) ?? ""
+        launchctlAvailable = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .launchctlAvailable
+        ) ?? false
     }
 }
 

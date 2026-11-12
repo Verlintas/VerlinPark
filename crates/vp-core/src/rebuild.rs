@@ -525,6 +525,8 @@ mod tests {
                         max_entries: 7,
                         retention_days: 3,
                         include_integration: true,
+                        extra_env: vec!["REBUILD_INPUT".into()],
+                        extra_paths: vec!["config/local.env".into()],
                         ..vp_protocol::test_cache::TestCachePolicy::default()
                     },
                 )
@@ -627,6 +629,8 @@ mod tests {
         assert_eq!(test_cache_policy.max_entries, 7);
         assert_eq!(test_cache_policy.retention_days, 3);
         assert!(test_cache_policy.include_integration);
+        assert_eq!(test_cache_policy.extra_env, vec!["REBUILD_INPUT"]);
+        assert_eq!(test_cache_policy.extra_paths, vec!["config/local.env"]);
         let test_results = store
             .list_test_results(
                 &project_id,

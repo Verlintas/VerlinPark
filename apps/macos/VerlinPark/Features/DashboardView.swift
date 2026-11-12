@@ -457,6 +457,7 @@ struct DashboardView: View {
                 DashboardNoProjectCard(detail: "Select a project to edit policies.")
             }
         case .diagnostics:
+            DaemonSupervisionCard()
             DoctorCard()
         }
     }

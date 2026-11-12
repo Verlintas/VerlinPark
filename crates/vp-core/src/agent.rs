@@ -15234,6 +15234,11 @@ async fn run_loop_body(
                 // after an operator/wall-clock preemption.
                 let batch_token = crate::preemption::Token::tool_child(&control.preempt, None);
                 batch_token.set_phase(crate::preemption::Phase::Tool, None);
+                // Each tool gets its own deadline token in addition to the
+                // run/batch token. A tool deadline must abort only that tool;
+                // the run token still aborts the whole batch on operator or
+                // wall-clock preemption.
+                let tool_deadline = crate::preemption::tool_deadline(&control.preemption_policy());
                 let mut pending = prepared.into_iter();
                 let mut set = tokio::task::JoinSet::new();
                 for _ in 0..4 {
@@ -15243,25 +15248,25 @@ async fn run_loop_body(
                     let context = tool_context.clone();
                     let engine = engine.clone();
                     let session = session.clone();
-                    let tool_token = batch_token.clone();
+                    let tool_token =
+                        crate::preemption::Token::tool_child(&batch_token, tool_deadline);
+                    tool_token.set_phase(crate::preemption::Phase::Tool, Some(&name));
                     set.spawn(async move {
                         let started = Instant::now();
-                        let mut output = match tool {
-                            Some(tool) => match tool_token
-                                .scoped(Box::pin(
-                                    async move { tool.execute(&context, input).await },
-                                ))
-                                .await
-                            {
-                                Ok(output) => output,
-                                Err(error) => ToolOutput::from_tool_error(&name, &error),
-                            },
-                            None => run_read_tool_output(&engine, &session, input).await,
-                        };
+                        let (mut output, deadline) = execute_parallel_tool(
+                            tool,
+                            engine,
+                            session,
+                            context,
+                            tool_token,
+                            input,
+                            name.clone(),
+                        )
+                        .await;
                         output.normalize_failure(&name);
                         let duration_ms =
                             started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-                        (index, call_id, name, output, duration_ms, risk)
+                        (index, call_id, name, output, duration_ms, risk, deadline)
                     });
                 }
                 let mut results = Vec::new();
@@ -15298,40 +15303,51 @@ async fn run_loop_body(
                                 let context = tool_context.clone();
                                 let engine = engine.clone();
                                 let session = session.clone();
-                                let tool_token = batch_token.clone();
+                                let tool_token = crate::preemption::Token::tool_child(
+                                    &batch_token,
+                                    tool_deadline,
+                                );
+                                tool_token
+                                    .set_phase(crate::preemption::Phase::Tool, Some(&name));
                                 set.spawn(async move {
                                     let started = Instant::now();
-                                    let mut output = match tool {
-                                        Some(tool) => match tool_token
-                                            .scoped(Box::pin(async move {
-                                                tool.execute(&context, input).await
-                                            }))
-                                            .await
-                                        {
-                                            Ok(output) => output,
-                                            Err(error) => {
-                                                ToolOutput::from_tool_error(&name, &error)
-                                            }
-                                        },
-                                        None => {
-                                            run_read_tool_output(&engine, &session, input).await
-                                        }
-                                    };
+                                    let (mut output, deadline) = execute_parallel_tool(
+                                        tool,
+                                        engine,
+                                        session,
+                                        context,
+                                        tool_token,
+                                        input,
+                                        name.clone(),
+                                    )
+                                    .await;
                                     output.normalize_failure(&name);
                                     let duration_ms =
                                         started.elapsed().as_millis().min(u128::from(u64::MAX))
                                             as u64;
-                                    (index, call_id, name, output, duration_ms, risk)
+                                    (index, call_id, name, output, duration_ms, risk, deadline)
                                 });
                             }
                         }
                     }
                 }
-                results.sort_by_key(|(index, _, _, _, _, _)| *index);
+                results.sort_by_key(|(index, _, _, _, _, _, _)| *index);
+                // A per-tool deadline is recorded as that tool's event only.
+                // It never changes session status and never aborts siblings.
+                for (_, _, _, _, _, _, deadline) in &results {
+                    if let Some(snapshot) = deadline
+                        && snapshot.reason == crate::preemption::Reason::ToolDeadline
+                    {
+                        Box::pin(emit_tool_preempted(
+                            engine, session, project, spec, snapshot,
+                        ))
+                        .await?;
+                    }
+                }
                 let mut parallel_metrics = std::collections::HashMap::new();
                 let pending = results
                     .into_iter()
-                    .map(|(_, call_id, name, output, duration_ms, risk)| {
+                    .map(|(_, call_id, name, output, duration_ms, risk, _)| {
                         parallel_metrics.insert(call_id.clone(), (duration_ms, risk));
                         crate::tool_output::PendingToolOutput {
                             tool_call_id: call_id,
@@ -19195,6 +19211,64 @@ fn usage_cost(
 }
 
 /// Registry tools that only read repository state and can safely run in a
+/// Execute one tool inside a read-only parallel batch with its own deadline
+/// token. The token observes both the batch/run parent and the per-tool
+/// deadline; only this future is dropped when the deadline fires. Sibling
+/// tools keep running, and the run token still aborts the whole batch.
+async fn execute_parallel_tool(
+    tool: Option<Arc<dyn crate::tools::AgentTool>>,
+    engine: Engine,
+    session: Session,
+    context: ToolContext,
+    tool_token: crate::preemption::Token,
+    input: Value,
+    name: String,
+) -> (ToolOutput, Option<crate::preemption::Snapshot>) {
+    let scoped_token = tool_token.clone();
+    let work = async move {
+        match tool {
+            Some(tool) => {
+                scoped_token
+                    .scoped(Box::pin(async move { tool.execute(&context, input).await }))
+                    .await
+            }
+            None => Ok(run_read_tool_output(&engine, &session, input).await),
+        }
+    };
+    run_tool_with_token_deadline(&tool_token, &name, work).await
+}
+
+/// Race one tool future against its own deadline token. This is the unit under
+/// test for parallel-batch deadline isolation: the future is dropped when the
+/// token fires, so a read-only tool cannot leave work running after its result
+/// has been reported.
+async fn run_tool_with_token_deadline<F>(
+    tool_token: &crate::preemption::Token,
+    name: &str,
+    work: F,
+) -> (ToolOutput, Option<crate::preemption::Snapshot>)
+where
+    F: std::future::Future<Output = anyhow::Result<ToolOutput>>,
+{
+    tokio::pin!(work);
+    tokio::select! {
+        result = &mut work => match result {
+            Ok(output) => (output, None),
+            Err(error) => (ToolOutput::from_tool_error(name, &error), None),
+        },
+        _ = tool_token.cancelled() => {
+            let snapshot = tool_token.snapshot().unwrap_or_else(|| {
+                crate::preemption::fallback_snapshot(
+                    crate::preemption::Phase::Tool,
+                    Some(name),
+                )
+            });
+            let output = crate::preemption::tool_output(name, &snapshot);
+            (output, Some(snapshot))
+        }
+    }
+}
+
 /// bounded parallel batch. `shell` and `fetch_url` are deliberately excluded:
 /// shell commands can mutate state and network calls should not fan out.
 fn is_parallel_safe_tool(name: &str) -> bool {

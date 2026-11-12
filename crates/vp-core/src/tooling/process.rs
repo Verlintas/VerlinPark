@@ -26,7 +26,7 @@ impl AgentTool for ProcessTool {
     }
 
     fn description(&self) -> &'static str {
-        "Start, inspect, read logs from, wait for, or stop a durable sandboxed process. Processes survive a daemon restart when their identity can be verified, and are never restarted automatically."
+        "Start, inspect, read logs from, wait for, or stop a durable sandboxed process. Processes survive a daemon restart when their identity can be verified. Boot restart is opt-in per project policy, bounded, and never silent."
     }
 
     fn schema(&self) -> Value {
@@ -269,8 +269,20 @@ fn status_process(
     let id = process_id(input)?;
     let mut row = supervisor.get(session_id, id)?;
     supervisor.touch(&mut row);
+    let restart = if row.restart_attempts > 0 || row.state == "blocked" {
+        format!(
+            " · restart {}{}",
+            row.restart_attempts,
+            row.restart_blocked_reason
+                .as_deref()
+                .map(|reason| format!(" ({reason})"))
+                .unwrap_or_default()
+        )
+    } else {
+        String::new()
+    };
     let text = format!(
-        "{} {} · {}{}{}",
+        "{} {} · {}{}{}{}",
         row.id,
         row.name,
         row.state,
@@ -279,7 +291,8 @@ fn status_process(
             .unwrap_or_default(),
         row.exit_code
             .map(|code| format!(" · exit {code}"))
-            .unwrap_or_default()
+            .unwrap_or_default(),
+        restart
     );
     Ok(ToolOutput::ok_structured(
         text,

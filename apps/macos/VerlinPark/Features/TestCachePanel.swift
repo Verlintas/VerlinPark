@@ -159,6 +159,60 @@ struct TestCachePanel: View {
                 policyField("Output bytes", text: stringBinding(\.testCacheMaxOutputBytesText))
                 policyField("Failed TTL (s)", text: stringBinding(\.testCacheFailedRetentionText))
             }
+            HStack(alignment: .top, spacing: 10) {
+                cacheScopeEditor(
+                    title: "Extra env names · one per line",
+                    text: stringBinding(\.testCacheExtraEnvText)
+                )
+                cacheScopeEditor(
+                    title: "Extra worktree paths · one per line",
+                    text: stringBinding(\.testCacheExtraPathsText)
+                )
+            }
+            if let preview = model.testCacheScopePreview {
+                HStack(spacing: 8) {
+                    sourceBadge(
+                        "\(preview.extraEnv) env",
+                        preview.complete ? VPTheme.accent : VPTheme.warning
+                    )
+                    sourceBadge(
+                        "\(preview.extraPaths) path(s)",
+                        preview.complete ? VPTheme.accent : VPTheme.warning
+                    )
+                    sourceBadge(
+                        preview.complete ? "key inputs complete" : "reuse disabled",
+                        preview.complete ? VPTheme.success : VPTheme.danger
+                    )
+                    Spacer()
+                }
+                ForEach(preview.entries, id: \.self) { entry in
+                    HStack(spacing: 6) {
+                        Text(entry.kind == "env" ? "ENV" : "FILE")
+                            .font(VPTheme.mono(6.5, weight: .semibold))
+                            .foregroundStyle(entry.complete ? VPTheme.textTertiary : VPTheme.danger)
+                        Text(entry.label)
+                            .font(VPTheme.mono(8))
+                            .foregroundStyle(entry.complete ? VPTheme.textSecondary : VPTheme.danger)
+                            .lineLimit(1)
+                        if let note = entry.note {
+                            Text(note)
+                                .font(VPTheme.mono(7))
+                                .foregroundStyle(VPTheme.textTertiary)
+                                .lineLimit(1)
+                        }
+                        Spacer()
+                        Text("\(entry.bytes) B")
+                            .font(VPTheme.mono(7))
+                            .foregroundStyle(VPTheme.textTertiary)
+                    }
+                }
+            }
+            Text(
+                "Extra env names and worktree-relative files participate in the key. "
+                    + "Values are hashed only; unreadable, escaping, or oversized inputs fail closed."
+            )
+            .font(VPTheme.mono(7.5))
+            .foregroundStyle(VPTheme.textTertiary)
             HStack {
                 Button("Save policy") {
                     Task { await model.saveTestCachePolicy() }
@@ -191,6 +245,21 @@ struct TestCachePanel: View {
         }
         .padding(10)
         .background(VPTheme.surface.opacity(0.35), in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func cacheScopeEditor(title: String, text: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(VPTheme.mono(6.5, weight: .semibold))
+                .foregroundStyle(VPTheme.textTertiary)
+            TextEditor(text: text)
+                .font(VPTheme.mono(8.5))
+                .scrollContentBackground(.hidden)
+                .padding(4)
+                .frame(height: 58)
+                .background(VPTheme.surface, in: RoundedRectangle(cornerRadius: 6))
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func policyField(_ label: String, text: Binding<String>) -> some View {
