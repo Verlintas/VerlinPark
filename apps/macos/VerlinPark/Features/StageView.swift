@@ -166,9 +166,18 @@ private struct ProjectStageView: View {
                         .frame(width: 1, height: 9)
 
                     if let info = model.agentInfo {
-                        Text(info.configured ? (info.model ?? "MODEL") : L10n.t("NO MODEL"))
-                            .font(VPTheme.mono(8, weight: .medium))
-                            .foregroundStyle(info.configured ? VPTheme.textTertiary : VPTheme.warning)
+                        Text(
+                            info.configured
+                                ? (model.daemonModelLabel ?? "MODEL")
+                                : L10n.t("NO MODEL")
+                        )
+                        .font(VPTheme.mono(8, weight: .medium))
+                        .foregroundStyle(info.configured ? VPTheme.textTertiary : VPTheme.warning)
+                        .help(
+                            model.daemonModelSource.map {
+                                "Daemon-configured Leader model from \($0); local provider settings are not used for a live run."
+                            } ?? "Daemon-configured model."
+                        )
                     }
 
                     if let session = model.selectedSession {
@@ -671,8 +680,9 @@ private struct ProjectStageView: View {
 
             HStack(spacing: 8) {
                 if let info = model.agentInfo, info.configured {
-                    Label(info.model ?? "model", systemImage: "cpu")
+                    Label(model.daemonModelLabel ?? "model", systemImage: "cpu")
                         .foregroundStyle(VPTheme.textTertiary)
+                        .help("Model resolved from daemon agent.info, not local provider defaults.")
                 } else {
                     Label("no model configured", systemImage: "exclamationmark.triangle")
                         .foregroundStyle(VPTheme.warning)
@@ -881,42 +891,17 @@ private struct ContextPopoverView: View {
                 if let snapshot = model.efficiencySnapshot,
                    snapshot.cacheHitRatio != nil || snapshot.promptPrefixHash != nil
                 {
+                    CacheTelemetryPanel(snapshot: snapshot)
                     HStack(spacing: 8) {
-                        if let ratio = snapshot.cacheHitRatio {
-                            CacheHitPill(ratio: ratio)
-                        }
                         GovernorPill(status: model.governorStatus)
-                        if let ttl = snapshot.lastCacheTTL {
-                            Text("ttl \(ttl)")
-                                .font(.system(size: 9, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                        }
-                        if let breakpoints = snapshot.lastBreakpoints {
-                            Text("\(breakpoints) breakpoints")
-                                .font(.system(size: 9, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                        }
-                        if let savings = snapshot.estimatedSavingsUSD {
-                            Text("saved \(EfficiencyMetrics.usd(savings))")
-                                .font(.system(size: 9, design: .monospaced))
-                                .foregroundStyle(savings < 0 ? VPTheme.warning : .secondary)
-                        }
-                        if let miss = snapshot.lastMissReason {
-                            Text("miss \(EfficiencyMetrics.missReasonLabel(miss))")
-                                .font(.system(size: 9, design: .monospaced))
-                                .foregroundStyle(.tertiary)
-                        }
                         if let prefix = EfficiencyMetrics.shortHash(snapshot.promptPrefixHash) {
-                            Text("prefix \(prefix)…")
+                            Text("prompt prefix \(prefix)…")
                                 .font(.system(size: 9, design: .monospaced))
                                 .foregroundStyle(.tertiary)
                                 .textSelection(.enabled)
                         }
                         Spacer()
                     }
-                    Text("Cache reads are billed, not free; this is a hit ratio, not a discount.")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
                 }
 
                 if let instructions = model.sessionInstructions {

@@ -1120,6 +1120,28 @@ actor CoreClient {
         .decode(SessionCacheStatus.self)
     }
 
+    func sessionCacheCalls(
+        sessionID: String,
+        limit: Int = 20,
+        role: String? = nil,
+        missReason: String? = nil,
+        includeWarm: Bool = false
+    ) async throws -> SessionCacheCallsResult {
+        var params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "limit": .number(Double(max(1, min(100, limit)))),
+            "include_warm": .bool(includeWarm),
+        ]
+        if let role {
+            params["role"] = .string(role)
+        }
+        if let missReason {
+            params["miss_reason"] = .string(missReason)
+        }
+        return try await request(method: "session.cache.calls", params: params)
+            .decode(SessionCacheCallsResult.self)
+    }
+
     func sessionInstructions(
         sessionID: String,
         agentID: String? = nil

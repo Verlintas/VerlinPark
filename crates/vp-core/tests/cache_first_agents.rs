@@ -15,7 +15,10 @@ use tempfile::TempDir;
 use vp_core::Engine;
 use vp_core::agent::{AgentConfig, AgentService, CapacityController, ScopeLocks};
 use vp_core::tools::ToolRegistry;
-use vp_protocol::types::{ApprovalMode, CachePolicy, RoleModels, SkillCreateParams};
+use vp_protocol::types::{
+    ApprovalMode, CachePolicy, ProjectCacheParams, RoleModels, SessionCacheCallsParams,
+    SkillCreateParams,
+};
 use vp_providers::AnthropicProvider;
 use vp_store::Store;
 use wiremock::matchers::{method, path};
@@ -223,6 +226,13 @@ async fn anthropic_agent_run_emits_four_breakpoints_and_cache_telemetry() {
     assert_eq!(cache.payload["cache_write_tokens"], 200);
     assert_eq!(cache.payload["input_tokens"], 900);
     assert_eq!(cache.payload["miss_reason"], serde_json::Value::Null);
+    assert_eq!(cache.payload["cache_miss_tokens"], 300);
+    assert_eq!(cache.payload["theoretical_max_hit_ratio"], 0.0);
+    assert!(cache.payload["message_prefix_hash"].as_str().is_some());
+    assert_eq!(cache.payload["message_prefix_count"], 1);
+    assert!(cache.payload["append_only"].is_null());
+    assert!(cache.payload["cache_epoch"].as_str().is_some());
+    assert!(cache.payload["cache_epoch_source"].as_str().is_some());
     assert!(cache.payload["core_hash"].as_str().is_some());
     assert!(cache.payload["project_hash"].as_str().is_some());
     assert!(cache.payload["tools_hash"].as_str().is_some());
@@ -233,6 +243,244 @@ async fn anthropic_agent_run_emits_four_breakpoints_and_cache_telemetry() {
     assert_eq!(status.last_cache_ttl.as_deref(), Some("5m"));
     assert_eq!(status.recent_calls.len(), 1);
     assert_eq!(status.ttl_counts[0].key, "5m");
+    assert_eq!(status.cache_miss_tokens, 300);
+    assert_eq!(status.append_only_calls, 0);
+    assert_eq!(status.append_only_breaks, 0);
+    assert!(status.cache_epoch.is_some());
+
+    let calls = engine
+        .session_cache_calls(&SessionCacheCallsParams {
+            session_id: session.id.clone(),
+            limit: Some(1),
+            role: Some("leader".into()),
+            miss_reason: None,
+            include_warm: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(calls.returned, 1);
+    assert_eq!(calls.observed, 1);
+    assert!(!calls.truncated);
+    assert_eq!(calls.calls[0].cache_miss_tokens, 300);
+    let hidden = engine
+        .session_cache_calls(&SessionCacheCallsParams {
+            session_id: session.id.clone(),
+            limit: Some(1),
+            role: Some("worker".into()),
+            miss_reason: None,
+            include_warm: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(hidden.returned, 0);
+    assert_eq!(hidden.observed, 0);
+}
+
+fn anthropic_stream_with_usage(
+    input_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+) -> String {
+    format!(
+        concat!(
+            "event: message_start\n",
+            "data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":{},\"cache_read_input_tokens\":{},\"cache_creation_input_tokens\":{}}}}}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"Done.\"}}}}\n\n",
+            "event: message_delta\n",
+            "data: {{\"type\":\"message_delta\",\"usage\":{{\"output_tokens\":3}}}}\n\n",
+            "event: message_stop\n",
+            "data: {{\"type\":\"message_stop\"}}\n\n",
+        ),
+        input_tokens, cache_read_tokens, cache_write_tokens
+    )
+}
+
+#[tokio::test]
+async fn second_agent_turn_proves_append_only_and_tail_delta_attribution() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(anthropic_stream_with_usage(100, 0, 900)),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(anthropic_stream_with_usage(200, 1_000, 0)),
+        )
+        .mount(&server)
+        .await;
+    let dir = TempDir::new().unwrap();
+    let (engine, project_id) = test_engine(&dir);
+    create_skill(&engine, &project_id).await;
+    let provider = Arc::new(AnthropicProvider::with_base_url(
+        "anthropic",
+        format!("{}/v1", server.uri()),
+        Some("test-key".into()),
+    ));
+    let service = service(&engine, provider, "anthropic");
+    let session = engine
+        .create_session(project_id.clone(), "cache continuity".into(), None)
+        .await
+        .unwrap();
+    engine
+        .set_session_prompt_layout(&session.id, 2)
+        .await
+        .unwrap();
+    engine
+        .set_cache_policy(&project_id, CachePolicy::default())
+        .await
+        .unwrap();
+    service.start(&session.id, "first turn").await.unwrap();
+    wait_for_idle(&engine, &session.id).await;
+    service.start(&session.id, "second turn").await.unwrap();
+    wait_for_idle(&engine, &session.id).await;
+
+    let events = engine
+        .list_events(session.id.clone(), 0, 500)
+        .await
+        .unwrap();
+    let cache_events = events
+        .iter()
+        .filter(|event| event.kind == "context.cache")
+        .collect::<Vec<_>>();
+    assert_eq!(cache_events.len(), 2);
+    let first = cache_events[0];
+    let second = cache_events[1];
+    assert_eq!(first.payload["miss_reason"], "first_call");
+    assert!(first.payload["append_only"].is_null());
+    assert_eq!(second.payload["append_only"], true);
+    assert_eq!(second.payload["miss_reason"], "tail_delta");
+    assert_eq!(second.payload["cache_miss_tokens"], 200);
+    assert_eq!(second.payload["previous_message_prefix_count"], 1);
+    assert!(
+        second.payload["message_prefix_count"].as_u64().unwrap()
+            > second.payload["previous_message_prefix_count"]
+                .as_u64()
+                .unwrap()
+    );
+    assert_eq!(second.payload["cache_epoch"], first.payload["cache_epoch"]);
+    assert_eq!(second.payload["cache_epoch_source"], "l4");
+
+    let status = engine.session_cache_status(&session.id).await.unwrap();
+    assert_eq!(status.cache_miss_tokens, 1_200);
+    assert_eq!(status.append_only_calls, 1);
+    assert_eq!(status.append_only_breaks, 0);
+    assert_eq!(status.last_append_only, Some(true));
+    assert!(status.hit_ratio_p50.is_some());
+    assert_eq!(status.top_miss_reasons[0].key, "first_call");
+    assert_eq!(status.cache_epoch_timeline.len(), 1);
+
+    let calls = engine
+        .session_cache_calls(&SessionCacheCallsParams {
+            session_id: session.id.clone(),
+            limit: Some(20),
+            role: None,
+            miss_reason: None,
+            include_warm: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(calls.returned, 2);
+    assert_eq!(calls.calls[0].at, second.created_at);
+    assert_eq!(calls.calls[0].append_only, Some(true));
+    assert_eq!(calls.calls[1].append_only, None);
+
+    let tail_only = engine
+        .session_cache_calls(&SessionCacheCallsParams {
+            session_id: session.id.clone(),
+            limit: Some(1),
+            role: None,
+            miss_reason: Some("tail_delta".into()),
+            include_warm: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(tail_only.returned, 1);
+    assert_eq!(tail_only.observed, 1);
+    assert!(!tail_only.truncated);
+    assert_eq!(
+        tail_only.calls[0].miss_reason.as_deref(),
+        Some("tail_delta")
+    );
+
+    let limited = engine
+        .session_cache_calls(&SessionCacheCallsParams {
+            session_id: session.id.clone(),
+            limit: Some(1),
+            role: None,
+            miss_reason: None,
+            include_warm: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(limited.returned, 1);
+    assert_eq!(limited.observed, 2);
+    assert!(limited.truncated);
+
+    let overview = engine
+        .project_cache_overview(&ProjectCacheParams {
+            project_id: project_id.clone(),
+            limit: Some(1_000),
+        })
+        .await
+        .unwrap();
+    assert_eq!(overview.sessions_observed, 1);
+    assert_eq!(overview.calls, 2);
+    assert_eq!(overview.input_tokens, 2_200);
+    assert_eq!(overview.cache_miss_tokens, 1_200);
+    assert_eq!(overview.append_only_calls, 1);
+    assert_eq!(overview.append_only_breaks, 0);
+    assert_eq!(overview.cache_epochs, 1);
+    assert!(!overview.truncated);
+    assert_eq!(overview.scan_limit, 1_000);
+
+    engine
+        .store()
+        .append_event(
+            &session.id,
+            "context.cache",
+            serde_json::json!({
+                "warm": true,
+                "input_tokens": 500,
+                "cache_read_tokens": 400,
+                "output_tokens": 5,
+                "cache_epoch": "epoch-warm",
+                "agent_role": "cache_warm"
+            }),
+        )
+        .unwrap();
+    let without_warm = engine
+        .session_cache_calls(&SessionCacheCallsParams {
+            session_id: session.id.clone(),
+            limit: Some(20),
+            role: None,
+            miss_reason: None,
+            include_warm: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(without_warm.returned, 2);
+    let with_warm = engine
+        .session_cache_calls(&SessionCacheCallsParams {
+            session_id: session.id.clone(),
+            limit: Some(20),
+            role: Some("cache_warm".into()),
+            miss_reason: None,
+            include_warm: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(with_warm.returned, 1);
+    assert!(with_warm.calls[0].warm);
 }
 
 #[tokio::test]

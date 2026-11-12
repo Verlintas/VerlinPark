@@ -3859,6 +3859,27 @@ struct AgentInfo: Codable, Sendable {
         case contextWindow = "context_window"
         case approvalMode = "approval_mode"
     }
+
+    /// Model actually configured by the daemon for the session Leader.
+    ///
+    /// The client's `providerModel` UserDefaults can be stale after a daemon
+    /// restart, a role override, or a remote settings edit. The Stage and
+    /// header must show the daemon's configured Leader model instead.
+    var leaderModelLabel: String? {
+        let leader = roleModels.leader.model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !leader.isEmpty {
+            return leader
+        }
+        let base = model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return base.isEmpty ? nil : base
+    }
+
+    /// Nil when no provider is configured. This intentionally never falls back
+    /// to a local UserDefaults value.
+    var configuredModelLabel: String? {
+        guard configured else { return nil }
+        return leaderModelLabel
+    }
 }
 
 struct SessionCacheStatus: Codable, Sendable {
@@ -3886,6 +3907,27 @@ struct SessionCacheStatus: Codable, Sendable {
     let lastFirstTokenMS: Int?
     let recentCalls: [SessionCacheCall]
     let policy: SessionCachePolicy?
+    // L5 additive telemetry. Every field is optional so a pre-L5 daemon and a
+    // legacy payload still decode.
+    let cacheMissTokens: Int?
+    let theoreticalMaxHitRatio: Double?
+    let cacheEpoch: String?
+    let cacheEpochSource: String?
+    let appendOnlyCalls: Int?
+    let appendOnlyBreaks: Int?
+    let lastAppendOnly: Bool?
+    let hitRatioP50: Double?
+    let hitRatioP95: Double?
+    let theoreticalMaxP50: Double?
+    let theoreticalMaxP95: Double?
+    let costUSD: Double?
+    let cacheEpochTimeline: [SessionCacheEpochBucket]
+    let perRole: [SessionCacheRoleBucket]
+    let topMissReasons: [SessionCacheCountBucket]
+    let crossSessionReuseSessions: Int?
+    let crossSessionHitTokens: Int?
+    let crossSessionCallsObserved: Int?
+    let compactionLostCacheUSD: Double?
 
     /// `session.cache` may report either total provider input (which already
     /// includes cache reads/writes) or an explicit uncached count. Prefer the
@@ -3925,6 +3967,25 @@ struct SessionCacheStatus: Codable, Sendable {
         case lastFirstTokenMS = "last_first_token_ms"
         case recentCalls = "recent_calls"
         case policy
+        case cacheMissTokens = "cache_miss_tokens"
+        case theoreticalMaxHitRatio = "theoretical_max_hit_ratio"
+        case cacheEpoch = "cache_epoch"
+        case cacheEpochSource = "cache_epoch_source"
+        case appendOnlyCalls = "append_only_calls"
+        case appendOnlyBreaks = "append_only_breaks"
+        case lastAppendOnly = "last_append_only"
+        case hitRatioP50 = "hit_ratio_p50"
+        case hitRatioP95 = "hit_ratio_p95"
+        case theoreticalMaxP50 = "theoretical_max_p50"
+        case theoreticalMaxP95 = "theoretical_max_p95"
+        case costUSD = "cost_usd"
+        case cacheEpochTimeline = "cache_epoch_timeline"
+        case perRole = "per_role"
+        case topMissReasons = "top_miss_reasons"
+        case crossSessionReuseSessions = "cross_session_reuse_sessions"
+        case crossSessionHitTokens = "cross_session_hit_tokens"
+        case crossSessionCallsObserved = "cross_session_calls_observed"
+        case compactionLostCacheUSD = "compaction_lost_cache_usd"
     }
 
     private struct CacheKey: CodingKey {
@@ -3984,6 +4045,24 @@ struct SessionCacheStatus: Codable, Sendable {
             return nil
         }
 
+        func bool(_ names: String...) -> Bool? {
+            for name in names {
+                if let value = try? container.decode(Bool.self, forKey: CacheKey(name)) {
+                    return value
+                }
+            }
+            return nil
+        }
+
+        func buckets<T: Decodable>(_: T.Type, _ names: String...) -> [T] {
+            for name in names {
+                if let value = try? container.decode([T].self, forKey: CacheKey(name)) {
+                    return value
+                }
+            }
+            return []
+        }
+
         sessionID = string("session_id")
         inputTokens = int("input_tokens")
         uncachedInputTokens = int("uncached_input_tokens")
@@ -4008,6 +4087,25 @@ struct SessionCacheStatus: Codable, Sendable {
         lastFirstTokenMS = int("last_first_token_ms", "first_token_ms")
         recentCalls = (try? container.decode([SessionCacheCall].self, forKey: CacheKey("recent_calls"))) ?? []
         policy = try? container.decode(SessionCachePolicy.self, forKey: CacheKey("policy"))
+        cacheMissTokens = int("cache_miss_tokens")
+        theoreticalMaxHitRatio = double("theoretical_max_hit_ratio")
+        cacheEpoch = string("cache_epoch")
+        cacheEpochSource = string("cache_epoch_source")
+        appendOnlyCalls = int("append_only_calls")
+        appendOnlyBreaks = int("append_only_breaks")
+        lastAppendOnly = bool("last_append_only")
+        hitRatioP50 = double("hit_ratio_p50")
+        hitRatioP95 = double("hit_ratio_p95")
+        theoreticalMaxP50 = double("theoretical_max_p50")
+        theoreticalMaxP95 = double("theoretical_max_p95")
+        costUSD = double("cost_usd")
+        cacheEpochTimeline = buckets(SessionCacheEpochBucket.self, "cache_epoch_timeline")
+        perRole = buckets(SessionCacheRoleBucket.self, "per_role")
+        topMissReasons = buckets(SessionCacheCountBucket.self, "top_miss_reasons")
+        crossSessionReuseSessions = int("cross_session_reuse_sessions")
+        crossSessionHitTokens = int("cross_session_hit_tokens")
+        crossSessionCallsObserved = int("cross_session_calls_observed")
+        compactionLostCacheUSD = double("compaction_lost_cache_usd")
     }
 }
 
@@ -4156,11 +4254,23 @@ struct SessionCacheCall: Codable, Sendable, Identifiable, Equatable {
     let coreHash: String?
     let projectHash: String?
     let toolsHash: String?
+    let toolBundle: String?
+    let toolBundleHash: String?
     let volatileHash: String?
     let promptPrefixHash: String?
     let estimatedSavingsUSD: Double
     let missReason: String?
     let warm: Bool
+    let cacheMissTokens: Int
+    let theoreticalMaxHitRatio: Double
+    let messagePrefixHash: String?
+    let previousMessagePrefixHash: String?
+    let messagePrefixCount: Int
+    let previousMessagePrefixCount: Int
+    let appendOnly: Bool?
+    let cacheEpoch: String?
+    let cacheEpochSource: String?
+    let previousInputTokens: Int
 
     enum CodingKeys: String, CodingKey {
         case at
@@ -4178,11 +4288,23 @@ struct SessionCacheCall: Codable, Sendable, Identifiable, Equatable {
         case coreHash = "core_hash"
         case projectHash = "project_hash"
         case toolsHash = "tools_hash"
+        case toolBundle = "tool_bundle"
+        case toolBundleHash = "tool_bundle_hash"
         case volatileHash = "volatile_hash"
         case promptPrefixHash = "prompt_prefix_hash"
         case estimatedSavingsUSD = "estimated_savings_usd"
         case missReason = "miss_reason"
         case warm
+        case cacheMissTokens = "cache_miss_tokens"
+        case theoreticalMaxHitRatio = "theoretical_max_hit_ratio"
+        case messagePrefixHash = "message_prefix_hash"
+        case previousMessagePrefixHash = "previous_message_prefix_hash"
+        case messagePrefixCount = "message_prefix_count"
+        case previousMessagePrefixCount = "previous_message_prefix_count"
+        case appendOnly = "append_only"
+        case cacheEpoch = "cache_epoch"
+        case cacheEpochSource = "cache_epoch_source"
+        case previousInputTokens = "previous_input_tokens"
     }
 
     init(from decoder: Decoder) throws {
@@ -4202,11 +4324,167 @@ struct SessionCacheCall: Codable, Sendable, Identifiable, Equatable {
         coreHash = try? container.decode(String.self, forKey: .coreHash)
         projectHash = try? container.decode(String.self, forKey: .projectHash)
         toolsHash = try? container.decode(String.self, forKey: .toolsHash)
+        toolBundle = try? container.decode(String.self, forKey: .toolBundle)
+        toolBundleHash = try? container.decode(String.self, forKey: .toolBundleHash)
         volatileHash = try? container.decode(String.self, forKey: .volatileHash)
         promptPrefixHash = try? container.decode(String.self, forKey: .promptPrefixHash)
         estimatedSavingsUSD = (try? container.decode(Double.self, forKey: .estimatedSavingsUSD)) ?? 0
         missReason = try? container.decode(String.self, forKey: .missReason)
         warm = (try? container.decode(Bool.self, forKey: .warm)) ?? false
+        cacheMissTokens = (try? container.decode(Int.self, forKey: .cacheMissTokens)) ?? 0
+        theoreticalMaxHitRatio = (try? container.decode(Double.self, forKey: .theoreticalMaxHitRatio)) ?? 0
+        messagePrefixHash = try? container.decode(String.self, forKey: .messagePrefixHash)
+        previousMessagePrefixHash = try? container.decode(String.self, forKey: .previousMessagePrefixHash)
+        messagePrefixCount = (try? container.decode(Int.self, forKey: .messagePrefixCount)) ?? 0
+        previousMessagePrefixCount = (try? container.decode(Int.self, forKey: .previousMessagePrefixCount)) ??
+            0
+        appendOnly = try? container.decode(Bool.self, forKey: .appendOnly)
+        cacheEpoch = try? container.decode(String.self, forKey: .cacheEpoch)
+        cacheEpochSource = try? container.decode(String.self, forKey: .cacheEpochSource)
+        previousInputTokens = (try? container.decode(Int.self, forKey: .previousInputTokens)) ?? 0
+    }
+}
+
+/// One cache epoch in the bounded session timeline.
+struct SessionCacheEpochBucket: Codable, Sendable, Identifiable, Equatable {
+    var id: String {
+        epoch
+    }
+
+    let epoch: String
+    let source: String?
+    let calls: Int
+    let firstAt: String
+    let lastAt: String
+    let inputTokens: Int
+    let cacheReadTokens: Int
+    let cacheMissTokens: Int
+    let hitRatio: Double
+    let appendOnlyBreaks: Int
+
+    enum CodingKeys: String, CodingKey {
+        case epoch
+        case source
+        case calls
+        case firstAt = "first_at"
+        case lastAt = "last_at"
+        case inputTokens = "input_tokens"
+        case cacheReadTokens = "cache_read_tokens"
+        case cacheMissTokens = "cache_miss_tokens"
+        case hitRatio = "hit_ratio"
+        case appendOnlyBreaks = "append_only_breaks"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        epoch = (try? container.decode(String.self, forKey: .epoch)) ?? ""
+        source = try? container.decode(String.self, forKey: .source)
+        calls = (try? container.decode(Int.self, forKey: .calls)) ?? 0
+        firstAt = (try? container.decode(String.self, forKey: .firstAt)) ?? ""
+        lastAt = (try? container.decode(String.self, forKey: .lastAt)) ?? ""
+        inputTokens = (try? container.decode(Int.self, forKey: .inputTokens)) ?? 0
+        cacheReadTokens = (try? container.decode(Int.self, forKey: .cacheReadTokens)) ?? 0
+        cacheMissTokens = (try? container.decode(Int.self, forKey: .cacheMissTokens)) ?? 0
+        hitRatio = (try? container.decode(Double.self, forKey: .hitRatio)) ?? 0
+        appendOnlyBreaks = (try? container.decode(Int.self, forKey: .appendOnlyBreaks)) ?? 0
+    }
+}
+
+/// Per-role cache accounting from `session.cache`.
+struct SessionCacheRoleBucket: Codable, Sendable, Identifiable, Equatable {
+    var id: String {
+        role
+    }
+
+    let role: String
+    let calls: Int
+    let inputTokens: Int
+    let cacheReadTokens: Int
+    let cacheMissTokens: Int
+    let hitRatio: Double
+    let theoreticalMaxHitRatio: Double
+    let costUSD: Double
+
+    enum CodingKeys: String, CodingKey {
+        case role
+        case calls
+        case inputTokens = "input_tokens"
+        case cacheReadTokens = "cache_read_tokens"
+        case cacheMissTokens = "cache_miss_tokens"
+        case hitRatio = "hit_ratio"
+        case theoreticalMaxHitRatio = "theoretical_max_hit_ratio"
+        case costUSD = "cost_usd"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        role = (try? container.decode(String.self, forKey: .role)) ?? ""
+        calls = (try? container.decode(Int.self, forKey: .calls)) ?? 0
+        inputTokens = (try? container.decode(Int.self, forKey: .inputTokens)) ?? 0
+        cacheReadTokens = (try? container.decode(Int.self, forKey: .cacheReadTokens)) ?? 0
+        cacheMissTokens = (try? container.decode(Int.self, forKey: .cacheMissTokens)) ?? 0
+        hitRatio = (try? container.decode(Double.self, forKey: .hitRatio)) ?? 0
+        theoreticalMaxHitRatio = (try? container.decode(Double.self, forKey: .theoreticalMaxHitRatio)) ?? 0
+        costUSD = (try? container.decode(Double.self, forKey: .costUSD)) ?? 0
+    }
+}
+
+/// Miss-reason count bucket. Unknown keys stay visible.
+struct SessionCacheCountBucket: Codable, Sendable, Identifiable, Equatable {
+    var id: String {
+        key
+    }
+
+    let key: String
+    let calls: Int
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        key = (try? container.decode(String.self, forKey: .key)) ?? ""
+        calls = (try? container.decode(Int.self, forKey: .calls)) ?? 0
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case key
+        case calls
+    }
+}
+
+/// Bounded newest-first per-call cache table from `session.cache.calls`.
+struct SessionCacheCallsResult: Codable, Sendable, Equatable {
+    let sessionID: String
+    let calls: [SessionCacheCall]
+    let observed: Int
+    let returned: Int
+    let truncated: Bool
+    let limit: Int
+    let role: String?
+    let missReason: String?
+    let includeWarm: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case calls
+        case observed
+        case returned
+        case truncated
+        case limit
+        case role
+        case missReason = "miss_reason"
+        case includeWarm = "include_warm"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = (try? container.decode(String.self, forKey: .sessionID)) ?? ""
+        calls = (try? container.decode([SessionCacheCall].self, forKey: .calls)) ?? []
+        observed = (try? container.decode(Int.self, forKey: .observed)) ?? 0
+        returned = (try? container.decode(Int.self, forKey: .returned)) ?? calls.count
+        truncated = (try? container.decode(Bool.self, forKey: .truncated)) ?? false
+        limit = (try? container.decode(Int.self, forKey: .limit)) ?? 0
+        role = try? container.decode(String.self, forKey: .role)
+        missReason = try? container.decode(String.self, forKey: .missReason)
+        includeWarm = (try? container.decode(Bool.self, forKey: .includeWarm)) ?? false
     }
 }
 

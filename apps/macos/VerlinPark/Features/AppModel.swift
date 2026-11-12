@@ -89,6 +89,8 @@ final class AppModel {
     var usageLedger: UsageLedgerResult?
     var usageStatus: String?
     var sessionCacheStatus: SessionCacheStatus?
+    var sessionCacheCalls: [SessionCacheCall] = []
+    var sessionCacheCallsTruncated = false
     var sessionInstructions: SessionInstructionsReport?
     var governorStatus: GovernorSessionStatus?
     var governorStatusMessage: String?
@@ -715,6 +717,24 @@ final class AppModel {
         sessions.first { $0.id == selectedSessionID }
     }
 
+    /// The model the daemon will actually use for the session Leader.
+    ///
+    /// This is `agent.info.role_models.leader.model` when a role override is
+    /// configured, otherwise `agent.info.model`. It deliberately never falls
+    /// back to the local `providerModel` UserDefaults value: that value can be
+    /// stale after a daemon restart or a settings edit and must not be shown as
+    /// the live run's model.
+    var daemonModelLabel: String? {
+        agentInfo?.configuredModelLabel
+    }
+
+    var daemonModelSource: String? {
+        guard let info = agentInfo, info.configured else { return nil }
+        let leader = info.roleModels.leader.model?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return leader.isEmpty ? "agent.info.model" : "agent.info.role_models.leader"
+    }
+
     /// Dashboard/popover view of the selected run, assembled from real RPC
     /// results. `session.cache` is optional until the daemon ships it.
     var efficiencySnapshot: EfficiencySnapshot? {
@@ -727,6 +747,16 @@ final class AppModel {
             eventTypes: events.map(\.type),
             latestPrefixHash: latestPromptPrefixHash
         )
+    }
+
+    /// Per-call table rows. The dedicated `session.cache.calls` RPC is newest
+    /// first and filterable; older daemons fall back to the bounded list on
+    /// `session.cache`.
+    var cacheCallRows: [SessionCacheCall] {
+        if !sessionCacheCalls.isEmpty {
+            return sessionCacheCalls
+        }
+        return sessionCacheStatus?.recentCalls ?? []
     }
 
     var latestPromptPrefixHash: String? {
@@ -775,6 +805,8 @@ final class AppModel {
         efficiencyRefreshTask?.cancel()
         toolActivityRefreshTask?.cancel()
         sessionCacheStatus = nil
+        sessionCacheCalls = []
+        sessionCacheCallsTruncated = false
         sessionInstructions = nil
         governorStatus = nil
         governorStatusMessage = nil
@@ -3785,6 +3817,17 @@ final class AppModel {
                 efficiencyStatus =
                     "session.cache is unavailable; cache values are derived from session.usage."
             }
+        }
+
+        do {
+            let calls = try await core.sessionCacheCalls(sessionID: sessionID, limit: 20)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            sessionCacheCalls = calls.calls
+            sessionCacheCallsTruncated = calls.truncated
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            sessionCacheCalls = []
+            sessionCacheCallsTruncated = false
         }
 
         do {

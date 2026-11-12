@@ -259,6 +259,239 @@ final class EfficiencyDashboardTests: XCTestCase {
         XCTAssertEqual(call.cacheBreakpoints, 0)
         XCTAssertFalse(call.warm)
         XCTAssertNil(call.missReason)
+        XCTAssertEqual(call.cacheMissTokens, 0)
+        XCTAssertEqual(call.theoreticalMaxHitRatio, 0)
+        XCTAssertNil(call.appendOnly)
+        XCTAssertNil(call.cacheEpoch)
+    }
+
+    func testSessionCacheL5FieldsDecodeOnStatusAndCall() throws {
+        let json = """
+        {
+          "session_id": "session-1",
+          "input_tokens": 200000,
+          "cache_read_tokens": 199000,
+          "cache_miss_tokens": 1000,
+          "cache_hit_ratio": 0.995,
+          "theoretical_max_hit_ratio": 0.997,
+          "cache_epoch": "epoch-abc",
+          "cache_epoch_source": "prompt_prefix_v3",
+          "append_only_calls": 49,
+          "append_only_breaks": 0,
+          "last_append_only": true,
+          "hit_ratio_p50": 0.996,
+          "hit_ratio_p95": 0.999,
+          "theoretical_max_p50": 0.997,
+          "theoretical_max_p95": 0.999,
+          "cost_usd": 0.12,
+          "cache_epoch_timeline": [{
+            "epoch": "epoch-abc",
+            "source": "prompt_prefix_v3",
+            "calls": 50,
+            "first_at": "a",
+            "last_at": "b",
+            "input_tokens": 1000,
+            "cache_read_tokens": 900,
+            "cache_miss_tokens": 100,
+            "hit_ratio": 0.9,
+            "append_only_breaks": 0
+          }],
+          "per_role": [{
+            "role": "leader",
+            "calls": 50,
+            "input_tokens": 200000,
+            "cache_read_tokens": 199000,
+            "cache_miss_tokens": 1000,
+            "hit_ratio": 0.995,
+            "theoretical_max_hit_ratio": 0.997,
+            "cost_usd": 0.12
+          }],
+          "top_miss_reasons": [{"key": "tail_delta", "calls": 49}],
+          "cross_session_reuse_sessions": 2,
+          "cross_session_hit_tokens": 4000,
+          "cross_session_calls_observed": 8,
+          "compaction_lost_cache_usd": 0.003,
+          "recent_calls": [{
+            "at": "now",
+            "agent_role": "leader",
+            "input_tokens": 200000,
+            "cache_read_tokens": 199000,
+            "cache_miss_tokens": 1000,
+            "cache_hit_ratio": 0.995,
+            "theoretical_max_hit_ratio": 0.997,
+            "message_prefix_hash": "message",
+            "previous_message_prefix_hash": "previous",
+            "message_prefix_count": 12,
+            "previous_message_prefix_count": 10,
+            "append_only": true,
+            "cache_epoch": "epoch-abc",
+            "cache_epoch_source": "prompt_prefix_v3",
+            "previous_input_tokens": 198000,
+            "tool_bundle": "leader",
+            "tool_bundle_hash": "bundle",
+            "miss_reason": "tail_delta"
+          }]
+        }
+        """
+        let status = try JSONDecoder().decode(SessionCacheStatus.self, from: Data(json.utf8))
+        XCTAssertEqual(status.cacheMissTokens, 1000)
+        XCTAssertEqual(status.theoreticalMaxHitRatio ?? 0, 0.997, accuracy: 0.0001)
+        XCTAssertEqual(status.cacheEpoch, "epoch-abc")
+        XCTAssertEqual(status.cacheEpochSource, "prompt_prefix_v3")
+        XCTAssertEqual(status.appendOnlyCalls, 49)
+        XCTAssertEqual(status.appendOnlyBreaks, 0)
+        XCTAssertEqual(status.lastAppendOnly, true)
+        XCTAssertEqual(status.hitRatioP50 ?? 0, 0.996, accuracy: 0.0001)
+        XCTAssertEqual(status.cacheEpochTimeline.count, 1)
+        XCTAssertEqual(status.cacheEpochTimeline[0].epoch, "epoch-abc")
+        XCTAssertEqual(status.perRole.count, 1)
+        XCTAssertEqual(status.perRole[0].role, "leader")
+        XCTAssertEqual(status.topMissReasons[0].key, "tail_delta")
+        XCTAssertEqual(status.crossSessionReuseSessions, 2)
+        XCTAssertEqual(status.compactionLostCacheUSD ?? 0, 0.003, accuracy: 0.000001)
+        XCTAssertEqual(status.recentCalls.count, 1)
+        let call = status.recentCalls[0]
+        XCTAssertEqual(call.cacheMissTokens, 1000)
+        XCTAssertEqual(call.theoreticalMaxHitRatio, 0.997, accuracy: 0.0001)
+        XCTAssertEqual(call.appendOnly, true)
+        XCTAssertEqual(call.cacheEpoch, "epoch-abc")
+        XCTAssertEqual(call.messagePrefixCount, 12)
+        XCTAssertEqual(call.previousMessagePrefixCount, 10)
+        XCTAssertEqual(call.toolBundle, "leader")
+    }
+
+    func testSnapshotCarriesL5CachePanelFields() throws {
+        let cache = try JSONDecoder().decode(
+            SessionCacheStatus.self,
+            from: Data(
+                #"{"session_id":"session-1","input_tokens":1000,"cache_read_tokens":900,"cache_miss_tokens":100,"cache_hit_ratio":0.9,"theoretical_max_hit_ratio":0.95,"last_append_only":true,"append_only_calls":3,"append_only_breaks":0,"hit_ratio_p50":0.9,"hit_ratio_p95":0.95,"cost_usd":0.02,"cross_session_reuse_sessions":2,"cross_session_hit_tokens":500,"compaction_lost_cache_usd":0.001,"top_miss_reasons":[{"key":"tail_delta","calls":3}],"per_role":[{"role":"leader","calls":3,"hit_ratio":0.9,"cache_miss_tokens":100,"cost_usd":0.02}],"cache_epoch":"epoch","cache_epoch_source":"prompt_prefix_v3"}"#
+                    .utf8
+            )
+        )
+        let snapshot = EfficiencyMetrics.makeSnapshot(
+            projectUsage: nil,
+            usage: nil,
+            context: nil,
+            cache: cache,
+            toolOutputs: nil,
+            eventTypes: [],
+            latestPrefixHash: nil
+        )
+        XCTAssertEqual(snapshot?.cacheMissTokens, 100)
+        XCTAssertEqual(snapshot?.resolvedCacheMissTokens, 100)
+        XCTAssertEqual(snapshot?.theoreticalMaxHitRatio ?? 0, 0.95, accuracy: 0.0001)
+        XCTAssertEqual(snapshot?.appendOnlyCalls, 3)
+        XCTAssertEqual(snapshot?.appendOnlyBreaks, 0)
+        XCTAssertEqual(snapshot?.lastAppendOnly, true)
+        XCTAssertEqual(snapshot?.cacheEpoch, "epoch")
+        XCTAssertEqual(snapshot?.topMissReasons.first?.key, "tail_delta")
+        XCTAssertEqual(snapshot?.perRole.first?.role, "leader")
+        XCTAssertEqual(snapshot?.crossSessionReuseSessions, 2)
+        XCTAssertEqual(snapshot?.compactionLostCacheUSD ?? 0, 0.001, accuracy: 0.000001)
+        XCTAssertEqual(snapshot?.cacheHeadroomGap ?? 0, 0.05, accuracy: 0.0001)
+        XCTAssertEqual(snapshot?.appendOnlyKnownCalls, 3)
+    }
+
+    func testAgentInfoLeaderModelLabelUsesDaemonRoleOverride() throws {
+        let json = """
+        {
+          "configured": true,
+          "provider": "deepseek",
+          "model": "deepseek-chat",
+          "base_url": "https://api.deepseek.com",
+          "role_models": {
+            "leader": {"model": "deepseek-flash"},
+            "manager": {},
+            "worker": {},
+            "verifier": {},
+            "labour": {}
+          }
+        }
+        """
+        let info = try JSONDecoder().decode(AgentInfo.self, from: Data(json.utf8))
+        XCTAssertEqual(info.leaderModelLabel, "deepseek-flash")
+        XCTAssertEqual(info.configuredModelLabel, "deepseek-flash")
+
+        let base = try JSONDecoder().decode(
+            AgentInfo.self,
+            from: Data(
+                #"{"configured":true,"model":"deepseek-chat","role_models":{"leader":{},"manager":{},"worker":{},"verifier":{},"labour":{}}}"#
+                    .utf8
+            )
+        )
+        XCTAssertEqual(base.leaderModelLabel, "deepseek-chat")
+        XCTAssertEqual(base.configuredModelLabel, "deepseek-chat")
+        let unconfigured = try JSONDecoder().decode(
+            AgentInfo.self,
+            from: Data(
+                #"{"configured":false,"model":"stale-local","role_models":{"leader":{},"manager":{},"worker":{},"verifier":{},"labour":{}}}"#
+                    .utf8
+            )
+        )
+        XCTAssertNil(unconfigured.configuredModelLabel)
+    }
+
+    func testCacheEpochTimelineDecodesLegacyFieldsAndUnknownSource() throws {
+        let json = """
+        {
+          "session_id": "session-1",
+          "cache_epoch_timeline": [
+            {"epoch": "old", "calls": 2},
+            {"epoch": "new", "source": "future_source", "calls": 3, "hit_ratio": 0.99, "append_only_breaks": 1}
+          ]
+        }
+        """
+        let status = try JSONDecoder().decode(SessionCacheStatus.self, from: Data(json.utf8))
+        XCTAssertEqual(status.cacheEpochTimeline.count, 2)
+        XCTAssertEqual(status.cacheEpochTimeline[0].epoch, "old")
+        XCTAssertEqual(status.cacheEpochTimeline[0].calls, 2)
+        XCTAssertNil(status.cacheEpochTimeline[0].source)
+        XCTAssertEqual(status.cacheEpochTimeline[1].source, "future_source")
+        XCTAssertEqual(status.cacheEpochTimeline[1].hitRatio, 0.99, accuracy: 0.0001)
+        XCTAssertEqual(status.cacheEpochTimeline[1].appendOnlyBreaks, 1)
+    }
+
+    func testSessionCacheCallsResultDecodesBoundedTable() throws {
+        let json = """
+        {
+          "session_id": "session-1",
+          "observed": 42,
+          "returned": 2,
+          "truncated": true,
+          "limit": 2,
+          "role": "leader",
+          "miss_reason": null,
+          "include_warm": false,
+          "calls": [
+            {"at": "two", "input_tokens": 200, "cache_read_tokens": 190, "cache_miss_tokens": 10, "cache_hit_ratio": 0.95, "theoretical_max_hit_ratio": 0.96, "append_only": true, "miss_reason": "tail_delta"},
+            {"at": "one", "input_tokens": 100, "cache_read_tokens": 90, "cache_miss_tokens": 10, "cache_hit_ratio": 0.9, "append_only": false, "miss_reason": "first_call"}
+          ]
+        }
+        """
+        let result = try JSONDecoder().decode(SessionCacheCallsResult.self, from: Data(json.utf8))
+        XCTAssertEqual(result.sessionID, "session-1")
+        XCTAssertEqual(result.observed, 42)
+        XCTAssertEqual(result.returned, 2)
+        XCTAssertTrue(result.truncated)
+        XCTAssertEqual(result.limit, 2)
+        XCTAssertEqual(result.role, "leader")
+        XCTAssertEqual(result.calls.count, 2)
+        XCTAssertEqual(result.calls[0].appendOnly, true)
+        XCTAssertEqual(result.calls[1].appendOnly, false)
+
+        let legacy = try JSONDecoder().decode(
+            SessionCacheCallsResult.self,
+            from: Data(#"{"session_id":"session-1"}"#.utf8)
+        )
+        XCTAssertEqual(legacy.returned, 0)
+        XCTAssertFalse(legacy.truncated)
+        XCTAssertTrue(legacy.calls.isEmpty)
+    }
+
+    func testMissReasonLabelsCoverTailDeltaAndProviderMiss() {
+        XCTAssertEqual(EfficiencyMetrics.missReasonLabel("tail_delta"), "new tail")
+        XCTAssertEqual(EfficiencyMetrics.missReasonLabel("provider_cache_miss"), "provider miss")
+        XCTAssertEqual(EfficiencyMetrics.missReasonLabel("ttl_or_provider_miss"), "TTL or provider miss")
     }
 
     func testSnapshotCarriesSavingsTtlBreakpointsAndMissReason() throws {

@@ -16,8 +16,15 @@ struct EfficiencyCard: View {
             header
             if let snapshot {
                 ratioRow(snapshot)
+                cacheContinuityRow(snapshot)
                 cachePlanRow(snapshot)
+                cacheBreakdownRows(snapshot)
                 recentCacheRows(snapshot)
+                CacheCallTable(
+                    calls: model.cacheCallRows,
+                    truncated: model.sessionCacheCallsTruncated
+                )
+                CacheEpochTimelineView(epochs: snapshot.cacheEpochTimeline)
                 tokenRow(snapshot)
                 costRow(snapshot)
                 governorRow(snapshot)
@@ -111,6 +118,154 @@ struct EfficiencyCard: View {
         }
     }
 
+    /// Miss tokens, theoretical maximum, append-only continuity, epoch, and
+    /// latency percentiles. Every value comes from `session.cache`; absent
+    /// fields are shown as unavailable rather than replaced with a guess.
+    @ViewBuilder
+    private func cacheContinuityRow(_ snapshot: EfficiencySnapshot) -> some View {
+        if snapshot.resolvedCacheMissTokens != nil
+            || snapshot.theoreticalMaxHitRatio != nil
+            || snapshot.cacheEpoch != nil
+            || snapshot.appendOnlyCalls != nil
+        {
+            HStack(spacing: 10) {
+                metric(
+                    "Cache miss",
+                    EfficiencyMetrics.tokenLabel(snapshot.resolvedCacheMissTokens),
+                    detail: "uncached prompt tokens"
+                )
+                metric(
+                    "Theoretical max",
+                    EfficiencyMetrics.percent(snapshot.theoreticalMaxHitRatio),
+                    detail: "previous prompt / current input"
+                )
+                metric(
+                    "Append-only",
+                    appendOnlyLabel(snapshot),
+                    detail: appendOnlyDetail(snapshot)
+                )
+                metric(
+                    "Cache epoch",
+                    EfficiencyMetrics.shortHash(snapshot.cacheEpoch) ?? "—",
+                    detail: snapshot.cacheEpochSource ?? "no epoch telemetry"
+                )
+            }
+            if let p50 = snapshot.hitRatioP50, let p95 = snapshot.hitRatioP95 {
+                HStack(spacing: 10) {
+                    metric(
+                        "Per-call p50 / p95",
+                        "\(EfficiencyMetrics.percent(p50)) / \(EfficiencyMetrics.percent(p95))",
+                        detail: "nearest-rank over observed provider calls"
+                    )
+                    metric(
+                        "Theoretical p50",
+                        EfficiencyMetrics.percent(snapshot.theoreticalMaxP50),
+                        detail: "append-only headroom, not a provider promise"
+                    )
+                    if let gap = snapshot.cacheHeadroomGap {
+                        metric(
+                            "Headroom gap",
+                            String(format: "%.1f pts", gap * 100),
+                            detail: gap > 0.05 ? "inspect tail/provider eviction" : "within the expected tail"
+                        )
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
+        }
+    }
+
+    /// Top miss reasons, per-role accounting, cross-session reuse, and the
+    /// compaction-invalidated cache savings.
+    @ViewBuilder
+    private func cacheBreakdownRows(_ snapshot: EfficiencySnapshot) -> some View {
+        if !snapshot.topMissReasons.isEmpty
+            || !snapshot.perRole.isEmpty
+            || snapshot.crossSessionReuseSessions != nil
+            || snapshot.compactionLostCacheUSD != nil
+        {
+            VStack(alignment: .leading, spacing: 6) {
+                if !snapshot.topMissReasons.isEmpty {
+                    HStack(spacing: 8) {
+                        Text("TOP MISS REASONS")
+                            .font(VPTheme.mono(8, weight: .semibold))
+                            .foregroundStyle(VPTheme.textTertiary)
+                        ForEach(snapshot.topMissReasons.prefix(5)) { reason in
+                            Text("\(EfficiencyMetrics.missReasonLabel(reason.key)) ×\(reason.calls)")
+                                .font(VPTheme.mono(8))
+                                .foregroundStyle(reason.key == "provider_cache_miss"
+                                    ? VPTheme.warning : VPTheme.textSecondary)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                }
+                if !snapshot.perRole.isEmpty {
+                    ForEach(Array(snapshot.perRole.prefix(4))) { role in
+                        HStack(spacing: 8) {
+                            Text(role.role.uppercased())
+                                .font(VPTheme.mono(8, weight: .semibold))
+                                .foregroundStyle(VPTheme.textSecondary)
+                                .frame(width: 78, alignment: .leading)
+                            Text("\(EfficiencyMetrics.percent(role.hitRatio)) hit")
+                                .font(VPTheme.mono(8))
+                                .monospacedDigit()
+                            Text("miss \(EfficiencyMetrics.tokenLabel(role.cacheMissTokens))")
+                                .font(VPTheme.mono(8))
+                                .foregroundStyle(VPTheme.textTertiary)
+                            Text("\(role.calls) calls")
+                                .font(VPTheme.mono(8))
+                                .foregroundStyle(VPTheme.textTertiary)
+                            Spacer(minLength: 0)
+                            Text(EfficiencyMetrics.usd(role.costUSD))
+                                .font(VPTheme.mono(8))
+                                .monospacedDigit()
+                                .foregroundStyle(VPTheme.textTertiary)
+                        }
+                    }
+                }
+                HStack(spacing: 10) {
+                    metric(
+                        "Cross-session",
+                        "\(snapshot.crossSessionReuseSessions ?? 0)",
+                        detail: "\(EfficiencyMetrics.tokenLabel(snapshot.crossSessionHitTokens)) hit tokens observed"
+                    )
+                    metric(
+                        "Lost to compaction",
+                        EfficiencyMetrics.usd(snapshot.compactionLostCacheUSD),
+                        detail: "estimated invalidated cache-read savings"
+                    )
+                    if !snapshot.cacheEpochTimeline.isEmpty {
+                        metric(
+                            "Epoch timeline",
+                            "\(snapshot.cacheEpochTimeline.count)",
+                            detail: "bounded, newest last"
+                        )
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
+            .padding(8)
+            .background(VPTheme.surfaceRaised.opacity(0.45), in: RoundedRectangle(cornerRadius: 9))
+        }
+    }
+
+    private func appendOnlyLabel(_ snapshot: EfficiencySnapshot) -> String {
+        guard let last = snapshot.lastAppendOnly else {
+            guard let known = snapshot.appendOnlyKnownCalls, known > 0 else { return "—" }
+            return "\(snapshot.appendOnlyCalls ?? 0)/\(known)"
+        }
+        return last ? "yes" : "no"
+    }
+
+    private func appendOnlyDetail(_ snapshot: EfficiencySnapshot) -> String {
+        let calls = snapshot.appendOnlyCalls ?? 0
+        let breaks = snapshot.appendOnlyBreaks ?? 0
+        if calls == 0, breaks == 0 {
+            return "no continuity telemetry"
+        }
+        return "\(calls) append-only · \(breaks) break\(breaks == 1 ? "" : "s")"
+    }
+
     @ViewBuilder
     private func cachePlanRow(_ snapshot: EfficiencySnapshot) -> some View {
         if snapshot.estimatedSavingsUSD != nil
@@ -176,9 +331,19 @@ struct EfficiencyCard: View {
                                     ? VPTheme.warning
                                     : VPTheme.success
                             )
-                        Text("read \(EfficiencyMetrics.tokenLabel(call.cacheReadTokens))")
+                        Text(
+                            "read \(EfficiencyMetrics.tokenLabel(call.cacheReadTokens)) · miss \(EfficiencyMetrics.tokenLabel(call.cacheMissTokens))"
+                        )
+                        .font(VPTheme.mono(8))
+                        .foregroundStyle(VPTheme.textTertiary)
+                        Text("max \(EfficiencyMetrics.percent(call.theoreticalMaxHitRatio))")
                             .font(VPTheme.mono(8))
                             .foregroundStyle(VPTheme.textTertiary)
+                        if let appendOnly = call.appendOnly {
+                            Text(appendOnly ? "append" : "break")
+                                .font(VPTheme.mono(8, weight: .semibold))
+                                .foregroundStyle(appendOnly ? VPTheme.success : VPTheme.warning)
+                        }
                         if call.warm {
                             Text("warm")
                                 .font(VPTheme.mono(8, weight: .semibold))
@@ -613,6 +778,322 @@ struct CacheHitPill: View {
             Capsule().strokeBorder(tint.opacity(0.24), lineWidth: 1)
         }
         .help("Share of provider input served from cache. Cache reads are still billed.")
+    }
+}
+
+/// Bounded newest-first per-call cache table. It uses the dedicated
+/// `session.cache.calls` RPC when available and falls back to the `session.cache`
+/// recent-call list on older daemons. No prompt text is present.
+struct CacheCallTable: View {
+    let calls: [SessionCacheCall]
+    let truncated: Bool
+
+    var body: some View {
+        if !calls.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Text("PER-CALL CACHE TABLE")
+                        .font(VPTheme.mono(8, weight: .semibold))
+                        .foregroundStyle(VPTheme.textTertiary)
+                    Text("\(calls.count) newest")
+                        .font(VPTheme.mono(7))
+                        .foregroundStyle(VPTheme.textTertiary)
+                    if truncated {
+                        Text("older rows truncated")
+                            .font(VPTheme.mono(7))
+                            .foregroundStyle(VPTheme.warning)
+                    }
+                    Spacer(minLength: 0)
+                }
+                Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 3) {
+                    GridRow {
+                        header("ROLE")
+                        header("INPUT")
+                        header("READ")
+                        header("MISS")
+                        header("HIT")
+                        header("MAX")
+                        header("APPEND")
+                        header("REASON")
+                        header("TTL")
+                        header("FTL")
+                    }
+                    ForEach(calls.prefix(10)) { call in
+                        GridRow {
+                            cell(call.role?.uppercased() ?? "AGENT", weight: .semibold)
+                            cell(EfficiencyMetrics.tokenLabel(call.inputTokens))
+                            cell(EfficiencyMetrics.tokenLabel(call.cacheReadTokens))
+                            cell(EfficiencyMetrics.tokenLabel(call.cacheMissTokens))
+                            cell(
+                                EfficiencyMetrics.percent(call.cacheHitRatio),
+                                tint: EfficiencyMetrics.isLowCacheHitRatio(call.cacheHitRatio)
+                                    ? VPTheme.warning : VPTheme.textPrimary
+                            )
+                            cell(EfficiencyMetrics.percent(call.theoreticalMaxHitRatio))
+                            cell(
+                                call.appendOnly == nil
+                                    ? "n/a" : (call.appendOnly == true ? "yes" : "break"),
+                                tint: call.appendOnly == false ? VPTheme.warning : VPTheme.textSecondary
+                            )
+                            cell(EfficiencyMetrics.missReasonLabel(call.missReason ?? "—"))
+                            cell(call.cacheTTL ?? "—")
+                            cell(call.firstTokenMS.map { "\($0) ms" } ?? "—")
+                        }
+                    }
+                }
+                if calls.count > 10 {
+                    Text("+\(calls.count - 10) more rows")
+                        .font(VPTheme.mono(7))
+                        .foregroundStyle(VPTheme.textTertiary)
+                }
+            }
+            .padding(8)
+            .background(VPTheme.surfaceRaised.opacity(0.35), in: RoundedRectangle(cornerRadius: 9))
+        }
+    }
+
+    private func header(_ title: String) -> some View {
+        Text(title)
+            .font(VPTheme.mono(7, weight: .semibold))
+            .foregroundStyle(VPTheme.textTertiary)
+    }
+
+    private func cell(_ value: String, tint: Color = VPTheme.textSecondary,
+                      weight: Font.Weight = .regular) -> some View
+    {
+        Text(value)
+            .font(VPTheme.mono(7, weight: weight))
+            .monospacedDigit()
+            .foregroundStyle(tint)
+            .lineLimit(1)
+    }
+}
+
+/// Bounded cache-epoch timeline. The daemon emits newest-last, so the oldest
+/// entry is first and a new epoch is visually an appended row. Repeated
+/// epochs are possible when a provider evicts a prefix; the row is evidence,
+/// not a diagnosis.
+struct CacheEpochTimelineView: View {
+    let epochs: [SessionCacheEpochBucket]
+
+    var body: some View {
+        if !epochs.isEmpty {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 8) {
+                    Text("CACHE EPOCH TIMELINE")
+                        .font(VPTheme.mono(8, weight: .semibold))
+                        .foregroundStyle(VPTheme.textTertiary)
+                    Text("\(epochs.count) observed · newest last")
+                        .font(VPTheme.mono(7))
+                        .foregroundStyle(VPTheme.textTertiary)
+                    Spacer(minLength: 0)
+                }
+                ForEach(epochs) { epoch in
+                    HStack(spacing: 8) {
+                        Text(EfficiencyMetrics.shortHash(epoch.epoch, length: 8) ?? "—")
+                            .font(VPTheme.mono(8, weight: .semibold))
+                            .foregroundStyle(VPTheme.textSecondary)
+                            .frame(width: 70, alignment: .leading)
+                        Text(epoch.source ?? "unknown source")
+                            .font(VPTheme.mono(7))
+                            .foregroundStyle(VPTheme.textTertiary)
+                            .frame(width: 110, alignment: .leading)
+                        Text("\(epoch.calls) calls")
+                            .font(VPTheme.mono(7))
+                            .foregroundStyle(VPTheme.textTertiary)
+                        Text(EfficiencyMetrics.percent(epoch.hitRatio))
+                            .font(VPTheme.mono(7, weight: .semibold))
+                            .monospacedDigit()
+                            .foregroundStyle(EfficiencyMetrics.isLowCacheHitRatio(epoch.hitRatio)
+                                ? VPTheme.warning : VPTheme.textSecondary)
+                        Text("miss \(EfficiencyMetrics.tokenLabel(epoch.cacheMissTokens))")
+                            .font(VPTheme.mono(7))
+                            .foregroundStyle(VPTheme.textTertiary)
+                        if epoch.appendOnlyBreaks > 0 {
+                            Text("\(epoch.appendOnlyBreaks) break\(epoch.appendOnlyBreaks == 1 ? "" : "s")")
+                                .font(VPTheme.mono(7, weight: .semibold))
+                                .foregroundStyle(VPTheme.warning)
+                        }
+                        Spacer(minLength: 0)
+                        Text(epoch.lastAt)
+                            .font(VPTheme.mono(6))
+                            .foregroundStyle(VPTheme.textTertiary)
+                    }
+                }
+            }
+            .padding(8)
+            .background(VPTheme.surfaceRaised.opacity(0.35), in: RoundedRectangle(cornerRadius: 9))
+        }
+    }
+}
+
+/// Full cache panel for the Stage context popover. It is intentionally
+/// read-only and derives every displayed value from the daemon snapshot.
+struct CacheTelemetryPanel: View {
+    let snapshot: EfficiencySnapshot
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 8) {
+                CacheHitPill(ratio: snapshot.cacheHitRatio)
+                if let theoretical = snapshot.theoreticalMaxHitRatio {
+                    tag(
+                        "max \(EfficiencyMetrics.percent(theoretical))",
+                        tint: VPTheme.textSecondary,
+                        help: "Theoretical maximum from the previous prompt size. Not a provider guarantee."
+                    )
+                }
+                if let appendOnly = snapshot.lastAppendOnly {
+                    tag(
+                        appendOnly ? "append-only" : "prefix break",
+                        tint: appendOnly ? VPTheme.success : VPTheme.warning,
+                        help: appendOnly
+                            ? "The previous canonical message list is an exact prefix of this call."
+                            : "The previous canonical message list was not an exact prefix. Inspect the audit."
+                    )
+                }
+                if let epoch = EfficiencyMetrics.shortHash(snapshot.cacheEpoch) {
+                    tag(
+                        "epoch \(epoch)",
+                        tint: VPTheme.textTertiary,
+                        help: snapshot.cacheEpochSource ?? "cache epoch"
+                    )
+                }
+                Spacer(minLength: 0)
+                if let ttl = snapshot.lastCacheTTL {
+                    tag("ttl \(ttl)", tint: VPTheme.textTertiary, help: "Configured provider cache TTL.")
+                }
+                if let breakpoints = snapshot.lastBreakpoints {
+                    tag(
+                        "\(breakpoints) bp",
+                        tint: VPTheme.textTertiary,
+                        help: "Explicit provider breakpoints."
+                    )
+                }
+                if let savings = snapshot.estimatedSavingsUSD {
+                    tag(
+                        "saved \(EfficiencyMetrics.usd(savings))",
+                        tint: savings < 0 ? VPTheme.warning : VPTheme.textSecondary,
+                        help: "Estimated from configured prices; cache reads are still billed."
+                    )
+                }
+            }
+            HStack(spacing: 14) {
+                stat("read", EfficiencyMetrics.tokenLabel(snapshot.cacheReadTokens))
+                stat("miss", EfficiencyMetrics.tokenLabel(snapshot.resolvedCacheMissTokens))
+                stat("p50", EfficiencyMetrics.percent(snapshot.hitRatioP50))
+                stat("p95", EfficiencyMetrics.percent(snapshot.hitRatioP95))
+                stat("cost", EfficiencyMetrics.usd(snapshot.costUSD, digits: 3))
+                stat(
+                    "reuse",
+                    "\(snapshot.crossSessionReuseSessions ?? 0) sess",
+                    detail: "\(EfficiencyMetrics.tokenLabel(snapshot.crossSessionHitTokens)) hit"
+                )
+                stat(
+                    "lost",
+                    EfficiencyMetrics.usd(snapshot.compactionLostCacheUSD),
+                    detail: "compaction"
+                )
+                Spacer(minLength: 0)
+            }
+            if !snapshot.topMissReasons.isEmpty {
+                HStack(spacing: 6) {
+                    Text("miss reasons")
+                        .font(VPTheme.mono(7, weight: .semibold))
+                        .foregroundStyle(VPTheme.textTertiary)
+                    ForEach(snapshot.topMissReasons.prefix(5)) { reason in
+                        Text("\(EfficiencyMetrics.missReasonLabel(reason.key)) ×\(reason.calls)")
+                            .font(VPTheme.mono(7))
+                            .foregroundStyle(reason.key == "provider_cache_miss"
+                                ? VPTheme.warning : VPTheme.textTertiary)
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
+            if !snapshot.perRole.isEmpty {
+                HStack(spacing: 10) {
+                    ForEach(snapshot.perRole.prefix(4)) { role in
+                        Text(
+                            "\(role.role) \(EfficiencyMetrics.percent(role.hitRatio)) · miss \(EfficiencyMetrics.tokenLabel(role.cacheMissTokens)) · \(EfficiencyMetrics.usd(role.costUSD, digits: 3))"
+                        )
+                        .font(VPTheme.mono(7))
+                        .foregroundStyle(VPTheme.textTertiary)
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
+            if !snapshot.recentCacheCalls.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(Array(snapshot.recentCacheCalls.prefix(3))) { call in
+                        HStack(spacing: 6) {
+                            Text(call.role?.uppercased() ?? "AGENT")
+                                .font(VPTheme.mono(7, weight: .semibold))
+                                .foregroundStyle(VPTheme.textSecondary)
+                                .frame(width: 58, alignment: .leading)
+                            Text(
+                                "\(EfficiencyMetrics.percent(call.cacheHitRatio)) hit · read \(EfficiencyMetrics.tokenLabel(call.cacheReadTokens)) · miss \(EfficiencyMetrics.tokenLabel(call.cacheMissTokens))"
+                            )
+                            .font(VPTheme.mono(7))
+                            .monospacedDigit()
+                            .foregroundStyle(VPTheme.textTertiary)
+                            if let appendOnly = call.appendOnly {
+                                Text(appendOnly ? "append" : "break")
+                                    .font(VPTheme.mono(7, weight: .semibold))
+                                    .foregroundStyle(appendOnly ? VPTheme.success : VPTheme.warning)
+                            }
+                            if let miss = call.missReason {
+                                Text(EfficiencyMetrics.missReasonLabel(miss))
+                                    .font(VPTheme.mono(7))
+                                    .foregroundStyle(VPTheme.textTertiary)
+                            }
+                            Spacer(minLength: 0)
+                            if let epoch = EfficiencyMetrics.shortHash(call.cacheEpoch) {
+                                Text(epoch)
+                                    .font(VPTheme.mono(7))
+                                    .foregroundStyle(VPTheme.textTertiary)
+                            }
+                        }
+                    }
+                }
+            }
+            if !snapshot.cacheEpochTimeline.isEmpty {
+                CacheEpochTimelineView(epochs: snapshot.cacheEpochTimeline)
+            }
+            Text(
+                "Cache reads are billed, not free; this is a hit ratio, not a discount. Cross-session reuse is observed, never guaranteed."
+            )
+            .font(VPTheme.mono(7))
+            .foregroundStyle(VPTheme.textTertiary)
+        }
+        .padding(8)
+        .background(VPTheme.surfaceRaised.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func tag(_ text: String, tint: Color, help: String) -> some View {
+        Text(text)
+            .font(VPTheme.mono(8, weight: .semibold))
+            .padding(.horizontal, 5)
+            .padding(.vertical, 2)
+            .foregroundStyle(tint)
+            .background(tint.opacity(0.10), in: Capsule())
+            .help(help)
+    }
+
+    private func stat(_ title: String, _ value: String, detail: String? = nil) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(title.uppercased())
+                .font(VPTheme.mono(7, weight: .semibold))
+                .foregroundStyle(VPTheme.textTertiary)
+            Text(value)
+                .font(VPTheme.mono(9, weight: .semibold))
+                .monospacedDigit()
+                .foregroundStyle(VPTheme.textSecondary)
+            if let detail {
+                Text(detail)
+                    .font(VPTheme.mono(6))
+                    .foregroundStyle(VPTheme.textTertiary)
+            }
+        }
     }
 }
 

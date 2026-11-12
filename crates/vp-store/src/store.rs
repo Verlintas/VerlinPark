@@ -18730,6 +18730,102 @@ impl Store {
         Ok(events)
     }
 
+    /// Bounded cross-session observation of one cache epoch. The query scans
+    /// the newest `context.cache` events across sessions and filters in Rust;
+    /// it never reads prompt text and never claims a provider cache hit. The
+    /// limit is clamped so a dashboard refresh cannot load an unbounded log.
+    ///
+    /// Returns `(distinct_sessions_with_reads, hit_tokens, matched_calls)`.
+    pub fn cache_epoch_cross_session(
+        &self,
+        epoch: &str,
+        exclude_session: &str,
+        limit: u32,
+    ) -> Result<(u64, u64, u64)> {
+        if epoch.is_empty() {
+            return Ok((0, 0, 0));
+        }
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT session_id, payload
+             FROM events
+             WHERE type = 'context.cache' AND session_id <> ?1
+             ORDER BY created_at DESC, seq DESC
+             LIMIT ?2",
+        )?;
+        let rows =
+            statement.query_map(params![exclude_session, limit.clamp(1, 10_000)], |row| {
+                let payload: String = row.get(1)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    serde_json::from_str::<serde_json::Value>(&payload)
+                        .unwrap_or(serde_json::Value::Null),
+                ))
+            })?;
+        let mut sessions = std::collections::BTreeSet::new();
+        let mut hit_tokens = 0u64;
+        let mut calls = 0u64;
+        for row in rows {
+            let (session_id, payload) = row?;
+            let Some(candidate) = payload
+                .get("cache_epoch")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    payload
+                        .get("prompt_prefix_hash")
+                        .and_then(serde_json::Value::as_str)
+                })
+            else {
+                continue;
+            };
+            if candidate != epoch {
+                continue;
+            }
+            calls = calls.saturating_add(1);
+            let read = payload
+                .get("cache_read_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            if read > 0 {
+                sessions.insert(session_id);
+                hit_tokens = hit_tokens.saturating_add(read);
+            }
+        }
+        Ok((sessions.len() as u64, hit_tokens, calls))
+    }
+
+    /// Bounded newest-first project cache events for the read-only overview.
+    /// Only `context.cache` rows belonging to the project's sessions are read;
+    /// payloads never contain prompt text. The caller receives `(events,
+    /// truncated)`.
+    pub fn project_cache_events(&self, project_id: &str, limit: u32) -> Result<(Vec<Event>, bool)> {
+        let limit = limit.clamp(1, 50_000);
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT e.session_id, e.seq, e.type, e.payload, e.created_at
+             FROM events e
+             JOIN sessions s ON s.id = e.session_id
+             WHERE s.project_id = ?1 AND e.type = 'context.cache'
+             ORDER BY e.created_at DESC, e.seq DESC
+             LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![project_id, limit + 1], |row| {
+            let payload: String = row.get(3)?;
+            Ok(Event {
+                session_id: row.get(0)?,
+                seq: row.get::<_, i64>(1)? as u64,
+                kind: row.get(2)?,
+                payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
+                created_at: row.get(4)?,
+            })
+        })?;
+        let mut events = rows.collect::<Result<Vec<_>, _>>()?;
+        let truncated = events.len() > limit as usize;
+        events.truncate(limit as usize);
+        events.reverse();
+        Ok((events, truncated))
+    }
+
     /// Newest-first bounded window of one event kind. Used by the read-only
     /// tool-activity projection; callers never load an unbounded session log.
     pub fn list_recent_events_by_kind(

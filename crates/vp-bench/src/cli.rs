@@ -59,6 +59,12 @@ pub enum BenchCommand {
         #[arg(long)]
         allow_mismatch: bool,
     },
+    /// Prompt-cache benchmark: deterministic simulator or explicit live mode.
+    #[command(name = "cache-bench")]
+    CacheBench {
+        #[command(subcommand)]
+        command: crate::cache_bench::CacheBenchCommand,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -136,6 +142,14 @@ pub async fn execute(command: BenchCommand, json_mode: bool) -> Result<CommandOu
             b,
             allow_mismatch,
         } => compare_command(&a, &b, allow_mismatch, json_mode),
+        BenchCommand::CacheBench { command } => {
+            let exit_code = crate::cache_bench::execute(command, json_mode).await?;
+            Ok(CommandOutcome {
+                exit_code,
+                human: String::new(),
+                json: None,
+            })
+        }
     }
 }
 
@@ -477,6 +491,47 @@ mod tests {
         };
         let error = run_command(args, false).await.unwrap_err();
         assert!(error.to_string().contains("only valid"));
+    }
+
+    #[test]
+    fn parses_cache_bench_subcommand_and_controls() {
+        let cli = BenchCli::parse_from([
+            "vp-bench",
+            "cache-bench",
+            "run",
+            "--cold-start",
+            "--turns",
+            "24",
+            "--csv",
+        ]);
+        match cli.command {
+            BenchCommand::CacheBench {
+                command: crate::cache_bench::CacheBenchCommand::Run(args),
+            } => {
+                assert!(args.cold_start);
+                assert_eq!(args.turns, 24);
+                assert!(args.csv);
+                assert!(!args.live);
+            }
+            other => panic!("expected cache-bench run, got {other:?}"),
+        }
+        let cli = BenchCli::parse_from([
+            "vp-bench",
+            "cache-bench",
+            "compare",
+            "a.json",
+            "b.json",
+            "--allow-mismatch",
+        ]);
+        assert!(matches!(
+            cli.command,
+            BenchCommand::CacheBench {
+                command: crate::cache_bench::CacheBenchCommand::Compare {
+                    allow_mismatch: true,
+                    ..
+                }
+            }
+        ));
     }
 
     #[test]

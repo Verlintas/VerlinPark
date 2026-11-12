@@ -35,6 +35,113 @@ fn rejects_duplicate_project() {
 }
 
 #[test]
+fn cross_session_cache_epoch_scan_is_bounded_and_excludes_the_source() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let first = store.create_session(&project.id, "first").unwrap();
+    let second = store.create_session(&project.id, "second").unwrap();
+    let third = store.create_session(&project.id, "third").unwrap();
+    for (session, epoch, read) in [
+        (&first.id, "epoch-a", 900),
+        (&second.id, "epoch-a", 700),
+        (&second.id, "epoch-a", 0),
+        (&third.id, "epoch-b", 500),
+    ] {
+        store
+            .append_event(
+                session,
+                "context.cache",
+                serde_json::json!({
+                    "cache_epoch": epoch,
+                    "cache_read_tokens": read,
+                    "input_tokens": 1_000
+                }),
+            )
+            .unwrap();
+    }
+    let (sessions, hit_tokens, calls) = store
+        .cache_epoch_cross_session("epoch-a", &first.id, 500)
+        .unwrap();
+    assert_eq!(sessions, 1);
+    assert_eq!(hit_tokens, 700);
+    assert_eq!(calls, 2);
+    let (sessions, hit_tokens, calls) = store
+        .cache_epoch_cross_session("epoch-a", &first.id, 1)
+        .unwrap();
+    assert_eq!(sessions, 0);
+    assert_eq!(hit_tokens, 0);
+    assert_eq!(calls, 0);
+    assert_eq!(
+        store.cache_epoch_cross_session("", &first.id, 100).unwrap(),
+        (0, 0, 0)
+    );
+    assert_eq!(
+        store
+            .cache_epoch_cross_session("epoch-z", &first.id, 100)
+            .unwrap(),
+        (0, 0, 0)
+    );
+}
+
+#[test]
+fn project_cache_events_are_project_scoped_ordered_and_bounded() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let other_repo = TempDir::new().unwrap();
+    let other = store
+        .add_project(other_repo.path().to_str().unwrap(), Some("other"))
+        .unwrap();
+    let first = store.create_session(&project.id, "first").unwrap();
+    let second = store.create_session(&project.id, "second").unwrap();
+    let unrelated = store.create_session(&other.id, "other").unwrap();
+    for (session, read) in [(&first.id, 10), (&unrelated.id, 99), (&second.id, 20)] {
+        store
+            .append_event(
+                session,
+                "context.cache",
+                serde_json::json!({"input_tokens": 100, "cache_read_tokens": read}),
+            )
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    store
+        .append_event(&first.id, "note", serde_json::json!({"text": "not cache"}))
+        .unwrap();
+    let (events, truncated) = store.project_cache_events(&project.id, 100).unwrap();
+    assert!(!truncated);
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].session_id, first.id);
+    assert_eq!(events[1].session_id, second.id);
+    assert!(events.iter().all(|event| event.kind == "context.cache"));
+    let (events, truncated) = store.project_cache_events(&project.id, 1).unwrap();
+    assert!(truncated);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].session_id, second.id);
+    let (events, truncated) = store.project_cache_events(&other.id, 100).unwrap();
+    assert!(!truncated);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].session_id, unrelated.id);
+}
+
+#[test]
+fn project_cache_events_are_empty_safe_and_clamp_the_limit() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let (events, truncated) = store.project_cache_events(&project.id, 0).unwrap();
+    assert!(events.is_empty());
+    assert!(!truncated);
+    let (events, truncated) = store.project_cache_events("missing-project", 100).unwrap();
+    assert!(events.is_empty());
+    assert!(!truncated);
+}
+
+#[test]
 fn creates_sessions_and_events() {
     let (_data, store, repo) = test_store();
     let project = store

@@ -631,12 +631,19 @@ impl CacheCallFingerprint {
     }
 }
 
-/// Derived miss attribution. A reason is recorded only when the provider
-/// reported zero cache reads for the call; `None` means the call hit the
-/// prefix cache or no attribution was needed.
+/// Derived miss attribution.
+///
+/// A reason is recorded when the call left prompt tokens uncached, or when the
+/// provider reported zero reads for an expected cache call. `None` means the
+/// call fully hit (or caching was not expected). `tail_delta` is the expected
+/// uncached suffix of an append-only turn, not a cache failure;
+/// `provider_cache_miss` describes a provider-side eviction or a gap larger
+/// than the new suffix. `ttl_or_provider_miss` is retained for legacy events
+/// that predate the split.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheMissReason {
     FirstCall,
+    TailDelta,
     PrefixChanged,
     ModelChanged,
     ToolsChanged,
@@ -654,6 +661,7 @@ impl CacheMissReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::FirstCall => "first_call",
+            Self::TailDelta => "tail_delta",
             Self::PrefixChanged => "prefix_changed",
             Self::ModelChanged => "model_changed",
             Self::ToolsChanged => "tools_changed",
@@ -668,6 +676,7 @@ impl CacheMissReason {
     pub fn parse(value: &str) -> Option<Self> {
         Some(match value {
             "first_call" => Self::FirstCall,
+            "tail_delta" => Self::TailDelta,
             "prefix_changed" => Self::PrefixChanged,
             "model_changed" => Self::ModelChanged,
             "tools_changed" => Self::ToolsChanged,
@@ -688,6 +697,156 @@ impl CacheMissReason {
             Self::PrefixChanged | Self::ModelChanged | Self::ToolsChanged | Self::ProjectChanged
         )
     }
+    /// True for reasons that indicate our own prefix bytes changed rather than
+    /// a provider eviction or the expected new tail.
+    pub fn is_prefix_break(self) -> bool {
+        matches!(
+            self,
+            Self::PrefixChanged | Self::ToolsChanged | Self::ProjectChanged | Self::CompactionReset
+        )
+    }
+}
+
+/// Provider input tokens that were not served from cache. `input_tokens`
+/// already includes cache reads, so the subtraction is clamped at zero for
+/// inconsistent or legacy provider metadata.
+pub fn cache_miss_tokens(input_tokens: u64, cache_read_tokens: u64) -> u64 {
+    input_tokens.saturating_sub(cache_read_tokens.min(input_tokens))
+}
+
+/// Best achievable in-session cache-read ratio from the previous prompt size.
+///
+/// The previous prompt is the longest prefix the provider could have cached
+/// locally. `min(previous, current) / current` is therefore an upper bound on
+/// this call's hit ratio; it is not a provider TTL, block-size, or hit
+/// guarantee. A zero or smaller previous prompt yields `0.0` rather than a
+/// fabricated value.
+pub fn theoretical_max_hit_ratio(previous_input_tokens: u64, input_tokens: u64) -> f64 {
+    if input_tokens == 0 {
+        return 0.0;
+    }
+    let readable = previous_input_tokens.min(input_tokens);
+    (readable as f64 / input_tokens as f64).clamp(0.0, 1.0)
+}
+
+/// Share of provider input served from cache, using the same denominator as
+/// [`theoretical_max_hit_ratio`]: total input. Clamped and zero-safe.
+pub fn cache_read_ratio(input_tokens: u64, cache_read_tokens: u64) -> f64 {
+    if input_tokens == 0 {
+        return 0.0;
+    }
+    (cache_read_tokens.min(input_tokens) as f64 / input_tokens as f64).clamp(0.0, 1.0)
+}
+
+/// Canonical hash of a conversation message list. It is intentionally narrower
+/// than [`conversation_generation`]: no stable prefix and no message index
+/// outside the list, so it can be compared across calls and sessions. Tool
+/// calls serialize in their stored order; the provider adapter owns canonical
+/// wire ordering (L2).
+pub fn message_prefix_hash(messages: &[ChatMessage]) -> String {
+    let mut material = String::new();
+    for message in messages {
+        message_material(&mut material, message);
+        material.push('\u{1e}');
+    }
+    sha256_hex(material.as_bytes())
+}
+
+fn message_material(material: &mut String, message: &ChatMessage) {
+    material.push_str(&message.role);
+    material.push('\u{1f}');
+    material.push_str(&message.content.len().to_string());
+    material.push('\u{1f}');
+    material.push_str(&message.content);
+    material.push('\u{1f}');
+    if let Some(calls) = &message.tool_calls {
+        for call in calls {
+            material.push_str(&call.id);
+            material.push('\u{1d}');
+            material.push_str(&call.name);
+            material.push('\u{1d}');
+            material.push_str(&call.arguments);
+            material.push('\u{1d}');
+        }
+    }
+    material.push('\u{1f}');
+    if let Some(call_id) = &message.tool_call_id {
+        material.push_str(call_id);
+    }
+}
+
+/// Whether a previous canonical message list is an exact prefix of the current
+/// list. The previous call stores a hash over its first `previous_count`
+/// messages; recomputing that hash over the current prefix proves continuity
+/// without storing prompt text or the full message list in telemetry.
+pub fn message_list_is_append_only(
+    previous_hash: &str,
+    previous_count: u64,
+    messages: &[ChatMessage],
+) -> bool {
+    if previous_hash.is_empty() {
+        return false;
+    }
+    let Ok(previous_count) = usize::try_from(previous_count) else {
+        return false;
+    };
+    if previous_count > messages.len() {
+        return false;
+    }
+    // An empty previous list is a prefix of everything, but it carries no
+    // continuity evidence; callers treat it as unknown, not as a break.
+    if previous_count == 0 {
+        return true;
+    }
+    message_prefix_hash(&messages[..previous_count]) == previous_hash
+}
+
+/// One provider call observed by the cache tracker. The canonical message
+/// list is borrowed only for the duration of the observation; no prompt text
+/// is persisted.
+#[derive(Debug, Clone, Copy)]
+pub struct CacheCallObservation<'a> {
+    pub fingerprint: &'a CacheCallFingerprint,
+    pub messages: &'a [ChatMessage],
+    pub input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    /// True when the provider/policy is expected to report prefix cache
+    /// reads. A provider without prompt caching must not be labeled as a
+    /// provider miss on every call.
+    pub cache_expected: bool,
+    pub cache_epoch: Option<&'a str>,
+    pub cache_epoch_source: Option<&'a str>,
+}
+
+/// Epoch-projection context for the legacy miss-attribution path. It is
+/// separate from [`CacheCallObservation`] because it carries no conversation
+/// bytes and is used by callers that only have provider token counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheEpochObservation {
+    pub input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub first_session_call: bool,
+    pub prior_sessions: u64,
+}
+
+/// Derived per-call telemetry. All ratio fields are clamped and zero-safe; the
+/// values are derived from provider-reported token counts plus the canonical
+/// message continuity proof, never from prompt text.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CacheCallTelemetry {
+    pub cache_miss_tokens: u64,
+    pub theoretical_max_hit_ratio: f64,
+    pub cache_hit_ratio: f64,
+    pub message_prefix_hash: String,
+    pub previous_message_prefix_hash: Option<String>,
+    pub message_prefix_count: u64,
+    pub previous_message_prefix_count: u64,
+    pub append_only: Option<bool>,
+    pub cache_epoch: Option<String>,
+    pub cache_epoch_source: Option<String>,
+    pub previous_input_tokens: u64,
+    pub miss_reason: Option<CacheMissReason>,
 }
 
 /// In-run miss tracker. It is seeded from the latest persisted cache call so a
@@ -697,6 +856,11 @@ impl CacheMissReason {
 pub struct CacheCallTracker {
     last: Option<CacheCallFingerprint>,
     compaction_pending: bool,
+    previous_message_prefix_hash: Option<String>,
+    previous_message_prefix_count: u64,
+    previous_input_tokens: u64,
+    first_session_call: bool,
+    prior_sessions: u64,
 }
 
 impl CacheCallTracker {
@@ -704,15 +868,47 @@ impl CacheCallTracker {
         Self {
             last,
             compaction_pending: false,
+            previous_message_prefix_hash: None,
+            previous_message_prefix_count: 0,
+            previous_input_tokens: 0,
+            first_session_call: false,
+            prior_sessions: 0,
         }
     }
 
     pub fn from_event(payload: Option<&Value>) -> Self {
-        Self::new(payload.and_then(CacheCallFingerprint::from_event_payload))
+        let mut tracker = Self::new(payload.and_then(CacheCallFingerprint::from_event_payload));
+        if let Some(payload) = payload {
+            tracker.previous_message_prefix_hash = payload
+                .get("message_prefix_hash")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            tracker.previous_message_prefix_count = payload
+                .get("message_prefix_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            tracker.previous_input_tokens = payload
+                .get("input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+        }
+        tracker
     }
 
     pub fn last(&self) -> Option<&CacheCallFingerprint> {
         self.last.as_ref()
+    }
+
+    pub fn previous_input_tokens(&self) -> u64 {
+        self.previous_input_tokens
+    }
+
+    pub fn previous_message_prefix_hash(&self) -> Option<&str> {
+        self.previous_message_prefix_hash.as_deref()
+    }
+
+    pub fn previous_message_prefix_count(&self) -> u64 {
+        self.previous_message_prefix_count
     }
 
     pub fn mark_compaction(&mut self) {
@@ -723,18 +919,142 @@ impl CacheCallTracker {
         self.compaction_pending
     }
 
-    /// Observe one call with only cache-read tokens. Retained for callers and
-    /// tests that do not have the full provider input count; it delegates to
-    /// [`Self::observe_call`] with an input equal to the cache reads so a hit
-    /// stays a hit and a zero-read call remains attributable.
+    /// Seed the epoch-projection context for the next observation. The caller
+    /// reads these values from persisted observations; they are never guessed
+    /// from the in-memory tracker.
+    pub fn set_epoch_context(&mut self, first_session_call: bool, prior_sessions: u64) {
+        self.first_session_call = first_session_call;
+        self.prior_sessions = prior_sessions;
+    }
+
+    /// Observe one call and produce the L5 per-call telemetry. A hit or an
+    /// expected tail clears the compaction marker because the following call
+    /// compares against the new observation.
+    pub fn observe_call(&mut self, observation: CacheCallObservation<'_>) -> CacheCallTelemetry {
+        let current_hash = message_prefix_hash(observation.messages);
+        let current_count = observation.messages.len() as u64;
+        let previous_hash = self.previous_message_prefix_hash.clone();
+        let previous_count = self.previous_message_prefix_count;
+        let append_only = match previous_hash.as_deref() {
+            Some(hash) if previous_count > 0 => Some(message_list_is_append_only(
+                hash,
+                previous_count,
+                observation.messages,
+            )),
+            Some(_) => None,
+            None => None,
+        };
+        let input_tokens = observation.input_tokens;
+        let cache_read_tokens = observation.cache_read_tokens.min(input_tokens);
+        let miss_tokens = cache_miss_tokens(input_tokens, cache_read_tokens);
+        let theoretical = theoretical_max_hit_ratio(self.previous_input_tokens, input_tokens);
+
+        let structural = self.last.as_ref().and_then(|last| {
+            if !last.model.is_empty()
+                && !observation.fingerprint.model.is_empty()
+                && last.model != observation.fingerprint.model
+            {
+                Some(CacheMissReason::ModelChanged)
+            } else if last.tools_hash != observation.fingerprint.tools_hash {
+                Some(CacheMissReason::ToolsChanged)
+            } else if last.project_hash != observation.fingerprint.project_hash {
+                Some(CacheMissReason::ProjectChanged)
+            } else if last.core_hash != observation.fingerprint.core_hash
+                || (last.prefix_hash != observation.fingerprint.prefix_hash
+                    && last.cache_epoch == observation.fingerprint.cache_epoch)
+            {
+                Some(CacheMissReason::PrefixChanged)
+            } else {
+                None
+            }
+        });
+
+        let miss_reason = if !observation.cache_expected {
+            None
+        } else if let Some(reason) = structural {
+            Some(reason)
+        } else if self.compaction_pending && miss_tokens > 0 {
+            Some(CacheMissReason::CompactionReset)
+        } else if append_only == Some(false) {
+            if miss_tokens > 0 {
+                Some(CacheMissReason::PrefixChanged)
+            } else {
+                None
+            }
+        } else if cache_read_tokens == 0 {
+            if self.last.is_none() && self.previous_input_tokens == 0 {
+                if self.prior_sessions > 0 {
+                    // The epoch existed in this project, so a cold provider
+                    // cache is an eviction observation, not a new session.
+                    Some(CacheMissReason::ProviderCacheMiss)
+                } else {
+                    Some(CacheMissReason::FirstCall)
+                }
+            } else {
+                Some(CacheMissReason::ProviderCacheMiss)
+            }
+        } else if self.last.is_none() && self.previous_input_tokens == 0 {
+            // A first local observation can still read a prefix populated by
+            // another session. There is no local prompt to compare, so this is
+            // cross-session reuse rather than a provider miss.
+            None
+        } else if miss_tokens == 0 {
+            None
+        } else if append_only == Some(true) {
+            // The provider could read the previous prompt; anything beyond
+            // that plus block rounding is the new append-only tail. A larger
+            // gap means the provider did not serve a prefix it had seen.
+            let readable = self.previous_input_tokens.min(input_tokens);
+            let tail = input_tokens.saturating_sub(readable);
+            let tolerance = CACHE_BLOCK_TOKENS;
+            if miss_tokens <= tail.saturating_add(tolerance) {
+                Some(CacheMissReason::TailDelta)
+            } else {
+                Some(CacheMissReason::ProviderCacheMiss)
+            }
+        } else {
+            // Continuity is unknown (legacy event or no previous message hash),
+            // but a partial read with an unchanged stable prefix is still a
+            // provider-side gap rather than our own prefix change.
+            Some(CacheMissReason::ProviderCacheMiss)
+        };
+
+        let telemetry = CacheCallTelemetry {
+            cache_miss_tokens: miss_tokens,
+            theoretical_max_hit_ratio: theoretical,
+            cache_hit_ratio: cache_read_ratio(input_tokens, cache_read_tokens),
+            message_prefix_hash: current_hash.clone(),
+            previous_message_prefix_hash: previous_hash,
+            message_prefix_count: current_count,
+            previous_message_prefix_count: previous_count,
+            append_only,
+            cache_epoch: observation.cache_epoch.map(str::to_string),
+            cache_epoch_source: observation.cache_epoch_source.map(str::to_string),
+            previous_input_tokens: self.previous_input_tokens,
+            miss_reason,
+        };
+
+        self.last = Some(observation.fingerprint.clone());
+        self.previous_message_prefix_hash = Some(current_hash);
+        self.previous_message_prefix_count = current_count;
+        self.previous_input_tokens = input_tokens;
+        // The marker describes the next observation only. Whether that call
+        // hit or missed, a later call compares against the new fingerprint and
+        // must not keep reporting the same compaction reset.
+        self.compaction_pending = false;
+        telemetry
+    }
+
+    /// Legacy observation path kept for callers and tests that only have a
+    /// fingerprint and a read count. New code should use [`Self::observe_call`].
     pub fn observe(
         &mut self,
         current: &CacheCallFingerprint,
         cache_read_tokens: u64,
     ) -> Option<CacheMissReason> {
-        self.observe_call(
+        self.observe_epoch(
             current,
-            CacheCallObservation {
+            CacheEpochObservation {
                 // A zero-read call must still be classified. With no input
                 // count, one token is the smallest honest denominator.
                 input_tokens: cache_read_tokens.max(1),
@@ -761,10 +1081,10 @@ impl CacheCallTracker {
     ///
     /// A hit clears the compaction marker because the following call's prefix
     /// is no longer the pre-compaction generation.
-    pub fn observe_call(
+    pub fn observe_epoch(
         &mut self,
         current: &CacheCallFingerprint,
-        observation: CacheCallObservation,
+        observation: CacheEpochObservation,
     ) -> Option<CacheMissReason> {
         if !crate::cache_epoch::is_low_cache_hit(
             observation.input_tokens,
@@ -815,16 +1135,10 @@ impl CacheCallTracker {
     }
 }
 
-/// Provider-reported shape for one call. `first_session_call` and
-/// `prior_sessions` come from the persisted epoch projection, not from an
-/// in-memory guess.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct CacheCallObservation {
-    pub input_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub first_session_call: bool,
-    pub prior_sessions: u64,
-}
+/// Provider block granularity used only as a tolerance when deciding whether
+/// an uncached suffix is the expected append-only tail. It is not a claim
+/// about any provider's cache block size.
+pub const CACHE_BLOCK_TOKENS: u64 = 64;
 
 /// Estimated no-cache cost minus billed cost for one call. `input` already
 /// includes cache reads and writes. Negative values are valid when cache
@@ -928,10 +1242,7 @@ pub fn cache_call_record(payload: &Value, created_at: &str) -> SessionCacheCall 
         previous_message_prefix_hash: text("previous_message_prefix_hash")
             .filter(|hash| !hash.is_empty()),
         message_prefix_hash: text("message_prefix_hash"),
-        append_only: payload
-            .get("append_only")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+        append_only: payload.get("append_only").and_then(Value::as_bool),
         message_count: u64("message_count"),
         head_prefix_hash: text("head_prefix_hash"),
         tail_prefix_hash: text("tail_prefix_hash"),
@@ -976,6 +1287,29 @@ pub fn cache_call_record(payload: &Value, created_at: &str) -> SessionCacheCall 
             .get("warm")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        cache_miss_tokens: payload
+            .get("cache_miss_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| cache_miss_tokens(u64("input_tokens"), u64("cache_read_tokens"))),
+        theoretical_max_hit_ratio: payload
+            .get("theoretical_max_hit_ratio")
+            .and_then(Value::as_f64)
+            .map(clamp_ratio)
+            .unwrap_or(0.0),
+        message_prefix_count: u64("message_prefix_count"),
+        previous_message_prefix_count: u64("previous_message_prefix_count"),
+        cache_epoch_source: text("cache_epoch_source"),
+        previous_input_tokens: u64("previous_input_tokens"),
+    }
+}
+
+/// Clamp a ratio from persisted or provider telemetry. Non-finite values
+/// collapse to zero; the caller never fabricates a percentage.
+pub fn clamp_ratio(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
     }
 }
 
@@ -1036,6 +1370,71 @@ pub struct CacheTelemetryAggregate {
     pub prefix_changes: u64,
     /// Always-computed lost cache-read estimate from reset events.
     pub compaction_lost_cache_usd: f64,
+    // L5 aggregation. Token totals include warm calls because warm calls are
+    // real provider input; `calls`/`warm_calls` remain separate so a dashboard
+    // can show the ordinary-call count without hiding warm cost.
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cache_miss_tokens: u64,
+    pub hit_ratio: f64,
+    pub hit_ratio_p50: Option<f64>,
+    pub hit_ratio_p95: Option<f64>,
+    pub theoretical_max_p50: Option<f64>,
+    pub theoretical_max_p95: Option<f64>,
+    pub latest_theoretical_max_hit_ratio: f64,
+    pub latest_cache_epoch: Option<String>,
+    pub latest_cache_epoch_source: Option<String>,
+    pub append_only_calls: u64,
+    pub append_only_breaks: u64,
+    pub last_append_only: Option<bool>,
+    pub cache_epoch_timeline: Vec<vp_protocol::types::CacheEpochBucket>,
+    pub per_role: Vec<vp_protocol::types::CacheRoleBucket>,
+    pub top_miss_reasons: Vec<vp_protocol::types::CacheCountBucket>,
+}
+
+/// Bounded cross-session observation of one cache epoch. This is provider-
+/// reported reuse in other sessions, not a guarantee that a new session will
+/// hit; the scan window is recorded so the caller can label it honestly.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CacheEpochReuse {
+    pub sessions: u64,
+    pub hit_tokens: u64,
+    pub calls: u64,
+}
+
+#[derive(Default)]
+struct RoleAccumulator {
+    calls: u64,
+    input_tokens: u64,
+    cache_read_tokens: u64,
+    cache_miss_tokens: u64,
+    theoretical_sum: f64,
+    theoretical_calls: u64,
+}
+
+#[derive(Default)]
+struct EpochAccumulator {
+    source: Option<String>,
+    calls: u64,
+    first_at: String,
+    last_at: String,
+    input_tokens: u64,
+    cache_read_tokens: u64,
+    cache_miss_tokens: u64,
+    append_only_breaks: u64,
+}
+
+/// Nearest-rank percentile for floating ratios. `None` for an empty sample;
+/// values are clamped before they enter the sample.
+fn nearest_rank_f64(sorted: &[f64], percentile: u64) -> Option<f64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let rank = (percentile as f64 / 100.0 * sorted.len() as f64).ceil() as usize;
+    let index = rank.saturating_sub(1).min(sorted.len() - 1);
+    sorted.get(index).copied().map(clamp_ratio)
 }
 
 /// Nearest-rank percentile over a small sorted sample. Returns `None` for an
@@ -1062,8 +1461,12 @@ pub fn aggregate_cache_events(
     let mut ttls: BTreeMap<String, u64> = BTreeMap::new();
     let mut breakpoints: BTreeMap<String, u64> = BTreeMap::new();
     let mut savings: BTreeMap<String, (u64, f64)> = BTreeMap::new();
-    let mut epochs: BTreeMap<String, u64> = BTreeMap::new();
+    let mut roles: BTreeMap<String, RoleAccumulator> = BTreeMap::new();
+    let mut epochs: BTreeMap<String, EpochAccumulator> = BTreeMap::new();
     let mut first_tokens = Vec::new();
+    let mut hit_ratios = Vec::new();
+    let mut theoretical_ratios = Vec::new();
+    let mut previous_ordinary_input: Option<u64> = None;
     for event in cache_events {
         let payload = &event.payload;
         let warm = payload
@@ -1074,13 +1477,6 @@ pub fn aggregate_cache_events(
             aggregate.warm_calls = aggregate.warm_calls.saturating_add(1);
         } else {
             aggregate.calls = aggregate.calls.saturating_add(1);
-        }
-        if let Some(epoch) = payload
-            .get("cache_epoch")
-            .and_then(Value::as_str)
-            .filter(|value| crate::cache_epoch::is_cache_epoch(value))
-        {
-            *epochs.entry(epoch.to_string()).or_default() += 1;
         }
         if !warm {
             if let Some(reason) = payload.get("miss_reason").and_then(Value::as_str)
@@ -1127,7 +1523,7 @@ pub fn aggregate_cache_events(
             .get("estimated_savings_usd")
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
-        let entry = savings.entry(role).or_insert((0, 0.0));
+        let entry = savings.entry(role.clone()).or_insert((0, 0.0));
         entry.0 = entry.0.saturating_add(1);
         entry.1 += value;
         if let Some(latency) = payload.get("first_token_ms").and_then(Value::as_u64)
@@ -1135,10 +1531,175 @@ pub fn aggregate_cache_events(
         {
             first_tokens.push(latency);
         }
+
+        let input_tokens = payload
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let cache_read_tokens = payload
+            .get("cache_read_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .min(input_tokens);
+        let cache_write_tokens = payload
+            .get("cache_write_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .min(input_tokens.saturating_sub(cache_read_tokens));
+        let miss_tokens = payload
+            .get("cache_miss_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| cache_miss_tokens(input_tokens, cache_read_tokens))
+            .min(input_tokens);
+        let hit_ratio = payload
+            .get("cache_hit_ratio")
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite())
+            .map(clamp_ratio)
+            .unwrap_or_else(|| cache_read_ratio(input_tokens, cache_read_tokens));
+        aggregate.input_tokens = aggregate.input_tokens.saturating_add(input_tokens);
+        aggregate.output_tokens = aggregate.output_tokens.saturating_add(
+            payload
+                .get("output_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        );
+        aggregate.cache_read_tokens = aggregate
+            .cache_read_tokens
+            .saturating_add(cache_read_tokens);
+        aggregate.cache_write_tokens = aggregate
+            .cache_write_tokens
+            .saturating_add(cache_write_tokens);
+        aggregate.cache_miss_tokens = aggregate.cache_miss_tokens.saturating_add(miss_tokens);
+
+        let recorded_theoretical = payload
+            .get("theoretical_max_hit_ratio")
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite());
+        let theoretical = if warm {
+            recorded_theoretical.map(clamp_ratio).unwrap_or(0.0)
+        } else if let Some(recorded) = recorded_theoretical {
+            clamp_ratio(recorded)
+        } else if let Some(previous) = previous_ordinary_input {
+            theoretical_max_hit_ratio(previous, input_tokens)
+        } else {
+            0.0
+        };
+        if input_tokens > 0 {
+            hit_ratios.push(hit_ratio);
+            theoretical_ratios.push(theoretical);
+        }
+        if !warm {
+            previous_ordinary_input = Some(input_tokens);
+            if input_tokens > 0 {
+                aggregate.latest_theoretical_max_hit_ratio = theoretical;
+            }
+        }
+        if let Some(epoch) = payload
+            .get("cache_epoch")
+            .and_then(Value::as_str)
+            .or_else(|| payload.get("prompt_prefix_hash").and_then(Value::as_str))
+        {
+            aggregate.latest_cache_epoch = Some(epoch.to_string());
+            if let Some(source) = payload.get("cache_epoch_source").and_then(Value::as_str) {
+                aggregate.latest_cache_epoch_source = Some(source.to_string());
+            }
+        }
+
+        if let Some(append_only) = payload.get("append_only").and_then(Value::as_bool) {
+            aggregate.last_append_only = Some(append_only);
+            if append_only {
+                aggregate.append_only_calls = aggregate.append_only_calls.saturating_add(1);
+            } else {
+                let previous_count = payload
+                    .get("previous_message_prefix_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let previous_input = payload
+                    .get("previous_input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                // A first observation has no previous list; it is not a break.
+                if previous_count > 0 || previous_input > 0 {
+                    aggregate.append_only_breaks = aggregate.append_only_breaks.saturating_add(1);
+                }
+            }
+        }
+
+        let role_entry = roles.entry(role).or_default();
+        role_entry.calls = role_entry.calls.saturating_add(1);
+        role_entry.input_tokens = role_entry.input_tokens.saturating_add(input_tokens);
+        role_entry.cache_read_tokens = role_entry
+            .cache_read_tokens
+            .saturating_add(cache_read_tokens);
+        role_entry.cache_miss_tokens = role_entry.cache_miss_tokens.saturating_add(miss_tokens);
+        role_entry.theoretical_sum += theoretical;
+        role_entry.theoretical_calls = role_entry.theoretical_calls.saturating_add(1);
+
+        if let Some(epoch) = payload
+            .get("cache_epoch")
+            .and_then(Value::as_str)
+            .or_else(|| payload.get("prompt_prefix_hash").and_then(Value::as_str))
+        {
+            let epoch_entry = epochs.entry(epoch.to_string()).or_default();
+            if epoch_entry.first_at.is_empty() {
+                epoch_entry.first_at = event.created_at.clone();
+            }
+            epoch_entry.last_at = event.created_at.clone();
+            epoch_entry.calls = epoch_entry.calls.saturating_add(1);
+            epoch_entry.input_tokens = epoch_entry.input_tokens.saturating_add(input_tokens);
+            epoch_entry.cache_read_tokens = epoch_entry
+                .cache_read_tokens
+                .saturating_add(cache_read_tokens);
+            epoch_entry.cache_miss_tokens =
+                epoch_entry.cache_miss_tokens.saturating_add(miss_tokens);
+            if epoch_entry.source.is_none() {
+                epoch_entry.source = payload
+                    .get("cache_epoch_source")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+            if payload.get("append_only").and_then(Value::as_bool) == Some(false) {
+                let previous_count = payload
+                    .get("previous_message_prefix_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let previous_input = payload
+                    .get("previous_input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                if previous_count > 0 || previous_input > 0 {
+                    epoch_entry.append_only_breaks =
+                        epoch_entry.append_only_breaks.saturating_add(1);
+                }
+            }
+        }
     }
     first_tokens.sort_unstable();
     aggregate.first_token_p50_ms = nearest_rank(&first_tokens, 50);
     aggregate.first_token_p95_ms = nearest_rank(&first_tokens, 95);
+    hit_ratios.sort_by(|left, right| left.total_cmp(right));
+    theoretical_ratios.sort_by(|left, right| left.total_cmp(right));
+    aggregate.hit_ratio_p50 = nearest_rank_f64(&hit_ratios, 50);
+    aggregate.hit_ratio_p95 = nearest_rank_f64(&hit_ratios, 95);
+    aggregate.theoretical_max_p50 = nearest_rank_f64(&theoretical_ratios, 50);
+    aggregate.theoretical_max_p95 = nearest_rank_f64(&theoretical_ratios, 95);
+    aggregate.hit_ratio = cache_read_ratio(aggregate.input_tokens, aggregate.cache_read_tokens);
+    let mut top_misses = misses
+        .iter()
+        .map(|(key, calls)| vp_protocol::types::CacheCountBucket {
+            key: key.clone(),
+            calls: *calls,
+        })
+        .collect::<Vec<_>>();
+    top_misses.sort_by(|left, right| {
+        right
+            .calls
+            .cmp(&left.calls)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    top_misses.truncate(5);
+    aggregate.top_miss_reasons = top_misses;
     aggregate.miss_reason_counts = misses
         .into_iter()
         .map(|(key, calls)| vp_protocol::types::CacheCountBucket { key, calls })
@@ -1152,8 +1713,11 @@ pub fn aggregate_cache_events(
         .map(|(key, calls)| vp_protocol::types::CacheCountBucket { key, calls })
         .collect();
     aggregate.cache_epoch_counts = epochs
-        .into_iter()
-        .map(|(key, calls)| vp_protocol::types::CacheCountBucket { key, calls })
+        .iter()
+        .map(|(key, bucket)| vp_protocol::types::CacheCountBucket {
+            key: key.clone(),
+            calls: bucket.calls,
+        })
         .collect();
     aggregate.savings_by_role = savings
         .into_iter()
@@ -1165,6 +1729,50 @@ pub fn aggregate_cache_events(
             },
         )
         .collect();
+    aggregate.per_role = roles
+        .into_iter()
+        .map(|(role_name, role)| {
+            let theoretical_max_hit_ratio = if role.theoretical_calls == 0 {
+                0.0
+            } else {
+                clamp_ratio(role.theoretical_sum / role.theoretical_calls as f64)
+            };
+            vp_protocol::types::CacheRoleBucket {
+                role: role_name,
+                calls: role.calls,
+                input_tokens: role.input_tokens,
+                cache_read_tokens: role.cache_read_tokens,
+                cache_miss_tokens: role.cache_miss_tokens,
+                hit_ratio: cache_read_ratio(role.input_tokens, role.cache_read_tokens),
+                theoretical_max_hit_ratio,
+                cost_usd: 0.0,
+            }
+        })
+        .collect();
+    let mut epoch_timeline = epochs
+        .into_iter()
+        .map(|(epoch, bucket)| vp_protocol::types::CacheEpochBucket {
+            epoch,
+            source: bucket.source,
+            calls: bucket.calls,
+            first_at: bucket.first_at,
+            last_at: bucket.last_at,
+            input_tokens: bucket.input_tokens,
+            cache_read_tokens: bucket.cache_read_tokens,
+            cache_miss_tokens: bucket.cache_miss_tokens,
+            hit_ratio: cache_read_ratio(bucket.input_tokens, bucket.cache_read_tokens),
+            append_only_breaks: bucket.append_only_breaks,
+        })
+        .collect::<Vec<_>>();
+    epoch_timeline.sort_by(|left, right| {
+        left.last_at
+            .cmp(&right.last_at)
+            .then_with(|| left.epoch.cmp(&right.epoch))
+    });
+    if epoch_timeline.len() > 20 {
+        epoch_timeline = epoch_timeline.split_off(epoch_timeline.len() - 20);
+    }
+    aggregate.cache_epoch_timeline = epoch_timeline;
     for event in compaction_events {
         let reason = event
             .payload
@@ -1537,7 +2145,7 @@ mod tests {
             Some("previous")
         );
         assert_eq!(record.message_prefix_hash.as_deref(), Some("chain"));
-        assert!(record.append_only);
+        assert_eq!(record.append_only, Some(true));
         assert_eq!(record.message_count, 7);
         assert_eq!(record.tail_memory_mode.as_deref(), Some("embedded"));
         assert_eq!(record.provider_tail_system, Some(true));
@@ -1724,9 +2332,9 @@ mod tests {
             .hashes("model", &[])
             .fingerprint_with_epoch(&epoch);
         assert_eq!(
-            tracker.observe_call(
+            tracker.observe_epoch(
                 &current,
-                CacheCallObservation {
+                CacheEpochObservation {
                     input_tokens: 1_000,
                     cache_read_tokens: 400,
                     first_session_call: true,
@@ -1737,9 +2345,9 @@ mod tests {
             "a brand-new epoch with a partial cold hit is a first call"
         );
         assert_eq!(
-            tracker.observe_call(
+            tracker.observe_epoch(
                 &current,
-                CacheCallObservation {
+                CacheEpochObservation {
                     input_tokens: 1_000,
                     cache_read_tokens: 400,
                     first_session_call: false,
@@ -1750,9 +2358,9 @@ mod tests {
             "the same epoch must not be reported as our prefix changing"
         );
         assert_eq!(
-            tracker.observe_call(
+            tracker.observe_epoch(
                 &current,
-                CacheCallObservation {
+                CacheEpochObservation {
                     input_tokens: 1_000,
                     cache_read_tokens: 900,
                     first_session_call: false,
@@ -1772,9 +2380,9 @@ mod tests {
             .hashes("model", &[])
             .fingerprint_with_epoch(&epoch);
         assert_eq!(
-            tracker.observe_call(
+            tracker.observe_epoch(
                 &current,
-                CacheCallObservation {
+                CacheEpochObservation {
                     input_tokens: 1_000,
                     cache_read_tokens: 0,
                     first_session_call: true,
@@ -1792,9 +2400,9 @@ mod tests {
         let first = sections()
             .hashes("model-a", &[])
             .fingerprint_with_epoch_and_model(&"a".repeat(64), "model-a");
-        tracker.observe_call(
+        tracker.observe_epoch(
             &first,
-            CacheCallObservation {
+            CacheEpochObservation {
                 input_tokens: 1_000,
                 cache_read_tokens: 900,
                 first_session_call: true,
@@ -1805,9 +2413,9 @@ mod tests {
             .hashes("model-b", &[])
             .fingerprint_with_epoch_and_model(&"b".repeat(64), "model-b");
         assert_eq!(
-            tracker.observe_call(
+            tracker.observe_epoch(
                 &second,
-                CacheCallObservation {
+                CacheEpochObservation {
                     input_tokens: 1_000,
                     cache_read_tokens: 0,
                     first_session_call: false,
@@ -1899,18 +2507,392 @@ mod tests {
     fn miss_reason_strings_round_trip() {
         for reason in [
             CacheMissReason::FirstCall,
+            CacheMissReason::TailDelta,
             CacheMissReason::PrefixChanged,
             CacheMissReason::ModelChanged,
             CacheMissReason::ToolsChanged,
             CacheMissReason::ProjectChanged,
             CacheMissReason::ProviderCacheMiss,
             CacheMissReason::TtlOrProviderMiss,
+            CacheMissReason::ProviderCacheMiss,
             CacheMissReason::CompactionReset,
             CacheMissReason::Unknown,
         ] {
             assert_eq!(CacheMissReason::parse(reason.as_str()), Some(reason));
         }
         assert_eq!(CacheMissReason::parse("provider_said_no"), None);
+    }
+
+    #[test]
+    fn cache_metric_math_is_zero_safe_and_clamped() {
+        assert_eq!(cache_miss_tokens(100, 40), 60);
+        assert_eq!(cache_miss_tokens(100, 100), 0);
+        assert_eq!(cache_miss_tokens(100, 400), 0);
+        assert_eq!(cache_miss_tokens(0, 0), 0);
+        assert_eq!(cache_read_ratio(0, 0), 0.0);
+        assert_eq!(cache_read_ratio(100, 200), 1.0);
+        assert!((cache_read_ratio(1_000, 250) - 0.25).abs() < 1e-12);
+        assert_eq!(theoretical_max_hit_ratio(0, 1_000), 0.0);
+        assert_eq!(theoretical_max_hit_ratio(1_000, 0), 0.0);
+        assert!((theoretical_max_hit_ratio(1_000, 2_000) - 0.5).abs() < 1e-12);
+        assert_eq!(theoretical_max_hit_ratio(2_000, 1_000), 1.0);
+        assert_eq!(clamp_ratio(f64::NAN), 0.0);
+        assert_eq!(clamp_ratio(f64::INFINITY), 0.0);
+        assert_eq!(clamp_ratio(1.4), 1.0);
+        assert_eq!(clamp_ratio(-0.2), 0.0);
+        assert_eq!(clamp_ratio(0.75), 0.75);
+    }
+
+    #[test]
+    fn append_only_proof_detects_edits_and_reordering() {
+        let messages = vec![
+            ChatMessage::user("first"),
+            ChatMessage::assistant_tool_calls("second", Vec::new()),
+            ChatMessage::user("third"),
+        ];
+        let previous_hash = message_prefix_hash(&messages[..2]);
+        let mut extended = messages.clone();
+        extended.push(ChatMessage::user("fourth"));
+        assert!(message_list_is_append_only(&previous_hash, 2, &extended));
+        assert!(message_list_is_append_only(&previous_hash, 2, &messages));
+        assert!(!message_list_is_append_only(
+            &previous_hash,
+            2,
+            &messages[..1]
+        ));
+
+        let mut edited = messages.clone();
+        edited[1].content = "edited".to_string();
+        assert!(!message_list_is_append_only(&previous_hash, 2, &edited));
+
+        let mut reordered = messages.clone();
+        reordered.swap(0, 1);
+        assert!(!message_list_is_append_only(&previous_hash, 2, &reordered));
+
+        assert!(!message_list_is_append_only("", 0, &messages));
+        assert!(!message_list_is_append_only(&previous_hash, 5, &messages));
+        assert_eq!(
+            message_prefix_hash(&messages),
+            message_prefix_hash(&messages)
+        );
+        assert_ne!(message_prefix_hash(&messages), message_prefix_hash(&edited));
+    }
+
+    fn observation<'a>(
+        fingerprint: &'a CacheCallFingerprint,
+        messages: &'a [ChatMessage],
+        input: u64,
+        read: u64,
+    ) -> CacheCallObservation<'a> {
+        CacheCallObservation {
+            fingerprint,
+            messages,
+            input_tokens: input,
+            cache_read_tokens: read,
+            cache_write_tokens: 0,
+            cache_expected: true,
+            cache_epoch: Some("epoch-1"),
+            cache_epoch_source: Some("prompt_prefix_v3"),
+        }
+    }
+
+    #[test]
+    fn observe_call_attributes_tail_delta_and_provider_cache_miss() {
+        let fingerprint = sections().hashes("model", &[]).fingerprint();
+        let mut tracker = CacheCallTracker::default();
+        let mut messages = vec![ChatMessage::user("first")];
+        let first = tracker.observe_call(observation(&fingerprint, &messages, 1_000, 0));
+        assert_eq!(first.miss_reason, Some(CacheMissReason::FirstCall));
+        assert_eq!(first.cache_miss_tokens, 1_000);
+        assert_eq!(first.theoretical_max_hit_ratio, 0.0);
+        assert_eq!(first.append_only, None);
+
+        messages.push(ChatMessage::user("second"));
+        let second = tracker.observe_call(observation(&fingerprint, &messages, 1_200, 1_000));
+        assert_eq!(second.append_only, Some(true));
+        assert_eq!(second.miss_reason, Some(CacheMissReason::TailDelta));
+        assert!((second.theoretical_max_hit_ratio - 1_000.0 / 1_200.0).abs() < 1e-12);
+
+        messages.push(ChatMessage::user("third"));
+        let third = tracker.observe_call(observation(&fingerprint, &messages, 1_500, 1_000));
+        assert_eq!(third.append_only, Some(true));
+        assert_eq!(third.miss_reason, Some(CacheMissReason::ProviderCacheMiss));
+        assert_eq!(third.cache_miss_tokens, 500);
+    }
+
+    #[test]
+    fn observe_call_detects_message_edits_tools_and_compaction() {
+        let fingerprint = sections().hashes("model", &[]).fingerprint();
+        let mut tracker = CacheCallTracker::default();
+        let mut messages = vec![ChatMessage::user("first"), ChatMessage::user("second")];
+        tracker.observe_call(observation(&fingerprint, &messages, 1_000, 1_000));
+        messages[1].content = "edited".to_string();
+        let edited = tracker.observe_call(observation(&fingerprint, &messages, 1_100, 900));
+        assert_eq!(edited.append_only, Some(false));
+        assert_eq!(edited.miss_reason, Some(CacheMissReason::PrefixChanged));
+
+        let changed_tools = sections()
+            .hashes("model", &[tool("write_file")])
+            .fingerprint();
+        let tools = tracker.observe_call(observation(&changed_tools, &messages, 1_200, 0));
+        assert_eq!(tools.miss_reason, Some(CacheMissReason::ToolsChanged));
+
+        tracker.mark_compaction();
+        let compacted = tracker.observe_call(observation(&changed_tools, &messages, 1_300, 0));
+        assert_eq!(
+            compacted.miss_reason,
+            Some(CacheMissReason::CompactionReset)
+        );
+
+        let no_cache = CacheCallObservation {
+            cache_expected: false,
+            ..observation(&changed_tools, &messages, 1_400, 0)
+        };
+        assert_eq!(tracker.observe_call(no_cache).miss_reason, None);
+    }
+
+    #[test]
+    fn tracker_seeds_continuity_and_previous_input_from_a_persisted_event() {
+        let messages = vec![ChatMessage::user("one"), ChatMessage::user("two")];
+        let hashes = sections().hashes("model", &[]);
+        let payload = serde_json::json!({
+            "prompt_prefix_hash": hashes.prefix_hash,
+            "core_hash": hashes.core_hash,
+            "project_hash": hashes.project_hash,
+            "tools_hash": hashes.tools_hash,
+            "input_tokens": 4_000,
+            "message_prefix_hash": message_prefix_hash(&messages),
+            "message_prefix_count": 2,
+        });
+        let mut tracker = CacheCallTracker::from_event(Some(&payload));
+        assert_eq!(tracker.previous_input_tokens(), 4_000);
+        assert_eq!(tracker.previous_message_prefix_count(), 2);
+        let mut next = messages;
+        next.push(ChatMessage::user("three"));
+        let fingerprint = sections().hashes("model", &[]).fingerprint();
+        let telemetry = tracker.observe_call(observation(&fingerprint, &next, 4_400, 4_000));
+        assert_eq!(telemetry.append_only, Some(true));
+        assert_eq!(telemetry.previous_input_tokens, 4_000);
+        assert_eq!(telemetry.miss_reason, Some(CacheMissReason::TailDelta));
+    }
+
+    #[test]
+    fn aggregate_l5_fields_compute_ratios_epochs_roles_and_breaks() {
+        let events = vec![
+            event(
+                "context.cache",
+                serde_json::json!({
+                    "agent_role": "leader",
+                    "input_tokens": 1_000,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 50,
+                    "cache_epoch": "e1",
+                    "cache_epoch_source": "prompt_prefix_v3",
+                    "miss_reason": "first_call",
+                    "append_only": false,
+                    "previous_message_prefix_count": 0,
+                    "previous_input_tokens": 0,
+                    "first_token_ms": 100
+                }),
+            ),
+            event(
+                "context.cache",
+                serde_json::json!({
+                    "agent_role": "leader",
+                    "input_tokens": 2_000,
+                    "cache_read_tokens": 1_500,
+                    "output_tokens": 60,
+                    "cache_epoch": "e1",
+                    "cache_epoch_source": "prompt_prefix_v3",
+                    "miss_reason": "tail_delta",
+                    "append_only": true,
+                    "previous_message_prefix_count": 2,
+                    "previous_input_tokens": 1_000,
+                    "theoretical_max_hit_ratio": 0.5,
+                    "first_token_ms": 200
+                }),
+            ),
+            event(
+                "context.cache",
+                serde_json::json!({
+                    "agent_role": "worker",
+                    "input_tokens": 3_000,
+                    "cache_read_tokens": 2_900,
+                    "output_tokens": 70,
+                    "cache_epoch": "e2",
+                    "cache_epoch_source": "prompt_prefix_v3",
+                    "miss_reason": "provider_cache_miss",
+                    "append_only": false,
+                    "previous_message_prefix_count": 3,
+                    "previous_input_tokens": 2_000,
+                    "theoretical_max_hit_ratio": 0.67,
+                    "first_token_ms": 300
+                }),
+            ),
+            event(
+                "context.cache",
+                serde_json::json!({
+                    "agent_role": "cache_warm",
+                    "input_tokens": 500,
+                    "cache_read_tokens": 500,
+                    "output_tokens": 5,
+                    "cache_epoch": "e2",
+                    "warm": true
+                }),
+            ),
+        ];
+        let aggregate = aggregate_cache_events(&events, &[]);
+        assert_eq!(aggregate.calls, 3);
+        assert_eq!(aggregate.warm_calls, 1);
+        assert_eq!(aggregate.input_tokens, 6_500);
+        assert_eq!(aggregate.cache_read_tokens, 4_900);
+        assert_eq!(aggregate.cache_miss_tokens, 1_600);
+        assert!((aggregate.hit_ratio - 4_900.0 / 6_500.0).abs() < 1e-12);
+        assert_eq!(aggregate.append_only_calls, 1);
+        assert_eq!(aggregate.append_only_breaks, 1);
+        assert_eq!(aggregate.last_append_only, Some(false));
+        assert_eq!(aggregate.cache_epoch_timeline.len(), 2);
+        assert_eq!(aggregate.cache_epoch_timeline[0].epoch, "e1");
+        assert_eq!(aggregate.cache_epoch_timeline[0].calls, 2);
+        assert_eq!(aggregate.cache_epoch_timeline[1].epoch, "e2");
+        assert_eq!(aggregate.cache_epoch_timeline[1].calls, 2);
+        assert_eq!(aggregate.per_role.len(), 3);
+        let leader = aggregate
+            .per_role
+            .iter()
+            .find(|bucket| bucket.role == "leader")
+            .unwrap();
+        assert_eq!(leader.calls, 2);
+        assert_eq!(leader.input_tokens, 3_000);
+        assert_eq!(leader.cache_miss_tokens, 1_500);
+        assert_eq!(aggregate.top_miss_reasons[0].key, "first_call");
+        assert_eq!(aggregate.top_miss_reasons[0].calls, 1);
+        assert_eq!(aggregate.hit_ratio_p50, Some(0.75));
+        assert_eq!(aggregate.first_token_p50_ms, Some(200));
+    }
+
+    #[test]
+    fn first_cross_session_hit_is_not_labelled_a_provider_miss() {
+        let fingerprint = sections().hashes("model", &[]).fingerprint();
+        let mut tracker = CacheCallTracker::default();
+        let messages = vec![ChatMessage::user("first")];
+        let telemetry = tracker.observe_call(observation(&fingerprint, &messages, 1_000, 600));
+        assert_eq!(telemetry.miss_reason, None);
+        assert_eq!(telemetry.cache_miss_tokens, 400);
+        assert_eq!(telemetry.append_only, None);
+        assert_eq!(telemetry.theoretical_max_hit_ratio, 0.0);
+        // The next call can now compare against the persisted local prompt.
+        let mut next = messages;
+        next.push(ChatMessage::user("second"));
+        let second = tracker.observe_call(observation(&fingerprint, &next, 1_200, 1_000));
+        assert_eq!(second.append_only, Some(true));
+        assert_eq!(second.miss_reason, Some(CacheMissReason::TailDelta));
+        assert!((second.theoretical_max_hit_ratio - 1_000.0 / 1_200.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn no_cache_expected_suppresses_reasons_but_keeps_token_math() {
+        let fingerprint = sections().hashes("model", &[]).fingerprint();
+        let mut tracker = CacheCallTracker::default();
+        let messages = vec![ChatMessage::user("first")];
+        let telemetry = tracker.observe_call(CacheCallObservation {
+            cache_expected: false,
+            ..observation(&fingerprint, &messages, 1_000, 0)
+        });
+        assert_eq!(telemetry.miss_reason, None);
+        assert_eq!(telemetry.cache_miss_tokens, 1_000);
+        assert_eq!(telemetry.cache_hit_ratio, 0.0);
+    }
+
+    #[test]
+    fn aggregate_clamps_inconsistent_counts_and_bounds_epochs_and_reasons() {
+        let mut events = Vec::new();
+        for index in 0..25u64 {
+            events.push(event(
+                "context.cache",
+                serde_json::json!({
+                    "agent_role": if index % 2 == 0 { "leader" } else { "worker" },
+                    "input_tokens": 100,
+                    // Deliberately inconsistent: more reads than input.
+                    "cache_read_tokens": if index == 0 { 250 } else { 90 },
+                    "cache_write_tokens": 500,
+                    "cache_epoch": format!("epoch-{index:02}"),
+                    "miss_reason": format!("reason-{index:02}"),
+                    "append_only": true,
+                    "previous_message_prefix_count": 1,
+                    "previous_input_tokens": 100
+                }),
+            ));
+        }
+        let aggregate = aggregate_cache_events(&events, &[]);
+        assert_eq!(aggregate.input_tokens, 2_500);
+        assert_eq!(aggregate.cache_read_tokens, 2_260);
+        assert_eq!(aggregate.cache_miss_tokens, 240);
+        assert!(aggregate.hit_ratio <= 1.0);
+        assert_eq!(aggregate.cache_epoch_timeline.len(), 20);
+        assert_eq!(aggregate.cache_epoch_timeline[0].epoch, "epoch-05");
+        assert_eq!(aggregate.cache_epoch_timeline[19].epoch, "epoch-24");
+        assert_eq!(aggregate.top_miss_reasons.len(), 5);
+        assert_eq!(aggregate.top_miss_reasons[0].key, "reason-00");
+        assert_eq!(aggregate.per_role.len(), 2);
+        assert!(
+            aggregate
+                .per_role
+                .iter()
+                .all(|bucket| bucket.hit_ratio <= 1.0)
+        );
+    }
+
+    #[test]
+    fn aggregate_handles_zero_input_without_nan() {
+        let events = vec![event(
+            "context.cache",
+            serde_json::json!({
+                "input_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_miss_tokens": 0,
+                "cache_hit_ratio": serde_json::Value::Null,
+                "theoretical_max_hit_ratio": serde_json::Value::Null,
+                "append_only": false,
+                "previous_message_prefix_count": 0,
+                "previous_input_tokens": 0
+            }),
+        )];
+        let aggregate = aggregate_cache_events(&events, &[]);
+        assert_eq!(aggregate.hit_ratio, 0.0);
+        assert_eq!(aggregate.hit_ratio_p50, None);
+        assert_eq!(aggregate.latest_theoretical_max_hit_ratio, 0.0);
+        assert_eq!(aggregate.append_only_breaks, 0);
+    }
+
+    #[test]
+    fn cache_call_record_reads_l5_fields_and_derives_missing_miss_tokens() {
+        let record = cache_call_record(
+            &serde_json::json!({
+                "input_tokens": 1_000,
+                "cache_read_tokens": 900,
+                "message_prefix_hash": "message",
+                "previous_message_prefix_hash": "previous",
+                "message_prefix_count": 4,
+                "previous_message_prefix_count": 2,
+                "append_only": true,
+                "cache_epoch": "epoch",
+                "cache_epoch_source": "prompt_prefix_v3",
+                "theoretical_max_hit_ratio": 0.91,
+                "previous_input_tokens": 910
+            }),
+            "now",
+        );
+        assert_eq!(record.cache_miss_tokens, 100);
+        assert_eq!(record.message_prefix_hash.as_deref(), Some("message"));
+        assert_eq!(record.previous_message_prefix_count, 2);
+        assert_eq!(record.append_only, Some(true));
+        assert_eq!(record.cache_epoch.as_deref(), Some("epoch"));
+        assert_eq!(record.theoretical_max_hit_ratio, 0.91);
+
+        let legacy = cache_call_record(&serde_json::json!({"input_tokens": 10}), "now");
+        assert_eq!(legacy.cache_miss_tokens, 10);
+        assert_eq!(legacy.append_only, None);
     }
 }
 

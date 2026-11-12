@@ -213,7 +213,182 @@ pub fn audit_cache_events(
         ));
     }
 
-    // 10. The prefix plan is the authoritative expectation. If a later call
+    // 10. L5 continuity. A break after the first observation means the
+    //     canonical message list was edited/reordered or a prior message was
+    //     re-serialized differently. The audit cannot repair it and must not
+    //     pretend the provider caused it.
+    if aggregate.append_only_breaks > 0 {
+        let first_break = cache_events
+            .iter()
+            .find(|event| {
+                event
+                    .payload
+                    .get("append_only")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(false)
+                    && (payload_u64(event, "previous_message_prefix_count") > 0
+                        || payload_u64(event, "previous_input_tokens") > 0)
+            })
+            .or_else(|| cache_events.first());
+        let mut evidence =
+            BTreeMap::from([("breaks".to_string(), aggregate.append_only_breaks.into())]);
+        if let Some(event) = first_break {
+            evidence.insert(
+                "first_break_at".to_string(),
+                event.created_at.clone().into(),
+            );
+            if let Some(hash) = payload_str(event, "previous_message_prefix_hash") {
+                evidence.insert("previous_message_prefix_hash".to_string(), hash.into());
+            }
+            if let Some(hash) = payload_str(event, "message_prefix_hash") {
+                evidence.insert("message_prefix_hash".to_string(), hash.into());
+            }
+            if let Some(reason) = payload_str(event, "miss_reason") {
+                evidence.insert("miss_reason".to_string(), reason.into());
+            }
+        }
+        findings.push(finding(
+            "append_only_prefix_break",
+            "warning",
+            format!(
+                "{} call(s) did not extend the previous canonical message list; prior history may have been edited, reordered, or re-serialized",
+                aggregate.append_only_breaks
+            ),
+            evidence,
+        ));
+    }
+
+    // 11. Epoch churn separates our stable-identity changes from a provider
+    //     eviction. More than one epoch is expected after an intentional
+    //     model/tool/project change; it is informational evidence, not an
+    //     error by itself.
+    if aggregate.cache_epoch_timeline.len() > 1 {
+        findings.push(finding(
+            "cache_epoch_churn",
+            "info",
+            format!(
+                "{} cache epochs were observed in the bounded window; check whether a model, tool bundle, project section, or compaction boundary changed",
+                aggregate.cache_epoch_timeline.len()
+            ),
+            BTreeMap::from([(
+                "epochs".to_string(),
+                aggregate.cache_epoch_timeline.len().into(),
+            )]),
+        ));
+    }
+
+    // 12. Theoretical max is the append-only headroom implied by the previous
+    //     prompt. A sustained gap means a provider eviction or a larger tail
+    //     than the message history explains; it is not a TTL fact.
+    let observed_hit_ratio = aggregate.hit_ratio;
+    let theoretical = aggregate.theoretical_max_p50.unwrap_or(0.0);
+    if aggregate.calls >= 5 && theoretical >= 0.5 && observed_hit_ratio + 0.05 < theoretical {
+        findings.push(finding(
+            "theoretical_cache_headroom_gap",
+            "warning",
+            format!(
+                "observed cache-read share is {:.1}% but the append-only prompt headroom is {:.1}%; inspect provider eviction and uncached tail size",
+                observed_hit_ratio * 100.0,
+                theoretical * 100.0
+            ),
+            BTreeMap::from([
+                ("hit_ratio".to_string(), observed_hit_ratio.into()),
+                ("theoretical_max_hit_ratio".to_string(), theoretical.into()),
+                ("calls".to_string(), aggregate.calls.into()),
+            ]),
+        ));
+    }
+
+    // 13. Long-context sessions have an explicit acceptance target. Report a
+    //     miss honestly; short sessions are not compared against the 99.x
+    //     target because their initial prompt dominates the denominator.
+    if aggregate.calls >= 5 && aggregate.input_tokens >= 200_000 {
+        if observed_hit_ratio < 0.99 {
+            findings.push(finding(
+                "long_context_cache_below_99",
+                "warning",
+                format!(
+                    "long-context session hit ratio is {:.2}%; the working target is 99.0% and the stretch target is 99.84%",
+                    observed_hit_ratio * 100.0
+                ),
+                BTreeMap::from([
+                    ("hit_ratio".to_string(), observed_hit_ratio.into()),
+                    ("input_tokens".to_string(), aggregate.input_tokens.into()),
+                    ("cache_miss_tokens".to_string(), aggregate.cache_miss_tokens.into()),
+                ]),
+            ));
+        } else if observed_hit_ratio < 0.995 {
+            findings.push(finding(
+                "long_context_cache_below_995",
+                "info",
+                format!(
+                    "long-context session hit ratio is {:.2}%; the long-prefix benchmark target is 99.5% and the stretch target is 99.84%",
+                    observed_hit_ratio * 100.0
+                ),
+                BTreeMap::from([
+                    ("hit_ratio".to_string(), observed_hit_ratio.into()),
+                    ("cache_miss_tokens".to_string(), aggregate.cache_miss_tokens.into()),
+                ]),
+            ));
+        }
+    }
+
+    // 14. Legacy events cannot prove continuity. Say so instead of treating
+    //     missing append-only fields as a break.
+    let continuity_observed = cache_events.iter().any(|event| {
+        event
+            .payload
+            .get("append_only")
+            .and_then(serde_json::Value::as_bool)
+            .is_some()
+    });
+    if calls_checked >= 2 && !continuity_observed {
+        findings.push(finding(
+            "missing_append_only_telemetry",
+            "info",
+            "cache events predate append-only continuity telemetry; the audit cannot distinguish a provider miss from a message-list break"
+                .to_string(),
+            BTreeMap::from([("calls".to_string(), calls_checked.into())]),
+        ));
+    }
+
+    // 15. Identify the first stable section key that changed between the two
+    //     latest prompt-prefix events. It is intentionally a key/hash diff, not
+    //     a prompt-text diff: operators get a section to inspect without the
+    //     audit ever reading prompt content.
+    if let Some(change) = first_stable_section_change(prefix_events) {
+        let (key, previous_hash, current_hash) = change;
+        findings.push(finding(
+            "stable_section_changed",
+            "warning",
+            format!(
+                "stable section '{key}' changed between the two latest prompt-prefix observations; check source/skill/model/tool edits before blaming the provider"
+            ),
+            BTreeMap::from([
+                ("section_key".to_string(), key.into()),
+                ("previous_hash".to_string(), previous_hash.into()),
+                ("current_hash".to_string(), current_hash.into()),
+            ]),
+        ));
+    }
+
+    // 16. A placeholder epoch is expected before L4 finalization. Surface it so
+    //     an operator does not treat the prompt-prefix hash as a finalized
+    //     cache-epoch identity.
+    if cache_events.iter().any(|event| {
+        payload_bool(event, "cache_epoch_placeholder") == Some(true)
+            || payload_str(event, "cache_epoch_source") == Some("l1_placeholder")
+    }) {
+        findings.push(finding(
+            "cache_epoch_placeholder",
+            "info",
+            "one or more calls use the prompt-prefix placeholder as the cache epoch; a later epoch lifecycle can finalize the identity without changing this report"
+                .to_string(),
+            BTreeMap::new(),
+        ));
+    }
+
+    // 17. The prefix plan is the authoritative expectation. If a later call
     //     reports a different provider plan, surface the mismatch instead of
     //     silently trusting telemetry.
     // 11. Epoch churn is distinct from tool/project churn: it says the stable
@@ -492,6 +667,14 @@ pub fn audit_cache_events(
         cache_write_tokens,
         findings,
         clean,
+        input_tokens,
+        cache_miss_tokens: aggregate.cache_miss_tokens,
+        theoretical_max_hit_ratio: aggregate.latest_theoretical_max_hit_ratio,
+        hit_ratio_p50: aggregate.hit_ratio_p50,
+        hit_ratio_p95: aggregate.hit_ratio_p95,
+        append_only_calls: aggregate.append_only_calls,
+        append_only_breaks: aggregate.append_only_breaks,
+        cache_epochs: aggregate.cache_epoch_timeline.len() as u64,
     }
 }
 
@@ -527,6 +710,57 @@ fn payload_u64(event: &Event, key: &str) -> u64 {
 
 fn payload_str<'a>(event: &'a Event, key: &str) -> Option<&'a str> {
     event.payload.get(key).and_then(serde_json::Value::as_str)
+}
+
+fn payload_bool(event: &Event, key: &str) -> Option<bool> {
+    event.payload.get(key).and_then(serde_json::Value::as_bool)
+}
+
+/// Compare the ordered head-section key/hash list between the two latest
+/// prompt-prefix events. Returns the first changed key and both hashes. A new
+/// or removed section is also a change; the missing side is reported as an
+/// empty hash rather than a fabricated value.
+fn first_stable_section_change(prefix_events: &[Event]) -> Option<(String, String, String)> {
+    let mut latest = prefix_events
+        .iter()
+        .rev()
+        .filter_map(|event| {
+            let sections = event.payload.get("head_sections")?.as_array()?;
+            let pairs = sections
+                .iter()
+                .filter_map(|section| {
+                    Some((
+                        section.get("key")?.as_str()?.to_string(),
+                        section.get("hash")?.as_str()?.to_string(),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            (!pairs.is_empty()).then_some(pairs)
+        })
+        .take(2);
+    let current = latest.next()?;
+    let previous = latest.next()?;
+    for (index, (key, hash)) in current.iter().enumerate() {
+        match previous.get(index) {
+            Some((previous_key, previous_hash)) if previous_key == key && previous_hash == hash => {
+            }
+            Some((previous_key, previous_hash)) if previous_key == key => {
+                return Some((key.clone(), previous_hash.clone(), hash.clone()));
+            }
+            Some((previous_key, previous_hash)) => {
+                return Some((
+                    key.clone(),
+                    format!("{previous_key}:{previous_hash}"),
+                    hash.clone(),
+                ));
+            }
+            None => return Some((key.clone(), String::new(), hash.clone())),
+        }
+    }
+    if let Some((key, hash)) = previous.get(current.len()) {
+        return Some((key.clone(), hash.clone(), String::new()));
+    }
+    None
 }
 
 fn sum_u64(events: &[Event], key: &str) -> u64 {
@@ -581,7 +815,10 @@ mod tests {
                 "project_hash": "p1",
                 "core_hash": "c1",
                 "tools_hash": "t1",
-                "prompt_prefix_hash": "x"
+                "prompt_prefix_hash": "x",
+                "append_only": true,
+                "previous_message_prefix_count": 0,
+                "previous_input_tokens": 0
             })),
             cache(serde_json::json!({
                 "input_tokens": 1200,
@@ -592,7 +829,10 @@ mod tests {
                 "project_hash": "p1",
                 "core_hash": "c1",
                 "tools_hash": "t1",
-                "prompt_prefix_hash": "x"
+                "prompt_prefix_hash": "x",
+                "append_only": true,
+                "previous_message_prefix_count": 2,
+                "previous_input_tokens": 1000
             })),
         ];
         let result = audit_cache_events(
@@ -896,5 +1136,213 @@ mod tests {
         assert_eq!(finding.severity, "warning");
         assert_eq!(finding.evidence["planned"].as_u64(), Some(4));
         assert_eq!(finding.evidence["observed"].as_u64(), Some(3));
+    }
+
+    #[test]
+    fn append_only_break_and_epoch_churn_are_reported() {
+        let events = vec![
+            cache(serde_json::json!({
+                "input_tokens": 1_000,
+                "cache_read_tokens": 900,
+                "cache_epoch": "e1",
+                "cache_epoch_source": "prompt_prefix_v3",
+                "message_prefix_hash": "current",
+                "previous_message_prefix_hash": "previous",
+                "previous_message_prefix_count": 2,
+                "previous_input_tokens": 900,
+                "append_only": true,
+                "cache_breakpoints": 4,
+                "cache_ttl": "5m",
+                "core_hash": "c",
+                "project_hash": "p",
+                "tools_hash": "t",
+                "prompt_prefix_hash": "x"
+            })),
+            cache(serde_json::json!({
+                "input_tokens": 1_100,
+                "cache_read_tokens": 0,
+                "cache_epoch": "e2",
+                "cache_epoch_source": "prompt_prefix_v3",
+                "message_prefix_hash": "current-2",
+                "previous_message_prefix_hash": "current",
+                "previous_message_prefix_count": 2,
+                "previous_input_tokens": 1_000,
+                "append_only": false,
+                "miss_reason": "prefix_changed",
+                "cache_breakpoints": 4,
+                "cache_ttl": "5m",
+                "core_hash": "c",
+                "project_hash": "p",
+                "tools_hash": "t",
+                "prompt_prefix_hash": "x"
+            })),
+        ];
+        let result = audit_cache_events("ses-1", Some("deepseek"), None, &events, &[], &[], &[]);
+        let codes = codes(&result);
+        assert!(codes.contains(&"append_only_prefix_break"));
+        assert!(codes.contains(&"cache_epoch_churn"));
+        assert_eq!(result.append_only_breaks, 1);
+        assert_eq!(result.append_only_calls, 1);
+        assert_eq!(result.cache_epochs, 2);
+        assert_eq!(result.input_tokens, 2_100);
+        assert_eq!(result.cache_miss_tokens, 1_200);
+        let break_finding = result
+            .findings
+            .iter()
+            .find(|finding| finding.code == "append_only_prefix_break")
+            .unwrap();
+        assert_eq!(break_finding.evidence["breaks"].as_u64(), Some(1));
+        assert_eq!(
+            break_finding.evidence["previous_message_prefix_hash"].as_str(),
+            Some("current")
+        );
+    }
+
+    #[test]
+    fn theoretical_headroom_gap_and_long_context_targets_are_reported() {
+        let events = (0..5)
+            .map(|_| {
+                cache(serde_json::json!({
+                    "input_tokens": 50_000,
+                    "cache_read_tokens": 45_000,
+                    "cache_miss_tokens": 5_000,
+                    "theoretical_max_hit_ratio": 0.99,
+                    "append_only": true,
+                    "previous_message_prefix_count": 1,
+                    "previous_input_tokens": 49_000,
+                    "cache_breakpoints": 0,
+                    "cache_ttl": "5m"
+                }))
+            })
+            .collect::<Vec<_>>();
+        let result = audit_cache_events(
+            "ses-1",
+            Some("openai-compatible"),
+            None,
+            &events,
+            &[],
+            &[],
+            &[],
+        );
+        let codes = codes(&result);
+        assert!(codes.contains(&"theoretical_cache_headroom_gap"));
+        assert!(codes.contains(&"long_context_cache_below_99"));
+        assert_eq!(result.input_tokens, 250_000);
+        assert_eq!(result.cache_miss_tokens, 25_000);
+        assert_eq!(result.theoretical_max_hit_ratio, 0.99);
+    }
+
+    #[test]
+    fn first_changed_stable_section_and_placeholder_epoch_are_reported() {
+        let prefix_events = vec![
+            event(
+                "context.prompt_prefix",
+                serde_json::json!({
+                    "head_sections": [
+                        {"key": "core/charter", "hash": "c1", "ordinal": 10, "tail": false},
+                        {"key": "project/sources", "hash": "p1", "ordinal": 30, "tail": false}
+                    ]
+                }),
+            ),
+            event(
+                "context.prompt_prefix",
+                serde_json::json!({
+                    "head_sections": [
+                        {"key": "core/charter", "hash": "c1", "ordinal": 10, "tail": false},
+                        {"key": "project/sources", "hash": "p2", "ordinal": 30, "tail": false}
+                    ]
+                }),
+            ),
+        ];
+        let cache_events = vec![cache(serde_json::json!({
+            "input_tokens": 100,
+            "cache_read_tokens": 10,
+            "cache_epoch": "epoch",
+            "cache_epoch_source": "l1_placeholder",
+            "cache_epoch_placeholder": true,
+            "cache_breakpoints": 0,
+            "cache_ttl": "5m"
+        }))];
+        let result = audit_cache_events(
+            "ses-1",
+            Some("deepseek"),
+            None,
+            &cache_events,
+            &prefix_events,
+            &[],
+            &[],
+        );
+        let codes = codes(&result);
+        assert!(codes.contains(&"stable_section_changed"));
+        assert!(codes.contains(&"cache_epoch_placeholder"));
+        let change = result
+            .findings
+            .iter()
+            .find(|finding| finding.code == "stable_section_changed")
+            .unwrap();
+        assert_eq!(
+            change.evidence["section_key"].as_str(),
+            Some("project/sources")
+        );
+        assert_eq!(change.evidence["previous_hash"].as_str(), Some("p1"));
+        assert_eq!(change.evidence["current_hash"].as_str(), Some("p2"));
+    }
+
+    #[test]
+    fn first_changed_section_detects_added_removed_and_reordered_sections() {
+        let event_with = |sections: serde_json::Value| {
+            event(
+                "context.prompt_prefix",
+                serde_json::json!({"head_sections": sections}),
+            )
+        };
+        let base = event_with(serde_json::json!([
+            {"key": "core/charter", "hash": "c1", "ordinal": 10, "tail": false},
+            {"key": "project/sources", "hash": "p1", "ordinal": 30, "tail": false}
+        ]));
+        let added = event_with(serde_json::json!([
+            {"key": "core/charter", "hash": "c1", "ordinal": 10, "tail": false},
+            {"key": "project/sources", "hash": "p1", "ordinal": 30, "tail": false},
+            {"key": "project/skills", "hash": "s1", "ordinal": 40, "tail": false}
+        ]));
+        let removed = event_with(serde_json::json!([
+            {"key": "core/charter", "hash": "c1", "ordinal": 10, "tail": false}
+        ]));
+        let reordered = event_with(serde_json::json!([
+            {"key": "project/sources", "hash": "p1", "ordinal": 30, "tail": false},
+            {"key": "core/charter", "hash": "c1", "ordinal": 10, "tail": false}
+        ]));
+        let added_change =
+            first_stable_section_change(&[base.clone(), added]).expect("added section");
+        assert_eq!(added_change.0, "project/skills");
+        assert_eq!(added_change.1, "");
+        let removed_change =
+            first_stable_section_change(&[base.clone(), removed]).expect("removed section");
+        assert_eq!(removed_change.0, "project/sources");
+        assert_eq!(removed_change.2, "");
+        let reordered_change =
+            first_stable_section_change(&[base, reordered]).expect("reordered sections");
+        assert_eq!(reordered_change.0, "project/sources");
+        assert!(reordered_change.1.contains("core/charter"));
+    }
+
+    #[test]
+    fn legacy_events_are_reported_as_missing_continuity_not_a_break() {
+        let events = (0..2)
+            .map(|_| {
+                cache(serde_json::json!({
+                    "input_tokens": 100,
+                    "cache_read_tokens": 50,
+                    "cache_breakpoints": 0,
+                    "cache_ttl": "5m"
+                }))
+            })
+            .collect::<Vec<_>>();
+        let result = audit_cache_events("ses-1", None, None, &events, &[], &[], &[]);
+        let codes = codes(&result);
+        assert!(codes.contains(&"missing_append_only_telemetry"));
+        assert!(!codes.contains(&"append_only_prefix_break"));
+        assert_eq!(result.append_only_breaks, 0);
+        assert_eq!(result.cache_epochs, 0);
     }
 }

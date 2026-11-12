@@ -12,6 +12,7 @@
 //! deterministic in-process fake; real-provider mode requires an explicit flag
 //! and environment gate.
 
+pub mod cache_bench;
 pub mod cli;
 pub mod compare;
 pub mod fixture;
@@ -21,6 +22,17 @@ pub mod report;
 pub mod runner;
 pub mod scenario;
 
+pub use cache_bench::{
+    CACHE_BENCH_SCHEMA, CacheBenchAcceptance, CacheBenchAggregate, CacheBenchCall,
+    CacheBenchCommand, CacheBenchComparison, CacheBenchMatrix, CacheBenchMatrixArgs,
+    CacheBenchMode, CacheBenchPricing, CacheBenchRefusal, CacheBenchReport, CacheBenchRunArgs,
+    CacheBenchScenario, CacheBenchScenarioConfig, CacheBenchScenarioKind, CostEstimate,
+    LONG_PREFIX_HIT_TARGET, LONG_PREFIX_STRETCH_TARGET, LiveCacheBenchSettings, LiveRunOptions,
+    PrefixCacheSimulator, SIMULATOR_BLOCK_SIZE, ScenarioSizeCheck, compare_cache_bench_reports,
+    execute as execute_cache_bench, load_cache_bench_report, long_prefix_scenario,
+    run_live_benchmark, run_live_benchmark_with_options, run_live_benchmark_with_provider,
+    run_simulated_benchmark, write_cache_bench_artifacts,
+};
 pub use compare::{
     CompareOptions, CompareRefusal, ComparisonMismatch, ComparisonReport, compare_reports,
 };

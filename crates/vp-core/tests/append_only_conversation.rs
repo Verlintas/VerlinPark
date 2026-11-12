@@ -235,7 +235,7 @@ async fn normal_turns_are_append_only_and_carry_canonical_telemetry() {
     assert_eq!(events.len(), 2, "two ordinary cache observations");
     let first_event = &events[0].payload;
     let second_event = &events[1].payload;
-    assert_eq!(first_event["append_only"], false);
+    assert!(first_event["append_only"].is_null());
     assert_eq!(first_event["cache_break_reason"], "first_call");
     assert_eq!(second_event["append_only"], true);
     assert_eq!(
@@ -411,7 +411,7 @@ async fn memory_is_appended_once_and_keeps_history_append_only_across_runs() {
         .await
         .unwrap();
     assert_eq!(cache.len(), 3);
-    assert_eq!(cache[0].payload["append_only"], false);
+    assert!(cache[0].payload["append_only"].is_null());
     assert_eq!(cache[1].payload["append_only"], true);
     assert_eq!(cache[2].payload["append_only"], true);
     assert_eq!(
@@ -466,15 +466,12 @@ async fn first_call_break_has_no_previous_hash_and_legacy_events_still_decode() 
         .await
         .unwrap();
     assert_eq!(cache.len(), 1);
-    assert_eq!(
-        cache[0].payload["previous_message_prefix_hash"],
-        serde_json::json!("")
-    );
+    assert!(cache[0].payload["previous_message_prefix_hash"].is_null());
     assert_eq!(cache[0].payload["previous_message_count"], 0);
 
     let status = engine.session_cache_status(&session.id).await.unwrap();
     assert!(status.cache_calls >= 1);
-    assert!(!status.last_append_only);
+    assert!(!status.last_append_only.unwrap_or(false));
     assert!(
         status
             .recent_breaks
@@ -483,7 +480,7 @@ async fn first_call_break_has_no_previous_hash_and_legacy_events_still_decode() 
     );
     assert!(status.last_message_prefix_hash.is_some());
     assert_eq!(status.append_only_calls, 0);
-    assert_eq!(status.non_append_only_calls, 1);
+    assert_eq!(status.non_append_only_calls, 0);
     assert_eq!(
         status.last_tail_system_capability.as_deref(),
         Some("supported")
@@ -523,7 +520,7 @@ async fn session_cache_projection_is_bounded_and_content_free() {
 
     let status = engine.session_cache_status(&session.id).await.unwrap();
     assert_eq!(status.append_only_calls, 1);
-    assert_eq!(status.non_append_only_calls, 1);
+    assert_eq!(status.non_append_only_calls, 0);
     assert!(status.recent_calls.len() <= 20);
     assert!(status.recent_breaks.len() <= 20);
     assert!(
@@ -536,7 +533,7 @@ async fn session_cache_projection_is_bounded_and_content_free() {
         status.recent_calls[0].message_prefix_hash.as_deref(),
         status.last_message_prefix_hash.as_deref()
     );
-    assert!(status.recent_calls[0].append_only);
+    assert_eq!(status.recent_calls[0].append_only, Some(true));
     let encoded = serde_json::to_string(&status).unwrap();
     assert!(!encoded.contains("do work"));
     assert!(!encoded.contains("all done"));
@@ -695,7 +692,7 @@ async fn cache_breaks_rpc_is_bounded_and_newest_first() {
         .unwrap();
     assert_eq!(result.session_id, session.id);
     assert_eq!(result.append_only_calls, 1);
-    assert_eq!(result.non_append_only_calls, 1);
+    assert_eq!(result.non_append_only_calls, 0);
     assert_eq!(result.breaks.len(), 1);
     assert!(result.total_breaks >= 2);
     assert!(result.truncated);

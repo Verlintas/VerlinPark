@@ -11,6 +11,7 @@ struct EfficiencySnapshot: Equatable, Sendable {
 
     let scope: Scope
     let cacheHitRatio: Double?
+    let inputTokens: Int?
     let cacheReadTokens: Int?
     let cacheWriteTokens: Int?
     let uncachedInputTokens: Int?
@@ -52,12 +53,57 @@ struct EfficiencySnapshot: Equatable, Sendable {
     let promptPrefixHash: String?
     let governor: GovernorSessionStatus?
     let ratioIsFromDaemon: Bool
+    // L5 cache-panel telemetry. All values are daemon-reported or derived from
+    // daemon-reported token counts; the view never invents a ratio.
+    let cacheMissTokens: Int?
+    let theoreticalMaxHitRatio: Double?
+    let cacheEpoch: String?
+    let cacheEpochSource: String?
+    let appendOnlyCalls: Int?
+    let appendOnlyBreaks: Int?
+    let lastAppendOnly: Bool?
+    let hitRatioP50: Double?
+    let hitRatioP95: Double?
+    let theoreticalMaxP50: Double?
+    let theoreticalMaxP95: Double?
+    let costUSD: Double?
+    let cacheEpochTimeline: [SessionCacheEpochBucket]
+    let perRole: [SessionCacheRoleBucket]
+    let topMissReasons: [SessionCacheCountBucket]
+    let crossSessionReuseSessions: Int?
+    let crossSessionHitTokens: Int?
+    let crossSessionCallsObserved: Int?
+    let compactionLostCacheUSD: Double?
+    let toolBundle: String?
 
     var contextUsageFraction: Double? {
         guard let contextEstimatedTokens, let contextWindow, contextWindow > 0 else {
             return nil
         }
         return min(1, max(0, Double(contextEstimatedTokens) / Double(contextWindow)))
+    }
+
+    /// Uncached prompt tokens. Prefer the daemon's explicit value and otherwise
+    /// normalize total input by the cache-read subset (never negative).
+    var resolvedCacheMissTokens: Int? {
+        if let cacheMissTokens {
+            return max(0, cacheMissTokens)
+        }
+        guard let inputTokens else { return nil }
+        return max(0, inputTokens - max(0, cacheReadTokens ?? 0))
+    }
+
+    /// How many percentage points of append-only headroom the provider did not
+    /// serve. A positive value is not automatically a fault: the new tail must
+    /// miss. The audit explains the difference.
+    var cacheHeadroomGap: Double? {
+        guard let theoreticalMaxHitRatio, let cacheHitRatio else { return nil }
+        return max(0, theoreticalMaxHitRatio - cacheHitRatio)
+    }
+
+    var appendOnlyKnownCalls: Int? {
+        guard let appendOnlyCalls, let appendOnlyBreaks else { return nil }
+        return appendOnlyCalls + appendOnlyBreaks
     }
 
     var costPerSession: Double? {
@@ -138,10 +184,12 @@ enum EfficiencyMetrics {
     static func missReasonLabel(_ reason: String) -> String {
         switch reason {
         case "first_call": "first call"
+        case "tail_delta": "new tail"
         case "prefix_changed": "prefix changed"
         case "tools_changed": "tools changed"
         case "project_changed": "project changed"
         case "ttl_or_provider_miss": "TTL or provider miss"
+        case "provider_cache_miss": "provider miss"
         case "compaction_reset": "compaction reset"
         case "unknown": "unknown"
         default: reason
@@ -203,6 +251,7 @@ enum EfficiencyMetrics {
         return EfficiencySnapshot(
             scope: scope,
             cacheHitRatio: ratio,
+            inputTokens: cache?.inputTokens ?? totals?.inputTokens,
             cacheReadTokens: cacheReadTokens,
             cacheWriteTokens: cacheWriteTokens,
             uncachedInputTokens: uncachedInputTokens,
@@ -252,7 +301,27 @@ enum EfficiencyMetrics {
                 ?? contextUsage?.preambleTokensEstimate,
             promptPrefixHash: cache?.promptPrefixHash ?? latestPrefixHash,
             governor: governor,
-            ratioIsFromDaemon: ratioIsFromDaemon
+            ratioIsFromDaemon: ratioIsFromDaemon,
+            cacheMissTokens: cache?.cacheMissTokens,
+            theoreticalMaxHitRatio: cache?.theoreticalMaxHitRatio,
+            cacheEpoch: cache?.cacheEpoch,
+            cacheEpochSource: cache?.cacheEpochSource,
+            appendOnlyCalls: cache?.appendOnlyCalls,
+            appendOnlyBreaks: cache?.appendOnlyBreaks,
+            lastAppendOnly: cache?.lastAppendOnly,
+            hitRatioP50: cache?.hitRatioP50,
+            hitRatioP95: cache?.hitRatioP95,
+            theoreticalMaxP50: cache?.theoreticalMaxP50,
+            theoreticalMaxP95: cache?.theoreticalMaxP95,
+            costUSD: cache?.costUSD ?? totals?.costUsd,
+            cacheEpochTimeline: cache?.cacheEpochTimeline ?? [],
+            perRole: cache?.perRole ?? [],
+            topMissReasons: cache?.topMissReasons ?? [],
+            crossSessionReuseSessions: cache?.crossSessionReuseSessions,
+            crossSessionHitTokens: cache?.crossSessionHitTokens,
+            crossSessionCallsObserved: cache?.crossSessionCallsObserved,
+            compactionLostCacheUSD: cache?.compactionLostCacheUSD,
+            toolBundle: cache?.recentCalls.first?.toolBundle
         )
     }
 

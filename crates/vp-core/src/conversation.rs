@@ -370,15 +370,15 @@ pub fn aggregate_continuity(
         {
             continue;
         }
-        let Some(append_only) = payload.get("append_only").and_then(Value::as_bool) else {
-            continue;
-        };
-        if append_only {
-            aggregate.append_only_calls = aggregate.append_only_calls.saturating_add(1);
-        } else {
-            aggregate.non_append_only_calls = aggregate.non_append_only_calls.saturating_add(1);
+        let append_only = payload.get("append_only").and_then(Value::as_bool);
+        if let Some(append_only) = append_only {
+            if append_only {
+                aggregate.append_only_calls = aggregate.append_only_calls.saturating_add(1);
+            } else {
+                aggregate.non_append_only_calls = aggregate.non_append_only_calls.saturating_add(1);
+            }
+            aggregate.last_append_only = append_only;
         }
-        aggregate.last_append_only = append_only;
         aggregate.last_message_prefix_hash = payload
             .get("message_prefix_hash")
             .and_then(Value::as_str)

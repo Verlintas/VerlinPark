@@ -138,6 +138,17 @@ enum Command {
         #[command(subcommand)]
         command: vp_bench::cli::BenchCommand,
     },
+    /// Run the deterministic prompt-cache benchmark, or the explicit live mode.
+    ///
+    /// With no subcommand this runs the deterministic simulator. `run` is the
+    /// explicit spelling; `compare` and `report` operate on saved JSON.
+    #[command(name = "cache-bench")]
+    CacheBench {
+        #[command(subcommand)]
+        command: Option<vp_bench::cache_bench::CacheBenchCommand>,
+        #[command(flatten)]
+        run: vp_bench::cache_bench::CacheBenchRunArgs,
+    },
     /// Explicitly install, remove, or inspect the user LaunchAgent for verlinpadd.
     DaemonAgent {
         #[command(subcommand)]
@@ -1076,6 +1087,14 @@ enum Command {
     ProjectBudget { project: String },
     /// Show token/cost usage grouped by session for a project.
     ProjectUsage { project: String },
+    /// Show aggregate prompt-cache telemetry across a project's sessions.
+    #[command(name = "project-cache")]
+    ProjectCache {
+        project: String,
+        /// Bounded event scan (default 5000, max 50000).
+        #[arg(long)]
+        limit: Option<u32>,
+    },
     /// Set or clear the project-wide shared budget.
     ProjectBudgetSet {
         project: String,
@@ -2250,6 +2269,23 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Show a bounded per-call cache table with optional role/reason filters.
+    #[command(name = "cache-calls")]
+    CacheCalls {
+        session: String,
+        /// Newest-first row limit (1-100, default 20).
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Exact role filter (`leader`, `worker`, ...).
+        #[arg(long)]
+        role: Option<String>,
+        /// Exact miss-reason filter (`tail_delta`, `provider_cache_miss`, ...).
+        #[arg(long)]
+        miss_reason: Option<String>,
+        /// Include explicit warm calls.
+        #[arg(long)]
+        include_warm: bool,
+    },
     /// Show the ordered content-addressed instruction sections and hashes.
     /// Section text is never printed.
     Instructions {
@@ -3034,6 +3070,18 @@ async fn run(cli: Cli) -> Result<()> {
             }
         };
     }
+    if let Command::CacheBench { command, run } = &cli.command {
+        let command = command
+            .clone()
+            .unwrap_or(vp_bench::cache_bench::CacheBenchCommand::Run(run.clone()));
+        match vp_bench::cache_bench::execute(command, cli.json).await {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("vp cache-bench: {error:#}");
+                std::process::exit(2);
+            }
+        }
+    }
     if let Command::DbRebuild { dry_run, force } = &cli.command {
         let data_dir = cli.data_dir.clone().unwrap_or_else(paths::data_dir);
         if data_dir.join("run/daemon.json").exists() && !force {
@@ -3811,6 +3859,9 @@ async fn run(cli: Cli) -> Result<()> {
             unreachable!("backup-anchor-import is handled before discovery")
         }
         Command::Bench { .. } => unreachable!("bench is handled before discovery"),
+        Command::CacheBench { .. } => {
+            unreachable!("cache-bench is handled before discovery")
+        }
         Command::DaemonAgent { .. } => {
             unreachable!("daemon-agent is handled before discovery")
         }
@@ -5091,6 +5142,14 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::ProjectUsage { project } => {
             rpc(&discovery, "project.usage", json!({"project_id": project})).await?
+        }
+        Command::ProjectCache { project, limit } => {
+            rpc(
+                &discovery,
+                "project.cache",
+                json!({"project_id": project, "limit": limit}),
+            )
+            .await?
         }
         Command::ProjectBudgetSet {
             project,
@@ -7360,6 +7419,26 @@ async fn run(cli: Cli) -> Result<()> {
                     "older_than_days": older_than_days,
                     "keep_epochs": keep_epochs,
                     "dry_run": dry_run,
+                }),
+            )
+            .await?
+        }
+        Command::CacheCalls {
+            session,
+            limit,
+            role,
+            miss_reason,
+            include_warm,
+        } => {
+            rpc(
+                &discovery,
+                "session.cache.calls",
+                json!({
+                    "session_id": session,
+                    "limit": limit,
+                    "role": role,
+                    "miss_reason": miss_reason,
+                    "include_warm": include_warm,
                 }),
             )
             .await?
@@ -12202,6 +12281,111 @@ fn print_human(value: &Value) {
     {
         return;
     }
+    if let Some(project_id) = value.get("project_id").and_then(Value::as_str)
+        && value
+            .get("sessions_observed")
+            .and_then(Value::as_u64)
+            .is_some()
+        && value.get("scan_limit").and_then(Value::as_u64).is_some()
+    {
+        println!(
+            "project cache  {project_id}  {} session(s) · {} call(s) · scan limit {}{}",
+            value["sessions_observed"].as_u64().unwrap_or(0),
+            value["calls"].as_u64().unwrap_or(0),
+            value["scan_limit"].as_u64().unwrap_or(0),
+            if value["truncated"].as_bool().unwrap_or(false) {
+                " · truncated"
+            } else {
+                ""
+            }
+        );
+        println!(
+            "  hit ratio        {:.2}% · read {} · miss {} · write {}",
+            value["hit_ratio"].as_f64().unwrap_or(0.0) * 100.0,
+            value["cache_read_tokens"].as_u64().unwrap_or(0),
+            value["cache_miss_tokens"].as_u64().unwrap_or(0),
+            value["cache_write_tokens"].as_u64().unwrap_or(0)
+        );
+        if let (Some(p50), Some(p95)) = (
+            value["hit_ratio_p50"].as_f64(),
+            value["hit_ratio_p95"].as_f64(),
+        ) {
+            println!(
+                "  percentiles      p50 {:.2}% · p95 {:.2}%",
+                p50 * 100.0,
+                p95 * 100.0
+            );
+        }
+        println!(
+            "  continuity       append-only {} · breaks {} · epochs {}",
+            value["append_only_calls"].as_u64().unwrap_or(0),
+            value["append_only_breaks"].as_u64().unwrap_or(0),
+            value["cache_epochs"].as_u64().unwrap_or(0)
+        );
+        if let Some(reasons) = value["top_miss_reasons"].as_array()
+            && !reasons.is_empty()
+        {
+            let rendered = reasons
+                .iter()
+                .map(|reason| {
+                    format!(
+                        "{}×{}",
+                        reason["key"].as_str().unwrap_or("?"),
+                        reason["calls"].as_u64().unwrap_or(0)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
+            println!("  top misses       {rendered}");
+        }
+        return;
+    }
+    if let Some(session_id) = value.get("session_id").and_then(Value::as_str)
+        && value.get("returned").and_then(Value::as_u64).is_some()
+        && value.get("calls").and_then(Value::as_array).is_some()
+    {
+        println!(
+            "cache calls  {session_id}  {} returned · {} matching · limit {}{}",
+            value["returned"].as_u64().unwrap_or(0),
+            value["observed"].as_u64().unwrap_or(0),
+            value["limit"].as_u64().unwrap_or(0),
+            if value["truncated"].as_bool().unwrap_or(false) {
+                " · truncated"
+            } else {
+                ""
+            }
+        );
+        if let Some(role) = value["role"].as_str() {
+            println!("  role filter     {role}");
+        }
+        if let Some(reason) = value["miss_reason"].as_str() {
+            println!("  reason filter   {reason}");
+        }
+        println!(
+            "  {:<19} {:<14} {:>8} {:>8} {:>8} {:>7} {:>7} {:<16} EPOCH",
+            "AT", "ROLE", "INPUT", "READ", "MISS", "HIT", "APPEND", "MISS REASON"
+        );
+        for call in value["calls"].as_array().into_iter().flatten() {
+            let append = match call["append_only"].as_bool() {
+                Some(true) => "yes",
+                Some(false) => "break",
+                None => "n/a",
+            };
+            println!(
+                "  {:<19} {:<14} {:>8} {:>8} {:>8} {:>7.2}% {:>7} {:<16} {}",
+                call["at"].as_str().unwrap_or("-"),
+                call["role"].as_str().unwrap_or("-"),
+                call["input_tokens"].as_u64().unwrap_or(0),
+                call["cache_read_tokens"].as_u64().unwrap_or(0),
+                call["cache_miss_tokens"].as_u64().unwrap_or(0),
+                call["cache_hit_ratio"].as_f64().unwrap_or(0.0) * 100.0,
+                append,
+                call["miss_reason"].as_str().unwrap_or("-"),
+                short_hash(&call["cache_epoch"])
+            );
+        }
+        return;
+    }
     if let Some(session_id) = value.get("session_id").and_then(Value::as_str)
         && value.get("calls_checked").and_then(Value::as_u64).is_some()
         && value.get("findings").and_then(Value::as_array).is_some()
@@ -12214,11 +12398,21 @@ fn print_human(value: &Value) {
             value["compactions_checked"].as_u64().unwrap_or(0)
         );
         println!(
-            "  hit ratio        {:.2}% · read {} · write {}",
+            "  hit ratio        {:.2}% · read {} · miss {} · write {}",
             value["hit_ratio"].as_f64().unwrap_or(0.0) * 100.0,
             value["cache_read_tokens"].as_u64().unwrap_or(0),
+            value["cache_miss_tokens"].as_u64().unwrap_or(0),
             value["cache_write_tokens"].as_u64().unwrap_or(0)
         );
+        if let Some(theoretical) = value["theoretical_max_hit_ratio"].as_f64() {
+            println!(
+                "  theoretical max  {:.2}% · append-only {} · breaks {} · epochs {}",
+                theoretical * 100.0,
+                value["append_only_calls"].as_u64().unwrap_or(0),
+                value["append_only_breaks"].as_u64().unwrap_or(0),
+                value["cache_epochs"].as_u64().unwrap_or(0)
+            );
+        }
         if value["clean"].as_bool().unwrap_or(false) {
             println!("  result           clean (no warning or critical findings)");
         }
@@ -12359,11 +12553,93 @@ fn print_human(value: &Value) {
             ratio * 100.0
         );
         println!(
-            "  tokens           input {} · cache read {} · cache write {} · output {}",
+            "  tokens           input {} · cache read {} · cache miss {} · cache write {} · output {}",
             value["input_tokens"].as_u64().unwrap_or(0),
             value["cache_read_tokens"].as_u64().unwrap_or(0),
+            value["cache_miss_tokens"].as_u64().unwrap_or_else(|| {
+                value["input_tokens"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .saturating_sub(value["cache_read_tokens"].as_u64().unwrap_or(0))
+            }),
             value["cache_write_tokens"].as_u64().unwrap_or(0),
             value["output_tokens"].as_u64().unwrap_or(0)
+        );
+        if let Some(theoretical) = value["theoretical_max_hit_ratio"].as_f64() {
+            println!(
+                "  theoretical max  {:.2}%  (previous prompt / current input; append-only headroom)",
+                theoretical * 100.0
+            );
+        }
+        if let (Some(p50), Some(p95)) = (
+            value["hit_ratio_p50"].as_f64(),
+            value["hit_ratio_p95"].as_f64(),
+        ) {
+            println!(
+                "  percentiles      p50 {:.2}% · p95 {:.2}%",
+                p50 * 100.0,
+                p95 * 100.0
+            );
+        }
+        println!(
+            "  continuity       append-only {} · breaks {} · last {}",
+            value["append_only_calls"].as_u64().unwrap_or(0),
+            value["append_only_breaks"].as_u64().unwrap_or(0),
+            match value["last_append_only"].as_bool() {
+                Some(true) => "yes",
+                Some(false) => "no",
+                None => "unknown",
+            }
+        );
+        if value["cache_epoch"].as_str().is_some() {
+            println!(
+                "  cache epoch      {} ({})",
+                short_hash(&value["cache_epoch"]),
+                value["cache_epoch_source"].as_str().unwrap_or("unknown")
+            );
+        }
+        if let Some(reasons) = value["top_miss_reasons"].as_array()
+            && !reasons.is_empty()
+        {
+            let rendered = reasons
+                .iter()
+                .map(|reason| {
+                    format!(
+                        "{}×{}",
+                        reason["key"].as_str().unwrap_or("?"),
+                        reason["calls"].as_u64().unwrap_or(0)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
+            println!("  top misses       {rendered}");
+        }
+        if let Some(roles) = value["per_role"].as_array()
+            && !roles.is_empty()
+        {
+            let rendered = roles
+                .iter()
+                .map(|role| {
+                    format!(
+                        "{} {:.1}% ({} miss, ${:.4})",
+                        role["role"].as_str().unwrap_or("?"),
+                        role["hit_ratio"].as_f64().unwrap_or(0.0) * 100.0,
+                        role["cache_miss_tokens"].as_u64().unwrap_or(0),
+                        role["cost_usd"].as_f64().unwrap_or(0.0)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
+            println!("  per role         {rendered}");
+        }
+        println!(
+            "  cross-session    {} session(s) · {} hit token(s) observed (bounded scan, not a guarantee)",
+            value["cross_session_reuse_sessions"].as_u64().unwrap_or(0),
+            value["cross_session_hit_tokens"].as_u64().unwrap_or(0)
+        );
+        println!(
+            "  lost to compact  ${:.6} (estimated cache-read savings invalidated by compaction)",
+            value["compaction_lost_cache_usd"].as_f64().unwrap_or(0.0)
         );
         println!(
             "  savings          ${:.6} (estimated from configured prices; negative means cache writes cost more than reads saved)",
@@ -19847,5 +20123,156 @@ mod i5_cli_tests {
             }
             other => panic!("expected process-policy-set, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cache_bench_runs_without_a_subcommand_and_parses_compare() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "cache-bench",
+                    "--turns",
+                    "24",
+                    "--stable-prefix-tokens",
+                    "180000",
+                    "--initial-context-tokens",
+                    "20000",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::CacheBench { command, run } => {
+                        assert!(command.is_none());
+                        assert_eq!(run.turns, 24);
+                        assert_eq!(run.stable_prefix_tokens, 180_000);
+                        assert_eq!(run.initial_context_tokens, 20_000);
+                        assert!(!run.live);
+                        assert!(!run.allow_live);
+                    }
+                    other => panic!("expected cache-bench, got {other:?}"),
+                }
+
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "cache-bench",
+                    "compare",
+                    "a.json",
+                    "b.json",
+                    "--allow-mismatch",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::CacheBench {
+                        command:
+                            Some(vp_bench::cache_bench::CacheBenchCommand::Compare {
+                                left,
+                                right,
+                                allow_mismatch,
+                            }),
+                        ..
+                    } => {
+                        assert_eq!(left, std::path::PathBuf::from("a.json"));
+                        assert_eq!(right, std::path::PathBuf::from("b.json"));
+                        assert!(allow_mismatch);
+                    }
+                    other => panic!("expected cache-bench compare, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn project_cache_parses_bounded_scan() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from(["vp", "project-cache", "proj-1", "--limit", "2000"])
+                    .unwrap();
+                match cli.command {
+                    Command::ProjectCache { project, limit } => {
+                        assert_eq!(project, "proj-1");
+                        assert_eq!(limit, Some(2_000));
+                    }
+                    other => panic!("expected project-cache, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn cache_calls_parses_bounded_filters() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "cache-calls",
+                    "ses-1",
+                    "--limit",
+                    "40",
+                    "--role",
+                    "worker",
+                    "--miss-reason",
+                    "tail_delta",
+                    "--include-warm",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::CacheCalls {
+                        session,
+                        limit,
+                        role,
+                        miss_reason,
+                        include_warm,
+                    } => {
+                        assert_eq!(session, "ses-1");
+                        assert_eq!(limit, Some(40));
+                        assert_eq!(role.as_deref(), Some("worker"));
+                        assert_eq!(miss_reason.as_deref(), Some("tail_delta"));
+                        assert!(include_warm);
+                    }
+                    other => panic!("expected cache-calls, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn cache_bench_live_gate_is_explicit() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "cache-bench",
+                    "run",
+                    "--live",
+                    "--allow-live",
+                    "--model",
+                    "deepseek-chat",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::CacheBench {
+                        command: Some(vp_bench::cache_bench::CacheBenchCommand::Run(args)),
+                        ..
+                    } => {
+                        assert!(args.live);
+                        assert!(args.allow_live);
+                        assert_eq!(args.model.as_deref(), Some("deepseek-chat"));
+                    }
+                    other => panic!("expected live cache-bench run, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

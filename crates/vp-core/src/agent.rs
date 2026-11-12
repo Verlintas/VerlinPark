@@ -14103,6 +14103,14 @@ async fn warm_prompt_cache(
         "cache_epoch_reused_from_sessions": epoch_reuse.prior_sessions,
         "cross_session_cache_read_tokens": 0,
         "cross_session_first_call": false,
+        "cache_miss_tokens": crate::prompt_cache::cache_miss_tokens(input_tokens, usage.cache_read),
+        "theoretical_max_hit_ratio": 0.0,
+        "message_prefix_hash": crate::prompt_cache::message_prefix_hash(&request.messages),
+        "previous_message_prefix_hash": serde_json::Value::Null,
+        "message_prefix_count": request.messages.len(),
+        "previous_message_prefix_count": 0,
+        "append_only": serde_json::Value::Null,
+        "previous_input_tokens": 0,
     });
     if let (Some(target), Some(fields)) = (warm_payload.as_object_mut(), warm_canonical.as_object())
     {
@@ -15710,15 +15718,19 @@ async fn run_loop_body(
             let fingerprint =
                 prompt_hashes.fingerprint_with_epoch_and_model(&prompt_epoch.hash, &model_name);
             let first_session_call = epoch_observed_calls == 0;
-            let miss_reason = cache_tracker.observe_call(
-                &fingerprint,
-                crate::prompt_cache::CacheCallObservation {
+            cache_tracker.set_epoch_context(first_session_call, epoch_reuse.prior_sessions);
+            let cache_telemetry =
+                cache_tracker.observe_call(crate::prompt_cache::CacheCallObservation {
+                    fingerprint: &fingerprint,
+                    messages: &request.messages,
                     input_tokens,
                     cache_read_tokens,
-                    first_session_call,
-                    prior_sessions: epoch_reuse.prior_sessions,
-                },
-            );
+                    cache_write_tokens,
+                    cache_expected: cache_plan.enabled,
+                    cache_epoch: Some(&prompt_epoch.hash),
+                    cache_epoch_source: Some("l4"),
+                });
+            let miss_reason = cache_telemetry.miss_reason;
             let savings =
                 crate::prompt_cache::round_usd(crate::prompt_cache::estimated_cache_savings_usd(
                     input_tokens,
@@ -15731,9 +15743,10 @@ async fn run_loop_body(
                     prices.cache_write,
                 ));
             if input_tokens > 0 {
-                let provider_cache_miss = observation.report.append_only
-                    && observation.report.had_previous
-                    && cache_read_tokens == 0;
+                let provider_cache_miss = matches!(
+                    miss_reason,
+                    Some(crate::prompt_cache::CacheMissReason::ProviderCacheMiss)
+                );
                 let mut payload = serde_json::json!({
                     "input_tokens": input_tokens,
                     "cache_read_tokens": cache_read_tokens,
@@ -15784,6 +15797,44 @@ async fn run_loop_body(
                     for (key, value) in fields {
                         target.insert(key.clone(), value.clone());
                     }
+                }
+                if let Some(object) = payload.as_object_mut() {
+                    object.insert(
+                        "cache_miss_tokens".into(),
+                        serde_json::json!(cache_telemetry.cache_miss_tokens),
+                    );
+                    object.insert(
+                        "cache_hit_ratio_v2".into(),
+                        serde_json::json!(cache_telemetry.cache_hit_ratio),
+                    );
+                    object.insert(
+                        "theoretical_max_hit_ratio".into(),
+                        serde_json::json!(cache_telemetry.theoretical_max_hit_ratio),
+                    );
+                    object.insert(
+                        "message_prefix_hash".into(),
+                        serde_json::json!(cache_telemetry.message_prefix_hash),
+                    );
+                    object.insert(
+                        "previous_message_prefix_hash".into(),
+                        serde_json::json!(cache_telemetry.previous_message_prefix_hash),
+                    );
+                    object.insert(
+                        "message_prefix_count".into(),
+                        serde_json::json!(cache_telemetry.message_prefix_count),
+                    );
+                    object.insert(
+                        "previous_message_prefix_count".into(),
+                        serde_json::json!(cache_telemetry.previous_message_prefix_count),
+                    );
+                    object.insert(
+                        "append_only".into(),
+                        serde_json::json!(cache_telemetry.append_only),
+                    );
+                    object.insert(
+                        "previous_input_tokens".into(),
+                        serde_json::json!(cache_telemetry.previous_input_tokens),
+                    );
                 }
                 if let Some(object) = payload.as_object_mut() {
                     for (key, value) in prompt_epoch.payload_fields() {

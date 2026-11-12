@@ -547,9 +547,12 @@ private struct DashboardRuntimeCard: View {
                 }
                 Spacer()
                 if let info = model.agentInfo {
-                    Text(info.configured ? (info.model ?? "model") : "no model")
+                    Text(info.configured ? (model.daemonModelLabel ?? "model") : "no model")
                         .font(.system(size: 9, design: .monospaced))
                         .foregroundStyle(info.configured ? Color.secondary : Color.orange)
+                        .help(
+                            "Daemon-configured Leader model; local provider settings are not used for a live run."
+                        )
                 }
             }
             Divider().opacity(0.2)

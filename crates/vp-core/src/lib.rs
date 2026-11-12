@@ -7882,6 +7882,29 @@ impl Engine {
         tokio::task::spawn_blocking(move || store.recent_events_by_kind(&id, &kind, limit)).await?
     }
 
+    /// Bounded cross-session cache-epoch observation for `session.cache`.
+    /// This is a read-only scan of recent `context.cache` events in other
+    /// sessions; it never calls a provider and never claims a guaranteed hit.
+    pub async fn cache_epoch_cross_session(
+        &self,
+        epoch: &str,
+        exclude_session: &str,
+    ) -> Result<crate::prompt_cache::CacheEpochReuse> {
+        const CROSS_SESSION_SCAN_LIMIT: u32 = 5_000;
+        let store = self.store.clone();
+        let epoch = epoch.to_string();
+        let exclude = exclude_session.to_string();
+        let (sessions, hit_tokens, calls) = tokio::task::spawn_blocking(move || {
+            store.cache_epoch_cross_session(&epoch, &exclude, CROSS_SESSION_SCAN_LIMIT)
+        })
+        .await??;
+        Ok(crate::prompt_cache::CacheEpochReuse {
+            sessions,
+            hit_tokens,
+            calls,
+        })
+    }
+
     pub async fn task_queue(
         &self,
         project_id: Option<String>,
@@ -10266,6 +10289,36 @@ impl Engine {
             Some(project_id) => self.get_cache_policy(&project_id).await.ok(),
             None => None,
         };
+        let latest_cache_epoch = aggregate.latest_cache_epoch.clone().or_else(|| {
+            prefix_event
+                .as_ref()
+                .and_then(|event| event.payload.get("cache_epoch"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        });
+        let cross_session = match latest_cache_epoch.as_deref() {
+            Some(epoch) => self
+                .cache_epoch_cross_session(epoch, session_id)
+                .await
+                .unwrap_or_default(),
+            None => crate::prompt_cache::CacheEpochReuse::default(),
+        };
+        let role_costs = ledger
+            .totals
+            .by_role
+            .iter()
+            .map(|bucket| (bucket.key.clone(), bucket.cost_usd))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut per_role = aggregate.per_role.clone();
+        for bucket in &mut per_role {
+            if let Some(cost) = role_costs.get(&bucket.role) {
+                bucket.cost_usd = crate::prompt_cache::round_usd(*cost);
+            }
+        }
+        let cache_miss_tokens = crate::prompt_cache::cache_miss_tokens(
+            ledger.totals.input_tokens,
+            ledger.totals.cache_read_tokens,
+        );
 
         let epoch_reuse = crate::cache_epoch::reuse_from_projection(
             epoch_aggregate.as_ref(),
@@ -10388,10 +10441,13 @@ impl Engine {
             last_first_token_ms: last_cache
                 .and_then(|event| event.payload.get("first_token_ms"))
                 .and_then(serde_json::Value::as_u64),
-            last_message_prefix_hash: continuity.last_message_prefix_hash,
+            last_message_prefix_hash: continuity.last_message_prefix_hash.or_else(|| {
+                last_cache
+                    .and_then(|event| event.payload.get("message_prefix_hash"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            }),
             last_previous_message_prefix_hash: continuity.last_previous_message_prefix_hash,
-            last_append_only: continuity.last_append_only,
-            append_only_calls: continuity.append_only_calls,
             non_append_only_calls: continuity.non_append_only_calls,
             last_message_count: continuity.last_message_count,
             last_tail_memory_mode: continuity.last_tail_memory_mode,
@@ -10414,6 +10470,141 @@ impl Engine {
             compaction_invalidation_tokens: aggregate.compaction_invalidation_tokens,
             compaction_invalidation_estimated_usd: aggregate.compaction_invalidation_estimated_usd,
             policy,
+            cache_miss_tokens,
+            theoretical_max_hit_ratio: aggregate.latest_theoretical_max_hit_ratio,
+            append_only_calls: aggregate.append_only_calls,
+            append_only_breaks: aggregate.append_only_breaks,
+            last_append_only: aggregate.last_append_only,
+            hit_ratio_p50: aggregate.hit_ratio_p50,
+            hit_ratio_p95: aggregate.hit_ratio_p95,
+            theoretical_max_p50: aggregate.theoretical_max_p50,
+            theoretical_max_p95: aggregate.theoretical_max_p95,
+            cost_usd: ledger.totals.cost_usd,
+            cache_epoch_timeline: aggregate.cache_epoch_timeline.clone(),
+            per_role,
+            top_miss_reasons: aggregate.top_miss_reasons.clone(),
+            cross_session_reuse_sessions: cross_session.sessions,
+            cross_session_calls_observed: cross_session.calls,
+        })
+    }
+
+    /// Bounded newest-first per-call cache table for `session.cache.calls`.
+    ///
+    /// Filters are exact and case-insensitive for role/reason. Warm calls are
+    /// excluded by default. The scan is bounded to the newest 2,000 cache
+    /// events; `truncated` reports only whether the requested limit cut the
+    /// matching rows, not whether the underlying scan hit its bound.
+    pub async fn session_cache_calls(
+        &self,
+        params: &vp_protocol::types::SessionCacheCallsParams,
+    ) -> Result<vp_protocol::types::SessionCacheCallsResult> {
+        const SCAN_LIMIT: u32 = 2_000;
+        let limit = params.limit.unwrap_or(20).clamp(1, 100);
+        let role_filter = params
+            .role
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase);
+        let reason_filter = params
+            .miss_reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase);
+        let events = self
+            .recent_events_of_kind(&params.session_id, "context.cache", SCAN_LIMIT)
+            .await?;
+        let mut matching = Vec::new();
+        for event in events.iter().rev() {
+            let warm = event
+                .payload
+                .get("warm")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if warm && !params.include_warm {
+                continue;
+            }
+            let role = event
+                .payload
+                .get("agent_role")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if let Some(filter) = role_filter.as_deref()
+                && role != filter
+            {
+                continue;
+            }
+            let reason = event
+                .payload
+                .get("miss_reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if let Some(filter) = reason_filter.as_deref()
+                && reason != filter
+            {
+                continue;
+            }
+            matching.push(crate::prompt_cache::cache_call_record(
+                &event.payload,
+                &event.created_at,
+            ));
+        }
+        let observed = matching.len() as u64;
+        matching.truncate(limit as usize);
+        let returned = matching.len() as u64;
+        Ok(vp_protocol::types::SessionCacheCallsResult {
+            session_id: params.session_id.clone(),
+            calls: matching,
+            observed,
+            returned,
+            truncated: observed > returned,
+            limit,
+            role: params.role.clone(),
+            miss_reason: params.miss_reason.clone(),
+            include_warm: params.include_warm,
+        })
+    }
+
+    /// Read-only project-wide cache overview over a bounded scan of recent
+    /// `context.cache` events. No provider call, no prompt text, and no
+    /// cross-host claim.
+    pub async fn project_cache_overview(
+        &self,
+        params: &vp_protocol::types::ProjectCacheParams,
+    ) -> Result<vp_protocol::types::ProjectCacheOverview> {
+        let limit = params.limit.unwrap_or(5_000).clamp(1, 50_000);
+        let store = self.store.clone();
+        let project_id = params.project_id.clone();
+        let (events, truncated) =
+            tokio::task::spawn_blocking(move || store.project_cache_events(&project_id, limit))
+                .await??;
+        let sessions = events
+            .iter()
+            .map(|event| event.session_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len() as u64;
+        let aggregate = crate::prompt_cache::aggregate_cache_events(&events, &[]);
+        Ok(vp_protocol::types::ProjectCacheOverview {
+            project_id: params.project_id.clone(),
+            sessions_observed: sessions,
+            calls: aggregate.calls,
+            input_tokens: aggregate.input_tokens,
+            cache_read_tokens: aggregate.cache_read_tokens,
+            cache_miss_tokens: aggregate.cache_miss_tokens,
+            cache_write_tokens: aggregate.cache_write_tokens,
+            hit_ratio: aggregate.hit_ratio,
+            hit_ratio_p50: aggregate.hit_ratio_p50,
+            hit_ratio_p95: aggregate.hit_ratio_p95,
+            append_only_calls: aggregate.append_only_calls,
+            append_only_breaks: aggregate.append_only_breaks,
+            cache_epochs: aggregate.cache_epoch_timeline.len() as u64,
+            top_miss_reasons: aggregate.top_miss_reasons,
+            cache_epoch_timeline: aggregate.cache_epoch_timeline,
+            scan_limit: limit,
+            truncated,
         })
     }
 

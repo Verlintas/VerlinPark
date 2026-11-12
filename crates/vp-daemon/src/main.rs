@@ -77,16 +77,17 @@ use vp_protocol::types::{
     PingResult, PreemptionOverviewParams, PreemptionPolicyParams, PreemptionPolicyResult,
     ProcessListParams, ProcessLogsParams, ProcessPolicyParams, ProcessPolicyResult,
     ProcessRestartParams, ProcessStopParams, ProjectBudgetParams, ProjectCacheEpochParams,
-    ProjectCacheEpochPruneParams, ProjectForkForestParams, ProjectListResult, ProjectUsageParams,
-    PromptParams, PromptResult, QuestionListParams, RehydrateSessionParams, ReplaySessionParams,
-    ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams, ResolveMergeResult,
-    RetryMergeParams, RetryMergeResult, SchedulerStatusParams, SearchParams, ServerInfo,
-    SessionCacheAuditParams, SessionCacheBreaksParams, SessionCacheEpochParams, SessionCacheParams,
-    SessionCachePlanParams, SessionCacheWarmParams, SessionCheckpointDeleteParams,
-    SessionCheckpointDiffParams, SessionCheckpointListParams, SessionCheckpointParams,
-    SessionCheckpointPruneParams, SessionCheckpointRestoreParams, SessionCheckpointStatsParams,
-    SessionCitationAuditParams, SessionCitationsParams, SessionCompactParams, SessionCompareParams,
-    SessionContextParams, SessionContinuationCancelParams, SessionContinuationReclaimParams,
+    ProjectCacheEpochPruneParams, ProjectCacheParams, ProjectForkForestParams, ProjectListResult,
+    ProjectUsageParams, PromptParams, PromptResult, QuestionListParams, RehydrateSessionParams,
+    ReplaySessionParams, ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams,
+    ResolveMergeResult, RetryMergeParams, RetryMergeResult, SchedulerStatusParams, SearchParams,
+    ServerInfo, SessionCacheAuditParams, SessionCacheBreaksParams, SessionCacheCallsParams,
+    SessionCacheEpochParams, SessionCacheParams, SessionCachePlanParams, SessionCacheWarmParams,
+    SessionCheckpointDeleteParams, SessionCheckpointDiffParams, SessionCheckpointListParams,
+    SessionCheckpointParams, SessionCheckpointPruneParams, SessionCheckpointRestoreParams,
+    SessionCheckpointStatsParams, SessionCitationAuditParams, SessionCitationsParams,
+    SessionCompactParams, SessionCompareParams, SessionContextParams,
+    SessionContinuationCancelParams, SessionContinuationReclaimParams,
     SessionContinuationStatusParams, SessionContinuationsParams, SessionDeferParams,
     SessionDiffParams, SessionExportParams, SessionForkParams, SessionForkTreeParams,
     SessionImportParams, SessionInstructionsParams, SessionLineageParams, SessionListResult,
@@ -2962,6 +2963,13 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             },
             Err(response) => response_with_id(id, response),
         },
+        "session.cache.calls" => match parse_params::<SessionCacheCallsParams>(request.params) {
+            Ok(params) => match state.engine.session_cache_calls(&params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
         "project.cache_epochs" => match parse_params::<ProjectCacheEpochParams>(request.params) {
             Ok(params) => match state
                 .engine
@@ -3349,6 +3357,13 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "project.usage" => match parse_params::<ProjectUsageParams>(request.params) {
             Ok(params) => match state.engine.project_usage_report(&params.project_id).await {
                 Ok(report) => RpcResponse::success(id, report),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "project.cache" => match parse_params::<ProjectCacheParams>(request.params) {
+            Ok(params) => match state.engine.project_cache_overview(&params).await {
+                Ok(result) => RpcResponse::success(id, result),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),
