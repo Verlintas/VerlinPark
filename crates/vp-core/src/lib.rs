@@ -20,28 +20,30 @@ use vp_protocol::now_rfc3339;
 use vp_protocol::remote::RemoteTestEvidence;
 use vp_protocol::types::{
     AcpAgent, AcpAgentConfig, AcpAgentListResult, AcpProbeResult, AcpTransport,
+    AgentCoordinationReplayParams, AgentCoordinationReplayReport, AgentCoordinationWake,
     AgentIdentitiesResult, AgentIdentityPolicy, AgentIdentityReplayParams,
-    AgentIdentityReplayReport, AgentIdentityResult, AgentMessage, AgentRecord, Approval,
-    ApprovalAuditEvent, ApprovalAuditResult, ApprovalBatchItemResult, ApprovalBatchResolveResult,
-    ApprovalGrant, ApprovalQueueResult, ApprovalTemplate, ApprovalTemplateCreateParams,
-    ApprovalTemplateDeleteParams, ApprovalTemplateDeleteResult, ApprovalTemplateFromApprovalParams,
-    ApprovalTemplateResult, ApprovalTemplateUpdateParams, Artifact, ArtifactBackfillResult,
-    ArtifactDiffParams, ArtifactDiffResult, ArtifactGcResult, ArtifactMaterialization,
-    ArtifactPolicy, ArtifactVersionsResult, AttentionPolicy, AttentionPolicyResult,
-    AttentionPolicySetParams, BudgetGovernorDecision, CachePolicy, CheckpointPolicyResult,
-    CheckpointRetentionPolicy, CitationAudit, CitationAuditMessage, ConsoleCloseResult,
-    ConsoleOpenResult, ConsoleReadResult, ConsoleSignalResult, ConsoleWriteResult,
-    ContextCompactionSummary, ContextMeasurement, ContextUsage, ContinuationOutcome,
-    ContractPolicy, CreateAgentIdentityParams, CreateModelPresetParams, CriticalPathPolicy,
-    DoctorCheck, EffectPolicy, EffectReceipt, EffectReconcileParams, EffectReconcileResult,
-    EffectState, Event, ForgeOriginStatus, ForgePreflightResult, ForgeProviderStatus,
-    ForgeStatusResult, GateRecord, GitLogResult, GitShowResult, GovernorSessionStatus,
-    IntakeCreateParams, IntakeListResult, IntakeTask, IntakeUpdateParams, IntegrationPolicy,
-    IntentDecisionRecord, MailboxGcResult, MailboxPolicy, McpCallResult, McpGetPromptResult,
-    McpPinActionResult, McpPinApproveParams, McpPinRejectParams, McpProbeResult,
-    McpPromptListResult, McpReadResourceResult, McpResourceListResult, McpServer, McpServerConfig,
-    McpServerListResult, McpToolListResult, McpToolPin, MemoryBriefResult, MemoryConflict,
-    MemoryConflictResolveResult, MemoryConflictScanResult, MemoryConflictsResult,
+    AgentIdentityReplayReport, AgentIdentityResult, AgentInboxListParams, AgentInboxListResult,
+    AgentInboxMessageParams, AgentInboxReadResult, AgentInboxSendParams, AgentInboxSendResult,
+    AgentMessage, AgentRecord, Approval, ApprovalAuditEvent, ApprovalAuditResult,
+    ApprovalBatchItemResult, ApprovalBatchResolveResult, ApprovalGrant, ApprovalQueueResult,
+    ApprovalTemplate, ApprovalTemplateCreateParams, ApprovalTemplateDeleteParams,
+    ApprovalTemplateDeleteResult, ApprovalTemplateFromApprovalParams, ApprovalTemplateResult,
+    ApprovalTemplateUpdateParams, Artifact, ArtifactBackfillResult, ArtifactDiffParams,
+    ArtifactDiffResult, ArtifactGcResult, ArtifactMaterialization, ArtifactPolicy,
+    ArtifactVersionsResult, AttentionPolicy, AttentionPolicyResult, AttentionPolicySetParams,
+    BudgetGovernorDecision, CachePolicy, CheckpointPolicyResult, CheckpointRetentionPolicy,
+    CitationAudit, CitationAuditMessage, ConsoleCloseResult, ConsoleOpenResult, ConsoleReadResult,
+    ConsoleSignalResult, ConsoleWriteResult, ContextCompactionSummary, ContextMeasurement,
+    ContextUsage, ContinuationOutcome, ContractPolicy, CreateAgentIdentityParams,
+    CreateModelPresetParams, CriticalPathPolicy, DoctorCheck, EffectPolicy, EffectReceipt,
+    EffectReconcileParams, EffectReconcileResult, EffectState, Event, ForgeOriginStatus,
+    ForgePreflightResult, ForgeProviderStatus, ForgeStatusResult, GateRecord, GitLogResult,
+    GitShowResult, GovernorSessionStatus, IntakeCreateParams, IntakeListResult, IntakeTask,
+    IntakeUpdateParams, IntegrationPolicy, IntentDecisionRecord, MailboxGcResult, MailboxPolicy,
+    McpCallResult, McpGetPromptResult, McpPinActionResult, McpPinApproveParams, McpPinRejectParams,
+    McpProbeResult, McpPromptListResult, McpReadResourceResult, McpResourceListResult, McpServer,
+    McpServerConfig, McpServerListResult, McpToolListResult, McpToolPin, MemoryBriefResult,
+    MemoryConflict, MemoryConflictResolveResult, MemoryConflictScanResult, MemoryConflictsResult,
     MemoryDeleteResult, MemoryEmbeddingPolicy, MemoryEmbeddingsIndexRebuildResult,
     MemoryEmbeddingsIndexStatusResult, MemoryEmbeddingsRebuildResult, MemoryEmbeddingsStatusResult,
     MemoryEmbeddingsTestResult, MemoryEvidence, MemoryHealthResult, MemoryItem, MemoryListResult,
@@ -64,6 +66,8 @@ use vp_protocol::types::{
     ProjectMcpPinsResult, ProjectUsageResult, PromptPrefixAggregate, PromptPrefixObservation,
     PullRequestResult, Question, QuestionListResult, ResumeAgentIdentityParams,
     RetireAgentIdentityParams, ReviseTeamPlanResult, ScheduledTask, SearchResult, Session,
+    SessionAssignParams, SessionAssignResult, SessionAssignmentRenewParams,
+    SessionAssignmentRenewResult, SessionAssignmentsParams, SessionAssignmentsResult,
     SessionBundle, SessionCacheStatus, SessionCheckpoint, SessionCheckpointDeleteResult,
     SessionCheckpointDiffResult, SessionCheckpointListResult, SessionCheckpointPruneResult,
     SessionCheckpointRestoreResult, SessionCheckpointStatsResult, SessionCitationAuditResult,
@@ -75,8 +79,8 @@ use vp_protocol::types::{
     SessionForkTreeResult, SessionImportResult, SessionInstructionSection,
     SessionInstructionStateReport, SessionInstructionsReport, SessionLandResult,
     SessionLineageEntry, SessionLineageResult, SessionLogStatus, SessionPreemptionResult,
-    SessionPriorityResult, SessionRehydrateResult, SessionReplayReport,
-    SessionSkillActivationsResult, SessionStallsResult, SessionSteerResult,
+    SessionPriorityResult, SessionRehydrateResult, SessionReleaseParams, SessionReleaseResult,
+    SessionReplayReport, SessionSkillActivationsResult, SessionStallsResult, SessionSteerResult,
     SessionSteeringCancelResult, SessionSteeringListResult, SessionTranscriptResult,
     SessionUnlimitedResult, ShellPolicy, Skill, SkillActivation, SkillCreateParams,
     SkillDeleteResult, SkillEnabledParams, SkillImportParams, SkillListResult, SkillUpdateParams,
@@ -125,6 +129,7 @@ pub mod context;
 pub mod continuation;
 pub mod contract;
 pub mod conversation;
+pub mod coordination;
 pub mod critical_path;
 pub mod daemon_agent;
 mod dashboard;
@@ -16981,6 +16986,18 @@ impl Engine {
             ))
         })
         .await??;
+        let coordination_store = store.clone();
+        let coordination_project = project.id.clone();
+        let (session_agent_assignments, agent_inbox, agent_coordination_events) =
+            tokio::task::spawn_blocking(move || {
+                Ok::<_, anyhow::Error>((
+                    coordination_store.list_agent_assignments_for_replay(&coordination_project)?,
+                    coordination_store.list_agent_inbox_for_replay(&coordination_project)?,
+                    coordination_store
+                        .list_agent_coordination_events_for_project(&coordination_project, None)?,
+                ))
+            })
+            .await??;
         Ok(SessionBundle {
             version: 1,
             exported_at: vp_protocol::now_rfc3339(),
@@ -17020,6 +17037,9 @@ impl Engine {
             effects: data.effects,
             agent_identities,
             agent_identity_events,
+            session_agent_assignments,
+            agent_inbox,
+            agent_coordination_events,
         })
     }
 
@@ -17748,6 +17768,432 @@ impl Engine {
             ))
         })
         .await?
+    }
+
+    // -----------------------------------------------------------------
+    // S2 session assignment, identity lease, and project inbox
+    // -----------------------------------------------------------------
+
+    pub async fn session_assignments(
+        &self,
+        params: SessionAssignmentsParams,
+    ) -> Result<SessionAssignmentsResult> {
+        let store = self.store.clone();
+        let assignments = tokio::task::spawn_blocking(move || {
+            store.list_session_agent_assignments(
+                params.session_id.as_deref(),
+                params.identity_id.as_deref(),
+                params.project_id.as_deref(),
+                params.status.as_deref(),
+                params.limit,
+            )
+        })
+        .await??;
+        Ok(SessionAssignmentsResult { assignments })
+    }
+
+    /// Assign one project identity to a session. Assignment is a durable
+    /// coordination record, not a run: it creates no agent row, worktree, or
+    /// provider call. `wake_session` is an optional continuation.
+    pub async fn assign_session_identity(
+        &self,
+        params: SessionAssignParams,
+    ) -> Result<SessionAssignResult> {
+        let store = self.store.clone();
+        let session_id = params.session_id.clone();
+        let identity_id = params.identity_id.clone();
+        let wake_session = params.wake_session;
+        let mutation = tokio::task::spawn_blocking(move || {
+            store.create_session_agent_assignment(
+                &params.session_id,
+                &params.identity_id,
+                params.role.as_deref(),
+                params.lease_secs,
+                params.operator.as_deref(),
+            )
+        })
+        .await??;
+        let mut wake = AgentCoordinationWake {
+            requested: wake_session,
+            reason: if wake_session {
+                "not_attempted".to_string()
+            } else {
+                String::new()
+            },
+            ..AgentCoordinationWake::default()
+        };
+        if wake_session {
+            let body = crate::coordination::render_assignment_wake_body(&mutation.assignment);
+            let operation_id = format!(
+                "coordination-wake:assignment:{}:{}:{}",
+                session_id, identity_id, mutation.assignment.assigned_at
+            );
+            wake = self
+                .wake_session_for_coordination(&session_id, &operation_id, &body, true)
+                .await;
+        }
+        self.record_project_manifest_best_effort().await;
+        Ok(SessionAssignResult {
+            assignment: mutation.assignment,
+            created: mutation.changed,
+            wake,
+        })
+    }
+
+    pub async fn renew_session_assignment(
+        &self,
+        params: SessionAssignmentRenewParams,
+    ) -> Result<SessionAssignmentRenewResult> {
+        let store = self.store.clone();
+        let mutation = tokio::task::spawn_blocking(move || {
+            store.renew_session_agent_assignment(
+                &params.session_id,
+                &params.identity_id,
+                params.lease_secs,
+                params.operator.as_deref(),
+            )
+        })
+        .await??;
+        self.record_project_manifest_best_effort().await;
+        Ok(SessionAssignmentRenewResult {
+            assignment: mutation.assignment,
+            renewed: mutation.changed,
+        })
+    }
+
+    pub async fn release_session_identity(
+        &self,
+        params: SessionReleaseParams,
+    ) -> Result<SessionReleaseResult> {
+        let store = self.store.clone();
+        let mutation = tokio::task::spawn_blocking(move || {
+            store.release_session_agent_assignment(
+                &params.session_id,
+                &params.identity_id,
+                params.operator,
+                params.reason.as_deref(),
+            )
+        })
+        .await??;
+        self.record_project_manifest_best_effort().await;
+        Ok(SessionReleaseResult {
+            assignment: mutation.assignment,
+            released: mutation.changed,
+        })
+    }
+
+    /// Read-only project coordination replay, or explicit projection repair.
+    /// Repair derives both projections from the append-only stream and never
+    /// appends an event.
+    pub async fn replay_agent_coordination(
+        &self,
+        params: AgentCoordinationReplayParams,
+    ) -> Result<AgentCoordinationReplayReport> {
+        let store = self.store.clone();
+        let project_id = params.project_id;
+        let repair = params.repair;
+        tokio::task::spawn_blocking(move || {
+            let events = store.list_agent_coordination_events_for_project(&project_id, None)?;
+            let (expected_assignments, expected_inbox) =
+                crate::coordination::project_from_events(&events)?;
+            let mut actual_assignments = store.list_agent_assignments_for_replay(&project_id)?;
+            let mut actual_inbox = store.list_agent_inbox_for_replay(&project_id)?;
+            let mut mismatches = crate::coordination::compare_coordination_projection(
+                &expected_assignments,
+                &actual_assignments,
+                &expected_inbox,
+                &actual_inbox,
+            );
+            let mut repaired = false;
+            if repair && !mismatches.is_empty() {
+                store.replace_agent_coordination_projection(
+                    &project_id,
+                    &expected_assignments,
+                    &expected_inbox,
+                )?;
+                actual_assignments = store.list_agent_assignments_for_replay(&project_id)?;
+                actual_inbox = store.list_agent_inbox_for_replay(&project_id)?;
+                mismatches = crate::coordination::compare_coordination_projection(
+                    &expected_assignments,
+                    &actual_assignments,
+                    &expected_inbox,
+                    &actual_inbox,
+                );
+                repaired = true;
+            }
+            Ok(crate::coordination::replay_report(
+                &project_id,
+                expected_assignments.len(),
+                expected_inbox.len(),
+                events.len(),
+                repaired,
+                mismatches,
+            ))
+        })
+        .await?
+    }
+
+    /// Send one project-scoped inbox row. The optional wake is a deferred
+    /// continuation; it never starts a provider call by itself and never holds
+    /// a Worker/Labour slot.
+    pub async fn send_agent_inbox(
+        &self,
+        params: AgentInboxSendParams,
+    ) -> Result<AgentInboxSendResult> {
+        let store = self.store.clone();
+        let params_for_store = params.clone();
+        let message = tokio::task::spawn_blocking(move || {
+            let project_id = match params_for_store.project_id.as_deref() {
+                Some(project_id) => project_id.to_string(),
+                None => store
+                    .get_agent_identity(&params_for_store.identity_id)?
+                    .map(|identity| identity.project_id)
+                    .ok_or_else(|| {
+                        vp_protocol::types::AgentCoordinationError::new(
+                            vp_protocol::types::agent_coordination_codes::INBOX_RECIPIENT_INVALID,
+                            format!("agent identity not found: {}", params_for_store.identity_id),
+                        )
+                    })?,
+            };
+            let payload = match (&params_for_store.payload, &params_for_store.body) {
+                (Some(_), Some(_)) => {
+                    return Err(vp_protocol::types::AgentCoordinationError::new(
+                        vp_protocol::types::agent_coordination_codes::INBOX_PAYLOAD_INVALID,
+                        "pass either payload or body, not both",
+                    )
+                    .into());
+                }
+                (Some(payload), None) => payload.clone(),
+                (None, Some(body)) => {
+                    let body = body.trim();
+                    if body.is_empty() || body.chars().count() > 4_000 {
+                        return Err(vp_protocol::types::AgentCoordinationError::new(
+                            vp_protocol::types::agent_coordination_codes::INBOX_PAYLOAD_INVALID,
+                            "body must be 1-4000 characters",
+                        )
+                        .into());
+                    }
+                    serde_json::json!({"body": body})
+                }
+                (None, None) => serde_json::json!({}),
+            };
+            store.send_agent_inbox_message(
+                &project_id,
+                &params_for_store.identity_id,
+                params_for_store.session_id.as_deref(),
+                params_for_store.from_identity_id.as_deref(),
+                &params_for_store.kind,
+                &payload,
+                params_for_store.expires_in_secs,
+            )
+        })
+        .await??;
+        let mut wake = AgentCoordinationWake {
+            requested: params.wake_session,
+            reason: if params.wake_session {
+                "not_attempted".to_string()
+            } else {
+                String::new()
+            },
+            ..AgentCoordinationWake::default()
+        };
+        if params.wake_session {
+            let target_session = match params.session_id.clone() {
+                Some(session_id) => Some(session_id),
+                None => {
+                    let store = self.store.clone();
+                    let identity_id = message.identity_id.clone();
+                    tokio::task::spawn_blocking(move || {
+                        store
+                            .list_session_agent_assignments(
+                                None,
+                                Some(&identity_id),
+                                None,
+                                Some("active"),
+                                Some(1),
+                            )
+                            .map(|rows| rows.into_iter().next().map(|row| row.session_id))
+                    })
+                    .await??
+                }
+            };
+            if let Some(session_id) = target_session {
+                let store = self.store.clone();
+                let identity_id = message.identity_id.clone();
+                let session_for_list = session_id.clone();
+                let unread = tokio::task::spawn_blocking(move || {
+                    store
+                        .list_agent_inbox_messages(
+                            None,
+                            Some(&identity_id),
+                            Some(&session_for_list),
+                            None,
+                            true,
+                            Some(20),
+                        )
+                        .map(|(messages, _)| messages)
+                })
+                .await??;
+                let body = if unread.is_empty() {
+                    crate::coordination::render_inbox_wake_body(std::slice::from_ref(&message))
+                } else {
+                    crate::coordination::render_inbox_wake_body(&unread)
+                };
+                let operation_id = format!("coordination-wake:inbox:{}", message.id);
+                wake = self
+                    .wake_session_for_coordination(&session_id, &operation_id, &body, true)
+                    .await;
+            } else {
+                wake.reason = "no_active_session".to_string();
+            }
+        }
+        self.record_project_manifest_best_effort().await;
+        Ok(AgentInboxSendResult { message, wake })
+    }
+
+    pub async fn list_agent_inbox(
+        &self,
+        params: AgentInboxListParams,
+    ) -> Result<AgentInboxListResult> {
+        let store = self.store.clone();
+        let (messages, counts) = tokio::task::spawn_blocking(move || {
+            store.list_agent_inbox_messages(
+                params.project_id.as_deref(),
+                params.identity_id.as_deref(),
+                params.session_id.as_deref(),
+                params.status.as_deref(),
+                params.unread_only,
+                params.limit,
+            )
+        })
+        .await??;
+        Ok(AgentInboxListResult { messages, counts })
+    }
+
+    pub async fn read_agent_inbox(
+        &self,
+        params: AgentInboxMessageParams,
+    ) -> Result<AgentInboxReadResult> {
+        let store = self.store.clone();
+        let (message, changed) = tokio::task::spawn_blocking(move || {
+            store.mark_agent_inbox_read(
+                &params.message_id,
+                params.project_id.as_deref(),
+                params.identity_id.as_deref(),
+            )
+        })
+        .await??;
+        Ok(AgentInboxReadResult { message, changed })
+    }
+
+    pub async fn ack_agent_inbox(
+        &self,
+        params: AgentInboxMessageParams,
+    ) -> Result<AgentInboxReadResult> {
+        let store = self.store.clone();
+        let (message, changed) = tokio::task::spawn_blocking(move || {
+            store.ack_agent_inbox_message(
+                &params.message_id,
+                params.project_id.as_deref(),
+                params.identity_id.as_deref(),
+            )
+        })
+        .await??;
+        self.record_project_manifest_best_effort().await;
+        Ok(AgentInboxReadResult { message, changed })
+    }
+
+    /// Startup/periodic lease reconciliation. Expired leases become `released`
+    /// and emit one bounded `agent.assignment.expired` event each. Active
+    /// identities are never reassigned by this sweep.
+    pub async fn reconcile_session_agent_assignments(&self) -> Result<usize> {
+        let store = self.store.clone();
+        let events = tokio::task::spawn_blocking(move || {
+            store.expire_session_agent_assignments(Some(1_000))
+        })
+        .await??;
+        if !events.is_empty() {
+            self.record_project_manifest_best_effort().await;
+        }
+        Ok(events.len())
+    }
+
+    pub async fn sweep_agent_inbox_expiry(&self) -> Result<usize> {
+        let store = self.store.clone();
+        let events = tokio::task::spawn_blocking(move || store.expire_due_agent_inbox(Some(1_000)))
+            .await??;
+        if !events.is_empty() {
+            self.record_project_manifest_best_effort().await;
+        }
+        Ok(events.len())
+    }
+
+    /// Create a deferred continuation for a coordination wake. It is
+    /// deliberately best-effort: a busy session or a continuation failure must
+    /// never fail the durable assignment/inbox write or hold a Worker slot.
+    async fn wake_session_for_coordination(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+        body: &str,
+        requested: bool,
+    ) -> AgentCoordinationWake {
+        let mut wake = AgentCoordinationWake {
+            requested,
+            created: false,
+            continuation_id: None,
+            reason: String::new(),
+        };
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let session = match tokio::task::spawn_blocking(move || store.get_session(&id)).await {
+            Ok(Ok(Some(session))) => session,
+            Ok(Ok(None)) => {
+                wake.reason = "session_missing".to_string();
+                return wake;
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "coordination wake could not read the session");
+                wake.reason = "session_read_failed".to_string();
+                return wake;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "coordination wake session read task failed");
+                wake.reason = "session_read_failed".to_string();
+                return wake;
+            }
+        };
+        if !crate::coordination::wake_eligible_status(&session.status) {
+            wake.reason = format!("session_{}", session.status);
+            return wake;
+        }
+        match self
+            .defer_session_watching_gate(
+                session_id,
+                body,
+                Vec::new(),
+                None,
+                None,
+                Some(1),
+                None,
+                None,
+                None,
+                None,
+                Some(operation_id),
+            )
+            .await
+        {
+            Ok(result) => {
+                wake.created = true;
+                wake.continuation_id = Some(result.continuation.id);
+                wake.reason = "deferred_continuation".to_string();
+            }
+            Err(error) => {
+                tracing::warn!(%error, "coordination wake could not create a continuation");
+                wake.reason = "wake_failed".to_string();
+            }
+        }
+        wake
     }
 
     #[allow(clippy::too_many_arguments)]

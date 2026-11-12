@@ -2558,6 +2558,116 @@ enum Command {
         #[arg(long = "retirement-requires-approval")]
         retirement_requires_approval: Option<bool>,
     },
+    /// List session→identity assignments. Requires one of session, identity, or
+    /// project.
+    Assignments {
+        session: Option<String>,
+        #[arg(long)]
+        identity: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
+        /// active, released, or queued.
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+    /// Assign a project identity to a session. This is a durable coordination
+    /// record, not a run.
+    Assign {
+        session: String,
+        identity: String,
+        /// Optional consistency check against the identity role.
+        #[arg(long)]
+        role: Option<String>,
+        /// Identity-lease seconds (60-86400, default 600).
+        #[arg(long)]
+        lease_secs: Option<u64>,
+        /// Create a deferred wake continuation when the session is idle,
+        /// failed, or cancelled. It never blocks or holds a Worker slot.
+        #[arg(long)]
+        wake: bool,
+        #[arg(long)]
+        operator: Option<String>,
+    },
+    /// Heartbeat/renew a live identity lease.
+    AssignmentRenew {
+        session: String,
+        identity: String,
+        #[arg(long)]
+        lease_secs: Option<u64>,
+        #[arg(long)]
+        operator: Option<String>,
+    },
+    /// Release an assignment owned by the named session.
+    Release {
+        session: String,
+        identity: String,
+        #[arg(long)]
+        operator: bool,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// List project inbox rows. Unread rows sort first.
+    Inbox {
+        identity: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+        /// unread, read, done, or expired.
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        unread: bool,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+    /// Send one project-scoped inbox message to a Leader/Manager/Worker.
+    InboxSend {
+        identity: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long = "from")]
+        from_identity: Option<String>,
+        /// task, message, question, handoff, decision, or review.
+        #[arg(long, default_value = "message")]
+        kind: String,
+        /// Convenience text; stored as {"body": ...}.
+        #[arg(long)]
+        body: Option<String>,
+        /// Structured JSON object (max 16 KiB, no credential-like keys).
+        #[arg(long = "payload-json")]
+        payload: Option<String>,
+        #[arg(long = "expires-in")]
+        expires_in_secs: Option<u64>,
+        #[arg(long)]
+        wake: bool,
+    },
+    /// Mark an inbox message read.
+    InboxRead {
+        message: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        identity: Option<String>,
+    },
+    /// Acknowledge an inbox message as done.
+    InboxAck {
+        message: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        identity: Option<String>,
+    },
+    /// Read-only project coordination replay, or explicit projection repair.
+    CoordinationReplay {
+        project: String,
+        #[arg(long)]
+        repair: bool,
+    },
     /// Show local effect receipts for a session. `done`/`failed` rows are
     /// settled evidence; `intent`/`unknown` rows block merge until reconciled.
     Effects {
@@ -8189,6 +8299,210 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await?
         }
+        Command::Assignments {
+            session,
+            identity,
+            project,
+            status,
+            limit,
+        } => {
+            if session.is_none() && identity.is_none() && project.is_none() {
+                bail!("pass a session, --identity, or --project");
+            }
+            rpc(
+                &discovery,
+                "session.assignments",
+                json!({
+                    "session_id": session,
+                    "identity_id": identity,
+                    "project_id": project,
+                    "status": status,
+                    "limit": limit,
+                }),
+            )
+            .await?
+        }
+        Command::Assign {
+            session,
+            identity,
+            role,
+            lease_secs,
+            wake,
+            operator,
+        } => {
+            rpc(
+                &discovery,
+                "session.assign",
+                json!({
+                    "session_id": session,
+                    "identity_id": identity,
+                    "role": role,
+                    "lease_secs": lease_secs,
+                    "wake_session": wake,
+                    "operator": operator,
+                }),
+            )
+            .await?
+        }
+        Command::AssignmentRenew {
+            session,
+            identity,
+            lease_secs,
+            operator,
+        } => {
+            rpc(
+                &discovery,
+                "session.assignment.renew",
+                json!({
+                    "session_id": session,
+                    "identity_id": identity,
+                    "lease_secs": lease_secs,
+                    "operator": operator,
+                }),
+            )
+            .await?
+        }
+        Command::Release {
+            session,
+            identity,
+            operator,
+            reason,
+        } => {
+            rpc(
+                &discovery,
+                "session.release",
+                json!({
+                    "session_id": session,
+                    "identity_id": identity,
+                    "operator": operator,
+                    "reason": reason,
+                }),
+            )
+            .await?
+        }
+        Command::Inbox {
+            identity,
+            project,
+            session,
+            status,
+            unread,
+            limit,
+        } => {
+            if identity.is_none() && project.is_none() && session.is_none() {
+                bail!("pass an identity, --project, or --session");
+            }
+            rpc(
+                &discovery,
+                "agent.inbox.list",
+                json!({
+                    "identity_id": identity,
+                    "project_id": project,
+                    "session_id": session,
+                    "status": status,
+                    "unread_only": unread,
+                    "limit": limit,
+                }),
+            )
+            .await?
+        }
+        Command::InboxSend {
+            identity,
+            project,
+            session,
+            from_identity,
+            kind,
+            body,
+            payload,
+            expires_in_secs,
+            wake,
+        } => {
+            if body.is_some() && payload.is_some() {
+                bail!("pass either --body or --payload-json, not both");
+            }
+            let payload = match payload {
+                Some(raw) => {
+                    let value: Value =
+                        serde_json::from_str(&raw).context("--payload-json must be valid JSON")?;
+                    if !value.is_object() {
+                        bail!("--payload-json must be a JSON object");
+                    }
+                    Some(value)
+                }
+                None => None,
+            };
+            let project = match project {
+                Some(project) => Some(project),
+                None => {
+                    let identity = rpc(
+                        &discovery,
+                        "agent.identities.get",
+                        json!({"identity_id": identity}),
+                    )
+                    .await?;
+                    identity
+                        .get("identity")
+                        .and_then(|identity| identity.get("project_id"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                }
+            };
+            rpc(
+                &discovery,
+                "agent.inbox.send",
+                json!({
+                    "project_id": project,
+                    "identity_id": identity,
+                    "session_id": session,
+                    "from_identity_id": from_identity,
+                    "kind": kind,
+                    "body": body,
+                    "payload": payload,
+                    "expires_in_secs": expires_in_secs,
+                    "wake_session": wake,
+                }),
+            )
+            .await?
+        }
+        Command::InboxRead {
+            message,
+            project,
+            identity,
+        } => {
+            rpc(
+                &discovery,
+                "agent.inbox.read",
+                json!({
+                    "message_id": message,
+                    "project_id": project,
+                    "identity_id": identity,
+                }),
+            )
+            .await?
+        }
+        Command::InboxAck {
+            message,
+            project,
+            identity,
+        } => {
+            rpc(
+                &discovery,
+                "agent.inbox.ack",
+                json!({
+                    "message_id": message,
+                    "project_id": project,
+                    "identity_id": identity,
+                }),
+            )
+            .await?
+        }
+        Command::CoordinationReplay { project, repair } => {
+            rpc(
+                &discovery,
+                "agent.coordination.replay",
+                json!({"project_id": project, "repair": repair}),
+            )
+            .await?
+        }
         Command::Effects {
             session,
             task,
@@ -13581,7 +13895,148 @@ fn agent_identity_lines(value: &Value) -> Option<Vec<String>> {
     None
 }
 
+fn coordination_lines(value: &Value) -> Option<Vec<String>> {
+    if let Some(assignments) = value.get("assignments").and_then(Value::as_array) {
+        if assignments.is_empty() {
+            return Some(vec!["No session assignments.".to_string()]);
+        }
+        let mut lines = Vec::with_capacity(assignments.len() + 1);
+        lines.push(format!("{} session assignments", assignments.len()));
+        for assignment in assignments {
+            let latest = assignment["status"].as_str().unwrap_or("?");
+            let lease = assignment["lease_expires_at"]
+                .as_str()
+                .map(|expires| format!(" · lease {expires}"))
+                .unwrap_or_default();
+            let active = if assignment["lease_active"].as_bool().unwrap_or(false) {
+                " · live"
+            } else {
+                ""
+            };
+            lines.push(format!(
+                "{}  {}  {}  {}{}{}",
+                assignment["session_id"].as_str().unwrap_or("?"),
+                assignment["identity_id"].as_str().unwrap_or("?"),
+                assignment["role"].as_str().unwrap_or("?"),
+                latest,
+                active,
+                lease
+            ));
+        }
+        return Some(lines);
+    }
+    if let Some(assignment) = value.get("assignment")
+        && (value.get("created").is_some()
+            || value.get("released").is_some()
+            || value.get("renewed").is_some())
+    {
+        let changed = if value["created"].as_bool().unwrap_or(false) {
+            "created"
+        } else if value["released"].as_bool().unwrap_or(false) {
+            "released"
+        } else if value["renewed"].as_bool().unwrap_or(false) {
+            "renewed"
+        } else {
+            "unchanged"
+        };
+        let mut lines = vec![format!(
+            "{}  {}  {}  {changed}",
+            assignment["session_id"].as_str().unwrap_or("?"),
+            assignment["identity_id"].as_str().unwrap_or("?"),
+            assignment["status"].as_str().unwrap_or("?")
+        )];
+        if let Some(wake) = value.get("wake")
+            && wake["requested"].as_bool().unwrap_or(false)
+        {
+            lines.push(format!(
+                "wake: {} ({})",
+                if wake["created"].as_bool().unwrap_or(false) {
+                    "deferred continuation created"
+                } else {
+                    "not created"
+                },
+                wake["reason"].as_str().unwrap_or("unknown")
+            ));
+        }
+        return Some(lines);
+    }
+    if let Some(messages) = value.get("messages").and_then(Value::as_array)
+        && value.get("counts").is_some()
+    {
+        let counts = &value["counts"];
+        let mut lines = vec![format!(
+            "{} inbox rows · unread {} · read {} · done {} · expired {}",
+            messages.len(),
+            counts["unread"].as_u64().unwrap_or(0),
+            counts["read"].as_u64().unwrap_or(0),
+            counts["done"].as_u64().unwrap_or(0),
+            counts["expired"].as_u64().unwrap_or(0)
+        )];
+        for message in messages {
+            let summary = message["payload"]
+                .get("summary")
+                .or_else(|| message["payload"].get("body"))
+                .or_else(|| message["payload"].get("title"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            lines.push(format!(
+                "{}  {}  {}  {}  {}{}",
+                message["id"].as_str().unwrap_or("?"),
+                message["status"].as_str().unwrap_or("?"),
+                message["kind"].as_str().unwrap_or("?"),
+                message["from_label"].as_str().unwrap_or("operator"),
+                summary,
+                message["expires_at"]
+                    .as_str()
+                    .map(|expires| format!(" · expires {expires}"))
+                    .unwrap_or_default()
+            ));
+        }
+        return Some(lines);
+    }
+    if let Some(message) = value.get("message")
+        && value.get("changed").is_some()
+        && message.get("identity_id").is_some()
+    {
+        return Some(vec![format!(
+            "{}  {}  {}{}",
+            message["id"].as_str().unwrap_or("?"),
+            message["status"].as_str().unwrap_or("?"),
+            message["kind"].as_str().unwrap_or("?"),
+            if value["changed"].as_bool().unwrap_or(false) {
+                " (changed)"
+            } else {
+                " (unchanged)"
+            }
+        )]);
+    }
+    if value.get("consistent").is_some()
+        && value.get("assignments").is_some()
+        && value.get("inbox").is_some()
+        && value.get("events").is_some()
+    {
+        return Some(vec![format!(
+            "coordination replay: assignments {} · inbox {} · events {} · {}",
+            value["assignments"].as_u64().unwrap_or(0),
+            value["inbox"].as_u64().unwrap_or(0),
+            value["events"].as_u64().unwrap_or(0),
+            if value["consistent"].as_bool().unwrap_or(false) {
+                "consistent"
+            } else {
+                "drift detected"
+            }
+        )]);
+    }
+    None
+}
+
 fn print_human(value: &Value) {
+    if let Some(lines) = coordination_lines(value) {
+        for line in lines {
+            println!("{line}");
+        }
+        return;
+    }
     if let Some(lines) = agent_identity_lines(value) {
         for line in lines {
             println!("{line}");
@@ -22818,5 +23273,238 @@ mod agent_identity_cli_tests {
             Command::AgentPolicy { project } => assert_eq!(project, "prj-1"),
             other => panic!("expected agent-policy, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod coordination_cli_tests {
+    use super::*;
+
+    #[test]
+    fn assignment_commands_parse_bounded_lease_and_wake() {
+        let cli = Cli::try_parse_from([
+            "vp",
+            "assign",
+            "ses-1",
+            "identity-1",
+            "--role",
+            "worker",
+            "--lease-secs",
+            "900",
+            "--wake",
+            "--operator",
+            "alice",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Assign {
+                session,
+                identity,
+                role,
+                lease_secs,
+                wake,
+                operator,
+            } => {
+                assert_eq!(session, "ses-1");
+                assert_eq!(identity, "identity-1");
+                assert_eq!(role.as_deref(), Some("worker"));
+                assert_eq!(lease_secs, Some(900));
+                assert!(wake);
+                assert_eq!(operator.as_deref(), Some("alice"));
+            }
+            other => panic!("expected assign, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "assignments",
+            "ses-1",
+            "--status",
+            "active",
+            "--limit",
+            "20",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Assignments {
+                session,
+                identity,
+                project,
+                status,
+                limit,
+            } => {
+                assert_eq!(session.as_deref(), Some("ses-1"));
+                assert!(identity.is_none());
+                assert!(project.is_none());
+                assert_eq!(status.as_deref(), Some("active"));
+                assert_eq!(limit, 20);
+            }
+            other => panic!("expected assignments, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "release",
+            "ses-1",
+            "identity-1",
+            "--operator",
+            "--reason",
+            "done",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Release {
+                session,
+                identity,
+                operator,
+                reason,
+            } => {
+                assert_eq!(session, "ses-1");
+                assert_eq!(identity, "identity-1");
+                assert!(operator);
+                assert_eq!(reason.as_deref(), Some("done"));
+            }
+            other => panic!("expected release, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inbox_commands_parse_body_payload_and_expiry() {
+        let cli = Cli::try_parse_from([
+            "vp",
+            "inbox-send",
+            "identity-1",
+            "--kind",
+            "handoff",
+            "--body",
+            "review the change",
+            "--expires-in",
+            "600",
+            "--wake",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::InboxSend {
+                identity,
+                kind,
+                body,
+                payload,
+                expires_in_secs,
+                wake,
+                ..
+            } => {
+                assert_eq!(identity, "identity-1");
+                assert_eq!(kind, "handoff");
+                assert_eq!(body.as_deref(), Some("review the change"));
+                assert!(payload.is_none());
+                assert_eq!(expires_in_secs, Some(600));
+                assert!(wake);
+            }
+            other => panic!("expected inbox-send, got {other:?}"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["vp", "inbox", "identity-1", "--unread", "--limit", "5"]).unwrap();
+        match cli.command {
+            Command::Inbox {
+                identity,
+                unread,
+                limit,
+                ..
+            } => {
+                assert_eq!(identity.as_deref(), Some("identity-1"));
+                assert!(unread);
+                assert_eq!(limit, 5);
+            }
+            other => panic!("expected inbox, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["vp", "inbox-read", "msg-1", "--project", "prj-1"]).unwrap();
+        match cli.command {
+            Command::InboxRead {
+                message,
+                project,
+                identity,
+            } => {
+                assert_eq!(message, "msg-1");
+                assert_eq!(project.as_deref(), Some("prj-1"));
+                assert!(identity.is_none());
+            }
+            other => panic!("expected inbox-read, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["vp", "inbox-ack", "msg-1"]).unwrap();
+        assert!(matches!(cli.command, Command::InboxAck { .. }));
+        let cli = Cli::try_parse_from(["vp", "coordination-replay", "prj-1", "--repair"]).unwrap();
+        match cli.command {
+            Command::CoordinationReplay { project, repair } => {
+                assert_eq!(project, "prj-1");
+                assert!(repair);
+            }
+            other => panic!("expected coordination-replay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coordination_human_lines_show_lease_inbox_and_wake_without_secrets() {
+        let assignments = json!({
+            "assignments": [{
+                "session_id": "ses-1",
+                "project_id": "prj-1",
+                "identity_id": "identity-1",
+                "role": "worker",
+                "status": "active",
+                "lease_active": true,
+                "lease_expires_at": "2026-11-13T00:10:00Z",
+                "assigned_at": "2026-11-13T00:00:00Z",
+                "heartbeat_at": "2026-11-13T00:00:00Z"
+            }]
+        });
+        let rendered = coordination_lines(&assignments).unwrap().join("\n");
+        assert!(rendered.contains("ses-1"));
+        assert!(rendered.contains("live"));
+        assert!(!rendered.contains("lease_token"));
+
+        let result = json!({
+            "assignment": {
+                "session_id": "ses-1",
+                "identity_id": "identity-1",
+                "role": "worker",
+                "status": "active"
+            },
+            "created": true,
+            "wake": {"requested": true, "created": false, "reason": "session_running"}
+        });
+        let rendered = coordination_lines(&result).unwrap().join("\n");
+        assert!(rendered.contains("created"));
+        assert!(rendered.contains("session_running"));
+
+        let inbox = json!({
+            "messages": [{
+                "id": "msg-1",
+                "status": "unread",
+                "kind": "handoff",
+                "from_label": "operator",
+                "payload": {"body": "review"},
+                "expires_at": "2026-11-13T01:00:00Z"
+            }],
+            "counts": {"unread": 1, "read": 0, "done": 0, "expired": 0}
+        });
+        let rendered = coordination_lines(&inbox).unwrap().join("\n");
+        assert!(rendered.contains("unread 1"));
+        assert!(rendered.contains("review"));
+
+        let replay = json!({
+            "project_id": "prj-1",
+            "assignments": 1,
+            "inbox": 2,
+            "events": 3,
+            "consistent": true,
+            "repaired": false,
+            "mismatches": []
+        });
+        let rendered = coordination_lines(&replay).unwrap().join("\n");
+        assert!(rendered.contains("assignments 1"));
+        assert!(rendered.contains("consistent"));
     }
 }

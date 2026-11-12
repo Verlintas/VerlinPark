@@ -12064,6 +12064,9 @@ fn context_checkpoint_bundle_validation_checks_session_and_project() {
         effects: Vec::new(),
         agent_identities: Vec::new(),
         agent_identity_events: Vec::new(),
+        session_agent_assignments: Vec::new(),
+        agent_inbox: Vec::new(),
+        agent_coordination_events: Vec::new(),
     };
     validate_session_bundle(&bundle).unwrap();
     bundle.context_checkpoints[0].project_id = "other-project".into();
@@ -12327,6 +12330,9 @@ fn importing_a_projection_only_bundle_synthesizes_checkpoint_events() {
         effects: Vec::new(),
         agent_identities: Vec::new(),
         agent_identity_events: Vec::new(),
+        session_agent_assignments: Vec::new(),
+        agent_inbox: Vec::new(),
+        agent_coordination_events: Vec::new(),
     };
     let imported = Store::open(data.path().join("imported")).unwrap();
     imported.import_session_bundle(&bundle).unwrap();
@@ -14191,6 +14197,9 @@ fn bundle_import_preserves_supervised_process_lifecycle_rows() {
         }],
         agent_identities: Vec::new(),
         agent_identity_events: Vec::new(),
+        session_agent_assignments: Vec::new(),
+        agent_inbox: Vec::new(),
+        agent_coordination_events: Vec::new(),
     };
     validate_session_bundle(&bundle).unwrap();
     let data = TempDir::new().unwrap();
@@ -14265,6 +14274,9 @@ fn supervised_process_bundle_validation_rejects_wrong_session() {
         effects: Vec::new(),
         agent_identities: Vec::new(),
         agent_identity_events: Vec::new(),
+        session_agent_assignments: Vec::new(),
+        agent_inbox: Vec::new(),
+        agent_coordination_events: Vec::new(),
     };
     let error = validate_session_bundle(&bundle).unwrap_err();
     assert!(error.to_string().contains("belongs to session"), "{error}");
@@ -16494,6 +16506,9 @@ fn bundle_import_preserves_instruction_state_and_rejects_missing_blobs() {
         effects: Vec::new(),
         agent_identities: Vec::new(),
         agent_identity_events: Vec::new(),
+        session_agent_assignments: Vec::new(),
+        agent_inbox: Vec::new(),
+        agent_coordination_events: Vec::new(),
     };
     store.import_session_bundle(&bundle).unwrap();
     assert_eq!(
@@ -16567,6 +16582,9 @@ fn bundle_import_rejects_a_corrupt_instruction_blob() {
         effects: Vec::new(),
         agent_identities: Vec::new(),
         agent_identity_events: Vec::new(),
+        session_agent_assignments: Vec::new(),
+        agent_inbox: Vec::new(),
+        agent_coordination_events: Vec::new(),
     };
     assert!(store.import_session_bundle(&bundle).is_err());
 }
@@ -18130,12 +18148,12 @@ mod agent_identity_tests {
         assert_eq!(agents.len(), 1);
         assert!(agents[0].identity_id.is_none());
 
-        // No S2–S6 tables or behavior were introduced.
+        // S2 adds assignment/inbox tables, but S3–S6 tables must still be
+        // absent. The legacy run roster remains unchanged.
         for table in [
             "session_agent_assignments",
             "agent_inbox",
-            "agent_memories",
-            "project_agent_policy",
+            "agent_coordination_events",
         ] {
             let exists: bool = store
                 .lock()
@@ -18148,7 +18166,21 @@ mod agent_identity_tests {
                 .optional()
                 .unwrap()
                 .unwrap_or(false);
-            assert!(!exists, "{table} must not exist in S1");
+            assert!(exists, "{table} must exist after S2");
+        }
+        for table in ["agent_memories", "project_agent_policy"] {
+            let exists: bool = store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    params![table],
+                    |_| Ok(true),
+                )
+                .optional()
+                .unwrap()
+                .unwrap_or(false);
+            assert!(!exists, "{table} must not exist before S3/S6");
         }
         assert!(store.get_agent_identity(&agent.id).unwrap().is_none());
         assert!(

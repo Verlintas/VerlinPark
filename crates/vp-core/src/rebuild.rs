@@ -131,6 +131,60 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
                 }
                 store.replace_agent_identity_projection(&snapshot.project.id, &expected)?;
             }
+            if snapshot.agent_coordination_events.is_empty() {
+                // Forward compatibility for a manifest written before S2. No
+                // synthetic events are created.
+                for assignment in &snapshot.session_agent_assignments {
+                    if assignment.project_id != snapshot.project.id {
+                        anyhow::bail!(
+                            "assignment {}:{} belongs to another project in the manifest",
+                            assignment.session_id,
+                            assignment.identity_id
+                        );
+                    }
+                    store.insert_session_agent_assignment_snapshot(assignment)?;
+                }
+                for message in &snapshot.agent_inbox {
+                    if message.project_id != snapshot.project.id {
+                        anyhow::bail!(
+                            "inbox message {} belongs to another project in the manifest",
+                            message.id
+                        );
+                    }
+                    store.insert_agent_inbox_snapshot(message)?;
+                }
+            } else {
+                for event in &snapshot.agent_coordination_events {
+                    if event.project_id != snapshot.project.id {
+                        anyhow::bail!(
+                            "coordination event {} belongs to another project in the manifest",
+                            event.id
+                        );
+                    }
+                    store.insert_agent_coordination_event_snapshot(event)?;
+                }
+                let (assignments, inbox) =
+                    crate::coordination::project_from_events(&snapshot.agent_coordination_events)?;
+                for assignment in &assignments {
+                    if assignment.project_id != snapshot.project.id {
+                        anyhow::bail!(
+                            "coordination replay produced an assignment for another project"
+                        );
+                    }
+                }
+                for message in &inbox {
+                    if message.project_id != snapshot.project.id {
+                        anyhow::bail!(
+                            "coordination replay produced an inbox row for another project"
+                        );
+                    }
+                }
+                store.replace_agent_coordination_projection(
+                    &snapshot.project.id,
+                    &assignments,
+                    &inbox,
+                )?;
+            }
             let effect_policy = snapshot.effect_policy.normalized().map_err(|error| {
                 anyhow::anyhow!(
                     "effect policy for project {} is invalid: {error}",

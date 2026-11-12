@@ -1751,6 +1751,27 @@ actor CoreClient {
             .identities
     }
 
+    /// Read-only session assignments and lease metadata. The client never
+    /// renews or releases a lease; those are explicit operator/CLI actions.
+    func sessionAssignments(sessionID: String) async throws -> [AgentAssignment] {
+        let params: [String: JSONValue] = ["session_id": .string(sessionID)]
+        return try await request(method: "session.assignments", params: params)
+            .decode(SessionAssignmentsResult.self)
+            .assignments
+    }
+
+    /// Read-only project inbox metadata. Pull-based delivery is unchanged by
+    /// this call; the app does not mark messages read from the dashboard.
+    func agentInbox(projectID: String, limit: Int = 50) async throws -> AgentInboxListResult {
+        var params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "limit": .number(Double(limit)),
+        ]
+        params["unread_only"] = .bool(false)
+        return try await request(method: "agent.inbox.list", params: params)
+            .decode(AgentInboxListResult.self)
+    }
+
     func listMailbox(
         sessionID: String,
         agentID: String? = nil,

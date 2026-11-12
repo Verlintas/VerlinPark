@@ -11233,6 +11233,20 @@ pub struct SessionBundle {
     /// without inventing rows.
     #[serde(default)]
     pub agent_identity_events: Vec<AgentIdentityEvent>,
+    /// Session→identity assignments for this archive's project. Older bundles
+    /// decode as an empty list. Leases are evidence, not live local ownership;
+    /// the daemon startup sweep expires any lease whose timestamp has passed.
+    #[serde(default)]
+    pub session_agent_assignments: Vec<AgentAssignment>,
+    /// Project-scoped agent inbox rows for this archive's project. Older
+    /// bundles decode as an empty list and imported rows remain inert.
+    #[serde(default)]
+    pub agent_inbox: Vec<AgentInboxMessage>,
+    /// Append-only assignment/inbox event stream. These are project-scoped and
+    /// portable by event id, so an archive import can be idempotent without
+    /// colliding with an unrelated local sequence.
+    #[serde(default)]
+    pub agent_coordination_events: Vec<AgentCoordinationEvent>,
 }
 
 /// Project policy for automatic crash resume. Manual `session.run.resume`
@@ -12033,6 +12047,535 @@ pub struct AgentIdentityReplayReport {
     pub project_id: String,
     #[serde(default)]
     pub identities: u64,
+    #[serde(default)]
+    pub events: u64,
+    #[serde(default)]
+    pub consistent: bool,
+    #[serde(default)]
+    pub repaired: bool,
+    #[serde(default)]
+    pub mismatches: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Session assignment, identity lease, and project agent inbox (S2)
+// ---------------------------------------------------------------------------
+
+/// Assignment row states. `queued` is reserved for a later portfolio phase and
+/// is never produced by S2; the only S2 transitions are `active -> released`.
+pub const AGENT_ASSIGNMENT_STATUSES: [&str; 3] = ["active", "released", "queued"];
+
+pub const AGENT_ASSIGNMENT_CREATED_EVENT: &str = "agent.assignment.created";
+pub const AGENT_ASSIGNMENT_RENEWED_EVENT: &str = "agent.assignment.renewed";
+pub const AGENT_ASSIGNMENT_RELEASED_EVENT: &str = "agent.assignment.released";
+pub const AGENT_ASSIGNMENT_EXPIRED_EVENT: &str = "agent.assignment.expired";
+
+pub const AGENT_ASSIGNMENT_EVENT_KINDS: [&str; 4] = [
+    AGENT_ASSIGNMENT_CREATED_EVENT,
+    AGENT_ASSIGNMENT_RENEWED_EVENT,
+    AGENT_ASSIGNMENT_RELEASED_EVENT,
+    AGENT_ASSIGNMENT_EXPIRED_EVENT,
+];
+
+/// Default identity-lease duration: ten minutes, renewed by an explicit
+/// heartbeat. The range is deliberately narrow; an assignment is not an
+/// unkillable process and a stale lease must not pin an identity for a day.
+pub const AGENT_ASSIGNMENT_DEFAULT_LEASE_SECS: u64 = 600;
+pub const AGENT_ASSIGNMENT_MIN_LEASE_SECS: u64 = 60;
+pub const AGENT_ASSIGNMENT_MAX_LEASE_SECS: u64 = 86_400;
+
+/// Hard row cap for one assignment listing.
+pub const AGENT_ASSIGNMENT_MAX_LIST: u32 = 500;
+
+/// Inbox kinds. Labour has no project inbox; these kinds are for durable
+/// Leader/Manager/Worker identities only.
+pub const AGENT_INBOX_KINDS: [&str; 6] = [
+    "task", "message", "question", "handoff", "decision", "review",
+];
+
+pub const AGENT_INBOX_STATUSES: [&str; 4] = ["unread", "read", "done", "expired"];
+
+pub const AGENT_INBOX_MESSAGE_EVENT: &str = "agent.inbox.message";
+pub const AGENT_INBOX_READ_EVENT: &str = "agent.inbox.read";
+pub const AGENT_INBOX_DONE_EVENT: &str = "agent.inbox.done";
+pub const AGENT_INBOX_EXPIRED_EVENT: &str = "agent.inbox.expired";
+
+pub const AGENT_INBOX_EVENT_KINDS: [&str; 4] = [
+    AGENT_INBOX_MESSAGE_EVENT,
+    AGENT_INBOX_READ_EVENT,
+    AGENT_INBOX_DONE_EVENT,
+    AGENT_INBOX_EXPIRED_EVENT,
+];
+
+/// Bounded structured payload. There is no prompt text, file blob, or
+/// credential store here; the core and store surfaces reject oversized or
+/// obviously sensitive key names before persisting.
+pub const AGENT_INBOX_MAX_PAYLOAD_BYTES: usize = 16_384;
+pub const AGENT_INBOX_MAX_BODY_CHARS: usize = 4_000;
+pub const AGENT_INBOX_MAX_LIST: u32 = 500;
+pub const AGENT_INBOX_MIN_TTL_SECS: u64 = 60;
+pub const AGENT_INBOX_MAX_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+/// Hard cap for one project coordination replay read.
+pub const AGENT_COORDINATION_MAX_EVENTS: u32 = 100_000;
+/// Maximum number of characters of one message summary that may enter a wake
+/// continuation context note.
+pub const AGENT_INBOX_MAX_SUMMARY_CHARS: usize = 200;
+
+/// Stable, bounded coordination error codes. These are wire values, not
+/// message-text classifications.
+pub mod agent_coordination_codes {
+    pub const ASSIGNMENT_NOT_FOUND: &str = "ASSIGNMENT_NOT_FOUND";
+    pub const ASSIGNMENT_INVALID: &str = "ASSIGNMENT_INVALID";
+    pub const ASSIGNMENT_CONFLICT: &str = "ASSIGNMENT_CONFLICT";
+    pub const ASSIGNMENT_PROJECT_MISMATCH: &str = "ASSIGNMENT_PROJECT_MISMATCH";
+    pub const ASSIGNMENT_ROLE_MISMATCH: &str = "ASSIGNMENT_ROLE_MISMATCH";
+    pub const ASSIGNMENT_IDENTITY_RETIRED: &str = "ASSIGNMENT_IDENTITY_RETIRED";
+    pub const ASSIGNMENT_IDENTITY_UNAVAILABLE: &str = "ASSIGNMENT_IDENTITY_UNAVAILABLE";
+    pub const ASSIGNMENT_LEASE_EXPIRED: &str = "ASSIGNMENT_LEASE_EXPIRED";
+    pub const ASSIGNMENT_POLICY_DISABLED: &str = "ASSIGNMENT_POLICY_DISABLED";
+    pub const INBOX_NOT_FOUND: &str = "INBOX_NOT_FOUND";
+    pub const INBOX_INVALID: &str = "INBOX_INVALID";
+    pub const INBOX_CONFLICT: &str = "INBOX_CONFLICT";
+    pub const INBOX_PROJECT_MISMATCH: &str = "INBOX_PROJECT_MISMATCH";
+    pub const INBOX_RECIPIENT_INVALID: &str = "INBOX_RECIPIENT_INVALID";
+    pub const INBOX_SENDER_INVALID: &str = "INBOX_SENDER_INVALID";
+    pub const INBOX_RECIPIENT_RETIRED: &str = "INBOX_RECIPIENT_RETIRED";
+    pub const INBOX_EXPIRED: &str = "INBOX_EXPIRED";
+    pub const INBOX_PAYLOAD_INVALID: &str = "INBOX_PAYLOAD_INVALID";
+    pub const COORDINATION_REPLAY_INVALID: &str = "COORDINATION_REPLAY_INVALID";
+    pub const INVALID_COORDINATION_EVENT: &str = "INVALID_COORDINATION_EVENT";
+}
+
+/// Typed coordination failure. It carries only a stable code and a bounded
+/// message; payload text and secrets never enter it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentCoordinationError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl AgentCoordinationError {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for AgentCoordinationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for AgentCoordinationError {}
+
+/// Validate and normalize an identity-lease duration. `None` uses the
+/// ten-minute default; explicit values must be in `60..=86400`.
+pub fn normalize_assignment_lease_secs(
+    value: Option<u64>,
+) -> std::result::Result<u64, AgentCoordinationError> {
+    let value = value.unwrap_or(AGENT_ASSIGNMENT_DEFAULT_LEASE_SECS);
+    if !(AGENT_ASSIGNMENT_MIN_LEASE_SECS..=AGENT_ASSIGNMENT_MAX_LEASE_SECS).contains(&value) {
+        return Err(AgentCoordinationError::new(
+            agent_coordination_codes::ASSIGNMENT_INVALID,
+            format!(
+                "lease_secs must be {}..={}",
+                AGENT_ASSIGNMENT_MIN_LEASE_SECS, AGENT_ASSIGNMENT_MAX_LEASE_SECS
+            ),
+        ));
+    }
+    Ok(value)
+}
+
+/// Validate an optional inbox TTL. `None` means the message does not expire by
+/// time; explicit values are bounded to `60..=2,592,000` seconds.
+pub fn normalize_inbox_ttl_secs(
+    value: Option<u64>,
+) -> std::result::Result<Option<u64>, AgentCoordinationError> {
+    match value {
+        None => Ok(None),
+        Some(seconds)
+            if (AGENT_INBOX_MIN_TTL_SECS..=AGENT_INBOX_MAX_TTL_SECS).contains(&seconds) =>
+        {
+            Ok(Some(seconds))
+        }
+        Some(_) => Err(AgentCoordinationError::new(
+            agent_coordination_codes::INBOX_INVALID,
+            format!(
+                "expires_in_secs must be {}..={}",
+                AGENT_INBOX_MIN_TTL_SECS, AGENT_INBOX_MAX_TTL_SECS
+            ),
+        )),
+    }
+}
+
+fn inbox_key_is_sensitive(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "apikey"
+            | "accesstoken"
+            | "refreshtoken"
+            | "token"
+            | "password"
+            | "passphrase"
+            | "secret"
+            | "clientsecret"
+            | "privatekey"
+            | "authorization"
+            | "credential"
+            | "credentials"
+            | "bearer"
+            | "cookie"
+            | "sessiontoken"
+    )
+}
+
+fn inbox_payload_has_sensitive_key(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => object.iter().any(|(key, value)| {
+            inbox_key_is_sensitive(key) || inbox_payload_has_sensitive_key(value)
+        }),
+        Value::Array(items) => items.iter().any(inbox_payload_has_sensitive_key),
+        _ => false,
+    }
+}
+
+/// Validate one inbox payload. The payload must be a JSON object, fit the
+/// bounded size, and must not use an obvious credential key at any depth. This
+/// is a defensive shape check, not a content classifier: callers remain
+/// responsible for never sending secrets.
+pub fn validate_agent_inbox_payload(
+    payload: &Value,
+) -> std::result::Result<(), AgentCoordinationError> {
+    if !payload.is_object() {
+        return Err(AgentCoordinationError::new(
+            agent_coordination_codes::INBOX_PAYLOAD_INVALID,
+            "inbox payload must be a JSON object",
+        ));
+    }
+    let encoded = serde_json::to_string(payload).map_err(|_| {
+        AgentCoordinationError::new(
+            agent_coordination_codes::INBOX_PAYLOAD_INVALID,
+            "inbox payload is not serializable",
+        )
+    })?;
+    if encoded.len() > AGENT_INBOX_MAX_PAYLOAD_BYTES {
+        return Err(AgentCoordinationError::new(
+            agent_coordination_codes::INBOX_PAYLOAD_INVALID,
+            format!(
+                "inbox payload exceeds {} bytes",
+                AGENT_INBOX_MAX_PAYLOAD_BYTES
+            ),
+        ));
+    }
+    if inbox_payload_has_sensitive_key(payload) {
+        return Err(AgentCoordinationError::new(
+            agent_coordination_codes::INBOX_PAYLOAD_INVALID,
+            "inbox payload uses a credential-like key; send a label and use Keychain for secrets",
+        ));
+    }
+    Ok(())
+}
+
+/// One assignment of a project identity to a session. The lease token is
+/// deliberately absent: it is an internal fencing value and never enters the
+/// wire, an event, a bundle, a CLI line, or the UI.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentAssignment {
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub identity_id: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub assigned_at: String,
+    #[serde(default)]
+    pub released_at: Option<String>,
+    #[serde(default)]
+    pub heartbeat_at: String,
+    #[serde(default)]
+    pub lease_expires_at: Option<String>,
+    /// Derived, time-relative convenience for read surfaces. Events and stored
+    /// rows always carry the authoritative status and expiry.
+    #[serde(default)]
+    pub lease_active: bool,
+}
+
+/// One durable project-scoped inbox row. Delivery is pull-based and this is not
+/// a task-scoped Labour inbox.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentInboxMessage {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub identity_id: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub from_identity_id: Option<String>,
+    /// `operator` for an operator-authored row, otherwise the sender identity
+    /// id. It is a label, not a credential.
+    #[serde(default)]
+    pub from_label: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default = "default_identity_policy_json")]
+    pub payload: Value,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub read_at: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentInboxCounts {
+    #[serde(default)]
+    pub unread: u64,
+    #[serde(default)]
+    pub read: u64,
+    #[serde(default)]
+    pub done: u64,
+    #[serde(default)]
+    pub expired: u64,
+}
+
+/// One append-only project-scoped coordination event. `seq` is a per-project
+/// ordering value; `id` is portable across databases so an archive import can
+/// be idempotent without colliding with an unrelated local stream.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentCoordinationEvent {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub payload: Value,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+/// Optional wake outcome for assignment and inbox commands. A wake is a
+/// deferred continuation, never a hidden provider call or a held Worker slot.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCoordinationWake {
+    #[serde(default)]
+    pub requested: bool,
+    #[serde(default)]
+    pub created: bool,
+    #[serde(default)]
+    pub continuation_id: Option<String>,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionAssignmentsParams {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub identity_id: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionAssignmentsResult {
+    #[serde(default)]
+    pub assignments: Vec<AgentAssignment>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionAssignParams {
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub identity_id: String,
+    /// Optional consistency check. When present it must equal the identity role.
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub lease_secs: Option<u64>,
+    /// Create a deferred wake continuation when the session is idle/failed/
+    /// cancelled. Never blocks and never holds a Worker slot.
+    #[serde(default)]
+    pub wake_session: bool,
+    /// Bounded operator label for the audit event.
+    #[serde(default)]
+    pub operator: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionAssignResult {
+    #[serde(default)]
+    pub assignment: AgentAssignment,
+    #[serde(default)]
+    pub created: bool,
+    #[serde(default)]
+    pub wake: AgentCoordinationWake,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionAssignmentRenewParams {
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub identity_id: String,
+    #[serde(default)]
+    pub lease_secs: Option<u64>,
+    #[serde(default)]
+    pub operator: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionAssignmentRenewResult {
+    #[serde(default)]
+    pub assignment: AgentAssignment,
+    #[serde(default)]
+    pub renewed: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionReleaseParams {
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub identity_id: String,
+    /// Operator-initiated releases are still scoped to the owning session; this
+    /// flag is audit metadata, not an authentication claim.
+    #[serde(default)]
+    pub operator: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionReleaseResult {
+    #[serde(default)]
+    pub assignment: AgentAssignment,
+    #[serde(default)]
+    pub released: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentInboxSendParams {
+    /// Optional; derived from the recipient identity when absent and required
+    /// to match when present.
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub identity_id: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Sender identity. Omit for the stable `operator` sender.
+    #[serde(default)]
+    pub from_identity_id: Option<String>,
+    /// task, message, question, handoff, decision, or review.
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub payload: Option<Value>,
+    /// Convenience text; becomes `{"body": ...}` when no structured payload is
+    /// supplied. Never a secret store.
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub expires_in_secs: Option<u64>,
+    #[serde(default)]
+    pub wake_session: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentInboxSendResult {
+    #[serde(default)]
+    pub message: AgentInboxMessage,
+    #[serde(default)]
+    pub wake: AgentCoordinationWake,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentInboxListParams {
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub identity_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub unread_only: bool,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentInboxListResult {
+    #[serde(default)]
+    pub messages: Vec<AgentInboxMessage>,
+    #[serde(default)]
+    pub counts: AgentInboxCounts,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentInboxMessageParams {
+    #[serde(default)]
+    pub message_id: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub identity_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentInboxReadResult {
+    #[serde(default)]
+    pub message: AgentInboxMessage,
+    #[serde(default)]
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentCoordinationReplayParams {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub repair: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentCoordinationReplayReport {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub assignments: u64,
+    #[serde(default)]
+    pub inbox: u64,
     #[serde(default)]
     pub events: u64,
     #[serde(default)]
@@ -17341,6 +17884,9 @@ mod context_checkpoint_bundle_tests {
             }],
             agent_identities: Vec::new(),
             agent_identity_events: Vec::new(),
+            session_agent_assignments: Vec::new(),
+            agent_inbox: Vec::new(),
+            agent_coordination_events: Vec::new(),
         };
         let encoded = serde_json::to_string(&bundle).unwrap();
         let decoded: SessionBundle = serde_json::from_str(&encoded).unwrap();
@@ -20624,5 +21170,118 @@ mod agent_identity_protocol_tests {
         );
         assert!(AGENT_IDENTITY_ROLES.contains(&"leader"));
         assert!(!AGENT_IDENTITY_ROLES.contains(&"labour"));
+    }
+}
+
+#[cfg(test)]
+mod agent_coordination_protocol_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn assignment_and_inbox_decoders_are_additive() {
+        let assignment: AgentAssignment = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "project_id": "prj-1",
+            "identity_id": "id-1",
+            "role": "worker",
+            "status": "active",
+            "assigned_at": "2026-11-13T00:00:00Z",
+            "heartbeat_at": "2026-11-13T00:00:00Z",
+            "lease_expires_at": "2026-11-13T00:10:00Z"
+        }))
+        .unwrap();
+        assert!(!assignment.lease_active);
+        assert!(assignment.released_at.is_none());
+
+        let message: AgentInboxMessage = serde_json::from_value(json!({
+            "id": "msg-1",
+            "project_id": "prj-1",
+            "identity_id": "id-1",
+            "kind": "message",
+            "status": "unread"
+        }))
+        .unwrap();
+        assert_eq!(message.payload, json!({}));
+        assert_eq!(message.from_label, "");
+        assert!(message.session_id.is_none());
+
+        let list: AgentInboxListResult = serde_json::from_value(json!({})).unwrap();
+        assert!(list.messages.is_empty());
+        assert_eq!(list.counts.unread, 0);
+        let params: AgentInboxSendParams = serde_json::from_value(json!({
+            "identity_id": "id-1"
+        }))
+        .unwrap();
+        assert!(params.project_id.is_none());
+        assert!(!params.wake_session);
+        assert!(params.kind.is_empty());
+        let assign: SessionAssignParams = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "identity_id": "id-1",
+            "wake_session": true
+        }))
+        .unwrap();
+        assert!(assign.lease_secs.is_none());
+        assert!(assign.wake_session);
+    }
+
+    #[test]
+    fn lease_and_ttl_bounds_fail_closed() {
+        assert_eq!(
+            normalize_assignment_lease_secs(None).unwrap(),
+            AGENT_ASSIGNMENT_DEFAULT_LEASE_SECS
+        );
+        assert!(normalize_assignment_lease_secs(Some(59)).is_err());
+        assert!(normalize_assignment_lease_secs(Some(86_401)).is_err());
+        assert_eq!(
+            normalize_assignment_lease_secs(Some(60)).unwrap(),
+            AGENT_ASSIGNMENT_MIN_LEASE_SECS
+        );
+        assert_eq!(normalize_inbox_ttl_secs(None).unwrap(), None);
+        assert!(normalize_inbox_ttl_secs(Some(59)).is_err());
+        assert_eq!(normalize_inbox_ttl_secs(Some(60)).unwrap(), Some(60));
+    }
+
+    #[test]
+    fn inbox_payload_is_bounded_object_and_rejects_credential_keys() {
+        assert!(validate_agent_inbox_payload(&json!({"summary": "review T1"})).is_ok());
+        assert!(validate_agent_inbox_payload(&json!("plain text")).is_err());
+        assert!(validate_agent_inbox_payload(&json!({"api_key": "x"})).is_err());
+        assert!(validate_agent_inbox_payload(&json!({"nested": [{"password": "x"}]})).is_err());
+        let oversized = json!({"body": "x".repeat(AGENT_INBOX_MAX_PAYLOAD_BYTES)});
+        assert!(validate_agent_inbox_payload(&oversized).is_err());
+        assert!(validate_agent_inbox_payload(&json!({"context_tokens": 12})).is_ok());
+    }
+
+    #[test]
+    fn event_kinds_and_codes_are_stable_wire_values() {
+        assert!(AGENT_ASSIGNMENT_EVENT_KINDS.contains(&"agent.assignment.expired"));
+        assert!(AGENT_INBOX_EVENT_KINDS.contains(&"agent.inbox.done"));
+        assert_eq!(
+            agent_coordination_codes::ASSIGNMENT_CONFLICT,
+            "ASSIGNMENT_CONFLICT"
+        );
+        assert!(!AGENT_IDENTITY_ROLES.contains(&"labour"));
+        assert!(AGENT_INBOX_KINDS.contains(&"handoff"));
+    }
+
+    #[test]
+    fn bundle_new_fields_decode_as_empty_for_older_archives() {
+        let bundle: SessionBundle = serde_json::from_value(json!({
+            "version": 1,
+            "exported_at": "2026-11-13T00:00:00Z",
+            "project": {"id": "prj-1", "name": "p", "root": "/tmp/p", "default_branch": "main", "created_at": "2026-11-13T00:00:00Z"},
+            "session": {"id": "ses-1", "project_id": "prj-1", "goal": "g", "status": "idle", "created_at": "2026-11-13T00:00:00Z"},
+            "events": [],
+            "agents": [],
+            "messages": [],
+            "todos": [],
+            "merge_queue": []
+        }))
+        .unwrap();
+        assert!(bundle.session_agent_assignments.is_empty());
+        assert!(bundle.agent_inbox.is_empty());
+        assert!(bundle.agent_coordination_events.is_empty());
     }
 }

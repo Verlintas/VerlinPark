@@ -75,6 +75,13 @@ final class AppModel {
     var agentIdentities: [AgentIdentity] = []
     var agentIdentitiesStatus: String?
     var agentIdentitiesBusy = false
+    var sessionAssignments: [AgentAssignment] = []
+    var sessionAssignmentsStatus: String?
+    var sessionAssignmentsBusy = false
+    var coordinationInbox: [AgentInboxMessage] = []
+    var coordinationInboxCounts: AgentInboxCounts?
+    var coordinationInboxStatus: String?
+    var coordinationInboxBusy = false
     var mergeQueue: [MergeQueueEntry] = []
     var mailbox: [AgentMessage] = []
     var artifacts: [Artifact] = []
@@ -8182,6 +8189,57 @@ final class AppModel {
             artifacts = published
         } catch {
             // The event stream will retry on mailbox/artifact events.
+        }
+    }
+
+    /// Read-only session assignment metadata for the coordination card.
+    func loadSessionAssignments() async {
+        guard let sessionID = selectedSessionID else {
+            sessionAssignments = []
+            sessionAssignmentsStatus = nil
+            return
+        }
+        sessionAssignmentsBusy = true
+        defer { sessionAssignmentsBusy = false }
+        let generation = selectionGeneration
+        do {
+            let rows = try await core.sessionAssignments(sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            sessionAssignments = rows
+            sessionAssignmentsStatus = rows.isEmpty
+                ? "No identities assigned to this session."
+                : "\(rows.count) assignments"
+        } catch {
+            if isCurrent(sessionID: sessionID, generation: generation) {
+                sessionAssignmentsStatus = error.localizedDescription
+            }
+        }
+    }
+
+    /// Read-only project inbox metadata. This never marks a message read; the
+    /// CLI/operator owns lifecycle changes.
+    func loadCoordinationInbox() async {
+        guard let projectID = selectedProjectID else {
+            coordinationInbox = []
+            coordinationInboxCounts = nil
+            coordinationInboxStatus = nil
+            return
+        }
+        coordinationInboxBusy = true
+        defer { coordinationInboxBusy = false }
+        do {
+            let result = try await core.agentInbox(projectID: projectID)
+            if projectID == selectedProjectID {
+                coordinationInbox = result.messages
+                coordinationInboxCounts = result.counts
+                coordinationInboxStatus = result.messages.isEmpty
+                    ? "No project inbox rows."
+                    : "\(result.counts.unread) unread"
+            }
+        } catch {
+            if projectID == selectedProjectID {
+                coordinationInboxStatus = error.localizedDescription
+            }
         }
     }
 

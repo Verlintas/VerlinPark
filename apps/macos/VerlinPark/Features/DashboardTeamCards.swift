@@ -3034,3 +3034,157 @@ struct ProgramDetailSheet: View {
         }
     }
 }
+
+/// Read-only S2 coordination metadata: session assignments with lease state and
+/// project inbox counts. There is intentionally no assign/release/send action
+/// in the client; those are explicit RPC/CLI operations.
+struct CoordinationCard: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Coordination")
+                    Text(model.selectedSession?.goal ?? "No session selected")
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                        .lineLimit(1)
+                }
+                Spacer()
+                if model.sessionAssignmentsBusy || model.coordinationInboxBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Refresh") {
+                    Task {
+                        await model.loadSessionAssignments()
+                        await model.loadCoordinationInbox()
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.selectedProjectID == nil)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Assignments")
+                    .font(.system(size: 9, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                if model.selectedSessionID == nil {
+                    Text("Select a session to inspect its identity assignments.")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                } else if model.sessionAssignments.isEmpty {
+                    Text(model.sessionAssignmentsStatus ?? "No assignments.")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                } else {
+                    ForEach(model.sessionAssignments) { assignment in
+                        HStack(spacing: 8) {
+                            Image(systemName: icon(for: assignment.role))
+                                .font(.system(size: 10))
+                                .foregroundStyle(assignment.isLive ? .green : .secondary)
+                                .frame(width: 14)
+                            Text(assignment.identityId)
+                                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                                .lineLimit(1)
+                            Text(assignment.role)
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Text(assignment.isLive ? "live" : assignment.status)
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(assignment.isLive ? .green : .secondary)
+                            if let expires = assignment.leaseExpiresAt, assignment.isLive {
+                                Text(shortTime(expires))
+                                    .font(.system(size: 8, design: .monospaced))
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                        .padding(7)
+                        .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 8))
+                    }
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Text("Project inbox")
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    if let counts = model.coordinationInboxCounts {
+                        Text("unread \(counts.unread)")
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(counts.unread > 0 ? Color.orange : Color.secondary)
+                        Text("done \(counts.done)")
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                    }
+                    Spacer()
+                }
+                if model.coordinationInbox.isEmpty {
+                    Text(model.coordinationInboxStatus ?? "No project inbox rows.")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                } else {
+                    ForEach(model.coordinationInbox.prefix(6)) { message in
+                        HStack(alignment: .top, spacing: 8) {
+                            Text(message.status.uppercased())
+                                .font(.system(size: 8, weight: .medium, design: .monospaced))
+                                .foregroundStyle(color(for: message.status))
+                                .frame(width: 56, alignment: .leading)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text("[\(message.kind)] \(message.payload.displaySummary)")
+                                    .font(.system(size: 9))
+                                    .lineLimit(1)
+                                Text("\(message.identityId) · \(message.fromLabel)")
+                                    .font(.system(size: 8, design: .monospaced))
+                                    .foregroundStyle(.tertiary)
+                                    .lineLimit(1)
+                            }
+                            Spacer(minLength: 0)
+                        }
+                    }
+                    if model.coordinationInbox.count > 6 {
+                        Text("… and \(model.coordinationInbox.count - 6) more")
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 0)
+        .task {
+            await model.loadSessionAssignments()
+            await model.loadCoordinationInbox()
+        }
+    }
+
+    private func icon(for role: String) -> String {
+        switch role {
+        case "leader": "crown"
+        case "manager": "person.2"
+        default: "wrench.and.screwdriver"
+        }
+    }
+
+    private func color(for status: String) -> Color {
+        switch status {
+        case "unread", "active": .green
+        case "read": .cyan
+        case "done": .secondary
+        case "expired": .orange
+        default: .secondary
+        }
+    }
+
+    private func shortTime(_ timestamp: String) -> String {
+        timestamp.count >= 16 ? String(timestamp.dropFirst(11).prefix(5)) : timestamp
+    }
+}

@@ -7701,6 +7701,157 @@ struct AgentIdentitiesResult: Codable, Sendable {
     let identities: [AgentIdentity]
 }
 
+/// Read-only session→identity assignment metadata. The lease token is never on
+/// the wire; `leaseActive` is a server-derived, time-relative hint.
+struct AgentAssignment: Codable, Identifiable, Hashable, Sendable {
+    let sessionId: String
+    let projectId: String
+    let identityId: String
+    let role: String
+    let status: String
+    let assignedAt: String
+    let releasedAt: String?
+    let heartbeatAt: String
+    let leaseExpiresAt: String?
+    let leaseActive: Bool
+
+    var id: String {
+        "\(sessionId)#\(identityId)"
+    }
+
+    var isLive: Bool {
+        status == "active" && leaseActive
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case projectId = "project_id"
+        case identityId = "identity_id"
+        case role
+        case status
+        case assignedAt = "assigned_at"
+        case releasedAt = "released_at"
+        case heartbeatAt = "heartbeat_at"
+        case leaseExpiresAt = "lease_expires_at"
+        case leaseActive = "lease_active"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionId = try container.decode(String.self, forKey: .sessionId)
+        projectId = try container.decode(String.self, forKey: .projectId)
+        identityId = try container.decode(String.self, forKey: .identityId)
+        role = try container.decode(String.self, forKey: .role)
+        status = try container.decode(String.self, forKey: .status)
+        assignedAt = try container.decode(String.self, forKey: .assignedAt)
+        releasedAt = try container.decodeIfPresent(String.self, forKey: .releasedAt)
+        heartbeatAt = try container.decode(String.self, forKey: .heartbeatAt)
+        leaseExpiresAt = try container.decodeIfPresent(String.self, forKey: .leaseExpiresAt)
+        leaseActive = try container.decodeIfPresent(Bool.self, forKey: .leaseActive) ?? false
+    }
+}
+
+struct SessionAssignmentsResult: Codable, Sendable {
+    let assignments: [AgentAssignment]
+}
+
+/// Known inbox payload fields. Unknown fields are ignored by the view and are
+/// never interpreted as instructions or credentials.
+struct AgentInboxPayload: Codable, Hashable, Sendable {
+    let values: [String: JSONValue]
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        values = try container.decode([String: JSONValue].self)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(values)
+    }
+
+    var displaySummary: String {
+        for key in ["summary", "title", "body", "message", "question", "decision"] {
+            if case let .string(value) = values[key], !value.isEmpty {
+                return value
+            }
+        }
+        return "…"
+    }
+}
+
+/// Read-only project inbox row. Delivery is pull-based; no view logic sends,
+/// acks, or wakes anything.
+struct AgentInboxMessage: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let projectId: String
+    let identityId: String
+    let sessionId: String?
+    let fromIdentityId: String?
+    let fromLabel: String
+    let kind: String
+    let payload: AgentInboxPayload
+    let status: String
+    let createdAt: String
+    let readAt: String?
+    let expiresAt: String?
+
+    var isUnread: Bool {
+        status == "unread"
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case projectId = "project_id"
+        case identityId = "identity_id"
+        case sessionId = "session_id"
+        case fromIdentityId = "from_identity_id"
+        case fromLabel = "from_label"
+        case kind
+        case payload
+        case status
+        case createdAt = "created_at"
+        case readAt = "read_at"
+        case expiresAt = "expires_at"
+    }
+}
+
+struct AgentInboxCounts: Codable, Hashable, Sendable {
+    let unread: Int
+    let read: Int
+    let done: Int
+    let expired: Int
+}
+
+struct AgentInboxListResult: Codable, Sendable {
+    let messages: [AgentInboxMessage]
+    let counts: AgentInboxCounts
+}
+
+struct AgentCoordinationWake: Codable, Hashable, Sendable {
+    let requested: Bool
+    let created: Bool
+    let continuationId: String?
+    let reason: String
+
+    enum CodingKeys: String, CodingKey {
+        case requested
+        case created
+        case continuationId = "continuation_id"
+        case reason
+    }
+}
+
+struct AgentInboxSendResult: Codable, Sendable {
+    let message: AgentInboxMessage
+    let wake: AgentCoordinationWake
+}
+
+struct AgentInboxReadResult: Codable, Sendable {
+    let message: AgentInboxMessage
+    let changed: Bool
+}
+
 struct MergeQueueEntry: Codable, Identifiable, Hashable, Sendable {
     let id: String
     let sessionId: String

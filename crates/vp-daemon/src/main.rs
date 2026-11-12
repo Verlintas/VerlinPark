@@ -45,54 +45,56 @@ use vp_protocol::test_cache::{
 };
 use vp_protocol::types::{
     AcpAgentConfig, AcpAgentIdParams, AcpProbeParams, AddAcpAgentParams, AddMcpServerParams,
-    AddProjectParams, AgentIdentityListParams, AgentIdentityParams, AgentIdentityPolicyParams,
-    AgentIdentityPolicyResult, AgentIdentityReplayParams, AgentListParams, AgentListResult,
-    AgentMessageResult, AnswerQuestionParams, AnswerQuestionResult, ApprovalAuditParams,
-    ApprovalBatchResolveParams, ApprovalBatchResolveResult, ApprovalGrantCreateParams,
-    ApprovalGrantCreateResult, ApprovalGrantDeleteParams, ApprovalGrantDeleteResult,
-    ApprovalGrantListParams, ApprovalGrantListResult, ApprovalListResult, ApprovalQueueParams,
-    ApprovalTemplateCreateParams, ApprovalTemplateDeleteParams, ApprovalTemplateFromApprovalParams,
-    ApprovalTemplateListParams, ApprovalTemplateListResult, ApprovalTemplateUpdateParams,
-    ArtifactArchiveExtractParams, ArtifactArchiveListParams, ArtifactBackfillParams,
-    ArtifactDiffParams, ArtifactGcParams, ArtifactGetParams, ArtifactListParams,
-    ArtifactListResult, ArtifactMaterializeParams, ArtifactPolicyParams, ArtifactPolicyResult,
-    ArtifactRestoreParams, ArtifactResult, ArtifactVersionsParams, AttentionPolicyGetParams,
-    AttentionPolicySetParams, AuthParams, AuthResult, CachePolicyParams, CachePolicyResult,
-    CancelSessionParams, CancelSessionResult, CheckpointPolicyParams, CleanupWorktreesParams,
-    CommitSessionParams, ConfigureAgentParams, ConsoleCloseParams, ConsoleOpenParams,
-    ConsoleReadParams, ConsoleSignalParams, ConsoleWriteParams, ContextCheckpointCreateParams,
-    ContextCheckpointDeleteParams, ContextCheckpointDetailParams, ContextCheckpointListParams,
-    ContextCheckpointPolicyParams, ContextCheckpointPruneParams, ContextRestoreParams,
-    ContractPolicyParams, ContractPolicyResult, CreateAgentIdentityParams, CreateModelPresetParams,
-    CreateSessionParams, CriticalPathMode, CriticalPathPolicyParams, CriticalPathPolicyResult,
-    DaemonMetrics, DaemonMetricsResult, DashboardParams, DeleteModelPresetParams,
-    DiscardSessionParams, DoctorCheck, DoctorReport, EffectPolicyParams, EffectPolicyResult,
-    EffectReconcileParams, EffectReconcileResult, EventListResult, ForgePreflightParams,
-    ForgeStatusParams, ForkAuditParams, ForkRepairParams, GateCancelParams, GateListParams,
-    GateOpenParams, GatePolicyParams, GatePolicyResult, GateResolveParams, GateStatusParams,
-    GateSweepParams, GitLogParams, GitShowParams, GovernorPreviewParams, GovernorStatusParams,
-    IntakeCreateParams, IntakeDeleteResult, IntakeListParams, IntakeTaskParams, IntakeUpdateParams,
-    IntegrationPolicyParams, IntegrationPolicyResult, LandSessionParams, ListApprovalsParams,
-    ListEventsParams, ListSessionsParams, MailboxGcParams, MailboxListParams, MailboxListResult,
-    MailboxPolicyParams, MailboxPolicyResult, MarkMessageReadParams, McpCallParams,
-    McpGetPromptParams, McpPinApproveParams, McpPinRejectParams, McpProbeParams,
-    McpReadResourceParams, McpServerIdParams, MediaInfoParams, MediaTranscodeParams,
-    MemoryBriefParams, MemoryConflictResolveParams, MemoryConflictScanParams,
-    MemoryConflictsParams, MemoryCreateParams, MemoryCreateResult, MemoryDeleteParams,
-    MemoryEmbeddingsIndexRebuildParams, MemoryEmbeddingsIndexStatusParams,
-    MemoryEmbeddingsRebuildParams, MemoryEmbeddingsStatusParams, MemoryEmbeddingsTestParams,
-    MemoryHealthParams, MemoryListParams, MemoryPolicyParams, MemoryPruneParams,
-    MemorySearchParams, MemoryStatsParams, MemorySweepParams, MemoryUpdateParams,
-    MemoryVerifyParams, MergeQueueListParams, MergeQueueListResult, OpenPullRequestParams,
-    PauseAgentIdentityParams, PingResult, PreemptionOverviewParams, PreemptionPolicyParams,
-    PreemptionPolicyResult, ProcessListParams, ProcessLogsParams, ProcessPolicyParams,
-    ProcessPolicyResult, ProcessRestartParams, ProcessStopParams, ProjectBudgetParams,
-    ProjectCacheEpochParams, ProjectCacheEpochPruneParams, ProjectCacheParams,
+    AddProjectParams, AgentCoordinationReplayParams, AgentIdentityListParams, AgentIdentityParams,
+    AgentIdentityPolicyParams, AgentIdentityPolicyResult, AgentIdentityReplayParams,
+    AgentInboxListParams, AgentInboxMessageParams, AgentInboxSendParams, AgentListParams,
+    AgentListResult, AgentMessageResult, AnswerQuestionParams, AnswerQuestionResult,
+    ApprovalAuditParams, ApprovalBatchResolveParams, ApprovalBatchResolveResult,
+    ApprovalGrantCreateParams, ApprovalGrantCreateResult, ApprovalGrantDeleteParams,
+    ApprovalGrantDeleteResult, ApprovalGrantListParams, ApprovalGrantListResult,
+    ApprovalListResult, ApprovalQueueParams, ApprovalTemplateCreateParams,
+    ApprovalTemplateDeleteParams, ApprovalTemplateFromApprovalParams, ApprovalTemplateListParams,
+    ApprovalTemplateListResult, ApprovalTemplateUpdateParams, ArtifactArchiveExtractParams,
+    ArtifactArchiveListParams, ArtifactBackfillParams, ArtifactDiffParams, ArtifactGcParams,
+    ArtifactGetParams, ArtifactListParams, ArtifactListResult, ArtifactMaterializeParams,
+    ArtifactPolicyParams, ArtifactPolicyResult, ArtifactRestoreParams, ArtifactResult,
+    ArtifactVersionsParams, AttentionPolicyGetParams, AttentionPolicySetParams, AuthParams,
+    AuthResult, CachePolicyParams, CachePolicyResult, CancelSessionParams, CancelSessionResult,
+    CheckpointPolicyParams, CleanupWorktreesParams, CommitSessionParams, ConfigureAgentParams,
+    ConsoleCloseParams, ConsoleOpenParams, ConsoleReadParams, ConsoleSignalParams,
+    ConsoleWriteParams, ContextCheckpointCreateParams, ContextCheckpointDeleteParams,
+    ContextCheckpointDetailParams, ContextCheckpointListParams, ContextCheckpointPolicyParams,
+    ContextCheckpointPruneParams, ContextRestoreParams, ContractPolicyParams, ContractPolicyResult,
+    CreateAgentIdentityParams, CreateModelPresetParams, CreateSessionParams, CriticalPathMode,
+    CriticalPathPolicyParams, CriticalPathPolicyResult, DaemonMetrics, DaemonMetricsResult,
+    DashboardParams, DeleteModelPresetParams, DiscardSessionParams, DoctorCheck, DoctorReport,
+    EffectPolicyParams, EffectPolicyResult, EffectReconcileParams, EffectReconcileResult,
+    EventListResult, ForgePreflightParams, ForgeStatusParams, ForkAuditParams, ForkRepairParams,
+    GateCancelParams, GateListParams, GateOpenParams, GatePolicyParams, GatePolicyResult,
+    GateResolveParams, GateStatusParams, GateSweepParams, GitLogParams, GitShowParams,
+    GovernorPreviewParams, GovernorStatusParams, IntakeCreateParams, IntakeDeleteResult,
+    IntakeListParams, IntakeTaskParams, IntakeUpdateParams, IntegrationPolicyParams,
+    IntegrationPolicyResult, LandSessionParams, ListApprovalsParams, ListEventsParams,
+    ListSessionsParams, MailboxGcParams, MailboxListParams, MailboxListResult, MailboxPolicyParams,
+    MailboxPolicyResult, MarkMessageReadParams, McpCallParams, McpGetPromptParams,
+    McpPinApproveParams, McpPinRejectParams, McpProbeParams, McpReadResourceParams,
+    McpServerIdParams, MediaInfoParams, MediaTranscodeParams, MemoryBriefParams,
+    MemoryConflictResolveParams, MemoryConflictScanParams, MemoryConflictsParams,
+    MemoryCreateParams, MemoryCreateResult, MemoryDeleteParams, MemoryEmbeddingsIndexRebuildParams,
+    MemoryEmbeddingsIndexStatusParams, MemoryEmbeddingsRebuildParams, MemoryEmbeddingsStatusParams,
+    MemoryEmbeddingsTestParams, MemoryHealthParams, MemoryListParams, MemoryPolicyParams,
+    MemoryPruneParams, MemorySearchParams, MemoryStatsParams, MemorySweepParams,
+    MemoryUpdateParams, MemoryVerifyParams, MergeQueueListParams, MergeQueueListResult,
+    OpenPullRequestParams, PauseAgentIdentityParams, PingResult, PreemptionOverviewParams,
+    PreemptionPolicyParams, PreemptionPolicyResult, ProcessListParams, ProcessLogsParams,
+    ProcessPolicyParams, ProcessPolicyResult, ProcessRestartParams, ProcessStopParams,
+    ProjectBudgetParams, ProjectCacheEpochParams, ProjectCacheEpochPruneParams, ProjectCacheParams,
     ProjectForkForestParams, ProjectListResult, ProjectMcpPinsParams, ProjectUsageParams,
     PromptParams, PromptResult, QuestionListParams, RehydrateSessionParams, ReplaySessionParams,
     ResolveApprovalParams, ResolveApprovalResult, ResolveMergeParams, ResolveMergeResult,
     ResumeAgentIdentityParams, RetireAgentIdentityParams, RetryMergeParams, RetryMergeResult,
-    SchedulerStatusParams, SearchParams, ServerInfo, SessionCacheAuditParams,
+    SchedulerStatusParams, SearchParams, ServerInfo, SessionAssignParams,
+    SessionAssignmentRenewParams, SessionAssignmentsParams, SessionCacheAuditParams,
     SessionCacheBreaksParams, SessionCacheCallsParams, SessionCacheEpochParams, SessionCacheParams,
     SessionCachePlanParams, SessionCacheWarmParams, SessionCheckpointDeleteParams,
     SessionCheckpointDiffParams, SessionCheckpointListParams, SessionCheckpointParams,
@@ -104,14 +106,14 @@ use vp_protocol::types::{
     SessionForkParams, SessionForkTreeParams, SessionImportParams, SessionInstructionsParams,
     SessionLineageParams, SessionListResult, SessionLogParams, SessionMergeForkParams,
     SessionPauseParams, SessionPauseResult, SessionPlanResumeParams, SessionPlanResumeResult,
-    SessionPreemptParams, SessionPreemptionParams, SessionResumeParams, SessionResumeResult,
-    SessionRunCancelParams, SessionRunDetailParams, SessionRunPolicyParams, SessionRunResumeParams,
-    SessionRunsParams, SessionSkillActivationsParams, SessionStallsParams, SessionSteerParams,
-    SessionSteeringCancelParams, SessionSteeringParams, SessionTodosParams, SessionTodosResult,
-    SessionTranscriptParams, SetAgentIdentityPolicyParams, SetArtifactPolicyParams,
-    SetCachePolicyParams, SetCheckpointPolicyParams, SetContextCheckpointPolicyParams,
-    SetContractPolicyParams, SetCriticalPathPolicyParams, SetGatePolicyParams,
-    SetIntegrationPolicyParams, SetMailboxPolicyParams, SetMemoryPolicyParams,
+    SessionPreemptParams, SessionPreemptionParams, SessionReleaseParams, SessionResumeParams,
+    SessionResumeResult, SessionRunCancelParams, SessionRunDetailParams, SessionRunPolicyParams,
+    SessionRunResumeParams, SessionRunsParams, SessionSkillActivationsParams, SessionStallsParams,
+    SessionSteerParams, SessionSteeringCancelParams, SessionSteeringParams, SessionTodosParams,
+    SessionTodosResult, SessionTranscriptParams, SetAgentIdentityPolicyParams,
+    SetArtifactPolicyParams, SetCachePolicyParams, SetCheckpointPolicyParams,
+    SetContextCheckpointPolicyParams, SetContractPolicyParams, SetCriticalPathPolicyParams,
+    SetGatePolicyParams, SetIntegrationPolicyParams, SetMailboxPolicyParams, SetMemoryPolicyParams,
     SetPreemptionPolicyParams, SetProcessPolicyParams, SetProjectBudgetParams,
     SetProjectPromptLayoutParams, SetSessionPriorityParams, SetSessionPromptLayoutParams,
     SetSessionRunPolicyParams, SetSessionUnlimitedParams, SetShellPolicyParams,
@@ -223,6 +225,19 @@ async fn run() -> Result<()> {
             "marked sessions interrupted by the previous daemon as failed"
         );
     }
+    match engine.reconcile_session_agent_assignments().await {
+        Ok(0) => {}
+        Ok(expired) => tracing::info!(
+            expired,
+            "released expired identity leases from the previous daemon"
+        ),
+        Err(error) => tracing::warn!(%error, "failed to reconcile identity leases"),
+    }
+    match engine.sweep_agent_inbox_expiry().await {
+        Ok(0) => {}
+        Ok(expired) => tracing::info!(expired, "expired due project inbox rows"),
+        Err(error) => tracing::warn!(%error, "failed to sweep project inbox expiry"),
+    }
     if let Err(error) = engine.retire_legacy_gui_leases().await {
         tracing::warn!(%error, "failed to retire legacy GUI leases");
     }
@@ -290,6 +305,7 @@ async fn run() -> Result<()> {
     spawn_task_stall_sweeper(state.engine.clone());
     spawn_effect_sweeper(state.engine.clone());
     spawn_gate_sweeper(state.engine.clone());
+    spawn_coordination_sweeper(state.engine.clone());
     spawn_stall_recovery_reconciler(state.agent.clone());
     spawn_process_sweeper(state.engine.clone());
     spawn_approval_sweeper(state.engine.clone());
@@ -4114,6 +4130,73 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 Err(response) => response_with_id(id, response),
             }
         }
+        "session.assignments" => match parse_params::<SessionAssignmentsParams>(request.params) {
+            Ok(params) => match state.engine.session_assignments(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => coordination_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.assign" => match parse_params::<SessionAssignParams>(request.params) {
+            Ok(params) => match state.engine.assign_session_identity(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => coordination_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.assignment.renew" => {
+            match parse_params::<SessionAssignmentRenewParams>(request.params) {
+                Ok(params) => match state.engine.renew_session_assignment(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => coordination_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "session.release" => match parse_params::<SessionReleaseParams>(request.params) {
+            Ok(params) => match state.engine.release_session_identity(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => coordination_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "agent.inbox.list" => match parse_params::<AgentInboxListParams>(request.params) {
+            Ok(params) => match state.engine.list_agent_inbox(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => coordination_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "agent.inbox.send" => match parse_params::<AgentInboxSendParams>(request.params) {
+            Ok(params) => match state.engine.send_agent_inbox(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => coordination_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "agent.inbox.read" => match parse_params::<AgentInboxMessageParams>(request.params) {
+            Ok(params) => match state.engine.read_agent_inbox(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => coordination_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "agent.inbox.ack" => match parse_params::<AgentInboxMessageParams>(request.params) {
+            Ok(params) => match state.engine.ack_agent_inbox(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => coordination_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "agent.coordination.replay" => {
+            match parse_params::<AgentCoordinationReplayParams>(request.params) {
+                Ok(params) => match state.engine.replay_agent_coordination(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => coordination_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "project.agent_identity_policy.get" => {
             match parse_params::<AgentIdentityPolicyParams>(request.params) {
                 Ok(params) => match state
@@ -5231,6 +5314,13 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             | "agent.identity.resume"
             | "agent.identity.retire"
             | "agent.identities.replay"
+            | "session.assign"
+            | "session.assignment.renew"
+            | "session.release"
+            | "agent.inbox.send"
+            | "agent.inbox.read"
+            | "agent.inbox.ack"
+            | "agent.coordination.replay"
             | "project.effect_policy.set"
             | "project.cache_policy.set"
             | "project.integration_policy.set"
@@ -5365,6 +5455,37 @@ fn identity_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
     RpcResponse::error(
         id,
         RpcError::with_data(rpc_code, typed.message.clone(), json!({"code": typed.code})),
+    )
+}
+
+/// Map the stable assignment/inbox taxonomy to a bounded RPC failure. It also
+/// accepts the S1 identity taxonomy so a missing identity or read-only import
+/// keeps its existing wire code.
+fn coordination_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
+    if let Some(typed) = error.downcast_ref::<vp_protocol::types::AgentCoordinationError>() {
+        let rpc_code = match typed.code {
+            vp_protocol::types::agent_coordination_codes::ASSIGNMENT_NOT_FOUND
+            | vp_protocol::types::agent_coordination_codes::INBOX_NOT_FOUND => codes::NOT_FOUND,
+            _ => codes::INVALID_PARAMS,
+        };
+        return RpcResponse::error(
+            id,
+            RpcError::with_data(rpc_code, typed.message.clone(), json!({"code": typed.code})),
+        );
+    }
+    if let Some(typed) = error.downcast_ref::<vp_protocol::types::AgentIdentityError>() {
+        let rpc_code = match typed.code {
+            vp_protocol::types::agent_identity_codes::IDENTITY_NOT_FOUND => codes::NOT_FOUND,
+            _ => codes::INVALID_PARAMS,
+        };
+        return RpcResponse::error(
+            id,
+            RpcError::with_data(rpc_code, typed.message.clone(), json!({"code": typed.code})),
+        );
+    }
+    RpcResponse::error(
+        id,
+        RpcError::new(codes::INTERNAL_ERROR, format!("{error:#}")),
     )
 }
 
@@ -5564,6 +5685,33 @@ fn spawn_gate_sweeper(engine: Engine) {
                     );
                 }
                 Err(error) => tracing::warn!(%error, "external gate expiry sweep failed"),
+            }
+        }
+    });
+}
+
+/// Assignment leases and inbox TTLs are project-scoped, so one bounded sweep
+/// covers every project. It never reassigns an active identity and never
+/// removes an inbox row; expiry is a status transition with one event.
+fn spawn_coordination_sweeper(engine: Engine) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(30));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            match engine.reconcile_session_agent_assignments().await {
+                Ok(expired) if expired > 0 => {
+                    tracing::info!(expired, "identity lease expiry sweep");
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "identity lease expiry sweep failed"),
+            }
+            match engine.sweep_agent_inbox_expiry().await {
+                Ok(expired) if expired > 0 => {
+                    tracing::info!(expired, "project inbox expiry sweep");
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "project inbox expiry sweep failed"),
             }
         }
     });
@@ -7070,6 +7218,65 @@ mod agent_identity_rpc_error_tests {
     #[test]
     fn untyped_identity_failures_remain_internal_errors() {
         let response = identity_error(Some(json!("3")), anyhow::anyhow!("database is closed"));
+        let error = response.error.expect("error");
+        assert_eq!(error.code, codes::INTERNAL_ERROR);
+        assert!(error.data.is_none());
+    }
+}
+
+#[cfg(test)]
+mod agent_coordination_rpc_error_tests {
+    use super::*;
+    use vp_protocol::types::{AgentCoordinationError, agent_coordination_codes};
+
+    #[test]
+    fn typed_coordination_errors_map_to_bounded_rpc_codes() {
+        let response = coordination_error(
+            Some(json!("1")),
+            anyhow::Error::new(AgentCoordinationError::new(
+                agent_coordination_codes::ASSIGNMENT_NOT_FOUND,
+                "session not found: ses-1",
+            )),
+        );
+        let error = response.error.expect("error");
+        assert_eq!(error.code, codes::NOT_FOUND);
+        assert_eq!(
+            error.data.expect("data")["code"],
+            agent_coordination_codes::ASSIGNMENT_NOT_FOUND
+        );
+
+        let response = coordination_error(
+            Some(json!("2")),
+            anyhow::Error::new(AgentCoordinationError::new(
+                agent_coordination_codes::ASSIGNMENT_CONFLICT,
+                "identity already assigned",
+            )),
+        );
+        let error = response.error.expect("error");
+        assert_eq!(error.code, codes::INVALID_PARAMS);
+        let data = error.data.expect("data");
+        assert_eq!(data["code"], agent_coordination_codes::ASSIGNMENT_CONFLICT);
+        assert!(!data.to_string().contains("prompt"));
+        assert!(!data.to_string().contains("api_key"));
+
+        let response = coordination_error(
+            Some(json!("3")),
+            anyhow::Error::new(vp_protocol::types::AgentIdentityError::new(
+                vp_protocol::types::agent_identity_codes::IDENTITY_NOT_FOUND,
+                "agent identity not found: id-1",
+            )),
+        );
+        let error = response.error.expect("error");
+        assert_eq!(error.code, codes::NOT_FOUND);
+        assert_eq!(
+            error.data.expect("data")["code"],
+            vp_protocol::types::agent_identity_codes::IDENTITY_NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn untyped_coordination_failures_remain_internal_errors() {
+        let response = coordination_error(Some(json!("4")), anyhow::anyhow!("database closed"));
         let error = response.error.expect("error");
         assert_eq!(error.code, codes::INTERNAL_ERROR);
         assert!(error.data.is_none());

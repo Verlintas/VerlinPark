@@ -13,39 +13,40 @@ use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
-    AcpAgent, AcpAgentConfig, AcpTransport, AgentIdentity, AgentIdentityError, AgentIdentityEvent,
-    AgentIdentityPolicy, AgentMessage, AgentRecord, Approval, ApprovalAuditEvent, ApprovalGrant,
-    ApprovalTemplate, Artifact, ArtifactPolicy, ArtifactProvenance, ArtifactVersion,
-    AttentionPolicy, CacheEpochBundleBucket, CacheEpochReuseSession, CachePolicy,
-    CheckpointRetentionPolicy, ContextCheckpoint, ContextCheckpointPolicy, ContinuationOutcome,
-    ContractPolicy, CriticalPathPolicy, EffectEvidence, EffectPolicy, EffectReceipt, EffectState,
-    EffectTarget, Event, GatePolicy, GateRecord, GuiActionInfo, GuiPolicy, InstructionBlob,
-    IntakeTask, IntegrationPolicy, MailboxPolicy, McpServer, McpServerConfig, McpToolPin,
-    McpTransport, MemoryConflict, MemoryEmbeddingJobStatus, MemoryEmbeddingPolicy,
-    MemoryEmbeddingUsage, MemoryEmbeddingsStatusResult, MemoryEvidence, MemoryHealthResult,
-    MemoryItem, MemoryPolicy, MemoryStatCount, MergeQueueEntry, MergeQueueSource, MetricCount,
-    ModelPreset, OrchestrationDecision, OrchestrationNote, OrchestrationPolicy,
-    OrchestrationRecovery, PlanTaskProgress, PreemptionPolicy, PreemptionSessionSummary,
-    ProcessPolicy, Program, ProgramEvent, ProgramMilestone, ProgramMilestoneStatus, ProgramPolicy,
-    ProgramStatus, ProgramUsage, Project, ProjectBudget, ProjectUsageSession,
-    PromptPrefixAggregate, PromptPrefixObservation, PromptPrefixRecord, PromptSectionRef, Question,
-    RunBudgetSnapshot, RunCheckpoint, RunStep, RunToolCall, ScheduledTask, SearchHit, Session,
-    SessionBundle, SessionContinuation, SessionInstructionState, SessionRun, SessionRunPolicy,
-    ShellPolicy, Skill, Source, SourceChunk, SourceCollection, SourceEmbeddingIntegrity,
-    SourceEmbeddingJobStatus, SourceEmbeddingPolicy, SourceEmbeddingStatusResult,
-    SourceEmbeddingUsage, SourceRetrievalPolicy, SourceSearchHit, SourceStats, SteeringMessage,
-    StoredMessage, SupervisedProcess, TaskSchedulerPolicy, TaskStall, TeamPlan, TodoItem,
-    ToolOutputAuditResult, ToolOutputPolicy, ToolOutputToolStat, UsageEntry,
-    WorktreeRetentionPolicy, WriteLease, cache_hit_ratio,
+    AcpAgent, AcpAgentConfig, AcpTransport, AgentAssignment, AgentCoordinationEvent, AgentIdentity,
+    AgentIdentityError, AgentIdentityEvent, AgentIdentityPolicy, AgentInboxMessage, AgentMessage,
+    AgentRecord, Approval, ApprovalAuditEvent, ApprovalGrant, ApprovalTemplate, Artifact,
+    ArtifactPolicy, ArtifactProvenance, ArtifactVersion, AttentionPolicy, CacheEpochBundleBucket,
+    CacheEpochReuseSession, CachePolicy, CheckpointRetentionPolicy, ContextCheckpoint,
+    ContextCheckpointPolicy, ContinuationOutcome, ContractPolicy, CriticalPathPolicy,
+    EffectEvidence, EffectPolicy, EffectReceipt, EffectState, EffectTarget, Event, GatePolicy,
+    GateRecord, GuiActionInfo, GuiPolicy, InstructionBlob, IntakeTask, IntegrationPolicy,
+    MailboxPolicy, McpServer, McpServerConfig, McpToolPin, McpTransport, MemoryConflict,
+    MemoryEmbeddingJobStatus, MemoryEmbeddingPolicy, MemoryEmbeddingUsage,
+    MemoryEmbeddingsStatusResult, MemoryEvidence, MemoryHealthResult, MemoryItem, MemoryPolicy,
+    MemoryStatCount, MergeQueueEntry, MergeQueueSource, MetricCount, ModelPreset,
+    OrchestrationDecision, OrchestrationNote, OrchestrationPolicy, OrchestrationRecovery,
+    PlanTaskProgress, PreemptionPolicy, PreemptionSessionSummary, ProcessPolicy, Program,
+    ProgramEvent, ProgramMilestone, ProgramMilestoneStatus, ProgramPolicy, ProgramStatus,
+    ProgramUsage, Project, ProjectBudget, ProjectUsageSession, PromptPrefixAggregate,
+    PromptPrefixObservation, PromptPrefixRecord, PromptSectionRef, Question, RunBudgetSnapshot,
+    RunCheckpoint, RunStep, RunToolCall, ScheduledTask, SearchHit, Session, SessionBundle,
+    SessionContinuation, SessionInstructionState, SessionRun, SessionRunPolicy, ShellPolicy, Skill,
+    Source, SourceChunk, SourceCollection, SourceEmbeddingIntegrity, SourceEmbeddingJobStatus,
+    SourceEmbeddingPolicy, SourceEmbeddingStatusResult, SourceEmbeddingUsage,
+    SourceRetrievalPolicy, SourceSearchHit, SourceStats, SteeringMessage, StoredMessage,
+    SupervisedProcess, TaskSchedulerPolicy, TaskStall, TeamPlan, TodoItem, ToolOutputAuditResult,
+    ToolOutputPolicy, ToolOutputToolStat, UsageEntry, WorktreeRetentionPolicy, WriteLease,
+    cache_hit_ratio,
 };
 
 use vp_protocol::types::{
-    AGENT_IDENTITY_EVENT_KINDS, AGENT_IDENTITY_MAX_COMPONENT_CHARS,
+    AGENT_ASSIGNMENT_STATUSES, AGENT_IDENTITY_EVENT_KINDS, AGENT_IDENTITY_MAX_COMPONENT_CHARS,
     AGENT_IDENTITY_MAX_DEPARTMENT_CHARS, AGENT_IDENTITY_MAX_ID_CHARS,
     AGENT_IDENTITY_MAX_MODEL_CHARS, AGENT_IDENTITY_MAX_POLICY_BYTES,
     AGENT_IDENTITY_MAX_TITLE_CHARS, AGENT_IDENTITY_PROFILE_VALUES, AGENT_IDENTITY_STATUSES,
-    CreateAgentIdentityParams, RetireAgentIdentityParams, UpdateAgentIdentityParams,
-    agent_identity_codes, agent_identity_role,
+    AGENT_INBOX_KINDS, AGENT_INBOX_STATUSES, CreateAgentIdentityParams, RetireAgentIdentityParams,
+    UpdateAgentIdentityParams, agent_identity_codes, agent_identity_role,
 };
 
 use vp_protocol::otel::OtelPolicy;
@@ -1353,6 +1354,16 @@ pub struct ProjectManifestSnapshot {
     /// Append-only project identity lifecycle events.
     #[serde(default)]
     pub agent_identity_events: Vec<AgentIdentityEvent>,
+    /// Event-derived session→identity assignment projection. The
+    /// `agent_coordination_events` stream is authoritative.
+    #[serde(default)]
+    pub session_agent_assignments: Vec<AgentAssignment>,
+    /// Event-derived project-scoped agent inbox projection.
+    #[serde(default)]
+    pub agent_inbox: Vec<AgentInboxMessage>,
+    /// Append-only assignment/inbox stream for this project.
+    #[serde(default)]
+    pub agent_coordination_events: Vec<AgentCoordinationEvent>,
     /// Project-scoped effect-receipt policy. Older manifests decode as the
     /// enabled, unknown-blocks-merge, 120s-grace default.
     #[serde(default)]
@@ -1600,6 +1611,17 @@ pub fn validate_storage_id(kind: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Stable projection fields compared when a session bundle is imported into a
+/// database that may already contain the same assignment key.
+type AssignmentProjectionRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+);
+
 fn ensure_bundle_session(kind: &str, actual: &str, expected: &str) -> Result<()> {
     if actual != expected {
         return Err(anyhow!(
@@ -1667,6 +1689,106 @@ fn validate_session_bundle(bundle: &SessionBundle) -> Result<()> {
                 "bundle identity event {}:{} has an unknown kind",
                 event.identity_id,
                 event.seq
+            ));
+        }
+    }
+    let mut active_identities = std::collections::HashSet::new();
+    for assignment in &bundle.session_agent_assignments {
+        if assignment.project_id != bundle.project.id {
+            return Err(anyhow!(
+                "bundle assignment {}:{} belongs to a different project",
+                assignment.session_id,
+                assignment.identity_id
+            ));
+        }
+        if !identity_ids.contains(assignment.identity_id.as_str()) {
+            return Err(anyhow!(
+                "bundle assignment {}:{} has no identity snapshot",
+                assignment.session_id,
+                assignment.identity_id
+            ));
+        }
+        if agent_identity_role(&assignment.role).is_none() {
+            return Err(anyhow!(
+                "bundle assignment {}:{} has an invalid role",
+                assignment.session_id,
+                assignment.identity_id
+            ));
+        }
+        if !AGENT_ASSIGNMENT_STATUSES.contains(&assignment.status.as_str()) {
+            return Err(anyhow!(
+                "bundle assignment {}:{} has an invalid status",
+                assignment.session_id,
+                assignment.identity_id
+            ));
+        }
+        if assignment.status == "active"
+            && !active_identities.insert(assignment.identity_id.clone())
+        {
+            return Err(anyhow!(
+                "bundle has two active assignments for identity {}",
+                assignment.identity_id
+            ));
+        }
+    }
+    for message in &bundle.agent_inbox {
+        if message.project_id != bundle.project.id {
+            return Err(anyhow!(
+                "bundle inbox message {} belongs to a different project",
+                message.id
+            ));
+        }
+        if !identity_ids.contains(message.identity_id.as_str()) {
+            return Err(anyhow!(
+                "bundle inbox message {} has no identity snapshot",
+                message.id
+            ));
+        }
+        if !AGENT_INBOX_KINDS.contains(&message.kind.as_str()) {
+            return Err(anyhow!(
+                "bundle inbox message {} has an invalid kind",
+                message.id
+            ));
+        }
+        if !AGENT_INBOX_STATUSES.contains(&message.status.as_str()) {
+            return Err(anyhow!(
+                "bundle inbox message {} has an invalid status",
+                message.id
+            ));
+        }
+        vp_protocol::types::validate_agent_inbox_payload(&message.payload)
+            .map_err(|error| anyhow!("bundle inbox message {} is invalid: {error}", message.id))?;
+    }
+    let mut event_ids = std::collections::HashSet::new();
+    let mut event_seqs = std::collections::HashSet::new();
+    for event in &bundle.agent_coordination_events {
+        if event.project_id != bundle.project.id {
+            return Err(anyhow!(
+                "bundle coordination event {} belongs to a different project",
+                event.id
+            ));
+        }
+        if event.id.trim().is_empty() || event.seq == 0 {
+            return Err(anyhow!("bundle coordination event has an empty id or seq"));
+        }
+        if !event_ids.insert(event.id.clone()) {
+            return Err(anyhow!(
+                "bundle coordination event {} is duplicated",
+                event.id
+            ));
+        }
+        if !event_seqs.insert(event.seq) {
+            return Err(anyhow!(
+                "bundle coordination events repeat seq {}",
+                event.seq
+            ));
+        }
+        if !vp_protocol::types::AGENT_ASSIGNMENT_EVENT_KINDS.contains(&event.kind.as_str())
+            && !vp_protocol::types::AGENT_INBOX_EVENT_KINDS.contains(&event.kind.as_str())
+        {
+            return Err(anyhow!(
+                "bundle coordination event {} has an unknown kind",
+                event.id
             ));
         }
     }
@@ -2369,6 +2491,73 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_agent_identity_events_project
                 ON agent_identity_events(project_id, created_at, identity_id, seq);
+
+            -- Session→identity assignment and identity lease. A session may use
+            -- several identities (Leader/Managers/Workers), but v1 permits one
+            -- active session per identity. The partial unique index is the
+            -- database backstop; the store also checks the same invariant in a
+            -- transaction so the failure is a typed conflict, not a raw SQL
+            -- constraint. `queued` is reserved and never produced by S2.
+            CREATE TABLE IF NOT EXISTS session_agent_assignments (
+                session_id       TEXT NOT NULL,
+                identity_id      TEXT NOT NULL REFERENCES agent_identities(id) ON DELETE CASCADE,
+                role             TEXT NOT NULL,
+                status           TEXT NOT NULL,
+                lease_token      TEXT,
+                lease_expires_at TEXT,
+                assigned_at      TEXT NOT NULL,
+                released_at      TEXT,
+                heartbeat_at     TEXT NOT NULL,
+                PRIMARY KEY (session_id, identity_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_session_agent_assignments_session
+                ON session_agent_assignments(session_id, status, assigned_at);
+            CREATE INDEX IF NOT EXISTS idx_session_agent_assignments_identity
+                ON session_agent_assignments(identity_id, status, lease_expires_at);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_session_agent_assignments_one_active
+                ON session_agent_assignments(identity_id)
+                WHERE status = 'active';
+
+            -- Project-scoped identity inbox. Labour, Verifier, and Scout do not
+            -- have project identities and therefore never use this table; their
+            -- task-scoped delivery is separate.
+            CREATE TABLE IF NOT EXISTS agent_inbox (
+                id               TEXT PRIMARY KEY,
+                project_id       TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                identity_id      TEXT NOT NULL REFERENCES agent_identities(id) ON DELETE CASCADE,
+                session_id       TEXT,
+                from_identity_id TEXT,
+                kind             TEXT NOT NULL,
+                payload_json     TEXT NOT NULL,
+                status           TEXT NOT NULL,
+                created_at       TEXT NOT NULL,
+                read_at          TEXT,
+                expires_at       TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_agent_inbox_identity
+                ON agent_inbox(project_id, identity_id, status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_agent_inbox_session
+                ON agent_inbox(project_id, session_id, status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_agent_inbox_expiry
+                ON agent_inbox(status, expires_at);
+
+            -- Project-scoped append-only coordination stream for assignments and
+            -- inbox transitions. `seq` orders replay within one project; `id`
+            -- is portable across databases so archive import can be idempotent.
+            CREATE TABLE IF NOT EXISTS agent_coordination_events (
+                id         TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                seq        INTEGER NOT NULL,
+                kind       TEXT NOT NULL,
+                payload    TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE (project_id, seq)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_agent_coordination_events_project
+                ON agent_coordination_events(project_id, seq);
 
             CREATE TABLE IF NOT EXISTS messages (
                 id           TEXT PRIMARY KEY,
@@ -4522,6 +4711,10 @@ impl Store {
                 agent_identities: self.list_agent_identities(&project.id, None, None)?,
                 agent_identity_events: self
                     .list_agent_identity_events_for_project(&project.id, Some(100_000))?,
+                session_agent_assignments: self.list_agent_assignments_for_replay(&project.id)?,
+                agent_inbox: self.list_agent_inbox_for_replay(&project.id)?,
+                agent_coordination_events: self
+                    .list_agent_coordination_events_for_project(&project.id, None)?,
                 effect_policy: self.get_effect_policy(&project.id)?,
                 gate_policy: self.get_gate_policy(&project.id)?,
                 otel_policy: self.get_otel_policy(&project.id)?,
@@ -27283,6 +27476,121 @@ impl Store {
             }
         }
 
+        // Project-scoped coordination events are portable by id. A same-id
+        // event must be byte-identical; a per-project seq collision with a
+        // different id fails closed rather than reordering local history.
+        for event in &bundle.agent_coordination_events {
+            let existing: Option<(i64, String, String, String)> = tx
+                .query_row(
+                    "SELECT seq, kind, payload, created_at FROM agent_coordination_events
+                     WHERE id = ?1",
+                    params![event.id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            let expected_payload = serde_json::to_string(&event.payload)?;
+            match existing {
+                Some((seq, kind, payload, created_at)) => {
+                    if seq != event.seq as i64
+                        || kind != event.kind
+                        || payload != expected_payload
+                        || created_at != event.created_at
+                    {
+                        return Err(anyhow!(
+                            "bundle coordination event {} conflicts with the local event stream",
+                            event.id
+                        ));
+                    }
+                }
+                None => {
+                    let seq_owner: Option<String> = tx
+                        .query_row(
+                            "SELECT id FROM agent_coordination_events
+                             WHERE project_id = ?1 AND seq = ?2",
+                            params![bundle.project.id, event.seq as i64],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if let Some(owner) = seq_owner
+                        && owner != event.id
+                    {
+                        return Err(anyhow!(
+                            "bundle coordination event {} conflicts with local seq {}",
+                            event.id,
+                            event.seq
+                        ));
+                    }
+                    tx.execute(
+                        "INSERT INTO agent_coordination_events
+                         (id, project_id, seq, kind, payload, created_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            event.id,
+                            event.project_id,
+                            event.seq as i64,
+                            event.kind,
+                            expected_payload,
+                            event.created_at
+                        ],
+                    )?;
+                }
+            }
+        }
+        for assignment in &bundle.session_agent_assignments {
+            let existing: Option<AssignmentProjectionRow> = tx
+                .query_row(
+                    "SELECT role, status, assigned_at, released_at, heartbeat_at, lease_expires_at
+                     FROM session_agent_assignments
+                     WHERE session_id = ?1 AND identity_id = ?2",
+                    params![assignment.session_id, assignment.identity_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            match existing {
+                Some((role, status, assigned_at, released_at, heartbeat_at, expires_at)) => {
+                    if role != assignment.role
+                        || status != assignment.status
+                        || assigned_at != assignment.assigned_at
+                        || released_at != assignment.released_at
+                        || heartbeat_at != assignment.heartbeat_at
+                        || expires_at != assignment.lease_expires_at
+                    {
+                        return Err(anyhow!(
+                            "bundle assignment {}:{} conflicts with the local projection",
+                            assignment.session_id,
+                            assignment.identity_id
+                        ));
+                    }
+                }
+                None => {
+                    crate::store::coordination::insert_assignment_row_tx(&tx, assignment)?;
+                }
+            }
+        }
+        for message in &bundle.agent_inbox {
+            match crate::store::coordination::query_inbox_tx(&tx, &message.id)? {
+                Some(existing) if &existing == message => {}
+                Some(_) => {
+                    return Err(anyhow!(
+                        "bundle inbox message {} conflicts with the local projection",
+                        message.id
+                    ));
+                }
+                None => {
+                    crate::store::coordination::insert_inbox_row_tx(&tx, message)?;
+                }
+            }
+        }
+
         let session_exists: bool = tx
             .query_row(
                 "SELECT 1 FROM sessions WHERE id = ?1",
@@ -32314,6 +32622,7 @@ fn search_snippet(text: &str, query: &str) -> String {
 }
 
 mod continuation_lease;
+mod coordination;
 mod gate;
 mod lease;
 
@@ -32321,6 +32630,7 @@ pub use continuation_lease::{
     ContinuationAckLostReason, ContinuationClaimToken, SessionContinuationAckError,
     SessionContinuationClaim, SessionContinuationClaimStatus,
 };
+pub use coordination::{AGENT_COORDINATION_EVENT_LIMIT, AssignmentMutation};
 pub use gate::{GateTransition, gates_from_events};
 pub use lease::{
     DaemonIdentity, LeaseLostReason, MAX_RUNTIME_LEASE_TTL_SECS, RuntimeLeaseAcquisition,
