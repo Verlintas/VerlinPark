@@ -60,6 +60,20 @@ Limits:
 - No GUI gate resolution and no cross-host/distributed gate consensus.
 - `gate.open` has no operation id; a blind retry can create a second gate.
 
+## 0.6 2026-11-12 Contracted execution C4
+
+C4 is implemented and merged at `f66e485` (ADR-0196): canonical runtime/policy/tool/prompt/plan/contract snapshots, `policy_snapshots`, compatible/drift/incompatible resume, approval-classified `plan.migrate`, and read-only `orchestration.replay` with bounded diffs and `controller_equivalent_only`. Rust 3,531 passed; Swift 495 passed.
+
+Limits:
+
+- `plan.migrate` is an explicit RPC confirmation, not a pending GUI approval row.
+- Runtime team capacity caps are not in the policy snapshot.
+- `tool_bundle_hash` pins membership, not full schema bytes; schema drift remains visible in prompt telemetry as drift.
+- Governor-enabled dispatches are skipped in replay because historical critical-path inputs are not recorded.
+- `policy_snapshots` has no retention/GC.
+- Legacy plans remain `snapshot_missing` drift until explicitly migrated.
+- Pinning/replay is same-host SQLite only, not cross-host consensus.
+
 ## 0. 2026-10-30 跟进
 
 第一轮硬化已完成（同一 `main` 线，提交见仓库历史）：

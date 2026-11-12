@@ -1,7 +1,7 @@
 # VerlinPark 进度
 
 > 最后更新：2026-11-12
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark + task contracts/intent authorization/MCP schema pins + effect receipts/postconditions + external gates/durable waits 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark + task contracts/intent authorization/MCP schema pins + effect receipts/postconditions + external gates/durable waits + runtime pinning/controller replay 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
@@ -205,6 +205,50 @@ C3 已实现并合入 `835cb17`，ADR-0195。Rust **3,506 passed / 0 failed / 6 
 - `wait_for_gate` 不支持 Verifier/Labour/Scout/read-only Manager roundtable。
 - 没有 GUI gate resolution，也没有跨主机 gate consensus。
 - `gate.open` 没有 operation id，blind retry 可能创建第二个 gate。
+
+---
+
+## 2026-11-12 Contracted execution C4: runtime pinning and controller replay
+
+C4 已实现并合入 `f66e485`，ADR-0196。Rust **3,531 passed / 0 failed / 3 ignored live-provider tests**，Swift **495 passed**（363 app + 132 helper），clippy/swiftformat/xcodebuild 通过。
+
+### Runtime/policy pinning
+
+- canonical `RuntimeSnapshot`：`runtime_version`、`runtime_build`、`policy_hash`、`tool_bundle_hash`、`prompt_layout_version`、`plan_revision`、`contract_hash`、`created_at`。
+- 持久化在 `sessions.plan_runtime_snapshot`、`session_runs.runtime_snapshot_json`，并嵌入 plan/run events。
+- `policy_snapshots(project_id, hash, json, created_at)`：content-addressed、按项目去重，覆盖 shell/contract/effect/gate/cache/orchestration/scaling/scheduler/session-run/critical-path/attention policies；manifest/db-rebuild/replay/bundle 覆盖。
+
+### Compatibility / migration
+
+- 状态 `compatible | drift | incompatible`，含 bounded changed fields/warnings/snapshot age。
+- plan/run resume 比较 stored snapshot 与当前 runtime identity。
+- drift：追加 `runtime.compatibility_drift` 后继续。
+- incompatible：fail closed `RUNTIME_INCOMPATIBLE`。
+- legacy plan 无 snapshot：`snapshot_missing` drift，保持旧 resume 行为。
+- `plan.migrate` 需要 `approved: true`，记录 `approval_risk=host_state`；重新校验 plan structure/dependency cycles/contract derivation；只更新 snapshot，发 `plan.migrated`；失败不动 plan/snapshot；不重写 tasks/scopes/deps/budgets/contracts/receipts/gates。
+
+### Controller replay
+
+- `orchestration.replay` / `vp orchestrate-replay <session>`：读取 newest 1–2000 decisions（默认 200）。
+- 重建 `plan_task.*` state、active plan、coordination notes、budget state、scaling observation、scheduler readiness、resume remaining work。
+- 报告 `matched/mismatched/skipped/truncated` 与 bounded per-entry diff。
+- 不做 provider call/tool execution/event append/plan/task/budget/capacity mutation/retry/cancel/merge/rewrite；报告标 `controller_equivalent_only`。
+
+### 界面
+
+- RPC：`session.compatibility`、`plan.migrate`、`orchestration.replay`。
+- CLI：`vp compatibility <session> [--run]`、`vp plan-migrate <session> --yes`、`vp orchestrate-replay <session> [--limit]`。
+- Swift：`CompatibilityReportView`、`PlanMigrateResultView`、`ControllerReplayReportView`、Stage runtime-pin badge、Efficiency inspector section。
+
+### 限制
+
+- `plan.migrate` 是显式 RPC `approved: true` + `host_state` risk，不创建 pending GUI approval row。
+- team capacity caps 是 runtime config，不在 policy snapshot。
+- `tool_bundle_hash` pin 的是 bundle membership，不是完整 schema bytes；schema 变化仍是 prompt telemetry 可见的 drift，不是 incompatibility。
+- historical critical-path governor inputs 未记录，governor-enabled dispatch 在 replay 中 `skipped`，不猜。
+- `policy_snapshots` 没有 retention/GC。
+- legacy plans 保持 `snapshot_missing` drift，直到显式 migrate。
+- same-host SQLite only，无 cross-host consensus。
 
 ---
 
