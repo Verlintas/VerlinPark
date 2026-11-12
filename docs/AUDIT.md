@@ -126,6 +126,19 @@ Limits:
 - Prompt-generator wording changes can move identity bytes for the same generation; the generation counter is the semantic change signal.
 - No distributed lease, cross-host scheduling, or hidden model routing.
 
+## 0.11 2026-11-13 Project-scoped identities S4
+
+S4 is implemented and merged at `349b9bb` (ADR-0208): project component branches, session Worker worktrees, Labour child worktrees, component leases, deterministic Labour→Worker merges with rollback, unchanged Worker→session Verifier/Integrator, explicit `workspace.land`, archive/retire evidence, and legacy fallback. Rust 3,751 passed; Swift 508 passed. One `vp-remote` cancellation test flaked under full load and passed alone and on rerun.
+
+Limits:
+
+- Leases are same-host SQLite coordination, not distributed locks.
+- Workspace worktree storage is not swept by the existing worktree-retention sweeper.
+- `workspace.land` does not rerun the project test suite/integration command.
+- Imported workspaces are read-only evidence.
+- A busy component falls back to a legacy task worktree; that commit is not part of the component workspace until a future integration path.
+- No automatic land, hidden merge, force-push, cross-host workspace, S5–S8, or gate weakening.
+
 ## 0. 2026-10-30 跟进
 
 第一轮硬化已完成（同一 `main` 线，提交见仓库历史）：

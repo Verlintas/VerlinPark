@@ -249,7 +249,8 @@
         "conflict rolls back without changing session branch",
         "workspace survives session end"
       ],
-      "acceptance": "Two-level integration preserves Verifier/Integrator and component ownership."
+      "acceptance": "Two-level integration preserves Verifier/Integrator and component ownership.",
+      "status": "implemented"
     },
     {
       "id": "S5",
@@ -572,6 +573,23 @@
         "layout v2 and external ACP transports do not receive the native identity section",
         "prompt-generator wording changes can move identity bytes for the same generation",
         "no distributed lease/cross-host scheduling/hidden routing"
+      ]
+    },
+    "S4": {
+      "status": "implemented",
+      "commit": "349b9bb",
+      "adr": "0208",
+      "tests": {
+        "rust": 3751,
+        "swift": 508
+      },
+      "limits": [
+        "same-host SQLite leases, not distributed locks",
+        "workspace worktree storage is not swept by worktree retention",
+        "land does not rerun the project test suite/integration command",
+        "imported workspaces are read-only evidence",
+        "busy component falls back to legacy task worktree",
+        "no automatic land/hidden merge/force-push/cross-host/S5-S8"
       ]
     }
   }
