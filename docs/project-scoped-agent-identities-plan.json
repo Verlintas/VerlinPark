@@ -211,7 +211,8 @@
         "promotion/transfer changes cache epoch",
         "Labour has no identity section"
       ],
-      "acceptance": "Stable identity prompts are cache-safe and Worker/Labour responsibilities are enforced by role policy."
+      "acceptance": "Stable identity prompts are cache-safe and Worker/Labour responsibilities are enforced by role policy.",
+      "status": "implemented"
     },
     {
       "id": "S4",
@@ -554,6 +555,23 @@
         "imported assignments are archive evidence",
         "payload guard is key-name based, not a secret classifier",
         "Swift card is read-only"
+      ]
+    },
+    "S3": {
+      "status": "implemented",
+      "commit": "5cedc62",
+      "adr": "0207",
+      "tests": {
+        "rust": 3719,
+        "swift": 506
+      },
+      "limits": [
+        "S4-S8 remain: no Worker workspace/branch, identity-memory table, hiring, org chart, team templates",
+        "run-to-identity selection is deterministic but not persisted as a workspace binding until S4",
+        "agent/memory is best-effort project memory, not durable per-identity memory",
+        "layout v2 and external ACP transports do not receive the native identity section",
+        "prompt-generator wording changes can move identity bytes for the same generation",
+        "no distributed lease/cross-host scheduling/hidden routing"
       ]
     }
   }

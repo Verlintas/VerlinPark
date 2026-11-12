@@ -496,7 +496,8 @@ should wait until the identity/role contracts and Worker workspace phases
 | **Phase 1 complete** | **C1–C5** | contract/intent/MCP pins, effects, gates, runtime pinning, reliability |
 | S1 Project-scoped identities | **implemented** | `9bf3df9`, ADR-0205, 3,607 Rust / 503 Swift tests |
 | S2 Session assignment + identity lease + inbox | **implemented** | `fa25081`, ADR-0206, 3,634 Rust / 506 Swift tests |
-| S3 Role contracts + prompts/cache | planned | next |
+| S3 Role contracts + prompts/cache | **implemented** | `5cedc62`, ADR-0207, 3,719 Rust / 506 Swift tests |
+| S4 Worker workspace + two-level integration | planned | next |
 | C6 Failure attribution | planned | |
 | C7 Bounded fan-out | planned | |
 | C8 Tool search v2 + delta snapshots | planned | |

@@ -113,6 +113,19 @@ Limits:
 - Payload guard rejects obvious credential key names, not secret content.
 - The Swift card is read-only.
 
+## 0.10 2026-11-13 Project-scoped identities S3
+
+S3 is implemented and merged at `5cedc62` (ADR-0207): content-addressed `agent/identity` head section, bounded `agent/memory` tail, Worker tech-lead/Labour implementation contracts, role-specific delegation schemas, and identity generation in the cache epoch. Rust 3,719 passed; Swift 506 passed.
+
+Limits:
+
+- S4–S8 remain: no Worker component workspace/branch, identity-memory table, hiring/retirement, org chart, or team templates.
+- Run-to-identity selection is deterministic but not persisted as an explicit workspace binding until S4.
+- `agent/memory` is a bounded best-effort reuse of project memory, not durable per-identity memory.
+- Layout v2 and external ACP transports do not receive the native identity section.
+- Prompt-generator wording changes can move identity bytes for the same generation; the generation counter is the semantic change signal.
+- No distributed lease, cross-host scheduling, or hidden model routing.
+
 ## 0. 2026-10-30 跟进
 
 第一轮硬化已完成（同一 `main` 线，提交见仓库历史）：
