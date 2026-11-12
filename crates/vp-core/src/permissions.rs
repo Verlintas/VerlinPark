@@ -425,6 +425,17 @@ pub fn assess_tool_call_with_gui(
         | "use_skill" => {
             PermissionAssessment::new(RiskLevel::ReadOnly, "read-only or runtime-managed")
         }
+        "archive_list" | "media_info" => {
+            PermissionAssessment::new(RiskLevel::ReadOnly, "bounded artifact metadata inspection")
+        }
+        "archive_extract" => PermissionAssessment::new(
+            RiskLevel::External,
+            "extracts a bounded archive into daemon-owned scratch and publishes derived artifacts",
+        ),
+        "media_transcode" => PermissionAssessment::new(
+            RiskLevel::HostState,
+            "runs a host ffmpeg process and writes daemon-owned scratch/artifact output",
+        ),
         _ => PermissionAssessment::new(RiskLevel::External, "externally supplied tool"),
     }
 }
@@ -2285,6 +2296,50 @@ mod tests {
         ));
         assert!(matches!(
             decide(ApprovalMode::Unattended, &screen, false),
+            ApprovalDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn archive_and_media_tools_have_explicit_risk_classes() {
+        let worktree = worktree();
+        for tool in ["archive_list", "media_info"] {
+            let assessment = assess_tool_call(tool, &serde_json::json!({}), &worktree);
+            assert_eq!(assessment.risk, RiskLevel::ReadOnly, "{tool}");
+            assert!(matches!(
+                decide(ApprovalMode::Unattended, &assessment, false),
+                ApprovalDecision::Allow { .. }
+            ));
+        }
+        let extract = assess_tool_call(
+            "archive_extract",
+            &serde_json::json!({"artifact_id": "art", "entries": ["a"]}),
+            &worktree,
+        );
+        assert_eq!(extract.risk, RiskLevel::External);
+        assert!(extract.reason.contains("daemon-owned scratch"));
+        assert!(matches!(
+            decide(ApprovalMode::Smart, &extract, false),
+            ApprovalDecision::Allow { .. }
+        ));
+        assert!(matches!(
+            decide(ApprovalMode::Strict, &extract, false),
+            ApprovalDecision::Ask { .. }
+        ));
+
+        let transcode = assess_tool_call(
+            "media_transcode",
+            &serde_json::json!({"artifact_id": "art", "format": "mp4"}),
+            &worktree,
+        );
+        assert_eq!(transcode.risk, RiskLevel::HostState);
+        assert!(transcode.reason.contains("ffmpeg"));
+        assert!(matches!(
+            decide(ApprovalMode::Smart, &transcode, false),
+            ApprovalDecision::Ask { .. }
+        ));
+        assert!(matches!(
+            decide(ApprovalMode::Unattended, &transcode, false),
             ApprovalDecision::Deny { .. }
         ));
     }

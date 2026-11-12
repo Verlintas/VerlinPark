@@ -27,3 +27,4 @@ vp-store = { path = "../vp-store" }
 
 [dev-dependencies]
 tempfile = "3"
+zip = { version = "2.4", default-features = false, features = ["deflate-flate2", "flate2"] }

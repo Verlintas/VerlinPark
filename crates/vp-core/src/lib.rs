@@ -99,6 +99,7 @@ use crate::budget_governor::GovernorBudgetView;
 pub mod acp;
 pub mod agent;
 pub mod approvals;
+pub mod archive_media;
 pub mod backup;
 pub mod browser;
 pub mod budget;
@@ -518,6 +519,7 @@ fn artifact_event_payload(artifact: &Artifact) -> serde_json::Value {
         "sha256": artifact.sha256,
         "path": artifact.path,
         "content": artifact.content,
+        "provenance": artifact.provenance,
     })
 }
 
@@ -10332,6 +10334,7 @@ impl Engine {
                 &mime_type,
                 &data,
                 &sha256,
+                None,
             )
         })
         .await??;
@@ -10354,6 +10357,29 @@ impl Engine {
         kind: &str,
         mime_type: &str,
         data: &[u8],
+    ) -> Result<Artifact> {
+        self.publish_artifact_binary_with_provenance(
+            session_id, agent_id, agent_name, task_id, name, kind, mime_type, data, None,
+        )
+        .await
+    }
+
+    /// Publish binary bytes with explicit derivation metadata. Archive
+    /// extraction and media transcoding use this path so the resulting
+    /// artifact records its source artifact, entry path, and operation without
+    /// a separate mutable metadata table.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_artifact_binary_with_provenance(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        agent_name: &str,
+        task_id: Option<String>,
+        name: &str,
+        kind: &str,
+        mime_type: &str,
+        data: &[u8],
+        provenance: Option<vp_protocol::types::ArtifactProvenance>,
     ) -> Result<Artifact> {
         if data.is_empty() {
             anyhow::bail!("binary artifact is empty");
@@ -10385,6 +10411,7 @@ impl Engine {
                 &mime_type,
                 &data,
                 &sha256,
+                provenance.as_ref(),
             )
         })
         .await??;
@@ -13241,6 +13268,16 @@ impl Engine {
                             .and_then(serde_json::Value::as_u64)
                             .unwrap_or(1)
                             .clamp(1, u32::MAX as u64) as u32,
+                        provenance: event
+                            .payload
+                            .get("provenance")
+                            .filter(|value| !value.is_null())
+                            .and_then(|value| {
+                                serde_json::from_value::<vp_protocol::types::ArtifactProvenance>(
+                                    value.clone(),
+                                )
+                                .ok()
+                            }),
                         created_at: event.created_at.clone(),
                     };
                     artifacts.insert(
@@ -13292,7 +13329,9 @@ impl Engine {
                 || (expected.task_id == projected.task_id
                     && expected.mime_type == projected.mime_type
                     && expected.content == projected.content
-                    && expected.sha256 == projected.sha256))
+                    && expected.sha256 == projected.sha256
+                    && (expected.provenance.is_none()
+                        || expected.provenance == projected.provenance)))
     }
 
     fn expected_agent_messages(data: &ReplayData) -> Vec<AgentMessage> {

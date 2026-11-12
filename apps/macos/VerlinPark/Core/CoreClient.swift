@@ -4,7 +4,7 @@ enum CoreError: LocalizedError, Sendable {
     case invalidURL
     case notConnected
     case disconnected
-    case rpc(code: Int, message: String)
+    case rpc(code: Int, message: String, data: JSONValue?)
     case daemonNotFound(String)
     case timeout
 
@@ -16,13 +16,25 @@ enum CoreError: LocalizedError, Sendable {
             "Not connected to the VerlinPark daemon."
         case .disconnected:
             "The daemon connection was closed."
-        case let .rpc(_, message):
+        case let .rpc(_, message, _):
             message
         case let .daemonNotFound(details):
             details
         case .timeout:
             "The daemon did not respond in time."
         }
+    }
+
+    /// Stable Q3 error code carried in `error.data.code`, when present.
+    var typedCode: String? {
+        guard case let .rpc(_, _, data) = self, let data else { return nil }
+        return data.objectValue?["code"]?.stringValue
+    }
+
+    /// Bounded hint carried in `error.data.hint`, when present.
+    var typedHint: String? {
+        guard case let .rpc(_, _, data) = self, let data else { return nil }
+        return data.objectValue?["hint"]?.stringValue
     }
 }
 
@@ -63,7 +75,11 @@ actor CoreClient {
             ]
         )
         guard try authResult.decode(AuthResult.self).ok else {
-            throw CoreError.rpc(code: -32001, message: "authentication failed")
+            throw CoreError.rpc(
+                code: -32001,
+                message: "authentication failed",
+                data: nil
+            )
         }
         _ = try await request(method: "event.subscribe", params: [:])
     }
@@ -1491,6 +1507,66 @@ actor CoreClient {
             params: ["artifact_id": .string(artifactID)]
         )
         .decode(ArtifactVersionsResult.self)
+    }
+
+    func artifactArchiveList(
+        artifactID: String,
+        maxEntries: Int? = nil
+    ) async throws -> ArtifactArchiveListResult {
+        var params: [String: JSONValue] = ["artifact_id": .string(artifactID)]
+        if let maxEntries {
+            params["max_entries"] = .number(Double(maxEntries))
+        }
+        return try await request(method: "artifact.archive.list", params: params)
+            .decode(ArtifactArchiveListResult.self)
+    }
+
+    func artifactArchiveExtract(
+        artifactID: String,
+        entries: [String],
+        all: Bool = false,
+        maxEntries: Int? = nil,
+        includePreviews: Bool = true
+    ) async throws -> ArtifactArchiveExtractResult {
+        var params: [String: JSONValue] = [
+            "artifact_id": .string(artifactID),
+            "entries": .array(entries.map(JSONValue.string)),
+            "all": .bool(all),
+            "include_previews": .bool(includePreviews),
+        ]
+        if let maxEntries {
+            params["max_entries"] = .number(Double(maxEntries))
+        }
+        return try await request(method: "artifact.archive.extract", params: params)
+            .decode(ArtifactArchiveExtractResult.self)
+    }
+
+    func mediaInfo(artifactID: String) async throws -> MediaInfoResult {
+        try await request(
+            method: "media.info",
+            params: ["artifact_id": .string(artifactID)]
+        )
+        .decode(MediaInfoResult.self)
+    }
+
+    func mediaTranscode(
+        artifactID: String,
+        format: String,
+        maxDurationSecs: Int,
+        maxBytes: Int? = nil,
+        approved: Bool
+    ) async throws -> MediaTranscodeResult {
+        var params: [String: JSONValue] = [
+            "artifact_id": .string(artifactID),
+            "format": .string(format),
+            "max_duration_secs": .number(Double(maxDurationSecs)),
+            "approved": .bool(approved),
+        ]
+        if let maxBytes {
+            params["max_bytes"] = .number(Double(maxBytes))
+        }
+        return try await request(method: "media.transcode", params: params)
+            .decode(MediaTranscodeResult.self)
     }
 
     func restoreArtifactVersion(artifactID: String, version: Int) async throws -> Artifact {
@@ -3713,7 +3789,11 @@ actor CoreClient {
             requestTimeouts.removeValue(forKey: id)?.cancel()
             if let error = envelope.error {
                 continuation.resume(
-                    throwing: CoreError.rpc(code: error.code, message: error.message)
+                    throwing: CoreError.rpc(
+                        code: error.code,
+                        message: error.message,
+                        data: error.data
+                    )
                 )
             } else {
                 continuation.resume(returning: envelope.result ?? .null)

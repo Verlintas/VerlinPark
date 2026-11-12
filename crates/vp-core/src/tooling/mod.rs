@@ -4,6 +4,7 @@
 //! project-aware tools that absorb deterministic work instead of forcing the
 //! model to compose long shell/search/read chains.
 
+pub mod archive;
 pub mod code;
 pub mod code_intel;
 pub mod data;

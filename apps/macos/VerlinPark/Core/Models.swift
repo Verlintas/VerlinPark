@@ -2845,6 +2845,7 @@ struct EventListResult: Codable, Sendable {
 struct RPCErrorPayload: Codable, Sendable {
     let code: Int
     let message: String
+    let data: JSONValue?
 }
 
 struct RPCEnvelope: Codable, Sendable {
@@ -2903,6 +2904,7 @@ struct Artifact: Codable, Identifiable, Hashable, Sendable {
     let path: String?
     let dataBase64: String?
     let version: Int
+    let provenance: ArtifactProvenance?
     let createdAt: String
 
     enum CodingKeys: String, CodingKey {
@@ -2922,6 +2924,7 @@ struct Artifact: Codable, Identifiable, Hashable, Sendable {
         case path
         case dataBase64 = "data_base64"
         case version
+        case provenance
         case createdAt = "created_at"
     }
 
@@ -2943,6 +2946,7 @@ struct Artifact: Codable, Identifiable, Hashable, Sendable {
         path = try container.decodeIfPresent(String.self, forKey: .path)
         dataBase64 = try container.decodeIfPresent(String.self, forKey: .dataBase64)
         version = try container.decodeIfPresent(Int.self, forKey: .version) ?? 1
+        provenance = try container.decodeIfPresent(ArtifactProvenance.self, forKey: .provenance)
         createdAt = try container.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
     }
 }
@@ -2959,6 +2963,7 @@ struct ArtifactVersion: Codable, Identifiable, Hashable, Sendable {
     let sizeBytes: Int
     let sha256: String
     let path: String?
+    let provenance: ArtifactProvenance?
     let createdAt: String
 
     var id: Int {
@@ -2977,6 +2982,7 @@ struct ArtifactVersion: Codable, Identifiable, Hashable, Sendable {
         case sizeBytes = "size_bytes"
         case sha256
         case path
+        case provenance
         case createdAt = "created_at"
     }
 }
@@ -2995,6 +3001,351 @@ struct ArtifactListResult: Codable, Sendable {
 
 struct ArtifactResult: Codable, Sendable {
     let artifact: Artifact
+    let provenance: ArtifactProvenance?
+}
+
+struct ArtifactProvenance: Codable, Hashable, Sendable {
+    let operation: String
+    let sourceArtifactId: String?
+    let sourceArtifactName: String?
+    let sourceSha256: String?
+    let sourceMimeType: String?
+    let entryPath: String?
+    let archiveFormat: String?
+    let extractionId: String?
+    let entrySha256: String?
+    let sourceFormat: String?
+    let outputFormat: String?
+    let tool: String?
+    let maxDurationSecs: Int?
+    let truncated: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case operation
+        case sourceArtifactId = "source_artifact_id"
+        case sourceArtifactName = "source_artifact_name"
+        case sourceSha256 = "source_sha256"
+        case sourceMimeType = "source_mime_type"
+        case entryPath = "entry_path"
+        case archiveFormat = "archive_format"
+        case extractionId = "extraction_id"
+        case entrySha256 = "entry_sha256"
+        case sourceFormat = "source_format"
+        case outputFormat = "output_format"
+        case tool
+        case maxDurationSecs = "max_duration_secs"
+        case truncated
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        operation = try container.decodeIfPresent(String.self, forKey: .operation) ?? ""
+        sourceArtifactId = try container.decodeIfPresent(String.self, forKey: .sourceArtifactId)
+        sourceArtifactName = try container.decodeIfPresent(String.self, forKey: .sourceArtifactName)
+        sourceSha256 = try container.decodeIfPresent(String.self, forKey: .sourceSha256)
+        sourceMimeType = try container.decodeIfPresent(String.self, forKey: .sourceMimeType)
+        entryPath = try container.decodeIfPresent(String.self, forKey: .entryPath)
+        archiveFormat = try container.decodeIfPresent(String.self, forKey: .archiveFormat)
+        extractionId = try container.decodeIfPresent(String.self, forKey: .extractionId)
+        entrySha256 = try container.decodeIfPresent(String.self, forKey: .entrySha256)
+        sourceFormat = try container.decodeIfPresent(String.self, forKey: .sourceFormat)
+        outputFormat = try container.decodeIfPresent(String.self, forKey: .outputFormat)
+        tool = try container.decodeIfPresent(String.self, forKey: .tool)
+        maxDurationSecs = try container.decodeIfPresent(Int.self, forKey: .maxDurationSecs)
+        truncated = try container.decodeIfPresent(Bool.self, forKey: .truncated) ?? false
+    }
+}
+
+struct ArchiveLimits: Codable, Hashable, Sendable {
+    let maxEntries: Int
+    let maxEntryBytes: Int
+    let maxTotalBytes: Int
+    let maxArchiveBytes: Int
+    let maxCompressionRatio: Int
+
+    enum CodingKeys: String, CodingKey {
+        case maxEntries = "max_entries"
+        case maxEntryBytes = "max_entry_bytes"
+        case maxTotalBytes = "max_total_bytes"
+        case maxArchiveBytes = "max_archive_bytes"
+        case maxCompressionRatio = "max_compression_ratio"
+    }
+}
+
+struct ArchiveEntry: Codable, Identifiable, Hashable, Sendable {
+    let index: Int
+    let path: String
+    let kind: String
+    let sizeBytes: Int
+    let compressedSize: Int?
+    let mode: Int?
+    let safe: Bool
+    let unsafeReason: String?
+    let duplicate: Bool
+    let modifiedAt: String?
+
+    var id: String {
+        "\(index):\(path)"
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case index
+        case path
+        case kind
+        case sizeBytes = "size_bytes"
+        case compressedSize = "compressed_size"
+        case mode
+        case safe
+        case unsafeReason = "unsafe_reason"
+        case duplicate
+        case modifiedAt = "modified_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        index = try container.decodeIfPresent(Int.self, forKey: .index) ?? 0
+        path = try container.decode(String.self, forKey: .path)
+        kind = try container.decodeIfPresent(String.self, forKey: .kind) ?? "other"
+        sizeBytes = try container.decodeIfPresent(Int.self, forKey: .sizeBytes) ?? 0
+        compressedSize = try container.decodeIfPresent(Int.self, forKey: .compressedSize)
+        mode = try container.decodeIfPresent(Int.self, forKey: .mode)
+        safe = try container.decodeIfPresent(Bool.self, forKey: .safe) ?? false
+        unsafeReason = try container.decodeIfPresent(String.self, forKey: .unsafeReason)
+        duplicate = try container.decodeIfPresent(Bool.self, forKey: .duplicate) ?? false
+        modifiedAt = try container.decodeIfPresent(String.self, forKey: .modifiedAt)
+    }
+}
+
+struct ArtifactArchiveListResult: Codable, Sendable {
+    let artifactId: String
+    let name: String
+    let mimeType: String
+    let sizeBytes: Int
+    let sha256: String
+    let format: String
+    let entries: [ArchiveEntry]
+    let entryCount: Int
+    let truncated: Bool
+    let totalUncompressedBytes: Int
+    let totalCompressedBytes: Int
+    let limits: ArchiveLimits
+    let warnings: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case artifactId = "artifact_id"
+        case name
+        case mimeType = "mime_type"
+        case sizeBytes = "size_bytes"
+        case sha256
+        case format
+        case entries
+        case entryCount = "entry_count"
+        case truncated
+        case totalUncompressedBytes = "total_uncompressed_bytes"
+        case totalCompressedBytes = "total_compressed_bytes"
+        case limits
+        case warnings
+    }
+
+    var safeFileCount: Int {
+        entries.filter { $0.safe && $0.kind == "file" }.count
+    }
+}
+
+struct ExtractedArchiveEntry: Codable, Identifiable, Hashable, Sendable {
+    let path: String
+    let kind: String
+    let sizeBytes: Int
+    let sha256: String?
+    let publishedArtifactId: String?
+    let preview: String?
+    let previewEncoding: String
+    let truncated: Bool
+    let skippedReason: String?
+
+    var id: String {
+        path
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case path
+        case kind
+        case sizeBytes = "size_bytes"
+        case sha256
+        case publishedArtifactId = "published_artifact_id"
+        case preview
+        case previewEncoding = "preview_encoding"
+        case truncated
+        case skippedReason = "skipped_reason"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        path = try container.decode(String.self, forKey: .path)
+        kind = try container.decodeIfPresent(String.self, forKey: .kind) ?? "file"
+        sizeBytes = try container.decodeIfPresent(Int.self, forKey: .sizeBytes) ?? 0
+        sha256 = try container.decodeIfPresent(String.self, forKey: .sha256)
+        publishedArtifactId = try container.decodeIfPresent(String.self, forKey: .publishedArtifactId)
+        preview = try container.decodeIfPresent(String.self, forKey: .preview)
+        previewEncoding = try container.decodeIfPresent(String.self, forKey: .previewEncoding) ?? "none"
+        truncated = try container.decodeIfPresent(Bool.self, forKey: .truncated) ?? false
+        skippedReason = try container.decodeIfPresent(String.self, forKey: .skippedReason)
+    }
+}
+
+struct ArtifactArchiveExtractResult: Codable, Sendable {
+    let artifactId: String
+    let extractionId: String
+    let format: String
+    let entries: [ExtractedArchiveEntry]
+    let publishedArtifacts: [Artifact]
+    let totalBytes: Int
+    let scratchRetained: Bool
+    let warnings: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case artifactId = "artifact_id"
+        case extractionId = "extraction_id"
+        case format
+        case entries
+        case publishedArtifacts = "published_artifacts"
+        case totalBytes = "total_bytes"
+        case scratchRetained = "scratch_retained"
+        case warnings
+    }
+}
+
+struct MediaStreamInfo: Codable, Hashable, Sendable {
+    let index: Int
+    let codecType: String
+    let codecName: String
+    let codecLongName: String?
+    let width: Int?
+    let height: Int?
+    let durationSecs: Double?
+    let bitRate: Int?
+    let sampleRate: Int?
+    let channels: Int?
+    let language: String?
+    let frames: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case index
+        case codecType = "codec_type"
+        case codecName = "codec_name"
+        case codecLongName = "codec_long_name"
+        case width
+        case height
+        case durationSecs = "duration_secs"
+        case bitRate = "bit_rate"
+        case sampleRate = "sample_rate"
+        case channels
+        case language
+        case frames
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        index = try container.decodeIfPresent(Int.self, forKey: .index) ?? 0
+        codecType = try container.decodeIfPresent(String.self, forKey: .codecType) ?? "unknown"
+        codecName = try container.decodeIfPresent(String.self, forKey: .codecName) ?? ""
+        codecLongName = try container.decodeIfPresent(String.self, forKey: .codecLongName)
+        width = try container.decodeIfPresent(Int.self, forKey: .width)
+        height = try container.decodeIfPresent(Int.self, forKey: .height)
+        durationSecs = try container.decodeIfPresent(Double.self, forKey: .durationSecs)
+        bitRate = try container.decodeIfPresent(Int.self, forKey: .bitRate)
+        sampleRate = try container.decodeIfPresent(Int.self, forKey: .sampleRate)
+        channels = try container.decodeIfPresent(Int.self, forKey: .channels)
+        language = try container.decodeIfPresent(String.self, forKey: .language)
+        frames = try container.decodeIfPresent(Int.self, forKey: .frames)
+    }
+}
+
+struct MediaInfo: Codable, Hashable, Sendable {
+    let container: String?
+    let formatLongName: String?
+    let durationSecs: Double?
+    let bitRate: Int?
+    let width: Int?
+    let height: Int?
+    let streams: [MediaStreamInfo]
+    let tags: [String: String]
+    let source: String
+    let tool: String?
+    let warnings: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case container
+        case formatLongName = "format_long_name"
+        case durationSecs = "duration_secs"
+        case bitRate = "bit_rate"
+        case width
+        case height
+        case streams
+        case tags
+        case source
+        case tool
+        case warnings
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.container = try container.decodeIfPresent(String.self, forKey: .container)
+        formatLongName = try container.decodeIfPresent(String.self, forKey: .formatLongName)
+        durationSecs = try container.decodeIfPresent(Double.self, forKey: .durationSecs)
+        bitRate = try container.decodeIfPresent(Int.self, forKey: .bitRate)
+        width = try container.decodeIfPresent(Int.self, forKey: .width)
+        height = try container.decodeIfPresent(Int.self, forKey: .height)
+        streams = try container.decodeIfPresent([MediaStreamInfo].self, forKey: .streams) ?? []
+        tags = try container.decodeIfPresent([String: String].self, forKey: .tags) ?? [:]
+        source = try container.decodeIfPresent(String.self, forKey: .source) ?? "unknown"
+        tool = try container.decodeIfPresent(String.self, forKey: .tool)
+        warnings = try container.decodeIfPresent([String].self, forKey: .warnings) ?? []
+    }
+}
+
+struct MediaInfoResult: Codable, Sendable {
+    let artifactId: String
+    let name: String
+    let mimeType: String
+    let sizeBytes: Int
+    let sha256: String
+    let info: MediaInfo
+
+    enum CodingKeys: String, CodingKey {
+        case artifactId = "artifact_id"
+        case name
+        case mimeType = "mime_type"
+        case sizeBytes = "size_bytes"
+        case sha256
+        case info
+    }
+}
+
+struct MediaTranscodeResult: Codable, Sendable {
+    let sourceArtifactId: String
+    let artifact: Artifact
+    let format: String
+    let durationSecs: Double?
+    let sizeBytes: Int
+    let elapsedMs: Int
+    let commandSummary: String
+    let maxDurationSecs: Int
+    let maxBytes: Int
+    let warnings: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case sourceArtifactId = "source_artifact_id"
+        case artifact
+        case format
+        case durationSecs = "duration_secs"
+        case sizeBytes = "size_bytes"
+        case elapsedMs = "elapsed_ms"
+        case commandSummary = "command_summary"
+        case maxDurationSecs = "max_duration_secs"
+        case maxBytes = "max_bytes"
+        case warnings
+    }
 }
 
 struct AgentMessageResult: Codable, Sendable {

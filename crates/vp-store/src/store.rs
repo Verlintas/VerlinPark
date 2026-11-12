@@ -14,11 +14,11 @@ use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
     AcpAgent, AcpAgentConfig, AcpTransport, AgentMessage, AgentRecord, Approval,
-    ApprovalAuditEvent, ApprovalGrant, ApprovalTemplate, Artifact, ArtifactPolicy, ArtifactVersion,
-    AttentionPolicy, CachePolicy, CheckpointRetentionPolicy, ContextCheckpoint,
-    ContextCheckpointPolicy, ContinuationOutcome, CriticalPathPolicy, Event, GuiActionInfo,
-    GuiPolicy, IntakeTask, IntegrationPolicy, MailboxPolicy, McpServer, McpServerConfig,
-    McpTransport, MemoryConflict, MemoryEmbeddingJobStatus, MemoryEmbeddingPolicy,
+    ApprovalAuditEvent, ApprovalGrant, ApprovalTemplate, Artifact, ArtifactPolicy,
+    ArtifactProvenance, ArtifactVersion, AttentionPolicy, CachePolicy, CheckpointRetentionPolicy,
+    ContextCheckpoint, ContextCheckpointPolicy, ContinuationOutcome, CriticalPathPolicy, Event,
+    GuiActionInfo, GuiPolicy, IntakeTask, IntegrationPolicy, MailboxPolicy, McpServer,
+    McpServerConfig, McpTransport, MemoryConflict, MemoryEmbeddingJobStatus, MemoryEmbeddingPolicy,
     MemoryEmbeddingUsage, MemoryEmbeddingsStatusResult, MemoryEvidence, MemoryHealthResult,
     MemoryItem, MemoryPolicy, MemoryStatCount, MergeQueueEntry, MergeQueueSource, MetricCount,
     ModelPreset, OrchestrationDecision, OrchestrationNote, OrchestrationPolicy,
@@ -1752,6 +1752,7 @@ impl Store {
                 sha256     TEXT NOT NULL DEFAULT '',
                 path       TEXT,
                 version    INTEGER NOT NULL DEFAULT 1,
+                provenance TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL
             );
 
@@ -1767,6 +1768,7 @@ impl Store {
                 size_bytes  INTEGER NOT NULL,
                 sha256      TEXT NOT NULL,
                 path        TEXT,
+                provenance TEXT NOT NULL DEFAULT '',
                 created_at  TEXT NOT NULL,
                 PRIMARY KEY (artifact_id, version)
             );
@@ -3205,11 +3207,18 @@ impl Store {
         ensure_column(&conn, "artifacts", "sha256", "TEXT NOT NULL DEFAULT ''")?;
         ensure_column(&conn, "artifacts", "path", "TEXT")?;
         ensure_column(&conn, "artifacts", "version", "INTEGER NOT NULL DEFAULT 1")?;
+        ensure_column(&conn, "artifacts", "provenance", "TEXT NOT NULL DEFAULT ''")?;
         ensure_column(
             &conn,
             "artifacts",
             "compression",
             "TEXT NOT NULL DEFAULT 'none'",
+        )?;
+        ensure_column(
+            &conn,
+            "artifact_versions",
+            "provenance",
+            "TEXT NOT NULL DEFAULT ''",
         )?;
         ensure_column(&conn, "usage_ledger", "department", "TEXT")?;
         ensure_column(
@@ -9800,6 +9809,7 @@ impl Store {
             path: path.map(str::to_string),
             data_base64: None,
             version: 1,
+            provenance: None,
             created_at: now_rfc3339(),
         };
         tx.execute(
@@ -9845,6 +9855,7 @@ impl Store {
                 "path": artifact.path,
                 "content": artifact.content,
                 "version": artifact.version,
+                "provenance": artifact.provenance,
             }),
         )?;
         tx.commit()?;
@@ -9866,6 +9877,7 @@ impl Store {
         mime_type: &str,
         data: &[u8],
         sha256: &str,
+        provenance: Option<&ArtifactProvenance>,
     ) -> Result<(Artifact, Event)> {
         let id = Uuid::now_v7().to_string();
         let dir = self.data_dir.join("artifacts").join("blobs");
@@ -9896,15 +9908,18 @@ impl Store {
             path: Some(path.to_string_lossy().to_string()),
             data_base64: None,
             version: 1,
+            provenance: provenance.cloned(),
             created_at: now_rfc3339(),
         };
+        let provenance_encoded = encode_artifact_provenance(provenance)?;
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO artifacts
              (id, session_id, agent_id, agent_name, task_id, name, kind, mime_type,
-              content, storage, compression, size_bytes, sha256, path, created_at, version)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '', 'file', 'zstd', ?9, ?10, ?11, ?12, 1)",
+              content, storage, compression, size_bytes, sha256, path, provenance,
+              created_at, version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '', 'file', 'zstd', ?9, ?10, ?11, ?12, ?13, 1)",
             params![
                 artifact.id,
                 artifact.session_id,
@@ -9917,6 +9932,7 @@ impl Store {
                 artifact.size_bytes as i64,
                 artifact.sha256,
                 artifact.path,
+                provenance_encoded,
                 artifact.created_at
             ],
         )?;
@@ -9940,6 +9956,7 @@ impl Store {
                 "path": artifact.path,
                 "content": "",
                 "version": artifact.version,
+                "provenance": artifact.provenance,
             }),
         )?;
         if let Err(error) = tx.commit() {
@@ -9972,7 +9989,7 @@ impl Store {
             .query_row(
                 "SELECT id, session_id, agent_id, agent_name, task_id, name, kind,
                         mime_type, content, storage, compression, size_bytes, sha256, path,
-                        created_at, version
+                        created_at, version, provenance
                  FROM artifacts WHERE id = ?1",
                 params![artifact_id],
                 map_artifact,
@@ -10057,7 +10074,7 @@ impl Store {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT artifact_id, version, name, kind, mime_type, content, storage,
-                    compression, size_bytes, sha256, path, created_at
+                    compression, size_bytes, sha256, path, created_at, provenance
              FROM artifact_versions WHERE artifact_id = ?1 ORDER BY version ASC",
         )?;
         let rows = stmt.query_map(params![artifact_id], map_artifact_version)?;
@@ -10084,7 +10101,7 @@ impl Store {
         let stored = conn
             .query_row(
                 "SELECT artifact_id, version, name, kind, mime_type, content, storage,
-                        compression, size_bytes, sha256, path, created_at
+                        compression, size_bytes, sha256, path, created_at, provenance
                  FROM artifact_versions WHERE artifact_id = ?1 AND version = ?2",
                 params![artifact_id, version as i64],
                 map_artifact_version,
@@ -10120,7 +10137,7 @@ impl Store {
             .query_row(
                 "SELECT id, session_id, agent_id, agent_name, task_id, name, kind,
                         mime_type, content, storage, compression, size_bytes, sha256, path,
-                        created_at, version
+                        created_at, version, provenance
                  FROM artifacts WHERE id = ?1",
                 params![artifact_id],
                 map_artifact,
@@ -10199,7 +10216,7 @@ impl Store {
         conn.query_row(
             "SELECT a.id, a.session_id, a.agent_id, a.agent_name, a.task_id, a.name,
                     a.kind, a.mime_type, a.content, a.storage, a.compression,
-                    a.size_bytes, a.sha256, a.path, a.created_at, a.version
+                    a.size_bytes, a.sha256, a.path, a.created_at, a.version, a.provenance
              FROM artifact_requests r
              JOIN artifacts a ON a.id = r.artifact_id
              WHERE r.session_id = ?1 AND r.request_key = ?2",
@@ -10231,7 +10248,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT id, session_id, agent_id, agent_name, task_id, name, kind,
                     mime_type, content, storage, compression, size_bytes, sha256, path,
-                    created_at, version
+                    created_at, version, provenance
              FROM artifacts WHERE session_id = ?1 ORDER BY created_at ASC, id ASC",
         )?;
         let rows = stmt.query_map(params![session_id], map_artifact)?;
@@ -10243,7 +10260,7 @@ impl Store {
         conn.query_row(
             "SELECT id, session_id, agent_id, agent_name, task_id, name, kind,
                     mime_type, content, storage, compression, size_bytes, sha256, path,
-                    created_at, version
+                    created_at, version, provenance
              FROM artifacts WHERE id = ?1",
             params![artifact_id],
             map_artifact,
@@ -12254,7 +12271,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT a.id, a.session_id, a.agent_id, a.agent_name, a.task_id, a.name,
                     a.kind, a.mime_type, a.content, a.storage, a.compression,
-                    a.size_bytes, a.sha256, a.path, a.created_at, a.version
+                    a.size_bytes, a.sha256, a.path, a.created_at, a.version, a.provenance
              FROM artifacts a
              JOIN sessions s ON s.id = a.session_id
              WHERE s.project_id = ?1
@@ -21882,8 +21899,9 @@ impl Store {
                 tx.execute(
                     "INSERT INTO artifacts
                      (id, session_id, agent_id, agent_name, task_id, name, kind, mime_type,
-                      content, storage, compression, size_bytes, sha256, path, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                      content, storage, compression, size_bytes, sha256, path, provenance,
+                      created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                     params![
                         artifact.id,
                         artifact.session_id,
@@ -21899,6 +21917,7 @@ impl Store {
                         artifact.size_bytes as i64,
                         artifact.sha256,
                         artifact.path,
+                        encode_artifact_provenance(artifact.provenance.as_ref())?,
                         artifact.created_at
                     ],
                 )?;
@@ -22283,8 +22302,9 @@ impl Store {
             tx.execute(
                 "INSERT INTO artifacts
                  (id, session_id, agent_id, agent_name, task_id, name, kind,
-                  mime_type, content, storage, compression, size_bytes, sha256, path, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                  mime_type, content, storage, compression, size_bytes, sha256, path,
+                  provenance, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     artifact.id,
                     artifact.session_id,
@@ -22300,6 +22320,7 @@ impl Store {
                     size_bytes as i64,
                     sha256,
                     path,
+                    encode_artifact_provenance(artifact.provenance.as_ref())?,
                     artifact.created_at
                 ],
             )?;
@@ -24297,8 +24318,31 @@ fn map_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Artifact> {
         path: row.get(13)?,
         data_base64: None,
         version: row.get::<_, i64>(15).unwrap_or(1).max(1) as u32,
+        provenance: parse_artifact_provenance(row.get::<_, String>(16).unwrap_or_default())?,
         created_at: row.get(14)?,
     })
+}
+
+fn parse_artifact_provenance(raw: String) -> rusqlite::Result<Option<ArtifactProvenance>> {
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str::<ArtifactProvenance>(&raw)
+        .map(Some)
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                16,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })
+}
+
+fn encode_artifact_provenance(provenance: Option<&ArtifactProvenance>) -> Result<String> {
+    match provenance {
+        Some(provenance) => serde_json::to_string(provenance).map_err(Into::into),
+        None => Ok(String::new()),
+    }
 }
 
 fn artifact_version_from_artifact(artifact: &Artifact) -> ArtifactVersion {
@@ -24314,6 +24358,7 @@ fn artifact_version_from_artifact(artifact: &Artifact) -> ArtifactVersion {
         size_bytes: artifact.size_bytes,
         sha256: artifact.sha256.clone(),
         path: artifact.path.clone(),
+        provenance: artifact.provenance.clone(),
         created_at: artifact.created_at.clone(),
     }
 }
@@ -24331,16 +24376,18 @@ fn map_artifact_version(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactVer
         size_bytes: row.get::<_, i64>(8)?.max(0) as u64,
         sha256: row.get(9)?,
         path: row.get(10)?,
+        provenance: parse_artifact_provenance(row.get::<_, String>(12).unwrap_or_default())?,
         created_at: row.get(11)?,
     })
 }
 
 fn insert_artifact_version_tx(tx: &Transaction<'_>, artifact: &Artifact) -> Result<()> {
+    let provenance = encode_artifact_provenance(artifact.provenance.as_ref())?;
     tx.execute(
         "INSERT INTO artifact_versions
          (artifact_id, version, name, kind, mime_type, content, storage, compression,
-          size_bytes, sha256, path, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+          size_bytes, sha256, path, created_at, provenance)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          ON CONFLICT(artifact_id, version) DO UPDATE SET
             name = excluded.name,
             kind = excluded.kind,
@@ -24350,7 +24397,8 @@ fn insert_artifact_version_tx(tx: &Transaction<'_>, artifact: &Artifact) -> Resu
             compression = excluded.compression,
             size_bytes = excluded.size_bytes,
             sha256 = excluded.sha256,
-            path = excluded.path",
+            path = excluded.path,
+            provenance = excluded.provenance",
         params![
             artifact.id,
             artifact.version as i64,
@@ -24364,6 +24412,7 @@ fn insert_artifact_version_tx(tx: &Transaction<'_>, artifact: &Artifact) -> Resu
             artifact.sha256,
             artifact.path,
             artifact.created_at,
+            provenance,
         ],
     )?;
     Ok(())

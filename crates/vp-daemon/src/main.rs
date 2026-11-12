@@ -44,26 +44,27 @@ use vp_protocol::types::{
     ApprovalGrantDeleteParams, ApprovalGrantDeleteResult, ApprovalGrantListParams,
     ApprovalGrantListResult, ApprovalListResult, ApprovalQueueParams, ApprovalTemplateCreateParams,
     ApprovalTemplateDeleteParams, ApprovalTemplateFromApprovalParams, ApprovalTemplateListParams,
-    ApprovalTemplateListResult, ApprovalTemplateUpdateParams, ArtifactBackfillParams,
-    ArtifactDiffParams, ArtifactGcParams, ArtifactGetParams, ArtifactListParams,
-    ArtifactListResult, ArtifactMaterializeParams, ArtifactPolicyParams, ArtifactPolicyResult,
-    ArtifactRestoreParams, ArtifactResult, ArtifactVersionsParams, AttentionPolicyGetParams,
-    AttentionPolicySetParams, AuthParams, AuthResult, CachePolicyParams, CachePolicyResult,
-    CancelSessionParams, CancelSessionResult, CheckpointPolicyParams, CleanupWorktreesParams,
-    CommitSessionParams, ConfigureAgentParams, ConsoleCloseParams, ConsoleOpenParams,
-    ConsoleReadParams, ConsoleSignalParams, ConsoleWriteParams, ContextCheckpointCreateParams,
-    ContextCheckpointDeleteParams, ContextCheckpointDetailParams, ContextCheckpointListParams,
-    ContextCheckpointPolicyParams, ContextCheckpointPruneParams, ContextRestoreParams,
-    CreateModelPresetParams, CreateSessionParams, CriticalPathMode, CriticalPathPolicyParams,
-    CriticalPathPolicyResult, DaemonMetrics, DaemonMetricsResult, DashboardParams,
-    DeleteModelPresetParams, DiscardSessionParams, DoctorCheck, DoctorReport, EventListResult,
-    ForgePreflightParams, ForgeStatusParams, ForkAuditParams, ForkRepairParams, GitLogParams,
-    GitShowParams, GovernorPreviewParams, GovernorStatusParams, IntakeCreateParams,
-    IntakeDeleteResult, IntakeListParams, IntakeTaskParams, IntakeUpdateParams,
-    IntegrationPolicyParams, IntegrationPolicyResult, LandSessionParams, ListApprovalsParams,
-    ListEventsParams, ListSessionsParams, MailboxGcParams, MailboxListParams, MailboxListResult,
-    MailboxPolicyParams, MailboxPolicyResult, MarkMessageReadParams, McpCallParams,
-    McpGetPromptParams, McpProbeParams, McpReadResourceParams, McpServerIdParams,
+    ApprovalTemplateListResult, ApprovalTemplateUpdateParams, ArtifactArchiveExtractParams,
+    ArtifactArchiveListParams, ArtifactBackfillParams, ArtifactDiffParams, ArtifactGcParams,
+    ArtifactGetParams, ArtifactListParams, ArtifactListResult, ArtifactMaterializeParams,
+    ArtifactPolicyParams, ArtifactPolicyResult, ArtifactRestoreParams, ArtifactResult,
+    ArtifactVersionsParams, AttentionPolicyGetParams, AttentionPolicySetParams, AuthParams,
+    AuthResult, CachePolicyParams, CachePolicyResult, CancelSessionParams, CancelSessionResult,
+    CheckpointPolicyParams, CleanupWorktreesParams, CommitSessionParams, ConfigureAgentParams,
+    ConsoleCloseParams, ConsoleOpenParams, ConsoleReadParams, ConsoleSignalParams,
+    ConsoleWriteParams, ContextCheckpointCreateParams, ContextCheckpointDeleteParams,
+    ContextCheckpointDetailParams, ContextCheckpointListParams, ContextCheckpointPolicyParams,
+    ContextCheckpointPruneParams, ContextRestoreParams, CreateModelPresetParams,
+    CreateSessionParams, CriticalPathMode, CriticalPathPolicyParams, CriticalPathPolicyResult,
+    DaemonMetrics, DaemonMetricsResult, DashboardParams, DeleteModelPresetParams,
+    DiscardSessionParams, DoctorCheck, DoctorReport, EventListResult, ForgePreflightParams,
+    ForgeStatusParams, ForkAuditParams, ForkRepairParams, GitLogParams, GitShowParams,
+    GovernorPreviewParams, GovernorStatusParams, IntakeCreateParams, IntakeDeleteResult,
+    IntakeListParams, IntakeTaskParams, IntakeUpdateParams, IntegrationPolicyParams,
+    IntegrationPolicyResult, LandSessionParams, ListApprovalsParams, ListEventsParams,
+    ListSessionsParams, MailboxGcParams, MailboxListParams, MailboxListResult, MailboxPolicyParams,
+    MailboxPolicyResult, MarkMessageReadParams, McpCallParams, McpGetPromptParams, McpProbeParams,
+    McpReadResourceParams, McpServerIdParams, MediaInfoParams, MediaTranscodeParams,
     MemoryBriefParams, MemoryConflictResolveParams, MemoryConflictScanParams,
     MemoryConflictsParams, MemoryCreateParams, MemoryCreateResult, MemoryDeleteParams,
     MemoryEmbeddingsIndexRebuildParams, MemoryEmbeddingsIndexStatusParams,
@@ -1441,7 +1442,16 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 .restore_artifact_version(&params.artifact_id, params.version)
                 .await
             {
-                Ok(artifact) => RpcResponse::success(id, ArtifactResult { artifact }),
+                Ok(artifact) => {
+                    let provenance = artifact.provenance.clone();
+                    RpcResponse::success(
+                        id,
+                        ArtifactResult {
+                            artifact,
+                            provenance,
+                        },
+                    )
+                }
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),
@@ -3929,12 +3939,53 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         },
         "artifact.get" => match parse_params::<ArtifactGetParams>(request.params) {
             Ok(params) => match state.engine.get_artifact(&params.artifact_id).await {
-                Ok(Some(artifact)) => RpcResponse::success(id, ArtifactResult { artifact }),
+                Ok(Some(artifact)) => {
+                    let provenance = artifact.provenance.clone();
+                    RpcResponse::success(
+                        id,
+                        ArtifactResult {
+                            artifact,
+                            provenance,
+                        },
+                    )
+                }
                 Ok(None) => RpcResponse::error(
                     id,
                     RpcError::new(codes::INVALID_PARAMS, "artifact not found".to_string()),
                 ),
                 Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "artifact.archive.list" => {
+            match parse_params::<ArtifactArchiveListParams>(request.params) {
+                Ok(params) => match state.engine.artifact_archive_list(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => archive_media_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "artifact.archive.extract" => {
+            match parse_params::<ArtifactArchiveExtractParams>(request.params) {
+                Ok(params) => match state.engine.artifact_archive_extract(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => archive_media_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "media.info" => match parse_params::<MediaInfoParams>(request.params) {
+            Ok(params) => match state.engine.media_info(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => archive_media_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "media.transcode" => match parse_params::<MediaTranscodeParams>(request.params) {
+            Ok(params) => match state.engine.media_transcode(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => archive_media_error(id, error),
             },
             Err(response) => response_with_id(id, response),
         },
@@ -4465,6 +4516,30 @@ fn remote_integration_error(id: Option<Value>, error: anyhow::Error) -> RpcRespo
             id,
             RpcError::with_data(codes::INTERNAL_ERROR, error.to_string(), data),
         ),
+        None => internal_error(id, error),
+    }
+}
+
+/// Archive/media failures are typed with the Q3 catalog. Request-shaped
+/// failures use INVALID_PARAMS; environment failures stay INTERNAL_ERROR. The
+/// `data` object carries the same bounded code/retryable/hint contract used by
+/// agent tools, so the Swift client can show the typed reason without parsing
+/// the human message.
+fn archive_media_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
+    match vp_core::archive_media::failure_data(&error) {
+        Some(data) => {
+            let code = data
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("TOOL_FAILED");
+            let rpc_code = match code {
+                "MEDIA_TOOL_UNAVAILABLE" | "INTERNAL_ERROR" | "ARCHIVE_CORRUPT" => {
+                    codes::INTERNAL_ERROR
+                }
+                _ => codes::INVALID_PARAMS,
+            };
+            RpcResponse::error(id, RpcError::with_data(rpc_code, error.to_string(), data))
+        }
         None => internal_error(id, error),
     }
 }
@@ -5515,5 +5590,235 @@ mod process_rpc_tests {
             "{}",
             error.message
         );
+    }
+}
+
+#[cfg(test)]
+mod archive_media_rpc_tests {
+    use super::*;
+    use serde_json::json;
+    use std::io::Write as _;
+    use tempfile::TempDir;
+    use vp_protocol::rpc::RpcRequest;
+    use vp_protocol::types::MediaTranscodeParams;
+
+    fn zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buffer = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut buffer);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            for (name, data) in entries {
+                writer.start_file(*name, options).unwrap();
+                writer.write_all(data).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        buffer.into_inner()
+    }
+
+    async fn call(state: &AppState, method: &str, params: Value) -> Value {
+        let response = dispatch(state, RpcRequest::new(json!(1), method, params)).await;
+        assert!(
+            response.error.is_none(),
+            "{} failed: {:?}",
+            method,
+            response.error
+        );
+        response.result.unwrap_or(Value::Null)
+    }
+
+    async fn call_error(state: &AppState, method: &str, params: Value) -> RpcError {
+        let response = dispatch(state, RpcRequest::new(json!(1), method, params)).await;
+        response
+            .error
+            .unwrap_or_else(|| panic!("{method} unexpectedly succeeded"))
+    }
+
+    #[tokio::test]
+    async fn archive_and_media_rpcs_return_typed_results_and_failures() {
+        let worktree = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        let project = store
+            .add_project(worktree.path().to_str().unwrap(), Some("archive-rpc"))
+            .unwrap();
+        let session = store.create_session(&project.id, "archive rpc").unwrap();
+        let engine = Engine::new(store);
+        let artifact = engine
+            .publish_artifact_binary(
+                &session.id,
+                "tester",
+                "Tester",
+                None,
+                "bundle.zip",
+                "archive",
+                "application/zip",
+                &zip_bytes(&[("a.txt", b"alpha"), ("dir/b.txt", b"beta")]),
+            )
+            .await
+            .unwrap();
+        let state = AppState {
+            engine: engine.clone(),
+            agent: AgentService::from_env(engine.clone()),
+            token: Arc::new("test-token".to_string()),
+            data_dir: data.path().to_path_buf(),
+            started_at: now_rfc3339(),
+            started: Instant::now(),
+            pid: std::process::id(),
+        };
+
+        let listing = call(
+            &state,
+            "artifact.archive.list",
+            json!({"artifact_id": artifact.id}),
+        )
+        .await;
+        assert_eq!(listing["format"], "zip");
+        assert_eq!(listing["entry_count"], 2);
+        assert_eq!(listing["entries"][1]["path"], "dir/b.txt");
+        assert_eq!(listing["entries"][1]["safe"], true);
+
+        let extraction = call(
+            &state,
+            "artifact.archive.extract",
+            json!({
+                "artifact_id": artifact.id,
+                "entries": ["dir/b.txt"],
+                "include_previews": true
+            }),
+        )
+        .await;
+        assert_eq!(extraction["entries"][0]["preview"], "beta");
+        assert_eq!(extraction["scratch_retained"], false);
+        let derived_id = extraction["published_artifacts"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let derived = call(&state, "artifact.get", json!({"artifact_id": derived_id})).await;
+        assert_eq!(derived["provenance"]["operation"], "archive_extract");
+        assert_eq!(derived["provenance"]["source_artifact_id"], artifact.id);
+        assert_eq!(derived["provenance"]["entry_path"], "dir/b.txt");
+
+        let malicious = engine
+            .publish_artifact_binary(
+                &session.id,
+                "tester",
+                "Tester",
+                None,
+                "slip.zip",
+                "archive",
+                "application/zip",
+                &zip_bytes(&[("../escape.txt", b"bad")]),
+            )
+            .await
+            .unwrap();
+        let error = call_error(
+            &state,
+            "artifact.archive.extract",
+            json!({
+                "artifact_id": malicious.id,
+                "entries": ["../escape.txt"]
+            }),
+        )
+        .await;
+        let failure = error.data.expect("typed archive failure data");
+        assert_eq!(failure["code"], "ARCHIVE_UNSAFE_ENTRY");
+        assert_eq!(failure["retryable"], false);
+
+        let transcode_error = call_error(
+            &state,
+            "media.transcode",
+            json!({
+                "artifact_id": artifact.id,
+                "format": "mp4",
+                "approved": false
+            }),
+        )
+        .await;
+        let failure = transcode_error.data.expect("typed media failure data");
+        assert_eq!(failure["code"], "APPROVAL_REQUIRED");
+
+        let media_error =
+            call_error(&state, "media.info", json!({"artifact_id": artifact.id})).await;
+        let failure = media_error.data.expect("typed media failure data");
+        assert!(
+            matches!(
+                failure["code"].as_str(),
+                Some("MEDIA_TOOL_UNAVAILABLE")
+                    | Some("MEDIA_PROBE_FAILED")
+                    | Some("MEDIA_LIMIT_EXCEEDED")
+            ),
+            "{failure}"
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_rpc_rejects_unapproved_and_unsupported_requests() {
+        let worktree = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        let project = store
+            .add_project(worktree.path().to_str().unwrap(), None)
+            .unwrap();
+        let session = store.create_session(&project.id, "archive rpc 2").unwrap();
+        let engine = Engine::new(store);
+        let artifact = engine
+            .publish_artifact_binary(
+                &session.id,
+                "tester",
+                "Tester",
+                None,
+                "bundle.zip",
+                "archive",
+                "application/zip",
+                &zip_bytes(&[("a.txt", b"a")]),
+            )
+            .await
+            .unwrap();
+        let state = AppState {
+            engine: engine.clone(),
+            agent: AgentService::from_env(engine.clone()),
+            token: Arc::new("test-token".to_string()),
+            data_dir: data.path().to_path_buf(),
+            started_at: now_rfc3339(),
+            started: Instant::now(),
+            pid: std::process::id(),
+        };
+
+        let error = call_error(
+            &state,
+            "artifact.archive.extract",
+            json!({"artifact_id": artifact.id, "entries": []}),
+        )
+        .await;
+        assert_eq!(error.data.unwrap()["code"], "ARCHIVE_EMPTY_SELECTION");
+
+        let error = call_error(
+            &state,
+            "artifact.archive.extract",
+            json!({"artifact_id": artifact.id, "entries": ["missing.txt"]}),
+        )
+        .await;
+        assert_eq!(error.data.unwrap()["code"], "ARCHIVE_ENTRY_NOT_FOUND");
+
+        let error = call_error(
+            &state,
+            "media.transcode",
+            json!({
+                "artifact_id": artifact.id,
+                "format": "avi",
+                "approved": true
+            }),
+        )
+        .await;
+        assert_eq!(error.data.unwrap()["code"], "MEDIA_FORMAT_UNSUPPORTED");
+        let _ = MediaTranscodeParams {
+            artifact_id: artifact.id,
+            format: "mp4".to_string(),
+            max_duration_secs: None,
+            max_bytes: None,
+            approved: false,
+        };
     }
 }

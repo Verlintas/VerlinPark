@@ -3524,6 +3524,93 @@ fn skills_round_trip_filter_and_toggle() {
 }
 
 #[test]
+fn artifact_provenance_round_trips_and_versions_preserve_it() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("demo"))
+        .unwrap();
+    let session = store.create_session(&project.id, "provenance").unwrap();
+    let provenance = vp_protocol::types::ArtifactProvenance {
+        operation: "archive_extract".to_string(),
+        source_artifact_id: Some("src-1".to_string()),
+        source_artifact_name: Some("bundle.zip".to_string()),
+        source_sha256: Some("a".repeat(64)),
+        source_mime_type: Some("application/zip".to_string()),
+        entry_path: Some("docs/readme.txt".to_string()),
+        archive_format: Some("zip".to_string()),
+        extraction_id: Some("extract-1".to_string()),
+        entry_sha256: Some("b".repeat(64)),
+        truncated: false,
+        ..Default::default()
+    };
+    let (artifact, event) = store
+        .create_artifact_file_with_event(
+            &session.id,
+            "daemon",
+            "Archive",
+            None,
+            "readme.txt",
+            "archive-entry",
+            "text/plain",
+            b"hello archive",
+            &format!("{:x}", Sha256::digest(b"hello archive")),
+            Some(&provenance),
+        )
+        .unwrap();
+    assert_eq!(event.kind, "artifact.published");
+    assert_eq!(event.payload["provenance"]["entry_path"], "docs/readme.txt");
+    let loaded = store.get_artifact(&artifact.id).unwrap().unwrap();
+    assert_eq!(loaded.provenance.as_ref(), Some(&provenance));
+    let versions = store.list_artifact_versions(&artifact.id).unwrap();
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].provenance.as_ref(), Some(&provenance));
+    let listed = store.list_artifacts(&session.id).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].provenance.as_ref(), Some(&provenance));
+    let by_project = store.list_artifacts_for_project(&project.id).unwrap();
+    assert_eq!(by_project.len(), 1);
+    assert_eq!(by_project[0].provenance.as_ref(), Some(&provenance));
+
+    // Artifacts without provenance keep decoding as None, including after a
+    // database reopen (the column default is the empty string).
+    let (plain, _) = store
+        .create_artifact_with_event(
+            &session.id,
+            "agent",
+            "Agent",
+            None,
+            "note",
+            "note",
+            "text/plain",
+            "plain",
+            "inline",
+            5,
+            &format!("{:x}", Sha256::digest(b"plain")),
+            None,
+        )
+        .unwrap();
+    assert!(plain.provenance.is_none());
+    drop(store);
+    let reopened = Store::open(_data.path()).unwrap();
+    assert!(
+        reopened
+            .get_artifact(&artifact.id)
+            .unwrap()
+            .unwrap()
+            .provenance
+            .is_some()
+    );
+    assert!(
+        reopened
+            .get_artifact(&plain.id)
+            .unwrap()
+            .unwrap()
+            .provenance
+            .is_none()
+    );
+}
+
+#[test]
 fn inline_artifact_versions_round_trip_and_conflict() {
     let (_data, store, repo) = test_store();
     let project = store

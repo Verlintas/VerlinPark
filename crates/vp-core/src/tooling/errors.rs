@@ -348,6 +348,23 @@ tool_error_codes! {
     UNSUPPORTED_CONTENT => "UNSUPPORTED_CONTENT", false, "file", "Use a tool that supports this content type; do not retry the same decoder.";
     FILE_DECODE_FAILED => "FILE_DECODE_FAILED", false, "file", "Inspect the encoding or use a bounded binary preview; do not retry the same decode.";
 
+    // Artifact archives
+    ARCHIVE_ENCRYPTED => "ARCHIVE_ENCRYPTED", false, "archive", "Password-protected archives are not supported; remove the password outside VerlinPark and publish a plain archive.";
+    ARCHIVE_FORMAT_UNSUPPORTED => "ARCHIVE_FORMAT_UNSUPPORTED", false, "archive", "Use a zip, tar, or tar.gz archive; no other decompressor is invoked.";
+    ARCHIVE_CORRUPT => "ARCHIVE_CORRUPT", false, "archive", "Inspect the archive locally; a malformed central directory or tar header is rejected rather than partially extracted.";
+    ARCHIVE_LIMIT_EXCEEDED => "ARCHIVE_LIMIT_EXCEEDED", false, "archive", "Reduce the archive entry count or size; the configured caps are hard and cannot be raised by a tool argument.";
+    ARCHIVE_UNSAFE_ENTRY => "ARCHIVE_UNSAFE_ENTRY", false, "archive", "Select only entries marked safe; traversal, links, devices, duplicates, and oversized entries are never extracted.";
+    ARCHIVE_ENTRY_NOT_FOUND => "ARCHIVE_ENTRY_NOT_FOUND", false, "archive", "List the archive again and select a normalized path from that result.";
+    ARCHIVE_EMPTY_SELECTION => "ARCHIVE_EMPTY_SELECTION", false, "archive", "Name at least one safe entry or set all=true for every safe regular file.";
+
+    // Media inspection and transcoding
+    MEDIA_TOOL_UNAVAILABLE => "MEDIA_TOOL_UNAVAILABLE", false, "media", "Install ffprobe/ffmpeg or use a still-image metadata fallback; the daemon never fabricates media metadata.";
+    MEDIA_PROBE_FAILED => "MEDIA_PROBE_FAILED", false, "media", "Inspect the local media file; a failed probe is not replaced with guessed metadata.";
+    MEDIA_TRANSCODE_FAILED => "MEDIA_TRANSCODE_FAILED", false, "media", "Read the bounded ffmpeg error summary and correct the source or format; do not retry unchanged.";
+    MEDIA_LIMIT_EXCEEDED => "MEDIA_LIMIT_EXCEEDED", false, "media", "Lower the duration or output size cap, or transcode a shorter excerpt.";
+    MEDIA_FORMAT_UNSUPPORTED => "MEDIA_FORMAT_UNSUPPORTED", false, "media", "Use one of the declared output formats: mp4, webm, mp3, wav, png, or jpeg.";
+    APPROVAL_REQUIRED => "APPROVAL_REQUIRED", false, "general", "Confirm the explicit host operation (for example transcode with approved=true or --yes); the daemon does not run it implicitly.";
+
     // Git
     GIT_NOT_REPOSITORY => "GIT_NOT_REPOSITORY", false, "git", "Run Git tools only inside a repository worktree, or initialize one outside the agent run.";
     GIT_FAILED => "GIT_FAILED", false, "git", "Inspect git status and the exact failing action; do not retry unchanged.";

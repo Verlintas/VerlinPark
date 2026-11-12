@@ -4623,6 +4623,51 @@ pub struct McpCallResult {
     pub result: Value,
 }
 
+/// Explicit derivation metadata for an artifact produced from another
+/// artifact. It is additive: older artifacts decode with `None`, and every new
+/// field is optional so a mixed-version client never fails to decode an
+/// artifact row.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactProvenance {
+    /// `archive_extract` or `media_transcode`. Empty for an unknown producer.
+    #[serde(default)]
+    pub operation: String,
+    #[serde(default)]
+    pub source_artifact_id: Option<String>,
+    #[serde(default)]
+    pub source_artifact_name: Option<String>,
+    #[serde(default)]
+    pub source_sha256: Option<String>,
+    #[serde(default)]
+    pub source_mime_type: Option<String>,
+    /// Normalized archive entry path selected during extraction.
+    #[serde(default)]
+    pub entry_path: Option<String>,
+    /// `zip`, `tar`, or `tar.gz`.
+    #[serde(default)]
+    pub archive_format: Option<String>,
+    /// Extraction operation id; all entries from one extraction share it.
+    #[serde(default)]
+    pub extraction_id: Option<String>,
+    /// SHA-256 of the exact entry bytes before they were stored as an artifact.
+    #[serde(default)]
+    pub entry_sha256: Option<String>,
+    /// Source/input format for a media transcode (for example `mov`).
+    #[serde(default)]
+    pub source_format: Option<String>,
+    /// Requested output format for a media transcode.
+    #[serde(default)]
+    pub output_format: Option<String>,
+    /// Host tool used for an explicit media operation (`ffmpeg`/`ffprobe`).
+    #[serde(default)]
+    pub tool: Option<String>,
+    /// Bounded transcode duration cap in seconds.
+    #[serde(default)]
+    pub max_duration_secs: Option<u64>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Artifact {
     pub id: String,
@@ -4650,6 +4695,10 @@ pub struct Artifact {
     pub data_base64: Option<String>,
     #[serde(default = "default_artifact_version")]
     pub version: u32,
+    /// Derivation metadata for archive entries and transcoded media. `None`
+    /// means the artifact was authored directly (agent publish, tool output).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ArtifactProvenance>,
     pub created_at: String,
 }
 
@@ -4672,6 +4721,8 @@ pub struct ArtifactVersion {
     pub sha256: String,
     #[serde(default)]
     pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ArtifactProvenance>,
     pub created_at: String,
 }
 
@@ -5119,6 +5170,284 @@ pub struct ArtifactGetParams {
 #[derive(Debug, Clone, Serialize)]
 pub struct ArtifactResult {
     pub artifact: Artifact,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ArtifactProvenance>,
+}
+
+// ---------------------------------------------------------------------------
+// Safe artifact archives
+// ---------------------------------------------------------------------------
+
+/// Hard bounds applied to every archive listing and extraction. The values are
+/// explicit in the response so a UI can explain why an entry is marked unsafe
+/// or why an archive was rejected instead of silently truncating it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchiveLimits {
+    #[serde(default = "default_archive_max_entries")]
+    pub max_entries: usize,
+    #[serde(default = "default_archive_max_entry_bytes")]
+    pub max_entry_bytes: u64,
+    #[serde(default = "default_archive_max_total_bytes")]
+    pub max_total_bytes: u64,
+    #[serde(default = "default_archive_max_archive_bytes")]
+    pub max_archive_bytes: u64,
+    #[serde(default = "default_archive_max_compression_ratio")]
+    pub max_compression_ratio: u64,
+}
+
+impl Default for ArchiveLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: default_archive_max_entries(),
+            max_entry_bytes: default_archive_max_entry_bytes(),
+            max_total_bytes: default_archive_max_total_bytes(),
+            max_archive_bytes: default_archive_max_archive_bytes(),
+            max_compression_ratio: default_archive_max_compression_ratio(),
+        }
+    }
+}
+
+fn default_archive_max_entries() -> usize {
+    2_000
+}
+
+fn default_archive_max_entry_bytes() -> u64 {
+    32 * 1024 * 1024
+}
+
+fn default_archive_max_total_bytes() -> u64 {
+    128 * 1024 * 1024
+}
+
+fn default_archive_max_archive_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+fn default_archive_max_compression_ratio() -> u64 {
+    100
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchiveEntry {
+    /// Zero-based position in the archive. It is stable for one listing and
+    /// keeps duplicate-path rows distinguishable in a client list.
+    #[serde(default)]
+    pub index: usize,
+    /// Normalized relative path with `/` separators. Unsafe paths are retained
+    /// for display but can never be selected for extraction.
+    pub path: String,
+    /// `file`, `directory`, `symlink`, `hardlink`, `device`, `fifo`, or `other`.
+    pub kind: String,
+    pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compressed_size: Option<u64>,
+    /// Unix mode from the archive, when present. It is display metadata only;
+    /// the extractor never applies archive modes to the host filesystem.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
+    /// False when path normalization, the entry kind, duplicate detection, a
+    /// size cap, or a compression-ratio cap makes the entry ineligible.
+    pub safe: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsafe_reason: Option<String>,
+    /// True when an earlier normalized entry already used this path.
+    #[serde(default)]
+    pub duplicate: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArtifactArchiveListParams {
+    pub artifact_id: String,
+    #[serde(default)]
+    pub max_entries: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactArchiveListResult {
+    pub artifact_id: String,
+    pub name: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    /// `zip`, `tar`, or `tar.gz`.
+    pub format: String,
+    pub entries: Vec<ArchiveEntry>,
+    /// Total entries found (including entries beyond the list cap).
+    pub entry_count: usize,
+    /// True when `max_entries` cut the returned list. Extraction refuses a
+    /// truncated listing unless only already-listed entries are selected.
+    pub truncated: bool,
+    pub total_uncompressed_bytes: u64,
+    pub total_compressed_bytes: u64,
+    pub limits: ArchiveLimits,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArtifactArchiveExtractParams {
+    pub artifact_id: String,
+    /// Normalized entry paths returned by `artifact.archive.list`. The request
+    /// is rejected when any selected entry is missing or unsafe.
+    #[serde(default)]
+    pub entries: Vec<String>,
+    /// Select every safe regular file instead of naming entries explicitly.
+    #[serde(default)]
+    pub all: bool,
+    /// Reduce the hard entry cap for this request; it can never raise the
+    /// default policy cap.
+    #[serde(default)]
+    pub max_entries: Option<usize>,
+    #[serde(default)]
+    pub include_previews: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExtractedArchiveEntry {
+    pub path: String,
+    pub kind: String,
+    pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// Content-addressed artifact published for this entry, when the bytes fit
+    /// the 5 MiB artifact cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_artifact_id: Option<String>,
+    /// Bounded preview. Text entries carry UTF-8; binary entries carry a hex
+    /// preview. The preview is never the full unbounded file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    #[serde(default)]
+    pub preview_encoding: String,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactArchiveExtractResult {
+    pub artifact_id: String,
+    pub extraction_id: String,
+    pub format: String,
+    pub entries: Vec<ExtractedArchiveEntry>,
+    /// Published content-addressed artifacts, in selection order.
+    pub published_artifacts: Vec<Artifact>,
+    pub total_bytes: u64,
+    /// The daemon-owned scratch directory is removed after publishing; it is
+    /// never exposed as a workspace path or retained indefinitely.
+    pub scratch_retained: bool,
+    pub warnings: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Explicit media inspection and transcoding
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MediaInfoParams {
+    pub artifact_id: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MediaStreamInfo {
+    pub index: u32,
+    #[serde(default)]
+    pub codec_type: String,
+    #[serde(default)]
+    pub codec_name: String,
+    #[serde(default)]
+    pub codec_long_name: Option<String>,
+    #[serde(default)]
+    pub width: Option<u64>,
+    #[serde(default)]
+    pub height: Option<u64>,
+    #[serde(default)]
+    pub duration_secs: Option<f64>,
+    #[serde(default)]
+    pub bit_rate: Option<u64>,
+    #[serde(default)]
+    pub sample_rate: Option<u64>,
+    #[serde(default)]
+    pub channels: Option<u64>,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub frames: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MediaInfo {
+    #[serde(default)]
+    pub container: Option<String>,
+    #[serde(default)]
+    pub format_long_name: Option<String>,
+    #[serde(default)]
+    pub duration_secs: Option<f64>,
+    #[serde(default)]
+    pub bit_rate: Option<u64>,
+    #[serde(default)]
+    pub width: Option<u64>,
+    #[serde(default)]
+    pub height: Option<u64>,
+    #[serde(default)]
+    pub streams: Vec<MediaStreamInfo>,
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
+    /// `ffprobe` when a probe ran, `image-metadata` when still-image metadata
+    /// was inspected as a fallback. Never a fabricated value.
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub tool: Option<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MediaInfoResult {
+    pub artifact_id: String,
+    pub name: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub info: MediaInfo,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MediaTranscodeParams {
+    pub artifact_id: String,
+    /// `mp4`, `webm`, `mp3`, `wav`, `png`, or `jpeg`.
+    pub format: String,
+    /// Requested duration cap. It is clamped to the daemon bound and passed to
+    /// ffmpeg as `-t`; the output is rejected if it exceeds the cap.
+    #[serde(default)]
+    pub max_duration_secs: Option<u64>,
+    /// Requested output byte cap. The daemon applies its own hard cap as well.
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+    /// Explicit confirmation. `false` is rejected with
+    /// `APPROVAL_REQUIRED`; the CLI requires `--yes` and the UI confirms.
+    #[serde(default)]
+    pub approved: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MediaTranscodeResult {
+    pub source_artifact_id: String,
+    pub artifact: Artifact,
+    pub format: String,
+    pub duration_secs: Option<f64>,
+    pub size_bytes: u64,
+    pub elapsed_ms: u64,
+    /// Redacted command identity: the tool path/name and codec choice, never
+    /// the full argv, source path, or environment.
+    pub command_summary: String,
+    pub max_duration_secs: u64,
+    pub max_bytes: u64,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -14640,5 +14969,107 @@ mod forge_protocol_tests {
         assert!(value.get("command").is_none());
         assert!(value.get("credential_source").is_none());
         assert!(value.get("auth_configured").is_some());
+    }
+}
+
+#[cfg(test)]
+mod archive_media_protocol_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn legacy_artifact_json_decodes_without_provenance() {
+        let value = json!({
+            "id": "art-1",
+            "session_id": "s1",
+            "agent_id": "a1",
+            "agent_name": "Agent",
+            "name": "notes.md",
+            "kind": "note",
+            "mime_type": "text/markdown",
+            "content": "hello",
+            "created_at": "2026-11-12T00:00:00Z"
+        });
+        let artifact: Artifact = serde_json::from_value(value).unwrap();
+        assert!(artifact.provenance.is_none());
+        assert_eq!(artifact.storage, "");
+        assert_eq!(artifact.version, 1);
+        let encoded = serde_json::to_value(&artifact).unwrap();
+        assert!(encoded.get("provenance").is_none());
+    }
+
+    #[test]
+    fn archive_requests_are_additive_and_defaulted() {
+        let list: ArtifactArchiveListParams =
+            serde_json::from_value(json!({"artifact_id": "art-1"})).unwrap();
+        assert!(list.max_entries.is_none());
+
+        let extract: ArtifactArchiveExtractParams =
+            serde_json::from_value(json!({"artifact_id": "art-1"})).unwrap();
+        assert!(extract.entries.is_empty());
+        assert!(!extract.all);
+        assert!(extract.max_entries.is_none());
+        assert!(extract.include_previews.is_none());
+
+        let transcode: MediaTranscodeParams =
+            serde_json::from_value(json!({"artifact_id": "art-1", "format": "mp4"})).unwrap();
+        assert!(!transcode.approved);
+        assert!(transcode.max_duration_secs.is_none());
+        assert!(transcode.max_bytes.is_none());
+    }
+
+    #[test]
+    fn archive_limits_and_provenance_round_trip() {
+        let limits = ArchiveLimits::default();
+        let encoded = serde_json::to_value(&limits).unwrap();
+        assert_eq!(encoded["max_entries"], 2000);
+        assert_eq!(encoded["max_archive_bytes"], 67_108_864);
+        let decoded: ArchiveLimits = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, limits);
+
+        let provenance = ArtifactProvenance {
+            operation: "archive_extract".to_string(),
+            source_artifact_id: Some("art-1".to_string()),
+            entry_path: Some("docs/a.txt".to_string()),
+            archive_format: Some("zip".to_string()),
+            extraction_id: Some("extract-1".to_string()),
+            ..Default::default()
+        };
+        let artifact = Artifact {
+            id: "art-2".to_string(),
+            session_id: "s1".to_string(),
+            agent_id: "daemon".to_string(),
+            agent_name: "Archive".to_string(),
+            task_id: None,
+            name: "a.txt".to_string(),
+            kind: "archive-entry".to_string(),
+            mime_type: "text/plain".to_string(),
+            content: String::new(),
+            storage: "file".to_string(),
+            compression: "zstd".to_string(),
+            size_bytes: 4,
+            sha256: "a".repeat(64),
+            path: None,
+            data_base64: None,
+            version: 1,
+            provenance: Some(provenance.clone()),
+            created_at: "2026-11-12T00:00:00Z".to_string(),
+        };
+        let decoded: Artifact =
+            serde_json::from_value(serde_json::to_value(&artifact).unwrap()).unwrap();
+        assert_eq!(decoded.provenance, Some(provenance));
+    }
+
+    #[test]
+    fn media_info_defaults_streams_tags_and_warnings() {
+        let value = json!({
+            "container": "mp4",
+            "source": "ffprobe"
+        });
+        let info: MediaInfo = serde_json::from_value(value).unwrap();
+        assert!(info.streams.is_empty());
+        assert!(info.tags.is_empty());
+        assert!(info.warnings.is_empty());
+        assert_eq!(info.source, "ffprobe");
     }
 }

@@ -6990,6 +6990,55 @@ final class AppModel {
         }
     }
 
+    func artifactArchiveList(
+        artifactID: String,
+        maxEntries: Int? = nil
+    ) async throws -> ArtifactArchiveListResult {
+        try await core.artifactArchiveList(
+            artifactID: artifactID,
+            maxEntries: maxEntries
+        )
+    }
+
+    func artifactArchiveExtract(
+        artifactID: String,
+        entries: [String],
+        all: Bool,
+        maxEntries: Int? = nil,
+        includePreviews: Bool = true
+    ) async throws -> ArtifactArchiveExtractResult {
+        let result = try await core.artifactArchiveExtract(
+            artifactID: artifactID,
+            entries: entries,
+            all: all,
+            maxEntries: maxEntries,
+            includePreviews: includePreviews
+        )
+        await loadMailbox()
+        return result
+    }
+
+    func mediaInfo(artifactID: String) async throws -> MediaInfoResult {
+        try await core.mediaInfo(artifactID: artifactID)
+    }
+
+    func mediaTranscode(
+        artifactID: String,
+        format: String,
+        maxDurationSecs: Int,
+        maxBytes: Int? = nil
+    ) async throws -> MediaTranscodeResult {
+        let result = try await core.mediaTranscode(
+            artifactID: artifactID,
+            format: format,
+            maxDurationSecs: maxDurationSecs,
+            maxBytes: maxBytes,
+            approved: true
+        )
+        await loadMailbox()
+        return result
+    }
+
     func artifactPreviewData(_ artifact: Artifact) async -> ArtifactPreviewData {
         // File-backed artifacts are read from the daemon path only; their
         // `content` field is intentionally empty and is not a fallback source.

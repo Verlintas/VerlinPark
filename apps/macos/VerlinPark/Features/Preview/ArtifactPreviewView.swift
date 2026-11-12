@@ -230,10 +230,38 @@ struct ArtifactRow: View {
                 )
             case .pdf, .video, .audio:
                 mediaSummary(preview)
-            case .archive, .other:
+            case .archive:
+                archiveSummary(preview)
+            case .other:
                 unsupportedSummary(preview)
             }
         }
+    }
+
+    private func archiveSummary(_: ArtifactPreviewData) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "archivebox")
+                .font(.system(size: 13))
+                .foregroundStyle(VPTheme.textSecondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(L10n.t("Browse archive"))
+                    .font(VPTheme.font(10, weight: .medium))
+                    .foregroundStyle(VPTheme.textPrimary)
+                Text(L10n.t("List entries, inspect safe flags, and extract selected files into artifacts."))
+                    .font(VPTheme.mono(7))
+                    .foregroundStyle(VPTheme.textTertiary)
+                    .lineLimit(2)
+            }
+            Spacer()
+            Button(L10n.t("Browse")) {
+                showingPreview = true
+            }
+            .buttonStyle(.plain)
+            .font(VPTheme.mono(8))
+            .foregroundStyle(VPTheme.accent)
+        }
+        .padding(7)
+        .background(.white.opacity(0.025), in: RoundedRectangle(cornerRadius: 8))
     }
 
     private func mediaSummary(_ preview: ArtifactPreviewData) -> some View {
@@ -605,13 +633,20 @@ struct ArtifactPreviewSheet: View {
                                     .font(VPTheme.mono(8))
                                     .foregroundStyle(VPTheme.textTertiary)
                             }
+                            ArtifactMediaInfoCard(artifact: artifact)
+                                .environment(model)
                         }
                         .padding(14)
                     }
                 case .pdf:
                     localContent(preview)
                 case .video, .audio:
-                    localContent(preview)
+                    VStack(spacing: 8) {
+                        localContent(preview)
+                        ArtifactMediaInfoCard(artifact: artifact)
+                            .environment(model)
+                    }
+                    .padding(14)
                 case .text:
                     textContent(preview)
                 case .binary:
@@ -622,7 +657,10 @@ struct ArtifactPreviewSheet: View {
                         compact: false
                     )
                     .padding(14)
-                case .archive, .other:
+                case .archive:
+                    ArchiveBrowserView(artifact: artifact)
+                        .environment(model)
+                case .other:
                     unsupportedContent(preview)
                 }
             }
@@ -705,10 +743,7 @@ struct ArtifactPreviewSheet: View {
                 .foregroundStyle(VPTheme.textSecondary)
             Text(
                 preview.kind == .archive
-                    ? L10n
-                    .t(
-                        "Archive extraction is not available in this build. Use Quick Look, Open, or Save As to inspect it."
-                    )
+                    ? L10n.t("Archive browser unavailable.")
                     : L10n.t("This artifact type has no inline preview. Use Quick Look, Open, or Save As.")
             )
             .font(VPTheme.mono(9))

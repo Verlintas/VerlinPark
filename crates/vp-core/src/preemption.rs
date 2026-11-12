@@ -213,6 +213,8 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "read_image",
     "data_query",
     "read_document",
+    "archive_list",
+    "media_info",
 ];
 
 /// Whether a preempted tool may have produced an external or workspace side

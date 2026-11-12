@@ -11803,6 +11803,10 @@ fn tool_role_matrix_matches_the_tooling_roadmap() {
     assert!(AgentRole::Manager.allows_tool(AgentProfile::Coding, "read_pdf"));
     assert!(AgentRole::Manager.allows_tool(AgentProfile::Coding, "read_image"));
     assert!(AgentRole::Manager.allows_tool(AgentProfile::Coding, "read_document"));
+    assert!(AgentRole::Manager.allows_tool(AgentProfile::Coding, "archive_list"));
+    assert!(AgentRole::Manager.allows_tool(AgentProfile::Coding, "media_info"));
+    assert!(!AgentRole::Manager.allows_tool(AgentProfile::Coding, "archive_extract"));
+    assert!(!AgentRole::Manager.allows_tool(AgentProfile::Coding, "media_transcode"));
     assert!(AgentRole::Manager.allows_tool(AgentProfile::Coding, "data_query"));
     assert!(AgentRole::Manager.allows_tool(AgentProfile::Research, "web_search"));
     assert!(!AgentRole::Manager.allows_tool(AgentProfile::Coding, "web_search"));
@@ -11822,6 +11826,17 @@ fn tool_role_matrix_matches_the_tooling_roadmap() {
     assert!(AgentRole::Worker.allows_tool(AgentProfile::Coding, "browser"));
     assert!(AgentRole::Worker.allows_tool(AgentProfile::Coding, "computer"));
     assert!(AgentRole::Labour.allows_tool(AgentProfile::Coding, "computer"));
+    assert!(AgentRole::Worker.allows_tool(AgentProfile::Coding, "archive_extract"));
+    assert!(AgentRole::Worker.allows_tool(AgentProfile::Coding, "media_transcode"));
+    assert!(AgentRole::Worker.allows_tool(AgentProfile::Research, "archive_extract"));
+    assert!(AgentRole::Worker.allows_tool(AgentProfile::Research, "media_transcode"));
+    assert!(AgentRole::Scout.allows_tool(AgentProfile::Coding, "archive_list"));
+    assert!(AgentRole::Scout.allows_tool(AgentProfile::Coding, "media_info"));
+    assert!(!AgentRole::Scout.allows_tool(AgentProfile::Coding, "archive_extract"));
+    assert!(!AgentRole::Scout.allows_tool(AgentProfile::Coding, "media_transcode"));
+    assert!(AgentRole::Verifier.allows_tool(AgentProfile::Verification, "archive_list"));
+    assert!(AgentRole::Verifier.allows_tool(AgentProfile::Verification, "media_info"));
+    assert!(!AgentRole::Verifier.allows_tool(AgentProfile::Verification, "archive_extract"));
     assert!(!AgentRole::Worker.allows_tool(AgentProfile::Research, "browser"));
     assert!(!AgentRole::Worker.allows_tool(AgentProfile::Research, "computer"));
     assert!(!AgentRole::Worker.allows_tool(AgentProfile::Research, "apply_patch"));
@@ -12014,12 +12029,12 @@ fn tool_help_is_read_only_role_filtered_and_bounded() {
 
     let catalog = run_tool_help(
         &worker,
-        &json!({"include_error_codes": true, "max_chars": 4000}),
+        &json!({"include_error_codes": true, "max_chars": 8000}),
     );
     assert!(!catalog.is_error);
     assert!(catalog.content.contains("[file]"));
     assert!(catalog.content.contains("PATCH_CONFLICT"));
-    assert!(catalog.content.chars().count() <= 4000);
+    assert!(catalog.content.chars().count() <= 8000);
 
     // The catalog is guidance, not a schema mutation: the advertised bundle is
     // byte-identical before and after a help call for every role.

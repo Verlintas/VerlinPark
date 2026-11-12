@@ -2444,6 +2444,42 @@ enum Command {
     MailboxGc { project: String },
     /// Read an artifact by id.
     Artifact { artifact: String },
+    /// List entries in a zip/tar/tar.gz artifact with safe flags and caps.
+    ArtifactArchiveList {
+        artifact: String,
+        #[arg(long)]
+        max_entries: Option<usize>,
+    },
+    /// Extract selected safe archive entries into daemon scratch and publish artifacts.
+    ArtifactArchiveExtract {
+        artifact: String,
+        /// Normalized entry path (repeatable).
+        #[arg(long = "entry")]
+        entries: Vec<String>,
+        /// Select every safe regular file.
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        max_entries: Option<usize>,
+        /// Omit bounded text/hex previews.
+        #[arg(long)]
+        no_previews: bool,
+    },
+    /// Probe a media artifact with ffprobe (or still-image metadata fallback).
+    MediaInfo { artifact: String },
+    /// Explicitly transcode a media artifact into a bounded artifact. Requires --yes.
+    MediaTranscode {
+        artifact: String,
+        /// One of mp4, webm, mp3, wav, png, jpeg.
+        format: String,
+        #[arg(long, default_value_t = 60)]
+        max_duration_secs: u64,
+        #[arg(long)]
+        max_bytes: Option<u64>,
+        /// Explicit confirmation of the host ffmpeg operation.
+        #[arg(long)]
+        yes: bool,
+    },
     /// List saved versions of an inline artifact.
     ArtifactVersions { artifact: String },
     /// Restore an inline artifact version as a new version.
@@ -6686,6 +6722,68 @@ async fn run(cli: Cli) -> Result<()> {
                 value
             }
         }
+        Command::ArtifactArchiveList {
+            artifact,
+            max_entries,
+        } => {
+            rpc(
+                &discovery,
+                "artifact.archive.list",
+                json!({"artifact_id": artifact, "max_entries": max_entries}),
+            )
+            .await?
+        }
+        Command::ArtifactArchiveExtract {
+            artifact,
+            entries,
+            all,
+            max_entries,
+            no_previews,
+        } => {
+            if !all && entries.is_empty() {
+                bail!("artifact-archive-extract requires at least one --entry or --all");
+            }
+            rpc(
+                &discovery,
+                "artifact.archive.extract",
+                json!({
+                    "artifact_id": artifact,
+                    "entries": entries,
+                    "all": all,
+                    "max_entries": max_entries,
+                    "include_previews": !no_previews,
+                }),
+            )
+            .await?
+        }
+        Command::MediaInfo { artifact } => {
+            rpc(&discovery, "media.info", json!({"artifact_id": artifact})).await?
+        }
+        Command::MediaTranscode {
+            artifact,
+            format,
+            max_duration_secs,
+            max_bytes,
+            yes,
+        } => {
+            if !yes {
+                bail!(
+                    "media-transcode is an explicit host operation; pass --yes after reviewing the source and bounds"
+                );
+            }
+            rpc(
+                &discovery,
+                "media.transcode",
+                json!({
+                    "artifact_id": artifact,
+                    "format": format,
+                    "max_duration_secs": max_duration_secs,
+                    "max_bytes": max_bytes,
+                    "approved": true,
+                }),
+            )
+            .await?
+        }
         Command::BackfillArtifacts { session } => {
             rpc(
                 &discovery,
@@ -7913,9 +8011,27 @@ async fn rpc(discovery: &Discovery, method: &str, params: Value) -> Result<Value
     }
     let response: RpcResponse = serde_json::from_str(&text)?;
     if let Some(error) = response.error {
-        bail!("{} (code {})", error.message, error.code);
+        bail!("{}", format_rpc_error(&error));
     }
     Ok(response.result.unwrap_or(Value::Null))
+}
+
+/// Render an RPC failure for the terminal. The stable Q3 code and hint are
+/// append-only additions to the human message; they are never inferred from
+/// the message text.
+fn format_rpc_error(error: &vp_protocol::rpc::RpcError) -> String {
+    let mut message = format!("{} (code {})", error.message, error.code);
+    if let Some(data) = &error.data {
+        if let Some(code) = data.get("code").and_then(Value::as_str) {
+            message.push_str(&format!(" [{code}]"));
+        }
+        if let Some(hint) = data.get("hint").and_then(Value::as_str)
+            && !hint.trim().is_empty()
+        {
+            message.push_str(&format!("\nhint: {hint}"));
+        }
+    }
+    message
 }
 
 fn load_keyring_optional(directory: Option<&Path>) -> Result<Option<Keyring>> {
@@ -10116,6 +10232,166 @@ fn pull_request_lines(value: &Value) -> Option<Vec<String>> {
     )])
 }
 
+fn archive_list_lines(value: &Value) -> Option<Vec<String>> {
+    let entries = value.get("entries")?.as_array()?;
+    if value.get("format").and_then(Value::as_str).is_none()
+        || value.get("entry_count").and_then(Value::as_u64).is_none()
+    {
+        return None;
+    }
+    let mut lines = vec![format!(
+        "{} · {} · {} entries · {} bytes uncompressed{}",
+        value["name"].as_str().unwrap_or("archive"),
+        value["format"].as_str().unwrap_or("?"),
+        value["entry_count"].as_u64().unwrap_or(0),
+        value["total_uncompressed_bytes"].as_u64().unwrap_or(0),
+        if value["truncated"].as_bool().unwrap_or(false) {
+            " · truncated at cap"
+        } else {
+            ""
+        }
+    )];
+    for entry in entries.iter().take(200) {
+        let safe = entry["safe"].as_bool().unwrap_or(false);
+        lines.push(format!(
+            "{}  {:<60}  {:>10} bytes{}",
+            if safe { "safe  " } else { "UNSAFE" },
+            entry["path"].as_str().unwrap_or("?"),
+            entry["size_bytes"].as_u64().unwrap_or(0),
+            entry["unsafe_reason"]
+                .as_str()
+                .map(|reason| format!(" · {reason}"))
+                .unwrap_or_default()
+        ));
+    }
+    if entries.len() > 200 {
+        lines.push(format!("… {} more entries omitted", entries.len() - 200));
+    }
+    for warning in value["warnings"].as_array().into_iter().flatten() {
+        if let Some(warning) = warning.as_str() {
+            lines.push(format!("warning: {warning}"));
+        }
+    }
+    Some(lines)
+}
+
+fn archive_extract_lines(value: &Value) -> Option<Vec<String>> {
+    let entries = value.get("entries")?.as_array()?;
+    value.get("extraction_id")?.as_str()?;
+    let artifacts = value["published_artifacts"].as_array().map_or(0, Vec::len);
+    let mut lines = vec![format!(
+        "extracted {} entries ({} bytes) from {} · {} artifact(s) · scratch retained: {}",
+        entries.len(),
+        value["total_bytes"].as_u64().unwrap_or(0),
+        value["format"].as_str().unwrap_or("?"),
+        artifacts,
+        value["scratch_retained"].as_bool().unwrap_or(false)
+    )];
+    for entry in entries.iter().take(200) {
+        lines.push(format!(
+            "{}  {} bytes{}",
+            entry["path"].as_str().unwrap_or("?"),
+            entry["size_bytes"].as_u64().unwrap_or(0),
+            entry["published_artifact_id"]
+                .as_str()
+                .map(|id| format!(" · artifact {id}"))
+                .or_else(|| {
+                    entry["skipped_reason"]
+                        .as_str()
+                        .map(|reason| format!(" · skipped: {reason}"))
+                })
+                .unwrap_or_default()
+        ));
+        if let Some(preview) = entry["preview"].as_str() {
+            let preview = preview
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(120)
+                .collect::<String>();
+            lines.push(format!("    preview: {preview}"));
+        }
+    }
+    Some(lines)
+}
+
+fn media_info_lines(value: &Value) -> Option<Vec<String>> {
+    let info = value.get("info")?;
+    let source = info.get("source")?.as_str()?;
+    let mut lines = vec![format!(
+        "{} · {} · {} · source {}",
+        value["name"].as_str().unwrap_or("media"),
+        info["container"].as_str().unwrap_or("unknown container"),
+        value["size_bytes"].as_u64().unwrap_or(0),
+        source
+    )];
+    if let Some(duration) = info["duration_secs"].as_f64() {
+        lines.push(format!("duration: {duration:.2}s"));
+    }
+    if let (Some(width), Some(height)) = (info["width"].as_u64(), info["height"].as_u64()) {
+        lines.push(format!("dimensions: {width}x{height}"));
+    }
+    for stream in info["streams"].as_array().into_iter().flatten() {
+        lines.push(format!(
+            "stream {}: {} {}{}{}",
+            stream["index"].as_u64().unwrap_or(0),
+            stream["codec_type"].as_str().unwrap_or("?"),
+            stream["codec_name"].as_str().unwrap_or("?"),
+            stream["width"]
+                .as_u64()
+                .zip(stream["height"].as_u64())
+                .map(|(width, height)| format!(" {width}x{height}"))
+                .unwrap_or_default(),
+            stream["duration_secs"]
+                .as_f64()
+                .map(|duration| format!(" {duration:.2}s"))
+                .unwrap_or_default()
+        ));
+    }
+    for warning in info["warnings"].as_array().into_iter().flatten() {
+        if let Some(warning) = warning.as_str() {
+            lines.push(format!("warning: {warning}"));
+        }
+    }
+    Some(lines)
+}
+
+fn media_transcode_lines(value: &Value) -> Option<Vec<String>> {
+    let artifact = value.get("artifact")?;
+    value.get("source_artifact_id")?.as_str()?;
+    value.get("command_summary")?.as_str()?;
+    let mut lines = vec![format!(
+        "transcoded {} -> {} ({}) · artifact {} · {} bytes · {} ms",
+        value["source_artifact_id"].as_str().unwrap_or("?"),
+        value["format"].as_str().unwrap_or("?"),
+        artifact["mime_type"].as_str().unwrap_or("?"),
+        artifact["id"].as_str().unwrap_or("?"),
+        value["size_bytes"].as_u64().unwrap_or(0),
+        value["elapsed_ms"].as_u64().unwrap_or(0)
+    )];
+    lines.push(format!(
+        "bounds: max {}s · max {} bytes · command {}",
+        value["max_duration_secs"].as_u64().unwrap_or(0),
+        value["max_bytes"].as_u64().unwrap_or(0),
+        value["command_summary"].as_str().unwrap_or("?")
+    ));
+    if let Some(provenance) = artifact.get("provenance") {
+        lines.push(format!(
+            "provenance: {} · source {} · output {}",
+            provenance["operation"].as_str().unwrap_or("?"),
+            provenance["source_artifact_id"].as_str().unwrap_or("?"),
+            provenance["output_format"].as_str().unwrap_or("?")
+        ));
+    }
+    for warning in value["warnings"].as_array().into_iter().flatten() {
+        if let Some(warning) = warning.as_str() {
+            lines.push(format!("warning: {warning}"));
+        }
+    }
+    Some(lines)
+}
+
 fn print_human(value: &Value) {
     if let Some(lines) = forge_preflight_lines(value) {
         for line in lines {
@@ -10130,6 +10406,21 @@ fn print_human(value: &Value) {
         return;
     }
     if let Some(lines) = pull_request_lines(value) {
+        for line in lines {
+            println!("{line}");
+        }
+        return;
+    }
+    if let Some(lines) = [
+        archive_list_lines(value),
+        archive_extract_lines(value),
+        media_info_lines(value),
+        media_transcode_lines(value),
+    ]
+    .into_iter()
+    .flatten()
+    .next()
+    {
         for line in lines {
             println!("{line}");
         }
@@ -16031,6 +16322,207 @@ mod governor_fairness_cli_tests {
         assert!(!lines.contains("Path table"));
         assert!(!lines.contains("Fairness:"));
         assert!(lines.contains("Admit: a"));
+    }
+
+    #[test]
+    fn rpc_error_renderer_includes_typed_code_and_hint() {
+        let error = vp_protocol::rpc::RpcError::with_data(
+            -32602,
+            "archive entry is not safe to extract",
+            json!({
+                "code": "ARCHIVE_UNSAFE_ENTRY",
+                "retryable": false,
+                "hint": "Select only entries marked safe."
+            }),
+        );
+        let rendered = format_rpc_error(&error);
+        assert!(rendered.contains("archive entry is not safe to extract (code -32602)"));
+        assert!(rendered.contains("[ARCHIVE_UNSAFE_ENTRY]"));
+        assert!(rendered.contains("hint: Select only entries marked safe."));
+        let legacy = vp_protocol::rpc::RpcError::new(-32603, "internal");
+        assert_eq!(format_rpc_error(&legacy), "internal (code -32603)");
+    }
+
+    #[test]
+    fn archive_and_media_commands_parse() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "artifact-archive-list",
+                    "art-1",
+                    "--max-entries",
+                    "25",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::ArtifactArchiveList {
+                        artifact,
+                        max_entries,
+                    } => {
+                        assert_eq!(artifact, "art-1");
+                        assert_eq!(max_entries, Some(25));
+                    }
+                    other => panic!("expected archive list, got {other:?}"),
+                }
+
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "artifact-archive-extract",
+                    "art-1",
+                    "--entry",
+                    "docs/a.txt",
+                    "--entry",
+                    "docs/b.txt",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::ArtifactArchiveExtract { entries, all, .. } => {
+                        assert_eq!(entries, vec!["docs/a.txt", "docs/b.txt"]);
+                        assert!(!all);
+                    }
+                    other => panic!("expected archive extract, got {other:?}"),
+                }
+
+                let cli = Cli::try_parse_from([
+                    "vp",
+                    "media-transcode",
+                    "art-1",
+                    "mp4",
+                    "--max-duration-secs",
+                    "30",
+                    "--yes",
+                ])
+                .unwrap();
+                match cli.command {
+                    Command::MediaTranscode {
+                        format,
+                        max_duration_secs,
+                        yes,
+                        ..
+                    } => {
+                        assert_eq!(format, "mp4");
+                        assert_eq!(max_duration_secs, 30);
+                        assert!(yes);
+                    }
+                    other => panic!("expected media transcode, got {other:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn archive_list_renderer_marks_unsafe_entries_and_warnings() {
+        let value = json!({
+            "name": "bundle.zip",
+            "format": "zip",
+            "entry_count": 3,
+            "total_uncompressed_bytes": 128,
+            "truncated": true,
+            "entries": [
+                {"path": "a.txt", "size_bytes": 10, "safe": true},
+                {"path": "../escape", "size_bytes": 0, "safe": false, "unsafe_reason": "path_traversal"}
+            ],
+            "warnings": ["entry_count_truncated"]
+        });
+        let lines = archive_list_lines(&value).unwrap().join("\n");
+        assert!(lines.contains("bundle.zip · zip · 3 entries"));
+        assert!(lines.contains("truncated at cap"));
+        assert!(lines.contains("safe  "));
+        assert!(lines.contains("UNSAFE"));
+        assert!(lines.contains("path_traversal"));
+        assert!(lines.contains("warning: entry_count_truncated"));
+    }
+
+    #[test]
+    fn archive_extract_renderer_shows_published_artifacts_and_previews() {
+        let value = json!({
+            "extraction_id": "ext-1",
+            "format": "zip",
+            "total_bytes": 4,
+            "scratch_retained": false,
+            "entries": [
+                {
+                    "path": "dir/b.txt",
+                    "size_bytes": 4,
+                    "published_artifact_id": "art-2",
+                    "preview": "beta\nsecond line"
+                },
+                {
+                    "path": "big.bin",
+                    "size_bytes": 9999999,
+                    "skipped_reason": "exceeds_artifact_cap"
+                }
+            ],
+            "published_artifacts": [{"id": "art-2"}]
+        });
+        let lines = archive_extract_lines(&value).unwrap().join("\n");
+        assert!(lines.contains("extracted 2 entries (4 bytes) from zip · 1 artifact(s)"));
+        assert!(lines.contains("scratch retained: false"));
+        assert!(lines.contains("artifact art-2"));
+        assert!(lines.contains("preview: beta"));
+        assert!(lines.contains("exceeds_artifact_cap"));
+    }
+
+    #[test]
+    fn media_renderers_show_probe_source_streams_and_bounds() {
+        let info = json!({
+            "name": "clip.mp4",
+            "size_bytes": 4096,
+            "info": {
+                "source": "ffprobe",
+                "container": "mp4",
+                "duration_secs": 12.5,
+                "width": 640,
+                "height": 360,
+                "streams": [
+                    {
+                        "index": 0,
+                        "codec_type": "video",
+                        "codec_name": "h264",
+                        "width": 640,
+                        "height": 360,
+                        "duration_secs": 12.5
+                    }
+                ],
+                "warnings": ["probe warning"]
+            }
+        });
+        let lines = media_info_lines(&info).unwrap().join("\n");
+        assert!(lines.contains("clip.mp4 · mp4 · 4096 · source ffprobe"));
+        assert!(lines.contains("duration: 12.50s"));
+        assert!(lines.contains("dimensions: 640x360"));
+        assert!(lines.contains("stream 0: video h264 640x360 12.50s"));
+        assert!(lines.contains("warning: probe warning"));
+
+        let transcode = json!({
+            "source_artifact_id": "art-1",
+            "format": "mp4",
+            "size_bytes": 2048,
+            "elapsed_ms": 120,
+            "max_duration_secs": 30,
+            "max_bytes": 5242880,
+            "command_summary": "ffmpeg · mp4 · max 30s",
+            "warnings": ["capped"],
+            "artifact": {
+                "id": "art-2",
+                "mime_type": "video/mp4",
+                "provenance": {
+                    "operation": "media_transcode",
+                    "source_artifact_id": "art-1",
+                    "output_format": "mp4"
+                }
+            }
+        });
+        let lines = media_transcode_lines(&transcode).unwrap().join("\n");
+        assert!(lines.contains("transcoded art-1 -> mp4"));
+        assert!(lines.contains("artifact art-2"));
+        assert!(lines.contains("bounds: max 30s"));
+        assert!(lines.contains("provenance: media_transcode"));
+        assert!(lines.contains("warning: capped"));
     }
 }
 
