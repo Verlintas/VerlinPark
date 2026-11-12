@@ -12062,6 +12062,8 @@ fn context_checkpoint_bundle_validation_checks_session_and_project() {
         instructions: Vec::new(),
         prompt_prefix_observations: Vec::new(),
         effects: Vec::new(),
+        agent_identities: Vec::new(),
+        agent_identity_events: Vec::new(),
     };
     validate_session_bundle(&bundle).unwrap();
     bundle.context_checkpoints[0].project_id = "other-project".into();
@@ -12323,6 +12325,8 @@ fn importing_a_projection_only_bundle_synthesizes_checkpoint_events() {
         instructions: Vec::new(),
         prompt_prefix_observations: Vec::new(),
         effects: Vec::new(),
+        agent_identities: Vec::new(),
+        agent_identity_events: Vec::new(),
     };
     let imported = Store::open(data.path().join("imported")).unwrap();
     imported.import_session_bundle(&bundle).unwrap();
@@ -14185,6 +14189,8 @@ fn bundle_import_preserves_supervised_process_lifecycle_rows() {
             created_at: now_rfc3339(),
             resolved_at: Some(now_rfc3339()),
         }],
+        agent_identities: Vec::new(),
+        agent_identity_events: Vec::new(),
     };
     validate_session_bundle(&bundle).unwrap();
     let data = TempDir::new().unwrap();
@@ -14257,6 +14263,8 @@ fn supervised_process_bundle_validation_rejects_wrong_session() {
         instructions: Vec::new(),
         prompt_prefix_observations: Vec::new(),
         effects: Vec::new(),
+        agent_identities: Vec::new(),
+        agent_identity_events: Vec::new(),
     };
     let error = validate_session_bundle(&bundle).unwrap_err();
     assert!(error.to_string().contains("belongs to session"), "{error}");
@@ -16484,6 +16492,8 @@ fn bundle_import_preserves_instruction_state_and_rejects_missing_blobs() {
         }],
         prompt_prefix_observations: Vec::new(),
         effects: Vec::new(),
+        agent_identities: Vec::new(),
+        agent_identity_events: Vec::new(),
     };
     store.import_session_bundle(&bundle).unwrap();
     assert_eq!(
@@ -16555,6 +16565,8 @@ fn bundle_import_rejects_a_corrupt_instruction_blob() {
         instructions: Vec::new(),
         prompt_prefix_observations: Vec::new(),
         effects: Vec::new(),
+        agent_identities: Vec::new(),
+        agent_identity_events: Vec::new(),
     };
     assert!(store.import_session_bundle(&bundle).is_err());
 }
@@ -17700,4 +17712,795 @@ fn scaling_decision_replay_inputs_round_trip() {
     let rows = store.list_scaling_decisions(&session.id, 10).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].replay_inputs, decision.replay_inputs);
+}
+
+mod agent_identity_tests {
+    use super::*;
+    use vp_protocol::types::{
+        AgentIdentityError, AgentIdentityPolicy, CreateAgentIdentityParams,
+        RetireAgentIdentityParams, UpdateAgentIdentityParams, agent_identity_codes,
+    };
+
+    fn create_params(
+        project_id: &str,
+        role: &str,
+        parent: Option<&str>,
+    ) -> CreateAgentIdentityParams {
+        CreateAgentIdentityParams {
+            project_id: project_id.to_string(),
+            role: role.to_string(),
+            department: Some("engineering".to_string()),
+            component: Some("runtime".to_string()),
+            title: Some(format!("{role} title")),
+            profile: Some("coding".to_string()),
+            model: Some("test-model".to_string()),
+            parent_identity_id: parent.map(str::to_string),
+            policy: Some(serde_json::json!({"note": "bounded metadata"})),
+        }
+    }
+
+    fn code(error: &anyhow::Error) -> &'static str {
+        error
+            .downcast_ref::<AgentIdentityError>()
+            .map(|typed| typed.code)
+            .unwrap_or("UNTYPED")
+    }
+
+    #[test]
+    fn lifecycle_generation_and_terminal_retirement() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("identity"))
+            .unwrap();
+        let (leader, created_event) = store
+            .create_agent_identity(&create_params(&project.id, "leader", None))
+            .unwrap();
+        assert_eq!(leader.status, "active");
+        assert_eq!(leader.generation, 1);
+        assert_eq!(leader.origin, "local");
+        assert!(!leader.created_at.is_empty());
+        assert_eq!(created_event.kind, "agent.identity.created");
+        assert_eq!(created_event.seq, 1);
+        assert_eq!(created_event.payload["identity"]["id"], leader.id);
+
+        let (manager, _) = store
+            .create_agent_identity(&create_params(&project.id, "manager", Some(&leader.id)))
+            .unwrap();
+        let update = UpdateAgentIdentityParams {
+            identity_id: manager.id.clone(),
+            department: Some(Some("platform".to_string())),
+            ..UpdateAgentIdentityParams::default()
+        };
+        let (updated, event) = store.update_agent_identity(&update).unwrap().unwrap();
+        assert_eq!(updated.id, manager.id);
+        assert_eq!(updated.department.as_deref(), Some("platform"));
+        assert_eq!(updated.generation, 2);
+        assert_eq!(event.kind, "agent.identity.updated");
+        assert_eq!(
+            event.payload["changed_fields"],
+            serde_json::json!(["department"])
+        );
+        assert_eq!(event.payload["previous_generation"], 1);
+        assert_eq!(event.payload["generation"], 2);
+
+        // Several generation-affecting fields in one request increment once.
+        let update = UpdateAgentIdentityParams {
+            identity_id: manager.id.clone(),
+            title: Some(Some("Lead".to_string())),
+            profile: Some(Some("generic".to_string())),
+            model: Some(Some("other-model".to_string())),
+            ..UpdateAgentIdentityParams::default()
+        };
+        let (updated, _) = store.update_agent_identity(&update).unwrap().unwrap();
+        assert_eq!(updated.generation, 3);
+
+        // Non-generation metadata updates do not increment it.
+        let update = UpdateAgentIdentityParams {
+            identity_id: manager.id.clone(),
+            policy: Some(serde_json::json!({"note": "changed"})),
+            ..UpdateAgentIdentityParams::default()
+        };
+        let (updated, _) = store.update_agent_identity(&update).unwrap().unwrap();
+        assert_eq!(updated.generation, 3);
+
+        // A no-op update appends no event.
+        let update = UpdateAgentIdentityParams {
+            identity_id: manager.id.clone(),
+            department: Some(Some("platform".to_string())),
+            ..UpdateAgentIdentityParams::default()
+        };
+        assert!(store.update_agent_identity(&update).unwrap().is_none());
+
+        let (paused, event) = store.pause_agent_identity(&manager.id).unwrap().unwrap();
+        assert_eq!(paused.status, "paused");
+        assert_eq!(paused.generation, 3);
+        assert_eq!(event.kind, "agent.identity.paused");
+        assert!(store.pause_agent_identity(&manager.id).unwrap().is_none());
+        let (resumed, event) = store.resume_agent_identity(&manager.id).unwrap().unwrap();
+        assert_eq!(resumed.status, "active");
+        assert_eq!(event.kind, "agent.identity.resumed");
+
+        let (retired, event) = store
+            .retire_agent_identity(&RetireAgentIdentityParams {
+                identity_id: manager.id.clone(),
+                successor_id: Some(leader.id.clone()),
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(retired.status, "retired");
+        assert!(retired.retired_at.is_some());
+        assert_eq!(retired.generation, 3);
+        assert_eq!(event.kind, "agent.identity.retired");
+
+        let error = store.resume_agent_identity(&manager.id).unwrap_err();
+        assert_eq!(code(&error), agent_identity_codes::IDENTITY_RETIRED);
+        let error = store
+            .update_agent_identity(&UpdateAgentIdentityParams {
+                identity_id: manager.id.clone(),
+                role: Some("worker".to_string()),
+                ..UpdateAgentIdentityParams::default()
+            })
+            .unwrap_err();
+        assert_eq!(code(&error), agent_identity_codes::IDENTITY_RETIRED);
+        // Retirement is idempotent when the successor does not change.
+        assert!(
+            store
+                .retire_agent_identity(&RetireAgentIdentityParams {
+                    identity_id: manager.id.clone(),
+                    successor_id: Some(leader.id.clone()),
+                })
+                .unwrap()
+                .is_none()
+        );
+
+        let events = store.list_agent_identity_events(&manager.id, None).unwrap();
+        let kinds = events
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                "agent.identity.created",
+                "agent.identity.updated",
+                "agent.identity.updated",
+                "agent.identity.updated",
+                "agent.identity.paused",
+                "agent.identity.resumed",
+                "agent.identity.retired",
+            ]
+        );
+    }
+
+    #[test]
+    fn role_parent_and_successor_are_project_scoped() {
+        let (_data, store, repo) = test_store();
+        let project_a = store
+            .add_project(repo.path().to_str().unwrap(), Some("a"))
+            .unwrap();
+        let repo_b = TempDir::new().unwrap();
+        let project_b = store
+            .add_project(repo_b.path().to_str().unwrap(), Some("b"))
+            .unwrap();
+        let (leader_a, _) = store
+            .create_agent_identity(&create_params(&project_a.id, "leader", None))
+            .unwrap();
+        let (leader_b, _) = store
+            .create_agent_identity(&create_params(&project_b.id, "leader", None))
+            .unwrap();
+
+        let error = store
+            .create_agent_identity(&create_params(&project_a.id, "manager", Some(&leader_b.id)))
+            .unwrap_err();
+        assert_eq!(
+            code(&error),
+            agent_identity_codes::IDENTITY_PROJECT_MISMATCH
+        );
+        let error = store
+            .create_agent_identity(&create_params(&project_a.id, "worker", Some(&leader_a.id)))
+            .unwrap_err();
+        assert_eq!(code(&error), agent_identity_codes::IDENTITY_INVALID);
+        let error = store
+            .create_agent_identity(&create_params(&project_a.id, "labour", None))
+            .unwrap_err();
+        assert_eq!(code(&error), agent_identity_codes::IDENTITY_ROLE_INVALID);
+        let error = store
+            .create_agent_identity(&create_params(&project_a.id, "verifier", None))
+            .unwrap_err();
+        assert_eq!(code(&error), agent_identity_codes::IDENTITY_ROLE_INVALID);
+        let error = store
+            .create_agent_identity(&create_params(&project_a.id, "scout", None))
+            .unwrap_err();
+        assert_eq!(code(&error), agent_identity_codes::IDENTITY_ROLE_INVALID);
+
+        let (manager_a, _) = store
+            .create_agent_identity(&create_params(&project_a.id, "manager", Some(&leader_a.id)))
+            .unwrap();
+        let error = store
+            .update_agent_identity(&UpdateAgentIdentityParams {
+                identity_id: manager_a.id.clone(),
+                successor_id: Some(Some(leader_b.id.clone())),
+                ..UpdateAgentIdentityParams::default()
+            })
+            .unwrap_err();
+        assert_eq!(
+            code(&error),
+            agent_identity_codes::IDENTITY_PROJECT_MISMATCH
+        );
+        let error = store
+            .update_agent_identity(&UpdateAgentIdentityParams {
+                identity_id: manager_a.id.clone(),
+                parent_identity_id: Some(Some(leader_b.id.clone())),
+                ..UpdateAgentIdentityParams::default()
+            })
+            .unwrap_err();
+        assert_eq!(
+            code(&error),
+            agent_identity_codes::IDENTITY_PROJECT_MISMATCH
+        );
+
+        // One live Leader per project; retirement releases the slot.
+        let error = store
+            .create_agent_identity(&create_params(&project_a.id, "leader", None))
+            .unwrap_err();
+        assert_eq!(code(&error), agent_identity_codes::IDENTITY_CONFLICT);
+        store
+            .retire_agent_identity(&RetireAgentIdentityParams {
+                identity_id: leader_a.id.clone(),
+                successor_id: Some(manager_a.id.clone()),
+            })
+            .unwrap();
+        let (next_leader, _) = store
+            .create_agent_identity(&create_params(&project_a.id, "leader", None))
+            .unwrap();
+        assert_eq!(next_leader.role, "leader");
+        assert_eq!(leader_b.role, "leader");
+    }
+
+    #[test]
+    fn policy_caps_are_validated_and_project_scoped() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("caps"))
+            .unwrap();
+        let default_policy = store.get_agent_identity_policy(&project.id).unwrap();
+        assert!(!default_policy.enabled);
+        assert_eq!(default_policy.max_managers, 4);
+        assert_eq!(default_policy.max_workers, 10);
+        assert!(default_policy.hire_requires_approval);
+        assert!(default_policy.retirement_requires_approval);
+
+        let invalid = AgentIdentityPolicy {
+            max_managers: 6,
+            ..AgentIdentityPolicy::default()
+        };
+        let error = store
+            .set_agent_identity_policy(&project.id, &invalid)
+            .unwrap_err();
+        assert_eq!(code(&error), agent_identity_codes::IDENTITY_POLICY_INVALID);
+        let invalid = AgentIdentityPolicy {
+            max_workers: 11,
+            ..AgentIdentityPolicy::default()
+        };
+        let error = store
+            .set_agent_identity_policy(&project.id, &invalid)
+            .unwrap_err();
+        assert_eq!(code(&error), agent_identity_codes::IDENTITY_POLICY_INVALID);
+
+        store
+            .set_agent_identity_policy(
+                &project.id,
+                &AgentIdentityPolicy {
+                    enabled: true,
+                    max_managers: 1,
+                    max_workers: 1,
+                    hire_requires_approval: true,
+                    retirement_requires_approval: true,
+                },
+            )
+            .unwrap();
+        let policy = store.get_agent_identity_policy(&project.id).unwrap();
+        assert!(policy.enabled);
+        assert_eq!(policy.max_managers, 1);
+
+        let (leader, _) = store
+            .create_agent_identity(&create_params(&project.id, "leader", None))
+            .unwrap();
+        let (manager, _) = store
+            .create_agent_identity(&create_params(&project.id, "manager", Some(&leader.id)))
+            .unwrap();
+        let error = store
+            .create_agent_identity(&create_params(&project.id, "manager", Some(&leader.id)))
+            .unwrap_err();
+        assert_eq!(code(&error), agent_identity_codes::IDENTITY_CAP_EXCEEDED);
+        let (worker, _) = store
+            .create_agent_identity(&create_params(&project.id, "worker", Some(&manager.id)))
+            .unwrap();
+        let error = store
+            .create_agent_identity(&create_params(&project.id, "worker", Some(&manager.id)))
+            .unwrap_err();
+        assert_eq!(code(&error), agent_identity_codes::IDENTITY_CAP_EXCEEDED);
+
+        // Retiring a non-leader removes it from the live count.
+        store
+            .retire_agent_identity(&RetireAgentIdentityParams {
+                identity_id: worker.id.clone(),
+                successor_id: None,
+            })
+            .unwrap();
+        store
+            .create_agent_identity(&create_params(&project.id, "worker", Some(&manager.id)))
+            .unwrap();
+
+        // Project isolation of the policy row.
+        let data_b = TempDir::new().unwrap();
+        let repo_b = TempDir::new().unwrap();
+        let store_b = Store::open(data_b.path()).unwrap();
+        let project_b = store_b
+            .add_project(repo_b.path().to_str().unwrap(), Some("caps-b"))
+            .unwrap();
+        assert!(
+            !store_b
+                .get_agent_identity_policy(&project_b.id)
+                .unwrap()
+                .enabled
+        );
+    }
+
+    #[test]
+    fn projection_replace_updates_rows_without_appending_events() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("replay"))
+            .unwrap();
+        let (leader, _) = store
+            .create_agent_identity(&create_params(&project.id, "leader", None))
+            .unwrap();
+        let events_before = store
+            .list_agent_identity_events_for_project(&project.id, None)
+            .unwrap()
+            .len();
+        let mut repaired = leader.clone();
+        repaired.status = "paused".to_string();
+        repaired.generation = 9;
+        store
+            .replace_agent_identity_projection(&project.id, &[repaired.clone()])
+            .unwrap();
+        let loaded = store.get_agent_identity(&leader.id).unwrap().unwrap();
+        assert_eq!(loaded.status, "paused");
+        assert_eq!(loaded.generation, 9);
+        let events_after = store
+            .list_agent_identity_events_for_project(&project.id, None)
+            .unwrap()
+            .len();
+        assert_eq!(events_before, events_after);
+        let mut wrong_project = leader.clone();
+        wrong_project.project_id = "another-project".to_string();
+        let error = store
+            .replace_agent_identity_projection(&project.id, &[wrong_project])
+            .unwrap_err();
+        assert_eq!(
+            code(&error),
+            agent_identity_codes::IDENTITY_PROJECT_MISMATCH
+        );
+    }
+
+    #[test]
+    fn imported_identities_are_read_only() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("imported"))
+            .unwrap();
+        let (identity, _) = store
+            .create_agent_identity(&create_params(&project.id, "leader", None))
+            .unwrap();
+        let mut imported = identity.clone();
+        imported.origin = "imported".to_string();
+        store.insert_agent_identity_snapshot(&imported).unwrap();
+        let error = store.pause_agent_identity(&identity.id).unwrap_err();
+        assert_eq!(
+            code(&error),
+            agent_identity_codes::IDENTITY_IMPORTED_READONLY
+        );
+        let error = store
+            .retire_agent_identity(&RetireAgentIdentityParams {
+                identity_id: identity.id.clone(),
+                successor_id: None,
+            })
+            .unwrap_err();
+        assert_eq!(
+            code(&error),
+            agent_identity_codes::IDENTITY_IMPORTED_READONLY
+        );
+    }
+
+    #[test]
+    fn existing_agents_remain_run_records_with_null_identity() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("legacy"))
+            .unwrap();
+        let session = store.create_session(&project.id, "session").unwrap();
+        let (agent, event) = store
+            .create_leader_agent_with_snapshot(&session.id, "test-model")
+            .unwrap();
+        assert!(agent.identity_id.is_none());
+        assert!(event.payload["identity_id"].is_null());
+        let agents = store.list_agents(&session.id).unwrap();
+        assert_eq!(agents.len(), 1);
+        assert!(agents[0].identity_id.is_none());
+
+        // No S2–S6 tables or behavior were introduced.
+        for table in [
+            "session_agent_assignments",
+            "agent_inbox",
+            "agent_memories",
+            "project_agent_policy",
+        ] {
+            let exists: bool = store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    params![table],
+                    |_| Ok(true),
+                )
+                .optional()
+                .unwrap()
+                .unwrap_or(false);
+            assert!(!exists, "{table} must not exist in S1");
+        }
+        assert!(store.get_agent_identity(&agent.id).unwrap().is_none());
+        assert!(
+            store
+                .list_agent_identities(&project.id, None, None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn update_revalidates_hierarchy_and_bounds_metadata() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("hierarchy"))
+            .unwrap();
+        let (leader, _) = store
+            .create_agent_identity(&create_params(&project.id, "leader", None))
+            .unwrap();
+        let (manager, _) = store
+            .create_agent_identity(&create_params(&project.id, "manager", Some(&leader.id)))
+            .unwrap();
+        let (worker, _) = store
+            .create_agent_identity(&create_params(&project.id, "worker", Some(&manager.id)))
+            .unwrap();
+
+        // A Manager cannot become a Worker while keeping a Leader parent.
+        let error = store
+            .update_agent_identity(&UpdateAgentIdentityParams {
+                identity_id: manager.id.clone(),
+                role: Some("worker".to_string()),
+                ..UpdateAgentIdentityParams::default()
+            })
+            .unwrap_err();
+        assert_eq!(code(&error), agent_identity_codes::IDENTITY_INVALID);
+
+        // Clearing the parent in the same request is valid and increments once.
+        let (changed, event) = store
+            .update_agent_identity(&UpdateAgentIdentityParams {
+                identity_id: manager.id.clone(),
+                role: Some("worker".to_string()),
+                parent_identity_id: Some(None),
+                ..UpdateAgentIdentityParams::default()
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(changed.role, "worker");
+        assert!(changed.parent_identity_id.is_none());
+        assert_eq!(changed.generation, 2);
+        assert_eq!(
+            event.payload["changed_fields"],
+            serde_json::json!(["role", "parent_identity_id"])
+        );
+
+        // A Leader cannot acquire a parent.
+        let error = store
+            .update_agent_identity(&UpdateAgentIdentityParams {
+                identity_id: leader.id.clone(),
+                parent_identity_id: Some(Some(manager.id.clone())),
+                ..UpdateAgentIdentityParams::default()
+            })
+            .unwrap_err();
+        assert_eq!(code(&error), agent_identity_codes::IDENTITY_CONFLICT);
+
+        // Control characters, overlarge policy objects, and non-objects fail.
+        let error = store
+            .update_agent_identity(&UpdateAgentIdentityParams {
+                identity_id: worker.id.clone(),
+                title: Some(Some("bad\u{0007}title".to_string())),
+                ..UpdateAgentIdentityParams::default()
+            })
+            .unwrap_err();
+        assert_eq!(code(&error), agent_identity_codes::IDENTITY_INVALID);
+        let error = store
+            .update_agent_identity(&UpdateAgentIdentityParams {
+                identity_id: worker.id.clone(),
+                policy: Some(serde_json::json!({"note": "x".repeat(9_000)})),
+                ..UpdateAgentIdentityParams::default()
+            })
+            .unwrap_err();
+        assert_eq!(code(&error), agent_identity_codes::IDENTITY_INVALID);
+        let error = store
+            .update_agent_identity(&UpdateAgentIdentityParams {
+                identity_id: worker.id.clone(),
+                policy: Some(serde_json::json!("not-an-object")),
+                ..UpdateAgentIdentityParams::default()
+            })
+            .unwrap_err();
+        assert_eq!(code(&error), agent_identity_codes::IDENTITY_INVALID);
+        let error = store
+            .update_agent_identity(&UpdateAgentIdentityParams {
+                identity_id: worker.id.clone(),
+                profile: Some(Some("unknown-profile".to_string())),
+                ..UpdateAgentIdentityParams::default()
+            })
+            .unwrap_err();
+        assert_eq!(code(&error), agent_identity_codes::IDENTITY_INVALID);
+        assert_eq!(
+            store
+                .list_agent_identities(&project.id, None, Some("unknown"))
+                .unwrap_err()
+                .downcast_ref::<AgentIdentityError>()
+                .map(|typed| typed.code),
+            Some(agent_identity_codes::IDENTITY_INVALID)
+        );
+    }
+
+    #[test]
+    fn disabled_policy_allows_explicit_preprovisioning_and_event_sequences_stay_per_identity() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("preprovision"))
+            .unwrap();
+        let policy = store.get_agent_identity_policy(&project.id).unwrap();
+        assert!(!policy.enabled);
+        let (leader, created) = store
+            .create_agent_identity(&create_params(&project.id, "leader", None))
+            .unwrap();
+        let (manager, _) = store
+            .create_agent_identity(&create_params(&project.id, "manager", Some(&leader.id)))
+            .unwrap();
+        store.pause_agent_identity(&manager.id).unwrap();
+        store.resume_agent_identity(&manager.id).unwrap();
+        store
+            .update_agent_identity(&UpdateAgentIdentityParams {
+                identity_id: leader.id.clone(),
+                title: Some(Some("Project Lead".to_string())),
+                ..UpdateAgentIdentityParams::default()
+            })
+            .unwrap();
+        assert_eq!(created.seq, 1);
+        let leader_events = store.list_agent_identity_events(&leader.id, None).unwrap();
+        assert_eq!(
+            leader_events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let manager_events = store.list_agent_identity_events(&manager.id, None).unwrap();
+        assert_eq!(
+            manager_events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            manager_events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "agent.identity.created",
+                "agent.identity.paused",
+                "agent.identity.resumed",
+            ]
+        );
+        // The disabled policy still constrains explicit pre-provisioning caps.
+        store
+            .set_agent_identity_policy(
+                &project.id,
+                &AgentIdentityPolicy {
+                    enabled: false,
+                    max_managers: 1,
+                    max_workers: 0,
+                    ..AgentIdentityPolicy::default()
+                },
+            )
+            .unwrap();
+        let error = store
+            .create_agent_identity(&create_params(&project.id, "worker", Some(&manager.id)))
+            .unwrap_err();
+        assert_eq!(code(&error), agent_identity_codes::IDENTITY_CAP_EXCEEDED);
+    }
+
+    #[test]
+    fn retired_successor_bookkeeping_and_policy_survive_a_reopen() {
+        let (data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("retired-bookkeeping"))
+            .unwrap();
+        let (leader, _) = store
+            .create_agent_identity(&create_params(&project.id, "leader", None))
+            .unwrap();
+        let (manager, _) = store
+            .create_agent_identity(&create_params(&project.id, "manager", Some(&leader.id)))
+            .unwrap();
+        let (worker, _) = store
+            .create_agent_identity(&create_params(&project.id, "worker", Some(&manager.id)))
+            .unwrap();
+        store
+            .retire_agent_identity(&RetireAgentIdentityParams {
+                identity_id: manager.id.clone(),
+                successor_id: Some(leader.id.clone()),
+            })
+            .unwrap();
+        let (changed, event) = store
+            .update_agent_identity(&UpdateAgentIdentityParams {
+                identity_id: manager.id.clone(),
+                successor_id: Some(Some(worker.id.clone())),
+                ..UpdateAgentIdentityParams::default()
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(changed.successor_id.as_deref(), Some(worker.id.as_str()));
+        assert_eq!(changed.generation, 1);
+        assert_eq!(event.kind, "agent.identity.updated");
+        assert_eq!(
+            event.payload["changed_fields"],
+            serde_json::json!(["successor_id"])
+        );
+        let error = store
+            .update_agent_identity(&UpdateAgentIdentityParams {
+                identity_id: manager.id.clone(),
+                title: Some(Some("renamed".to_string())),
+                ..UpdateAgentIdentityParams::default()
+            })
+            .unwrap_err();
+        assert_eq!(code(&error), agent_identity_codes::IDENTITY_RETIRED);
+        assert!(
+            store
+                .update_agent_identity(&UpdateAgentIdentityParams {
+                    identity_id: manager.id.clone(),
+                    successor_id: Some(Some(worker.id.clone())),
+                    ..UpdateAgentIdentityParams::default()
+                })
+                .unwrap()
+                .is_none()
+        );
+
+        store
+            .set_agent_identity_policy(
+                &project.id,
+                &AgentIdentityPolicy {
+                    enabled: true,
+                    max_managers: 3,
+                    max_workers: 7,
+                    hire_requires_approval: false,
+                    retirement_requires_approval: true,
+                },
+            )
+            .unwrap();
+        drop(store);
+        let reopened = Store::open(data.path()).unwrap();
+        let policy = reopened.get_agent_identity_policy(&project.id).unwrap();
+        assert!(policy.enabled);
+        assert_eq!(policy.max_managers, 3);
+        assert_eq!(policy.max_workers, 7);
+        assert!(!policy.hire_requires_approval);
+        assert!(policy.retirement_requires_approval);
+        let rows = reopened
+            .list_agent_identities(&project.id, Some("manager"), Some("retired"))
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].successor_id.as_deref(), Some(worker.id.as_str()));
+    }
+}
+
+mod agent_identity_view_tests {
+    use super::*;
+    use vp_protocol::types::CreateAgentIdentityParams;
+
+    fn create_params(
+        project_id: &str,
+        role: &str,
+        parent: Option<&str>,
+    ) -> CreateAgentIdentityParams {
+        CreateAgentIdentityParams {
+            project_id: project_id.to_string(),
+            role: role.to_string(),
+            parent_identity_id: parent.map(str::to_string),
+            ..CreateAgentIdentityParams::default()
+        }
+    }
+
+    #[test]
+    fn agent_runs_view_exposes_the_run_projection_with_identity_link() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("runs-view"))
+            .unwrap();
+        let session = store.create_session(&project.id, "run view").unwrap();
+        let (agent, _) = store
+            .create_leader_agent_with_snapshot(&session.id, "test-model")
+            .unwrap();
+        let conn = store.lock().unwrap();
+        let (id, identity_id, role, status, started_at, ended_at): (
+            String,
+            Option<String>,
+            String,
+            String,
+            String,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT id, identity_id, role, status, started_at, ended_at
+             FROM agent_runs WHERE id = ?1",
+                params![agent.id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(id, agent.id);
+        assert!(identity_id.is_none());
+        assert_eq!(role, "leader");
+        assert_eq!(status, "running");
+        assert!(!started_at.is_empty());
+        assert!(ended_at.is_none());
+    }
+
+    #[test]
+    fn deleting_a_project_cascades_identity_rows_and_events() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("cascade"))
+            .unwrap();
+        let (leader, _) = store
+            .create_agent_identity(&create_params(&project.id, "leader", None))
+            .unwrap();
+        assert!(
+            store
+                .list_agent_identities(&project.id, None, None)
+                .unwrap()
+                .len()
+                == 1
+        );
+        assert!(
+            !store
+                .list_agent_identity_events_for_project(&project.id, None)
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM projects WHERE id = ?1", params![project.id])
+            .unwrap();
+        assert!(store.get_agent_identity(&leader.id).unwrap().is_none());
+        assert!(
+            store
+                .list_agent_identity_events_for_project(&project.id, None)
+                .unwrap()
+                .is_empty()
+        );
+    }
 }

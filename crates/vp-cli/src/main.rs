@@ -2455,6 +2455,109 @@ enum Command {
         #[arg(long)]
         max_commits: Option<u64>,
     },
+    /// List project-scoped agent identities (Leader, Managers, Workers). A
+    /// legacy session id still lists that session's run-scoped agents.
+    Agents {
+        /// Project id, or a session id when `--session` is used.
+        project: String,
+        /// Force the legacy session run-roster view.
+        #[arg(long)]
+        session: Option<String>,
+        /// Exact role filter: leader, manager, or worker.
+        #[arg(long)]
+        role: Option<String>,
+        /// Exact status filter: active, idle, paused, or retired.
+        #[arg(long)]
+        status: Option<String>,
+    },
+    /// Create one explicit project identity. No session is created or assigned.
+    AgentCreate {
+        project: String,
+        #[arg(long)]
+        role: String,
+        #[arg(long)]
+        department: Option<String>,
+        #[arg(long)]
+        component: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        /// coding, research, verification, or generic.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Explicit model reference. It never routes a provider call by itself.
+        #[arg(long)]
+        model: Option<String>,
+        /// Parent identity id (Manager→Leader, Worker→Manager, same project).
+        #[arg(long)]
+        parent: Option<String>,
+        /// Bounded non-secret metadata as a JSON object. Defaults to `{}`.
+        #[arg(long = "policy-json")]
+        policy: Option<String>,
+    },
+    /// Update an identity. Omitted fields keep their current value.
+    AgentUpdate {
+        identity: String,
+        #[arg(long)]
+        role: Option<String>,
+        #[arg(long)]
+        department: Option<String>,
+        #[arg(long = "clear-department")]
+        clear_department: bool,
+        #[arg(long)]
+        component: Option<String>,
+        #[arg(long = "clear-component")]
+        clear_component: bool,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long = "clear-title")]
+        clear_title: bool,
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long = "clear-profile")]
+        clear_profile: bool,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long = "clear-model")]
+        clear_model: bool,
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long = "clear-parent")]
+        clear_parent: bool,
+        #[arg(long)]
+        successor: Option<String>,
+        #[arg(long = "clear-successor")]
+        clear_successor: bool,
+        /// Bounded non-secret metadata as a JSON object. `{}` clears it.
+        #[arg(long = "policy-json")]
+        policy: Option<String>,
+    },
+    /// Pause an active identity. Pausing an already paused identity is a no-op.
+    AgentPause { identity: String },
+    /// Resume a paused identity.
+    AgentResume { identity: String },
+    /// Retire an identity. Retirement is terminal and never deletes evidence.
+    AgentRetire {
+        identity: String,
+        /// Optional same-project, same-role successor.
+        #[arg(long)]
+        successor: Option<String>,
+    },
+    /// Show the project agent-identity policy.
+    AgentPolicy { project: String },
+    /// Set the project agent-identity policy. Omitted flags keep their value.
+    AgentPolicySet {
+        project: String,
+        #[arg(long)]
+        enabled: Option<bool>,
+        #[arg(long = "max-managers")]
+        max_managers: Option<u32>,
+        #[arg(long = "max-workers")]
+        max_workers: Option<u32>,
+        #[arg(long = "hire-requires-approval")]
+        hire_requires_approval: Option<bool>,
+        #[arg(long = "retirement-requires-approval")]
+        retirement_requires_approval: Option<bool>,
+    },
     /// Show local effect receipts for a session. `done`/`failed` rows are
     /// settled evidence; `intent`/`unknown` rows block merge until reconciled.
     Effects {
@@ -2687,8 +2790,6 @@ enum Command {
         #[arg(long)]
         message: Option<String>,
     },
-    /// List the agents spawned for a session.
-    Agents { session: String },
     /// List typed agent messages.
     Mailbox {
         session: String,
@@ -7901,6 +8002,193 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await?
         }
+        Command::Agents {
+            project,
+            session,
+            role,
+            status,
+        } => {
+            if let Some(session) = session {
+                rpc(&discovery, "agent.list", json!({"session_id": session})).await?
+            } else {
+                let projects = rpc(&discovery, "project.list", json!({})).await?;
+                let is_project = projects["projects"].as_array().is_some_and(|rows| {
+                    rows.iter().any(|row| row["id"].as_str() == Some(&project))
+                });
+                if is_project {
+                    rpc(
+                        &discovery,
+                        "agent.identities.list",
+                        json!({"project_id": project, "role": role, "status": status}),
+                    )
+                    .await?
+                } else {
+                    // Backward-compatible `vp agents <session>` behavior.
+                    rpc(&discovery, "agent.list", json!({"session_id": project})).await?
+                }
+            }
+        }
+        Command::AgentCreate {
+            project,
+            role,
+            department,
+            component,
+            title,
+            profile,
+            model,
+            parent,
+            policy,
+        } => {
+            let policy = parse_agent_identity_policy_json(policy.as_deref())?;
+            rpc(
+                &discovery,
+                "agent.identity.create",
+                json!({
+                    "project_id": project,
+                    "role": role,
+                    "department": department,
+                    "component": component,
+                    "title": title,
+                    "profile": profile,
+                    "model": model,
+                    "parent_identity_id": parent,
+                    "policy": policy,
+                }),
+            )
+            .await?
+        }
+        Command::AgentUpdate {
+            identity,
+            role,
+            department,
+            clear_department,
+            component,
+            clear_component,
+            title,
+            clear_title,
+            profile,
+            clear_profile,
+            model,
+            clear_model,
+            parent,
+            clear_parent,
+            successor,
+            clear_successor,
+            policy,
+        } => {
+            if clear_department && department.is_some() {
+                bail!("pass only one of --department or --clear-department");
+            }
+            if clear_component && component.is_some() {
+                bail!("pass only one of --component or --clear-component");
+            }
+            if clear_title && title.is_some() {
+                bail!("pass only one of --title or --clear-title");
+            }
+            if clear_profile && profile.is_some() {
+                bail!("pass only one of --profile or --clear-profile");
+            }
+            if clear_model && model.is_some() {
+                bail!("pass only one of --model or --clear-model");
+            }
+            if clear_parent && parent.is_some() {
+                bail!("pass only one of --parent or --clear-parent");
+            }
+            if clear_successor && successor.is_some() {
+                bail!("pass only one of --successor or --clear-successor");
+            }
+            let mut params = serde_json::Map::new();
+            params.insert("identity_id".into(), json!(identity));
+            if let Some(role) = role {
+                params.insert("role".into(), json!(role));
+            }
+            insert_agent_identity_optional(&mut params, "department", department, clear_department);
+            insert_agent_identity_optional(&mut params, "component", component, clear_component);
+            insert_agent_identity_optional(&mut params, "title", title, clear_title);
+            insert_agent_identity_optional(&mut params, "profile", profile, clear_profile);
+            insert_agent_identity_optional(&mut params, "model", model, clear_model);
+            insert_agent_identity_optional(&mut params, "parent_identity_id", parent, clear_parent);
+            insert_agent_identity_optional(&mut params, "successor_id", successor, clear_successor);
+            if let Some(policy) = policy {
+                params.insert(
+                    "policy".into(),
+                    parse_agent_identity_policy_json(Some(&policy))?.unwrap_or_else(|| json!({})),
+                );
+            }
+            rpc(&discovery, "agent.identity.update", Value::Object(params)).await?
+        }
+        Command::AgentPause { identity } => {
+            rpc(
+                &discovery,
+                "agent.identity.pause",
+                json!({"identity_id": identity}),
+            )
+            .await?
+        }
+        Command::AgentResume { identity } => {
+            rpc(
+                &discovery,
+                "agent.identity.resume",
+                json!({"identity_id": identity}),
+            )
+            .await?
+        }
+        Command::AgentRetire {
+            identity,
+            successor,
+        } => {
+            rpc(
+                &discovery,
+                "agent.identity.retire",
+                json!({"identity_id": identity, "successor_id": successor}),
+            )
+            .await?
+        }
+        Command::AgentPolicy { project } => {
+            rpc(
+                &discovery,
+                "project.agent_identity_policy.get",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::AgentPolicySet {
+            project,
+            enabled,
+            max_managers,
+            max_workers,
+            hire_requires_approval,
+            retirement_requires_approval,
+        } => {
+            let current = rpc(
+                &discovery,
+                "project.agent_identity_policy.get",
+                json!({"project_id": project}),
+            )
+            .await?;
+            let mut policy = current.get("policy").cloned().unwrap_or_else(|| json!({}));
+            if let Some(enabled) = enabled {
+                policy["enabled"] = json!(enabled);
+            }
+            if let Some(max_managers) = max_managers {
+                policy["max_managers"] = json!(max_managers);
+            }
+            if let Some(max_workers) = max_workers {
+                policy["max_workers"] = json!(max_workers);
+            }
+            if let Some(hire_requires_approval) = hire_requires_approval {
+                policy["hire_requires_approval"] = json!(hire_requires_approval);
+            }
+            if let Some(retirement_requires_approval) = retirement_requires_approval {
+                policy["retirement_requires_approval"] = json!(retirement_requires_approval);
+            }
+            rpc(
+                &discovery,
+                "project.agent_identity_policy.set",
+                json!({"project_id": project, "policy": policy}),
+            )
+            .await?
+        }
         Command::Effects {
             session,
             task,
@@ -8349,9 +8637,6 @@ async fn run(cli: Cli) -> Result<()> {
                 }),
             )
             .await?
-        }
-        Command::Agents { session } => {
-            rpc(&discovery, "agent.list", json!({"session_id": session})).await?
         }
         Command::Mailbox {
             session,
@@ -9752,6 +10037,31 @@ async fn rpc(discovery: &Discovery, method: &str, params: Value) -> Result<Value
 /// Render an RPC failure for the terminal. The stable Q3 code and hint are
 /// append-only additions to the human message; they are never inferred from
 /// the message text.
+fn parse_agent_identity_policy_json(value: Option<&str>) -> Result<Option<Value>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let parsed: Value = serde_json::from_str(value)
+        .context("--policy-json must be a JSON object, for example '{}'")?;
+    if !parsed.is_object() {
+        bail!("--policy-json must be a JSON object, for example '{{}}'");
+    }
+    Ok(Some(parsed))
+}
+
+fn insert_agent_identity_optional(
+    params: &mut serde_json::Map<String, Value>,
+    key: &str,
+    value: Option<String>,
+    clear: bool,
+) {
+    if clear {
+        params.insert(key.to_string(), Value::Null);
+    } else if let Some(value) = value {
+        params.insert(key.to_string(), json!(value));
+    }
+}
+
 fn format_rpc_error(error: &vp_protocol::rpc::RpcError) -> String {
     let mut message = format!("{} (code {})", error.message, error.code);
     if let Some(data) = &error.data {
@@ -13188,7 +13498,96 @@ fn gate_lines(value: &Value) -> Option<Vec<String>> {
     None
 }
 
+fn agent_identity_lines(value: &Value) -> Option<Vec<String>> {
+    if let Some(identities) = value.get("identities").and_then(Value::as_array)
+        && identities
+            .iter()
+            .all(|identity| identity.get("project_id").is_some())
+    {
+        if identities.is_empty() {
+            return Some(vec!["No project identities.".to_string()]);
+        }
+        let mut lines = Vec::with_capacity(identities.len() + 1);
+        lines.push(format!("{} project identities", identities.len()));
+        for identity in identities {
+            let id = identity["id"].as_str().unwrap_or("?");
+            let role = identity["role"].as_str().unwrap_or("?");
+            let status = identity["status"].as_str().unwrap_or("?");
+            let generation = identity["generation"].as_u64().unwrap_or(0);
+            let mut detail = vec![format!("{id}  {role:<7}  {status:<7}  gen {generation}")];
+            if let Some(component) = identity["component"].as_str() {
+                detail.push(format!("component {component}"));
+            }
+            if let Some(department) = identity["department"].as_str() {
+                detail.push(format!("department {department}"));
+            }
+            if let Some(title) = identity["title"].as_str() {
+                detail.push(format!("title {title}"));
+            }
+            if let Some(parent) = identity["parent_identity_id"].as_str() {
+                detail.push(format!("parent {parent}"));
+            }
+            if let Some(successor) = identity["successor_id"].as_str() {
+                detail.push(format!("successor {successor}"));
+            }
+            if identity["origin"].as_str() == Some("imported") {
+                detail.push("imported/read-only".to_string());
+            }
+            lines.push(detail.join(" · "));
+        }
+        return Some(lines);
+    }
+    if let Some(identity) = value
+        .get("identity")
+        .filter(|identity| identity.get("project_id").is_some())
+    {
+        let changed = if value["changed"].as_bool().unwrap_or(false) {
+            " (changed)"
+        } else {
+            " (unchanged)"
+        };
+        let mut lines = vec![format!(
+            "{}  {}{}",
+            identity["id"].as_str().unwrap_or("?"),
+            identity["status"].as_str().unwrap_or("?"),
+            changed
+        )];
+        lines.push(
+            agent_identity_lines(&json!({"identities": [identity]}))
+                .and_then(|lines| lines.into_iter().nth(1))
+                .unwrap_or_default(),
+        );
+        return Some(lines);
+    }
+    if let Some(policy) = value
+        .get("policy")
+        .filter(|policy| policy.get("max_managers").is_some())
+    {
+        return Some(vec![format!(
+            "identities {} · managers ≤ {} · workers ≤ {} · hire approval {} · retirement approval {}",
+            if policy["enabled"].as_bool().unwrap_or(false) {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            policy["max_managers"].as_u64().unwrap_or(0),
+            policy["max_workers"].as_u64().unwrap_or(0),
+            policy["hire_requires_approval"].as_bool().unwrap_or(true),
+            policy["retirement_requires_approval"]
+                .as_bool()
+                .unwrap_or(true),
+        )]);
+    }
+    None
+}
+
 fn print_human(value: &Value) {
+    if let Some(lines) = agent_identity_lines(value) {
+        for line in lines {
+            println!("{line}");
+        }
+        return;
+    }
     if let Some(lines) = runtime_pin_lines(value) {
         for line in lines {
             println!("{line}");
@@ -22192,5 +22591,232 @@ mod gate_cli_tests {
         assert!(rendered.contains("MISMATCHED"));
         assert!(rendered.contains("controller-equivalent only"));
         assert!(!rendered.contains("verified"));
+    }
+}
+
+#[cfg(test)]
+mod agent_identity_cli_tests {
+    use super::*;
+
+    #[test]
+    fn agents_parses_project_role_status_and_legacy_session_override() {
+        let cli = Cli::try_parse_from([
+            "vp", "agents", "prj-1", "--role", "worker", "--status", "active",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Agents {
+                project,
+                session,
+                role,
+                status,
+            } => {
+                assert_eq!(project, "prj-1");
+                assert!(session.is_none());
+                assert_eq!(role.as_deref(), Some("worker"));
+                assert_eq!(status.as_deref(), Some("active"));
+            }
+            other => panic!("expected agents, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["vp", "agents", "ses-1", "--session", "ses-1"]).unwrap();
+        match cli.command {
+            Command::Agents { session, .. } => assert_eq!(session.as_deref(), Some("ses-1")),
+            other => panic!("expected agents, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_update_and_retire_commands_parse() {
+        let cli = Cli::try_parse_from([
+            "vp",
+            "agent-create",
+            "prj-1",
+            "--role",
+            "manager",
+            "--department",
+            "platform",
+            "--profile",
+            "generic",
+            "--model",
+            "explicit-model",
+            "--parent",
+            "leader-1",
+            "--policy-json",
+            "{\"note\":\"bounded\"}",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::AgentCreate {
+                project,
+                role,
+                department,
+                parent,
+                policy,
+                ..
+            } => {
+                assert_eq!(project, "prj-1");
+                assert_eq!(role, "manager");
+                assert_eq!(department.as_deref(), Some("platform"));
+                assert_eq!(parent.as_deref(), Some("leader-1"));
+                assert_eq!(policy.as_deref(), Some("{\"note\":\"bounded\"}"));
+            }
+            other => panic!("expected agent-create, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "agent-update",
+            "identity-1",
+            "--department",
+            "platform",
+            "--clear-title",
+            "--clear-successor",
+            "--policy-json",
+            "{}",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::AgentUpdate {
+                identity,
+                department,
+                clear_title,
+                clear_successor,
+                policy,
+                ..
+            } => {
+                assert_eq!(identity, "identity-1");
+                assert_eq!(department.as_deref(), Some("platform"));
+                assert!(clear_title);
+                assert!(clear_successor);
+                assert_eq!(policy.as_deref(), Some("{}"));
+            }
+            other => panic!("expected agent-update, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "agent-retire",
+            "identity-1",
+            "--successor",
+            "identity-2",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::AgentRetire {
+                identity,
+                successor,
+            } => {
+                assert_eq!(identity, "identity-1");
+                assert_eq!(successor.as_deref(), Some("identity-2"));
+            }
+            other => panic!("expected agent-retire, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn policy_and_lifecycle_commands_parse_and_validate_json() {
+        let cli = Cli::try_parse_from([
+            "vp",
+            "agent-policy-set",
+            "prj-1",
+            "--enabled",
+            "true",
+            "--max-managers",
+            "2",
+            "--max-workers",
+            "3",
+            "--hire-requires-approval",
+            "false",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::AgentPolicySet {
+                project,
+                enabled,
+                max_managers,
+                max_workers,
+                hire_requires_approval,
+                ..
+            } => {
+                assert_eq!(project, "prj-1");
+                assert_eq!(enabled, Some(true));
+                assert_eq!(max_managers, Some(2));
+                assert_eq!(max_workers, Some(3));
+                assert_eq!(hire_requires_approval, Some(false));
+            }
+            other => panic!("expected agent-policy-set, got {other:?}"),
+        }
+        assert!(
+            parse_agent_identity_policy_json(Some("{\"a\":1}"))
+                .unwrap()
+                .is_some()
+        );
+        assert!(parse_agent_identity_policy_json(Some("[1]")).is_err());
+        assert!(parse_agent_identity_policy_json(Some("not-json")).is_err());
+        assert!(parse_agent_identity_policy_json(None).unwrap().is_none());
+
+        let mut params = serde_json::Map::new();
+        insert_agent_identity_optional(&mut params, "title", Some("Lead".into()), false);
+        insert_agent_identity_optional(&mut params, "component", None, true);
+        assert_eq!(params["title"], json!("Lead"));
+        assert!(params["component"].is_null());
+        assert!(params.get("model").is_none());
+    }
+
+    #[test]
+    fn identity_human_lines_are_bounded_and_show_generation() {
+        let value = json!({
+            "identities": [{
+                "id": "identity-1",
+                "project_id": "prj-1",
+                "role": "worker",
+                "status": "active",
+                "generation": 4,
+                "component": "runtime",
+                "title": "Runtime Worker",
+                "parent_identity_id": "manager-1",
+                "origin": "local"
+            }]
+        });
+        let rendered = agent_identity_lines(&value).unwrap().join("\n");
+        assert!(rendered.contains("identity-1"));
+        assert!(rendered.contains("worker"));
+        assert!(rendered.contains("gen 4"));
+        assert!(rendered.contains("component runtime"));
+        assert!(!rendered.contains("api_key"));
+
+        let policy = json!({
+            "project_id": "prj-1",
+            "policy": {
+                "enabled": false,
+                "max_managers": 4,
+                "max_workers": 10,
+                "hire_requires_approval": true,
+                "retirement_requires_approval": true
+            }
+        });
+        let rendered = agent_identity_lines(&policy).unwrap().join("\n");
+        assert!(rendered.contains("identities disabled"));
+        assert!(rendered.contains("managers ≤ 4"));
+        assert!(rendered.contains("workers ≤ 10"));
+    }
+
+    #[test]
+    fn pause_resume_and_policy_read_commands_parse() {
+        let cli = Cli::try_parse_from(["vp", "agent-pause", "identity-1"]).unwrap();
+        match cli.command {
+            Command::AgentPause { identity } => assert_eq!(identity, "identity-1"),
+            other => panic!("expected agent-pause, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["vp", "agent-resume", "identity-1"]).unwrap();
+        match cli.command {
+            Command::AgentResume { identity } => assert_eq!(identity, "identity-1"),
+            other => panic!("expected agent-resume, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["vp", "agent-policy", "prj-1"]).unwrap();
+        match cli.command {
+            Command::AgentPolicy { project } => assert_eq!(project, "prj-1"),
+            other => panic!("expected agent-policy, got {other:?}"),
+        }
     }
 }

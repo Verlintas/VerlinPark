@@ -938,6 +938,7 @@ final class TranscriptAndCollabTests: XCTestCase {
             role: role,
             name: name,
             title: title,
+            identityId: nil,
             profile: role == "manager" ? "coding" : nil,
             parentId: parent,
             taskId: task,

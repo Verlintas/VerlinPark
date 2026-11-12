@@ -88,6 +88,49 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
                 )
             })?;
             store.set_contract_policy(&snapshot.project.id, &contract_policy)?;
+            let identity_policy = snapshot
+                .agent_identity_policy
+                .normalized()
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "agent identity policy for project {} is invalid: {error}",
+                        snapshot.project.id
+                    )
+                })?;
+            store.set_agent_identity_policy(&snapshot.project.id, &identity_policy)?;
+            if snapshot.agent_identity_events.is_empty() {
+                // Forward compatibility for a manifest written before the
+                // event stream existed. No synthetic events are created.
+                for identity in &snapshot.agent_identities {
+                    if identity.project_id != snapshot.project.id {
+                        anyhow::bail!(
+                            "agent identity {} belongs to another project in the manifest",
+                            identity.id
+                        );
+                    }
+                    store.insert_agent_identity_snapshot(identity)?;
+                }
+            } else {
+                let expected =
+                    crate::identity::identities_from_events(&snapshot.agent_identity_events)?;
+                if expected
+                    .iter()
+                    .any(|identity| identity.project_id != snapshot.project.id)
+                {
+                    anyhow::bail!("agent identity replay produced a row for another project");
+                }
+                for event in &snapshot.agent_identity_events {
+                    if event.project_id != snapshot.project.id {
+                        anyhow::bail!(
+                            "agent identity event {}:{} belongs to another project in the manifest",
+                            event.identity_id,
+                            event.seq
+                        );
+                    }
+                    store.insert_agent_identity_event_snapshot(event)?;
+                }
+                store.replace_agent_identity_projection(&snapshot.project.id, &expected)?;
+            }
             let effect_policy = snapshot.effect_policy.normalized().map_err(|error| {
                 anyhow::anyhow!(
                     "effect policy for project {} is invalid: {error}",

@@ -1742,6 +1742,15 @@ actor CoreClient {
             .agents
     }
 
+    /// Read-only project identity roster. S1 deliberately has no hire/assign
+    /// action in the client; the full org chart belongs to S7.
+    func agentIdentities(projectID: String) async throws -> [AgentIdentity] {
+        let params: [String: JSONValue] = ["project_id": .string(projectID)]
+        return try await request(method: "agent.identities.list", params: params)
+            .decode(AgentIdentitiesResult.self)
+            .identities
+    }
+
     func listMailbox(
         sessionID: String,
         agentID: String? = nil,

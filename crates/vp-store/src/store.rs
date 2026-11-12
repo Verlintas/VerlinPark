@@ -13,30 +13,39 @@ use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 use vp_protocol::now_rfc3339;
 use vp_protocol::types::{
-    AcpAgent, AcpAgentConfig, AcpTransport, AgentMessage, AgentRecord, Approval,
-    ApprovalAuditEvent, ApprovalGrant, ApprovalTemplate, Artifact, ArtifactPolicy,
-    ArtifactProvenance, ArtifactVersion, AttentionPolicy, CacheEpochBundleBucket,
-    CacheEpochReuseSession, CachePolicy, CheckpointRetentionPolicy, ContextCheckpoint,
-    ContextCheckpointPolicy, ContinuationOutcome, ContractPolicy, CriticalPathPolicy,
-    EffectEvidence, EffectPolicy, EffectReceipt, EffectState, EffectTarget, Event, GatePolicy,
-    GateRecord, GuiActionInfo, GuiPolicy, InstructionBlob, IntakeTask, IntegrationPolicy,
-    MailboxPolicy, McpServer, McpServerConfig, McpToolPin, McpTransport, MemoryConflict,
-    MemoryEmbeddingJobStatus, MemoryEmbeddingPolicy, MemoryEmbeddingUsage,
-    MemoryEmbeddingsStatusResult, MemoryEvidence, MemoryHealthResult, MemoryItem, MemoryPolicy,
-    MemoryStatCount, MergeQueueEntry, MergeQueueSource, MetricCount, ModelPreset,
-    OrchestrationDecision, OrchestrationNote, OrchestrationPolicy, OrchestrationRecovery,
-    PlanTaskProgress, PreemptionPolicy, PreemptionSessionSummary, ProcessPolicy, Program,
-    ProgramEvent, ProgramMilestone, ProgramMilestoneStatus, ProgramPolicy, ProgramStatus,
-    ProgramUsage, Project, ProjectBudget, ProjectUsageSession, PromptPrefixAggregate,
-    PromptPrefixObservation, PromptPrefixRecord, PromptSectionRef, Question, RunBudgetSnapshot,
-    RunCheckpoint, RunStep, RunToolCall, ScheduledTask, SearchHit, Session, SessionBundle,
-    SessionContinuation, SessionInstructionState, SessionRun, SessionRunPolicy, ShellPolicy, Skill,
-    Source, SourceChunk, SourceCollection, SourceEmbeddingIntegrity, SourceEmbeddingJobStatus,
-    SourceEmbeddingPolicy, SourceEmbeddingStatusResult, SourceEmbeddingUsage,
-    SourceRetrievalPolicy, SourceSearchHit, SourceStats, SteeringMessage, StoredMessage,
-    SupervisedProcess, TaskSchedulerPolicy, TaskStall, TeamPlan, TodoItem, ToolOutputAuditResult,
-    ToolOutputPolicy, ToolOutputToolStat, UsageEntry, WorktreeRetentionPolicy, WriteLease,
-    cache_hit_ratio,
+    AcpAgent, AcpAgentConfig, AcpTransport, AgentIdentity, AgentIdentityError, AgentIdentityEvent,
+    AgentIdentityPolicy, AgentMessage, AgentRecord, Approval, ApprovalAuditEvent, ApprovalGrant,
+    ApprovalTemplate, Artifact, ArtifactPolicy, ArtifactProvenance, ArtifactVersion,
+    AttentionPolicy, CacheEpochBundleBucket, CacheEpochReuseSession, CachePolicy,
+    CheckpointRetentionPolicy, ContextCheckpoint, ContextCheckpointPolicy, ContinuationOutcome,
+    ContractPolicy, CriticalPathPolicy, EffectEvidence, EffectPolicy, EffectReceipt, EffectState,
+    EffectTarget, Event, GatePolicy, GateRecord, GuiActionInfo, GuiPolicy, InstructionBlob,
+    IntakeTask, IntegrationPolicy, MailboxPolicy, McpServer, McpServerConfig, McpToolPin,
+    McpTransport, MemoryConflict, MemoryEmbeddingJobStatus, MemoryEmbeddingPolicy,
+    MemoryEmbeddingUsage, MemoryEmbeddingsStatusResult, MemoryEvidence, MemoryHealthResult,
+    MemoryItem, MemoryPolicy, MemoryStatCount, MergeQueueEntry, MergeQueueSource, MetricCount,
+    ModelPreset, OrchestrationDecision, OrchestrationNote, OrchestrationPolicy,
+    OrchestrationRecovery, PlanTaskProgress, PreemptionPolicy, PreemptionSessionSummary,
+    ProcessPolicy, Program, ProgramEvent, ProgramMilestone, ProgramMilestoneStatus, ProgramPolicy,
+    ProgramStatus, ProgramUsage, Project, ProjectBudget, ProjectUsageSession,
+    PromptPrefixAggregate, PromptPrefixObservation, PromptPrefixRecord, PromptSectionRef, Question,
+    RunBudgetSnapshot, RunCheckpoint, RunStep, RunToolCall, ScheduledTask, SearchHit, Session,
+    SessionBundle, SessionContinuation, SessionInstructionState, SessionRun, SessionRunPolicy,
+    ShellPolicy, Skill, Source, SourceChunk, SourceCollection, SourceEmbeddingIntegrity,
+    SourceEmbeddingJobStatus, SourceEmbeddingPolicy, SourceEmbeddingStatusResult,
+    SourceEmbeddingUsage, SourceRetrievalPolicy, SourceSearchHit, SourceStats, SteeringMessage,
+    StoredMessage, SupervisedProcess, TaskSchedulerPolicy, TaskStall, TeamPlan, TodoItem,
+    ToolOutputAuditResult, ToolOutputPolicy, ToolOutputToolStat, UsageEntry,
+    WorktreeRetentionPolicy, WriteLease, cache_hit_ratio,
+};
+
+use vp_protocol::types::{
+    AGENT_IDENTITY_EVENT_KINDS, AGENT_IDENTITY_MAX_COMPONENT_CHARS,
+    AGENT_IDENTITY_MAX_DEPARTMENT_CHARS, AGENT_IDENTITY_MAX_ID_CHARS,
+    AGENT_IDENTITY_MAX_MODEL_CHARS, AGENT_IDENTITY_MAX_POLICY_BYTES,
+    AGENT_IDENTITY_MAX_TITLE_CHARS, AGENT_IDENTITY_PROFILE_VALUES, AGENT_IDENTITY_STATUSES,
+    CreateAgentIdentityParams, RetireAgentIdentityParams, UpdateAgentIdentityParams,
+    agent_identity_codes, agent_identity_role,
 };
 
 use vp_protocol::otel::OtelPolicy;
@@ -1333,6 +1342,17 @@ pub struct ProjectManifestSnapshot {
     /// enabled/enforce default.
     #[serde(default)]
     pub contract_policy: ContractPolicy,
+    /// Project-scoped identity program policy. Older manifests decode as
+    /// disabled, so an upgrade never enables identities implicitly.
+    #[serde(default)]
+    pub agent_identity_policy: AgentIdentityPolicy,
+    /// Event-derived project identity projection. This is a rebuild snapshot,
+    /// not a second source of truth; `agent_identity_events` is authoritative.
+    #[serde(default)]
+    pub agent_identities: Vec<AgentIdentity>,
+    /// Append-only project identity lifecycle events.
+    #[serde(default)]
+    pub agent_identity_events: Vec<AgentIdentityEvent>,
     /// Project-scoped effect-receipt policy. Older manifests decode as the
     /// enabled, unknown-blocks-merge, 120s-grace default.
     #[serde(default)]
@@ -1600,6 +1620,55 @@ fn validate_session_bundle(bundle: &SessionBundle) -> Result<()> {
     }
     for agent in &bundle.agents {
         ensure_bundle_session("agent", &agent.session_id, &bundle.session.id)?;
+    }
+    for identity in &bundle.agent_identities {
+        validate_storage_id("agent identity", &identity.id)?;
+        if identity.project_id != bundle.project.id {
+            return Err(anyhow!(
+                "bundle identity {} belongs to a different project",
+                identity.id
+            ));
+        }
+        if agent_identity_role(&identity.role).is_none() {
+            return Err(anyhow!(
+                "bundle identity {} has an invalid role",
+                identity.id
+            ));
+        }
+        if !AGENT_IDENTITY_STATUSES.contains(&identity.status.as_str()) {
+            return Err(anyhow!(
+                "bundle identity {} has an invalid status",
+                identity.id
+            ));
+        }
+    }
+    let identity_ids = bundle
+        .agent_identities
+        .iter()
+        .map(|identity| identity.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    for event in &bundle.agent_identity_events {
+        if event.project_id != bundle.project.id {
+            return Err(anyhow!(
+                "bundle identity event {}:{} belongs to a different project",
+                event.identity_id,
+                event.seq
+            ));
+        }
+        if !identity_ids.contains(event.identity_id.as_str()) {
+            return Err(anyhow!(
+                "bundle identity event {}:{} has no identity snapshot",
+                event.identity_id,
+                event.seq
+            ));
+        }
+        if !vp_protocol::types::AGENT_IDENTITY_EVENT_KINDS.contains(&event.kind.as_str()) {
+            return Err(anyhow!(
+                "bundle identity event {}:{} has an unknown kind",
+                event.identity_id,
+                event.seq
+            ));
+        }
     }
     for message in &bundle.messages {
         ensure_bundle_session("message", &message.session_id, &bundle.session.id)?;
@@ -1893,6 +1962,15 @@ impl Store {
             -- Project-scoped task-contract policy. A missing row means the
             -- enabled/enforce default; it never means "no policy".
             CREATE TABLE IF NOT EXISTS project_contract_policies (
+                project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                policy     TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            -- Project setting for durable Leader/Manager/Worker identities.
+            -- A missing row means disabled, so upgrading never enables the
+            -- program implicitly.
+            CREATE TABLE IF NOT EXISTS project_agent_identity_policies (
                 project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
                 policy     TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -2242,6 +2320,55 @@ impl Store {
                 model      TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+
+            -- Project-scoped employee records. Identity/run separation begins
+            -- here: `agents` stays the run/roster projection, and a run may
+            -- only point at an identity when that assignment is made by a
+            -- later phase.
+            CREATE TABLE IF NOT EXISTS agent_identities (
+                id                TEXT PRIMARY KEY,
+                project_id        TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                role              TEXT NOT NULL,
+                department        TEXT,
+                component         TEXT,
+                title             TEXT,
+                profile           TEXT,
+                model             TEXT,
+                parent_identity_id TEXT,
+                status            TEXT NOT NULL,
+                generation        INTEGER NOT NULL DEFAULT 1,
+                created_at        TEXT NOT NULL,
+                updated_at        TEXT NOT NULL,
+                retired_at        TEXT,
+                successor_id      TEXT,
+                policy_json       TEXT NOT NULL DEFAULT '{}',
+                origin            TEXT NOT NULL DEFAULT 'local'
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_agent_identities_project_status
+                ON agent_identities(project_id, status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_agent_identities_project_role
+                ON agent_identities(project_id, role, status);
+            -- One live Leader per project. Retirement releases the slot; no
+            -- automatic successor is ever created.
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_identities_one_live_leader
+                ON agent_identities(project_id)
+                WHERE role = 'leader' AND status <> 'retired';
+
+            -- Project-scoped append-only lifecycle stream. There is no session
+            -- id: an identity outlives the sessions that may later use it.
+            CREATE TABLE IF NOT EXISTS agent_identity_events (
+                project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                identity_id TEXT NOT NULL,
+                seq         INTEGER NOT NULL,
+                kind        TEXT NOT NULL,
+                payload     TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                PRIMARY KEY (identity_id, seq)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_agent_identity_events_project
+                ON agent_identity_events(project_id, created_at, identity_id, seq);
 
             CREATE TABLE IF NOT EXISTS messages (
                 id           TEXT PRIMARY KEY,
@@ -3978,6 +4105,30 @@ impl Store {
         ensure_column(&conn, "agents", "branch", "TEXT")?;
         ensure_column(&conn, "agents", "task_id", "TEXT")?;
         ensure_column(&conn, "agents", "department", "TEXT")?;
+        // Nullable by design: every pre-S1 run record and every S1 run keeps
+        // `NULL` because session assignment is a later phase. No synthetic
+        // identities are backfilled.
+        ensure_column(&conn, "agents", "identity_id", "TEXT")?;
+        ensure_column(
+            &conn,
+            "agent_identities",
+            "origin",
+            "TEXT NOT NULL DEFAULT 'local'",
+        )?;
+        conn.execute_batch(
+            "CREATE VIEW IF NOT EXISTS agent_runs AS
+                 SELECT id,
+                        identity_id,
+                        session_id,
+                        task_id,
+                        role,
+                        status,
+                        worktree,
+                        branch,
+                        created_at AS started_at,
+                        NULL AS ended_at
+                 FROM agents;",
+        )?;
         ensure_column(
             &conn,
             "acp_agents",
@@ -4367,6 +4518,10 @@ impl Store {
                 recorded_at: now_rfc3339(),
                 shell_policy: self.get_shell_policy(&project.id)?,
                 contract_policy: self.get_contract_policy(&project.id)?,
+                agent_identity_policy: self.get_agent_identity_policy(&project.id)?,
+                agent_identities: self.list_agent_identities(&project.id, None, None)?,
+                agent_identity_events: self
+                    .list_agent_identity_events_for_project(&project.id, Some(100_000))?,
                 effect_policy: self.get_effect_policy(&project.id)?,
                 gate_policy: self.get_gate_policy(&project.id)?,
                 otel_policy: self.get_otel_policy(&project.id)?,
@@ -20484,6 +20639,7 @@ impl Store {
             role: role.to_string(),
             name: name.to_string(),
             title: title.map(ToOwned::to_owned),
+            identity_id: None,
             profile: None,
             parent_id: parent_id.map(ToOwned::to_owned),
             task_id: None,
@@ -20534,6 +20690,7 @@ impl Store {
             role: role.to_string(),
             name: name.to_string(),
             title: title.map(ToOwned::to_owned),
+            identity_id: None,
             profile: None,
             parent_id: parent_id.map(ToOwned::to_owned),
             task_id: None,
@@ -20739,7 +20896,7 @@ impl Store {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id, session_id, role, name, title, profile, parent_id, task_id, department,
-                    worktree, branch, status, model, created_at
+                    worktree, branch, status, model, created_at, identity_id
              FROM agents WHERE session_id = ?1 ORDER BY created_at ASC, rowid ASC",
         )?;
         let rows = stmt.query_map(params![session_id], |row| {
@@ -20749,6 +20906,7 @@ impl Store {
                 role: row.get(2)?,
                 name: row.get(3)?,
                 title: row.get(4)?,
+                identity_id: row.get(14)?,
                 profile: row.get(5)?,
                 parent_id: row.get(6)?,
                 task_id: row.get(7)?,
@@ -20761,6 +20919,553 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    // ---------------------------------------------------------------------
+    // Project-scoped agent identities
+    // ---------------------------------------------------------------------
+
+    pub fn get_agent_identity_policy(&self, project_id: &str) -> Result<AgentIdentityPolicy> {
+        let conn = self.lock()?;
+        let stored = conn
+            .query_row(
+                "SELECT policy FROM project_agent_identity_policies WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match stored {
+            Some(raw) => {
+                let policy: AgentIdentityPolicy =
+                    serde_json::from_str(&raw).context("parsing stored agent identity policy")?;
+                policy.normalized().map_err(|error| {
+                    AgentIdentityError::new(agent_identity_codes::IDENTITY_POLICY_INVALID, error)
+                        .into()
+                })
+            }
+            None => Ok(AgentIdentityPolicy::default()),
+        }
+    }
+
+    pub fn set_agent_identity_policy(
+        &self,
+        project_id: &str,
+        policy: &AgentIdentityPolicy,
+    ) -> Result<()> {
+        let policy = policy.normalized().map_err(|error| {
+            AgentIdentityError::new(agent_identity_codes::IDENTITY_POLICY_INVALID, error)
+        })?;
+        let encoded = serde_json::to_string(&policy)?;
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO project_agent_identity_policies (project_id, policy, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(project_id) DO UPDATE SET
+                policy = excluded.policy,
+                updated_at = excluded.updated_at",
+            params![project_id, encoded, now_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Create one explicit project identity and its `created` event in the same
+    /// transaction. This never creates a session, run, inbox, workspace, or
+    /// memory row.
+    pub fn create_agent_identity(
+        &self,
+        params: &CreateAgentIdentityParams,
+    ) -> Result<(AgentIdentity, AgentIdentityEvent)> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let identity = create_agent_identity_tx(&tx, params)?;
+        let event = insert_agent_identity_event_tx(
+            &tx,
+            &identity,
+            vp_protocol::types::AGENT_IDENTITY_CREATED_EVENT,
+            serde_json::json!({
+                "identity": identity,
+                "changed_fields": [],
+                "previous_generation": 0,
+                "generation": identity.generation,
+            }),
+        )?;
+        tx.commit()?;
+        Ok((identity, event))
+    }
+
+    pub fn get_agent_identity(&self, identity_id: &str) -> Result<Option<AgentIdentity>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            &format!("SELECT {AGENT_IDENTITY_COLUMNS} FROM agent_identities WHERE id = ?1"),
+            params![identity_id],
+            map_agent_identity,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_agent_identities(
+        &self,
+        project_id: &str,
+        role: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<Vec<AgentIdentity>> {
+        if let Some(role) = role
+            && agent_identity_role(role).is_none()
+        {
+            return Err(AgentIdentityError::new(
+                agent_identity_codes::IDENTITY_ROLE_INVALID,
+                format!("role must be one of leader, manager, worker: {role}"),
+            )
+            .into());
+        }
+        if let Some(status) = status
+            && !AGENT_IDENTITY_STATUSES.contains(&status)
+        {
+            return Err(AgentIdentityError::new(
+                agent_identity_codes::IDENTITY_INVALID,
+                format!("status must be one of active, idle, paused, retired: {status}"),
+            )
+            .into());
+        }
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(&format!(
+            "SELECT {AGENT_IDENTITY_COLUMNS}
+             FROM agent_identities
+             WHERE project_id = ?1
+               AND (?2 IS NULL OR role = ?2)
+               AND (?3 IS NULL OR status = ?3)
+             ORDER BY created_at ASC, id ASC"
+        ))?;
+        let rows = statement.query_map(params![project_id, role, status], map_agent_identity)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Apply the S1 update surface. `None` means no field changed and no event
+    /// was appended. A role/department/component/title/profile/model change
+    /// increments `generation` exactly once; retired rows are terminal except
+    /// for successor bookkeeping.
+    pub fn update_agent_identity(
+        &self,
+        params: &UpdateAgentIdentityParams,
+    ) -> Result<Option<(AgentIdentity, AgentIdentityEvent)>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let existing = get_agent_identity_tx(&tx, &params.identity_id)?;
+        ensure_identity_mutable(&existing)?;
+        let mut changed_fields = Vec::new();
+        let mut next = existing.clone();
+
+        if existing.status == "retired" {
+            if params.role.is_some()
+                || params.department.is_some()
+                || params.component.is_some()
+                || params.title.is_some()
+                || params.profile.is_some()
+                || params.model.is_some()
+                || params.parent_identity_id.is_some()
+                || params.policy.is_some()
+            {
+                return Err(AgentIdentityError::new(
+                    agent_identity_codes::IDENTITY_RETIRED,
+                    "a retired identity cannot change role, profile, model, hierarchy, or policy",
+                )
+                .into());
+            }
+            if let Some(successor) = &params.successor_id {
+                let successor = normalize_identity_text(
+                    successor.as_deref(),
+                    "successor_id",
+                    AGENT_IDENTITY_MAX_ID_CHARS,
+                )?;
+                if successor.as_deref() != existing.successor_id.as_deref() {
+                    if let Some(successor_id) = &successor {
+                        validate_identity_successor_tx(
+                            &tx,
+                            &existing.project_id,
+                            &existing.id,
+                            successor_id,
+                        )?;
+                    }
+                    next.successor_id = successor;
+                    changed_fields.push("successor_id");
+                }
+            }
+            if changed_fields.is_empty() {
+                return Ok(None);
+            }
+            next.updated_at = now_rfc3339();
+            update_agent_identity_row_tx(&tx, &next)?;
+            let event = insert_agent_identity_event_tx(
+                &tx,
+                &next,
+                vp_protocol::types::AGENT_IDENTITY_UPDATED_EVENT,
+                serde_json::json!({
+                    "identity": next,
+                    "changed_fields": changed_fields,
+                    "previous_generation": existing.generation,
+                    "generation": next.generation,
+                }),
+            )?;
+            tx.commit()?;
+            return Ok(Some((next, event)));
+        }
+
+        let next_role = match &params.role {
+            Some(role) => agent_identity_role(role.trim())
+                .ok_or_else(|| {
+                    AgentIdentityError::new(
+                        agent_identity_codes::IDENTITY_ROLE_INVALID,
+                        format!("role must be one of leader, manager, worker: {role}"),
+                    )
+                })?
+                .to_string(),
+            None => existing.role.clone(),
+        };
+        if next_role != existing.role {
+            ensure_identity_role_capacity_tx(
+                &tx,
+                &existing.project_id,
+                &next_role,
+                Some(&existing.id),
+            )?;
+            next.role = next_role.clone();
+            changed_fields.push("role");
+        }
+
+        apply_identity_field(
+            &mut next.department,
+            params.department.as_ref(),
+            "department",
+            AGENT_IDENTITY_MAX_DEPARTMENT_CHARS,
+            &mut changed_fields,
+        )?;
+        apply_identity_field(
+            &mut next.component,
+            params.component.as_ref(),
+            "component",
+            AGENT_IDENTITY_MAX_COMPONENT_CHARS,
+            &mut changed_fields,
+        )?;
+        apply_identity_field(
+            &mut next.title,
+            params.title.as_ref(),
+            "title",
+            AGENT_IDENTITY_MAX_TITLE_CHARS,
+            &mut changed_fields,
+        )?;
+        apply_identity_field(
+            &mut next.profile,
+            params.profile.as_ref(),
+            "profile",
+            AGENT_IDENTITY_MAX_DEPARTMENT_CHARS,
+            &mut changed_fields,
+        )?;
+        apply_identity_field(
+            &mut next.model,
+            params.model.as_ref(),
+            "model",
+            AGENT_IDENTITY_MAX_MODEL_CHARS,
+            &mut changed_fields,
+        )?;
+        if let Some(profile) = &next.profile
+            && !AGENT_IDENTITY_PROFILE_VALUES.contains(&profile.as_str())
+        {
+            return Err(AgentIdentityError::new(
+                agent_identity_codes::IDENTITY_INVALID,
+                format!(
+                    "profile must be one of coding, research, verification, generic: {profile}"
+                ),
+            )
+            .into());
+        }
+
+        if let Some(parent) = &params.parent_identity_id {
+            let parent = normalize_identity_text(
+                parent.as_deref(),
+                "parent_identity_id",
+                AGENT_IDENTITY_MAX_ID_CHARS,
+            )?;
+            if parent.as_deref() != existing.parent_identity_id.as_deref() {
+                next.parent_identity_id = parent;
+                changed_fields.push("parent_identity_id");
+            }
+        }
+        if let Some(successor) = &params.successor_id {
+            let successor = normalize_identity_text(
+                successor.as_deref(),
+                "successor_id",
+                AGENT_IDENTITY_MAX_ID_CHARS,
+            )?;
+            if successor.as_deref() != existing.successor_id.as_deref() {
+                next.successor_id = successor;
+                changed_fields.push("successor_id");
+            }
+        }
+        if let Some(policy) = &params.policy {
+            let policy = normalize_identity_policy(policy)?;
+            if policy != existing.policy {
+                next.policy = policy;
+                changed_fields.push("policy");
+            }
+        }
+
+        // Revalidate the resulting hierarchy, not only the fields that were
+        // supplied. A role change can invalidate an unchanged parent.
+        validate_identity_parent_tx(
+            &tx,
+            &existing.project_id,
+            &next.role,
+            next.parent_identity_id.as_deref(),
+        )?;
+        if let Some(successor) = &next.successor_id {
+            validate_identity_successor_tx(&tx, &existing.project_id, &existing.id, successor)?;
+        }
+
+        if changed_fields.is_empty() {
+            return Ok(None);
+        }
+        let generation_fields = [
+            "role",
+            "department",
+            "component",
+            "title",
+            "profile",
+            "model",
+        ];
+        let generation_changed = changed_fields
+            .iter()
+            .any(|field| generation_fields.contains(field));
+        if generation_changed {
+            next.generation = existing.generation.saturating_add(1);
+        }
+        next.updated_at = now_rfc3339();
+        update_agent_identity_row_tx(&tx, &next)?;
+        let event = insert_agent_identity_event_tx(
+            &tx,
+            &next,
+            vp_protocol::types::AGENT_IDENTITY_UPDATED_EVENT,
+            serde_json::json!({
+                "identity": next,
+                "changed_fields": changed_fields,
+                "previous_generation": existing.generation,
+                "generation": next.generation,
+            }),
+        )?;
+        tx.commit()?;
+        Ok(Some((next, event)))
+    }
+
+    pub fn pause_agent_identity(
+        &self,
+        identity_id: &str,
+    ) -> Result<Option<(AgentIdentity, AgentIdentityEvent)>> {
+        self.transition_agent_identity(
+            identity_id,
+            "active",
+            "paused",
+            vp_protocol::types::AGENT_IDENTITY_PAUSED_EVENT,
+        )
+    }
+
+    pub fn resume_agent_identity(
+        &self,
+        identity_id: &str,
+    ) -> Result<Option<(AgentIdentity, AgentIdentityEvent)>> {
+        self.transition_agent_identity(
+            identity_id,
+            "paused",
+            "active",
+            vp_protocol::types::AGENT_IDENTITY_RESUMED_EVENT,
+        )
+    }
+
+    /// Pause/resume share exactly one legal source status. A no-op transition
+    /// returns `None` and never appends a duplicate lifecycle event.
+    fn transition_agent_identity(
+        &self,
+        identity_id: &str,
+        from: &str,
+        to: &str,
+        event_kind: &str,
+    ) -> Result<Option<(AgentIdentity, AgentIdentityEvent)>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let existing = get_agent_identity_tx(&tx, identity_id)?;
+        ensure_identity_mutable(&existing)?;
+        if existing.status == "retired" {
+            return Err(AgentIdentityError::new(
+                agent_identity_codes::IDENTITY_RETIRED,
+                format!("identity {identity_id} is retired and terminal"),
+            )
+            .into());
+        }
+        if existing.status == to {
+            return Ok(None);
+        }
+        if existing.status != from {
+            return Err(AgentIdentityError::new(
+                agent_identity_codes::IDENTITY_CONFLICT,
+                format!(
+                    "identity {identity_id} cannot move from {} to {to}",
+                    existing.status
+                ),
+            )
+            .into());
+        }
+        let mut next = existing.clone();
+        next.status = to.to_string();
+        next.updated_at = now_rfc3339();
+        update_agent_identity_row_tx(&tx, &next)?;
+        let event = insert_agent_identity_event_tx(
+            &tx,
+            &next,
+            event_kind,
+            serde_json::json!({
+                "identity": next,
+                "changed_fields": ["status"],
+                "previous_generation": existing.generation,
+                "generation": next.generation,
+            }),
+        )?;
+        tx.commit()?;
+        Ok(Some((next, event)))
+    }
+
+    /// Retirement is terminal. Retired rows retain every event and may only
+    /// receive a successor reference; they are never deleted.
+    pub fn retire_agent_identity(
+        &self,
+        params: &RetireAgentIdentityParams,
+    ) -> Result<Option<(AgentIdentity, AgentIdentityEvent)>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let existing = get_agent_identity_tx(&tx, &params.identity_id)?;
+        ensure_identity_mutable(&existing)?;
+        let successor = normalize_identity_text(
+            params.successor_id.as_deref(),
+            "successor_id",
+            AGENT_IDENTITY_MAX_ID_CHARS,
+        )?;
+        if existing.status == "retired" {
+            if successor.is_some() && successor != existing.successor_id {
+                return Err(AgentIdentityError::new(
+                    agent_identity_codes::IDENTITY_CONFLICT,
+                    format!(
+                        "retired identity {} already has a different successor",
+                        existing.id
+                    ),
+                )
+                .into());
+            }
+            return Ok(None);
+        }
+        if let Some(successor_id) = &successor {
+            validate_identity_successor_tx(&tx, &existing.project_id, &existing.id, successor_id)?;
+        }
+        let mut next = existing.clone();
+        next.status = "retired".to_string();
+        next.updated_at = now_rfc3339();
+        next.retired_at = Some(next.updated_at.clone());
+        if successor.is_some() {
+            next.successor_id = successor;
+        }
+        let mut changed_fields = vec!["status"];
+        if next.successor_id != existing.successor_id {
+            changed_fields.push("successor_id");
+        }
+        update_agent_identity_row_tx(&tx, &next)?;
+        let event = insert_agent_identity_event_tx(
+            &tx,
+            &next,
+            vp_protocol::types::AGENT_IDENTITY_RETIRED_EVENT,
+            serde_json::json!({
+                "identity": next,
+                "changed_fields": changed_fields,
+                "previous_generation": existing.generation,
+                "generation": next.generation,
+            }),
+        )?;
+        tx.commit()?;
+        Ok(Some((next, event)))
+    }
+
+    pub fn list_agent_identity_events_for_project(
+        &self,
+        project_id: &str,
+        limit: Option<u32>,
+    ) -> Result<Vec<AgentIdentityEvent>> {
+        let conn = self.lock()?;
+        let limit = limit.unwrap_or(100_000).clamp(1, 100_000) as i64;
+        let mut statement = conn.prepare(
+            "SELECT project_id, identity_id, seq, kind, payload, created_at
+             FROM agent_identity_events
+             WHERE project_id = ?1
+             ORDER BY created_at ASC, identity_id ASC, seq ASC
+             LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![project_id, limit], map_agent_identity_event)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_agent_identity_events(
+        &self,
+        identity_id: &str,
+        limit: Option<u32>,
+    ) -> Result<Vec<AgentIdentityEvent>> {
+        let conn = self.lock()?;
+        let limit = limit.unwrap_or(10_000).clamp(1, 100_000) as i64;
+        let mut statement = conn.prepare(
+            "SELECT project_id, identity_id, seq, kind, payload, created_at
+             FROM agent_identity_events
+             WHERE identity_id = ?1
+             ORDER BY seq ASC
+             LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![identity_id, limit], map_agent_identity_event)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Rebuild the identity projection from event-derived rows. This appends no
+    /// events and is only called by explicit replay repair or archive rebuild.
+    pub fn replace_agent_identity_projection(
+        &self,
+        project_id: &str,
+        identities: &[AgentIdentity],
+    ) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        for identity in identities {
+            if identity.project_id != project_id {
+                return Err(AgentIdentityError::new(
+                    agent_identity_codes::IDENTITY_PROJECT_MISMATCH,
+                    format!(
+                        "identity {} belongs to project {}, not {project_id}",
+                        identity.id, identity.project_id
+                    ),
+                )
+                .into());
+            }
+        }
+        tx.execute(
+            "DELETE FROM agent_identities WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        for identity in identities {
+            insert_agent_identity_row_tx(&tx, identity)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn insert_agent_identity_snapshot(&self, identity: &AgentIdentity) -> Result<()> {
+        let conn = self.lock()?;
+        insert_agent_identity_row_conn(&conn, identity)
+    }
+
+    pub fn insert_agent_identity_event_snapshot(&self, event: &AgentIdentityEvent) -> Result<()> {
+        let conn = self.lock()?;
+        insert_agent_identity_event_snapshot_conn(&conn, event)
     }
 
     pub fn update_session_status(&self, session_id: &str, status: &str) -> Result<()> {
@@ -26510,6 +27215,74 @@ impl Store {
             }
         }
 
+        // Project identities are carried only as archive snapshots. Imported
+        // rows are explicitly marked `imported` and stay read-only until a
+        // rehome phase; a project id is never silently rewritten.
+        for identity in &bundle.agent_identities {
+            if identity.project_id != bundle.project.id {
+                return Err(anyhow!(
+                    "bundle identity {} belongs to project {}, not {}",
+                    identity.id,
+                    identity.project_id,
+                    bundle.project.id
+                ));
+            }
+            let existing: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT project_id, origin FROM agent_identities WHERE id = ?1",
+                    params![identity.id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            match existing {
+                Some((project_id, _)) if project_id != bundle.project.id => {
+                    return Err(anyhow!(
+                        "bundle identity {} conflicts with a local identity in another project",
+                        identity.id
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    let mut imported = identity.clone();
+                    imported.origin = "imported".to_string();
+                    insert_agent_identity_row_conn(&tx, &imported)?;
+                }
+            }
+        }
+        for event in &bundle.agent_identity_events {
+            if event.project_id != bundle.project.id {
+                return Err(anyhow!(
+                    "bundle identity event {}:{} belongs to another project",
+                    event.identity_id,
+                    event.seq
+                ));
+            }
+            let existing: Option<(String, String, String)> = tx
+                .query_row(
+                    "SELECT kind, payload, created_at FROM agent_identity_events
+                     WHERE identity_id = ?1 AND seq = ?2",
+                    params![event.identity_id, event.seq as i64],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            match existing {
+                Some((kind, payload, created_at)) => {
+                    let expected_payload = serde_json::to_string(&event.payload)?;
+                    if kind != event.kind
+                        || payload != expected_payload
+                        || created_at != event.created_at
+                    {
+                        return Err(anyhow!(
+                            "bundle identity event {}:{} conflicts with the local event stream",
+                            event.identity_id,
+                            event.seq
+                        ));
+                    }
+                }
+                None => insert_agent_identity_event_snapshot_conn(&tx, event)?,
+            }
+        }
+
         let session_exists: bool = tx
             .query_row(
                 "SELECT 1 FROM sessions WHERE id = ?1",
@@ -27714,10 +28487,658 @@ impl Store {
     }
 }
 
+const AGENT_IDENTITY_COLUMNS: &str = "id, project_id, role, department, component, title,
+    profile, model, parent_identity_id, status, generation, created_at, updated_at,
+    retired_at, successor_id, policy_json, origin";
+
+fn map_agent_identity(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentIdentity> {
+    let policy_json: String = row.get(15)?;
+    let policy = serde_json::from_str(&policy_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(15, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(AgentIdentity {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        role: row.get(2)?,
+        department: row.get(3)?,
+        component: row.get(4)?,
+        title: row.get(5)?,
+        profile: row.get(6)?,
+        model: row.get(7)?,
+        parent_identity_id: row.get(8)?,
+        status: row.get(9)?,
+        generation: row.get::<_, i64>(10)?.max(0) as u64,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+        retired_at: row.get(13)?,
+        successor_id: row.get(14)?,
+        policy,
+        origin: row.get(16)?,
+    })
+}
+
+fn map_agent_identity_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentIdentityEvent> {
+    let payload: String = row.get(4)?;
+    let payload = serde_json::from_str(&payload).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(AgentIdentityEvent {
+        project_id: row.get(0)?,
+        identity_id: row.get(1)?,
+        seq: row.get::<_, i64>(2)?.max(0) as u64,
+        kind: row.get(3)?,
+        payload,
+        created_at: row.get(5)?,
+    })
+}
+
+fn agent_identity_policy_tx(tx: &Transaction<'_>, project_id: &str) -> Result<AgentIdentityPolicy> {
+    let stored = tx
+        .query_row(
+            "SELECT policy FROM project_agent_identity_policies WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    match stored {
+        Some(raw) => {
+            let policy: AgentIdentityPolicy =
+                serde_json::from_str(&raw).context("parsing stored agent identity policy")?;
+            policy.normalized().map_err(|error| {
+                AgentIdentityError::new(agent_identity_codes::IDENTITY_POLICY_INVALID, error).into()
+            })
+        }
+        None => Ok(AgentIdentityPolicy::default()),
+    }
+}
+
+fn get_agent_identity_tx(tx: &Transaction<'_>, id: &str) -> Result<AgentIdentity> {
+    tx.query_row(
+        &format!("SELECT {AGENT_IDENTITY_COLUMNS} FROM agent_identities WHERE id = ?1"),
+        params![id],
+        map_agent_identity,
+    )
+    .optional()?
+    .ok_or_else(|| {
+        AgentIdentityError::new(
+            agent_identity_codes::IDENTITY_NOT_FOUND,
+            format!("agent identity not found: {id}"),
+        )
+        .into()
+    })
+}
+
+fn create_agent_identity_tx(
+    tx: &Transaction<'_>,
+    params: &CreateAgentIdentityParams,
+) -> Result<AgentIdentity> {
+    let project_id = params.project_id.trim();
+    let exists: bool = tx
+        .query_row(
+            "SELECT 1 FROM projects WHERE id = ?1",
+            params![project_id],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !exists {
+        return Err(AgentIdentityError::new(
+            agent_identity_codes::IDENTITY_NOT_FOUND,
+            format!("project not found: {project_id}"),
+        )
+        .into());
+    }
+    let role = agent_identity_role(params.role.trim()).ok_or_else(|| {
+        AgentIdentityError::new(
+            agent_identity_codes::IDENTITY_ROLE_INVALID,
+            format!(
+                "role must be one of leader, manager, worker: {}",
+                params.role
+            ),
+        )
+    })?;
+    let department = normalize_identity_text(
+        params.department.as_deref(),
+        "department",
+        AGENT_IDENTITY_MAX_DEPARTMENT_CHARS,
+    )?;
+    let component = normalize_identity_text(
+        params.component.as_deref(),
+        "component",
+        AGENT_IDENTITY_MAX_COMPONENT_CHARS,
+    )?;
+    let title = normalize_identity_text(
+        params.title.as_deref(),
+        "title",
+        AGENT_IDENTITY_MAX_TITLE_CHARS,
+    )?;
+    let profile = normalize_identity_text(
+        params.profile.as_deref(),
+        "profile",
+        AGENT_IDENTITY_MAX_DEPARTMENT_CHARS,
+    )?;
+    if let Some(profile) = &profile
+        && !AGENT_IDENTITY_PROFILE_VALUES.contains(&profile.as_str())
+    {
+        return Err(AgentIdentityError::new(
+            agent_identity_codes::IDENTITY_INVALID,
+            format!("profile must be one of coding, research, verification, generic: {profile}"),
+        )
+        .into());
+    }
+    let model = normalize_identity_text(
+        params.model.as_deref(),
+        "model",
+        AGENT_IDENTITY_MAX_MODEL_CHARS,
+    )?;
+    let parent_identity_id = normalize_identity_text(
+        params.parent_identity_id.as_deref(),
+        "parent_identity_id",
+        AGENT_IDENTITY_MAX_ID_CHARS,
+    )?;
+    validate_identity_parent_tx(tx, project_id, role, parent_identity_id.as_deref())?;
+    ensure_identity_role_capacity_tx(tx, project_id, role, None)?;
+    let empty_policy = serde_json::Value::Object(Default::default());
+    let policy = normalize_identity_policy(params.policy.as_ref().unwrap_or(&empty_policy))?;
+    let now = now_rfc3339();
+    let identity = AgentIdentity {
+        id: Uuid::now_v7().to_string(),
+        project_id: project_id.to_string(),
+        role: role.to_string(),
+        department,
+        component,
+        title,
+        profile,
+        model,
+        parent_identity_id,
+        status: "active".to_string(),
+        generation: 1,
+        created_at: now.clone(),
+        updated_at: now,
+        retired_at: None,
+        successor_id: None,
+        policy,
+        origin: "local".to_string(),
+    };
+    insert_agent_identity_row_tx(tx, &identity).map_err(|error| {
+        if is_unique_constraint(&error) {
+            AgentIdentityError::new(
+                agent_identity_codes::IDENTITY_CONFLICT,
+                format!(
+                    "project {project_id} already has a live Leader identity; retire it before creating another"
+                ),
+            )
+            .into()
+        } else {
+            error
+        }
+    })?;
+    Ok(identity)
+}
+
+fn is_unique_constraint(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<rusqlite::Error>()
+        .is_some_and(|error| match error {
+            rusqlite::Error::SqliteFailure(inner, _) => {
+                inner.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+            }
+            _ => false,
+        })
+}
+
+fn normalize_identity_text(
+    value: Option<&str>,
+    field: &str,
+    max_chars: usize,
+) -> Result<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.chars().count() > max_chars {
+        return Err(AgentIdentityError::new(
+            agent_identity_codes::IDENTITY_INVALID,
+            format!("{field} exceeds {max_chars} characters"),
+        )
+        .into());
+    }
+    if value.chars().any(|character| character.is_control()) {
+        return Err(AgentIdentityError::new(
+            agent_identity_codes::IDENTITY_INVALID,
+            format!("{field} contains a control character"),
+        )
+        .into());
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn normalize_identity_policy(policy: &serde_json::Value) -> Result<serde_json::Value> {
+    if !policy.is_object() {
+        return Err(AgentIdentityError::new(
+            agent_identity_codes::IDENTITY_INVALID,
+            "identity policy metadata must be a JSON object",
+        )
+        .into());
+    }
+    let encoded = serde_json::to_string(policy)?;
+    if encoded.len() > AGENT_IDENTITY_MAX_POLICY_BYTES {
+        return Err(AgentIdentityError::new(
+            agent_identity_codes::IDENTITY_INVALID,
+            format!("identity policy metadata exceeds {AGENT_IDENTITY_MAX_POLICY_BYTES} bytes"),
+        )
+        .into());
+    }
+    Ok(policy.clone())
+}
+
+fn apply_identity_field(
+    target: &mut Option<String>,
+    input: Option<&Option<String>>,
+    field: &'static str,
+    max_chars: usize,
+    changed_fields: &mut Vec<&'static str>,
+) -> Result<()> {
+    let Some(value) = input else {
+        return Ok(());
+    };
+    let normalized = normalize_identity_text(value.as_deref(), field, max_chars)?;
+    if normalized != *target {
+        *target = normalized;
+        changed_fields.push(field);
+    }
+    Ok(())
+}
+
+fn ensure_identity_mutable(identity: &AgentIdentity) -> Result<()> {
+    if identity.origin != "local" {
+        return Err(AgentIdentityError::new(
+            agent_identity_codes::IDENTITY_IMPORTED_READONLY,
+            format!(
+                "identity {} was imported from an archive and is read-only until an explicit rehome",
+                identity.id
+            ),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn ensure_identity_role_capacity_tx(
+    tx: &Transaction<'_>,
+    project_id: &str,
+    role: &str,
+    exclude_id: Option<&str>,
+) -> Result<()> {
+    let policy = agent_identity_policy_tx(tx, project_id)?;
+    let count = agent_identity_role_count_tx(tx, project_id, role, exclude_id)?;
+    match role {
+        "leader" => {
+            if count > 0 {
+                return Err(AgentIdentityError::new(
+                    agent_identity_codes::IDENTITY_CONFLICT,
+                    format!("project {project_id} already has a live Leader identity"),
+                )
+                .into());
+            }
+        }
+        "manager" => {
+            if count >= u64::from(policy.max_managers) {
+                return Err(AgentIdentityError::new(
+                    agent_identity_codes::IDENTITY_CAP_EXCEEDED,
+                    format!(
+                        "project {project_id} already has {count} live Manager identities; max_managers is {}",
+                        policy.max_managers
+                    ),
+                )
+                .into());
+            }
+        }
+        "worker" => {
+            if count >= u64::from(policy.max_workers) {
+                return Err(AgentIdentityError::new(
+                    agent_identity_codes::IDENTITY_CAP_EXCEEDED,
+                    format!(
+                        "project {project_id} already has {count} live Worker identities; max_workers is {}",
+                        policy.max_workers
+                    ),
+                )
+                .into());
+            }
+        }
+        _ => {
+            return Err(AgentIdentityError::new(
+                agent_identity_codes::IDENTITY_ROLE_INVALID,
+                format!("role must be one of leader, manager, worker: {role}"),
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn agent_identity_role_count_tx(
+    tx: &Transaction<'_>,
+    project_id: &str,
+    role: &str,
+    exclude_id: Option<&str>,
+) -> Result<u64> {
+    let count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM agent_identities
+         WHERE project_id = ?1 AND role = ?2 AND status <> 'retired'
+           AND (?3 IS NULL OR id <> ?3)",
+        params![project_id, role, exclude_id],
+        |row| row.get(0),
+    )?;
+    Ok(count.max(0) as u64)
+}
+
+fn validate_identity_parent_tx(
+    tx: &Transaction<'_>,
+    project_id: &str,
+    role: &str,
+    parent_id: Option<&str>,
+) -> Result<()> {
+    if role == "leader" {
+        if parent_id.is_some() {
+            return Err(AgentIdentityError::new(
+                agent_identity_codes::IDENTITY_CONFLICT,
+                "a Leader identity cannot have a parent identity",
+            )
+            .into());
+        }
+        return Ok(());
+    }
+    let expected_parent = match role {
+        "manager" => "leader",
+        "worker" => "manager",
+        _ => {
+            return Err(AgentIdentityError::new(
+                agent_identity_codes::IDENTITY_ROLE_INVALID,
+                format!("role must be one of leader, manager, worker: {role}"),
+            )
+            .into());
+        }
+    };
+    let Some(parent_id) = parent_id else {
+        return Ok(());
+    };
+    let parent: Option<(String, String, String)> = tx
+        .query_row(
+            "SELECT project_id, role, status FROM agent_identities WHERE id = ?1",
+            params![parent_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((parent_project, parent_role, parent_status)) = parent else {
+        return Err(AgentIdentityError::new(
+            agent_identity_codes::IDENTITY_NOT_FOUND,
+            format!("parent identity not found: {parent_id}"),
+        )
+        .into());
+    };
+    if parent_project != project_id {
+        return Err(AgentIdentityError::new(
+            agent_identity_codes::IDENTITY_PROJECT_MISMATCH,
+            format!("parent identity {parent_id} belongs to another project"),
+        )
+        .into());
+    }
+    if parent_status == "retired" {
+        return Err(AgentIdentityError::new(
+            agent_identity_codes::IDENTITY_RETIRED,
+            format!("parent identity {parent_id} is retired"),
+        )
+        .into());
+    }
+    if parent_role != expected_parent {
+        return Err(AgentIdentityError::new(
+            agent_identity_codes::IDENTITY_INVALID,
+            format!("a {role} identity's parent must be a {expected_parent}"),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_identity_successor_tx(
+    tx: &Transaction<'_>,
+    project_id: &str,
+    identity_id: &str,
+    successor_id: &str,
+) -> Result<()> {
+    if successor_id == identity_id {
+        return Err(AgentIdentityError::new(
+            agent_identity_codes::IDENTITY_CONFLICT,
+            "an identity cannot be its own successor",
+        )
+        .into());
+    }
+    let successor: Option<(String, String, String)> = tx
+        .query_row(
+            "SELECT project_id, role, status FROM agent_identities WHERE id = ?1",
+            params![successor_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((successor_project, successor_role, successor_status)) = successor else {
+        return Err(AgentIdentityError::new(
+            agent_identity_codes::IDENTITY_NOT_FOUND,
+            format!("successor identity not found: {successor_id}"),
+        )
+        .into());
+    };
+    if successor_project != project_id {
+        return Err(AgentIdentityError::new(
+            agent_identity_codes::IDENTITY_PROJECT_MISMATCH,
+            format!("successor identity {successor_id} belongs to another project"),
+        )
+        .into());
+    }
+    if successor_status == "retired" {
+        return Err(AgentIdentityError::new(
+            agent_identity_codes::IDENTITY_RETIRED,
+            format!("successor identity {successor_id} is retired"),
+        )
+        .into());
+    }
+    // Successor transfer is an S6 concern. S1 records only a same-project,
+    // non-retired pointer; it does not infer authority, promotion, or a role
+    // change from it.
+    let _ = successor_role;
+    Ok(())
+}
+
+fn insert_agent_identity_row_tx(tx: &Transaction<'_>, identity: &AgentIdentity) -> Result<()> {
+    insert_agent_identity_row_conn(tx, identity)
+}
+
+fn validate_agent_identity_row(identity: &AgentIdentity) -> Result<()> {
+    if identity.id.trim().is_empty() || identity.project_id.trim().is_empty() {
+        return Err(AgentIdentityError::new(
+            agent_identity_codes::IDENTITY_INVALID,
+            "identity row has an empty id or project id",
+        )
+        .into());
+    }
+    if agent_identity_role(&identity.role).is_none() {
+        return Err(AgentIdentityError::new(
+            agent_identity_codes::IDENTITY_ROLE_INVALID,
+            format!("identity {} has an invalid role", identity.id),
+        )
+        .into());
+    }
+    if !AGENT_IDENTITY_STATUSES.contains(&identity.status.as_str()) {
+        return Err(AgentIdentityError::new(
+            agent_identity_codes::IDENTITY_INVALID,
+            format!("identity {} has an invalid status", identity.id),
+        )
+        .into());
+    }
+    if !matches!(identity.origin.as_str(), "local" | "imported") {
+        return Err(AgentIdentityError::new(
+            agent_identity_codes::IDENTITY_INVALID,
+            format!("identity {} has an invalid origin", identity.id),
+        )
+        .into());
+    }
+    if identity.generation == 0 {
+        return Err(AgentIdentityError::new(
+            agent_identity_codes::IDENTITY_INVALID,
+            format!("identity {} has generation 0", identity.id),
+        )
+        .into());
+    }
+    normalize_identity_policy(&identity.policy)?;
+    Ok(())
+}
+
+fn insert_agent_identity_row_conn(conn: &Connection, identity: &AgentIdentity) -> Result<()> {
+    validate_agent_identity_row(identity)?;
+    let policy_json = serde_json::to_string(&identity.policy)?;
+    conn.execute(
+        "INSERT OR REPLACE INTO agent_identities
+         (id, project_id, role, department, component, title, profile, model,
+          parent_identity_id, status, generation, created_at, updated_at, retired_at,
+          successor_id, policy_json, origin)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+        params![
+            identity.id,
+            identity.project_id,
+            identity.role,
+            identity.department,
+            identity.component,
+            identity.title,
+            identity.profile,
+            identity.model,
+            identity.parent_identity_id,
+            identity.status,
+            identity.generation as i64,
+            identity.created_at,
+            identity.updated_at,
+            identity.retired_at,
+            identity.successor_id,
+            policy_json,
+            identity.origin
+        ],
+    )?;
+    Ok(())
+}
+
+fn update_agent_identity_row_tx(tx: &Transaction<'_>, identity: &AgentIdentity) -> Result<()> {
+    let policy_json = serde_json::to_string(&identity.policy)?;
+    let changed = tx.execute(
+        "UPDATE agent_identities
+         SET role = ?1, department = ?2, component = ?3, title = ?4, profile = ?5,
+             model = ?6, parent_identity_id = ?7, status = ?8, generation = ?9,
+             updated_at = ?10, retired_at = ?11, successor_id = ?12, policy_json = ?13
+         WHERE id = ?14",
+        params![
+            identity.role,
+            identity.department,
+            identity.component,
+            identity.title,
+            identity.profile,
+            identity.model,
+            identity.parent_identity_id,
+            identity.status,
+            identity.generation as i64,
+            identity.updated_at,
+            identity.retired_at,
+            identity.successor_id,
+            policy_json,
+            identity.id
+        ],
+    )?;
+    if changed == 0 {
+        return Err(AgentIdentityError::new(
+            agent_identity_codes::IDENTITY_NOT_FOUND,
+            format!("agent identity not found: {}", identity.id),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn next_agent_identity_seq_tx(tx: &Transaction<'_>, identity_id: &str) -> Result<u64> {
+    let seq: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM agent_identity_events WHERE identity_id = ?1",
+        params![identity_id],
+        |row| row.get(0),
+    )?;
+    Ok(seq.max(1) as u64)
+}
+
+fn insert_agent_identity_event_tx(
+    tx: &Transaction<'_>,
+    identity: &AgentIdentity,
+    kind: &str,
+    payload: serde_json::Value,
+) -> Result<AgentIdentityEvent> {
+    let seq = next_agent_identity_seq_tx(tx, &identity.id)?;
+    let created_at = now_rfc3339();
+    let event = AgentIdentityEvent {
+        identity_id: identity.id.clone(),
+        project_id: identity.project_id.clone(),
+        seq,
+        kind: kind.to_string(),
+        payload,
+        created_at,
+    };
+    tx.execute(
+        "INSERT INTO agent_identity_events
+         (project_id, identity_id, seq, kind, payload, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            event.project_id,
+            event.identity_id,
+            event.seq as i64,
+            event.kind,
+            serde_json::to_string(&event.payload)?,
+            event.created_at
+        ],
+    )?;
+    Ok(event)
+}
+
+fn insert_agent_identity_event_snapshot_conn(
+    conn: &Connection,
+    event: &AgentIdentityEvent,
+) -> Result<()> {
+    if event.identity_id.trim().is_empty()
+        || event.project_id.trim().is_empty()
+        || event.seq == 0
+        || !AGENT_IDENTITY_EVENT_KINDS.contains(&event.kind.as_str())
+    {
+        return Err(AgentIdentityError::new(
+            agent_identity_codes::IDENTITY_INVALID,
+            "identity event snapshot has an empty id/project, zero seq, or unknown kind",
+        )
+        .into());
+    }
+    conn.execute(
+        "INSERT OR REPLACE INTO agent_identity_events
+         (project_id, identity_id, seq, kind, payload, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            event.project_id,
+            event.identity_id,
+            event.seq as i64,
+            event.kind,
+            serde_json::to_string(&event.payload)?,
+            event.created_at
+        ],
+    )?;
+    Ok(())
+}
+
 fn get_agent_tx(tx: &Transaction<'_>, id: &str) -> Result<AgentRecord> {
     tx.query_row(
         "SELECT id, session_id, role, name, title, profile, parent_id, task_id, department,
-                worktree, branch, status, model, created_at
+                worktree, branch, status, model, created_at, identity_id
          FROM agents WHERE id = ?1",
         params![id],
         map_agent_record,
@@ -27733,6 +29154,7 @@ fn map_agent_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
         role: row.get(2)?,
         name: row.get(3)?,
         title: row.get(4)?,
+        identity_id: row.get(14)?,
         profile: row.get(5)?,
         parent_id: row.get(6)?,
         task_id: row.get(7)?,

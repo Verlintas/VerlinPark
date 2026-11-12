@@ -7609,6 +7609,7 @@ struct AgentRecord: Codable, Identifiable, Hashable, Sendable {
     let role: String
     let name: String
     let title: String?
+    let identityId: String?
     let profile: String?
     let parentId: String?
     let taskId: String?
@@ -7625,6 +7626,7 @@ struct AgentRecord: Codable, Identifiable, Hashable, Sendable {
         case role
         case name
         case title
+        case identityId = "identity_id"
         case profile
         case parentId = "parent_id"
         case taskId = "task_id"
@@ -7639,6 +7641,64 @@ struct AgentRecord: Codable, Identifiable, Hashable, Sendable {
 
 struct AgentListResult: Codable, Sendable {
     let agents: [AgentRecord]
+}
+
+/// Read-only project identity row. S7 owns the full org chart, hire/retire
+/// sheets, and identity detail; S1 decodes the durable roster for display only.
+struct AgentIdentity: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let projectId: String
+    let role: String
+    let department: String?
+    let component: String?
+    let title: String?
+    let profile: String?
+    let model: String?
+    let parentIdentityId: String?
+    let status: String
+    let generation: Int
+    let createdAt: String
+    let updatedAt: String
+    let retiredAt: String?
+    let successorId: String?
+    let origin: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case projectId = "project_id"
+        case role
+        case department
+        case component
+        case title
+        case profile
+        case model
+        case parentIdentityId = "parent_identity_id"
+        case status
+        case generation
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+        case retiredAt = "retired_at"
+        case successorId = "successor_id"
+        case origin
+    }
+
+    var displayName: String {
+        if let title, !title.isEmpty {
+            return title
+        }
+        if let component, !component.isEmpty {
+            return component
+        }
+        return role.capitalized
+    }
+
+    var isImported: Bool {
+        origin == "imported"
+    }
+}
+
+struct AgentIdentitiesResult: Codable, Sendable {
+    let identities: [AgentIdentity]
 }
 
 struct MergeQueueEntry: Codable, Identifiable, Hashable, Sendable {

@@ -2318,6 +2318,114 @@ struct AgentsCard: View {
     }
 }
 
+struct ProjectIdentitiesCard: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionLabel(title: "Project identities")
+                    Text(model.selectedProject?.name ?? "No project selected")
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                        .lineLimit(1)
+                }
+                Spacer()
+                if model.agentIdentitiesBusy {
+                    ProgressView().controlSize(.small)
+                }
+                if !model.agentIdentities.isEmpty {
+                    Text("\(model.agentIdentities.count)")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                Button("Refresh") {
+                    Task { await model.loadAgentIdentities() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.selectedProjectID == nil || model.agentIdentitiesBusy)
+            }
+            if model.selectedProjectID == nil {
+                Text("Select a project to inspect its durable roster.")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            } else if model.agentIdentities.isEmpty {
+                Text(model.agentIdentitiesStatus ?? "No project identities.")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            } else {
+                VStack(spacing: 6) {
+                    ForEach(model.agentIdentities) { identity in
+                        HStack(spacing: 8) {
+                            Image(systemName: icon(for: identity.role))
+                                .font(.system(size: 10))
+                                .foregroundStyle(color(for: identity.status))
+                                .frame(width: 14)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(identity.displayName)
+                                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                    .lineLimit(1)
+                                Text(identitySubtitle(identity))
+                                    .font(.system(size: 8, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                            Spacer()
+                            Text(identity.isImported ? "imported" : identity.status)
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(color(for: identity.status))
+                        }
+                        .padding(8)
+                        .background(.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 8))
+                    }
+                }
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 0)
+        .task { await model.loadAgentIdentities() }
+    }
+
+    private func identitySubtitle(_ identity: AgentIdentity) -> String {
+        var parts = [identity.role, "gen \(identity.generation)"]
+        if let component = identity.component, !component.isEmpty {
+            parts.append(component)
+        } else if let department = identity.department, !department.isEmpty {
+            parts.append(department)
+        }
+        if let model = identity.model, !model.isEmpty {
+            parts.append(model)
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private func icon(for role: String) -> String {
+        switch role {
+        case "leader": "crown"
+        case "manager": "person.badge.clock"
+        case "worker": "hammer"
+        default: "person"
+        }
+    }
+
+    private func color(for status: String) -> Color {
+        switch status {
+        case "active": .green
+        case "idle": .blue
+        case "paused": .orange
+        case "retired": .secondary
+        default: .secondary
+        }
+    }
+}
+
 struct ProgramsCard: View {
     @Environment(AppModel.self) private var model
     @State private var showComposer = false

@@ -11223,6 +11223,16 @@ pub struct SessionBundle {
     /// rebuilds the rows.
     #[serde(default)]
     pub effects: Vec<EffectReceipt>,
+    /// Project-scoped identities for this archive's project. Older bundles
+    /// decode as an empty list. Imported identities are read-only until an
+    /// explicit rehome; their project ids are never silently remapped.
+    #[serde(default)]
+    pub agent_identities: Vec<AgentIdentity>,
+    /// Append-only identity lifecycle events. These are project-scoped and are
+    /// exported alongside the session archive so projections can be rebuilt
+    /// without inventing rows.
+    #[serde(default)]
+    pub agent_identity_events: Vec<AgentIdentityEvent>,
 }
 
 /// Project policy for automatic crash resume. Manual `session.run.resume`
@@ -11576,6 +11586,11 @@ pub struct AgentRecord {
     pub name: String,
     #[serde(default)]
     pub title: Option<String>,
+    /// Project-scoped identity behind this run, when one was explicitly
+    /// assigned. S1 leaves this `None` for every existing run record; session
+    /// assignment is a separate phase.
+    #[serde(default)]
+    pub identity_id: Option<String>,
     pub parent_id: Option<String>,
     /// Plan task this agent is currently responsible for, when applicable.
     #[serde(default)]
@@ -11602,6 +11617,430 @@ pub struct AgentListParams {
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentListResult {
     pub agents: Vec<AgentRecord>,
+}
+
+// ---------------------------------------------------------------------------
+// Project-scoped agent identities (S1)
+// ---------------------------------------------------------------------------
+
+/// Roles that may own a durable project identity. Labour, Verifier, and Scout
+/// are deliberately absent: Labour is hired per task, and the other two are
+/// session/task gates rather than project employees.
+pub const AGENT_IDENTITY_ROLES: [&str; 3] = ["leader", "manager", "worker"];
+
+/// Stored lifecycle states. `idle` is reserved for the session-assignment
+/// phase and is never produced by the S1 lifecycle API.
+pub const AGENT_IDENTITY_STATUSES: [&str; 4] = ["active", "idle", "paused", "retired"];
+
+pub const AGENT_IDENTITY_CREATED_EVENT: &str = "agent.identity.created";
+pub const AGENT_IDENTITY_UPDATED_EVENT: &str = "agent.identity.updated";
+pub const AGENT_IDENTITY_PAUSED_EVENT: &str = "agent.identity.paused";
+pub const AGENT_IDENTITY_RESUMED_EVENT: &str = "agent.identity.resumed";
+pub const AGENT_IDENTITY_RETIRED_EVENT: &str = "agent.identity.retired";
+
+pub const AGENT_IDENTITY_EVENT_KINDS: [&str; 5] = [
+    AGENT_IDENTITY_CREATED_EVENT,
+    AGENT_IDENTITY_UPDATED_EVENT,
+    AGENT_IDENTITY_PAUSED_EVENT,
+    AGENT_IDENTITY_RESUMED_EVENT,
+    AGENT_IDENTITY_RETIRED_EVENT,
+];
+
+pub const AGENT_IDENTITY_PROFILE_VALUES: [&str; 4] =
+    ["coding", "research", "verification", "generic"];
+
+/// Runtime hard caps. A project policy may only narrow these; it can never
+/// enable more Managers or Workers than the existing team runtime will admit.
+pub const AGENT_IDENTITY_MAX_MANAGERS_HARD_CAP: u32 = 5;
+pub const AGENT_IDENTITY_MAX_WORKERS_HARD_CAP: u32 = 10;
+
+/// Bounded per-identity metadata. This is configuration, not prompt text or
+/// model output, and it is never interpreted as a credential.
+pub const AGENT_IDENTITY_MAX_POLICY_BYTES: usize = 8_192;
+pub const AGENT_IDENTITY_MAX_DEPARTMENT_CHARS: usize = 120;
+pub const AGENT_IDENTITY_MAX_COMPONENT_CHARS: usize = 200;
+pub const AGENT_IDENTITY_MAX_TITLE_CHARS: usize = 200;
+pub const AGENT_IDENTITY_MAX_MODEL_CHARS: usize = 200;
+pub const AGENT_IDENTITY_MAX_ID_CHARS: usize = 128;
+pub const AGENT_IDENTITY_MAX_ROLE_CHARS: usize = 32;
+pub const AGENT_IDENTITY_MAX_STATUS_CHARS: usize = 32;
+
+/// Stable, bounded error codes for identity RPCs. These are wire values, not
+/// message-text classifications.
+pub mod agent_identity_codes {
+    pub const IDENTITY_NOT_FOUND: &str = "IDENTITY_NOT_FOUND";
+    pub const IDENTITY_INVALID: &str = "IDENTITY_INVALID";
+    pub const IDENTITY_ROLE_INVALID: &str = "IDENTITY_ROLE_INVALID";
+    pub const IDENTITY_PROJECT_MISMATCH: &str = "IDENTITY_PROJECT_MISMATCH";
+    pub const IDENTITY_CONFLICT: &str = "IDENTITY_CONFLICT";
+    pub const IDENTITY_RETIRED: &str = "IDENTITY_RETIRED";
+    pub const IDENTITY_CAP_EXCEEDED: &str = "IDENTITY_CAP_EXCEEDED";
+    pub const IDENTITY_IMPORTED_READONLY: &str = "IDENTITY_IMPORTED_READONLY";
+    pub const IDENTITY_POLICY_INVALID: &str = "IDENTITY_POLICY_INVALID";
+}
+
+/// Typed identity failure. It carries only a stable code and a bounded message;
+/// prompts, project source text, and secrets never enter it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentIdentityError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl AgentIdentityError {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for AgentIdentityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for AgentIdentityError {}
+
+pub fn agent_identity_role(value: &str) -> Option<&'static str> {
+    match value {
+        "leader" => Some("leader"),
+        "manager" => Some("manager"),
+        "worker" => Some("worker"),
+        _ => None,
+    }
+}
+
+pub fn valid_agent_identity_profile(value: &str) -> bool {
+    AGENT_IDENTITY_PROFILE_VALUES.contains(&value)
+}
+
+fn default_identity_policy_enabled() -> bool {
+    false
+}
+
+fn default_identity_max_managers() -> u32 {
+    4
+}
+
+fn default_identity_max_workers() -> u32 {
+    10
+}
+
+fn default_identity_requires_approval() -> bool {
+    true
+}
+
+fn default_identity_generation() -> u64 {
+    1
+}
+
+fn default_identity_origin() -> String {
+    "local".to_string()
+}
+
+fn default_identity_policy_json() -> Value {
+    Value::Object(Default::default())
+}
+
+/// Project setting for the project-scoped identity program. The default is
+/// deliberately disabled: a project that never opts in keeps the run-scoped
+/// roster and the same behavior as before S1.
+///
+/// S1 only stores and validates this policy. Hire/retire approval workflows
+/// and session assignment are separate phases.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentIdentityPolicy {
+    #[serde(default = "default_identity_policy_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_identity_max_managers")]
+    pub max_managers: u32,
+    #[serde(default = "default_identity_max_workers")]
+    pub max_workers: u32,
+    #[serde(default = "default_identity_requires_approval")]
+    pub hire_requires_approval: bool,
+    #[serde(default = "default_identity_requires_approval")]
+    pub retirement_requires_approval: bool,
+}
+
+impl Default for AgentIdentityPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_managers: default_identity_max_managers(),
+            max_workers: default_identity_max_workers(),
+            hire_requires_approval: true,
+            retirement_requires_approval: true,
+        }
+    }
+}
+
+impl AgentIdentityPolicy {
+    /// Validate and return a normalized copy. Unknown values fail closed rather
+    /// than silently widening the caps.
+    pub fn normalized(&self) -> std::result::Result<Self, String> {
+        if self.max_managers > AGENT_IDENTITY_MAX_MANAGERS_HARD_CAP {
+            return Err(format!(
+                "max_managers must be between 0 and {}",
+                AGENT_IDENTITY_MAX_MANAGERS_HARD_CAP
+            ));
+        }
+        if self.max_workers > AGENT_IDENTITY_MAX_WORKERS_HARD_CAP {
+            return Err(format!(
+                "max_workers must be between 0 and {}",
+                AGENT_IDENTITY_MAX_WORKERS_HARD_CAP
+            ));
+        }
+        Ok(self.clone())
+    }
+}
+
+/// One durable project-scoped employee record. It is not a process, a lease, or
+/// a credential; a run may reference it later but execution policy is unchanged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentIdentity {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub project_id: String,
+    /// `leader`, `manager`, or `worker`. Labour is never a project identity.
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub department: Option<String>,
+    #[serde(default)]
+    pub component: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// Explicit model reference. It is metadata only; the user-configured role
+    /// model bindings still decide every provider call.
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub parent_identity_id: Option<String>,
+    /// `active`, `idle`, `paused`, or `retired`. `idle` is reserved for S2.
+    #[serde(default)]
+    pub status: String,
+    /// Increments once per role/department/component/title/profile/model change.
+    #[serde(default = "default_identity_generation")]
+    pub generation: u64,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+    #[serde(default)]
+    pub retired_at: Option<String>,
+    #[serde(default)]
+    pub successor_id: Option<String>,
+    /// Bounded, non-secret identity metadata. Defaults to `{}`.
+    #[serde(default = "default_identity_policy_json")]
+    pub policy: Value,
+    /// `local` or `imported`. Imported identities are read-only until an
+    /// explicit rehome phase assigns them to a local project.
+    #[serde(default = "default_identity_origin")]
+    pub origin: String,
+}
+
+impl Default for AgentIdentity {
+    /// Defaults exist for forward-compatible decoding of partial payloads.
+    /// They are not a valid stored row; the store always writes every field.
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            project_id: String::new(),
+            role: String::new(),
+            department: None,
+            component: None,
+            title: None,
+            profile: None,
+            model: None,
+            parent_identity_id: None,
+            status: "active".to_string(),
+            generation: 1,
+            created_at: String::new(),
+            updated_at: String::new(),
+            retired_at: None,
+            successor_id: None,
+            policy: default_identity_policy_json(),
+            origin: default_identity_origin(),
+        }
+    }
+}
+
+/// One append-only project-scoped identity lifecycle event. Payloads contain a
+/// bounded identity snapshot and changed field names, never prompts or secrets.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentIdentityEvent {
+    #[serde(default)]
+    pub identity_id: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub payload: Value,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentIdentityListParams {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentIdentitiesResult {
+    #[serde(default)]
+    pub identities: Vec<AgentIdentity>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentIdentityParams {
+    #[serde(default)]
+    pub identity_id: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentIdentityResult {
+    #[serde(default)]
+    pub identity: AgentIdentity,
+    #[serde(default)]
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CreateAgentIdentityParams {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub department: Option<String>,
+    #[serde(default)]
+    pub component: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub parent_identity_id: Option<String>,
+    #[serde(default)]
+    pub policy: Option<Value>,
+}
+
+/// Distinguish an omitted field (`None`) from an explicit JSON `null`
+/// (`Some(None)`) and a value (`Some(Some(value))`).
+fn deserialize_present_option<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateAgentIdentityParams {
+    #[serde(default)]
+    pub identity_id: String,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    pub department: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    pub component: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    pub title: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    pub profile: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    pub model: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    pub parent_identity_id: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    pub successor_id: Option<Option<String>>,
+    #[serde(default)]
+    pub policy: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PauseAgentIdentityParams {
+    #[serde(default)]
+    pub identity_id: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResumeAgentIdentityParams {
+    #[serde(default)]
+    pub identity_id: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RetireAgentIdentityParams {
+    #[serde(default)]
+    pub identity_id: String,
+    #[serde(default)]
+    pub successor_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentIdentityPolicyParams {
+    #[serde(default)]
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SetAgentIdentityPolicyParams {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub policy: AgentIdentityPolicy,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentIdentityPolicyResult {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub policy: AgentIdentityPolicy,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentIdentityReplayParams {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub repair: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentIdentityReplayReport {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub identities: u64,
+    #[serde(default)]
+    pub events: u64,
+    #[serde(default)]
+    pub consistent: bool,
+    #[serde(default)]
+    pub repaired: bool,
+    #[serde(default)]
+    pub mismatches: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -16900,11 +17339,14 @@ mod context_checkpoint_bundle_tests {
                 evidence: EffectEvidence::observed("workspace_sha256"),
                 ..Default::default()
             }],
+            agent_identities: Vec::new(),
+            agent_identity_events: Vec::new(),
         };
         let encoded = serde_json::to_string(&bundle).unwrap();
         let decoded: SessionBundle = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded.context_checkpoints, bundle.context_checkpoints);
         assert_eq!(decoded.effects, bundle.effects);
+        assert!(decoded.agent_identities.is_empty());
         let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         assert_eq!(value["context_checkpoints"][0]["id"], "ctx-1");
         assert_eq!(value["context_checkpoints"][0]["source_compaction_seq"], 3);
@@ -16944,6 +17386,8 @@ mod context_checkpoint_bundle_tests {
         value.as_object_mut().unwrap().remove("context_checkpoints");
         let bundle: SessionBundle = serde_json::from_value(value).unwrap();
         assert!(bundle.context_checkpoints.is_empty());
+        assert!(bundle.agent_identities.is_empty());
+        assert!(bundle.agent_identity_events.is_empty());
     }
 
     #[test]
@@ -20069,5 +20513,116 @@ mod gate_protocol_tests {
         .unwrap();
         assert!(cancel.reason.is_none());
         assert!(cancel.cancelled_by.is_none());
+    }
+}
+
+#[cfg(test)]
+mod agent_identity_protocol_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn policy_defaults_disabled_and_decodes_partial_objects() {
+        let policy: AgentIdentityPolicy = serde_json::from_value(json!({})).unwrap();
+        assert!(!policy.enabled);
+        assert_eq!(policy.max_managers, 4);
+        assert_eq!(policy.max_workers, 10);
+        assert!(policy.hire_requires_approval);
+        assert!(policy.retirement_requires_approval);
+        let policy: AgentIdentityPolicy =
+            serde_json::from_value(json!({"enabled": true, "max_managers": 1})).unwrap();
+        assert!(policy.enabled);
+        assert_eq!(policy.max_managers, 1);
+        assert_eq!(policy.max_workers, 10);
+        assert!(policy.normalized().is_ok());
+        let invalid = AgentIdentityPolicy {
+            max_workers: 100,
+            ..AgentIdentityPolicy::default()
+        };
+        assert!(invalid.normalized().is_err());
+    }
+
+    #[test]
+    fn identity_decodes_with_additive_defaults_and_old_agent_records_still_decode() {
+        let identity: AgentIdentity = serde_json::from_value(json!({
+            "id": "id-1",
+            "project_id": "prj-1",
+            "role": "worker",
+            "status": "active"
+        }))
+        .unwrap();
+        assert_eq!(identity.id, "id-1");
+        assert_eq!(identity.generation, 1);
+        assert_eq!(identity.policy, json!({}));
+        assert_eq!(identity.origin, "local");
+        assert!(identity.department.is_none());
+
+        let legacy_agent: AgentRecord = serde_json::from_value(json!({
+            "id": "run-1",
+            "session_id": "ses-1",
+            "role": "leader",
+            "name": "Leader",
+            "parent_id": null,
+            "status": "running",
+            "model": "m",
+            "created_at": "2026-11-12T00:00:00Z"
+        }))
+        .unwrap();
+        assert!(legacy_agent.identity_id.is_none());
+    }
+
+    #[test]
+    fn update_params_distinguish_absent_null_and_value() {
+        let absent: UpdateAgentIdentityParams =
+            serde_json::from_value(json!({"identity_id": "id-1"})).unwrap();
+        assert!(absent.department.is_none());
+        let null: UpdateAgentIdentityParams =
+            serde_json::from_value(json!({"identity_id": "id-1", "department": null})).unwrap();
+        assert_eq!(null.department, Some(None));
+        let value: UpdateAgentIdentityParams =
+            serde_json::from_value(json!({"identity_id": "id-1", "department": "platform"}))
+                .unwrap();
+        assert_eq!(value.department, Some(Some("platform".to_string())));
+    }
+
+    #[test]
+    fn results_and_replay_reports_decode_with_bounded_defaults() {
+        let result: AgentIdentityResult = serde_json::from_value(json!({})).unwrap();
+        assert!(!result.changed);
+        assert!(result.identity.id.is_empty());
+        assert_eq!(result.identity.generation, 1);
+        let list: AgentIdentitiesResult = serde_json::from_value(json!({})).unwrap();
+        assert!(list.identities.is_empty());
+        let report: AgentIdentityReplayReport = serde_json::from_value(json!({})).unwrap();
+        assert!(!report.consistent);
+        assert!(!report.repaired);
+        assert!(report.mismatches.is_empty());
+        let policy: AgentIdentityPolicyResult = serde_json::from_value(json!({
+            "project_id": "prj-1"
+        }))
+        .unwrap();
+        assert!(!policy.policy.enabled);
+        assert_eq!(policy.project_id, "prj-1");
+    }
+
+    #[test]
+    fn event_payload_and_code_values_are_stable() {
+        let event: AgentIdentityEvent = serde_json::from_value(json!({
+            "identity_id": "id-1",
+            "project_id": "prj-1",
+            "seq": 3,
+            "type": "agent.identity.paused",
+            "payload": {"identity": {"id": "id-1"}, "changed_fields": ["status"]},
+            "created_at": "2026-11-12T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(event.kind, "agent.identity.paused");
+        assert_eq!(event.payload["changed_fields"], json!(["status"]));
+        assert_eq!(
+            agent_identity_codes::IDENTITY_ROLE_INVALID,
+            "IDENTITY_ROLE_INVALID"
+        );
+        assert!(AGENT_IDENTITY_ROLES.contains(&"leader"));
+        assert!(!AGENT_IDENTITY_ROLES.contains(&"labour"));
     }
 }

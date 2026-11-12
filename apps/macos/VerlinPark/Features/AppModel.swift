@@ -72,6 +72,9 @@ final class AppModel {
     var sessionDirectory: [String: SessionDirectoryEntry] = [:]
     var todos: [TodoItem] = []
     var agents: [AgentRecord] = []
+    var agentIdentities: [AgentIdentity] = []
+    var agentIdentitiesStatus: String?
+    var agentIdentitiesBusy = false
     var mergeQueue: [MergeQueueEntry] = []
     var mailbox: [AgentMessage] = []
     var artifacts: [Artifact] = []
@@ -8134,6 +8137,31 @@ final class AppModel {
             }
         } catch {
             // The event stream will retry on the next agent event.
+        }
+    }
+
+    /// Read-only project identity roster. There is intentionally no hire,
+    /// assign, pause, or retire action in the S1 client.
+    func loadAgentIdentities() async {
+        guard let projectID = selectedProjectID else {
+            agentIdentities = []
+            agentIdentitiesStatus = nil
+            return
+        }
+        agentIdentitiesBusy = true
+        defer { agentIdentitiesBusy = false }
+        do {
+            let rows = try await core.agentIdentities(projectID: projectID)
+            if projectID == selectedProjectID {
+                agentIdentities = rows
+                agentIdentitiesStatus = rows.isEmpty
+                    ? "No project identities."
+                    : "\(rows.count) identities"
+            }
+        } catch {
+            if projectID == selectedProjectID {
+                agentIdentitiesStatus = error.localizedDescription
+            }
         }
     }
 

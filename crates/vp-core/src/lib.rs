@@ -19,59 +19,63 @@ use vp_protocol::lsp::{LspLanguageStatus, LspStatusResult};
 use vp_protocol::now_rfc3339;
 use vp_protocol::remote::RemoteTestEvidence;
 use vp_protocol::types::{
-    AcpAgent, AcpAgentConfig, AcpAgentListResult, AcpProbeResult, AcpTransport, AgentMessage,
-    AgentRecord, Approval, ApprovalAuditEvent, ApprovalAuditResult, ApprovalBatchItemResult,
-    ApprovalBatchResolveResult, ApprovalGrant, ApprovalQueueResult, ApprovalTemplate,
-    ApprovalTemplateCreateParams, ApprovalTemplateDeleteParams, ApprovalTemplateDeleteResult,
-    ApprovalTemplateFromApprovalParams, ApprovalTemplateResult, ApprovalTemplateUpdateParams,
-    Artifact, ArtifactBackfillResult, ArtifactDiffParams, ArtifactDiffResult, ArtifactGcResult,
-    ArtifactMaterialization, ArtifactPolicy, ArtifactVersionsResult, AttentionPolicy,
-    AttentionPolicyResult, AttentionPolicySetParams, BudgetGovernorDecision, CachePolicy,
-    CheckpointPolicyResult, CheckpointRetentionPolicy, CitationAudit, CitationAuditMessage,
-    ConsoleCloseResult, ConsoleOpenResult, ConsoleReadResult, ConsoleSignalResult,
-    ConsoleWriteResult, ContextCompactionSummary, ContextMeasurement, ContextUsage,
-    ContinuationOutcome, ContractPolicy, CreateModelPresetParams, CriticalPathPolicy, DoctorCheck,
-    EffectPolicy, EffectReceipt, EffectReconcileParams, EffectReconcileResult, EffectState, Event,
-    ForgeOriginStatus, ForgePreflightResult, ForgeProviderStatus, ForgeStatusResult, GateRecord,
-    GitLogResult, GitShowResult, GovernorSessionStatus, IntakeCreateParams, IntakeListResult,
-    IntakeTask, IntakeUpdateParams, IntegrationPolicy, IntentDecisionRecord, MailboxGcResult,
-    MailboxPolicy, McpCallResult, McpGetPromptResult, McpPinActionResult, McpPinApproveParams,
-    McpPinRejectParams, McpProbeResult, McpPromptListResult, McpReadResourceResult,
-    McpResourceListResult, McpServer, McpServerConfig, McpServerListResult, McpToolListResult,
-    McpToolPin, MemoryBriefResult, MemoryConflict, MemoryConflictResolveResult,
-    MemoryConflictScanResult, MemoryConflictsResult, MemoryDeleteResult, MemoryEmbeddingPolicy,
-    MemoryEmbeddingsIndexRebuildResult, MemoryEmbeddingsIndexStatusResult,
-    MemoryEmbeddingsRebuildResult, MemoryEmbeddingsStatusResult, MemoryEmbeddingsTestResult,
-    MemoryEvidence, MemoryHealthResult, MemoryItem, MemoryListResult, MemoryMatch, MemoryPolicy,
-    MemoryPolicyResult, MemoryPruneResult, MemorySearchParams, MemorySearchResult,
-    MemorySemanticSummary, MemoryStatsResult, MemorySweepResult, MemoryUpdateResult,
-    MemoryVerificationCheck, MemoryVerifyResult, MergeQueueEntry, MessageCitation, MetricCount,
-    ModelPreset, ModelPresetListResult, OrchestrationDecision, OrchestrationNote,
-    OrchestrationOverviewResult, OrchestrationOverviewTotals, OrchestrationPolicy,
-    OrchestrationPreviewAction, OrchestrationPreviewResult, OrchestrationRecoveriesResult,
-    OrchestrationRecovery, OrchestrationSessionSummary, OrchestrationSnapshot,
-    PlanRevisionDetailResult, PlanRevisionInfo, PreemptionOverviewResult, PreemptionPolicy,
-    PreemptionRecord, ProcessListResult, ProcessLogsResult, ProcessPolicy, ProcessRestartResult,
-    ProcessStopResult, ProcessSupervisorStatus, Program, ProgramActionParams, ProgramCreateParams,
+    AcpAgent, AcpAgentConfig, AcpAgentListResult, AcpProbeResult, AcpTransport,
+    AgentIdentitiesResult, AgentIdentityPolicy, AgentIdentityReplayParams,
+    AgentIdentityReplayReport, AgentIdentityResult, AgentMessage, AgentRecord, Approval,
+    ApprovalAuditEvent, ApprovalAuditResult, ApprovalBatchItemResult, ApprovalBatchResolveResult,
+    ApprovalGrant, ApprovalQueueResult, ApprovalTemplate, ApprovalTemplateCreateParams,
+    ApprovalTemplateDeleteParams, ApprovalTemplateDeleteResult, ApprovalTemplateFromApprovalParams,
+    ApprovalTemplateResult, ApprovalTemplateUpdateParams, Artifact, ArtifactBackfillResult,
+    ArtifactDiffParams, ArtifactDiffResult, ArtifactGcResult, ArtifactMaterialization,
+    ArtifactPolicy, ArtifactVersionsResult, AttentionPolicy, AttentionPolicyResult,
+    AttentionPolicySetParams, BudgetGovernorDecision, CachePolicy, CheckpointPolicyResult,
+    CheckpointRetentionPolicy, CitationAudit, CitationAuditMessage, ConsoleCloseResult,
+    ConsoleOpenResult, ConsoleReadResult, ConsoleSignalResult, ConsoleWriteResult,
+    ContextCompactionSummary, ContextMeasurement, ContextUsage, ContinuationOutcome,
+    ContractPolicy, CreateAgentIdentityParams, CreateModelPresetParams, CriticalPathPolicy,
+    DoctorCheck, EffectPolicy, EffectReceipt, EffectReconcileParams, EffectReconcileResult,
+    EffectState, Event, ForgeOriginStatus, ForgePreflightResult, ForgeProviderStatus,
+    ForgeStatusResult, GateRecord, GitLogResult, GitShowResult, GovernorSessionStatus,
+    IntakeCreateParams, IntakeListResult, IntakeTask, IntakeUpdateParams, IntegrationPolicy,
+    IntentDecisionRecord, MailboxGcResult, MailboxPolicy, McpCallResult, McpGetPromptResult,
+    McpPinActionResult, McpPinApproveParams, McpPinRejectParams, McpProbeResult,
+    McpPromptListResult, McpReadResourceResult, McpResourceListResult, McpServer, McpServerConfig,
+    McpServerListResult, McpToolListResult, McpToolPin, MemoryBriefResult, MemoryConflict,
+    MemoryConflictResolveResult, MemoryConflictScanResult, MemoryConflictsResult,
+    MemoryDeleteResult, MemoryEmbeddingPolicy, MemoryEmbeddingsIndexRebuildResult,
+    MemoryEmbeddingsIndexStatusResult, MemoryEmbeddingsRebuildResult, MemoryEmbeddingsStatusResult,
+    MemoryEmbeddingsTestResult, MemoryEvidence, MemoryHealthResult, MemoryItem, MemoryListResult,
+    MemoryMatch, MemoryPolicy, MemoryPolicyResult, MemoryPruneResult, MemorySearchParams,
+    MemorySearchResult, MemorySemanticSummary, MemoryStatsResult, MemorySweepResult,
+    MemoryUpdateResult, MemoryVerificationCheck, MemoryVerifyResult, MergeQueueEntry,
+    MessageCitation, MetricCount, ModelPreset, ModelPresetListResult, OrchestrationDecision,
+    OrchestrationNote, OrchestrationOverviewResult, OrchestrationOverviewTotals,
+    OrchestrationPolicy, OrchestrationPreviewAction, OrchestrationPreviewResult,
+    OrchestrationRecoveriesResult, OrchestrationRecovery, OrchestrationSessionSummary,
+    OrchestrationSnapshot, PauseAgentIdentityParams, PlanRevisionDetailResult, PlanRevisionInfo,
+    PreemptionOverviewResult, PreemptionPolicy, PreemptionRecord, ProcessListResult,
+    ProcessLogsResult, ProcessPolicy, ProcessRestartResult, ProcessStopResult,
+    ProcessSupervisorStatus, Program, ProgramActionParams, ProgramCreateParams,
     ProgramDeleteParams, ProgramListResult, ProgramMilestone, ProgramMilestoneActionParams,
     ProgramMilestoneCreateParams, ProgramMilestoneListResult, ProgramMilestoneUpdateParams,
     ProgramPolicy, ProgramReplayReport, ProgramStatus, ProgramStatusParams, ProgramStatusResult,
     ProgramTickParams, ProgramTickResult, ProgramUpdateParams, Project, ProjectBudget,
     ProjectBudgetResult, ProjectCacheEpochPruneResult, ProjectCacheEpochResult,
     ProjectMcpPinsResult, ProjectUsageResult, PromptPrefixAggregate, PromptPrefixObservation,
-    PullRequestResult, Question, QuestionListResult, ReviseTeamPlanResult, ScheduledTask,
-    SearchResult, Session, SessionBundle, SessionCacheStatus, SessionCheckpoint,
-    SessionCheckpointDeleteResult, SessionCheckpointDiffResult, SessionCheckpointListResult,
-    SessionCheckpointPruneResult, SessionCheckpointRestoreResult, SessionCheckpointStatsResult,
-    SessionCitationAuditResult, SessionCitationsResult, SessionCommit, SessionCompareFile,
-    SessionCompareResult, SessionContextStatus, SessionContinuation,
-    SessionContinuationCancelResult, SessionContinuationClaimInfo,
-    SessionContinuationReclaimResult, SessionContinuationStatusResult, SessionContinuationsResult,
-    SessionContractResult, SessionDeferResult, SessionDiff, SessionEffectsResult,
-    SessionForkResult, SessionForkTreeNode, SessionForkTreeResult, SessionImportResult,
-    SessionInstructionSection, SessionInstructionStateReport, SessionInstructionsReport,
-    SessionLandResult, SessionLineageEntry, SessionLineageResult, SessionLogStatus,
-    SessionPreemptionResult, SessionPriorityResult, SessionRehydrateResult, SessionReplayReport,
+    PullRequestResult, Question, QuestionListResult, ResumeAgentIdentityParams,
+    RetireAgentIdentityParams, ReviseTeamPlanResult, ScheduledTask, SearchResult, Session,
+    SessionBundle, SessionCacheStatus, SessionCheckpoint, SessionCheckpointDeleteResult,
+    SessionCheckpointDiffResult, SessionCheckpointListResult, SessionCheckpointPruneResult,
+    SessionCheckpointRestoreResult, SessionCheckpointStatsResult, SessionCitationAuditResult,
+    SessionCitationsResult, SessionCommit, SessionCompareFile, SessionCompareResult,
+    SessionContextStatus, SessionContinuation, SessionContinuationCancelResult,
+    SessionContinuationClaimInfo, SessionContinuationReclaimResult,
+    SessionContinuationStatusResult, SessionContinuationsResult, SessionContractResult,
+    SessionDeferResult, SessionDiff, SessionEffectsResult, SessionForkResult, SessionForkTreeNode,
+    SessionForkTreeResult, SessionImportResult, SessionInstructionSection,
+    SessionInstructionStateReport, SessionInstructionsReport, SessionLandResult,
+    SessionLineageEntry, SessionLineageResult, SessionLogStatus, SessionPreemptionResult,
+    SessionPriorityResult, SessionRehydrateResult, SessionReplayReport,
     SessionSkillActivationsResult, SessionStallsResult, SessionSteerResult,
     SessionSteeringCancelResult, SessionSteeringListResult, SessionTranscriptResult,
     SessionUnlimitedResult, ShellPolicy, Skill, SkillActivation, SkillCreateParams,
@@ -88,11 +92,11 @@ use vp_protocol::types::{
     ToolActivityEntry, ToolActivityResult, ToolActivitySummary, ToolActivityToolStat,
     ToolOutputAuditParams, ToolOutputAuditResult, ToolOutputListParams, ToolOutputListResult,
     ToolOutputPolicy, ToolOutputPolicyResult, ToolOutputPruneParams, ToolOutputPruneResult,
-    ToolOutputStatus, ToolOutputStatusParams, UpdateModelPresetParams, UpdateSourceMetadataParams,
-    UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult, UsageTotals, WorkspaceFileResult,
-    WorkspaceGrepResult, WorkspaceListResult, WorkspaceSearchResult, WorkspaceTreeResult,
-    WorkspaceWriteResult, WorktreeCleanupEntry, WorktreeCleanupResult, WorktreePolicyResult,
-    WorktreeRetentionPolicy, WriteLease,
+    ToolOutputStatus, ToolOutputStatusParams, UpdateAgentIdentityParams, UpdateModelPresetParams,
+    UpdateSourceMetadataParams, UsageBucket, UsageCsvResult, UsageEntry, UsageLedgerResult,
+    UsageTotals, WorkspaceFileResult, WorkspaceGrepResult, WorkspaceListResult,
+    WorkspaceSearchResult, WorkspaceTreeResult, WorkspaceWriteResult, WorktreeCleanupEntry,
+    WorktreeCleanupResult, WorktreePolicyResult, WorktreeRetentionPolicy, WriteLease,
 };
 use vp_store::Store;
 use vp_store::store::{
@@ -129,6 +133,7 @@ pub mod forge;
 pub mod gate;
 pub mod gui;
 pub mod history;
+pub mod identity;
 pub mod instruction;
 pub mod mcp;
 pub mod mcp_pins;
@@ -16966,6 +16971,16 @@ impl Engine {
             Ok::<_, anyhow::Error>(rows)
         })
         .await??;
+        let identity_store = store.clone();
+        let identity_project = project.id.clone();
+        let (agent_identities, agent_identity_events) = tokio::task::spawn_blocking(move || {
+            Ok::<_, anyhow::Error>((
+                identity_store.list_agent_identities(&identity_project, None, None)?,
+                identity_store
+                    .list_agent_identity_events_for_project(&identity_project, Some(100_000))?,
+            ))
+        })
+        .await??;
         Ok(SessionBundle {
             version: 1,
             exported_at: vp_protocol::now_rfc3339(),
@@ -17003,6 +17018,8 @@ impl Engine {
             instructions: data.instructions,
             prompt_prefix_observations: data.prompt_prefix_observations,
             effects: data.effects,
+            agent_identities,
+            agent_identity_events,
         })
     }
 
@@ -17530,6 +17547,207 @@ impl Engine {
         let store = self.store.clone();
         let id = session_id.to_string();
         tokio::task::spawn_blocking(move || store.list_agents(&id)).await?
+    }
+
+    // ---------------------------------------------------------------------
+    // Project-scoped agent identities
+    // ---------------------------------------------------------------------
+
+    pub async fn get_agent_identity_policy(&self, project_id: &str) -> Result<AgentIdentityPolicy> {
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        tokio::task::spawn_blocking(move || store.get_agent_identity_policy(&project_id)).await?
+    }
+
+    pub async fn set_agent_identity_policy(
+        &self,
+        project_id: &str,
+        policy: AgentIdentityPolicy,
+    ) -> Result<AgentIdentityPolicy> {
+        let store = self.store.clone();
+        let project_id_for_check = project_id.to_string();
+        tokio::task::spawn_blocking(move || store.get_project(&project_id_for_check))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("project not found: {project_id}"))?;
+        let policy = crate::identity::normalize_policy(&policy)?;
+        let for_store = policy.clone();
+        let project_id = project_id.to_string();
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            store.set_agent_identity_policy(&project_id, &for_store)
+        })
+        .await??;
+        Ok(policy)
+    }
+
+    /// Explicit identity creation. No session, run, inbox, workspace, or memory
+    /// row is created as a side effect.
+    pub async fn create_agent_identity(
+        &self,
+        params: CreateAgentIdentityParams,
+    ) -> Result<AgentIdentityResult> {
+        let store = self.store.clone();
+        let (identity, _event) =
+            tokio::task::spawn_blocking(move || store.create_agent_identity(&params)).await??;
+        Ok(AgentIdentityResult {
+            identity,
+            changed: true,
+        })
+    }
+
+    pub async fn get_agent_identity(&self, identity_id: &str) -> Result<AgentIdentityResult> {
+        let store = self.store.clone();
+        let identity_id = identity_id.to_string();
+        let identity = tokio::task::spawn_blocking(move || store.get_agent_identity(&identity_id))
+            .await??
+            .ok_or_else(|| {
+                vp_protocol::types::AgentIdentityError::new(
+                    crate::identity::codes::IDENTITY_NOT_FOUND,
+                    "agent identity not found",
+                )
+            })?;
+        Ok(AgentIdentityResult {
+            identity,
+            changed: false,
+        })
+    }
+
+    pub async fn list_agent_identities_for_project(
+        &self,
+        project_id: &str,
+        role: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<AgentIdentitiesResult> {
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        let role = role.map(str::to_string);
+        let status = status.map(str::to_string);
+        let identities = tokio::task::spawn_blocking(move || {
+            store.list_agent_identities(&project_id, role.as_deref(), status.as_deref())
+        })
+        .await??;
+        Ok(AgentIdentitiesResult { identities })
+    }
+
+    pub async fn update_agent_identity(
+        &self,
+        params: UpdateAgentIdentityParams,
+    ) -> Result<AgentIdentityResult> {
+        let store = self.store.clone();
+        let identity_id = params.identity_id.clone();
+        match tokio::task::spawn_blocking(move || store.update_agent_identity(&params)).await?? {
+            Some((identity, _event)) => Ok(AgentIdentityResult {
+                identity,
+                changed: true,
+            }),
+            None => {
+                let current = self.get_agent_identity(&identity_id).await?;
+                Ok(AgentIdentityResult {
+                    identity: current.identity,
+                    changed: false,
+                })
+            }
+        }
+    }
+
+    pub async fn pause_agent_identity(
+        &self,
+        params: PauseAgentIdentityParams,
+    ) -> Result<AgentIdentityResult> {
+        let store = self.store.clone();
+        let identity_id = params.identity_id.clone();
+        match tokio::task::spawn_blocking(move || store.pause_agent_identity(&params.identity_id))
+            .await??
+        {
+            Some((identity, _event)) => Ok(AgentIdentityResult {
+                identity,
+                changed: true,
+            }),
+            None => {
+                let current = self.get_agent_identity(&identity_id).await?;
+                Ok(AgentIdentityResult {
+                    identity: current.identity,
+                    changed: false,
+                })
+            }
+        }
+    }
+
+    pub async fn resume_agent_identity(
+        &self,
+        params: ResumeAgentIdentityParams,
+    ) -> Result<AgentIdentityResult> {
+        let store = self.store.clone();
+        let identity_id = params.identity_id.clone();
+        match tokio::task::spawn_blocking(move || store.resume_agent_identity(&params.identity_id))
+            .await??
+        {
+            Some((identity, _event)) => Ok(AgentIdentityResult {
+                identity,
+                changed: true,
+            }),
+            None => {
+                let current = self.get_agent_identity(&identity_id).await?;
+                Ok(AgentIdentityResult {
+                    identity: current.identity,
+                    changed: false,
+                })
+            }
+        }
+    }
+
+    pub async fn retire_agent_identity(
+        &self,
+        params: RetireAgentIdentityParams,
+    ) -> Result<AgentIdentityResult> {
+        let store = self.store.clone();
+        let identity_id = params.identity_id.clone();
+        match tokio::task::spawn_blocking(move || store.retire_agent_identity(&params)).await?? {
+            Some((identity, _event)) => Ok(AgentIdentityResult {
+                identity,
+                changed: true,
+            }),
+            None => {
+                let current = self.get_agent_identity(&identity_id).await?;
+                Ok(AgentIdentityResult {
+                    identity: current.identity,
+                    changed: false,
+                })
+            }
+        }
+    }
+
+    /// Read-only identity replay, or explicit projection repair. It never
+    /// appends lifecycle events and never assigns identities to sessions.
+    pub async fn replay_agent_identities(
+        &self,
+        params: AgentIdentityReplayParams,
+    ) -> Result<AgentIdentityReplayReport> {
+        let store = self.store.clone();
+        let project_id = params.project_id;
+        let repair = params.repair;
+        tokio::task::spawn_blocking(move || {
+            let events =
+                store.list_agent_identity_events_for_project(&project_id, Some(100_000))?;
+            let expected = crate::identity::identities_from_events(&events)?;
+            let mut actual = store.list_agent_identities(&project_id, None, None)?;
+            let mut mismatches = crate::identity::compare_identity_projection(&expected, &actual);
+            let mut repaired = false;
+            if repair && !mismatches.is_empty() {
+                store.replace_agent_identity_projection(&project_id, &expected)?;
+                actual = store.list_agent_identities(&project_id, None, None)?;
+                mismatches = crate::identity::compare_identity_projection(&expected, &actual);
+                repaired = true;
+            }
+            Ok(crate::identity::replay_report(
+                &project_id,
+                &expected,
+                events.len(),
+                repaired,
+                mismatches,
+            ))
+        })
+        .await?
     }
 
     #[allow(clippy::too_many_arguments)]
