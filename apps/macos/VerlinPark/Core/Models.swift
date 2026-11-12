@@ -6579,6 +6579,9 @@ struct MergeQueueEntry: Codable, Identifiable, Hashable, Sendable {
     let remoteBranch: String?
     let bundleSha256: String?
     let importedRef: String?
+    let remoteTestEvidenceId: String?
+    let remoteTestDigest: String?
+    let remoteTestStatus: String?
     let createdAt: String
     let updatedAt: String
 
@@ -6604,6 +6607,9 @@ struct MergeQueueEntry: Codable, Identifiable, Hashable, Sendable {
         case remoteBranch = "remote_branch"
         case bundleSha256 = "bundle_sha256"
         case importedRef = "imported_ref"
+        case remoteTestEvidenceId = "remote_test_evidence_id"
+        case remoteTestDigest = "remote_test_digest"
+        case remoteTestStatus = "remote_test_status"
         case createdAt = "created_at"
         case updatedAt = "updated_at"
     }
@@ -6690,6 +6696,9 @@ struct RemoteIntegrationQueueEntry: Codable, Identifiable, Hashable, Sendable {
     let verifierApproved: Bool?
     let verifierSummary: String?
     let environmentCaveat: String?
+    let remoteTestEvidenceId: String?
+    let remoteTestDigest: String?
+    let remoteTestStatus: String?
     let attempt: Int
     let detail: String?
     let createdAt: String
@@ -6708,6 +6717,9 @@ struct RemoteIntegrationQueueEntry: Codable, Identifiable, Hashable, Sendable {
         case verifierApproved = "verifier_approved"
         case verifierSummary = "verifier_summary"
         case environmentCaveat = "environment_caveat"
+        case remoteTestEvidenceId = "remote_test_evidence_id"
+        case remoteTestDigest = "remote_test_digest"
+        case remoteTestStatus = "remote_test_status"
         case attempt
         case detail
         case createdAt = "created_at"
@@ -6762,6 +6774,182 @@ struct RemoteIntegrationStatusResult: Codable, Sendable {
         case retainedRefs = "retained_refs"
         case verifierRequired = "verifier_required"
         case environmentCaveat = "environment_caveat"
+    }
+}
+
+struct RemoteBootstrapRecord: Codable, Sendable, Equatable {
+    let projectId: String
+    let host: String
+    let installPath: String
+    let sha256: String
+    let bytes: Int
+    let helperVersion: String
+    let protocolVersion: Int
+    let targetOs: String
+    let targetArch: String
+    let installedAt: String
+    let updatedAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case host
+        case installPath = "install_path"
+        case sha256
+        case bytes
+        case helperVersion = "helper_version"
+        case protocolVersion = "protocol_version"
+        case targetOs = "target_os"
+        case targetArch = "target_arch"
+        case installedAt = "installed_at"
+        case updatedAt = "updated_at"
+    }
+}
+
+struct RemoteBootstrapStatusResult: Codable, Sendable {
+    let projectId: String
+    let configured: Bool
+    let host: String?
+    let installPath: String
+    let configuredHelperPath: String
+    let pathMatchesConfig: Bool
+    let record: RemoteBootstrapRecord?
+    let risk: String
+    let approvalRequired: Bool
+    let environmentCaveat: String
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case configured
+        case host
+        case installPath = "install_path"
+        case configuredHelperPath = "configured_helper_path"
+        case pathMatchesConfig = "path_matches_config"
+        case record
+        case risk
+        case approvalRequired = "approval_required"
+        case environmentCaveat = "environment_caveat"
+    }
+}
+
+struct RemoteTestProfile: Codable, Sendable, Equatable {
+    let name: String
+    let kind: String
+    let command: String
+    let cwd: String?
+    let timeoutSecs: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case kind
+        case command
+        case cwd
+        case timeoutSecs = "timeout_secs"
+    }
+}
+
+struct RemoteTestPolicy: Codable, Sendable, Equatable {
+    let enabled: Bool
+    let defaultProfile: String?
+    let profiles: [RemoteTestProfile]
+    let timeoutSecs: Int
+    let outputCapBytes: Int
+
+    static let disabled = RemoteTestPolicy(
+        enabled: false,
+        defaultProfile: nil,
+        profiles: [],
+        timeoutSecs: 900,
+        outputCapBytes: 65536
+    )
+
+    enum CodingKeys: String, CodingKey {
+        case enabled
+        case defaultProfile = "default_profile"
+        case profiles
+        case timeoutSecs = "timeout_secs"
+        case outputCapBytes = "output_cap_bytes"
+    }
+}
+
+struct RemoteTestEvidence: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let projectId: String
+    let sessionId: String
+    let entryId: String?
+    let profile: String
+    let kind: String
+    let host: String
+    let commit: String
+    let command: String
+    let cwd: String?
+    let status: String
+    let exitCode: Int?
+    let durationMs: Int
+    let outputRef: String?
+    let outputSha256: String?
+    let outputBytes: Int
+    let outputTruncated: Bool
+    let timedOut: Bool
+    let detail: String?
+    let digest: String
+    let environmentCaveat: String
+    let createdAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case projectId = "project_id"
+        case sessionId = "session_id"
+        case entryId = "entry_id"
+        case profile
+        case kind
+        case host
+        case commit
+        case command
+        case cwd
+        case status
+        case exitCode = "exit_code"
+        case durationMs = "duration_ms"
+        case outputRef = "output_ref"
+        case outputSha256 = "output_sha256"
+        case outputBytes = "output_bytes"
+        case outputTruncated = "output_truncated"
+        case timedOut = "timed_out"
+        case detail
+        case digest
+        case environmentCaveat = "environment_caveat"
+        case createdAt = "created_at"
+    }
+}
+
+struct RemoteTestStatusResult: Codable, Sendable {
+    let projectId: String
+    let sessionId: String?
+    let entryId: String?
+    let policy: RemoteTestPolicy
+    let evidence: [RemoteTestEvidence]
+    let total: Int
+    let passed: Int
+    let failed: Int
+    let timedOut: Int
+    let latestDigest: String?
+    let environmentCaveat: String
+    let localVerifierRequired: Bool
+    let mergeGateUnchanged: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case sessionId = "session_id"
+        case entryId = "entry_id"
+        case policy
+        case evidence
+        case total
+        case passed
+        case failed
+        case timedOut = "timed_out"
+        case latestDigest = "latest_digest"
+        case environmentCaveat = "environment_caveat"
+        case localVerifierRequired = "local_verifier_required"
+        case mergeGateUnchanged = "merge_gate_unchanged"
     }
 }
 

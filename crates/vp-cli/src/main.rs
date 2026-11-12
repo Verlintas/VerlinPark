@@ -18,7 +18,9 @@ use vp_core::backup::repository::{
 };
 use vp_core::backup::signing::{Keyring, SecretSource, default_key_dir};
 use vp_protocol::discovery::Discovery;
-use vp_protocol::remote::RemoteIntegrationPolicy;
+use vp_protocol::remote::{
+    RemoteIntegrationPolicy, RemoteTestKind, RemoteTestPolicy, RemoteTestProfile,
+};
 use vp_protocol::rpc::RpcResponse;
 use vp_store::paths;
 
@@ -681,6 +683,117 @@ enum Command {
         entry: Option<String>,
         #[arg(long)]
         force: bool,
+    },
+    /// Upload and install the local vp-remote-agent on a project's SSH host.
+    /// This is an explicit host-state action: it requires --confirm and never
+    /// uses sudo.
+    #[command(name = "remote-bootstrap")]
+    RemoteBootstrap {
+        project: String,
+        /// Install path on the remote host (default: the configured helper path
+        /// or ~/.verlinpark/bin/vp-remote-agent). Paths outside the SSH user's
+        /// home are rejected; sudo is never used.
+        #[arg(long)]
+        install_path: Option<String>,
+        /// Pin the expected SHA-256 of the local helper binary.
+        #[arg(long)]
+        expected_sha256: Option<String>,
+        /// Pin the expected helper version (default: this build).
+        #[arg(long)]
+        expected_version: Option<String>,
+        /// Replace an existing helper. Without this flag bootstrap refuses.
+        #[arg(long)]
+        force: bool,
+        /// Required explicit operator confirmation for this host-level install.
+        #[arg(long)]
+        confirm: bool,
+        /// Bounded SSH/bootstrap timeout in seconds.
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// Optional session that receives a remote.bootstrap.completed event.
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Show the last recorded helper install for a project without connecting.
+    #[command(name = "remote-bootstrap-status")]
+    RemoteBootstrapStatus { project: String },
+    /// Run one bounded remote project check and record supplemental evidence.
+    #[command(name = "remote-test")]
+    RemoteTest {
+        project: String,
+        /// Session that receives the remote_test.completed event. Required
+        /// unless --entry derives it.
+        #[arg(long)]
+        session: Option<String>,
+        /// Remote merge-queue entry to attach the evidence digest to.
+        #[arg(long)]
+        entry: Option<String>,
+        /// Named profile from the project remote test policy.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Explicit one-off command (requires an enabled policy).
+        #[arg(long)]
+        command: Option<String>,
+        /// Working directory relative to the remote root.
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Bounded command timeout in seconds.
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// Per-stream output cap in bytes.
+        #[arg(long = "output-cap")]
+        output_cap: Option<u64>,
+        /// Assert the exact remote HEAD before running.
+        #[arg(long)]
+        expected_commit: Option<String>,
+    },
+    /// Show remote test evidence and the project policy.
+    #[command(name = "remote-test-status")]
+    RemoteTestStatus {
+        project: String,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        entry: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    /// Read a bounded page of a retained remote test output body.
+    #[command(name = "remote-test-output")]
+    RemoteTestOutput {
+        project: String,
+        evidence: String,
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
+        #[arg(long, default_value_t = 65536)]
+        limit: u64,
+    },
+    /// Show the project remote test policy.
+    #[command(name = "remote-test-policy")]
+    RemoteTestPolicy { project: String },
+    /// Update the project remote test policy. Profile syntax is
+    /// `name:kind:command` with kind check|lint|test|other.
+    #[command(name = "remote-test-policy-set")]
+    RemoteTestPolicySet {
+        project: String,
+        #[arg(long)]
+        enable: bool,
+        #[arg(long)]
+        disable: bool,
+        #[arg(long = "default")]
+        default_profile: Option<String>,
+        #[arg(long)]
+        timeout: Option<u64>,
+        #[arg(long = "output-cap")]
+        output_cap: Option<u64>,
+        /// Add or replace a profile (repeatable): name:kind:command.
+        #[arg(long = "profile")]
+        profiles: Vec<String>,
+        /// Remove a named profile (repeatable).
+        #[arg(long = "remove-profile")]
+        remove_profiles: Vec<String>,
+        #[arg(long)]
+        clear_profiles: bool,
     },
     /// Show the project's remote integration policy.
     #[command(name = "remote-integration-policy")]
@@ -3911,6 +4024,205 @@ async fn run(cli: Cli) -> Result<()> {
                     "confirm": confirm,
                     "keep_import_refs": if keep_import_refs { Some(true) } else { None },
                 }),
+            )
+            .await?
+        }
+        Command::RemoteBootstrap {
+            project,
+            install_path,
+            expected_sha256,
+            expected_version,
+            force,
+            confirm,
+            timeout,
+            session,
+        } => {
+            rpc(
+                &discovery,
+                "remote.bootstrap",
+                json!({
+                    "project_id": project,
+                    "install_path": install_path,
+                    "expected_sha256": expected_sha256,
+                    "expected_version": expected_version,
+                    "force": force,
+                    "confirm": confirm,
+                    "timeout_secs": timeout,
+                    "session_id": session,
+                }),
+            )
+            .await?
+        }
+        Command::RemoteBootstrapStatus { project } => {
+            rpc(
+                &discovery,
+                "remote.bootstrap.status",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::RemoteTest {
+            project,
+            session,
+            entry,
+            profile,
+            command,
+            cwd,
+            timeout,
+            output_cap,
+            expected_commit,
+        } => {
+            rpc(
+                &discovery,
+                "remote.test",
+                json!({
+                    "project_id": project,
+                    "session_id": session.unwrap_or_default(),
+                    "entry_id": entry,
+                    "profile": profile,
+                    "command": command,
+                    "cwd": cwd,
+                    "timeout_secs": timeout,
+                    "output_cap_bytes": output_cap,
+                    "expected_commit": expected_commit,
+                }),
+            )
+            .await?
+        }
+        Command::RemoteTestStatus {
+            project,
+            session,
+            entry,
+            limit,
+        } => {
+            rpc(
+                &discovery,
+                "remote.test.status",
+                json!({
+                    "project_id": project,
+                    "session_id": session,
+                    "entry_id": entry,
+                    "limit": limit,
+                }),
+            )
+            .await?
+        }
+        Command::RemoteTestOutput {
+            project,
+            evidence,
+            offset,
+            limit,
+        } => {
+            rpc(
+                &discovery,
+                "remote.test.output",
+                json!({
+                    "project_id": project,
+                    "evidence_id": evidence,
+                    "offset": offset,
+                    "limit": limit,
+                }),
+            )
+            .await?
+        }
+        Command::RemoteTestPolicy { project } => {
+            rpc(
+                &discovery,
+                "remote.test.policy.get",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::RemoteTestPolicySet {
+            project,
+            enable,
+            disable,
+            default_profile,
+            timeout,
+            output_cap,
+            profiles,
+            remove_profiles,
+            clear_profiles,
+        } => {
+            if enable && disable {
+                bail!("use either --enable or --disable, not both");
+            }
+            let current = rpc(
+                &discovery,
+                "remote.test.policy.get",
+                json!({"project_id": project}),
+            )
+            .await?;
+            let mut policy: RemoteTestPolicy = serde_json::from_value(
+                current
+                    .get("policy")
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("policy response is missing `policy`"))?,
+            )
+            .context("decoding the current remote test policy")?;
+            if enable {
+                policy.enabled = true;
+            }
+            if disable {
+                policy.enabled = false;
+            }
+            if let Some(default) = default_profile {
+                policy.default_profile = Some(default);
+            }
+            if let Some(timeout) = timeout {
+                policy.timeout_secs = timeout;
+            }
+            if let Some(output_cap) = output_cap {
+                policy.output_cap_bytes = output_cap;
+            }
+            if clear_profiles {
+                policy.profiles.clear();
+            }
+            for name in remove_profiles {
+                policy.profiles.retain(|profile| profile.name != name);
+            }
+            for raw in profiles {
+                let mut parts = raw.splitn(3, ':');
+                let name = parts.next().unwrap_or_default().trim();
+                let kind = parts.next().unwrap_or("other").trim();
+                let command = parts.next().unwrap_or_default();
+                if name.is_empty() || command.trim().is_empty() {
+                    bail!("profile {raw:?} must be name:kind:command");
+                }
+                let kind = match kind {
+                    "check" => RemoteTestKind::Check,
+                    "lint" => RemoteTestKind::Lint,
+                    "test" => RemoteTestKind::Test,
+                    "other" => RemoteTestKind::Other,
+                    other => bail!("unknown remote test kind {other:?}; use check|lint|test|other"),
+                };
+                let profile = RemoteTestProfile {
+                    name: name.to_string(),
+                    kind,
+                    command: command.to_string(),
+                    cwd: None,
+                    timeout_secs: None,
+                };
+                profile
+                    .validate()
+                    .map_err(|message| anyhow::anyhow!("invalid remote test profile: {message}"))?;
+                if let Some(existing) = policy
+                    .profiles
+                    .iter_mut()
+                    .find(|existing| existing.name == profile.name)
+                {
+                    *existing = profile;
+                } else {
+                    policy.profiles.push(profile);
+                }
+            }
+            policy
+                .validate()
+                .map_err(|message| anyhow::anyhow!("invalid remote test policy: {message}"))?;
+            rpc(
+                &discovery,
+                "remote.test.policy.set",
+                json!({"project_id": project, "policy": policy}),
             )
             .await?
         }
@@ -10008,6 +10320,203 @@ fn scaling_lines(value: &Value) -> Option<Vec<String>> {
     None
 }
 
+fn remote_bootstrap_lines(value: &Value) -> Option<Vec<String>> {
+    if value.get("used_sudo").is_some()
+        && value.get("sha256").is_some()
+        && value.get("host").is_some()
+    {
+        let mut lines = vec![format!(
+            "remote bootstrap {}  {}:{}  {}",
+            if value["replaced"].as_bool().unwrap_or(false) {
+                "replaced"
+            } else {
+                "installed"
+            },
+            value["host"].as_str().unwrap_or("?"),
+            value["install_path"].as_str().unwrap_or("?"),
+            value["helper_version"].as_str().unwrap_or("?")
+        )];
+        lines.push(format!(
+            "  sha256 {}  bytes {}  protocol {}  target {}/{}  sudo {}",
+            value["sha256"].as_str().unwrap_or("?"),
+            value["bytes"].as_u64().unwrap_or(0),
+            value["protocol_version"].as_u64().unwrap_or(0),
+            value["target_os"].as_str().unwrap_or("?"),
+            value["target_arch"].as_str().unwrap_or("?"),
+            value["used_sudo"].as_bool().unwrap_or(true)
+        ));
+        lines.push(format!(
+            "  risk {}  confirmation required  chunks {}  duration {}ms",
+            value["risk"].as_str().unwrap_or("host_state"),
+            value["chunks"].as_u64().unwrap_or(0),
+            value["duration_ms"].as_u64().unwrap_or(0)
+        ));
+        if value["host_path_mismatch"].as_bool().unwrap_or(false) {
+            lines.push(
+                "  note: ExecutionHost.helper_path does not name the installed file; update the host config explicitly"
+                    .to_string(),
+            );
+        }
+        if let Some(caveat) = value["environment_caveat"].as_str() {
+            lines.push(format!("  caveat: {caveat}"));
+        }
+        return Some(lines);
+    }
+    if value.get("configured").is_some() && value.get("configured_helper_path").is_some() {
+        let mut lines = vec![format!(
+            "remote bootstrap status for {}: configured={} path={}",
+            value["project_id"].as_str().unwrap_or("?"),
+            value["configured"].as_bool().unwrap_or(false),
+            value["install_path"].as_str().unwrap_or("?")
+        )];
+        lines.push(format!(
+            "  helper config {}  path matches install {}  risk {}",
+            value["configured_helper_path"].as_str().unwrap_or("?"),
+            value["path_matches_config"].as_bool().unwrap_or(false),
+            value["risk"].as_str().unwrap_or("host_state")
+        ));
+        if let Some(record) = value.get("record").filter(|record| !record.is_null()) {
+            lines.push(format!(
+                "  installed {}  version {}  protocol {}  sha256 {}  target {}/{}",
+                record["installed_at"].as_str().unwrap_or("?"),
+                record["helper_version"].as_str().unwrap_or("?"),
+                record["protocol_version"].as_u64().unwrap_or(0),
+                record["sha256"].as_str().unwrap_or("?"),
+                record["target_os"].as_str().unwrap_or("?"),
+                record["target_arch"].as_str().unwrap_or("?")
+            ));
+        } else {
+            lines.push("  no bootstrap record for this host".to_string());
+        }
+        if let Some(caveat) = value["environment_caveat"].as_str() {
+            lines.push(format!("  caveat: {caveat}"));
+        }
+        return Some(lines);
+    }
+    None
+}
+
+fn remote_test_lines(value: &Value) -> Option<Vec<String>> {
+    if let Some(evidence) = value
+        .get("evidence")
+        .filter(|evidence| evidence.get("digest").is_some())
+    {
+        let mut lines = vec![format!(
+            "remote test {}  {}  {}:{}  {}",
+            evidence["status"].as_str().unwrap_or("?"),
+            evidence["profile"].as_str().unwrap_or("?"),
+            evidence["host"].as_str().unwrap_or("?"),
+            evidence["commit"].as_str().unwrap_or("?"),
+            evidence["command"].as_str().unwrap_or("?")
+        )];
+        lines.push(format!(
+            "  exit {}  duration {}ms  digest {}",
+            evidence["exit_code"]
+                .as_i64()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            evidence["duration_ms"].as_u64().unwrap_or(0),
+            evidence["digest"].as_str().unwrap_or("?")
+        ));
+        if let Some(output) = evidence["output_ref"].as_str() {
+            lines.push(format!(
+                "  output {}  sha256 {}  bytes {}  truncated {}",
+                output,
+                evidence["output_sha256"].as_str().unwrap_or("?"),
+                evidence["output_bytes"].as_u64().unwrap_or(0),
+                evidence["output_truncated"].as_bool().unwrap_or(false)
+            ));
+        }
+        if value
+            .get("supplemental")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            lines.push(
+                "  supplemental: local Verifier and deterministic Integrator remain mandatory; the merge gate is unchanged"
+                    .to_string(),
+            );
+        }
+        if let Some(entry) = value.get("entry").filter(|entry| !entry.is_null()) {
+            lines.push(format!(
+                "  attached to queue entry {}  verifier {}  status {}",
+                entry["id"].as_str().unwrap_or("?"),
+                entry["verifier_approved"]
+                    .as_bool()
+                    .map(|approved| if approved { "approved" } else { "rejected" })
+                    .unwrap_or("not yet run"),
+                entry["status"].as_str().unwrap_or("?")
+            ));
+        }
+        if let Some(caveat) = value["environment_caveat"].as_str() {
+            lines.push(format!("  caveat: {caveat}"));
+        }
+        return Some(lines);
+    }
+    if value.get("passed").is_some()
+        && value.get("timed_out").is_some()
+        && value.get("evidence").is_some()
+    {
+        let mut lines = vec![format!(
+            "remote test evidence for {}: {} total · {} passed · {} failed · {} timeout",
+            value["project_id"].as_str().unwrap_or("?"),
+            value["total"].as_u64().unwrap_or(0),
+            value["passed"].as_u64().unwrap_or(0),
+            value["failed"].as_u64().unwrap_or(0),
+            value["timed_out"].as_u64().unwrap_or(0)
+        )];
+        if let Some(policy) = value.get("policy") {
+            lines.push(format!(
+                "  policy enabled={} default={} profiles={}",
+                policy["enabled"].as_bool().unwrap_or(false),
+                policy["default_profile"].as_str().unwrap_or("-"),
+                policy["profiles"].as_array().map(Vec::len).unwrap_or(0)
+            ));
+        }
+        for row in value["evidence"].as_array().cloned().unwrap_or_default() {
+            lines.push(format!(
+                "  {}  {}  {}  {}  digest {}",
+                row["status"].as_str().unwrap_or("?"),
+                row["profile"].as_str().unwrap_or("?"),
+                row["commit"].as_str().unwrap_or("?"),
+                row["command"].as_str().unwrap_or("?"),
+                row["digest"]
+                    .as_str()
+                    .map(|digest| &digest[..digest.len().min(12)])
+                    .unwrap_or("?")
+            ));
+        }
+        lines.push(
+            "  supplemental only: remote evidence never bypasses the local Verifier or deterministic Integrator"
+                .to_string(),
+        );
+        return Some(lines);
+    }
+    if let Some(policy) = value
+        .get("policy")
+        .filter(|policy| policy.get("profiles").is_some())
+    {
+        let mut lines = vec![format!(
+            "remote test policy for {}: enabled={} default={} timeout={}s output_cap={}B",
+            value["project_id"].as_str().unwrap_or("?"),
+            policy["enabled"].as_bool().unwrap_or(false),
+            policy["default_profile"].as_str().unwrap_or("-"),
+            policy["timeout_secs"].as_u64().unwrap_or(0),
+            policy["output_cap_bytes"].as_u64().unwrap_or(0)
+        )];
+        for profile in policy["profiles"].as_array().cloned().unwrap_or_default() {
+            lines.push(format!(
+                "  {}  {}  {}",
+                profile["name"].as_str().unwrap_or("?"),
+                profile["kind"].as_str().unwrap_or("?"),
+                profile["command"].as_str().unwrap_or("?")
+            ));
+        }
+        return Some(lines);
+    }
+    None
+}
+
 fn remote_integration_lines(value: &Value) -> Option<Vec<String>> {
     if value.get("removed_refs").is_some() && value.get("skipped").is_some() {
         let refs = value["removed_refs"]
@@ -10612,6 +11121,18 @@ fn print_human(value: &Value) {
         return;
     }
     if let Some(lines) = governor_lines(value) {
+        for line in lines {
+            println!("{line}");
+        }
+        return;
+    }
+    if let Some(lines) = remote_bootstrap_lines(value) {
+        for line in lines {
+            println!("{line}");
+        }
+        return;
+    }
+    if let Some(lines) = remote_test_lines(value) {
         for line in lines {
             println!("{line}");
         }
@@ -17409,5 +17930,284 @@ mod forge_cli_tests {
         assert_eq!(ForgeProviderArg::Gitea.as_str(), "gitea");
         assert_eq!(ForgeProviderArg::Forgejo.as_str(), "forgejo");
         assert_eq!(ForgeProviderArg::Bitbucket.as_str(), "bitbucket");
+    }
+}
+
+#[cfg(test)]
+mod remote_bootstrap_test_cli_tests {
+    use super::*;
+
+    #[test]
+    fn remote_bootstrap_and_test_commands_parse_bounds() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(parse_remote_bootstrap_test_commands)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn parse_remote_bootstrap_test_commands() {
+        let cli = Cli::try_parse_from([
+            "vp",
+            "remote-bootstrap",
+            "prj-1",
+            "--install-path",
+            "~/.verlinpark/bin/vp-remote-agent",
+            "--expected-sha256",
+            "aabb",
+            "--expected-version",
+            "0.1.0-dev",
+            "--force",
+            "--confirm",
+            "--timeout",
+            "120",
+            "--session",
+            "ses-1",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::RemoteBootstrap {
+                project,
+                install_path,
+                expected_sha256,
+                expected_version,
+                force,
+                confirm,
+                timeout,
+                session,
+            } => {
+                assert_eq!(project, "prj-1");
+                assert_eq!(
+                    install_path.as_deref(),
+                    Some("~/.verlinpark/bin/vp-remote-agent")
+                );
+                assert_eq!(expected_sha256.as_deref(), Some("aabb"));
+                assert_eq!(expected_version.as_deref(), Some("0.1.0-dev"));
+                assert!(force);
+                assert!(confirm);
+                assert_eq!(timeout, Some(120));
+                assert_eq!(session.as_deref(), Some("ses-1"));
+            }
+            other => panic!("expected remote-bootstrap, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "remote-test",
+            "prj-1",
+            "--session",
+            "ses-1",
+            "--entry",
+            "entry-1",
+            "--profile",
+            "check",
+            "--command",
+            "cargo check",
+            "--cwd",
+            "crates/vp-core",
+            "--timeout",
+            "600",
+            "--output-cap",
+            "65536",
+            "--expected-commit",
+            "abcdef1234567890",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::RemoteTest {
+                project,
+                session,
+                entry,
+                profile,
+                command,
+                cwd,
+                timeout,
+                output_cap,
+                expected_commit,
+            } => {
+                assert_eq!(project, "prj-1");
+                assert_eq!(session.as_deref(), Some("ses-1"));
+                assert_eq!(entry.as_deref(), Some("entry-1"));
+                assert_eq!(profile.as_deref(), Some("check"));
+                assert_eq!(command.as_deref(), Some("cargo check"));
+                assert_eq!(cwd.as_deref(), Some("crates/vp-core"));
+                assert_eq!(timeout, Some(600));
+                assert_eq!(output_cap, Some(65_536));
+                assert_eq!(expected_commit.as_deref(), Some("abcdef1234567890"));
+            }
+            other => panic!("expected remote-test, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "remote-test-policy-set",
+            "prj-1",
+            "--enable",
+            "--default",
+            "test",
+            "--profile",
+            "check:check:cargo check",
+            "--profile",
+            "test:test:cargo test --workspace",
+            "--timeout",
+            "900",
+            "--output-cap",
+            "131072",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::RemoteTestPolicySet {
+                project,
+                enable,
+                disable,
+                default_profile,
+                timeout,
+                output_cap,
+                profiles,
+                clear_profiles,
+                ..
+            } => {
+                assert_eq!(project, "prj-1");
+                assert!(enable);
+                assert!(!disable);
+                assert_eq!(default_profile.as_deref(), Some("test"));
+                assert_eq!(timeout, Some(900));
+                assert_eq!(output_cap, Some(131_072));
+                assert_eq!(profiles.len(), 2);
+                assert!(!clear_profiles);
+            }
+            other => panic!("expected remote-test-policy-set, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "remote-test-status",
+            "prj-1",
+            "--session",
+            "ses-1",
+            "--limit",
+            "5",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::RemoteTestStatus {
+                limit: 5,
+                session: Some(ref session),
+                ..
+            } if session == "ses-1"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "remote-test-output",
+            "prj-1",
+            "evidence-1",
+            "--offset",
+            "10",
+            "--limit",
+            "100",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::RemoteTestOutput {
+                offset: 10,
+                limit: 100,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn remote_bootstrap_human_output_is_explicit_about_sudo_and_caveat() {
+        let value = serde_json::json!({
+            "project_id": "prj-1",
+            "host": "build.example.com",
+            "install_path": "/home/agent/.verlinpark/bin/vp-remote-agent",
+            "sha256": "a".repeat(64),
+            "bytes": 4096,
+            "helper_version": "0.1.0-dev",
+            "protocol_version": 1,
+            "target_os": "linux",
+            "target_arch": "x86_64",
+            "remote_os": "Linux",
+            "remote_arch": "x86_64",
+            "replaced": false,
+            "used_sudo": false,
+            "chunks": 2,
+            "duration_ms": 42,
+            "installed_at": "2026-01-01T00:00:00Z",
+            "risk": "host_state",
+            "approval_required": true,
+            "confirmation_required": true,
+            "host_path_mismatch": true,
+            "environment_caveat": "trusted SSH host; not sandboxed"
+        });
+        let text = remote_bootstrap_lines(&value).unwrap().join("\n");
+        assert!(text.contains("installed"));
+        assert!(text.contains("build.example.com"));
+        assert!(text.contains("sha256"));
+        assert!(text.contains("sudo false"));
+        assert!(text.contains("risk host_state"));
+        assert!(text.contains("does not name the installed file"));
+        assert!(text.contains("not sandboxed"));
+    }
+
+    #[test]
+    fn remote_test_human_output_never_implies_the_merge_gate_changed() {
+        let value = serde_json::json!({
+            "project_id": "prj-1",
+            "session_id": "ses-1",
+            "evidence": {
+                "id": "ev-1",
+                "status": "passed",
+                "profile": "test",
+                "host": "build.example.com",
+                "commit": "abcdef1234567890",
+                "command": "cargo test",
+                "exit_code": 0,
+                "duration_ms": 12,
+                "digest": "d".repeat(64),
+                "output_ref": "remote-test-outputs/x.txt",
+                "output_sha256": "e".repeat(64),
+                "output_bytes": 100,
+                "output_truncated": false
+            },
+            "digest": "d".repeat(64),
+            "entry": {
+                "id": "entry-1",
+                "status": "queued",
+                "verifier_approved": null
+            },
+            "supplemental": true,
+            "local_verifier_required": true,
+            "merge_gate_unchanged": true,
+            "environment_caveat": "supplemental only"
+        });
+        let text = remote_test_lines(&value).unwrap().join("\n");
+        assert!(text.contains("remote test passed"));
+        assert!(text.contains("not yet run"));
+        assert!(text.contains("local Verifier"));
+        assert!(text.contains("merge gate is unchanged"));
+
+        let status = serde_json::json!({
+            "project_id": "prj-1",
+            "policy": {
+                "enabled": true,
+                "default_profile": "test",
+                "profiles": [{"name": "test", "kind": "test", "command": "cargo test"}]
+            },
+            "evidence": [],
+            "total": 0,
+            "passed": 0,
+            "failed": 0,
+            "timed_out": 0,
+            "environment_caveat": "supplemental only"
+        });
+        let text = remote_test_lines(&status).unwrap().join("\n");
+        assert!(text.contains("remote test evidence for prj-1"));
+        assert!(text.contains("never bypasses"));
     }
 }

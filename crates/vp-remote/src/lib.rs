@@ -14,6 +14,7 @@
 //! The daemon treats a configured remote host as trusted infrastructure. This
 //! crate does not claim to sandbox the remote user; see ADR-0156.
 
+pub mod bootstrap;
 pub mod bundle;
 pub mod client;
 pub mod exec;
@@ -25,6 +26,12 @@ pub mod protocol;
 pub mod server;
 pub mod transport;
 
+pub use bootstrap::{
+    BinaryTarget, BootstrapCommandOutput, BootstrapInstallation, BootstrapOutcome, BootstrapPhase,
+    BootstrapPreflight, BootstrapRequest, BootstrapTransport, BootstrapUploadOutput,
+    DEFAULT_INSTALL_PATH, HELPER_VERSION, SshBootstrapConfig, SshBootstrapTransport,
+    StdioBootstrapTransport, bootstrap_helper, inspect_binary_target, validate_install_path,
+};
 pub use bundle::{BundleRecord, BundleRegistry};
 pub use client::{RemoteClient, RemoteClientConfig, connect_stream};
 pub use jail::PathJail;

@@ -522,6 +522,21 @@ impl RemoteClient {
             .await
     }
 
+    /// Exec with an explicit bounded wait. Remote test commands may legitimately
+    /// run longer than the ordinary control-request timeout; the helper still
+    /// receives a finite `timeout_ms` and the client still sends a cancel on
+    /// expiry.
+    pub async fn exec_with_timeout(
+        &self,
+        params: &ExecParams,
+        wait: Duration,
+    ) -> Result<ExecResult, RemoteError> {
+        let wait = wait.min(Duration::from_millis(
+            MAX_EXEC_TIMEOUT_MS.saturating_add(30_000),
+        ));
+        self.call(METHOD_EXEC, params, wait).await
+    }
+
     pub async fn git_status(&self) -> Result<GitStatusResult, RemoteError> {
         self.call(
             METHOD_GIT_STATUS,

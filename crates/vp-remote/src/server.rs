@@ -119,12 +119,7 @@ impl ServerState {
     }
 
     fn capabilities(&self) -> Vec<String> {
-        let mut capabilities = REQUIRED_CAPABILITIES
-            .iter()
-            .map(|value| (*value).to_string())
-            .collect::<Vec<_>>();
-        capabilities.push(CAP_GIT_BUNDLE.to_string());
-        capabilities
+        helper_capabilities()
     }
 
     fn probe(&self) -> ProbeResult {

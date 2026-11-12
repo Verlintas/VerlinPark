@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use crate::Engine;
 use anyhow::{Context, Result, anyhow, bail};
+use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use vp_protocol::now_rfc3339;
@@ -55,9 +56,85 @@ struct Connection {
     last_used: Instant,
 }
 
+/// Creates a connected helper client for one project/config. Production uses
+/// SSH; tests and embedders can provide an in-process helper stream without
+/// weakening the real authentication and capability checks.
+#[async_trait]
+pub trait RemoteConnector: Send + Sync {
+    async fn connect(&self, project_id: &str, config: &ExecutionHost) -> Result<RemoteClient>;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SshConnector;
+
+#[async_trait]
+impl RemoteConnector for SshConnector {
+    async fn connect(&self, project_id: &str, config: &ExecutionHost) -> Result<RemoteClient> {
+        let token_env = config.token_env.as_deref().ok_or_else(|| {
+            anyhow!(
+                "remote host for project {project_id} has no token_env; the daemon needs the token to authenticate the helper"
+            )
+        })?;
+        let token = std::env::var(token_env).with_context(|| {
+            format!(
+                "reading remote auth token from daemon environment variable {token_env} for project {project_id}"
+            )
+        })?;
+        let token = token.trim().to_string();
+        if token.chars().count() < 16 {
+            bail!("remote auth token from {token_env} must contain at least 16 characters");
+        }
+        let mut transport_config = SshConfig {
+            host: config.host.clone(),
+            user: config.user.clone(),
+            port: config.port,
+            identity_file: config.identity_file.clone(),
+            helper_path: config.helper_path.clone(),
+            root: config.root.clone(),
+            token_env: config.token_env.clone(),
+            token_file: config.token_file.clone(),
+            ledger_path: config.ledger_path.clone(),
+            env_allow: config.env_allow.clone(),
+            connect_timeout_secs: config.connect_timeout_secs,
+            ssh_args: config.ssh_args.clone(),
+            max_frame_bytes: vp_remote::MAX_FRAME_BYTES,
+        };
+        if let Some(identity) = transport_config.identity_file.as_deref()
+            && identity.contains("~/")
+            && let Some(resolved) = vp_remote::transport::resolve_ssh_identity(identity)
+        {
+            transport_config.identity_file = Some(resolved.to_string_lossy().to_string());
+        }
+        let transport = SshTransport::new(transport_config);
+        let hello = HelloParams {
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            auth_token: token,
+            root: config.root.clone(),
+        };
+        let client = RemoteClient::connect(
+            &transport as &dyn RemoteTransport,
+            hello,
+            RemoteClientConfig {
+                request_timeout: Duration::from_secs(config.request_timeout_secs.clamp(1, 3600)),
+                handshake_timeout: Duration::from_secs(config.connect_timeout_secs.clamp(1, 300)),
+                max_frame_bytes: vp_remote::MAX_FRAME_BYTES as usize,
+            },
+        )
+        .await
+        .map_err(|error| anyhow!("remote helper handshake failed: {error}"))?;
+        client
+            .probe()
+            .await
+            .map_err(|error| anyhow!("remote helper connected but probe failed: {error}"))?;
+        Ok(client)
+    }
+}
+
 pub struct RemoteWorkspace {
     project_id: String,
     config: ExecutionHost,
+    connector: Arc<dyn RemoteConnector>,
     connection: AsyncMutex<Option<Connection>>,
     connect_lock: AsyncMutex<()>,
     health: Mutex<Health>,
@@ -77,11 +154,12 @@ impl std::fmt::Debug for RemoteWorkspace {
 }
 
 impl RemoteWorkspace {
-    fn new(project_id: String, config: ExecutionHost) -> Self {
+    fn new(project_id: String, config: ExecutionHost, connector: Arc<dyn RemoteConnector>) -> Self {
         let permits = config.max_concurrency.max(1) as usize;
         Self {
             project_id,
             config,
+            connector,
             connection: AsyncMutex::new(None),
             connect_lock: AsyncMutex::new(()),
             health: Mutex::new(Health::default()),
@@ -102,10 +180,6 @@ impl RemoteWorkspace {
     fn idle_timeout(&self) -> Option<Duration> {
         (self.config.idle_timeout_secs > 0)
             .then(|| Duration::from_secs(self.config.idle_timeout_secs))
-    }
-
-    fn request_timeout(&self) -> Duration {
-        Duration::from_secs(self.config.request_timeout_secs.clamp(1, 3600))
     }
 
     async fn current_client(&self) -> Result<Arc<RemoteClient>> {
@@ -172,67 +246,10 @@ impl RemoteWorkspace {
     }
 
     async fn connect_inner(&self) -> Result<Connection> {
-        let token_env = self.config.token_env.as_deref().ok_or_else(|| {
-            anyhow!(
-                "remote host for project {} has no token_env; the daemon needs the token to authenticate the helper",
-                self.project_id
-            )
-        })?;
-        let token = std::env::var(token_env).with_context(|| {
-            format!(
-                "reading remote auth token from daemon environment variable {token_env} for project {}",
-                self.project_id
-            )
-        })?;
-        let token = token.trim().to_string();
-        if token.chars().count() < 16 {
-            bail!("remote auth token from {token_env} must contain at least 16 characters");
-        }
-        let mut transport_config = SshConfig {
-            host: self.config.host.clone(),
-            user: self.config.user.clone(),
-            port: self.config.port,
-            identity_file: self.config.identity_file.clone(),
-            helper_path: self.config.helper_path.clone(),
-            root: self.config.root.clone(),
-            token_env: self.config.token_env.clone(),
-            token_file: self.config.token_file.clone(),
-            ledger_path: self.config.ledger_path.clone(),
-            env_allow: self.config.env_allow.clone(),
-            connect_timeout_secs: self.config.connect_timeout_secs,
-            ssh_args: self.config.ssh_args.clone(),
-            max_frame_bytes: vp_remote::MAX_FRAME_BYTES,
-        };
-        if let Some(identity) = transport_config.identity_file.as_deref()
-            && identity.contains("~/")
-            && let Some(resolved) = vp_remote::transport::resolve_ssh_identity(identity)
-        {
-            transport_config.identity_file = Some(resolved.to_string_lossy().to_string());
-        }
-        let transport = SshTransport::new(transport_config);
-        let hello = HelloParams {
-            protocol_version: REMOTE_PROTOCOL_VERSION,
-            client_version: env!("CARGO_PKG_VERSION").to_string(),
-            auth_token: token,
-            root: self.config.root.clone(),
-        };
-        let client = RemoteClient::connect(
-            &transport as &dyn RemoteTransport,
-            hello,
-            RemoteClientConfig {
-                request_timeout: self.request_timeout(),
-                handshake_timeout: Duration::from_secs(
-                    self.config.connect_timeout_secs.clamp(1, 300),
-                ),
-                max_frame_bytes: vp_remote::MAX_FRAME_BYTES as usize,
-            },
-        )
-        .await
-        .map_err(|error| anyhow!("remote helper handshake failed: {error}"))?;
-        client
-            .probe()
-            .await
-            .map_err(|error| anyhow!("remote helper connected but probe failed: {error}"))?;
+        let client = self
+            .connector
+            .connect(&self.project_id, &self.config)
+            .await?;
         Ok(Connection {
             hello: client.hello().clone(),
             client: Arc::new(client),
@@ -396,6 +413,20 @@ impl RemoteWorkspace {
             .await
     }
 
+    /// Bounded remote exec used by remote test evidence. The helper still gets
+    /// a finite `timeout_ms`; this only raises the client-side wait so a
+    /// legitimate long test is not cancelled by the control-request timeout.
+    pub async fn exec_with_timeout(
+        &self,
+        params: ExecParams,
+        wait: Duration,
+    ) -> Result<ExecResult> {
+        self.call(move |client| {
+            Box::pin(async move { client.exec_with_timeout(&params, wait).await })
+        })
+        .await
+    }
+
     pub async fn git_status(&self) -> Result<GitStatusResult> {
         self.call(|client| Box::pin(async move { client.git_status().await }))
             .await
@@ -504,6 +535,7 @@ impl RemoteWorkspace {
 pub struct RemoteManager {
     data_dir: std::path::PathBuf,
     helper_path: std::path::PathBuf,
+    connector: Arc<dyn RemoteConnector>,
     workspaces: Mutex<HashMap<String, Arc<RemoteWorkspace>>>,
 }
 
@@ -512,6 +544,7 @@ impl RemoteManager {
         Self {
             data_dir: data_dir.into(),
             helper_path: which_helper(),
+            connector: Arc::new(SshConnector),
             workspaces: Mutex::new(HashMap::new()),
         }
     }
@@ -523,8 +556,29 @@ impl RemoteManager {
         Self {
             data_dir: data_dir.into(),
             helper_path: helper_path.into(),
+            connector: Arc::new(SshConnector),
             workspaces: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Build a manager with an explicit connector. The production constructor
+    /// always uses SSH; this exists for the in-process helper contract tests
+    /// and embedders, and still runs the real handshake/capability checks.
+    pub fn with_connector(
+        data_dir: impl Into<std::path::PathBuf>,
+        helper_path: impl Into<std::path::PathBuf>,
+        connector: Arc<dyn RemoteConnector>,
+    ) -> Self {
+        Self {
+            data_dir: data_dir.into(),
+            helper_path: helper_path.into(),
+            connector,
+            workspaces: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn connector(&self) -> Arc<dyn RemoteConnector> {
+        self.connector.clone()
     }
 
     pub fn helper_path(&self) -> &std::path::Path {
@@ -575,7 +629,11 @@ impl RemoteManager {
                 bail!("too many active remote workspaces; close a session or wait for idle");
             }
         }
-        let workspace = Arc::new(RemoteWorkspace::new(project_id.to_string(), config.clone()));
+        let workspace = Arc::new(RemoteWorkspace::new(
+            project_id.to_string(),
+            config.clone(),
+            self.connector.clone(),
+        ));
         workspaces.insert(fingerprint, workspace.clone());
         Ok(workspace)
     }
@@ -908,6 +966,9 @@ impl Engine {
                     verifier_approved: entry.verifier_approved,
                     verifier_summary: entry.verifier_summary,
                     environment_caveat: entry.environment_caveat,
+                    remote_test_evidence_id: entry.remote_test_evidence_id,
+                    remote_test_digest: entry.remote_test_digest,
+                    remote_test_status: entry.remote_test_status,
                     attempt: entry.attempt,
                     detail: entry.detail,
                     created_at: entry.created_at,

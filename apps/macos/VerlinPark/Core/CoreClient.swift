@@ -1759,6 +1759,32 @@ actor CoreClient {
             .entries
     }
 
+    func remoteBootstrapStatus(projectID: String) async throws -> RemoteBootstrapStatusResult {
+        let params: [String: JSONValue] = ["project_id": .string(projectID)]
+        return try await request(method: "remote.bootstrap.status", params: params)
+            .decode(RemoteBootstrapStatusResult.self)
+    }
+
+    func remoteTestStatus(
+        projectID: String,
+        sessionID: String?,
+        entryID: String?,
+        limit: Int = 20
+    ) async throws -> RemoteTestStatusResult {
+        var params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "limit": .number(Double(limit)),
+        ]
+        if let sessionID {
+            params["session_id"] = .string(sessionID)
+        }
+        if let entryID {
+            params["entry_id"] = .string(entryID)
+        }
+        return try await request(method: "remote.test.status", params: params)
+            .decode(RemoteTestStatusResult.self)
+    }
+
     func remoteIntegrationStatus(
         projectID: String,
         sessionID: String?

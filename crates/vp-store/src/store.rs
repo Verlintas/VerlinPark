@@ -35,7 +35,10 @@ use vp_protocol::types::{
     cache_hit_ratio,
 };
 
-use vp_protocol::remote::{ExecutionHost, RemoteIntegrationPolicy};
+use vp_protocol::remote::{
+    ExecutionHost, RemoteBootstrapRecord, RemoteIntegrationPolicy, RemoteTestEvidence,
+    RemoteTestPolicy,
+};
 use vp_protocol::scaling::{ScalingDecision, ScalingPolicy};
 use vp_protocol::test_cache::{TestCacheEntry, TestCachePolicy, TestCacheStats};
 
@@ -870,6 +873,9 @@ pub struct SessionRepair {
     /// Event-backed test-cache metadata rows. `None` leaves the projection
     /// untouched; output bodies are not reconstructed.
     pub test_results: Option<Vec<TestCacheEntry>>,
+    /// Event-backed supplemental remote-test evidence rows. `None` leaves the
+    /// projection untouched; output bodies are not reconstructed.
+    pub remote_test_evidence: Option<Vec<RemoteTestEvidence>>,
     pub artifact_warnings: Vec<String>,
 }
 
@@ -1181,6 +1187,14 @@ pub struct ProjectManifestSnapshot {
     /// disabled with a bounded default cap.
     #[serde(default)]
     pub remote_integration_policy: RemoteIntegrationPolicy,
+    /// Opt-in remote test evidence policy. Older manifests decode as disabled.
+    #[serde(default)]
+    pub remote_test_policy: RemoteTestPolicy,
+    /// Last successful helper installs per host/path. These are project
+    /// configuration evidence, not session events, so the manifest is their
+    /// rebuild snapshot. No credentials are stored.
+    #[serde(default)]
+    pub remote_bootstrap_records: Vec<RemoteBootstrapRecord>,
     #[serde(default)]
     pub approval_grants: Vec<ApprovalGrant>,
     /// Project-scoped bounded auto-approval/deny rules. Older manifests decode
@@ -2974,6 +2988,9 @@ impl Store {
                 verifier_approved INTEGER,
                 verifier_summary TEXT,
                 environment_caveat TEXT,
+                remote_test_evidence_id TEXT,
+                remote_test_digest TEXT,
+                remote_test_status TEXT,
                 created_at  TEXT NOT NULL,
                 updated_at  TEXT NOT NULL
             );
@@ -2990,6 +3007,63 @@ impl Store {
                 keep_import_refs INTEGER NOT NULL DEFAULT 0,
                 updated_at       TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS project_remote_test_policies (
+                project_id       TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                enabled          INTEGER NOT NULL DEFAULT 0,
+                default_profile  TEXT,
+                profiles         TEXT NOT NULL DEFAULT '[]',
+                timeout_secs     INTEGER NOT NULL,
+                output_cap_bytes INTEGER NOT NULL,
+                updated_at       TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS remote_bootstrap_records (
+                project_id       TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                host             TEXT NOT NULL,
+                install_path     TEXT NOT NULL,
+                sha256           TEXT NOT NULL,
+                bytes            INTEGER NOT NULL,
+                helper_version   TEXT NOT NULL,
+                protocol_version INTEGER NOT NULL,
+                target_os        TEXT NOT NULL,
+                target_arch      TEXT NOT NULL,
+                installed_at     TEXT NOT NULL,
+                updated_at       TEXT NOT NULL,
+                PRIMARY KEY (project_id, host, install_path)
+            );
+
+            CREATE TABLE IF NOT EXISTS remote_test_evidence (
+                id                TEXT PRIMARY KEY,
+                project_id        TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                session_id        TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                entry_id          TEXT,
+                profile           TEXT NOT NULL,
+                kind              TEXT NOT NULL,
+                host              TEXT NOT NULL,
+                commit_hash       TEXT NOT NULL,
+                command           TEXT NOT NULL,
+                cwd               TEXT,
+                status            TEXT NOT NULL,
+                exit_code         INTEGER,
+                duration_ms       INTEGER NOT NULL,
+                output_ref        TEXT,
+                output_sha256     TEXT,
+                output_bytes      INTEGER NOT NULL DEFAULT 0,
+                output_truncated  INTEGER NOT NULL DEFAULT 0,
+                timed_out         INTEGER NOT NULL DEFAULT 0,
+                detail            TEXT,
+                digest            TEXT NOT NULL,
+                environment_caveat TEXT NOT NULL,
+                created_at        TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_remote_test_evidence_project
+                ON remote_test_evidence(project_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_remote_test_evidence_session
+                ON remote_test_evidence(session_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_remote_test_evidence_entry
+                ON remote_test_evidence(entry_id);
 
             CREATE TABLE IF NOT EXISTS merge_auto_attempts (
                 entry_id TEXT PRIMARY KEY REFERENCES merge_queue(id) ON DELETE CASCADE,
@@ -3547,6 +3621,9 @@ impl Store {
         ensure_column(&conn, "merge_queue", "verifier_approved", "INTEGER")?;
         ensure_column(&conn, "merge_queue", "verifier_summary", "TEXT")?;
         ensure_column(&conn, "merge_queue", "environment_caveat", "TEXT")?;
+        ensure_column(&conn, "merge_queue", "remote_test_evidence_id", "TEXT")?;
+        ensure_column(&conn, "merge_queue", "remote_test_digest", "TEXT")?;
+        ensure_column(&conn, "merge_queue", "remote_test_status", "TEXT")?;
         ensure_column(&conn, "plan_tasks", "next_attempt_at", "TEXT")?;
         ensure_column(&conn, "approvals", "approval_risk", "TEXT")?;
         ensure_column(&conn, "approvals", "approval_reason", "TEXT")?;
@@ -3722,6 +3799,8 @@ impl Store {
                 cache_policy: self.get_cache_policy(&project.id)?,
                 execution_host: self.get_execution_host(&project.id)?,
                 remote_integration_policy: self.get_remote_integration_policy(&project.id)?,
+                remote_test_policy: self.get_remote_test_policy(&project.id)?,
+                remote_bootstrap_records: self.list_remote_bootstrap_records(&project.id)?,
                 integration_policy: self.get_integration_policy(&project.id)?,
                 gui_policy: self.get_gui_policy(&project.id)?,
                 artifact_policy: self.get_artifact_policy(&project.id)?,
@@ -4174,6 +4253,336 @@ impl Store {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    pub fn get_remote_test_policy(&self, project_id: &str) -> Result<RemoteTestPolicy> {
+        let conn = self.lock()?;
+        let stored = conn
+            .query_row(
+                "SELECT enabled, default_profile, profiles, timeout_secs, output_cap_bytes
+                 FROM project_remote_test_policies WHERE project_id = ?1",
+                params![project_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? != 0,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)? as u64,
+                        row.get::<_, i64>(4)? as u64,
+                    ))
+                },
+            )
+            .optional()?;
+        match stored {
+            Some((enabled, default_profile, profiles, timeout_secs, output_cap_bytes)) => {
+                let profiles: Vec<vp_protocol::remote::RemoteTestProfile> =
+                    serde_json::from_str(&profiles)
+                        .context("parsing stored remote test profiles")?;
+                Ok(RemoteTestPolicy {
+                    enabled,
+                    default_profile,
+                    profiles,
+                    timeout_secs,
+                    output_cap_bytes,
+                })
+            }
+            None => Ok(RemoteTestPolicy::default()),
+        }
+    }
+
+    pub fn set_remote_test_policy(
+        &self,
+        project_id: &str,
+        policy: &RemoteTestPolicy,
+    ) -> Result<()> {
+        policy
+            .validate()
+            .map_err(|error| anyhow!("invalid remote test policy: {error}"))?;
+        let profiles =
+            serde_json::to_string(&policy.profiles).context("serializing remote test profiles")?;
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO project_remote_test_policies
+             (project_id, enabled, default_profile, profiles, timeout_secs,
+              output_cap_bytes, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(project_id) DO UPDATE SET
+                enabled = excluded.enabled,
+                default_profile = excluded.default_profile,
+                profiles = excluded.profiles,
+                timeout_secs = excluded.timeout_secs,
+                output_cap_bytes = excluded.output_cap_bytes,
+                updated_at = excluded.updated_at",
+            params![
+                project_id,
+                if policy.enabled { 1 } else { 0 },
+                policy.default_profile,
+                profiles,
+                policy.timeout_secs as i64,
+                policy.output_cap_bytes as i64,
+                now_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn remote_test_policy_updated_at(&self, project_id: &str) -> Result<Option<String>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT updated_at FROM project_remote_test_policies WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn upsert_remote_bootstrap_record(&self, record: &RemoteBootstrapRecord) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO remote_bootstrap_records
+             (project_id, host, install_path, sha256, bytes, helper_version,
+              protocol_version, target_os, target_arch, installed_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(project_id, host, install_path) DO UPDATE SET
+                sha256 = excluded.sha256,
+                bytes = excluded.bytes,
+                helper_version = excluded.helper_version,
+                protocol_version = excluded.protocol_version,
+                target_os = excluded.target_os,
+                target_arch = excluded.target_arch,
+                installed_at = excluded.installed_at,
+                updated_at = excluded.updated_at",
+            params![
+                record.project_id,
+                record.host,
+                record.install_path,
+                record.sha256,
+                record.bytes as i64,
+                record.helper_version,
+                record.protocol_version as i64,
+                record.target_os,
+                record.target_arch,
+                record.installed_at,
+                record.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_remote_bootstrap_records(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<RemoteBootstrapRecord>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT project_id, host, install_path, sha256, bytes, helper_version,
+                    protocol_version, target_os, target_arch, installed_at, updated_at
+             FROM remote_bootstrap_records
+             WHERE project_id = ?1
+             ORDER BY updated_at DESC, host ASC, install_path ASC",
+        )?;
+        let rows = stmt.query_map(params![project_id], map_remote_bootstrap_record)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_remote_bootstrap_record(
+        &self,
+        project_id: &str,
+        host: &str,
+        install_path: &str,
+    ) -> Result<Option<RemoteBootstrapRecord>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT project_id, host, install_path, sha256, bytes, helper_version,
+                    protocol_version, target_os, target_arch, installed_at, updated_at
+             FROM remote_bootstrap_records
+             WHERE project_id = ?1 AND host = ?2 AND install_path = ?3",
+            params![project_id, host, install_path],
+            map_remote_bootstrap_record,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Insert one evidence row and its `remote_test.completed` event in the
+    /// same transaction. Output bodies stay in daemon-owned storage; this row
+    /// carries only the digest and a bounded reference.
+    pub fn insert_remote_test_evidence_with_event(
+        &self,
+        evidence: &RemoteTestEvidence,
+    ) -> Result<Event> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO remote_test_evidence
+             (id, project_id, session_id, entry_id, profile, kind, host, commit_hash,
+              command, cwd, status, exit_code, duration_ms, output_ref, output_sha256,
+              output_bytes, output_truncated, timed_out, detail, digest,
+              environment_caveat, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+            params![
+                evidence.id,
+                evidence.project_id,
+                evidence.session_id,
+                evidence.entry_id,
+                evidence.profile,
+                evidence.kind,
+                evidence.host,
+                evidence.commit,
+                evidence.command,
+                evidence.cwd,
+                evidence.status,
+                evidence.exit_code,
+                evidence.duration_ms as i64,
+                evidence.output_ref,
+                evidence.output_sha256,
+                evidence.output_bytes as i64,
+                if evidence.output_truncated { 1 } else { 0 },
+                if evidence.timed_out { 1 } else { 0 },
+                evidence.detail,
+                evidence.digest,
+                evidence.environment_caveat,
+                evidence.created_at,
+            ],
+        )?;
+        let event = insert_event_tx(
+            &tx,
+            &evidence.session_id,
+            "remote_test.completed",
+            serde_json::json!({
+                "evidence": evidence,
+                "supplemental": true,
+                "local_verifier_required": true,
+                "merge_gate_unchanged": true,
+                "environment_caveat": evidence.environment_caveat,
+            }),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(event)
+    }
+
+    pub fn get_remote_test_evidence(&self, id: &str) -> Result<Option<RemoteTestEvidence>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, project_id, session_id, entry_id, profile, kind, host,
+                    commit_hash, command, cwd, status, exit_code, duration_ms,
+                    output_ref, output_sha256, output_bytes, output_truncated,
+                    timed_out, detail, digest, environment_caveat, created_at
+             FROM remote_test_evidence WHERE id = ?1",
+            params![id],
+            map_remote_test_evidence,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_remote_test_evidence(
+        &self,
+        project_id: &str,
+        session_id: Option<&str>,
+        entry_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<RemoteTestEvidence>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, session_id, entry_id, profile, kind, host,
+                    commit_hash, command, cwd, status, exit_code, duration_ms,
+                    output_ref, output_sha256, output_bytes, output_truncated,
+                    timed_out, detail, digest, environment_caveat, created_at
+             FROM remote_test_evidence
+             WHERE project_id = ?1
+               AND (?2 IS NULL OR session_id = ?2)
+               AND (?3 IS NULL OR entry_id = ?3)
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                project_id,
+                session_id,
+                entry_id,
+                i64::from(limit.clamp(1, 100))
+            ],
+            map_remote_test_evidence,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn list_remote_test_evidence_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<RemoteTestEvidence>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, session_id, entry_id, profile, kind, host,
+                    commit_hash, command, cwd, status, exit_code, duration_ms,
+                    output_ref, output_sha256, output_bytes, output_truncated,
+                    timed_out, detail, digest, environment_caveat, created_at
+             FROM remote_test_evidence
+             WHERE session_id = ?1
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], map_remote_test_evidence)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Attach a supplemental evidence digest to a queue row. This deliberately
+    /// does not touch `verifier_approved`, `status`, or `commit`.
+    pub fn set_merge_queue_remote_test_with_event(
+        &self,
+        entry_id: &str,
+        evidence_id: &str,
+        digest: &str,
+        status: &str,
+    ) -> Result<Option<(MergeQueueEntry, Event)>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE merge_queue
+             SET remote_test_evidence_id = ?1, remote_test_digest = ?2,
+                 remote_test_status = ?3, updated_at = ?4
+             WHERE id = ?5 AND source = 'remote'",
+            params![evidence_id, digest, status, now_rfc3339(), entry_id],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let entry = tx
+            .query_row(
+                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash,
+                        base_commit, pre_merge_commit, status, attempt, detail, source,
+                        remote_host, remote_branch, bundle_sha256, imported_ref,
+                        verifier_approved, verifier_summary, environment_caveat,
+                        remote_test_evidence_id, remote_test_digest, remote_test_status,
+                        created_at, updated_at
+                 FROM merge_queue WHERE id = ?1",
+                params![entry_id],
+                map_merge_queue_entry,
+            )
+            .optional()?;
+        let Some(entry) = entry else {
+            return Ok(None);
+        };
+        let event = insert_event_tx(
+            &tx,
+            &entry.session_id,
+            "merge_queue.updated",
+            serde_json::json!({
+                "entry": entry,
+                "reason": "remote_test_evidence_attached",
+                "supplemental": true,
+            }),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some((entry, event)))
     }
 
     pub fn get_cache_policy(&self, project_id: &str) -> Result<CachePolicy> {
@@ -15554,7 +15963,7 @@ impl Store {
         let conn = self.lock()?;
         conn.query_row(
             "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash,
-                    base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at
+                    base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, remote_test_evidence_id, remote_test_digest, remote_test_status, created_at, updated_at
              FROM merge_queue
              WHERE session_id = ?1 AND task_id = ?2 AND status = 'merged'
              ORDER BY updated_at DESC, created_at DESC, id ASC
@@ -22370,7 +22779,7 @@ impl Store {
         }
         for id in &queue_ids {
             let entry = tx.query_row(
-                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at
+                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, remote_test_evidence_id, remote_test_digest, remote_test_status, created_at, updated_at
                  FROM merge_queue WHERE id = ?1",
                 params![id],
                 map_merge_queue_entry,
@@ -22525,8 +22934,8 @@ impl Store {
             for entry in queue {
                 tx.execute(
                     "INSERT INTO merge_queue
-                     (id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                     (id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, remote_test_evidence_id, remote_test_digest, remote_test_status, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
                     params![
                         entry.id,
                         entry.session_id,
@@ -22547,8 +22956,52 @@ impl Store {
                         entry.verifier_approved.map(i64::from),
                         entry.verifier_summary,
                         entry.environment_caveat,
+                        entry.remote_test_evidence_id,
+                        entry.remote_test_digest,
+                        entry.remote_test_status,
                         entry.created_at,
                         entry.updated_at
+                    ],
+                )?;
+            }
+        }
+        if let Some(evidence) = &repair.remote_test_evidence {
+            tx.execute(
+                "DELETE FROM remote_test_evidence WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            for row in evidence {
+                tx.execute(
+                    "INSERT INTO remote_test_evidence
+                     (id, project_id, session_id, entry_id, profile, kind, host,
+                      commit_hash, command, cwd, status, exit_code, duration_ms,
+                      output_ref, output_sha256, output_bytes, output_truncated,
+                      timed_out, detail, digest, environment_caveat, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                             ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+                    params![
+                        row.id,
+                        row.project_id,
+                        row.session_id,
+                        row.entry_id,
+                        row.profile,
+                        row.kind,
+                        row.host,
+                        row.commit,
+                        row.command,
+                        row.cwd,
+                        row.status,
+                        row.exit_code,
+                        row.duration_ms as i64,
+                        row.output_ref,
+                        row.output_sha256,
+                        row.output_bytes as i64,
+                        if row.output_truncated { 1 } else { 0 },
+                        if row.timed_out { 1 } else { 0 },
+                        row.detail,
+                        row.digest,
+                        row.environment_caveat,
+                        row.created_at,
                     ],
                 )?;
             }
@@ -22978,8 +23431,8 @@ impl Store {
         for entry in &bundle.merge_queue {
             tx.execute(
                 "INSERT INTO merge_queue
-                 (id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                 (id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, remote_test_evidence_id, remote_test_digest, remote_test_status, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
                 params![
                     entry.id,
                     entry.session_id,
@@ -23000,6 +23453,9 @@ impl Store {
                     entry.verifier_approved.map(i64::from),
                     entry.verifier_summary,
                     entry.environment_caveat,
+                    entry.remote_test_evidence_id,
+                    entry.remote_test_digest,
+                    entry.remote_test_status,
                     entry.created_at,
                     entry.updated_at
                 ],
@@ -23424,7 +23880,7 @@ impl Store {
             ],
         )?;
         conn.query_row(
-            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at
+            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, remote_test_evidence_id, remote_test_digest, remote_test_status, created_at, updated_at
              FROM merge_queue WHERE id = ?1",
             params![id],
             map_merge_queue_entry,
@@ -23446,7 +23902,7 @@ impl Store {
             params![status, detail, now_rfc3339(), id],
         )?;
         conn.query_row(
-            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at
+            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, remote_test_evidence_id, remote_test_digest, remote_test_status, created_at, updated_at
              FROM merge_queue WHERE id = ?1",
             params![id],
             map_merge_queue_entry,
@@ -23485,7 +23941,7 @@ impl Store {
         }
         let entry = tx
             .query_row(
-                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at
+                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, remote_test_evidence_id, remote_test_digest, remote_test_status, created_at, updated_at
                  FROM merge_queue WHERE id = ?1",
                 params![id],
                 map_merge_queue_entry,
@@ -23521,7 +23977,7 @@ impl Store {
             params![pre_merge_commit, now_rfc3339(), id],
         )?;
         conn.query_row(
-            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at
+            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, remote_test_evidence_id, remote_test_digest, remote_test_status, created_at, updated_at
              FROM merge_queue WHERE id = ?1",
             params![id],
             map_merge_queue_entry,
@@ -23598,7 +24054,7 @@ impl Store {
             ],
         )?;
         let entry = tx.query_row(
-            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at
+            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, remote_test_evidence_id, remote_test_digest, remote_test_status, created_at, updated_at
              FROM merge_queue WHERE id = ?1",
             params![id],
             map_merge_queue_entry,
@@ -23635,7 +24091,7 @@ impl Store {
         }
         let entry = tx
             .query_row(
-                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at
+                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, remote_test_evidence_id, remote_test_digest, remote_test_status, created_at, updated_at
                  FROM merge_queue WHERE id = ?1",
                 params![id],
                 map_merge_queue_entry,
@@ -23678,7 +24134,7 @@ impl Store {
         }
         let entry = tx
             .query_row(
-                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at
+                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, remote_test_evidence_id, remote_test_digest, remote_test_status, created_at, updated_at
                  FROM merge_queue WHERE id = ?1",
                 params![id],
                 map_merge_queue_entry,
@@ -23707,7 +24163,7 @@ impl Store {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash,
-                    base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at
+                    base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, remote_test_evidence_id, remote_test_digest, remote_test_status, created_at, updated_at
              FROM merge_queue
              WHERE status = 'interrupted' AND pre_merge_commit IS NOT NULL
              ORDER BY created_at ASC, id ASC",
@@ -23719,7 +24175,7 @@ impl Store {
     pub fn list_merge_queue(&self, session_id: &str) -> Result<Vec<MergeQueueEntry>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at
+            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, remote_test_evidence_id, remote_test_digest, remote_test_status, created_at, updated_at
              FROM merge_queue WHERE session_id = ?1 ORDER BY created_at ASC, id ASC",
         )?;
         let rows = stmt.query_map(params![session_id], map_merge_queue_entry)?;
@@ -23739,7 +24195,9 @@ impl Store {
                     m.commit_hash, m.base_commit, m.pre_merge_commit, m.status, m.attempt,
                     m.detail, m.source, m.remote_host, m.remote_branch, m.bundle_sha256,
                     m.imported_ref, m.verifier_approved, m.verifier_summary,
-                    m.environment_caveat, m.created_at, m.updated_at
+                    m.environment_caveat, m.remote_test_evidence_id,
+                    m.remote_test_digest, m.remote_test_status,
+                    m.created_at, m.updated_at
              FROM merge_queue m
              JOIN sessions s ON s.id = m.session_id
              WHERE s.project_id = ?1
@@ -23755,7 +24213,7 @@ impl Store {
     pub fn get_merge_queue_entry(&self, id: &str) -> Result<Option<MergeQueueEntry>> {
         let conn = self.lock()?;
         conn.query_row(
-            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at
+            "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, remote_test_evidence_id, remote_test_digest, remote_test_status, created_at, updated_at
              FROM merge_queue WHERE id = ?1",
             params![id],
             map_merge_queue_entry,
@@ -23806,7 +24264,7 @@ impl Store {
         let mut entries = Vec::with_capacity(ids.len());
         for id in ids {
             entries.push(conn.query_row(
-                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, created_at, updated_at
+                "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, remote_test_evidence_id, remote_test_digest, remote_test_status, created_at, updated_at
                  FROM merge_queue WHERE id = ?1",
                 params![id],
                 map_merge_queue_entry,
@@ -25024,6 +25482,49 @@ fn insert_event_tx(
     Ok(event)
 }
 
+fn map_remote_bootstrap_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RemoteBootstrapRecord> {
+    Ok(RemoteBootstrapRecord {
+        project_id: row.get(0)?,
+        host: row.get(1)?,
+        install_path: row.get(2)?,
+        sha256: row.get(3)?,
+        bytes: row.get::<_, i64>(4)? as u64,
+        helper_version: row.get(5)?,
+        protocol_version: row.get::<_, i64>(6)? as u32,
+        target_os: row.get(7)?,
+        target_arch: row.get(8)?,
+        installed_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
+}
+
+fn map_remote_test_evidence(row: &rusqlite::Row<'_>) -> rusqlite::Result<RemoteTestEvidence> {
+    Ok(RemoteTestEvidence {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        session_id: row.get(2)?,
+        entry_id: row.get(3)?,
+        profile: row.get(4)?,
+        kind: row.get(5)?,
+        host: row.get(6)?,
+        commit: row.get(7)?,
+        command: row.get(8)?,
+        cwd: row.get(9)?,
+        status: row.get(10)?,
+        exit_code: row.get(11)?,
+        duration_ms: row.get::<_, i64>(12)? as u64,
+        output_ref: row.get(13)?,
+        output_sha256: row.get(14)?,
+        output_bytes: row.get::<_, i64>(15)? as u64,
+        output_truncated: row.get::<_, i64>(16)? != 0,
+        timed_out: row.get::<_, i64>(17)? != 0,
+        detail: row.get(18)?,
+        digest: row.get(19)?,
+        environment_caveat: row.get(20)?,
+        created_at: row.get(21)?,
+    })
+}
+
 fn map_merge_queue_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MergeQueueEntry> {
     Ok(MergeQueueEntry {
         id: row.get(0)?,
@@ -25046,8 +25547,11 @@ fn map_merge_queue_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MergeQueue
         verifier_approved: row.get::<_, Option<i64>>(17)?.map(|value| value != 0),
         verifier_summary: row.get(18)?,
         environment_caveat: row.get(19)?,
-        created_at: row.get(20)?,
-        updated_at: row.get(21)?,
+        remote_test_evidence_id: row.get(20)?,
+        remote_test_digest: row.get(21)?,
+        remote_test_status: row.get(22)?,
+        created_at: row.get(23)?,
+        updated_at: row.get(24)?,
     })
 }
 

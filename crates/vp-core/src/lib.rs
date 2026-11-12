@@ -17,6 +17,7 @@ use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 use vp_protocol::lsp::{LspLanguageStatus, LspStatusResult};
 use vp_protocol::now_rfc3339;
+use vp_protocol::remote::RemoteTestEvidence;
 use vp_protocol::types::{
     AcpAgent, AcpAgentConfig, AcpAgentListResult, AcpProbeResult, AcpTransport, AgentMessage,
     AgentRecord, Approval, ApprovalAuditEvent, ApprovalAuditResult, ApprovalBatchItemResult,
@@ -130,7 +131,9 @@ pub mod program;
 pub mod prompt_cache;
 pub mod rebuild;
 pub mod remote;
+pub mod remote_bootstrap;
 pub mod remote_integration;
+pub mod remote_test;
 pub mod run_journal;
 pub mod scaling;
 pub mod scheduler;
@@ -179,6 +182,7 @@ struct ReplayData {
     context_checkpoints: Vec<vp_protocol::types::ContextCheckpoint>,
     processes: Vec<vp_protocol::types::SupervisedProcess>,
     test_results: Vec<vp_protocol::test_cache::TestCacheEntry>,
+    remote_test_evidence: Vec<RemoteTestEvidence>,
     events: Vec<Event>,
 }
 
@@ -703,6 +707,15 @@ impl Engine {
             runtime_id,
             continuation_claims: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Replace the remote manager after construction. The daemon always uses
+    /// [`Engine::new`] (SSH connector); contract tests use this to attach an
+    /// in-process helper stream without bypassing the real handshake.
+    pub fn with_remote_manager(store: Store, remote: remote::RemoteManager) -> Self {
+        let mut engine = Self::new(store);
+        engine.remote = Arc::new(remote);
+        engine
     }
 
     pub fn daemon_identity(&self) -> &vp_store::store::DaemonIdentity {
@@ -13026,6 +13039,7 @@ impl Engine {
                 10_000,
                 &vp_protocol::now_rfc3339(),
             )?;
+            let remote_test_evidence = store.list_remote_test_evidence_for_session(&id)?;
             let events = store.list_all_events(&id)?;
             Ok(ReplayData {
                 session,
@@ -13054,6 +13068,7 @@ impl Engine {
                 context_checkpoints,
                 processes,
                 test_results,
+                remote_test_evidence,
                 events,
             })
         })
@@ -13639,6 +13654,31 @@ impl Engine {
             && left.cost_usd.to_bits() == right.cost_usd.to_bits()
     }
 
+    /// Rebuild supplemental evidence rows from `remote_test.completed`
+    /// events. A malformed event returns `None` rather than silently
+    /// dropping evidence.
+    fn expected_remote_test_evidence(data: &ReplayData) -> Option<Vec<RemoteTestEvidence>> {
+        let mut rows = Vec::new();
+        for event in data
+            .events
+            .iter()
+            .filter(|event| event.kind == "remote_test.completed")
+        {
+            match serde_json::from_value::<RemoteTestEvidence>(
+                event.payload.get("evidence")?.clone(),
+            ) {
+                Ok(row) => rows.push(row),
+                Err(_) => return None,
+            }
+        }
+        rows.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Some(rows)
+    }
+
     fn replay_report(data: &ReplayData, repaired: bool) -> Result<SessionReplayReport> {
         let mut mismatches = Vec::new();
         let replay_status = data
@@ -14194,6 +14234,19 @@ impl Engine {
             mismatches.push("merge queue projection differs from event stream".to_string());
         }
 
+        let replay_evidence = Self::expected_remote_test_evidence(data).unwrap_or_default();
+        let mut projected_evidence = data.remote_test_evidence.clone();
+        projected_evidence.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let remote_test_evidence_matches = replay_evidence == projected_evidence;
+        if !remote_test_evidence_matches {
+            mismatches
+                .push("remote test evidence projection differs from event stream".to_string());
+        }
+
         let consistent = status_matches
             && usage_matches
             && ledger_matches
@@ -14219,7 +14272,8 @@ impl Engine {
             && run_steps_match
             && run_checkpoints_match
             && context_checkpoints_match
-            && processes_match;
+            && processes_match
+            && remote_test_evidence_matches;
         Ok(SessionReplayReport {
             session_id: data.session.id.clone(),
             event_count: data.events.len(),
@@ -14249,6 +14303,7 @@ impl Engine {
             run_checkpoints_match,
             context_checkpoints_match,
             processes_match,
+            remote_test_evidence_matches,
             consistent,
             repaired,
             rebuilt: false,
@@ -14554,6 +14609,10 @@ impl Engine {
             context_checkpoints,
             supervised_processes: processes,
             test_results: Some(crate::test_cache::results_from_events(&data.events)),
+            remote_test_evidence: {
+                let expected = Self::expected_remote_test_evidence(data);
+                expected.filter(|rows| !rows.is_empty() || data.remote_test_evidence.is_empty())
+            },
             artifact_warnings,
         })
     }

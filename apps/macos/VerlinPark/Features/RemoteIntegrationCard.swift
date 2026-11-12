@@ -23,12 +23,17 @@ struct RemoteIntegrationCard: View {
                     ProgressView().controlSize(.small)
                 }
                 Button("Refresh") {
-                    Task { await model.loadRemoteIntegrationStatus() }
+                    Task {
+                        await model.loadRemoteIntegrationStatus()
+                        await model.loadRemoteOperations()
+                    }
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .disabled(model.remoteIntegrationBusy)
+                .disabled(model.remoteIntegrationBusy || model.remoteOperationsBusy)
             }
+            helperRow
+            testEvidenceRow
             if let status = model.remoteIntegrationStatus {
                 policyRow(status)
                 if status.retainedRefs > 0 {
@@ -76,6 +81,11 @@ struct RemoteIntegrationCard: View {
             } else {
                 ProgressView().controlSize(.small)
             }
+            if let message = model.remoteOperationsMessage {
+                Text(message)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
         }
         .padding(14)
         .background(
@@ -88,6 +98,94 @@ struct RemoteIntegrationCard: View {
         }
         .vpHoverLift(scale: 1.003, lift: 1)
         .vpAppear(index: 0)
+    }
+
+    private var helperRow: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 10) {
+                Text("HELPER")
+                    .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                if let status = model.remoteBootstrapStatus {
+                    if let record = status.record {
+                        metric("version", record.helperVersion)
+                        metric("protocol", "\(record.protocolVersion)")
+                        metric(
+                            "checksum",
+                            String(record.sha256.prefix(16)) + "…"
+                        )
+                        metric("target", "\(record.targetOs)/\(record.targetArch)")
+                    } else {
+                        Text(status.configured ? "not bootstrapped" : "local host")
+                            .font(.system(size: 9, weight: .medium, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Text(status.risk.uppercased())
+                        .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(.orange)
+                        .help(
+                            "Bootstrap is a host-state action and requires explicit confirmation; it never uses sudo."
+                        )
+                } else {
+                    Text("loading…")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            if let status = model.remoteBootstrapStatus {
+                Text(status.installPath)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if status.configured, !status.pathMatchesConfig {
+                    Text(
+                        "ExecutionHost.helper_path does not name the last installed file; update it explicitly with `vp host-set`."
+                    )
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.orange)
+                }
+            }
+        }
+    }
+
+    private var testEvidenceRow: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 10) {
+                Text("REMOTE TEST")
+                    .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                if let status = model.remoteTestStatus {
+                    metric("policy", status.policy.enabled ? "enabled" : "disabled")
+                    metric("evidence", "\(status.total)")
+                    metric("passed", "\(status.passed)")
+                    metric("failed", "\(status.failed)")
+                    if let latest = status.evidence.first {
+                        metric("latest", latest.status.uppercased())
+                    }
+                } else {
+                    Text("no evidence loaded")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+                Spacer()
+            }
+            if let latest = model.remoteTestStatus?.evidence.first {
+                Text(
+                    "\(latest.profile) · \(latest.command) · \(latest.commit.prefix(7)) · digest \(latest.digest.prefix(16))…"
+                )
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.tertiary)
+                .lineLimit(2)
+                Text(
+                    "Supplemental only: local Verifier and deterministic Integrator remain mandatory; remote evidence never changes the merge gate."
+                )
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 
     private func remoteBadge(_ status: RemoteIntegrationStatusResult) -> some View {
@@ -206,6 +304,12 @@ struct RemoteIntegrationCard: View {
                 .font(.system(size: 8, design: .monospaced))
                 .foregroundStyle(approved ? .green : .orange)
                 .lineLimit(2)
+            }
+            if let status = entry.remoteTestStatus, let digest = entry.remoteTestDigest {
+                Text("remote test \(status) · digest \(String(digest.prefix(16)))…")
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(status == "passed" ? .green : .orange)
+                    .lineLimit(1)
             }
             if let detail = entry.detail, !detail.isEmpty {
                 Text(detail)

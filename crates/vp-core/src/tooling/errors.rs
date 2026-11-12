@@ -132,7 +132,7 @@ pub fn render_code_detail(code: ToolErrorCode) -> String {
 /// Bounded table of all codes, grouped by category. Used by `tool_help` so an
 /// agent can look up a code without guessing or parsing an ADR.
 pub fn render_catalog(max_chars: usize) -> String {
-    let max_chars = max_chars.clamp(500, 24_000);
+    let max_chars = max_chars.clamp(500, 30_000);
     let mut entries = catalog();
     entries.sort_by(|left, right| {
         left.category
@@ -449,6 +449,31 @@ tool_error_codes! {
     REMOTE_INTEGRATION_VERIFIER_REJECTED => "REMOTE_INTEGRATION_VERIFIER_REJECTED", false, "remote", "Ask the remote author to fix the rejected evidence; a rejected commit is not enqueued.";
     REMOTE_INTEGRATION_FAILED => "REMOTE_INTEGRATION_FAILED", false, "remote", "Inspect the merge-queue entry; a conflict is retried explicitly against the imported ref.";
     REMOTE_PROTOCOL_ERROR => "REMOTE_PROTOCOL_ERROR", false, "remote", "The helper returned an invalid frame; verify helper version compatibility.";
+    REMOTE_BOOTSTRAP_APPROVAL_REQUIRED => "REMOTE_BOOTSTRAP_APPROVAL_REQUIRED", false, "remote", "Repeat bootstrap with explicit operator confirmation; installing on a host is never silent.";
+    REMOTE_BOOTSTRAP_PATH_REJECTED => "REMOTE_BOOTSTRAP_PATH_REJECTED", false, "remote", "Use the default ~/.verlinpark/bin/vp-remote-agent or another path inside the remote user's home; sudo paths are rejected.";
+    REMOTE_BOOTSTRAP_EXISTS => "REMOTE_BOOTSTRAP_EXISTS", false, "remote", "Inspect the installed helper, then repeat with force to replace it explicitly.";
+    REMOTE_BOOTSTRAP_ARCH_MISMATCH => "REMOTE_BOOTSTRAP_ARCH_MISMATCH", false, "remote", "Build vp-remote-agent for the remote host's OS and architecture; nothing was installed.";
+    REMOTE_BOOTSTRAP_CHECKSUM_MISMATCH => "REMOTE_BOOTSTRAP_CHECKSUM_MISMATCH", false, "remote", "Rebuild the local helper or update the pinned SHA-256; corrupted bytes are never installed.";
+    REMOTE_BOOTSTRAP_VERSION_MISMATCH => "REMOTE_BOOTSTRAP_VERSION_MISMATCH", false, "remote", "Build the helper from the same workspace revision as the daemon.";
+    REMOTE_BOOTSTRAP_PROTOCOL_MISMATCH => "REMOTE_BOOTSTRAP_PROTOCOL_MISMATCH", false, "remote", "Install a helper that speaks the daemon's remote protocol version; the existing helper was not replaced.";
+    REMOTE_BOOTSTRAP_DISK => "REMOTE_BOOTSTRAP_DISK", false, "remote", "Free space in the remote home or choose a different install path before retrying.";
+    REMOTE_BOOTSTRAP_UNSUPPORTED => "REMOTE_BOOTSTRAP_UNSUPPORTED", false, "remote", "Use an executable Mach-O or ELF helper for a supported OS/architecture; arbitrary files are rejected.";
+    REMOTE_BOOTSTRAP_UPLOAD_FAILED => "REMOTE_BOOTSTRAP_UPLOAD_FAILED", true, "remote", "Check SSH, remote disk space, and the temporary file, then retry the bounded upload.";
+    REMOTE_BOOTSTRAP_INSTALL_FAILED => "REMOTE_BOOTSTRAP_INSTALL_FAILED", false, "remote", "Inspect the remote install directory and permissions; the previous helper is left untouched on a failed rename.";
+    REMOTE_BOOTSTRAP_NOT_INSTALLED => "REMOTE_BOOTSTRAP_NOT_INSTALLED", false, "remote", "Run `vp remote-bootstrap` to install the helper before using remote tools.";
+    REMOTE_BOOTSTRAP_FAILED => "REMOTE_BOOTSTRAP_FAILED", false, "remote", "Inspect the bootstrap phase and remote SSH state; bootstrap never silently installs.";
+    REMOTE_TEST_DISABLED => "REMOTE_TEST_DISABLED", false, "remote", "Enable the project remote test policy explicitly before running remote evidence.";
+    REMOTE_TEST_NOT_CONFIGURED => "REMOTE_TEST_NOT_CONFIGURED", false, "remote", "Configure at least one reviewable remote test profile in the project policy.";
+    REMOTE_TEST_PROFILE_MISSING => "REMOTE_TEST_PROFILE_MISSING", false, "remote", "Use a profile name from `vp remote-test-policy`, or add the profile explicitly.";
+    REMOTE_TEST_COMMAND_MISSING => "REMOTE_TEST_COMMAND_MISSING", false, "remote", "Supply a bounded command or configure the named profile; an empty command is never inferred.";
+    REMOTE_TEST_SESSION_REQUIRED => "REMOTE_TEST_SESSION_REQUIRED", false, "remote", "Pass --session (or --entry, which derives it); evidence is recorded on a session event.";
+    REMOTE_TEST_ENTRY_NOT_REMOTE => "REMOTE_TEST_ENTRY_NOT_REMOTE", false, "remote", "Attach remote evidence only to a remote-sourced merge-queue entry.";
+    REMOTE_TEST_COMMIT_MISMATCH => "REMOTE_TEST_COMMIT_MISMATCH", false, "remote", "Check out the exact entry commit on the remote host before running evidence.";
+    REMOTE_TEST_FAILED => "REMOTE_TEST_FAILED", false, "remote", "Read the captured output and exit code; a failing remote test is recorded as failed evidence, not a pass.";
+    REMOTE_TEST_TIMEOUT => "REMOTE_TEST_TIMEOUT", true, "remote", "Raise the bounded timeout or make the remote command faster; timed-out evidence is recorded as timeout.";
+    REMOTE_TEST_OUTPUT_NOT_FOUND => "REMOTE_TEST_OUTPUT_NOT_FOUND", false, "remote", "Use an evidence id with a retained output_ref; output bodies are not reconstructed.";
+    REMOTE_TEST_EVIDENCE_NOT_FOUND => "REMOTE_TEST_EVIDENCE_NOT_FOUND", false, "remote", "List remote test evidence and use an exact evidence id.";
+    REMOTE_TEST_FAILED_TO_RECORD => "REMOTE_TEST_FAILED_TO_RECORD", false, "remote", "Inspect daemon storage and retry; no remote-test claim is made without a persisted evidence row.";
 
     // Tool-output paging
     TOOL_OUTPUT_NOT_FOUND => "TOOL_OUTPUT_NOT_FOUND", false, "tool_output", "Use the output_ref from the spilled result; handles are session-scoped.";
@@ -1637,7 +1662,7 @@ mod tests {
 
     #[test]
     fn rendered_catalog_names_every_code_and_category() {
-        let rendered = render_catalog(24_000);
+        let rendered = render_catalog(30_000);
         for code in ToolErrorCode::ALL {
             assert!(
                 rendered.contains(code.as_str()),

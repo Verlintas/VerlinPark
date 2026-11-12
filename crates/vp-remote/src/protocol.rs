@@ -89,6 +89,16 @@ pub const CAP_LEDGER: &str = "ledger";
 pub const CAP_SHA256: &str = "sha256";
 pub const CAP_BASE64: &str = "base64";
 
+/// Capabilities an up-to-date version-1 helper advertises. The required set is
+/// always present; `git.bundle` is optional so old helpers still connect.
+pub fn helper_capabilities() -> Vec<String> {
+    REQUIRED_CAPABILITIES
+        .iter()
+        .chain(std::iter::once(&CAP_GIT_BUNDLE))
+        .map(|value| (*value).to_string())
+        .collect()
+}
+
 /// Every capability a version-1 helper must advertise. The client checks this
 /// set before it exposes a workspace, so a partial helper fails at connect
 /// instead of at the first tool call.
@@ -143,6 +153,17 @@ pub enum RemoteErrorCode {
     ShutDown,
     InvalidResponse,
     Internal,
+    BootstrapPathRejected,
+    BootstrapExists,
+    BootstrapArchMismatch,
+    BootstrapChecksumMismatch,
+    BootstrapVersionMismatch,
+    BootstrapProtocolMismatch,
+    BootstrapDisk,
+    BootstrapUnsupported,
+    BootstrapUploadFailed,
+    BootstrapInstallFailed,
+    BootstrapNotInstalled,
 }
 
 impl RemoteErrorCode {
@@ -181,6 +202,17 @@ impl RemoteErrorCode {
             Self::ShutDown => "SHUTDOWN",
             Self::InvalidResponse => "INVALID_RESPONSE",
             Self::Internal => "INTERNAL",
+            Self::BootstrapPathRejected => "BOOTSTRAP_PATH_REJECTED",
+            Self::BootstrapExists => "BOOTSTRAP_EXISTS",
+            Self::BootstrapArchMismatch => "BOOTSTRAP_ARCH_MISMATCH",
+            Self::BootstrapChecksumMismatch => "BOOTSTRAP_CHECKSUM_MISMATCH",
+            Self::BootstrapVersionMismatch => "BOOTSTRAP_VERSION_MISMATCH",
+            Self::BootstrapProtocolMismatch => "BOOTSTRAP_PROTOCOL_MISMATCH",
+            Self::BootstrapDisk => "BOOTSTRAP_DISK",
+            Self::BootstrapUnsupported => "BOOTSTRAP_UNSUPPORTED",
+            Self::BootstrapUploadFailed => "BOOTSTRAP_UPLOAD_FAILED",
+            Self::BootstrapInstallFailed => "BOOTSTRAP_INSTALL_FAILED",
+            Self::BootstrapNotInstalled => "BOOTSTRAP_NOT_INSTALLED",
         }
     }
 
@@ -199,6 +231,7 @@ impl RemoteErrorCode {
                 | Self::TransportClosed
                 | Self::Internal
                 | Self::OutputLimit
+                | Self::BootstrapUploadFailed
         )
     }
 

@@ -405,7 +405,7 @@ fn legacy_manifest_without_cache_policy_decodes_the_default() {
     store.record_project_manifest().unwrap();
     let mut snapshots = read_project_manifest(data.path()).unwrap();
     let snapshot = snapshots.remove(0);
-    let mut value = serde_json::to_value(&snapshot).unwrap();
+    let mut value = serde_json::to_value(snapshot).unwrap();
     value
         .as_object_mut()
         .unwrap()
@@ -15597,4 +15597,238 @@ fn preemption_overview_groups_terminal_events_by_session_and_skips_sub_events() 
     assert_eq!(count(&by_reason, "tool_deadline"), None);
     let (limited, _, _) = store.preemption_overview(&project.id, 1).unwrap();
     assert_eq!(limited.len(), 1);
+}
+
+#[test]
+fn remote_test_policy_persists_validates_and_is_disabled_by_default() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("remote-test"))
+        .unwrap();
+    assert_eq!(
+        store.get_remote_test_policy(&project.id).unwrap(),
+        RemoteTestPolicy::default()
+    );
+    assert!(!store.get_remote_test_policy(&project.id).unwrap().enabled);
+    let policy = RemoteTestPolicy {
+        enabled: true,
+        default_profile: Some("check".into()),
+        profiles: vec![vp_protocol::remote::RemoteTestProfile {
+            name: "check".into(),
+            kind: vp_protocol::remote::RemoteTestKind::Check,
+            command: "cargo check".into(),
+            cwd: Some("crates/vp-core".into()),
+            timeout_secs: Some(120),
+        }],
+        timeout_secs: 600,
+        output_cap_bytes: 32 * 1024,
+    };
+    store.set_remote_test_policy(&project.id, &policy).unwrap();
+    store.record_project_manifest().unwrap();
+    assert_eq!(store.get_remote_test_policy(&project.id).unwrap(), policy);
+    assert!(
+        store
+            .remote_test_policy_updated_at(&project.id)
+            .unwrap()
+            .is_some()
+    );
+    let snapshots = read_project_manifest(store.data_dir()).unwrap();
+    let snapshot = snapshots
+        .iter()
+        .find(|snapshot| snapshot.project.id == project.id)
+        .unwrap();
+    assert_eq!(snapshot.remote_test_policy, policy);
+
+    let mut invalid = policy.clone();
+    invalid.default_profile = Some("missing".into());
+    assert!(store.set_remote_test_policy(&project.id, &invalid).is_err());
+    assert_eq!(store.get_remote_test_policy(&project.id).unwrap(), policy);
+
+    let mut legacy = serde_json::to_value(snapshot).unwrap();
+    legacy.as_object_mut().unwrap().remove("remote_test_policy");
+    let decoded: ProjectManifestSnapshot = serde_json::from_value(legacy).unwrap();
+    assert_eq!(decoded.remote_test_policy, RemoteTestPolicy::default());
+    assert!(!decoded.remote_test_policy.enabled);
+}
+
+#[test]
+fn bootstrap_records_upsert_list_and_round_trip_the_manifest() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("bootstrap"))
+        .unwrap();
+    assert!(
+        store
+            .list_remote_bootstrap_records(&project.id)
+            .unwrap()
+            .is_empty()
+    );
+    let now = now_rfc3339();
+    let record = RemoteBootstrapRecord {
+        project_id: project.id.clone(),
+        host: "build.example.com".into(),
+        install_path: "/home/agent/.verlinpark/bin/vp-remote-agent".into(),
+        sha256: "a".repeat(64),
+        bytes: 4_096,
+        helper_version: "0.1.0-dev".into(),
+        protocol_version: 1,
+        target_os: "linux".into(),
+        target_arch: "x86_64".into(),
+        installed_at: now.clone(),
+        updated_at: now,
+    };
+    store.upsert_remote_bootstrap_record(&record).unwrap();
+    store.record_project_manifest().unwrap();
+    assert_eq!(
+        store
+            .get_remote_bootstrap_record(
+                &project.id,
+                "build.example.com",
+                "/home/agent/.verlinpark/bin/vp-remote-agent"
+            )
+            .unwrap(),
+        Some(record.clone())
+    );
+    let mut updated = record.clone();
+    updated.sha256 = "b".repeat(64);
+    updated.bytes = 8_192;
+    store.upsert_remote_bootstrap_record(&updated).unwrap();
+    store.record_project_manifest().unwrap();
+    let records = store.list_remote_bootstrap_records(&project.id).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].sha256, "b".repeat(64));
+    let snapshots = read_project_manifest(store.data_dir()).unwrap();
+    let snapshot = snapshots
+        .iter()
+        .find(|snapshot| snapshot.project.id == project.id)
+        .unwrap();
+    assert_eq!(snapshot.remote_bootstrap_records, vec![updated]);
+}
+
+#[test]
+fn remote_test_evidence_is_event_backed_and_attaches_without_verifier_changes() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("evidence"))
+        .unwrap();
+    let session = store
+        .create_session(&project.id, "remote evidence")
+        .unwrap();
+    let source = MergeQueueSource::remote(
+        "build.example.com",
+        "feature/remote",
+        "a".repeat(64),
+        "refs/verlinpark/remote/s/import-1",
+    );
+    let (entry, _) = store
+        .enqueue_merge_with_event_source(
+            &session.id,
+            "agent_remote",
+            "Remote Worker",
+            None,
+            "verlinpark/remote",
+            "abcdef1234567890",
+            "1234567890abcdef",
+            None,
+            &source,
+        )
+        .unwrap();
+    let now = now_rfc3339();
+    let evidence = RemoteTestEvidence {
+        id: "evidence-1".into(),
+        project_id: project.id.clone(),
+        session_id: session.id.clone(),
+        entry_id: Some(entry.id.clone()),
+        profile: "test".into(),
+        kind: "test".into(),
+        host: "build.example.com".into(),
+        commit: entry.commit.clone(),
+        command: "cargo test".into(),
+        cwd: None,
+        status: "passed".into(),
+        exit_code: Some(0),
+        duration_ms: 42,
+        output_ref: Some(format!("remote-test-outputs/{}.txt", "c".repeat(64))),
+        output_sha256: Some("c".repeat(64)),
+        output_bytes: 12,
+        output_truncated: false,
+        timed_out: false,
+        detail: None,
+        digest: "d".repeat(64),
+        environment_caveat: "supplemental".into(),
+        created_at: now,
+    };
+    let event = store
+        .insert_remote_test_evidence_with_event(&evidence)
+        .unwrap();
+    assert_eq!(event.kind, "remote_test.completed");
+    assert_eq!(event.payload["supplemental"], true);
+    assert_eq!(event.payload["local_verifier_required"], true);
+    assert_eq!(event.payload["merge_gate_unchanged"], true);
+    assert_eq!(event.payload["evidence"]["digest"], "d".repeat(64));
+    assert_eq!(
+        store.get_remote_test_evidence("evidence-1").unwrap(),
+        Some(evidence.clone())
+    );
+    let listed = store
+        .list_remote_test_evidence(&project.id, Some(&session.id), None, 10)
+        .unwrap();
+    assert_eq!(listed, vec![evidence.clone()]);
+    let listed = store
+        .list_remote_test_evidence(&project.id, None, Some(&entry.id), 10)
+        .unwrap();
+    assert_eq!(listed, vec![evidence.clone()]);
+    assert_eq!(
+        store
+            .list_remote_test_evidence_for_session(&session.id)
+            .unwrap(),
+        vec![evidence.clone()]
+    );
+
+    let (attached, event) = store
+        .set_merge_queue_remote_test_with_event(
+            &entry.id,
+            &evidence.id,
+            &evidence.digest,
+            &evidence.status,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(attached.verifier_approved, None);
+    assert_eq!(attached.status, "queued");
+    assert_eq!(
+        attached.remote_test_evidence_id.as_deref(),
+        Some("evidence-1")
+    );
+    assert_eq!(
+        attached.remote_test_digest.as_deref(),
+        Some("d".repeat(64).as_str())
+    );
+    assert_eq!(attached.remote_test_status.as_deref(), Some("passed"));
+    assert_eq!(event.kind, "merge_queue.updated");
+    assert_eq!(event.payload["reason"], "remote_test_evidence_attached");
+    assert_eq!(event.payload["entry"]["remote_test_digest"], "d".repeat(64));
+
+    let missing = store
+        .set_merge_queue_remote_test_with_event("missing", "e", "d", "passed")
+        .unwrap();
+    assert!(missing.is_none());
+    let local = store
+        .enqueue_merge(
+            &session.id,
+            "agent_local",
+            "Local Worker",
+            None,
+            "verlinpark/local",
+            "fedcba0987654321",
+            "1234567890abcdef",
+            None,
+        )
+        .unwrap();
+    assert!(
+        store
+            .set_merge_queue_remote_test_with_event(&local.id, "e", "d", "passed")
+            .unwrap()
+            .is_none()
+    );
 }

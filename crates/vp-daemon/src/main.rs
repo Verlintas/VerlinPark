@@ -24,9 +24,11 @@ use vp_protocol::discovery::Discovery;
 use vp_protocol::lsp::LspStatusParams;
 use vp_protocol::remote::{
     HostListParams, HostListResult, HostProbeParams, HostProjectParams, HostSetParams,
-    RemoteIntegrationCleanupParams, RemoteIntegrationParams, RemoteIntegrationPolicyParams,
-    RemoteIntegrationStatusParams, RemoteLedgerParams, RemoteStatusParams,
-    RemoteWorktreeListParams, SetRemoteIntegrationPolicyParams,
+    RemoteBootstrapParams, RemoteBootstrapStatusParams, RemoteIntegrationCleanupParams,
+    RemoteIntegrationParams, RemoteIntegrationPolicyParams, RemoteIntegrationStatusParams,
+    RemoteLedgerParams, RemoteStatusParams, RemoteTestOutputParams, RemoteTestParams,
+    RemoteTestPolicyParams, RemoteTestStatusParams, RemoteWorktreeListParams,
+    SetRemoteIntegrationPolicyParams, SetRemoteTestPolicyParams,
 };
 use vp_protocol::rpc::{RpcError, RpcNotification, RpcRequest, RpcResponse, codes};
 use vp_protocol::scaling::{
@@ -745,6 +747,67 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             },
             Err(response) => response_with_id(id, response),
         },
+        "remote.bootstrap" => match parse_params::<RemoteBootstrapParams>(request.params) {
+            Ok(params) => match state.engine.remote_bootstrap(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => remote_bootstrap_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "remote.bootstrap.status" => {
+            match parse_params::<RemoteBootstrapStatusParams>(request.params) {
+                Ok(params) => match state.engine.remote_bootstrap_status(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "remote.test" => match parse_params::<RemoteTestParams>(request.params) {
+            Ok(params) => match state.engine.run_remote_test(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => remote_test_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "remote.test.status" => match parse_params::<RemoteTestStatusParams>(request.params) {
+            Ok(params) => match state.engine.remote_test_status(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => remote_test_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "remote.test.output" => match parse_params::<RemoteTestOutputParams>(request.params) {
+            Ok(params) => match state.engine.remote_test_output(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => remote_test_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "remote.test.policy.get" => match parse_params::<RemoteTestPolicyParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .remote_test_policy_result(&params.project_id)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "remote.test.policy.set" => {
+            match parse_params::<SetRemoteTestPolicyParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .set_remote_test_policy(&params.project_id, params.policy)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "remote.integration.status" => {
             match parse_params::<RemoteIntegrationStatusParams>(request.params) {
                 Ok(params) => match state
@@ -4593,6 +4656,26 @@ fn spawn_process_sweeper(engine: Engine) {
 /// Remote integration failures carry the Q3 tool-error shape in `data` so the
 /// CLI and Swift can show a stable code, retryability, and hint. Other errors
 /// remain ordinary internal errors and never invent a code.
+fn remote_bootstrap_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
+    match vp_core::remote_bootstrap::failure_data(&error) {
+        Some(data) => RpcResponse::error(
+            id,
+            RpcError::with_data(codes::INTERNAL_ERROR, error.to_string(), data),
+        ),
+        None => internal_error(id, error),
+    }
+}
+
+fn remote_test_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
+    match vp_core::remote_test::failure_data(&error) {
+        Some(data) => RpcResponse::error(
+            id,
+            RpcError::with_data(codes::INTERNAL_ERROR, error.to_string(), data),
+        ),
+        None => internal_error(id, error),
+    }
+}
+
 fn remote_integration_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
     match vp_core::remote_integration::failure_data(&error) {
         Some(data) => RpcResponse::error(

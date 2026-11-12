@@ -665,6 +665,14 @@ pub struct RemoteIntegrationQueueEntry {
     pub verifier_summary: Option<String>,
     #[serde(default)]
     pub environment_caveat: Option<String>,
+    /// Supplemental remote-test evidence metadata. This never implies local
+    /// verification or a merged state.
+    #[serde(default)]
+    pub remote_test_evidence_id: Option<String>,
+    #[serde(default)]
+    pub remote_test_digest: Option<String>,
+    #[serde(default)]
+    pub remote_test_status: Option<String>,
     pub attempt: u32,
     #[serde(default)]
     pub detail: Option<String>,
@@ -722,6 +730,480 @@ pub struct RemoteIntegrationStatusResult {
 /// status result. Keeping it in one constant prevents a UI or CLI from
 /// implying that the remote host was reproduced.
 pub const REMOTE_VERIFICATION_ENVIRONMENT_CAVEAT: &str = "Local verification checks the imported commit in an isolated clone on this daemon host. It does not reproduce the remote host's OS, installed tools, environment variables, network, or uncommitted files.";
+
+/// Default install path for the uploaded helper. It is expanded against the
+/// remote user's home; bootstrap refuses paths outside that home and never
+/// invokes sudo.
+pub const DEFAULT_REMOTE_BOOTSTRAP_PATH: &str = "~/.verlinpark/bin/vp-remote-agent";
+pub const MAX_REMOTE_BOOTSTRAP_PATH_CHARS: usize = 1_024;
+pub const MAX_REMOTE_BOOTSTRAP_BYTES: u64 = 128 * 1024 * 1024;
+pub const DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT_SECS: u64 = 120;
+pub const REMOTE_BOOTSTRAP_RISK: &str = "host_state";
+/// Stable statement attached to every bootstrap result. The SSH host is
+/// trusted infrastructure and bootstrap does not sandbox it.
+pub const REMOTE_BOOTSTRAP_ENVIRONMENT_CAVEAT: &str = "Bootstrap uploads the local vp-remote-agent to the configured SSH host over the existing SSH trust boundary. It never uses sudo, installs only as the remote SSH user under that user's home, and verifies SHA-256, protocol version, and target architecture before replacing an existing helper. The remote host is trusted infrastructure and is not sandboxed by this operation.";
+
+pub const DEFAULT_REMOTE_TEST_TIMEOUT_SECS: u64 = 900;
+pub const MIN_REMOTE_TEST_TIMEOUT_SECS: u64 = 1;
+pub const MAX_REMOTE_TEST_TIMEOUT_SECS: u64 = 3_600;
+pub const DEFAULT_REMOTE_TEST_OUTPUT_CAP_BYTES: u64 = 64 * 1024;
+pub const MIN_REMOTE_TEST_OUTPUT_CAP_BYTES: u64 = 1_024;
+pub const MAX_REMOTE_TEST_OUTPUT_CAP_BYTES: u64 = 4 * 1024 * 1024;
+pub const MAX_REMOTE_TEST_PROFILES: usize = 16;
+pub const MAX_REMOTE_TEST_PROFILE_NAME_CHARS: usize = 64;
+pub const MAX_REMOTE_TEST_COMMAND_CHARS: usize = 16 * 1024;
+pub const MAX_REMOTE_TEST_CWD_CHARS: usize = 1_024;
+pub const MAX_REMOTE_TEST_EVIDENCE_LIST: u32 = 100;
+pub const DEFAULT_REMOTE_TEST_EVIDENCE_LIST: u32 = 20;
+pub const MAX_REMOTE_TEST_OUTPUT_READ_BYTES: u64 = 256 * 1024;
+pub const DEFAULT_REMOTE_TEST_OUTPUT_READ_BYTES: u64 = 64 * 1024;
+/// Stable caveat for every remote test result. It states both the
+/// supplemental nature of the evidence and the unchanged merge gate.
+pub const REMOTE_TEST_ENVIRONMENT_CAVEAT: &str = "Remote test evidence is supplemental. The command ran on the configured SSH host under that user's authority; it was not executed in the local Verifier environment and is not network-isolated beyond refusing remote exec when the project ShellPolicy sets network=deny. A passing remote test never bypasses the local Verifier or the deterministic Integrator, and it does not replace the local merge queue or required checks.";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteTestKind {
+    #[default]
+    Check,
+    Lint,
+    Test,
+    Other,
+}
+
+impl RemoteTestKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Check => "check",
+            Self::Lint => "lint",
+            Self::Test => "test",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// One named remote project command. Commands are explicit configuration, not
+/// model-generated at run time: a project owner reviews what will execute on
+/// the remote host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteTestProfile {
+    pub name: String,
+    #[serde(default)]
+    pub kind: RemoteTestKind,
+    pub command: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+impl RemoteTestProfile {
+    pub fn validate(&self) -> Result<(), String> {
+        let name = self.name.trim();
+        if name.is_empty() || name.chars().count() > MAX_REMOTE_TEST_PROFILE_NAME_CHARS {
+            return Err(format!(
+                "remote test profile name must be 1..={MAX_REMOTE_TEST_PROFILE_NAME_CHARS} characters"
+            ));
+        }
+        if !name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+        {
+            return Err(format!(
+                "remote test profile name may contain only ASCII letters, digits, '.', '_', and '-': {name}"
+            ));
+        }
+        let command = self.command.trim();
+        if command.is_empty() {
+            return Err(format!("remote test profile {name} has an empty command"));
+        }
+        if command.chars().count() > MAX_REMOTE_TEST_COMMAND_CHARS {
+            return Err(format!(
+                "remote test profile {name} command exceeds {MAX_REMOTE_TEST_COMMAND_CHARS} characters"
+            ));
+        }
+        if command.contains('\0') {
+            return Err(format!("remote test profile {name} command contains NUL"));
+        }
+        if let Some(cwd) = self.cwd.as_deref() {
+            validate_relative_command_dir(cwd)?;
+        }
+        if let Some(timeout) = self.timeout_secs
+            && !(MIN_REMOTE_TEST_TIMEOUT_SECS..=MAX_REMOTE_TEST_TIMEOUT_SECS).contains(&timeout)
+        {
+            return Err(format!(
+                "remote test profile {name} timeout must be {MIN_REMOTE_TEST_TIMEOUT_SECS}..={MAX_REMOTE_TEST_TIMEOUT_SECS} seconds"
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_relative_command_dir(cwd: &str) -> Result<(), String> {
+    let cwd = cwd.trim();
+    if cwd.is_empty() {
+        return Err("remote test cwd must not be empty".to_string());
+    }
+    if cwd.chars().count() > MAX_REMOTE_TEST_CWD_CHARS {
+        return Err(format!(
+            "remote test cwd exceeds {MAX_REMOTE_TEST_CWD_CHARS} characters"
+        ));
+    }
+    if cwd.starts_with('/') || cwd.contains('\0') || cwd.contains('\\') {
+        return Err("remote test cwd must be a relative path inside the remote root".to_string());
+    }
+    if cwd
+        .split('/')
+        .any(|component| component == ".." || component == "." || component.is_empty())
+    {
+        return Err("remote test cwd must not contain empty, '.' or '..' components".to_string());
+    }
+    Ok(())
+}
+
+/// Opt-in project policy for remote test evidence. Disabled by default: a
+/// project must explicitly name the reviewable commands that may run on the
+/// remote host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteTestPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub default_profile: Option<String>,
+    #[serde(default)]
+    pub profiles: Vec<RemoteTestProfile>,
+    #[serde(default = "default_remote_test_timeout")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_remote_test_output_cap")]
+    pub output_cap_bytes: u64,
+}
+
+fn default_remote_test_timeout() -> u64 {
+    DEFAULT_REMOTE_TEST_TIMEOUT_SECS
+}
+
+fn default_remote_test_output_cap() -> u64 {
+    DEFAULT_REMOTE_TEST_OUTPUT_CAP_BYTES
+}
+
+impl Default for RemoteTestPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_profile: None,
+            profiles: Vec::new(),
+            timeout_secs: DEFAULT_REMOTE_TEST_TIMEOUT_SECS,
+            output_cap_bytes: DEFAULT_REMOTE_TEST_OUTPUT_CAP_BYTES,
+        }
+    }
+}
+
+impl RemoteTestPolicy {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.profiles.len() > MAX_REMOTE_TEST_PROFILES {
+            return Err(format!(
+                "at most {MAX_REMOTE_TEST_PROFILES} remote test profiles are allowed"
+            ));
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for profile in &self.profiles {
+            profile.validate()?;
+            if !names.insert(profile.name.trim().to_string()) {
+                return Err(format!(
+                    "duplicate remote test profile name: {}",
+                    profile.name
+                ));
+            }
+        }
+        if let Some(default) = self.default_profile.as_deref() {
+            let default = default.trim();
+            if !self.profiles.iter().any(|profile| profile.name == default) {
+                return Err(format!(
+                    "default remote test profile {default} is not in the profile list"
+                ));
+            }
+        }
+        if !(MIN_REMOTE_TEST_TIMEOUT_SECS..=MAX_REMOTE_TEST_TIMEOUT_SECS)
+            .contains(&self.timeout_secs)
+        {
+            return Err(format!(
+                "remote test timeout must be {MIN_REMOTE_TEST_TIMEOUT_SECS}..={MAX_REMOTE_TEST_TIMEOUT_SECS} seconds"
+            ));
+        }
+        if !(MIN_REMOTE_TEST_OUTPUT_CAP_BYTES..=MAX_REMOTE_TEST_OUTPUT_CAP_BYTES)
+            .contains(&self.output_cap_bytes)
+        {
+            return Err(format!(
+                "remote test output cap must be {MIN_REMOTE_TEST_OUTPUT_CAP_BYTES}..={MAX_REMOTE_TEST_OUTPUT_CAP_BYTES} bytes"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn profile(&self, name: &str) -> Option<&RemoteTestProfile> {
+        self.profiles.iter().find(|profile| profile.name == name)
+    }
+
+    pub fn resolved_default_profile(&self) -> Option<&RemoteTestProfile> {
+        if let Some(name) = self.default_profile.as_deref()
+            && let Some(profile) = self.profile(name)
+        {
+            return Some(profile);
+        }
+        (self.profiles.len() == 1).then(|| &self.profiles[0])
+    }
+
+    pub fn is_empty_policy(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteTestPolicyParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetRemoteTestPolicyParams {
+    pub project_id: String,
+    pub policy: RemoteTestPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteTestPolicyResult {
+    pub project_id: String,
+    pub policy: RemoteTestPolicy,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RemoteTestParams {
+    pub project_id: String,
+    pub session_id: String,
+    /// Named profile from the project policy. Omit to use the policy default.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// Explicit one-off command. The project policy must still be enabled, and
+    /// the command is recorded verbatim as evidence.
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Optional remote merge-queue entry. When set, the remote HEAD must equal
+    /// the entry commit and the digest is attached to that row.
+    #[serde(default)]
+    pub entry_id: Option<String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub output_cap_bytes: Option<u64>,
+    /// Assert the exact remote commit before running anything.
+    #[serde(default)]
+    pub expected_commit: Option<String>,
+}
+
+/// Event-backed evidence for one bounded remote command. `digest` is the
+/// SHA-256 of the canonical evidence fields (excluding the digest itself).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteTestEvidence {
+    pub id: String,
+    pub project_id: String,
+    pub session_id: String,
+    #[serde(default)]
+    pub entry_id: Option<String>,
+    pub profile: String,
+    pub kind: String,
+    pub host: String,
+    pub commit: String,
+    pub command: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// `passed`, `failed`, `timeout`, or `cancelled`.
+    pub status: String,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub output_ref: Option<String>,
+    #[serde(default)]
+    pub output_sha256: Option<String>,
+    #[serde(default)]
+    pub output_bytes: u64,
+    #[serde(default)]
+    pub output_truncated: bool,
+    #[serde(default)]
+    pub timed_out: bool,
+    #[serde(default)]
+    pub detail: Option<String>,
+    pub digest: String,
+    pub environment_caveat: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteTestResult {
+    pub project_id: String,
+    pub session_id: String,
+    pub evidence: RemoteTestEvidence,
+    /// The queue row updated with the digest, when the caller supplied one.
+    #[serde(default)]
+    pub entry: Option<crate::types::MergeQueueEntry>,
+    pub digest: String,
+    pub output_ref: Option<String>,
+    /// Remote evidence never claims merge authority.
+    pub supplemental: bool,
+    pub local_verifier_required: bool,
+    pub merge_gate_unchanged: bool,
+    pub environment_caveat: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RemoteTestStatusParams {
+    pub project_id: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub entry_id: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteTestStatusResult {
+    pub project_id: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub entry_id: Option<String>,
+    pub policy: RemoteTestPolicy,
+    pub evidence: Vec<RemoteTestEvidence>,
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub timed_out: usize,
+    #[serde(default)]
+    pub latest_digest: Option<String>,
+    pub environment_caveat: String,
+    pub local_verifier_required: bool,
+    pub merge_gate_unchanged: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemoteTestOutputParams {
+    pub project_id: String,
+    pub evidence_id: String,
+    #[serde(default)]
+    pub offset: u64,
+    #[serde(default = "default_remote_test_output_read")]
+    pub limit: u64,
+}
+
+fn default_remote_test_output_read() -> u64 {
+    DEFAULT_REMOTE_TEST_OUTPUT_READ_BYTES
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteTestOutputResult {
+    pub project_id: String,
+    pub evidence_id: String,
+    #[serde(default)]
+    pub output_ref: Option<String>,
+    #[serde(default)]
+    pub output_sha256: Option<String>,
+    pub offset: u64,
+    pub bytes_read: u64,
+    pub text: String,
+    pub done: bool,
+    pub output_truncated: bool,
+    pub environment_caveat: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RemoteBootstrapParams {
+    pub project_id: String,
+    #[serde(default)]
+    pub install_path: Option<String>,
+    #[serde(default)]
+    pub expected_sha256: Option<String>,
+    #[serde(default)]
+    pub expected_version: Option<String>,
+    #[serde(default)]
+    pub force: bool,
+    /// Explicit operator confirmation for this host-level install.
+    #[serde(default)]
+    pub confirm: bool,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// Optional session that should receive a `remote.bootstrap.completed`
+    /// audit event. Bootstrap is project-scoped and does not require a session.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteBootstrapRecord {
+    pub project_id: String,
+    pub host: String,
+    pub install_path: String,
+    pub sha256: String,
+    pub bytes: u64,
+    pub helper_version: String,
+    pub protocol_version: u32,
+    pub target_os: String,
+    pub target_arch: String,
+    pub installed_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteBootstrapResult {
+    pub project_id: String,
+    pub host: String,
+    pub install_path: String,
+    pub sha256: String,
+    pub bytes: u64,
+    pub helper_version: String,
+    pub protocol_version: u32,
+    pub target_os: String,
+    pub target_arch: String,
+    pub remote_os: String,
+    pub remote_arch: String,
+    pub replaced: bool,
+    pub used_sudo: bool,
+    pub chunks: u32,
+    pub duration_ms: u64,
+    pub installed_at: String,
+    /// Always `host_state`: an install changes host state and is never a
+    /// routine workspace write.
+    pub risk: String,
+    pub approval_required: bool,
+    pub confirmation_required: bool,
+    /// True when `ExecutionHost.helper_path` differs from the installed path.
+    /// The host config is not silently rewritten.
+    pub host_path_mismatch: bool,
+    pub environment_caveat: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RemoteBootstrapStatusParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteBootstrapStatusResult {
+    pub project_id: String,
+    pub configured: bool,
+    #[serde(default)]
+    pub host: Option<String>,
+    pub install_path: String,
+    pub configured_helper_path: String,
+    pub path_matches_config: bool,
+    #[serde(default)]
+    pub record: Option<RemoteBootstrapRecord>,
+    pub risk: String,
+    pub approval_required: bool,
+    pub environment_caveat: String,
+}
 
 #[cfg(test)]
 mod tests {
@@ -897,6 +1379,9 @@ mod tests {
                 verifier_approved: Some(true),
                 verifier_summary: Some("approved".into()),
                 environment_caveat: Some("local only".into()),
+                remote_test_evidence_id: None,
+                remote_test_digest: None,
+                remote_test_status: None,
                 attempt: 2,
                 detail: Some("conflict".into()),
                 created_at: "2026-11-11T00:00:00Z".into(),
@@ -941,6 +1426,209 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&result).unwrap()).unwrap();
         assert_eq!(decoded.removed_refs.len(), 1);
         assert_eq!(decoded.entries_examined, 2);
+    }
+
+    #[test]
+    fn remote_test_policy_defaults_disabled_and_decodes_legacy_rows() {
+        let policy: RemoteTestPolicy = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!policy.enabled);
+        assert!(policy.profiles.is_empty());
+        assert_eq!(policy.timeout_secs, DEFAULT_REMOTE_TEST_TIMEOUT_SECS);
+        assert_eq!(
+            policy.output_cap_bytes,
+            DEFAULT_REMOTE_TEST_OUTPUT_CAP_BYTES
+        );
+        assert!(policy.validate().is_ok());
+
+        let policy = RemoteTestPolicy {
+            enabled: true,
+            default_profile: Some("test".into()),
+            profiles: vec![RemoteTestProfile {
+                name: "test".into(),
+                kind: RemoteTestKind::Test,
+                command: "cargo test --workspace".into(),
+                cwd: Some("crates/vp-core".into()),
+                timeout_secs: Some(600),
+            }],
+            timeout_secs: 900,
+            output_cap_bytes: 65_536,
+        };
+        assert!(policy.validate().is_ok());
+        let decoded: RemoteTestPolicy =
+            serde_json::from_value(serde_json::to_value(&policy).unwrap()).unwrap();
+        assert_eq!(decoded, policy);
+        assert_eq!(decoded.resolved_default_profile().unwrap().name, "test");
+    }
+
+    #[test]
+    fn remote_test_policy_validation_rejects_unsafe_values() {
+        let mut policy = RemoteTestPolicy {
+            enabled: true,
+            default_profile: Some("missing".into()),
+            profiles: vec![RemoteTestProfile {
+                name: "test".into(),
+                kind: RemoteTestKind::Test,
+                command: "cargo test".into(),
+                cwd: None,
+                timeout_secs: None,
+            }],
+            timeout_secs: 900,
+            output_cap_bytes: 65_536,
+        };
+        assert!(policy.validate().is_err());
+        policy.default_profile = Some("test".into());
+        policy.profiles[0].cwd = Some("../escape".into());
+        assert!(policy.validate().is_err());
+        policy.profiles[0].cwd = Some("/absolute".into());
+        assert!(policy.validate().is_err());
+        policy.profiles[0].cwd = None;
+        policy.profiles[0].name = "bad name".into();
+        assert!(policy.validate().is_err());
+        policy.profiles[0].name = "test".into();
+        policy.profiles.push(policy.profiles[0].clone());
+        assert!(policy.validate().is_err());
+        policy.profiles.pop();
+        policy.timeout_secs = 0;
+        assert!(policy.validate().is_err());
+        policy.timeout_secs = 900;
+        policy.output_cap_bytes = 1;
+        assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn remote_test_and_bootstrap_requests_decode_with_safe_defaults() {
+        let params: RemoteTestParams = serde_json::from_value(serde_json::json!({
+            "project_id": "p1",
+            "session_id": "s1"
+        }))
+        .unwrap();
+        assert!(params.profile.is_none());
+        assert!(params.command.is_none());
+        assert!(params.entry_id.is_none());
+        assert!(params.timeout_secs.is_none());
+        assert!(params.expected_commit.is_none());
+        let status: RemoteTestStatusParams =
+            serde_json::from_value(serde_json::json!({"project_id": "p1"})).unwrap();
+        assert!(status.session_id.is_none());
+        assert!(status.entry_id.is_none());
+        assert!(status.limit.is_none());
+        let output: RemoteTestOutputParams = serde_json::from_value(serde_json::json!({
+            "project_id": "p1",
+            "evidence_id": "e1"
+        }))
+        .unwrap();
+        assert_eq!(output.offset, 0);
+        assert_eq!(output.limit, DEFAULT_REMOTE_TEST_OUTPUT_READ_BYTES);
+
+        let bootstrap: RemoteBootstrapParams = serde_json::from_value(serde_json::json!({
+            "project_id": "p1"
+        }))
+        .unwrap();
+        assert!(!bootstrap.confirm);
+        assert!(!bootstrap.force);
+        assert!(bootstrap.install_path.is_none());
+        assert!(bootstrap.expected_sha256.is_none());
+        assert!(bootstrap.timeout_secs.is_none());
+        assert!(bootstrap.session_id.is_none());
+    }
+
+    #[test]
+    fn remote_test_evidence_round_trips_and_merge_entries_default_additively() {
+        let evidence = RemoteTestEvidence {
+            id: "e1".into(),
+            project_id: "p1".into(),
+            session_id: "s1".into(),
+            entry_id: Some("q1".into()),
+            profile: "test".into(),
+            kind: "test".into(),
+            host: "build.example.com".into(),
+            commit: "abcdef1234567890".into(),
+            command: "cargo test".into(),
+            cwd: None,
+            status: "passed".into(),
+            exit_code: Some(0),
+            duration_ms: 10,
+            output_ref: Some("remote-test-outputs/x.txt".into()),
+            output_sha256: Some("b".repeat(64)),
+            output_bytes: 10,
+            output_truncated: false,
+            timed_out: false,
+            detail: None,
+            digest: "c".repeat(64),
+            environment_caveat: REMOTE_TEST_ENVIRONMENT_CAVEAT.into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let decoded: RemoteTestEvidence =
+            serde_json::from_value(serde_json::to_value(&evidence).unwrap()).unwrap();
+        assert_eq!(decoded, evidence);
+        let status = RemoteTestStatusResult {
+            project_id: "p1".into(),
+            session_id: None,
+            entry_id: None,
+            policy: RemoteTestPolicy::default(),
+            evidence: vec![evidence],
+            total: 1,
+            passed: 1,
+            failed: 0,
+            timed_out: 0,
+            latest_digest: Some("c".repeat(64)),
+            environment_caveat: REMOTE_TEST_ENVIRONMENT_CAVEAT.into(),
+            local_verifier_required: true,
+            merge_gate_unchanged: true,
+        };
+        let decoded: RemoteTestStatusResult =
+            serde_json::from_value(serde_json::to_value(&status).unwrap()).unwrap();
+        assert_eq!(decoded.passed, 1);
+        assert!(decoded.local_verifier_required);
+
+        let legacy = serde_json::json!({
+            "entry_id": "e1",
+            "session_id": "s1",
+            "status": "queued",
+            "commit": "abc",
+            "branch": "b",
+            "attempt": 1,
+            "created_at": "now",
+            "updated_at": "now"
+        });
+        let entry: RemoteIntegrationQueueEntry = serde_json::from_value(legacy).unwrap();
+        assert!(entry.remote_test_evidence_id.is_none());
+        assert!(entry.remote_test_digest.is_none());
+        assert!(entry.remote_test_status.is_none());
+    }
+
+    #[test]
+    fn bootstrap_status_and_result_serialize_the_stable_risk() {
+        let record = RemoteBootstrapRecord {
+            project_id: "p1".into(),
+            host: "build.example.com".into(),
+            install_path: "/home/agent/.verlinpark/bin/vp-remote-agent".into(),
+            sha256: "a".repeat(64),
+            bytes: 4096,
+            helper_version: "0.1.0-dev".into(),
+            protocol_version: 1,
+            target_os: "linux".into(),
+            target_arch: "x86_64".into(),
+            installed_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let status = RemoteBootstrapStatusResult {
+            project_id: "p1".into(),
+            configured: true,
+            host: Some("build.example.com".into()),
+            install_path: DEFAULT_REMOTE_BOOTSTRAP_PATH.into(),
+            configured_helper_path: DEFAULT_REMOTE_BOOTSTRAP_PATH.into(),
+            path_matches_config: true,
+            record: Some(record),
+            risk: REMOTE_BOOTSTRAP_RISK.into(),
+            approval_required: true,
+            environment_caveat: REMOTE_BOOTSTRAP_ENVIRONMENT_CAVEAT.into(),
+        };
+        let decoded: RemoteBootstrapStatusResult =
+            serde_json::from_value(serde_json::to_value(&status).unwrap()).unwrap();
+        assert_eq!(decoded.risk, "host_state");
+        assert!(decoded.approval_required);
+        assert!(decoded.record.unwrap().sha256.starts_with('a'));
     }
 
     #[test]

@@ -7950,6 +7950,15 @@ pub struct MergeQueueEntry {
     pub verifier_summary: Option<String>,
     #[serde(default)]
     pub environment_caveat: Option<String>,
+    /// Supplemental remote-test evidence attached by `remote.test`. These
+    /// fields never change the Verifier verdict or the merge gate; older rows
+    /// decode as `None`.
+    #[serde(default)]
+    pub remote_test_evidence_id: Option<String>,
+    #[serde(default)]
+    pub remote_test_digest: Option<String>,
+    #[serde(default)]
+    pub remote_test_status: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -8701,6 +8710,9 @@ pub struct SessionReplayReport {
     /// heartbeat/output telemetry is deliberately excluded from the comparison.
     #[serde(default)]
     pub processes_match: bool,
+    /// Event-backed supplemental remote-test evidence projection.
+    #[serde(default)]
+    pub remote_test_evidence_matches: bool,
     pub consistent: bool,
     #[serde(default)]
     pub repaired: bool,

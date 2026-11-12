@@ -513,6 +513,7 @@ struct DashboardView: View {
             await model.loadProjectForkForest()
             await model.loadLineage()
             await model.loadRemoteIntegrationStatus()
+            await model.loadRemoteOperations()
             if model.forkTree != nil {
                 await model.loadForkTree()
             }

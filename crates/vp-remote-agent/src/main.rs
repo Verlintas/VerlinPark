@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 use vp_remote::server::{ServerConfig, serve_stdio};
-use vp_remote::{MAX_FRAME_BYTES, MAX_LEDGER_ENTRIES};
+use vp_remote::{MAX_FRAME_BYTES, MAX_LEDGER_ENTRIES, REMOTE_PROTOCOL_VERSION};
 
 #[derive(Debug, Default)]
 struct Args {
@@ -25,6 +25,7 @@ struct Args {
     max_frame_bytes: Option<u64>,
     ledger_entries: Option<usize>,
     version: bool,
+    describe: bool,
 }
 
 fn usage() -> &'static str {
@@ -41,6 +42,7 @@ fn usage() -> &'static str {
        --max-frame-bytes <N>   Frame limit (1024..16777216)\n\
        --ledger-entries <N>    Retained ledger entries (1..8192)\n\
        --version               Print the helper version\n\
+       --describe              Print machine-readable helper metadata as JSON\n\
      \n\
      The helper writes protocol frames to stdout and logs only to stderr."
 }
@@ -91,6 +93,7 @@ fn parse_args() -> Result<Args> {
                 );
             }
             "--version" | "-V" => args.version = true,
+            "--describe" => args.describe = true,
             "--help" | "-h" => {
                 println!("{}", usage());
                 std::process::exit(0);
@@ -216,6 +219,17 @@ async fn run() -> Result<()> {
     let args = parse_args()?;
     if args.version {
         println!("vp-remote-agent {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if args.describe {
+        let describe = serde_json::json!({
+            "helper_version": env!("CARGO_PKG_VERSION"),
+            "protocol_version": REMOTE_PROTOCOL_VERSION,
+            "target_os": std::env::consts::OS,
+            "target_arch": std::env::consts::ARCH,
+            "capabilities": vp_remote::protocol::helper_capabilities(),
+        });
+        println!("{}", serde_json::to_string(&describe)?);
         return Ok(());
     }
     let root = args

@@ -87,6 +87,10 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
                 &snapshot.project.id,
                 &snapshot.remote_integration_policy,
             )?;
+            store.set_remote_test_policy(&snapshot.project.id, &snapshot.remote_test_policy)?;
+            for record in &snapshot.remote_bootstrap_records {
+                store.upsert_remote_bootstrap_record(record)?;
+            }
             store.set_integration_policy(&snapshot.project.id, &snapshot.integration_policy)?;
             store.set_gui_policy(&snapshot.project.id, &snapshot.gui_policy)?;
             store.set_artifact_policy(&snapshot.project.id, &snapshot.artifact_policy)?;

@@ -109,6 +109,10 @@ final class AppModel {
     var remoteIntegrationStatus: RemoteIntegrationStatusResult?
     var remoteIntegrationBusy = false
     var remoteIntegrationStatusMessage: String?
+    var remoteBootstrapStatus: RemoteBootstrapStatusResult?
+    var remoteTestStatus: RemoteTestStatusResult?
+    var remoteOperationsBusy = false
+    var remoteOperationsMessage: String?
     var guiPolicy = GuiPolicy.standard
     var guiGraceSecs = 45
     var guiWaitMs = 15000
@@ -1698,10 +1702,42 @@ final class AppModel {
         }
     }
 
+    func loadRemoteOperations() async {
+        guard let projectID = selectedProjectID else {
+            remoteBootstrapStatus = nil
+            remoteTestStatus = nil
+            remoteOperationsMessage = nil
+            return
+        }
+        remoteOperationsBusy = true
+        defer { remoteOperationsBusy = false }
+        do {
+            async let bootstrap = core.remoteBootstrapStatus(projectID: projectID)
+            async let tests = core.remoteTestStatus(
+                projectID: projectID,
+                sessionID: selectedSessionID,
+                entryID: nil
+            )
+            let (bootstrapStatus, testStatus) = try await (bootstrap, tests)
+            guard projectID == selectedProjectID else { return }
+            remoteBootstrapStatus = bootstrapStatus
+            remoteTestStatus = testStatus
+            remoteOperationsMessage = nil
+        } catch {
+            guard projectID == selectedProjectID else { return }
+            remoteBootstrapStatus = nil
+            remoteTestStatus = nil
+            remoteOperationsMessage = error.localizedDescription
+        }
+    }
+
     func loadRemoteIntegrationStatus() async {
         guard let projectID = selectedProjectID else {
             remoteIntegrationStatus = nil
             remoteIntegrationStatusMessage = nil
+            remoteBootstrapStatus = nil
+            remoteTestStatus = nil
+            remoteOperationsMessage = nil
             return
         }
         remoteIntegrationBusy = true
