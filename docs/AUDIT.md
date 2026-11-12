@@ -901,3 +901,17 @@ gate。四条线都已合入 `main`（`0e204d4` Q4 → `46eb570` Q3 → `8006dd7
   key escrow/KMS/远程 attestation/密钥撤销、Source ANN/rerank、artifact
   archive extraction/media transcoding、Bitbucket adapter，以及本文既有的完整
   shell read/network confinement、默认自动冲突解决等。
+
+## 11. 2026-11-12 Gap closure round
+
+这一轮补齐可在本地实现和验证的剩余缺口，并把依赖外部协调服务、签名/硬件或与安全模型冲突的项目明确列为非目标。六条线已合入 `main`（基线 `9141680`；`389edc5` I4 → `ef22413` I3 → `549ce0f` I2 → `427ae2e` I1 → `9bc0e8b` I6 → `5a6054a` I5），新增 +45,288 / -1,926 行。
+
+- **Source retrieval v2 已交付**：可选 source IVF ANN、确定性 rerank、lexical expansion、exact fallback/诊断、RPC/CLI/Swift。限制：本地派生状态；recall 仅 fixture 对比 exact；搜索不自动建索引；expansion 仅 lexical。
+- **Archive/media 已交付**：ZIP/tar/tar.gz 安全列表/解压、traversal/symlink/device/重复/bomb 防护、provenance；ffprobe metadata、ffmpeg 显式 transcode、missing-tool typed error。限制：5 MiB artifact；工具是有界但未 sandbox 的受信任二进制；不支持密码归档/7z/rar/xz/bzip2/zstd/裸 gzip/嵌套解压；scratch 无自动 sweeper。
+- **Bitbucket Cloud/forge 已交付**：统一 provider、Cloud REST、env-only 凭据、preflight、typed `FORGE_*`、wiremock 测试。限制：仅 Cloud；无 OAuth；preflight 只证明可读；创建非 exactly-once；无 reviewer/draft/label/merge 自动化。
+- **Backup revocation/rekey/anchor 已交付**：`revoked_at`、`backup-key-revoke`、`backup-rekey`（不重加密、ciphertext 前后校验）、signed raise-only portable anchor、revoked-key `--allow-revoked` 审计。限制：本地 trust state，不是 CRL/transparency/attestation；旧 anchor 在新主机可重放；rekey 不改 KDF/不追溯签名；anchor lock 非分布式。
+- **Boot persistence/retention 已交付**：用户 LaunchAgent install/uninstall/status（无 sudo/需确认）、`restart_on_boot` + attempts/backoff/blocked、GUI timeline retention、per-tool deadline、test-cache `extra_env`/`extra_paths`。限制：LaunchAgent 仅 fake launchctl/plutil 测试；boot restart 需本版本 env sidecar；GUI retention 物理删事件造成 mirror seq gap；外部 cache scope 仅显式/不跨主机。
+- **Remote bootstrap/test evidence 已交付**：显式 `remote.bootstrap`（checksum/arch/protocol/version、atomic rename、no sudo、force）、`RemoteTestPolicy`、同事务证据、队列只增 evidence 字段、本地 Verifier 不可绕过。限制：SSH host 受信任/未 sandbox；仅用户 home；不交叉编译；远程测试不复制本地环境；无跨主机缓存/分布式验证/fencing。
+- **栈修复**：CLI clap parser 与测试 parse 栈提升到 32 MiB（显式 test threads + `RUST_MIN_STACK`），生产 CLI 仍为 32 MiB 专用线程。
+- **验证**：Rust 2,938 passed / 0 failed / 6 ignored；Swift 473 passed（341 app + 132 helper）；`cargo fmt/clippy`、`swiftformat --lint`、`xcodebuild test`、`just bundle` 通过。
+- **明确非目标（未实现，不声称完成）**：跨主机 scheduler/lease consensus/distributed merge·program fencing；默认全量 shell read/network confinement；默认自动冲突解决/隐藏 LLM Integrator；Sparkle 自动更新；原生 GUI helper sandbox；分布式 semantic memory/跨主机 source·test-cache 共享；自动创建 Manager/plan rewrite；provider exactly-once/mid-stream resume；跨主机审批队列/分布式 waiter fencing/取消；key escrow/KMS/HSM/远程 attestation/transparency log；Bitbucket Server/Data Center；远程测试环境复现。原因见 `GAP_CLOSURE_PLAN.md §0`。

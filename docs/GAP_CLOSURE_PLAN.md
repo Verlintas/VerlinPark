@@ -1,6 +1,6 @@
 # Gap Closure Plan
 
-> **Status:** active implementation plan.
+> **Status:** implemented and verified (2026-11-12).
 > **Created:** 2026-11-12
 > **Base:** `659b001` (long-run operations round H1–H5 complete).
 > **Goal:** close every remaining gap that can be implemented and verified
@@ -15,18 +15,18 @@
 
 ### Implemented this round
 
-- [ ] Source semantic retrieval is exact-scan only; no ANN, rerank, or query
+- [x] Source semantic retrieval is exact-scan only; no ANN, rerank, or query
       expansion.
-- [ ] Artifacts have no safe archive listing/extraction; media metadata and
+- [x] Artifacts have no safe archive listing/extraction; media metadata and
       transcoding are absent.
-- [ ] PR/MR providers cover GitHub/GitLab/Gitea/Forgejo but not Bitbucket.
-- [ ] Signed backups have no key revocation, re-sign/rotation migration, or
+- [x] PR/MR providers cover GitHub/GitLab/Gitea/Forgejo but not Bitbucket.
+- [x] Signed backups have no key revocation, re-sign/rotation migration, or
       portable anti-rollback anchor.
-- [ ] Processes do not survive host reboot; there is no user LaunchAgent
+- [x] Processes do not survive host reboot; there is no user LaunchAgent
       lifecycle. GUI action events share session retention; test-cache keys
       ignore operator-declared external inputs; parallel read-only batches do
       not honor per-tool deadlines.
-- [ ] Remote helpers must be installed manually; remote project checks are not
+- [x] Remote helpers must be installed manually; remote project checks are not
       captured as supplemental evidence.
 
 ### Explicit non-goals (documented, not claimed as shipped)
@@ -294,3 +294,44 @@ confinement, Sparkle, native GUI sandboxing, distributed semantic memory,
 automatic Manager creation, provider exactly-once/mid-stream resume, key
 escrow/KMS/transparency, Bitbucket Server, and cross-host approval/cache/source
 sharing remain explicit non-goals, documented in the current-state docs.
+
+---
+
+## 7. Implementation record
+
+Implemented on `main` from base `9141680` in six commits:
+
+```text
+389edc5 feat(backup): key revocation, rekey, and portable anchor (I4)
+ef22413 feat(forge): Bitbucket Cloud provider and PR/MR abstraction (I3)
+549ce0f feat(artifacts): safe archive extraction and explicit media tools (I2)
+427ae2e feat(retrieval): source ANN, deterministic rerank, and lexical expansion (I1)
+9bc0e8b feat(remote): helper bootstrap and remote test evidence (I6)
+5a6054a feat(runtime): boot persistence, retention, and per-tool deadline polish (I5)
+```
+
+- Diff: **+45,288 / -1,926 lines across 80 files** (target +42,000).
+- Rust: `cargo test --workspace` **2,938 passed / 0 failed / 6 ignored**;
+  `cargo fmt --check` and `cargo clippy -D warnings` pass.
+- Swift: `xcodebuild test` **341 app + 132 helper = 473 passed / 0 failed**;
+  `swiftformat --lint` passes (0/108).
+- `just bundle` builds the Debug app and bundles `verlinpadd`.
+- ADR-0182–0187 record the six decisions.
+
+Merge-resolution notes:
+
+- The CLI's generated clap parser and helper-test parse stacks outgrew 8 MiB;
+  all explicit test parse stacks and `RUST_MIN_STACK` were raised to 32 MiB.
+  The production `vp` binary already parses/dispatches on a 32 MiB thread.
+- CLI/daemon/protocol/store test tails were reconstructed from pre-merge
+  versions so both sides' tests and typed-error helpers were retained.
+- The test-cache wall-clock prune assertion keeps the deterministic far-future
+  cutoff rather than a time-of-day-dependent clock.
+- The errors catalog cap is 30,000 characters to cover the grown code list.
+
+Explicit limits are recorded in AGENTS.md, README.md, PROGRESS.md, and AUDIT.md:
+ANN is local derived state with fixture-measured recall; archive/media tools are
+bounded but ffprobe/ffmpeg are trusted local binaries; Bitbucket is Cloud-only
+and not exactly-once; revocation/anchor are local trust state; LaunchAgent
+behavior is fixture-tested rather than installed; remote test evidence never
+bypasses the local Verifier; and the section-0 non-goals remain unimplemented.

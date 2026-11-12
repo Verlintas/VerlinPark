@@ -23,7 +23,7 @@
 | **Current** | [QUALITY_CACHE_GUI_TOOLING_PLAN.md](QUALITY_CACHE_GUI_TOOLING_PLAN.md) | Q1–Q4 质量轮计划与实现记录：cache-first prompt、GUI session layer、tool errors/recipes、LSP-first code intelligence；已完成 +32.6k 行验收 |
 | **Current** | [SCALING_PROCESS_SOURCE_REMOTE_BUDGET_PLAN.md](SCALING_PROCESS_SOURCE_REMOTE_BUDGET_PLAN.md) | F1–F5 第五轮计划与实现记录：deterministic scaling、durable process supervisor、semantic sources、remote worktree integration、budget/critical-path governor；已完成 +37.0k 行验收 |
 | **Current** | [LONG_RUN_OPERATIONS_HARDENING_PLAN.md](LONG_RUN_OPERATIONS_HARDENING_PLAN.md) | H1–H5 第六轮计划与实现记录：approval/attention optimizer、test-result cache/impact map、precise preemption、multi-path budget fairness、signed/rotatable backups；已完成 +38.5k 行验收 |
-| **Current** | [GAP_CLOSURE_PLAN.md](GAP_CLOSURE_PLAN.md) | I1–I6 第七轮计划：source ANN/rerank/expansion、archive/media、Bitbucket、backup revocation/rekey、boot persistence/retention、remote bootstrap/test evidence；含完整已知缺口清单与非目标 |
+| **Current** | [GAP_CLOSURE_PLAN.md](GAP_CLOSURE_PLAN.md) | I1–I6 第七轮计划与实现记录：source ANN/rerank/expansion、archive/media、Bitbucket、backup revocation/rekey、boot persistence/retention、remote bootstrap/test evidence；已完成 +45.3k 行验收，含完整已知缺口清单与非目标 |
 | **Reference** | [PRIDE_FLAGS.md](PRIDE_FLAGS.md) | Pride flag 资产来源与许可 |
 | **Reference** | [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) | FlagKit 等第三方资产许可 |
 | **Contributing** | [../CONTRIBUTING.md](../CONTRIBUTING.md) | 构建、测试、提交约定 |

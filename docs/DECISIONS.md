@@ -191,6 +191,12 @@
 | [0179](adr/0179-precise-preemption-and-deadlines.md) | Provider/tool preemption tokens, deadlines, and honest partial-use accounting | Accepted | Runtime/Providers/Tools |
 | [0180](adr/0180-multi-path-budget-fairness.md) | Bounded multi-path allocation, department floors, and starvation aging | Accepted | Runtime/Budget |
 | [0181](adr/0181-signed-backups-key-rotation-anti-rollback.md) | Ed25519-signed v3 backups, key rotation, and local anti-rollback anchor | Accepted | Runtime/CLI/Security |
+| [0182](adr/0182-source-retrieval-ann-rerank-expansion.md) | Deterministic source IVF ANN, rerank, and lexical query expansion | Accepted | Runtime/Retrieval |
+| [0183](adr/0183-safe-artifact-archives-and-media.md) | Bounded archive extraction and explicit media tools with ffprobe/ffmpeg availability | Accepted | Runtime/Artifacts |
+| [0184](adr/0184-bitbucket-cloud-forge-provider.md) | Unified forge provider abstraction with Bitbucket Cloud REST and env-only credentials | Accepted | Runtime/Forge/CLI |
+| [0185](adr/0185-backup-key-revocation-rekey-portable-anchor.md) | Backup key revocation, ciphertext-preserving rekey, and raise-only portable anchor | Accepted | Runtime/Security |
+| [0186](adr/0186-boot-persistence-retention-and-preemption-polish.md) | User LaunchAgent lifecycle, opt-in boot restart, GUI retention, and per-tool deadlines | Accepted | Runtime/Lifecycle |
+| [0187](adr/0187-remote-helper-bootstrap-and-test-evidence.md) | Checksummed remote helper bootstrap and supplemental remote test evidence | Accepted | Runtime/Remote |
 
 ---
 

@@ -1,12 +1,91 @@
 # VerlinPark 进度
 
 > 最后更新：2026-11-11
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
 
 ---
+
+## 2026-11-12 Gap closure: source ANN, archives/media, Bitbucket, backup revocation, boot persistence, remote bootstrap
+
+这一轮把剩余可在本地实现和验证的缺口一次补齐，并把无法在不引入外部协调服务/签名/硬件的前提下完成的项目明确列成非目标。计划与完整缺口清单见
+[GAP_CLOSURE_PLAN.md](GAP_CLOSURE_PLAN.md)，决策见 ADR-0182–0187。基线 `9141680`，本轮 **+45,288 / -1,926 行，80 个文件**。
+
+### I1 source retrieval v2
+
+- `SourceRetrievalPolicy`：ANN 默认关闭、`ann_min_vectors`、`nprobe`、rerank、lexical expansion、term cap；SQLite + manifest + db-rebuild。
+- 确定性 source IVF：bounded training（4,096 vectors / 8 MiB）、`nlist=ceil(sqrt(live))`、seeded k-means++、版本化 `VPSA` centroid blob、generation-fenced rebuild、增量 assignment（1,024/tick）。
+- 查询按 cosine 选 centroid，探 `nprobe` 簇，候选再用 exact cosine 重打分；exact scan 始终是 fallback。fallback 原因含 `ann_disabled`、`below_min_vectors`、`not_built`、`model_mismatch`、`index_corrupt`、`generation_conflict` 等。
+- rerank 固定权重 cosine 0.55 / lexical 0.25 / title 0.12 / freshness 0.08，缺失项归一化，确定性排序；hits 带组件分数，raw lane scores 保留。
+- lexical expansion 默认关闭；从 top 3 hit 的 title/heading/body 抽词，第二次 OR FTS，只给新增 chunk 标 `expanded`；semantic/hybrid 一次 bounded batch，不额外 provider round trip。
+- RPC/CLI/Swift Sources 状态卡与 rebuild；不序列化 vector/centroid/text。
+- 限制：ANN 是本地派生状态；recall 只在 fixture 上对比 exact；搜索不自动建/修索引；expansion 仅 lexical。
+
+### I2 safe artifact archives / media
+
+- 仅 ZIP / tar / tar.gz（byte magic）。硬上限 64 MiB archive、2,000 entries、32 MiB/entry、128 MiB total、100:1 ratio。
+- 拒绝 traversal、absolute、drive、NUL/control、symlink/hardlink/device/FIFO、重复 normalized path、加密 ZIP、malformed、bomb。
+- 解压只写 `<data_dir>/archive-extracts/extract-<uuid>/`，canonical component join + `create_new`，成功/失败清理；选中条目转 content-addressed artifact（≤5 MiB）或有界 preview；`ArtifactProvenance` 记录来源/entry hash/extraction id。
+- `media.info`：ffprobe bounded JSON、timeout、process-group kill、`-protocol_whitelist file`；缺失返回 `MEDIA_TOOL_UNAVAILABLE`；静图可显式 fallback `sips` metadata。
+- `media.transcode`：显式 approval、ffmpeg、allowlist 格式、clamp duration/bytes、输出只进 artifact、stderr 有界且路径 redact。
+- Agent tools、RPC/CLI/Swift ArchiveBrowser/Media card。
+- 限制：单 artifact 5 MiB；ffprobe/ffmpeg 是有界但未 sandbox 的受信任二进制；不支持密码归档/7z/rar/xz/bzip2/zstd/裸 gzip/嵌套自动解压；崩溃遗留 scratch 无自动 sweeper。
+
+### I3 Bitbucket Cloud / forge abstraction
+
+- `ForgeProvider` 统一 GitHub/GitLab/Gitea/Forgejo/Bitbucket Cloud；选择顺序显式 provider → env → origin。
+- Bitbucket Cloud 解析 HTTPS/SSH、`.git`、trailing slash、`ssh://`、userinfo；Server/Data Center 返回 `FORGE_SERVER_UNSUPPORTED`。
+- 凭据仅 `BITBUCKET_TOKEN` 或 `BITBUCKET_USERNAME`+`BITBUCKET_APP_PASSWORD`，zeroize + Q3 redaction，不序列化/不写事件/日志。
+- preflight `GET /2.0/repositories/...` 在 push 前；创建 `POST .../pullrequests`；必须返回可用 same-origin HTML link 或 numeric id，否则 `FORGE_RESPONSE_INVALID`。
+- 30s/1 MiB 上限、same-origin redirect ≤3、HTTPS、无 cookie、POST 不自动重试；超时/5xx 明确提示 PR 可能已存在。
+- CLI `vp pr --provider`、`vp forge status/check`；Settings/Stage provider-aware。
+- 限制：仅 Bitbucket Cloud；无 OAuth/浏览器凭据流；preflight 只证明可读；创建不是 exactly-once；无 reviewer/draft/label/merge 自动化。
+
+### I4 backup revocation / rekey / portable anchor
+
+- keyring 增加 `revoked_at`；`backup-key-revoke` 幂等，撤销 active key 需 `--force` 并清空 active；签名拒绝 revoked key。
+- verify/list/restore 对 revoked signer 返回 `BACKUP_KEY_REVOKED`，`--allow-revoked` 记录 warning + `snapshot.revoked_key_allowed` 审计。
+- `backup-rekey` 只重签 v3 manifest/metadata，不重加密 blob；保留 repository id/generation/chain/entries/tombstones；验证 blob ciphertext 前后 SHA-256 不变；幂等/可恢复/有界；拒绝 v2/v1、unsigned、missing key、revoked active。
+- `backup-anchor-export` 生成独立域 Ed25519 签名 anchor（无路径/秘密）；`backup-anchor-verify/import` 校验签名/revocation，strictly raise-only，`--require-newer`，0600 lock。
+- CLI/daemon status/Swift Settings。
+- 限制：本地 trust state，不是 CRL/transparency/attestation；旧签名 anchor 在从未更新过的主机上仍可能被重放；rekey 不重加密/不改 KDF/不追溯签名 unsigned history；anchor lock 是同主机文件锁。
+
+### I5 boot persistence / retention / preemption polish
+
+- 用户级 `vp daemon-agent install|uninstall|status`：`~/Library/LaunchAgents/com.verlinpark.daemon.plist`，`RunAtLoad`/`KeepAlive`/`ThrottleInterval`/`Umask 077`，日志在 data dir，绝对 binary path；无 sudo、无 shell string、无自动安装；install 需 `--yes`，拒绝 loaded job/live daemon/覆盖需 `--force`。
+- `ProcessPolicy.restart_on_boot`（默认 false）+ max attempts/backoff；只重启 `running` 且原 identity 消失/复用的行；identity 模糊则 `blocked: identity_unverified`；新 nonce，env 只存 0600 sidecar；事件 `process.restarting/restarted/restart_blocked`；显式 `session.process.restart`。
+- `GuiPolicy.timeline_retention_days` 默认 30（0 永久）；sweep/手动 prune 只删 `gui.action` 事件，按 cutoff/batch，重写 mirror，写 `gui.timeline_pruned` 审计；不影响其他事件。
+- 并行只读工具各自持有 `PreemptToken::tool_child`；单 tool deadline 只中止该 tool，兄弟继续，run/operator preemption 仍中止整个 batch。
+- test cache 增加 `extra_env`（仅名字）和 `extra_paths`（worktree 相对文件），参与 `external_scopes_hash`；缺失/不可读/越界/超大 fail closed；bounded 32 env / 64 paths / 8 KiB env value / 8 MiB file / 64 MiB total；manifest + db-rebuild；preview 不含值。
+- 限制：LaunchAgent 用 fake launchctl/plutil 测试，未真实安装；boot restart 需要本版本的 0600 env sidecar，旧行 `restart_env_unavailable`；GUI retention 物理删事件，pruned session 的 mirror 有 seq gap；cache 外部 scope 仅显式，不跨主机。
+
+### I6 remote bootstrap / test evidence
+
+- `remote.bootstrap` 显式 `--confirm`，`host_state`，上传本地 helper 分块到 `<path>.part-<token>`（umask 077），校验 SHA-256/目标 arch/protocol/version，临时运行 `--describe`，原子 rename；只允许 SSH 用户 `$HOME` 内路径，绝不 sudo，覆盖需 `force`。
+- `RemoteTestPolicy` 命名 check/lint/test 命令，bounded timeout/output；先解析远程 HEAD，拒绝 commit/queue-entry mismatch。
+- `remote_test.completed` 与证据同事务，记录 host/commit/command/exit/duration/output ref/hash/bytes/truncation/timeout/digest + 环境 caveat；输出存 `remote-test-outputs/<sha256>.txt`，可 replay。
+- 队列只增加 `remote_test_evidence_id/digest/status`，不改 verifier verdict/status/commit；本地 Verifier + 确定性 Integrator 仍强制。
+- 限制：SSH host 受信任且未 sandbox；仅用户 home；不交叉编译/下载；远程测试只是补充证据；无跨主机缓存/分布式验证/merge fencing；输出暂无自动按龄 prune。
+
+### 合并修复
+
+- CLI clap parser 与测试 parse 栈在 I5 后超过 8 MiB：所有显式 test parse stack 与 `RUST_MIN_STACK` 提升到 32 MiB；生产 `vp` 已是 32 MiB 专用线程。
+- CLI/daemon/protocol/store 测试尾部冲突按两侧完整内容重建；daemon 补齐 `MediaTranscodeParams` import；errors catalog 上限提升到 30,000 字符。
+- test-cache prune 测试保留确定性 2100 cutoff，不依赖运行时钟。
+
+### 验收
+
+- `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings` 通过。
+- `cargo test --workspace`：**2,938 passed / 0 failed / 6 ignored**。
+- `swiftformat --lint`：0/108 文件需要格式化。
+- `xcodegen generate` + `xcodebuild test`：**341 app + 132 helper = 473 passed / 0 failed**。
+- `just bundle` 通过，`verlinpadd` 已打包。
+
+### 仍未实现（明确非目标）
+
+跨主机 scheduler/lease consensus/distributed merge·program fencing、默认全量 shell read/network confinement、默认自动冲突解决/隐藏 LLM Integrator、Sparkle 自动更新、原生 GUI helper sandbox、分布式 semantic memory/跨主机 source·test-cache 共享、自动创建 Manager/plan rewrite、provider exactly-once/mid-stream resume、跨主机审批队列/分布式 waiter fencing/取消、key escrow/KMS/HSM/远程 attestation/transparency log、Bitbucket Server/Data Center、远程测试环境复现。原因见 [GAP_CLOSURE_PLAN.md §0](GAP_CLOSURE_PLAN.md)。
 
 ## 2026-11-12 Long-run operations: approvals, test cache, preemption, fairness, signed backups
 
