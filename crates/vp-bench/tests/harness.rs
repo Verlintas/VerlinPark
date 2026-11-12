@@ -6,7 +6,7 @@
 
 use std::fs;
 
-use vp_bench::cli::{BenchCommand, ProviderArg, RunArgs, execute};
+use vp_bench::cli::{BenchCommand, ProviderArg, ReliabilityArgs, RunArgs, execute};
 use vp_bench::compare::{CompareOptions, compare_reports};
 use vp_bench::metrics::Pricing;
 use vp_bench::report::{
@@ -437,6 +437,114 @@ async fn real_provider_baseline_smoke() {
     };
     let runs = run_scenarios(&[scenario], &options).await.unwrap();
     assert_eq!(runs.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reliability_runs_repeatable_fake_trials_and_writes_artifacts() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let output = dir.path().join("reliability");
+    let args = ReliabilityArgs {
+        scenarios: vec!["baseline-single-session".to_string()],
+        trials: 2,
+        k: 2,
+        from_report: None,
+        output: Some(output.clone()),
+        keep_worktrees: false,
+        provider: ProviderArg::Fake,
+        allow_real_provider: false,
+        model: None,
+        input_price: None,
+        output_price: None,
+        cache_read_price: None,
+        cache_write_price: None,
+        acceptance_timeout_secs: 60,
+        timeout_secs: None,
+    };
+    let outcome = execute(BenchCommand::Reliability(args), false)
+        .await
+        .unwrap();
+    assert_eq!(outcome.exit_code, 0, "{}", outcome.human);
+    assert!(outcome.human.contains("vp bench reliability"));
+    assert!(outcome.human.contains("pass@k"));
+    let json_path = fs::read_dir(&output)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension.to_string_lossy() == "json")
+        })
+        .expect("reliability JSON report");
+    let bytes = fs::read(&json_path).unwrap();
+    let report: vp_bench::ReliabilityReport = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(report.selection.trials, 2);
+    assert_eq!(report.selection.k, 2);
+    assert_eq!(report.scenarios.len(), 1);
+    assert_eq!(report.scenarios[0].solved, 2);
+    assert_eq!(report.scenarios[0].pass_at_k, Some(1.0));
+    assert_eq!(report.scenarios[0].pass_power_k, Some(1.0));
+    assert_eq!(report.scenarios[0].flake_rate, Some(0.0));
+    assert!(report.summary.coordination.total_tokens > 0);
+
+    // A saved `vp bench run` report is analyzed without a provider call.
+    let bench_output = dir.path().join("bench");
+    let run_args = RunArgs {
+        scenarios: vec!["baseline-single-session".to_string()],
+        repetitions: 2,
+        output: Some(bench_output.clone()),
+        keep_worktrees: false,
+        provider: ProviderArg::Fake,
+        allow_real_provider: false,
+        model: None,
+        input_price: None,
+        output_price: None,
+        cache_read_price: None,
+        cache_write_price: None,
+        acceptance_timeout_secs: 60,
+        timeout_secs: None,
+    };
+    let bench = execute(BenchCommand::Run(run_args), false).await.unwrap();
+    assert_eq!(bench.exit_code, 0, "{}", bench.human);
+    let bench_json = fs::read_dir(&bench_output)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension.to_string_lossy() == "json")
+        })
+        .expect("bench JSON report");
+    let analyze = ReliabilityArgs {
+        from_report: Some(bench_json),
+        trials: 2,
+        k: 2,
+        output: Some(dir.path().join("analysis")),
+        ..args_for_from_report()
+    };
+    let analyzed = execute(BenchCommand::Reliability(analyze), false)
+        .await
+        .unwrap();
+    assert_eq!(analyzed.exit_code, 0, "{}", analyzed.human);
+}
+
+fn args_for_from_report() -> ReliabilityArgs {
+    ReliabilityArgs {
+        scenarios: Vec::new(),
+        trials: 2,
+        k: 2,
+        from_report: None,
+        output: None,
+        keep_worktrees: false,
+        provider: ProviderArg::Fake,
+        allow_real_provider: false,
+        model: None,
+        input_price: None,
+        output_price: None,
+        cache_read_price: None,
+        cache_write_price: None,
+        acceptance_timeout_secs: 60,
+        timeout_secs: None,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

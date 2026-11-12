@@ -22,6 +22,10 @@ use vp_store::paths;
 use crate::compare::{CompareOptions, compare_reports};
 use crate::metrics::{Pricing, format_optional, format_percent, format_usd};
 use crate::provider::RealProviderSettings;
+use crate::reliability::{
+    MAX_RELIABILITY_SCENARIOS, MAX_RELIABILITY_TRIALS, ReliabilityArtifacts, ReliabilityReport,
+    from_saved_report, resolve_k, write_reliability_artifacts,
+};
 use crate::report::{BenchReport, REPORT_CAVEAT, ReportArtifacts, load_report, write_artifacts};
 use crate::runner::{BenchRunOptions, ProviderSelection, report_environment, run_scenarios};
 use crate::scenario::{Availability, Scenario};
@@ -59,6 +63,10 @@ pub enum BenchCommand {
         #[arg(long)]
         allow_mismatch: bool,
     },
+    /// Reliability projection: pass@k, pass^k, flake rate, Lucky-Pass, and
+    /// coordination overhead over repeated deterministic trials. This is
+    /// observation-only and never a merge gate.
+    Reliability(ReliabilityArgs),
     /// Prompt-cache benchmark: deterministic simulator or explicit live mode.
     #[command(name = "cache-bench")]
     CacheBench {
@@ -125,6 +133,56 @@ pub struct RunArgs {
     pub timeout_secs: Option<u64>,
 }
 
+#[derive(Debug, Clone, Args)]
+pub struct ReliabilityArgs {
+    /// Scenario id; repeatable. Defaults to all available scenarios.
+    #[arg(long = "scenario")]
+    pub scenarios: Vec<String>,
+    /// Repeated deterministic trials per scenario (1-20 for a new run).
+    #[arg(long, default_value_t = 5)]
+    pub trials: usize,
+    /// k for pass@k and pass^k. Zero means min(trials, 5).
+    #[arg(long, default_value_t = 0)]
+    pub k: u32,
+    /// Analyze a saved `vp bench run` JSON report instead of running trials.
+    /// This performs no provider call. Scenario filters still apply.
+    #[arg(long)]
+    pub from_report: Option<PathBuf>,
+    /// Directory for the JSON/Markdown/CSV reliability report.
+    #[arg(short, long)]
+    pub output: Option<PathBuf>,
+    /// Retain disposable fixture workspaces for debugging (run mode only).
+    #[arg(long)]
+    pub keep_worktrees: bool,
+    /// Provider mode. Fake is deterministic and performs no network I/O.
+    #[arg(long, value_enum, default_value_t = ProviderArg::Fake)]
+    pub provider: ProviderArg,
+    /// Required acknowledgement for real-provider mode.
+    #[arg(long)]
+    pub allow_real_provider: bool,
+    /// Model override for real-provider mode (also needs the environment gate).
+    #[arg(long)]
+    pub model: Option<String>,
+    /// USD per million input tokens. Defaults to the scenario profile.
+    #[arg(long)]
+    pub input_price: Option<f64>,
+    /// USD per million output tokens. Defaults to the scenario profile.
+    #[arg(long)]
+    pub output_price: Option<f64>,
+    /// USD per million cache-read tokens. Defaults to the scenario profile.
+    #[arg(long)]
+    pub cache_read_price: Option<f64>,
+    /// USD per million cache-write tokens. Defaults to the scenario profile.
+    #[arg(long)]
+    pub cache_write_price: Option<f64>,
+    /// Timeout for the harness-owned acceptance script (1-300 seconds).
+    #[arg(long, default_value_t = 60)]
+    pub acceptance_timeout_secs: u64,
+    /// Override every scenario's wall-clock timeout (1-3600 seconds).
+    #[arg(long)]
+    pub timeout_secs: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CommandOutcome {
     pub exit_code: i32,
@@ -142,6 +200,7 @@ pub async fn execute(command: BenchCommand, json_mode: bool) -> Result<CommandOu
             b,
             allow_mismatch,
         } => compare_command(&a, &b, allow_mismatch, json_mode),
+        BenchCommand::Reliability(args) => reliability_command(args, json_mode).await,
         BenchCommand::CacheBench { command } => {
             let exit_code = crate::cache_bench::execute(command, json_mode).await?;
             Ok(CommandOutcome {
@@ -220,49 +279,21 @@ async fn run_command(args: RunArgs, json_mode: bool) -> Result<CommandOutcome> {
     if args.provider == ProviderArg::Fake && args.model.is_some() {
         bail!("--model is only valid with --provider real");
     }
-    let catalog = Scenario::catalog();
-    Scenario::validate_catalog(&catalog).map_err(anyhow::Error::msg)?;
-    let mut selected = if args.scenarios.is_empty() {
-        catalog
-            .into_iter()
-            .filter(|scenario| scenario.availability.is_available())
-            .collect::<Vec<_>>()
-    } else {
-        let available = catalog
-            .into_iter()
-            .map(|scenario| (scenario.id.clone(), scenario))
-            .collect::<std::collections::HashMap<_, _>>();
-        let mut selected = Vec::new();
-        for id in &args.scenarios {
-            let scenario = available
-                .get(id)
-                .cloned()
-                .with_context(|| format!("unknown benchmark scenario '{id}'"))?;
-            if let Some(reason) = scenario.availability.reason() {
-                bail!("scenario '{id}' is unavailable in this build: {reason}");
-            }
-            selected.push(scenario);
-        }
-        selected
-    };
-    if selected.is_empty() {
-        bail!("no runnable benchmark scenarios were selected");
-    }
-    for scenario in &mut selected {
-        scenario.config.pricing = pricing_with_overrides(&args, scenario.config.pricing)?;
-    }
-    let provider = match args.provider {
-        ProviderArg::Fake => ProviderSelection::Fake,
-        ProviderArg::Real => {
-            if !args.allow_real_provider {
-                bail!(
-                    "real-provider mode requires --allow-real-provider and {} = 1",
-                    RealProviderSettings::GATE_ENV
-                );
-            }
-            ProviderSelection::Real(RealProviderSettings::from_env(args.model.as_deref())?)
-        }
-    };
+    let mut selected = select_scenarios(&args.scenarios)?;
+    apply_pricing(
+        &mut selected,
+        &PricingOverrides {
+            input: args.input_price,
+            output: args.output_price,
+            cache_read: args.cache_read_price,
+            cache_write: args.cache_write_price,
+        },
+    )?;
+    let provider = provider_selection(
+        args.provider,
+        args.allow_real_provider,
+        args.model.as_deref(),
+    )?;
     let options = BenchRunOptions {
         repetitions: args.repetitions,
         keep_worktrees: args.keep_worktrees,
@@ -304,6 +335,219 @@ async fn run_command(args: RunArgs, json_mode: bool) -> Result<CommandOutcome> {
         human,
         json,
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PricingOverrides {
+    input: Option<f64>,
+    output: Option<f64>,
+    cache_read: Option<f64>,
+    cache_write: Option<f64>,
+}
+
+fn select_scenarios(ids: &[String]) -> Result<Vec<Scenario>> {
+    let catalog = Scenario::catalog();
+    Scenario::validate_catalog(&catalog).map_err(anyhow::Error::msg)?;
+    let selected = if ids.is_empty() {
+        catalog
+            .into_iter()
+            .filter(|scenario| scenario.availability.is_available())
+            .collect::<Vec<_>>()
+    } else {
+        let available = catalog
+            .into_iter()
+            .map(|scenario| (scenario.id.clone(), scenario))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut selected = Vec::new();
+        for id in ids {
+            let scenario = available
+                .get(id)
+                .cloned()
+                .with_context(|| format!("unknown benchmark scenario '{id}'"))?;
+            if let Some(reason) = scenario.availability.reason() {
+                bail!("scenario '{id}' is unavailable in this build: {reason}");
+            }
+            selected.push(scenario);
+        }
+        selected
+    };
+    if selected.is_empty() {
+        bail!("no runnable benchmark scenarios were selected");
+    }
+    Ok(selected)
+}
+
+fn apply_pricing(scenarios: &mut [Scenario], overrides: &PricingOverrides) -> Result<()> {
+    for scenario in scenarios {
+        scenario.config.pricing = pricing_from_options(scenario.config.pricing, overrides)?;
+    }
+    Ok(())
+}
+
+fn pricing_from_options(base: Pricing, overrides: &PricingOverrides) -> Result<Pricing> {
+    let pricing = Pricing {
+        input_usd_per_million: overrides.input.unwrap_or(base.input_usd_per_million),
+        output_usd_per_million: overrides.output.unwrap_or(base.output_usd_per_million),
+        cache_read_usd_per_million: overrides
+            .cache_read
+            .unwrap_or(base.cache_read_usd_per_million),
+        cache_write_usd_per_million: overrides
+            .cache_write
+            .unwrap_or(base.cache_write_usd_per_million),
+    };
+    pricing.validate().map_err(anyhow::Error::msg)?;
+    Ok(pricing)
+}
+
+fn provider_selection(
+    provider: ProviderArg,
+    allow_real_provider: bool,
+    model: Option<&str>,
+) -> Result<ProviderSelection> {
+    match provider {
+        ProviderArg::Fake => Ok(ProviderSelection::Fake),
+        ProviderArg::Real => {
+            if !allow_real_provider {
+                bail!(
+                    "real-provider mode requires --allow-real-provider and {} = 1",
+                    RealProviderSettings::GATE_ENV
+                );
+            }
+            Ok(ProviderSelection::Real(RealProviderSettings::from_env(
+                model,
+            )?))
+        }
+    }
+}
+
+async fn reliability_command(args: ReliabilityArgs, json_mode: bool) -> Result<CommandOutcome> {
+    if args.from_report.is_none() {
+        if args.provider == ProviderArg::Fake && args.allow_real_provider {
+            bail!("--allow-real-provider is only valid with --provider real");
+        }
+        if args.provider == ProviderArg::Fake && args.model.is_some() {
+            bail!("--model is only valid with --provider real");
+        }
+        if args.trials == 0 || args.trials > MAX_RELIABILITY_TRIALS || args.trials > 20 {
+            bail!("--trials must be 1-20 for a new reliability run");
+        }
+    } else if args.provider != ProviderArg::Fake
+        || args.allow_real_provider
+        || args.model.is_some()
+        || args.input_price.is_some()
+        || args.output_price.is_some()
+        || args.cache_read_price.is_some()
+        || args.cache_write_price.is_some()
+        || args.keep_worktrees
+        || args.timeout_secs.is_some()
+    {
+        bail!(
+            "--from-report analyzes a saved report; provider, pricing, worktree, and timeout flags are not applicable"
+        );
+    }
+    let generated_at = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "unknown".to_string());
+    let report = if let Some(path) = args.from_report.as_deref() {
+        from_saved_report(path, &args.scenarios, args.k)?
+    } else {
+        let mut selected = select_scenarios(&args.scenarios)?;
+        if selected.len() > MAX_RELIABILITY_SCENARIOS {
+            bail!(
+                "reliability selection is limited to {MAX_RELIABILITY_SCENARIOS} scenarios, got {}",
+                selected.len()
+            );
+        }
+        apply_pricing(
+            &mut selected,
+            &PricingOverrides {
+                input: args.input_price,
+                output: args.output_price,
+                cache_read: args.cache_read_price,
+                cache_write: args.cache_write_price,
+            },
+        )?;
+        let k = resolve_k(args.k, args.trials)?;
+        let provider = provider_selection(
+            args.provider,
+            args.allow_real_provider,
+            args.model.as_deref(),
+        )?;
+        let options = BenchRunOptions {
+            repetitions: args.trials,
+            keep_worktrees: args.keep_worktrees,
+            provider,
+            acceptance_timeout_secs: args.acceptance_timeout_secs,
+            timeout_override_secs: args.timeout_secs,
+        };
+        let runs = run_scenarios(&selected, &options).await?;
+        ReliabilityReport::build(&runs, &selected, k, "run", generated_at)?
+    };
+    let output_dir = args
+        .output
+        .clone()
+        .unwrap_or_else(|| paths::data_dir().join("bench"));
+    let artifacts = write_reliability_artifacts(&report, &output_dir)?;
+    let exit_code = benchmark_exit_code(report.all_solved(), report.summary.harness_faults);
+    let human = render_reliability_summary(&report, &artifacts, exit_code);
+    let json = json_mode.then(|| {
+        json!({
+            "exit_code": exit_code,
+            "report": report,
+            "artifacts": artifacts,
+            "output_dir": output_dir,
+        })
+    });
+    Ok(CommandOutcome {
+        exit_code,
+        human,
+        json,
+    })
+}
+
+fn render_reliability_summary(
+    report: &ReliabilityReport,
+    artifacts: &ReliabilityArtifacts,
+    exit_code: i32,
+) -> String {
+    let mut human = format!(
+        "vp bench reliability · {} scenario(s) × {} trial(s) · k={}\n",
+        report.selection.scenario_ids.len(),
+        report.selection.trials,
+        report.selection.k
+    );
+    for scenario in &report.scenarios {
+        human.push_str(&format!(
+            "{:<30} {}/{} solved · pass@k {} · pass^k {} · flake {} · overhead {} · cost/solved {} USD · lucky {}\n",
+            scenario.scenario_id,
+            scenario.solved,
+            scenario.trials,
+            format_optional(scenario.pass_at_k, 4),
+            format_optional(scenario.pass_power_k, 4),
+            format_optional(scenario.flake_rate, 3),
+            format_optional(scenario.coordination.ratio, 3),
+            format_optional(scenario.cost_per_solved_task_usd, 6),
+            scenario.lucky_pass.flagged_runs
+        ));
+    }
+    human.push_str(&format!(
+        "summary: {}/{} runs solved · mean pass@k {} · flaky {} · coordination {} · cost/solved task {} USD\n",
+        report.summary.solved_runs,
+        report.summary.run_count,
+        format_optional(report.summary.mean_pass_at_k, 4),
+        report.summary.flaky_scenarios,
+        format_optional(report.summary.coordination.ratio, 3),
+        format_optional(report.summary.cost_per_solved_task_usd, 6)
+    ));
+    human.push_str(&format!("json: {}\n", artifacts.json_path.display()));
+    human.push_str(&format!(
+        "markdown: {}\n",
+        artifacts.markdown_path.display()
+    ));
+    human.push_str(&format!("csv: {}\n", artifacts.csv_path.display()));
+    human.push_str(&format!("exit: {exit_code}\n"));
+    human.push_str(&format!("caveat: {}\n", report.caveat));
+    human
 }
 
 fn report_command(file: &std::path::Path, json_mode: bool) -> Result<CommandOutcome> {
@@ -358,19 +602,17 @@ fn benchmark_exit_code(all_solved: bool, harness_faults: usize) -> i32 {
     }
 }
 
+#[cfg(test)]
 fn pricing_with_overrides(args: &RunArgs, base: Pricing) -> Result<Pricing> {
-    let pricing = Pricing {
-        input_usd_per_million: args.input_price.unwrap_or(base.input_usd_per_million),
-        output_usd_per_million: args.output_price.unwrap_or(base.output_usd_per_million),
-        cache_read_usd_per_million: args
-            .cache_read_price
-            .unwrap_or(base.cache_read_usd_per_million),
-        cache_write_usd_per_million: args
-            .cache_write_price
-            .unwrap_or(base.cache_write_usd_per_million),
-    };
-    pricing.validate().map_err(anyhow::Error::msg)?;
-    Ok(pricing)
+    pricing_from_options(
+        base,
+        &PricingOverrides {
+            input: args.input_price,
+            output: args.output_price,
+            cache_read: args.cache_read_price,
+            cache_write: args.cache_write_price,
+        },
+    )
 }
 
 fn render_run_summary(report: &BenchReport, artifacts: &ReportArtifacts, exit_code: i32) -> String {
@@ -447,6 +689,43 @@ mod tests {
                 assert_eq!(args.repetitions, 3);
                 assert_eq!(args.output.unwrap().to_string_lossy(), "/tmp/bench");
                 assert_eq!(args.input_price, Some(1.5));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cli = BenchCli::parse_from([
+            "vp-bench",
+            "reliability",
+            "--scenario",
+            "baseline-single-session",
+            "--trials",
+            "5",
+            "--k",
+            "3",
+        ]);
+        match cli.command {
+            BenchCommand::Reliability(args) => {
+                assert_eq!(args.scenarios, vec!["baseline-single-session"]);
+                assert_eq!(args.trials, 5);
+                assert_eq!(args.k, 3);
+                assert!(args.from_report.is_none());
+                assert_eq!(args.provider, ProviderArg::Fake);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cli = BenchCli::parse_from([
+            "vp-bench",
+            "reliability",
+            "--from-report",
+            "report.json",
+            "--k",
+            "2",
+        ]);
+        match cli.command {
+            BenchCommand::Reliability(args) => {
+                assert_eq!(args.from_report.unwrap().to_string_lossy(), "report.json");
+                assert_eq!(args.k, 2);
             }
             other => panic!("unexpected command: {other:?}"),
         }

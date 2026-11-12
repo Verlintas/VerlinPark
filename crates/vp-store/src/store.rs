@@ -39,6 +39,7 @@ use vp_protocol::types::{
     cache_hit_ratio,
 };
 
+use vp_protocol::otel::OtelPolicy;
 use vp_protocol::remote::{
     ExecutionHost, RemoteBootstrapRecord, RemoteIntegrationPolicy, RemoteTestEvidence,
     RemoteTestPolicy,
@@ -1340,6 +1341,10 @@ pub struct ProjectManifestSnapshot {
     /// local-only with the loopback resolve endpoint disabled.
     #[serde(default)]
     pub gate_policy: GatePolicy,
+    /// Project-scoped OTel GenAI export policy. Older manifests decode as
+    /// disabled with a loopback endpoint. Export remains explicit only.
+    #[serde(default)]
+    pub otel_policy: OtelPolicy,
     /// Immutable project policy bundles referenced by plan/run runtime
     /// snapshots. Content-addressed and deduplicated per project.
     #[serde(default)]
@@ -1995,6 +2000,14 @@ impl Store {
             -- Project-scoped external-gate policy. A missing row means
             -- local-only resolution and the loopback endpoint disabled.
             CREATE TABLE IF NOT EXISTS project_gate_policies (
+                project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                policy     TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            -- Project-scoped OTel GenAI export policy. A missing row means
+            -- export is disabled and the endpoint stays loopback-only.
+            CREATE TABLE IF NOT EXISTS project_otel_policies (
                 project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
                 policy     TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -4356,6 +4369,7 @@ impl Store {
                 contract_policy: self.get_contract_policy(&project.id)?,
                 effect_policy: self.get_effect_policy(&project.id)?,
                 gate_policy: self.get_gate_policy(&project.id)?,
+                otel_policy: self.get_otel_policy(&project.id)?,
                 policy_snapshots: self.list_policy_snapshots(&project.id, 10_000)?,
                 mcp_tool_pins: self.list_mcp_tool_pins(&project.id, None)?,
                 cache_policy: self.get_cache_policy(&project.id)?,
@@ -4829,6 +4843,44 @@ impl Store {
         let conn = self.lock()?;
         conn.execute(
             "INSERT INTO project_gate_policies (project_id, policy, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(project_id) DO UPDATE SET
+                policy = excluded.policy,
+                updated_at = excluded.updated_at",
+            params![project_id, encoded, now_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_otel_policy(&self, project_id: &str) -> Result<OtelPolicy> {
+        let conn = self.lock()?;
+        let stored = conn
+            .query_row(
+                "SELECT policy FROM project_otel_policies WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match stored {
+            Some(policy) => {
+                let policy: OtelPolicy =
+                    serde_json::from_str(&policy).context("parsing stored otel policy")?;
+                policy
+                    .normalized()
+                    .map_err(|error| anyhow!("stored otel policy is invalid: {error}"))
+            }
+            None => Ok(OtelPolicy::default()),
+        }
+    }
+
+    pub fn set_otel_policy(&self, project_id: &str, policy: &OtelPolicy) -> Result<()> {
+        let policy = policy
+            .normalized()
+            .map_err(|error| anyhow!("invalid otel policy: {error}"))?;
+        let encoded = serde_json::to_string(&policy)?;
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO project_otel_policies (project_id, policy, updated_at)
              VALUES (?1, ?2, ?3)
              ON CONFLICT(project_id) DO UPDATE SET
                 policy = excluded.policy,

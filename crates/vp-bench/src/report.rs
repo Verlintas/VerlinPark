@@ -338,6 +338,13 @@ pub struct RunRecord {
     /// Set only for harness failures that make the result invalid rather than
     /// merely unsolved (for example an exhausted deterministic script).
     pub harness_fault: Option<String>,
+    /// Deterministic trace evidence used by the reliability projection. It is
+    /// observation-only and never a merge or verifier gate.
+    #[serde(default)]
+    pub trial_evidence: crate::reliability::TrialEvidence,
+    /// Role/task token attribution for coordination overhead.
+    #[serde(default)]
+    pub coordination: crate::reliability::CoordinationUsage,
     pub comparison: ComparisonKey,
     pub pricing: Pricing,
     pub provider: ProviderMetadata,
@@ -390,6 +397,10 @@ pub struct ScenarioAggregate {
     pub session_ids: Vec<String>,
     pub comparison: ComparisonKey,
     pub unsolved_reason_counts: BTreeMap<String, u64>,
+    /// Additive reliability view over this scenario's repetitions. Existing
+    /// reports decode with conservative defaults.
+    #[serde(default)]
+    pub reliability: crate::reliability::ScenarioReliability,
 }
 
 /// Cross-scenario summary.
@@ -658,6 +669,11 @@ fn aggregate_scenario(scenario: &Scenario, runs: &[&RunRecord]) -> Result<Scenar
                 .or_insert(0) += 1;
         }
     }
+    let reliability = crate::reliability::ScenarioReliability::from_runs(
+        scenario,
+        runs,
+        u32::try_from(runs.len()).unwrap_or(1).max(1),
+    )?;
     Ok(ScenarioAggregate {
         scenario_id: scenario.id.clone(),
         title: scenario.title.clone(),
@@ -694,6 +710,7 @@ fn aggregate_scenario(scenario: &Scenario, runs: &[&RunRecord]) -> Result<Scenar
         session_ids: runs.iter().map(|run| run.session_id.clone()).collect(),
         comparison,
         unsolved_reason_counts,
+        reliability,
     })
 }
 
@@ -1188,6 +1205,96 @@ pub fn comparison_key(
     }
 }
 
+/// Minimal deterministic run fixture shared by report and reliability tests.
+/// It uses the baseline scenario's comparison identity and never touches a
+/// provider or workspace.
+#[cfg(test)]
+pub(crate) fn run_record_fixture(run_id: &str, repetition: usize, solved: bool) -> RunRecord {
+    let scenario = Scenario::find("baseline-single-session").unwrap();
+    let pricing = Pricing::new(3.0, 15.0, 0.3, 3.75);
+    let provider = ProviderMetadata::fake("vp-bench-fake", "bench-fake-1", "simulated", 0);
+    let usage = TokenUsage {
+        input_tokens: 1_900,
+        output_tokens: 100,
+        cache_read_tokens: 20,
+        cache_write_tokens: 5,
+        calls: 1,
+    };
+    let mut metrics = RunMetrics {
+        wall_clock_ms: 100 * repetition as u64,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_read_tokens: usage.cache_read_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
+        total_tokens: 2_000,
+        provider_calls: 1,
+        usage_calls: 1,
+        estimated_usage: false,
+        cost_usd: 0.0,
+        ledger_cost_usd: 0.0,
+        cost_reconciled: true,
+        cost_per_solved_task_usd: None,
+        tokens_per_solved_task: None,
+        cache_hit_ratio: None,
+        tool_calls: 1,
+        tool_errors: 0,
+        tool_output_bytes: 42,
+        tool_output_spills: None,
+        tool_output_paging_supported: false,
+        compactions: 0,
+        compaction_failures: 0,
+        retries: 0,
+        human_interventions: 0,
+        scouts: 0,
+        peak_workers: 1,
+        agent_failures: 0,
+        plan_tasks_total: 0,
+        plan_tasks_completed: 0,
+        plan_tasks_failed: 0,
+        plan_tasks_running: 0,
+    };
+    metrics.recompute_cost(&pricing, solved);
+    RunRecord {
+        run_id: run_id.to_string(),
+        scenario_id: scenario.id.clone(),
+        scenario_title: scenario.title.clone(),
+        repetition,
+        started_at: "2026-11-12T00:00:00Z".to_string(),
+        finished_at: "2026-11-12T00:00:01Z".to_string(),
+        session_id: format!("session-{run_id}"),
+        session_status: if solved { "idle" } else { "failed" }.to_string(),
+        timed_out: false,
+        solved,
+        acceptance: AcceptanceResult::from_execution(
+            crate::fixture::AcceptanceExecution {
+                passed: solved,
+                exit_code: Some(if solved { 0 } else { 1 }),
+                timed_out: false,
+                duration_ms: 4,
+                stdout: "acceptance: ok".to_string(),
+                stderr: String::new(),
+            },
+            scenario.acceptance.fingerprint(),
+        ),
+        verifier: VerifierMetrics::from_verdicts(Vec::new()),
+        merge: MergeMetrics::new(0, 0, 0, 0, None),
+        metrics,
+        unsolved_reasons: if solved {
+            Vec::new()
+        } else {
+            vec![UnsolvedReason::new("acceptance_failed", "fixture mismatch")]
+        },
+        harness_fault: None,
+        trial_evidence: crate::reliability::TrialEvidence::default(),
+        coordination: crate::reliability::CoordinationUsage::default(),
+        comparison: comparison_key(&scenario, &provider, &pricing),
+        pricing,
+        provider,
+        target_paths: scenario.target_paths(),
+        retained_workspace: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1281,6 +1388,8 @@ mod tests {
                 vec![UnsolvedReason::new("acceptance_failed", "fixture mismatch")]
             },
             harness_fault: None,
+            trial_evidence: crate::reliability::TrialEvidence::default(),
+            coordination: crate::reliability::CoordinationUsage::default(),
             comparison: comparison_key(&scenario, &provider(), &pricing()),
             pricing: pricing(),
             provider: provider(),
@@ -1383,6 +1492,25 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("expected 2"));
+    }
+
+    #[test]
+    fn legacy_reports_decode_without_reliability_fields() {
+        let report = report();
+        let mut value = serde_json::to_value(&report).unwrap();
+        for run in value["runs"].as_array_mut().unwrap() {
+            let object = run.as_object_mut().unwrap();
+            object.remove("trial_evidence");
+            object.remove("coordination");
+        }
+        for scenario in value["scenarios"].as_array_mut().unwrap() {
+            scenario.as_object_mut().unwrap().remove("reliability");
+        }
+        let decoded = parse_report(serde_json::to_string(&value).unwrap().as_bytes()).unwrap();
+        assert!(decoded.runs[0].trial_evidence.signals.is_empty());
+        assert_eq!(decoded.runs[0].coordination.ratio, None);
+        assert_eq!(decoded.scenarios[0].reliability.scenario_id, "");
+        assert_eq!(decoded.scenarios[0].reliability.trials, 0);
     }
 
     #[test]

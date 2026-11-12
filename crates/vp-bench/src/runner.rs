@@ -29,6 +29,7 @@ use crate::metrics::{Pricing, TokenUsage};
 use crate::provider::{
     BenchBehavior, FakeProvider, FakeUsageModel, MeteringProvider, RealProviderSettings,
 };
+use crate::reliability::CoordinationUsage;
 use crate::report::{
     AcceptanceResult, HostMetadata, MergeMetrics, ProviderMetadata, RunMetrics, RunRecord,
     UnsolvedReason, VerdictRecord, VerifierMetrics, comparison_key,
@@ -317,6 +318,8 @@ async fn run_one(
     }
     let solved = reasons.is_empty();
     metrics.recompute_cost(&pricing, solved);
+    let trial_evidence = crate::reliability::analyze_events(&events);
+    let coordination = CoordinationUsage::from_entries(&ledger.entries);
     let comparison = comparison_key(scenario, &built.metadata, &pricing);
     let mut record = RunRecord {
         run_id: format!(
@@ -340,6 +343,8 @@ async fn run_one(
         metrics,
         unsolved_reasons: reasons,
         harness_fault,
+        trial_evidence,
+        coordination,
         comparison,
         pricing,
         provider: built.metadata.clone(),

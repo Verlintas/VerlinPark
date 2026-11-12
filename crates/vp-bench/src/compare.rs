@@ -512,6 +512,7 @@ mod tests {
             session_ids: vec!["s".into()],
             comparison: key("bench", "acceptance"),
             unsolved_reason_counts: BTreeMap::new(),
+            reliability: Default::default(),
         }
     }
 

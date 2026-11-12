@@ -6,6 +6,7 @@
 
 pub mod discovery;
 pub mod lsp;
+pub mod otel;
 pub mod remote;
 pub mod replay;
 pub mod rpc;

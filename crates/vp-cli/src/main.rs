@@ -203,6 +203,41 @@ enum Command {
         #[arg(long)]
         prometheus: bool,
     },
+    /// Show the OTel GenAI projection policy and bounded span counts.
+    OtelStatus {
+        project: String,
+        /// Optional session whose projection counts are reported.
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Show the project OTel export policy.
+    OtelPolicy { project: String },
+    /// Update the project OTel export policy. Export remains explicit only.
+    OtelPolicySet {
+        project: String,
+        #[arg(long)]
+        enable: bool,
+        #[arg(long)]
+        disable: bool,
+        /// Loopback-only OTLP/HTTP base endpoint (for example http://127.0.0.1:4318).
+        #[arg(long)]
+        endpoint: Option<String>,
+        #[arg(long = "service-name")]
+        service_name: Option<String>,
+        #[arg(long = "batch-limit")]
+        batch_limit: Option<u32>,
+        #[arg(long = "timeout-secs")]
+        timeout_secs: Option<u64>,
+    },
+    /// Explicitly export one session's event projection as OTLP/HTTP JSON.
+    OtelExport {
+        session: String,
+        /// Span cap for this request (1-1000). Defaults to the project policy.
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Send one synthetic span to the configured local collector.
+    OtelTest { project: String },
     /// Run deterministic cost-per-solved-task benchmarks (no daemon required).
     Bench {
         #[command(subcommand)]
@@ -4122,6 +4157,81 @@ async fn run(cli: Cli) -> Result<()> {
                 );
             }
             return Ok(());
+        }
+        Command::OtelStatus { project, session } => {
+            rpc(
+                &discovery,
+                "telemetry.otel.status",
+                json!({"project_id": project, "session_id": session}),
+            )
+            .await?
+        }
+        Command::OtelPolicy { project } => {
+            rpc(
+                &discovery,
+                "project.otel_policy.get",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::OtelPolicySet {
+            project,
+            enable,
+            disable,
+            endpoint,
+            service_name,
+            batch_limit,
+            timeout_secs,
+        } => {
+            if enable && disable {
+                bail!("--enable and --disable are mutually exclusive");
+            }
+            let current = rpc(
+                &discovery,
+                "project.otel_policy.get",
+                json!({"project_id": project}),
+            )
+            .await?;
+            let mut policy = current.get("policy").cloned().unwrap_or_else(|| json!({}));
+            if let Some(object) = policy.as_object_mut() {
+                if enable || disable {
+                    object.insert("enabled".into(), json!(enable));
+                }
+                if let Some(endpoint) = endpoint {
+                    object.insert("endpoint".into(), json!(endpoint));
+                }
+                if let Some(service_name) = service_name {
+                    object.insert("service_name".into(), json!(service_name));
+                }
+                if let Some(batch_limit) = batch_limit {
+                    object.insert("batch_limit".into(), json!(batch_limit));
+                }
+                if let Some(timeout_secs) = timeout_secs {
+                    object.insert("timeout_secs".into(), json!(timeout_secs));
+                }
+            }
+            rpc(
+                &discovery,
+                "project.otel_policy.set",
+                json!({"project_id": project, "policy": policy}),
+            )
+            .await?
+        }
+        Command::OtelExport { session, limit } => {
+            rpc(
+                &discovery,
+                "telemetry.otel.export",
+                json!({"session_id": session, "limit": limit}),
+            )
+            .await?
+        }
+        Command::OtelTest { project } => {
+            rpc(
+                &discovery,
+                "telemetry.otel.test",
+                json!({"project_id": project}),
+            )
+            .await?
         }
         Command::Metrics { prometheus } => {
             let result = rpc(&discovery, "daemon.metrics", json!({})).await?;
@@ -21700,6 +21810,69 @@ mod effect_cli_tests {
         assert!(lines[0].contains("external_only"));
         let sweep = json!({"swept": 2});
         assert!(effect_lines(&sweep).unwrap()[0].contains("2 stale intent"));
+    }
+}
+
+#[cfg(test)]
+mod otel_cli_tests {
+    use super::*;
+
+    #[test]
+    fn otel_commands_parse_explicit_status_export_and_policy() {
+        let cli =
+            Cli::try_parse_from(["vp", "otel-status", "proj-1", "--session", "ses-1"]).unwrap();
+        match cli.command {
+            Command::OtelStatus { project, session } => {
+                assert_eq!(project, "proj-1");
+                assert_eq!(session.as_deref(), Some("ses-1"));
+            }
+            other => panic!("expected otel-status, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "otel-policy-set",
+            "proj-1",
+            "--enable",
+            "--endpoint",
+            "http://127.0.0.1:4318",
+            "--batch-limit",
+            "50",
+            "--timeout-secs",
+            "3",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::OtelPolicySet {
+                project,
+                enable,
+                disable,
+                endpoint,
+                batch_limit,
+                timeout_secs,
+                ..
+            } => {
+                assert_eq!(project, "proj-1");
+                assert!(enable);
+                assert!(!disable);
+                assert_eq!(endpoint.as_deref(), Some("http://127.0.0.1:4318"));
+                assert_eq!(batch_limit, Some(50));
+                assert_eq!(timeout_secs, Some(3));
+            }
+            other => panic!("expected otel-policy-set, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["vp", "otel-export", "ses-1", "--limit", "25"]).unwrap();
+        match cli.command {
+            Command::OtelExport { session, limit } => {
+                assert_eq!(session, "ses-1");
+                assert_eq!(limit, Some(25));
+            }
+            other => panic!("expected otel-export, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["vp", "otel-test", "proj-1"]).unwrap();
+        assert!(matches!(cli.command, Command::OtelTest { .. }));
     }
 }
 

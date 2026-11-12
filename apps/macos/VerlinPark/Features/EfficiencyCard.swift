@@ -29,6 +29,9 @@ struct EfficiencyCard: View {
                 if let compatibility = model.sessionCompatibility {
                     RuntimeCompatibilitySection(report: compatibility)
                 }
+                if let otel = model.otelStatus {
+                    OtelStatusSection(status: otel)
+                }
                 CacheCallTable(
                     calls: model.cacheCallRows,
                     truncated: model.sessionCacheCallsTruncated

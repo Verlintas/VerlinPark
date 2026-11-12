@@ -138,6 +138,7 @@ pub mod memory_index;
 pub mod multi_path;
 mod operation;
 pub mod orchestration;
+pub mod otel;
 pub mod permissions;
 pub mod preemption;
 pub mod process_supervisor;

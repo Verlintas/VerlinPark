@@ -22,6 +22,9 @@ use vp_core::Engine;
 use vp_core::agent::AgentService;
 use vp_protocol::discovery::Discovery;
 use vp_protocol::lsp::LspStatusParams;
+use vp_protocol::otel::{
+    OtelExportParams, OtelPolicyParams, OtelStatusParams, OtelTestParams, SetOtelPolicyParams,
+};
 use vp_protocol::remote::{
     HostListParams, HostListResult, HostProbeParams, HostProjectParams, HostSetParams,
     RemoteBootstrapParams, RemoteBootstrapStatusParams, RemoteIntegrationCleanupParams,
@@ -1665,6 +1668,65 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                     },
                 ),
                 Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "project.otel_policy.get" => match parse_params::<OtelPolicyParams>(request.params) {
+            Ok(params) => match state.engine.get_otel_policy(&params.project_id).await {
+                Ok(policy) => {
+                    let endpoint_valid = vp_core::otel::validate_endpoint(&policy.endpoint).is_ok();
+                    RpcResponse::success(
+                        id,
+                        vp_protocol::otel::OtelPolicyResult {
+                            project_id: params.project_id,
+                            policy,
+                            endpoint_valid,
+                            endpoint_loopback: endpoint_valid,
+                            warnings: Vec::new(),
+                        },
+                    )
+                }
+                Err(error) => otel_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "project.otel_policy.set" => match parse_params::<SetOtelPolicyParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .set_otel_policy(&params.project_id, params.policy)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => otel_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "telemetry.otel.status" => match parse_params::<OtelStatusParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .otel_status(&params.project_id, params.session_id.as_deref())
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => otel_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "telemetry.otel.export" => match parse_params::<OtelExportParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .otel_export(&params.session_id, params.limit)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => otel_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "telemetry.otel.test" => match parse_params::<OtelTestParams>(request.params) {
+            Ok(params) => match state.engine.otel_test(&params.project_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => otel_error(id, error),
             },
             Err(response) => response_with_id(id, response),
         },
@@ -5177,6 +5239,18 @@ fn runtime_pin_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
     internal_error(id, error)
 }
 
+/// OTel export failures carry a stable `OTEL_*` code and bounded data. They
+/// never include a collector credential or session content.
+fn otel_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
+    if let Some(otel) = error.downcast_ref::<vp_core::otel::OtelError>() {
+        return RpcResponse::error(
+            id,
+            RpcError::with_data(codes::INTERNAL_ERROR, otel.to_string(), otel.data()),
+        );
+    }
+    internal_error(id, error)
+}
+
 /// Forge failures carry the Q3 `FORGE_*` code, retryability, hint, and safe
 /// evidence in RPC error data. The message already starts with `error[CODE]`.
 fn forge_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
@@ -6754,6 +6828,36 @@ mod runtime_pin_rpc_tests {
         }))
         .unwrap();
         assert!(replay.limit.is_none());
+    }
+
+    #[test]
+    fn otel_params_decode_with_defaults_and_errors_are_bounded() {
+        let status = parse_params::<OtelStatusParams>(json!({"project_id": "proj-1"})).unwrap();
+        assert!(status.session_id.is_none());
+        let export = parse_params::<OtelExportParams>(json!({"session_id": "ses-1"})).unwrap();
+        assert!(export.limit.is_none());
+        let test = parse_params::<OtelTestParams>(json!({"project_id": "proj-1"})).unwrap();
+        assert_eq!(test.project_id, "proj-1");
+        let set = parse_params::<SetOtelPolicyParams>(json!({
+            "project_id": "proj-1",
+            "policy": {"enabled": true}
+        }))
+        .unwrap();
+        assert!(set.policy.enabled);
+        assert_eq!(set.policy.batch_limit, 200);
+
+        let error = vp_core::otel::otel_error(
+            vp_protocol::otel::otel_codes::OTEL_ENDPOINT_NOT_LOOPBACK,
+            "the endpoint is public",
+        );
+        let response = otel_error(Some(json!("id")), error);
+        let error = response.error.expect("error");
+        assert!(error.message.contains("OTEL_ENDPOINT_NOT_LOOPBACK"));
+        let data = error.data.expect("data");
+        assert_eq!(data["code"], "OTEL_ENDPOINT_NOT_LOOPBACK");
+        assert_eq!(data["retryable"], false);
+        assert!(!data.to_string().contains("api_key"));
+        assert!(!data.to_string().contains("prompt"));
     }
 
     #[test]

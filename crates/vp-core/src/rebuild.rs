@@ -96,6 +96,13 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
             })?;
             store.set_effect_policy(&snapshot.project.id, &effect_policy)?;
             store.set_gate_policy(&snapshot.project.id, &snapshot.gate_policy)?;
+            let otel_policy = snapshot.otel_policy.normalized().map_err(|error| {
+                anyhow::anyhow!(
+                    "otel policy for project {} is invalid: {error}",
+                    snapshot.project.id
+                )
+            })?;
+            store.set_otel_policy(&snapshot.project.id, &otel_policy)?;
             for policy_snapshot in &snapshot.policy_snapshots {
                 if policy_snapshot.project_id != snapshot.project.id {
                     anyhow::bail!(

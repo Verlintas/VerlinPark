@@ -1308,6 +1308,52 @@ actor CoreClient {
         return try response.decode(EffectPolicyEnvelope.self).policy
     }
 
+    func otelStatus(projectID: String, sessionID: String?) async throws -> OtelStatusReport {
+        var params: [String: JSONValue] = ["project_id": .string(projectID)]
+        if let sessionID {
+            params["session_id"] = .string(sessionID)
+        }
+        return try await request(method: "telemetry.otel.status", params: params)
+            .decode(OtelStatusReport.self)
+    }
+
+    func otelPolicy(projectID: String) async throws -> OtelPolicyEnvelope {
+        try await request(
+            method: "project.otel_policy.get",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(OtelPolicyEnvelope.self)
+    }
+
+    func setOtelPolicy(projectID: String, policy: OtelPolicy) async throws -> OtelPolicyEnvelope {
+        let encoded = try JSONEncoder().encode(policy)
+        let value = try JSONDecoder().decode(JSONValue.self, from: encoded)
+        return try await request(
+            method: "project.otel_policy.set",
+            params: ["project_id": .string(projectID), "policy": value]
+        )
+        .decode(OtelPolicyEnvelope.self)
+    }
+
+    func exportOtel(sessionID: String, limit: Int = 200) async throws -> OtelExportResult {
+        try await request(
+            method: "telemetry.otel.export",
+            params: [
+                "session_id": .string(sessionID),
+                "limit": .number(Double(limit)),
+            ]
+        )
+        .decode(OtelExportResult.self)
+    }
+
+    func testOtel(projectID: String) async throws -> OtelTestResult {
+        try await request(
+            method: "telemetry.otel.test",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(OtelTestResult.self)
+    }
+
     func setSessionPromptLayout(
         sessionID: String,
         layout: Int

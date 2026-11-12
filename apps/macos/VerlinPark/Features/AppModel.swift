@@ -96,6 +96,9 @@ final class AppModel {
     var sessionEffects: SessionEffectsReport?
     var sessionGates: SessionGatesReport?
     var sessionCompatibility: CompatibilityReportView?
+    var otelStatus: OtelStatusReport?
+    var otelMessage: String?
+    var otelBusy = false
     var governorStatus: GovernorSessionStatus?
     var governorStatusMessage: String?
     var efficiencyBusy = false
@@ -813,6 +816,9 @@ final class AppModel {
         sessionCacheCallsTruncated = false
         sessionInstructions = nil
         sessionContract = nil
+        otelStatus = nil
+        otelMessage = nil
+        otelBusy = false
         governorStatus = nil
         governorStatusMessage = nil
         toolOutputStatus = nil
@@ -3754,6 +3760,21 @@ final class AppModel {
             toolOutputStatus = nil
         }
 
+        do {
+            let status = try await core.otelStatus(projectID: projectID, sessionID: nil)
+            guard projectID == selectedProjectID, generation == selectionGeneration else {
+                return
+            }
+            otelStatus = status
+            otelMessage = nil
+        } catch {
+            guard projectID == selectedProjectID, generation == selectionGeneration else {
+                return
+            }
+            otelStatus = nil
+            otelMessage = "telemetry.otel.status is unavailable: \(error.localizedDescription)"
+        }
+
         guard let sessionID,
               selectedSessionID == sessionID,
               generation == selectionGeneration
@@ -3767,6 +3788,7 @@ final class AppModel {
             sessionEffects = nil
             sessionGates = nil
             sessionCompatibility = nil
+            otelStatus = nil
             governorStatus = nil
             governorStatusMessage = nil
             toolActivity = nil
@@ -3850,6 +3872,17 @@ final class AppModel {
         }
 
         do {
+            let status = try await core.otelStatus(projectID: projectID, sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            otelStatus = status
+            otelMessage = nil
+        } catch {
+            if isCurrent(sessionID: sessionID, generation: generation) {
+                otelMessage = "telemetry.otel.status is unavailable: \(error.localizedDescription)"
+            }
+        }
+
+        do {
             let cache = try await core.sessionCache(sessionID: sessionID)
             guard isCurrent(sessionID: sessionID, generation: generation) else { return }
             sessionCacheStatus = cache
@@ -3889,6 +3922,61 @@ final class AppModel {
         }
 
         await loadToolActivity()
+    }
+
+    /// Explicit one-shot OTel projection export for the selected session. This
+    /// never runs automatically; the policy only enables the operator action.
+    func exportOtelTraces() async {
+        guard let sessionID = selectedSessionID, !otelBusy else { return }
+        let generation = selectionGeneration
+        otelBusy = true
+        otelMessage = nil
+        defer {
+            if generation == selectionGeneration {
+                otelBusy = false
+            }
+        }
+        do {
+            let result = try await core.exportOtel(sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            if result.exported {
+                otelMessage =
+                    "Exported \(result.spanCount) span(s) to the local collector (HTTP \(result.httpStatus ?? 0))."
+            } else {
+                otelMessage = result.message ?? "OTel export failed (\(result.errorCode ?? "unknown"))."
+            }
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            otelMessage = error.localizedDescription
+        }
+    }
+
+    /// Explicit connectivity test. It sends one synthetic span and never
+    /// exports session content.
+    func testOtelCollector() async {
+        guard let projectID = selectedProjectID, !otelBusy else { return }
+        let generation = selectionGeneration
+        otelBusy = true
+        otelMessage = nil
+        defer {
+            if generation == selectionGeneration {
+                otelBusy = false
+            }
+        }
+        do {
+            let result = try await core.testOtel(projectID: projectID)
+            guard projectID == selectedProjectID, generation == selectionGeneration else {
+                return
+            }
+            otelMessage = result.ok
+                ? "Local collector reachable (HTTP \(result.httpStatus ?? 0))."
+                : (result.message ?? "OTel collector test failed (\(result.errorCode ?? "unknown")).")
+        } catch {
+            guard projectID == selectedProjectID, generation == selectionGeneration else {
+                return
+            }
+            otelMessage = error.localizedDescription
+        }
     }
 
     /// Load the bounded newest-first tool activity window. Older daemons do not

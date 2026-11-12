@@ -18,6 +18,7 @@ pub mod compare;
 pub mod fixture;
 pub mod metrics;
 pub mod provider;
+pub mod reliability;
 pub mod report;
 pub mod runner;
 pub mod scenario;
@@ -42,6 +43,12 @@ pub use fixture::{
 };
 pub use metrics::{Pricing, TokenUsage, cost_per_solved, priced_cost, tokens_per_solved};
 pub use provider::{BenchBehavior, FakeProvider, FakeUsageModel, RealProviderSettings};
+pub use reliability::{
+    CoordinationUsage, LuckyPassSummary, LuckySignal, ReliabilityArtifacts, ReliabilityReport,
+    ReliabilitySelection, ReliabilitySummary, ScenarioReliability, TrialEvidence, TrialOutcome,
+    analyze_events, flake_rate, from_saved_report, pass_at_k, pass_power_k, resolve_k,
+    success_variance, write_reliability_artifacts,
+};
 pub use report::{
     BenchReport, BenchSelection, HostMetadata, ProviderMetadata, RunRecord, ScenarioAggregate,
     load_report, parse_report, write_artifacts,
