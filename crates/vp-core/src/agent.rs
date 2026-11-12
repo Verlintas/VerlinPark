@@ -18640,6 +18640,8 @@ async fn run_source_tool(
                 origins: vec!["read".to_string()],
                 lexical_score: Some(1.0),
                 semantic_score: None,
+                source_updated_at: Some(result.source.updated_at.clone()),
+                ..SourceSearchHit::default()
             };
             let key = citations.add_hit(&hit, "read");
             let heading = chunk.heading.as_deref().unwrap_or("untitled section");

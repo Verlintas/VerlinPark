@@ -98,21 +98,23 @@ use vp_protocol::types::{
     SetPreemptionPolicyParams, SetProcessPolicyParams, SetProjectBudgetParams,
     SetSessionPriorityParams, SetSessionRunPolicyParams, SetSessionUnlimitedParams,
     SetShellPolicyParams, SetSourceCollectionParams, SetSourceEmbeddingPolicyParams,
-    SetSourceLabelsParams, SetTaskSchedulerPolicyParams, SetToolOutputPolicyParams,
-    SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult, SkillCreateParams,
-    SkillEnabledParams, SkillIdParams, SkillImportParams, SkillListParams, SkillUpdateParams,
-    SourceActionParams, SourceCollectionsParams, SourceCreateFileParams, SourceCreateNoteParams,
-    SourceCreateUrlParams, SourceEmbeddingPolicyParams, SourceEmbeddingReindexParams,
-    SourceEmbeddingStatusParams, SourceGetParams, SourceImportParams, SourceListParams,
-    SourceSearchParams, SubscribeParams, TaskActionParams, TaskActionResult, TaskDispatchParams,
-    TaskDispatchResult, TaskQueueParams, TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult,
-    TerminalCloseParams, TerminalOpenParams, TerminalReadParams, TerminalResizeParams,
-    TerminalWriteParams, ToolActivityParams, ToolOutputAuditParams, ToolOutputListParams,
-    ToolOutputPolicyParams, ToolOutputPolicyResult, ToolOutputPruneParams, ToolOutputStatusParams,
-    UpdateAcpAgentParams, UpdateCheckParams, UpdateDownloadParams, UpdateMcpServerParams,
-    UpdateModelPresetParams, UpdateSourceMetadataParams, UsageLedgerParams, WorkspaceFileParams,
-    WorkspaceGrepParams, WorkspaceListParams, WorkspaceSearchParams, WorkspaceTreeParams,
-    WorkspaceWriteParams, WorktreePolicyParams,
+    SetSourceLabelsParams, SetSourceRetrievalPolicyParams, SetTaskSchedulerPolicyParams,
+    SetToolOutputPolicyParams, SetWorktreePolicyParams, ShellPolicyParams, ShellPolicyResult,
+    SkillCreateParams, SkillEnabledParams, SkillIdParams, SkillImportParams, SkillListParams,
+    SkillUpdateParams, SourceActionParams, SourceCollectionsParams, SourceCreateFileParams,
+    SourceCreateNoteParams, SourceCreateUrlParams, SourceEmbeddingPolicyParams,
+    SourceEmbeddingReindexParams, SourceEmbeddingStatusParams, SourceGetParams, SourceImportParams,
+    SourceIndexRebuildParams, SourceIndexStatusParams, SourceListParams,
+    SourceRetrievalPolicyParams, SourceSearchParams, SubscribeParams, TaskActionParams,
+    TaskActionResult, TaskDispatchParams, TaskDispatchResult, TaskQueueParams,
+    TaskSchedulerPolicyParams, TeamPlanParams, TeamPlanResult, TerminalCloseParams,
+    TerminalOpenParams, TerminalReadParams, TerminalResizeParams, TerminalWriteParams,
+    ToolActivityParams, ToolOutputAuditParams, ToolOutputListParams, ToolOutputPolicyParams,
+    ToolOutputPolicyResult, ToolOutputPruneParams, ToolOutputStatusParams, UpdateAcpAgentParams,
+    UpdateCheckParams, UpdateDownloadParams, UpdateMcpServerParams, UpdateModelPresetParams,
+    UpdateSourceMetadataParams, UsageLedgerParams, WorkspaceFileParams, WorkspaceGrepParams,
+    WorkspaceListParams, WorkspaceSearchParams, WorkspaceTreeParams, WorkspaceWriteParams,
+    WorktreePolicyParams,
 };
 use vp_protocol::types::{
     ComputerLeaseInfo, ComputerLeaseListResult, ComputerLeaseReleaseParams,
@@ -1678,6 +1680,50 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 {
                     Ok(result) => RpcResponse::success(id, result),
                     Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "source.retrieval.policy.get" => {
+            match parse_params::<SourceRetrievalPolicyParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .get_source_retrieval_policy(&params.project_id)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "source.retrieval.policy.set" => {
+            match parse_params::<SetSourceRetrievalPolicyParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .set_source_retrieval_policy(&params.project_id, params.policy)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => retrieval_policy_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "source.embedding.index_status" => {
+            match parse_params::<SourceIndexStatusParams>(request.params) {
+                Ok(params) => match state.engine.source_index_status(&params.project_id).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "source.embedding.index_rebuild" => {
+            match parse_params::<SourceIndexRebuildParams>(request.params) {
+                Ok(params) => match state.engine.rebuild_source_index(&params.project_id).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => source_index_error(id, error),
                 },
                 Err(response) => response_with_id(id, response),
             }
@@ -4320,6 +4366,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             | "memory.policy.set"
             | "source.embedding.policy.set"
             | "source.embedding.reindex"
+            | "source.retrieval.policy.set"
             | "process.policy.set"
             | "mailbox.policy.set"
             | "artifact.policy.set"
@@ -4429,6 +4476,42 @@ fn forge_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
         );
     }
     internal_error(id, error)
+}
+
+/// Retrieval policy validation uses the Q3 error catalog. The numeric fields
+/// are clamped by the engine, so a failure here means a manifest or hand-edited
+/// value is outside the supported range.
+fn retrieval_policy_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
+    let code = vp_core::tooling::errors::ToolErrorCode::SOURCE_RETRIEVAL_POLICY_INVALID;
+    RpcResponse::error(
+        id,
+        RpcError::with_data(
+            codes::INVALID_PARAMS,
+            format!("error[{}] {}", code.as_str(), error),
+            serde_json::json!({
+                "code": code.as_str(),
+                "retryable": code.default_retryable(),
+                "hint": code.default_hint(),
+            }),
+        ),
+    )
+}
+
+/// A derived-index rebuild failure is retryable but never silently swallowed.
+fn source_index_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
+    let code = vp_core::tooling::errors::ToolErrorCode::SOURCE_INDEX_FAILED;
+    RpcResponse::error(
+        id,
+        RpcError::with_data(
+            codes::INTERNAL_ERROR,
+            format!("error[{}] {}", code.as_str(), error),
+            serde_json::json!({
+                "code": code.as_str(),
+                "retryable": code.default_retryable(),
+                "hint": code.default_hint(),
+            }),
+        ),
+    )
 }
 
 /// Approval rule failures are typed with the Q3 catalog. Invalid template or

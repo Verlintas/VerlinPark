@@ -2520,6 +2520,44 @@ actor CoreClient {
         .decode(SourceEmbeddingPolicyResult.self)
     }
 
+    func sourceRetrievalPolicy(projectID: String) async throws -> SourceRetrievalPolicyResult {
+        try await request(
+            method: "source.retrieval.policy.get",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(SourceRetrievalPolicyResult.self)
+    }
+
+    func setSourceRetrievalPolicy(
+        projectID: String,
+        policy: SourceRetrievalPolicy
+    ) async throws -> SourceRetrievalPolicyResult {
+        try await request(
+            method: "source.retrieval.policy.set",
+            params: [
+                "project_id": .string(projectID),
+                "policy": .object(policy.jsonObject()),
+            ]
+        )
+        .decode(SourceRetrievalPolicyResult.self)
+    }
+
+    func sourceIndexStatus(projectID: String) async throws -> SourceIndexStatusResult {
+        try await request(
+            method: "source.embedding.index_status",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(SourceIndexStatusResult.self)
+    }
+
+    func rebuildSourceIndex(projectID: String) async throws -> SourceIndexRebuildResult {
+        try await request(
+            method: "source.embedding.index_rebuild",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(SourceIndexRebuildResult.self)
+    }
+
     func sourceCollections(projectID: String) async throws -> SourceCollectionsResult {
         try await request(
             method: "source.collections",

@@ -894,6 +894,41 @@ enum Command {
         #[arg(long)]
         clear: bool,
     },
+    /// Show retrieval v2 controls: ANN, deterministic rerank, lexical expansion.
+    SourceRetrievalPolicy { project: String },
+    /// Update retrieval v2 controls. Omitted flags keep the stored value.
+    SourceRetrievalPolicySet {
+        project: String,
+        /// Enable the derived source IVF index (exact scan remains the fallback).
+        #[arg(long)]
+        enable_ann: bool,
+        /// Disable ANN while keeping the derived index on disk.
+        #[arg(long)]
+        disable_ann: bool,
+        /// Minimum current vectors before ANN is used (1-100000).
+        #[arg(long = "ann-min-vectors")]
+        ann_min_vectors: Option<u32>,
+        /// Centroids probed per query (1-32).
+        #[arg(long = "ann-nprobe")]
+        ann_nprobe: Option<u32>,
+        /// Rerank mode: off or deterministic. No model is called.
+        #[arg(long, value_parser = ["off", "deterministic"])]
+        rerank: Option<String>,
+        /// Query expansion: off or lexical. No model is called.
+        #[arg(long = "query-expansion", value_parser = ["off", "lexical"])]
+        query_expansion: Option<String>,
+        /// Maximum expansion terms extracted from the first pass (1-16).
+        #[arg(long = "max-expanded-terms")]
+        max_expanded_terms: Option<u32>,
+        /// Reset retrieval controls to their defaults (ANN off, rerank on,
+        /// expansion off).
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Show the derived source IVF index generation, coverage, and fallback.
+    SourceIndex { project: String },
+    /// Explicitly rebuild the derived source IVF index. No embedding request.
+    SourceIndexRebuild { project: String },
     /// Show the project-wide shared budget and spend.
     ProjectBudget { project: String },
     /// Show token/cost usage grouped by session for a project.
@@ -4408,6 +4443,72 @@ async fn run(cli: Cli) -> Result<()> {
                 &discovery,
                 "source.embedding.policy.set",
                 json!({"project_id": project, "policy": policy}),
+            )
+            .await?
+        }
+        Command::SourceRetrievalPolicy { project } => {
+            rpc(
+                &discovery,
+                "source.retrieval.policy.get",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::SourceRetrievalPolicySet {
+            project,
+            enable_ann,
+            disable_ann,
+            ann_min_vectors,
+            ann_nprobe,
+            rerank,
+            query_expansion,
+            max_expanded_terms,
+            clear,
+        } => {
+            let current = if clear {
+                json!({})
+            } else {
+                rpc(
+                    &discovery,
+                    "source.retrieval.policy.get",
+                    json!({"project_id": project}),
+                )
+                .await?
+                .get("policy")
+                .cloned()
+                .unwrap_or_default()
+            };
+            let policy = merge_source_retrieval_policy(
+                current,
+                enable_ann,
+                disable_ann,
+                ann_min_vectors,
+                ann_nprobe,
+                rerank,
+                query_expansion,
+                max_expanded_terms,
+                clear,
+            )?;
+            rpc(
+                &discovery,
+                "source.retrieval.policy.set",
+                json!({"project_id": project, "policy": policy}),
+            )
+            .await?
+        }
+        Command::SourceIndex { project } => {
+            rpc(
+                &discovery,
+                "source.embedding.index_status",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::SourceIndexRebuild { project } => {
+            rpc(
+                &discovery,
+                "source.embedding.index_rebuild",
+                json!({"project_id": project}),
             )
             .await?
         }
@@ -9132,6 +9233,78 @@ fn context_checkpoint_lines(value: &Value) -> Option<Vec<String>> {
 /// Validate the optional CLI preview mode before the RPC. `None` means "use
 /// the stored policy"; an unknown value is a local argument error, not a
 /// silent fallback that would change admission semantics.
+/// Merge CLI retrieval flags into a fetched/default policy object. This is a
+/// pure function so the defaults, conflict checks, and field preservation are
+/// testable without a daemon. The daemon remains the numeric clamp/validation
+/// authority; the CLI never widens a value locally.
+#[allow(clippy::too_many_arguments)]
+fn merge_source_retrieval_policy(
+    current: Value,
+    enable_ann: bool,
+    disable_ann: bool,
+    ann_min_vectors: Option<u32>,
+    ann_nprobe: Option<u32>,
+    rerank: Option<String>,
+    query_expansion: Option<String>,
+    max_expanded_terms: Option<u32>,
+    clear: bool,
+) -> anyhow::Result<Value> {
+    if enable_ann && disable_ann {
+        anyhow::bail!("--enable-ann and --disable-ann cannot be combined");
+    }
+    if clear
+        && (enable_ann
+            || disable_ann
+            || ann_min_vectors.is_some()
+            || ann_nprobe.is_some()
+            || rerank.is_some()
+            || query_expansion.is_some()
+            || max_expanded_terms.is_some())
+    {
+        anyhow::bail!("--clear cannot be combined with other retrieval policy flags");
+    }
+    let mut policy = if current.is_object() {
+        current
+    } else {
+        json!({})
+    };
+    let defaults = [
+        ("ann_enabled", json!(false)),
+        ("ann_min_vectors", json!(256)),
+        ("ann_nprobe", json!(8)),
+        ("rerank", json!("deterministic")),
+        ("query_expansion", json!("off")),
+        ("max_expanded_terms", json!(8)),
+    ];
+    for (key, value) in defaults {
+        if policy.get(key).is_none() {
+            policy[key] = value;
+        }
+    }
+    if enable_ann {
+        policy["ann_enabled"] = json!(true);
+    }
+    if disable_ann {
+        policy["ann_enabled"] = json!(false);
+    }
+    if let Some(value) = ann_min_vectors {
+        policy["ann_min_vectors"] = json!(value);
+    }
+    if let Some(value) = ann_nprobe {
+        policy["ann_nprobe"] = json!(value);
+    }
+    if let Some(value) = rerank {
+        policy["rerank"] = json!(value);
+    }
+    if let Some(value) = query_expansion {
+        policy["query_expansion"] = json!(value);
+    }
+    if let Some(value) = max_expanded_terms {
+        policy["max_expanded_terms"] = json!(value);
+    }
+    Ok(policy)
+}
+
 fn parse_governor_mode(value: Option<&str>) -> anyhow::Result<Option<&'static str>> {
     match value {
         None => Ok(None),
@@ -14671,6 +14844,217 @@ mod source_embedding_cli_tests {
             }
             other => panic!("expected source-embedding-policy-set, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn source_retrieval_commands_parse() {
+        let cli = parse(&["vp", "source-retrieval-policy", "proj-1"]);
+        match cli.command {
+            Command::SourceRetrievalPolicy { project } => assert_eq!(project, "proj-1"),
+            other => panic!("expected source-retrieval-policy, got {other:?}"),
+        }
+        let cli = parse(&["vp", "source-index", "proj-1"]);
+        match cli.command {
+            Command::SourceIndex { project } => assert_eq!(project, "proj-1"),
+            other => panic!("expected source-index, got {other:?}"),
+        }
+        let cli = parse(&["vp", "source-index-rebuild", "proj-1"]);
+        match cli.command {
+            Command::SourceIndexRebuild { project } => assert_eq!(project, "proj-1"),
+            other => panic!("expected source-index-rebuild, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_retrieval_policy_set_parses_every_flag() {
+        let cli = parse(&[
+            "vp",
+            "source-retrieval-policy-set",
+            "proj-1",
+            "--enable-ann",
+            "--ann-min-vectors",
+            "16",
+            "--ann-nprobe",
+            "3",
+            "--rerank",
+            "deterministic",
+            "--query-expansion",
+            "lexical",
+            "--max-expanded-terms",
+            "6",
+        ]);
+        match cli.command {
+            Command::SourceRetrievalPolicySet {
+                project,
+                enable_ann,
+                disable_ann,
+                ann_min_vectors,
+                ann_nprobe,
+                rerank,
+                query_expansion,
+                max_expanded_terms,
+                clear,
+            } => {
+                assert_eq!(project, "proj-1");
+                assert!(enable_ann);
+                assert!(!disable_ann);
+                assert_eq!(ann_min_vectors, Some(16));
+                assert_eq!(ann_nprobe, Some(3));
+                assert_eq!(rerank.as_deref(), Some("deterministic"));
+                assert_eq!(query_expansion.as_deref(), Some("lexical"));
+                assert_eq!(max_expanded_terms, Some(6));
+                assert!(!clear);
+            }
+            other => panic!("expected source-retrieval-policy-set, got {other:?}"),
+        }
+        let cli = parse(&[
+            "vp",
+            "source-retrieval-policy-set",
+            "proj-1",
+            "--disable-ann",
+            "--rerank",
+            "off",
+        ]);
+        match cli.command {
+            Command::SourceRetrievalPolicySet {
+                disable_ann,
+                rerank,
+                ..
+            } => {
+                assert!(disable_ann);
+                assert_eq!(rerank.as_deref(), Some("off"));
+            }
+            other => panic!("expected source-retrieval-policy-set, got {other:?}"),
+        }
+        assert!(
+            std::thread::Builder::new()
+                .stack_size(16 * 1024 * 1024)
+                .spawn(|| {
+                    Cli::try_parse_from([
+                        "vp",
+                        "source-retrieval-policy-set",
+                        "proj-1",
+                        "--rerank",
+                        "model",
+                    ])
+                    .is_err()
+                })
+                .unwrap()
+                .join()
+                .unwrap(),
+            "rerank is a closed enum"
+        );
+    }
+
+    #[test]
+    fn retrieval_policy_merge_preserves_fields_and_applies_defaults() {
+        let merged = merge_source_retrieval_policy(
+            json!({
+                "ann_enabled": true,
+                "ann_min_vectors": 32,
+                "ann_nprobe": 4,
+                "rerank": "off",
+                "query_expansion": "lexical",
+                "max_expanded_terms": 6
+            }),
+            false,
+            true,
+            Some(64),
+            None,
+            Some("deterministic".to_string()),
+            None,
+            Some(3),
+            false,
+        )
+        .unwrap();
+        assert_eq!(merged["ann_enabled"], false);
+        assert_eq!(merged["ann_min_vectors"], 64);
+        assert_eq!(merged["ann_nprobe"], 4, "absent flag keeps stored value");
+        assert_eq!(merged["rerank"], "deterministic");
+        assert_eq!(merged["query_expansion"], "lexical");
+        assert_eq!(merged["max_expanded_terms"], 3);
+
+        let defaults = merge_source_retrieval_policy(
+            json!({}),
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(defaults["ann_enabled"], false);
+        assert_eq!(defaults["ann_min_vectors"], 256);
+        assert_eq!(defaults["ann_nprobe"], 8);
+        assert_eq!(defaults["rerank"], "deterministic");
+        assert_eq!(defaults["query_expansion"], "off");
+        assert_eq!(defaults["max_expanded_terms"], 8);
+
+        let recovered = merge_source_retrieval_policy(
+            json!("bad"),
+            true,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(recovered["ann_enabled"], true);
+        assert_eq!(recovered["ann_min_vectors"], 256);
+    }
+
+    #[test]
+    fn retrieval_policy_merge_rejects_conflicting_flags() {
+        assert!(
+            merge_source_retrieval_policy(
+                json!({}),
+                true,
+                true,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            merge_source_retrieval_policy(
+                json!({}),
+                false,
+                false,
+                Some(8),
+                None,
+                None,
+                None,
+                None,
+                true
+            )
+            .is_err(),
+            "clear cannot carry other flags"
+        );
+        assert!(
+            merge_source_retrieval_policy(
+                json!({}),
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                true
+            )
+            .is_ok(),
+            "clear alone resets to defaults"
+        );
     }
 
     #[test]

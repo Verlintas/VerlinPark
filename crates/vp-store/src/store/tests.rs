@@ -13173,6 +13173,544 @@ fn source_embedding_usage_and_ready_counts_are_model_scoped() {
     );
 }
 
+fn insert_source_vector(
+    store: &Store,
+    source: &Source,
+    chunk_id: &str,
+    chunk_no: u32,
+    seed: f32,
+) -> u64 {
+    let generation = store.source_embedding_generation(&source.id).unwrap();
+    store
+        .record_source_embedding_success(
+            &source.id,
+            chunk_id,
+            chunk_no,
+            generation,
+            "embed-small",
+            8,
+            "hash",
+            &source_embedding_vector(8, seed),
+        )
+        .unwrap();
+    generation
+}
+
+#[test]
+fn source_retrieval_policy_manifest_round_trip_and_malformed_default() {
+    let (data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("retrieval"))
+        .unwrap();
+    let policy = SourceRetrievalPolicy {
+        ann_enabled: true,
+        ann_min_vectors: 4,
+        ann_nprobe: 3,
+        rerank: vp_protocol::types::SourceRerankMode::Deterministic,
+        query_expansion: vp_protocol::types::SourceQueryExpansionMode::Lexical,
+        max_expanded_terms: 5,
+    };
+    store
+        .set_source_retrieval_policy(&project.id, &policy)
+        .unwrap();
+    assert_eq!(
+        store.get_source_retrieval_policy(&project.id).unwrap(),
+        policy
+    );
+    store.record_project_manifest().unwrap();
+    let snapshots = crate::read_project_manifest(data.path()).unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].source_retrieval_policy, policy);
+
+    // A malformed row falls back to the documented defaults and never enables
+    // ANN implicitly.
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE project_source_retrieval_policies SET policy = '{not-json' WHERE project_id = ?1",
+            params![project.id],
+        )
+        .unwrap();
+    }
+    let recovered = store.get_source_retrieval_policy(&project.id).unwrap();
+    assert_eq!(recovered, SourceRetrievalPolicy::default());
+    assert!(!recovered.ann_enabled);
+}
+
+#[test]
+fn source_ann_index_generation_is_fenced_and_monotonic() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("ann-fence"))
+        .unwrap();
+    let (source, chunks) = source_fixture(
+        &project.id,
+        "source-fence",
+        "Fence",
+        "Deterministic source index fencing.",
+    );
+    store.insert_source(&source, &chunks).unwrap();
+    insert_source_vector(&store, &source, &chunks[0].id, 1, 0.2);
+    let centroids = vec![vec![1.0f32; 8]];
+    let blob = vp_core_test_centroids(8, &centroids);
+    let first = store
+        .save_source_ann_index(&project.id, "embed-small", 8, 1, 1, 1, &blob, Some(0))
+        .unwrap();
+    assert_eq!(first, Some(1));
+    let row = store.source_ann_index(&project.id).unwrap().unwrap();
+    assert_eq!(row.generation, 1);
+    assert_eq!(row.centroid_count, 1);
+    assert_eq!(row.vector_count, 1);
+    assert_eq!(row.centroids, blob);
+
+    // A stale expected generation is refused without changing the row.
+    assert_eq!(
+        store
+            .save_source_ann_index(&project.id, "embed-small", 8, 1, 1, 1, &blob, Some(0))
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .source_ann_index(&project.id)
+            .unwrap()
+            .unwrap()
+            .generation,
+        1
+    );
+    let second = store
+        .save_source_ann_index(&project.id, "embed-small", 8, 1, 1, 1, &blob, Some(1))
+        .unwrap();
+    assert_eq!(second, Some(2));
+
+    // Assignments are accepted only for the current generation.
+    assert!(
+        !store
+            .save_source_ann_assignments(
+                &project.id,
+                "embed-small",
+                8,
+                1,
+                &[(chunks[0].id.clone(), 0)]
+            )
+            .unwrap()
+    );
+    assert!(
+        store
+            .save_source_ann_assignments(
+                &project.id,
+                "embed-small",
+                8,
+                2,
+                &[(chunks[0].id.clone(), 0)]
+            )
+            .unwrap()
+    );
+    let counts = store
+        .source_ann_counts(&project.id, "embed-small", 8, 200, 2, 1)
+        .unwrap();
+    assert_eq!(counts.vector_count, 1);
+    assert_eq!(counts.assigned_vectors, 1);
+    assert_eq!(counts.invalid_assignments, 0);
+    assert_eq!(counts.total_assignments, 1);
+
+    // A rebuild resets assignments during the same generation bump.
+    assert_eq!(
+        store
+            .save_source_ann_index(&project.id, "embed-small", 8, 1, 1, 1, &blob, Some(2))
+            .unwrap(),
+        Some(3)
+    );
+    assert_eq!(
+        store
+            .source_ann_counts(&project.id, "embed-small", 8, 200, 3, 1)
+            .unwrap()
+            .total_assignments,
+        0
+    );
+}
+
+#[test]
+fn source_ann_candidates_respect_filters_clusters_and_generation() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("ann-candidates"))
+        .unwrap();
+    let (mut first, first_chunks) = source_fixture(
+        &project.id,
+        "source-a",
+        "Alpha",
+        "Deterministic leases and integration.",
+    );
+    first.collection = Some("engineering".to_string());
+    first.labels = vec!["runtime".to_string()];
+    let (mut second, second_chunks) = source_fixture(
+        &project.id,
+        "source-b",
+        "Beta",
+        "Retrieval citations and evidence.",
+    );
+    second.collection = Some("research".to_string());
+    second.labels = vec!["citation".to_string()];
+    store.insert_source(&first, &first_chunks).unwrap();
+    store.insert_source(&second, &second_chunks).unwrap();
+    insert_source_vector(&store, &first, &first_chunks[0].id, 1, 0.1);
+    insert_source_vector(&store, &second, &second_chunks[0].id, 1, 0.9);
+    let blob = vp_core_test_centroids(8, &[vec![1.0f32; 8]]);
+    store
+        .save_source_ann_index(&project.id, "embed-small", 8, 1, 1, 2, &blob, Some(0))
+        .unwrap();
+    store
+        .save_source_ann_assignments(
+            &project.id,
+            "embed-small",
+            8,
+            1,
+            &[
+                (first_chunks[0].id.clone(), 0),
+                (second_chunks[0].id.clone(), 0),
+            ],
+        )
+        .unwrap();
+    let all = store
+        .source_ann_candidates(
+            &project.id,
+            "embed-small",
+            8,
+            200,
+            1,
+            &[0],
+            &[],
+            &[],
+            &[],
+            32,
+        )
+        .unwrap();
+    assert_eq!(all.len(), 2);
+    assert!(all[0].source_updated_at.is_some());
+    let engineering = store
+        .source_ann_candidates(
+            &project.id,
+            "embed-small",
+            8,
+            200,
+            1,
+            &[0],
+            &[],
+            &["engineering".to_string()],
+            &[],
+            32,
+        )
+        .unwrap();
+    assert_eq!(engineering.len(), 1);
+    assert_eq!(engineering[0].source_id, "source-a");
+    let labels = store
+        .source_ann_candidates(
+            &project.id,
+            "embed-small",
+            8,
+            200,
+            1,
+            &[0],
+            &[],
+            &[],
+            &["citation".to_string()],
+            32,
+        )
+        .unwrap();
+    assert_eq!(labels.len(), 1);
+    assert_eq!(labels[0].source_id, "source-b");
+    let source_scoped = store
+        .source_ann_candidates(
+            &project.id,
+            "embed-small",
+            8,
+            200,
+            1,
+            &[0],
+            &["source-a".to_string()],
+            &[],
+            &[],
+            32,
+        )
+        .unwrap();
+    assert_eq!(source_scoped.len(), 1);
+    assert!(
+        store
+            .source_ann_candidates(
+                &project.id,
+                "embed-small",
+                8,
+                200,
+                1,
+                &[1],
+                &[],
+                &[],
+                &[],
+                32
+            )
+            .unwrap()
+            .is_empty(),
+        "unprobed clusters contribute nothing"
+    );
+    assert!(
+        store
+            .source_ann_candidates(
+                &project.id,
+                "embed-small",
+                8,
+                200,
+                2,
+                &[0],
+                &[],
+                &[],
+                &[],
+                32
+            )
+            .unwrap()
+            .is_empty(),
+        "a future generation has no assignments"
+    );
+    // A refresh advances the source generation; the old vector and assignment
+    // must drop out of the candidate window.
+    store.insert_source(&first, &first_chunks).unwrap();
+    let after_refresh = store
+        .source_ann_candidates(
+            &project.id,
+            "embed-small",
+            8,
+            200,
+            1,
+            &[0],
+            &[],
+            &[],
+            &[],
+            32,
+        )
+        .unwrap();
+    assert_eq!(after_refresh.len(), 1);
+    assert_eq!(after_refresh[0].source_id, "source-b");
+}
+
+#[test]
+fn source_ann_assignment_audit_repairs_invalid_rows() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("ann-audit"))
+        .unwrap();
+    let (source, chunks) = source_fixture(
+        &project.id,
+        "source-audit",
+        "Audit",
+        "Assignment audit repairs only derived rows.",
+    );
+    store.insert_source(&source, &chunks).unwrap();
+    insert_source_vector(&store, &source, &chunks[0].id, 1, 0.2);
+    let blob = vp_core_test_centroids(8, &[vec![1.0f32; 8], vec![0.5f32; 8]]);
+    store
+        .save_source_ann_index(&project.id, "embed-small", 8, 2, 2, 1, &blob, Some(0))
+        .unwrap();
+    store
+        .save_source_ann_assignments(
+            &project.id,
+            "embed-small",
+            8,
+            1,
+            &[(chunks[0].id.clone(), 0)],
+        )
+        .unwrap();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "INSERT INTO source_ann_assignments
+             (chunk_id, project_id, model, dimensions, generation, cluster, updated_at)
+             VALUES ('orphan-chunk', ?1, 'embed-small', 8, 1, 0, '2026-11-12T00:00:00Z')",
+            params![project.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE source_ann_assignments SET cluster = 99 WHERE chunk_id = ?1",
+            params![chunks[0].id],
+        )
+        .unwrap();
+    }
+    let audit = store
+        .source_ann_assignment_audit(&project.id, "embed-small", 8, 200, 1, 2)
+        .unwrap();
+    assert_eq!(audit.total, 2);
+    assert_eq!(audit.invalid(), 2);
+    let repaired = store
+        .delete_invalid_source_ann_assignments(&project.id, "embed-small", 8, 200, 1, 2)
+        .unwrap();
+    assert_eq!(repaired, 2);
+    let counts = store
+        .source_ann_counts(&project.id, "embed-small", 8, 200, 1, 2)
+        .unwrap();
+    assert_eq!(counts.total_assignments, 0);
+    assert_eq!(counts.assigned_vectors, 0);
+}
+
+#[test]
+fn source_ann_training_and_unassigned_windows_are_bounded_and_ordered() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("ann-windows"))
+        .unwrap();
+    let (source, chunks) = source_fixture(
+        &project.id,
+        "source-window",
+        "Window",
+        "Bounded training and assignment windows.",
+    );
+    store.insert_source(&source, &chunks).unwrap();
+    let mut ids = Vec::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        insert_source_vector(&store, &source, &chunk.id, (index + 1) as u32, 0.1);
+        ids.push(chunk.id.clone());
+    }
+    ids.sort();
+    let training = store
+        .source_ann_training_vectors(&project.id, "embed-small", 8, 200, 1, 8 * 1024 * 1024)
+        .unwrap();
+    assert_eq!(training.len(), 1);
+    assert_eq!(training[0].chunk_id, ids[0]);
+    let all = store
+        .source_ann_training_vectors(&project.id, "embed-small", 8, 200, 100, 8 * 1024 * 1024)
+        .unwrap();
+    assert_eq!(all.len(), ids.len());
+    assert!(
+        all.windows(2)
+            .all(|pair| pair[0].chunk_id <= pair[1].chunk_id)
+    );
+    // The byte cap is measured cumulatively and still returns a stable prefix.
+    let first_bytes = u64::try_from(all[0].vector.len()).unwrap();
+    let scoped = store
+        .source_ann_training_vectors(&project.id, "embed-small", 8, 200, 100, first_bytes)
+        .unwrap();
+    assert_eq!(scoped.len(), 1);
+    assert_eq!(scoped[0].chunk_id, all[0].chunk_id);
+
+    let blob = vp_core_test_centroids(8, &[vec![1.0f32; 8]]);
+    store
+        .save_source_ann_index(
+            &project.id,
+            "embed-small",
+            8,
+            1,
+            1,
+            ids.len() as u32,
+            &blob,
+            Some(0),
+        )
+        .unwrap();
+    let unassigned = store
+        .source_ann_unassigned_vectors(&project.id, "embed-small", 8, 200, 1, 1)
+        .unwrap();
+    assert_eq!(unassigned.len(), 1);
+    assert_eq!(unassigned[0].chunk_id, ids[0]);
+    store
+        .save_source_ann_assignments(
+            &project.id,
+            "embed-small",
+            8,
+            1,
+            &[(unassigned[0].chunk_id.clone(), 0)],
+        )
+        .unwrap();
+    let remaining = store
+        .source_ann_unassigned_vectors(&project.id, "embed-small", 8, 200, 1, 100)
+        .unwrap();
+    assert_eq!(remaining.len(), ids.len() - 1);
+    assert!(!remaining.iter().any(|row| row.chunk_id == ids[0]));
+}
+
+#[test]
+fn source_ann_clears_with_embeddings_and_source_delete() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("ann-clear"))
+        .unwrap();
+    let (source, chunks) = source_fixture(
+        &project.id,
+        "source-clear",
+        "Clear",
+        "Derived index state is cleared with vectors.",
+    );
+    store.insert_source(&source, &chunks).unwrap();
+    insert_source_vector(&store, &source, &chunks[0].id, 1, 0.2);
+    let blob = vp_core_test_centroids(8, &[vec![1.0f32; 8]]);
+    store
+        .save_source_ann_index(&project.id, "embed-small", 8, 1, 1, 1, &blob, Some(0))
+        .unwrap();
+    store
+        .save_source_ann_assignments(
+            &project.id,
+            "embed-small",
+            8,
+            1,
+            &[(chunks[0].id.clone(), 0)],
+        )
+        .unwrap();
+    store
+        .record_source_ann_error(&project.id, "http_503")
+        .unwrap();
+    assert_eq!(
+        store
+            .source_ann_index(&project.id)
+            .unwrap()
+            .unwrap()
+            .last_error
+            .as_deref(),
+        Some("http_503")
+    );
+    store.clear_source_embeddings(&project.id).unwrap();
+    assert!(store.source_ann_index(&project.id).unwrap().is_none());
+    let counts = store
+        .source_ann_counts(&project.id, "embed-small", 8, 200, 0, 0)
+        .unwrap();
+    assert_eq!(counts.total_assignments, 0);
+
+    // A source delete removes its assignment rows without a full rebuild.
+    store.insert_source(&source, &chunks).unwrap();
+    insert_source_vector(&store, &source, &chunks[0].id, 1, 0.2);
+    store
+        .save_source_ann_index(&project.id, "embed-small", 8, 1, 1, 1, &blob, Some(0))
+        .unwrap();
+    store
+        .save_source_ann_assignments(
+            &project.id,
+            "embed-small",
+            8,
+            1,
+            &[(chunks[0].id.clone(), 0)],
+        )
+        .unwrap();
+    assert!(store.delete_source(&source.id).unwrap());
+    let counts = store
+        .source_ann_counts(&project.id, "embed-small", 8, 200, 1, 1)
+        .unwrap();
+    assert_eq!(counts.total_assignments, 0);
+    assert_eq!(counts.vector_count, 0);
+}
+
+/// Minimal standalone centroid encoder for store tests. The vp-core encoder is
+/// validated separately; the store only needs a structurally valid blob with
+/// the same magic/version/length contract.
+fn vp_core_test_centroids(dimensions: u32, centroids: &[Vec<f32>]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"VPSA");
+    bytes.push(1);
+    bytes.extend_from_slice(&dimensions.to_le_bytes());
+    bytes.extend_from_slice(&u32::try_from(centroids.len()).unwrap().to_le_bytes());
+    for centroid in centroids {
+        assert_eq!(centroid.len() as u32, dimensions);
+        for value in centroid {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    bytes
+}
+
 fn supervised_row(session: &str, root: &std::path::Path, id: &str) -> SupervisedProcess {
     SupervisedProcess {
         id: id.to_string(),

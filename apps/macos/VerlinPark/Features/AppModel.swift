@@ -439,6 +439,10 @@ final class AppModel {
     var sourceEmbeddingStatus: SourceEmbeddingStatusResult?
     var sourceEmbeddingBusy = false
     var sourceEmbeddingMessage: String?
+    var sourceRetrievalPolicy: SourceRetrievalPolicy?
+    var sourceIndexStatus: SourceIndexStatusResult?
+    var sourceRetrievalBusy = false
+    var sourceRetrievalMessage: String?
     var sourceDraftTitle = ""
     var sourceDraftContent = ""
     var sourceDraftCollection = ""
@@ -1058,6 +1062,10 @@ final class AppModel {
         sourceEmbeddingStatus = nil
         sourceEmbeddingBusy = false
         sourceEmbeddingMessage = nil
+        sourceRetrievalPolicy = nil
+        sourceIndexStatus = nil
+        sourceRetrievalBusy = false
+        sourceRetrievalMessage = nil
         sourceDraftTitle = ""
         sourceDraftContent = ""
         sourceDraftCollection = ""
@@ -5962,10 +5970,14 @@ final class AppModel {
             )
             async let collectionsTask = core.sourceCollections(projectID: projectID)
             async let embeddingStatusTask = try? core.sourceEmbeddingStatus(projectID: projectID)
-            let (result, collections, embeddingStatus) = try await (
+            async let retrievalPolicyTask = try? core.sourceRetrievalPolicy(projectID: projectID)
+            async let indexStatusTask = try? core.sourceIndexStatus(projectID: projectID)
+            let (result, collections, embeddingStatus, retrievalPolicy, indexStatus) = try await (
                 sourcesTask,
                 collectionsTask,
-                embeddingStatusTask
+                embeddingStatusTask,
+                retrievalPolicyTask,
+                indexStatusTask
             )
             guard generation == selectionGeneration, projectID == selectedProjectID else {
                 return
@@ -5974,6 +5986,8 @@ final class AppModel {
             sourceStats = result.stats
             sourceCollections = collections.collections
             sourceEmbeddingStatus = embeddingStatus
+            sourceRetrievalPolicy = retrievalPolicy?.policy
+            sourceIndexStatus = indexStatus
             if let filter = sourceCollectionFilter,
                !filter.isEmpty,
                !collections.collections.contains(where: { $0.name == filter })
@@ -6119,6 +6133,89 @@ final class AppModel {
             await loadSources(silent: true)
         } catch {
             sourceEmbeddingMessage = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    /// Reload retrieval policy and derived-index status. Failures surface on
+    /// the retrieval card only and never hide lexical source search.
+    func loadSourceRetrievalStatus(silent: Bool = false) async {
+        guard let projectID = selectedProjectID else {
+            sourceRetrievalPolicy = nil
+            sourceIndexStatus = nil
+            return
+        }
+        if !silent {
+            sourceRetrievalBusy = true
+        }
+        defer {
+            if !silent {
+                sourceRetrievalBusy = false
+            }
+        }
+        async let policyTask = try? core.sourceRetrievalPolicy(projectID: projectID)
+        async let statusTask = try? core.sourceIndexStatus(projectID: projectID)
+        let (policy, status) = await (policyTask, statusTask)
+        guard projectID == selectedProjectID else { return }
+        if let policy {
+            sourceRetrievalPolicy = policy.policy
+        }
+        sourceIndexStatus = status
+        if !silent {
+            sourceRetrievalMessage = nil
+        }
+    }
+
+    /// Persist retrieval controls. The daemon clamps numeric fields and owns
+    /// the derived index; this client never touches stored centroids/vectors.
+    func updateSourceRetrievalPolicy(_ policy: SourceRetrievalPolicy) async {
+        guard let projectID = selectedProjectID else {
+            sourceRetrievalMessage = "Select a project first."
+            return
+        }
+        guard !sourceRetrievalBusy else { return }
+        sourceRetrievalBusy = true
+        defer { sourceRetrievalBusy = false }
+        do {
+            let result = try await core.setSourceRetrievalPolicy(
+                projectID: projectID,
+                policy: policy
+            )
+            guard projectID == selectedProjectID else { return }
+            sourceRetrievalPolicy = result.policy
+            sourceRetrievalMessage = result.policy.annEnabled
+                ? "ANN enabled; rebuild the derived index if status reports not_built."
+                : "ANN disabled; semantic search uses the exact scan."
+            await loadSourceRetrievalStatus(silent: true)
+            await loadSourceEmbeddingStatus(silent: true)
+        } catch {
+            sourceRetrievalMessage = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    /// Explicit derived-index rebuild. No embedding request is made.
+    func rebuildSourceIndex() async {
+        guard let projectID = selectedProjectID else {
+            sourceRetrievalMessage = "Select a project first."
+            return
+        }
+        guard !sourceRetrievalBusy else { return }
+        sourceRetrievalBusy = true
+        defer { sourceRetrievalBusy = false }
+        do {
+            let result = try await core.rebuildSourceIndex(projectID: projectID)
+            guard projectID == selectedProjectID else { return }
+            if result.rebuilt {
+                sourceRetrievalMessage =
+                    "Rebuilt generation \(result.generation ?? 0) over \(result.assignedVectors) vectors."
+            } else {
+                sourceRetrievalMessage =
+                    "Index not built: \(result.reason ?? "unavailable")."
+            }
+            await loadSourceRetrievalStatus(silent: true)
+        } catch {
+            sourceRetrievalMessage = error.localizedDescription
             handle(error)
         }
     }

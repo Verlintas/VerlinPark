@@ -1929,14 +1929,57 @@ pub struct SourceSearchHit {
     #[serde(default)]
     pub lexical_score: Option<f64>,
     /// Cosine similarity in 0..=1 retained for audit/debugging. Never a
-    /// vector or embedded text.
+    /// vector or embedded text. With deterministic reranking this remains the
+    /// raw cosine component; `rerank_score` is the blended ordering value.
     #[serde(default)]
     pub semantic_score: Option<f64>,
+    /// Effective rerank label for this hit: `off` or `deterministic`. Older
+    /// payloads decode as `off`.
+    #[serde(default = "default_source_rerank_label")]
+    pub rerank: String,
+    /// Blended deterministic rerank score in 0..=1. Absent when rerank is off.
+    #[serde(default)]
+    pub rerank_score: Option<f64>,
+    /// Fraction of query terms present in the chunk body in 0..=1.
+    #[serde(default)]
+    pub lexical_overlap: Option<f64>,
+    /// Fraction of query terms present in the source title and heading path.
+    #[serde(default)]
+    pub title_match: Option<f64>,
+    /// Recency component in 0..=1 derived from the source `updated_at`. Absent
+    /// when the timestamp is unavailable or unparsable.
+    #[serde(default)]
+    pub freshness: Option<f64>,
+    /// True only for a hit introduced by the bounded lexical expansion pass.
+    /// Expansion never creates a chunk; it can only re-surface a stored one.
+    #[serde(default)]
+    pub expanded: bool,
+    /// Expansion terms that actually occur in this hit, in deterministic plan
+    /// order. Empty for first-pass hits and for all hits when expansion is off.
+    #[serde(default)]
+    pub expansion_terms: Vec<String>,
+    /// Source `updated_at` used for the freshness component. Operational
+    /// metadata only; no content or vector is added.
+    #[serde(default)]
+    pub source_updated_at: Option<String>,
+}
+
+fn default_source_rerank_label() -> String {
+    "off".to_string()
+}
+
+fn default_source_index_path() -> String {
+    "exact".to_string()
+}
+
+fn default_source_expansion_label() -> String {
+    "off".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct SourceSearchResult {
     pub hits: Vec<SourceSearchHit>,
+    #[serde(default)]
     pub degraded: bool,
     /// Effective lane after fallback. This can differ from `requested_mode`.
     #[serde(default = "default_source_label")]
@@ -1952,6 +1995,34 @@ pub struct SourceSearchResult {
     /// telemetry only; no chunk text is duplicated here.
     #[serde(default)]
     pub candidates_scanned: usize,
+    /// Candidate path actually used for semantic retrieval: `exact` or `ann`.
+    /// Lexical-only searches always report `exact`.
+    #[serde(default = "default_source_index_path")]
+    pub index_path: String,
+    /// Derived ANN generation used for an ANN probe. `None` for exact scans.
+    #[serde(default)]
+    pub index_generation: Option<u64>,
+    /// Explicit reason the exact scan was used when ANN was requested. Reasons
+    /// are stable codes such as `ann_disabled`, `below_min_vectors`,
+    /// `not_built`, `index_corrupt: ...`, or `no_assignments`.
+    #[serde(default)]
+    pub index_fallback_reason: Option<String>,
+    /// Number of centroids probed by an ANN search. Zero for exact scans.
+    #[serde(default)]
+    pub probed_clusters: u32,
+    /// Bounded count of vectors examined by an ANN probe before cosine scoring.
+    #[serde(default)]
+    pub ann_candidates: usize,
+    /// Effective global rerank label: `off` or `deterministic`.
+    #[serde(default = "default_source_rerank_label")]
+    pub rerank: String,
+    /// Effective global query-expansion label: `off` or `lexical`.
+    #[serde(default = "default_source_expansion_label")]
+    pub expansion: String,
+    /// Bounded expansion terms used for the second pass. No model-generated
+    /// terms are ever present.
+    #[serde(default)]
+    pub expansion_terms: Vec<String>,
 }
 
 /// Opt-in embedding lane for project knowledge sources.
@@ -2189,6 +2260,203 @@ pub struct SourceEmbeddingReindexResult {
     pub cleared_jobs: u32,
     pub enqueued_sources: u32,
     pub max_chunks_per_source: u32,
+}
+
+/// Deterministic source rerank mode. `deterministic` blends fixed components
+/// with fixed weights and performs no model call.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceRerankMode {
+    Off,
+    #[default]
+    Deterministic,
+}
+
+impl SourceRerankMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Deterministic => "deterministic",
+        }
+    }
+}
+
+impl std::str::FromStr for SourceRerankMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "deterministic" => Ok(Self::Deterministic),
+            other => Err(format!(
+                "source rerank must be off or deterministic (got {other})"
+            )),
+        }
+    }
+}
+
+/// Lexical-only query expansion mode. `lexical` extracts bounded terms from
+/// the first pass with the deterministic tokenizer and performs one second
+/// pass. No LLM or remote service is involved.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceQueryExpansionMode {
+    #[default]
+    Off,
+    Lexical,
+}
+
+impl SourceQueryExpansionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Lexical => "lexical",
+        }
+    }
+}
+
+impl std::str::FromStr for SourceQueryExpansionMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "lexical" => Ok(Self::Lexical),
+            other => Err(format!(
+                "source query expansion must be off or lexical (got {other})"
+            )),
+        }
+    }
+}
+
+/// Project-scoped retrieval controls layered on top of the opt-in source
+/// embedding policy. Every field is additive and serde-defaulted so older
+/// manifests, clients, and events decode unchanged. ANN and expansion are off
+/// by default; rerank defaults to the deterministic, model-free blend.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SourceRetrievalPolicy {
+    /// Use the derived source IVF index for semantic candidate selection.
+    /// Disabled by default; the exact cosine scan remains the fallback.
+    #[serde(default)]
+    pub ann_enabled: bool,
+    /// Minimum number of current-generation vectors before an ANN index is
+    /// considered useful. Smaller corpora use the exact scan.
+    #[serde(default = "default_source_ann_min_vectors")]
+    pub ann_min_vectors: u32,
+    /// Centroids probed per query. Bounded to 1..=32.
+    #[serde(default = "default_source_ann_nprobe")]
+    pub ann_nprobe: u32,
+    /// Deterministic rerank mode. No hidden model routing is possible.
+    #[serde(default)]
+    pub rerank: SourceRerankMode,
+    /// Lexical query expansion mode. Off by default.
+    #[serde(default)]
+    pub query_expansion: SourceQueryExpansionMode,
+    /// Maximum expansion terms extracted from the first pass. Bounded 1..=16.
+    #[serde(default = "default_source_max_expanded_terms")]
+    pub max_expanded_terms: u32,
+}
+
+fn default_source_ann_min_vectors() -> u32 {
+    256
+}
+
+fn default_source_ann_nprobe() -> u32 {
+    8
+}
+
+fn default_source_max_expanded_terms() -> u32 {
+    8
+}
+
+impl Default for SourceRetrievalPolicy {
+    fn default() -> Self {
+        Self {
+            ann_enabled: false,
+            ann_min_vectors: default_source_ann_min_vectors(),
+            ann_nprobe: default_source_ann_nprobe(),
+            rerank: SourceRerankMode::Deterministic,
+            query_expansion: SourceQueryExpansionMode::Off,
+            max_expanded_terms: default_source_max_expanded_terms(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SourceRetrievalPolicyParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetSourceRetrievalPolicyParams {
+    pub project_id: String,
+    pub policy: SourceRetrievalPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct SourceRetrievalPolicyResult {
+    pub project_id: String,
+    pub policy: SourceRetrievalPolicy,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SourceIndexStatusParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SourceIndexRebuildParams {
+    pub project_id: String,
+}
+
+/// Bounded operational state for the derived source IVF index. Contains only
+/// counts, generation numbers, configuration, and stable fallback reasons.
+/// Centroid bytes, vectors, and embedded text are never serialized.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct SourceIndexStatusResult {
+    pub project_id: String,
+    pub policy: SourceRetrievalPolicy,
+    pub embedding_enabled: bool,
+    pub embedding_configured: bool,
+    pub model: Option<String>,
+    pub dimensions: u32,
+    pub ann_enabled: bool,
+    /// True only when the ANN index can serve the next semantic query.
+    pub ready: bool,
+    /// Effective candidate path for the next semantic query: `exact` or `ann`.
+    pub path: String,
+    pub generation: Option<u64>,
+    pub vector_count: u32,
+    pub assigned_vectors: u32,
+    pub invalid_assignments: u32,
+    pub centroid_count: u32,
+    pub nlist: u32,
+    pub nprobe: u32,
+    pub min_vectors: u32,
+    pub coverage: f64,
+    pub bytes: u64,
+    /// Stable reason the ANN path is unavailable. `None` when `ready` is true.
+    pub fallback_reason: Option<String>,
+    pub last_rebuilt_at: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct SourceIndexRebuildResult {
+    pub project_id: String,
+    pub rebuilt: bool,
+    pub reason: Option<String>,
+    pub generation: Option<u64>,
+    pub vector_count: u32,
+    pub assigned_vectors: u32,
+    pub centroid_count: u32,
+    pub nlist: u32,
+    pub nprobe: u32,
+    /// `exact` when the rebuild did not produce a usable ANN index.
+    pub path: String,
 }
 
 /// Citation evidence attached to an assistant message. The excerpt is a
@@ -13367,6 +13635,7 @@ mod context_checkpoint_bundle_tests {
             requested_mode: "hybrid".into(),
             semantic_unavailable: Some("no_indexed_vectors".into()),
             candidates_scanned: 12,
+            ..SourceSearchResult::default()
         };
         let value = serde_json::to_value(&result).unwrap();
         assert_eq!(value["mode"], "hybrid");
@@ -13520,6 +13789,200 @@ mod context_checkpoint_bundle_tests {
         assert!(status.recent_jobs.is_empty());
         assert_eq!(status.integrity, SourceEmbeddingIntegrity::default());
         assert!(status.semantic_unavailable.is_none());
+    }
+
+    #[test]
+    fn source_retrieval_policy_defaults_are_bounded_and_off() {
+        let policy = SourceRetrievalPolicy::default();
+        assert!(!policy.ann_enabled);
+        assert_eq!(policy.ann_min_vectors, 256);
+        assert_eq!(policy.ann_nprobe, 8);
+        assert_eq!(policy.rerank, SourceRerankMode::Deterministic);
+        assert_eq!(policy.query_expansion, SourceQueryExpansionMode::Off);
+        assert_eq!(policy.max_expanded_terms, 8);
+
+        let decoded: SourceRetrievalPolicy = serde_json::from_value(json!({
+            "ann_enabled": true,
+            "ann_nprobe": 4
+        }))
+        .unwrap();
+        assert!(decoded.ann_enabled);
+        assert_eq!(decoded.ann_nprobe, 4);
+        assert_eq!(decoded.ann_min_vectors, 256);
+        assert_eq!(decoded.rerank, SourceRerankMode::Deterministic);
+
+        let legacy: SourceRetrievalPolicy = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(legacy, SourceRetrievalPolicy::default());
+        assert_eq!(SourceRerankMode::Off.as_str(), "off");
+        assert_eq!(SourceRerankMode::Deterministic.as_str(), "deterministic");
+        assert_eq!(
+            "off".parse::<SourceRerankMode>().unwrap(),
+            SourceRerankMode::Off
+        );
+        assert!("model".parse::<SourceRerankMode>().is_err());
+        assert_eq!(
+            "lexical".parse::<SourceQueryExpansionMode>().unwrap(),
+            SourceQueryExpansionMode::Lexical
+        );
+        assert!("semantic".parse::<SourceQueryExpansionMode>().is_err());
+    }
+
+    #[test]
+    fn source_retrieval_policy_decodes_closed_modes_and_rejects_unknown_values() {
+        let policy: SourceRetrievalPolicy = serde_json::from_value(json!({
+            "ann_enabled": true,
+            "ann_min_vectors": 4,
+            "ann_nprobe": 2,
+            "rerank": "off",
+            "query_expansion": "lexical",
+            "max_expanded_terms": 3
+        }))
+        .unwrap();
+        assert_eq!(policy.rerank, SourceRerankMode::Off);
+        assert_eq!(policy.query_expansion, SourceQueryExpansionMode::Lexical);
+        assert_eq!(policy.ann_min_vectors, 4);
+        assert_eq!(policy.max_expanded_terms, 3);
+        assert!(
+            serde_json::from_value::<SourceRetrievalPolicy>(json!({
+                "rerank": "learned"
+            }))
+            .is_err(),
+            "rerank is a closed enum; no hidden model routing"
+        );
+        assert!(
+            serde_json::from_value::<SourceRetrievalPolicy>(json!({
+                "query_expansion": "semantic"
+            }))
+            .is_err()
+        );
+        let result = SourceRetrievalPolicyResult {
+            project_id: "prj-1".into(),
+            policy: policy.clone(),
+        };
+        let decoded: SourceRetrievalPolicyResult =
+            serde_json::from_value(serde_json::to_value(&result).unwrap()).unwrap();
+        assert_eq!(decoded, result);
+        let legacy: SourceRetrievalPolicyResult =
+            serde_json::from_value(json!({"project_id": "prj-1"})).unwrap();
+        assert_eq!(legacy.policy, SourceRetrievalPolicy::default());
+    }
+
+    #[test]
+    fn source_index_status_and_rebuild_round_trip_without_vector_data() {
+        let policy = SourceRetrievalPolicy {
+            ann_enabled: true,
+            ann_min_vectors: 16,
+            ann_nprobe: 3,
+            rerank: SourceRerankMode::Deterministic,
+            query_expansion: SourceQueryExpansionMode::Lexical,
+            max_expanded_terms: 4,
+        };
+        let status = SourceIndexStatusResult {
+            project_id: "prj-1".into(),
+            policy: policy.clone(),
+            embedding_enabled: true,
+            embedding_configured: true,
+            model: Some("embed-small".into()),
+            dimensions: 8,
+            ann_enabled: true,
+            ready: true,
+            path: "ann".into(),
+            generation: Some(3),
+            vector_count: 40,
+            assigned_vectors: 40,
+            invalid_assignments: 0,
+            centroid_count: 6,
+            nlist: 6,
+            nprobe: 3,
+            min_vectors: 16,
+            coverage: 1.0,
+            bytes: 1_024,
+            fallback_reason: None,
+            last_rebuilt_at: Some("2026-11-12T00:00:00Z".into()),
+            last_error: None,
+        };
+        let value = serde_json::to_value(&status).unwrap();
+        assert_eq!(value["path"], "ann");
+        assert_eq!(value["policy"]["ann_enabled"], true);
+        assert!(value.get("centroids").is_none());
+        assert!(value.get("vectors").is_none());
+        let decoded: SourceIndexStatusResult = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, status);
+
+        let legacy: SourceIndexStatusResult = serde_json::from_value(json!({
+            "project_id": "prj-1"
+        }))
+        .unwrap();
+        assert!(!legacy.ready);
+        assert_eq!(legacy.path, "");
+        assert_eq!(legacy.policy, SourceRetrievalPolicy::default());
+
+        let rebuild = SourceIndexRebuildResult {
+            project_id: "prj-1".into(),
+            rebuilt: true,
+            reason: None,
+            generation: Some(4),
+            vector_count: 40,
+            assigned_vectors: 40,
+            centroid_count: 6,
+            nlist: 6,
+            nprobe: 2,
+            path: "ann".into(),
+        };
+        let decoded: SourceIndexRebuildResult =
+            serde_json::from_value(serde_json::to_value(&rebuild).unwrap()).unwrap();
+        assert_eq!(decoded, rebuild);
+        let legacy: SourceIndexRebuildResult = serde_json::from_value(json!({})).unwrap();
+        assert!(!legacy.rebuilt);
+        assert_eq!(legacy.nprobe, 0);
+    }
+
+    #[test]
+    fn source_search_result_decodes_retrieval_v2_defaults() {
+        let result: SourceSearchResult = serde_json::from_value(json!({
+            "hits": [{
+                "source_id": "src-1",
+                "source_title": "Runtime",
+                "chunk_id": "src-1:0001:abcdef",
+                "chunk_no": 1,
+                "content": "Deterministic leases.",
+                "score": 0.75
+            }]
+        }))
+        .unwrap();
+        assert_eq!(result.index_path, "exact");
+        assert_eq!(result.rerank, "off");
+        assert_eq!(result.expansion, "off");
+        assert!(result.index_generation.is_none());
+        assert!(result.index_fallback_reason.is_none());
+        assert_eq!(result.probed_clusters, 0);
+        assert_eq!(result.ann_candidates, 0);
+        assert!(result.expansion_terms.is_empty());
+        assert_eq!(result.hits[0].rerank, "off");
+        assert!(!result.hits[0].expanded);
+        assert!(result.hits[0].rerank_score.is_none());
+        assert!(result.hits[0].lexical_overlap.is_none());
+        assert!(result.hits[0].title_match.is_none());
+        assert!(result.hits[0].freshness.is_none());
+        assert!(result.hits[0].expansion_terms.is_empty());
+        assert!(result.hits[0].source_updated_at.is_none());
+
+        let hit = SourceSearchHit {
+            rerank: "deterministic".into(),
+            rerank_score: Some(0.71),
+            lexical_overlap: Some(1.0),
+            title_match: Some(0.5),
+            freshness: Some(0.9),
+            expanded: true,
+            expansion_terms: vec!["leases".into()],
+            source_updated_at: Some("2026-11-12T00:00:00Z".into()),
+            ..SourceSearchHit::default()
+        };
+        let value = serde_json::to_value(&hit).unwrap();
+        assert_eq!(value["rerank"], "deterministic");
+        assert_eq!(value["expanded"], true);
+        assert_eq!(value["expansion_terms"][0], "leases");
+        assert!(value.get("vector").is_none());
     }
 }
 

@@ -134,6 +134,18 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
                 &snapshot.project.id,
                 &snapshot.source_embedding_policy,
             )?;
+            let mut source_retrieval_policy = snapshot.source_retrieval_policy.clone();
+            crate::source_retrieval::normalize_source_retrieval_policy(
+                &mut source_retrieval_policy,
+            );
+            crate::source_retrieval::validate_source_retrieval_policy(&source_retrieval_policy)
+                .with_context(|| {
+                    format!(
+                        "source retrieval policy for project {} is invalid",
+                        snapshot.project.id
+                    )
+                })?;
+            store.set_source_retrieval_policy(&snapshot.project.id, &source_retrieval_policy)?;
             store.set_orchestration_policy(&snapshot.project.id, &snapshot.orchestration_policy)?;
             store.set_critical_path_policy(&snapshot.project.id, &snapshot.critical_path_policy)?;
             store.restore_approval_grants(&snapshot.project.id, &snapshot.approval_grants)?;

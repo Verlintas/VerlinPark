@@ -493,6 +493,8 @@ tool_error_codes! {
     MAILBOX_FAILED => "MAILBOX_FAILED", false, "session", "Inspect the mailbox error and recipient; delivery is pull-based.";
     MEMORY_FAILED => "MEMORY_FAILED", false, "session", "Inspect memory scope/evidence requirements; do not invent evidence.";
     SOURCE_FAILED => "SOURCE_FAILED", false, "session", "Inspect the source id and indexing state; cite only returned keys.";
+    SOURCE_RETRIEVAL_POLICY_INVALID => "SOURCE_RETRIEVAL_POLICY_INVALID", false, "session", "Use bounded ANN/rerank/expansion values; the daemon clamps numeric fields and rejects out-of-range policies on manifest rebuild.";
+    SOURCE_INDEX_FAILED => "SOURCE_INDEX_FAILED", true, "session", "Retry the rebuild once; if the derived index is corrupt, clear source embeddings or reindex before rebuilding.";
     TASK_CONTROL_FAILED => "TASK_CONTROL_FAILED", false, "session", "Inspect the task status and allowed transition before retrying.";
     TASK_NOT_FOUND => "TASK_NOT_FOUND", false, "session", "List the stored plan tasks and use an exact task id from this session.";
     ARTIFACT_FAILED => "ARTIFACT_FAILED", false, "session", "Check artifact size/type limits; do not retry an oversized publish.";

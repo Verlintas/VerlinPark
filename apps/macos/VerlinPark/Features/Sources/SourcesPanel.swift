@@ -61,6 +61,7 @@ struct SourcesPanel: View {
     @State private var hoveredSourceID: String?
     @State private var pane: SourceLibraryPane = .library
     @State private var editingSource: ProjectSource?
+    @State private var editingRetrievalPolicy = false
 
     private var query: String {
         model.sourceSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -110,6 +111,10 @@ struct SourcesPanel: View {
         }
         .sheet(item: $editingSource) { source in
             SourceMetadataSheet(source: source)
+                .environment(model)
+        }
+        .sheet(isPresented: $editingRetrievalPolicy) {
+            SourceRetrievalPolicySheet(policy: model.sourceRetrievalPolicy ?? .defaults)
                 .environment(model)
         }
         .confirmationDialog(
@@ -248,6 +253,7 @@ struct SourcesPanel: View {
 
             if pane == .library {
                 sourceEmbeddingCard
+                sourceRetrievalCard
             }
 
             VPHairline()
@@ -348,6 +354,114 @@ struct SourcesPanel: View {
                     .foregroundStyle(VPTheme.textTertiary)
             }
             if let message = model.sourceEmbeddingMessage {
+                Text(message)
+                    .font(VPTheme.mono(6.3))
+                    .foregroundStyle(VPTheme.textSecondary)
+                    .lineLimit(2)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(VPTheme.surface.opacity(0.32), in: RoundedRectangle(cornerRadius: 6))
+        .padding(.horizontal, 8)
+        .padding(.bottom, 6)
+    }
+
+    /// Bounded retrieval v2 status. It exposes candidate path, generation,
+    /// counts, and a stable fallback reason only. Centroid/vector bytes never
+    /// reach the client.
+    private var sourceRetrievalCard: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 5) {
+                Image(systemName: "point.3.filled.connected.trianglepath.dotted")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(
+                        model.sourceIndexStatus?.ready == true
+                            ? VPTheme.success
+                            : VPTheme.textTertiary
+                    )
+                Text(L10n.t("Retrieval v2"))
+                    .font(VPTheme.mono(7.4, weight: .semibold))
+                    .foregroundStyle(VPTheme.textSecondary)
+                Spacer(minLength: 0)
+                if model.sourceRetrievalBusy {
+                    ProgressView().controlSize(.mini)
+                }
+                Button {
+                    editingRetrievalPolicy = true
+                } label: {
+                    Image(systemName: "slider.horizontal.3")
+                        .font(.system(size: 8, weight: .medium))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(VPTheme.textTertiary)
+                .help(L10n.t("Retrieval policy"))
+                Button {
+                    Task { await model.rebuildSourceIndex() }
+                } label: {
+                    Image(systemName: "square.stack.3d.up")
+                        .font(.system(size: 8, weight: .medium))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(VPTheme.textTertiary)
+                .help(L10n.t("Rebuild the derived source index"))
+            }
+            if let status = model.sourceIndexStatus {
+                HStack(spacing: 4) {
+                    auditChip(
+                        status.activePathLabel,
+                        tint: status.ready ? VPTheme.success : VPTheme.textTertiary
+                    )
+                    auditChip(
+                        "\(status.vectorCount) \(L10n.t("vectors"))",
+                        tint: VPTheme.accent
+                    )
+                    auditChip(
+                        "\(status.centroidCount) \(L10n.t("centroids"))",
+                        tint: VPTheme.plan
+                    )
+                    auditChip(
+                        "nprobe \(status.nprobe)",
+                        tint: VPTheme.textTertiary
+                    )
+                    Spacer(minLength: 0)
+                }
+                if let generation = status.generation {
+                    Text(
+                        "\(L10n.t("generation")) \(generation) · \(status.assignedVectors)/\(status.vectorCount) \(L10n.t("assigned")) · \(status.nlist) \(L10n.t("clusters"))"
+                    )
+                    .font(VPTheme.mono(6.4))
+                    .foregroundStyle(VPTheme.textTertiary)
+                    .lineLimit(1)
+                }
+                if let reason = status.fallbackReason {
+                    Text(reason)
+                        .font(VPTheme.mono(6.5))
+                        .foregroundStyle(VPTheme.warning.opacity(0.9))
+                        .lineLimit(1)
+                        .help(reason)
+                }
+                if let error = status.lastError {
+                    Text(error)
+                        .font(VPTheme.mono(6.2))
+                        .foregroundStyle(VPTheme.danger.opacity(0.85))
+                        .lineLimit(1)
+                        .help(error)
+                }
+            } else {
+                Text(L10n.t("No derived index status. Lexical retrieval remains available."))
+                    .font(VPTheme.mono(6.5))
+                    .foregroundStyle(VPTheme.textTertiary)
+            }
+            if let policy = model.sourceRetrievalPolicy {
+                Text(
+                    "\(policy.annEnabled ? L10n.t("ANN") : L10n.t("Exact scan")) · \(policy.rerank.title) \(L10n.t("rerank")) · \(policy.queryExpansion.title) \(L10n.t("expansion"))"
+                )
+                .font(VPTheme.mono(6.4))
+                .foregroundStyle(VPTheme.textTertiary)
+                .lineLimit(1)
+            }
+            if let message = model.sourceRetrievalMessage {
                 Text(message)
                     .font(VPTheme.mono(6.3))
                     .foregroundStyle(VPTheme.textSecondary)
@@ -1119,5 +1233,172 @@ private struct SourceMetadataSheet: View {
             }
         }
         return output
+    }
+}
+
+/// Project retrieval v2 controls. Every value is clamped by the daemon; this
+/// sheet only edits the persisted policy and never writes derived index state.
+private struct SourceRetrievalPolicySheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var annEnabled: Bool
+    @State private var annMinVectors: Int
+    @State private var annNProbe: Int
+    @State private var rerank: SourceRerankMode
+    @State private var queryExpansion: SourceQueryExpansionMode
+    @State private var maxExpandedTerms: Int
+    @State private var busy = false
+
+    init(policy: SourceRetrievalPolicy) {
+        _annEnabled = State(initialValue: policy.annEnabled)
+        _annMinVectors = State(initialValue: policy.annMinVectors)
+        _annNProbe = State(initialValue: policy.annNProbe)
+        _rerank = State(initialValue: policy.rerank)
+        _queryExpansion = State(initialValue: policy.queryExpansion)
+        _maxExpandedTerms = State(initialValue: policy.maxExpandedTerms)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "slider.horizontal.3")
+                    .foregroundStyle(VPTheme.accent)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(L10n.t("Source retrieval v2"))
+                        .font(VPTheme.font(16, weight: .semibold))
+                    Text(
+                        L10n.t(
+                            "ANN, rerank, and lexical expansion are deterministic. No model is selected here."
+                        )
+                    )
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(VPTheme.textSecondary)
+                }
+                Spacer()
+                VPCloseButton(size: 24, help: L10n.t("Close")) { dismiss() }
+            }
+
+            Toggle(isOn: $annEnabled) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(L10n.t("Derived ANN index"))
+                        .font(VPTheme.mono(9, weight: .semibold))
+                    Text(
+                        L10n.t(
+                            "Probes bounded IVF clusters; the exact cosine scan remains the fallback."
+                        )
+                    )
+                    .font(VPTheme.mono(7))
+                    .foregroundStyle(VPTheme.textTertiary)
+                }
+            }
+            .toggleStyle(.switch)
+
+            HStack(spacing: 14) {
+                Stepper(
+                    "\(L10n.t("Minimum vectors")) \(annMinVectors)",
+                    value: $annMinVectors,
+                    in: 1 ... 100_000,
+                    step: 16
+                )
+                .font(VPTheme.mono(8.5))
+                Stepper(
+                    "\(L10n.t("nprobe")) \(annNProbe)",
+                    value: $annNProbe,
+                    in: 1 ... 32
+                )
+                .font(VPTheme.mono(8.5))
+            }
+            .disabled(!annEnabled)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(L10n.t("Rerank"))
+                    .font(VPTheme.mono(8.5, weight: .semibold))
+                    .foregroundStyle(VPTheme.textSecondary)
+                Picker("", selection: $rerank) {
+                    ForEach(SourceRerankMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .controlSize(.small)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(L10n.t("Query expansion"))
+                    .font(VPTheme.mono(8.5, weight: .semibold))
+                    .foregroundStyle(VPTheme.textSecondary)
+                Picker("", selection: $queryExpansion) {
+                    ForEach(SourceQueryExpansionMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .controlSize(.small)
+                Stepper(
+                    "\(L10n.t("Maximum expansion terms")) \(maxExpandedTerms)",
+                    value: $maxExpandedTerms,
+                    in: 1 ... 16
+                )
+                .font(VPTheme.mono(8.5))
+                .disabled(queryExpansion == .off)
+            }
+
+            if let status = model.sourceIndexStatus {
+                HStack(spacing: 6) {
+                    Text(status.activePathLabel)
+                        .font(VPTheme.mono(7, weight: .semibold))
+                        .foregroundStyle(status.ready ? VPTheme.success : VPTheme.textTertiary)
+                    Text("\(status.vectorCount) \(L10n.t("vectors"))")
+                        .font(VPTheme.mono(7))
+                        .foregroundStyle(VPTheme.accent)
+                    if let reason = status.fallbackReason {
+                        Text(reason)
+                            .font(VPTheme.mono(7))
+                            .foregroundStyle(VPTheme.warning)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
+
+            HStack {
+                Text(
+                    L10n.t(
+                        "Disabling ANN keeps the derived index on disk; it is never used until re-enabled."
+                    )
+                )
+                .font(VPTheme.mono(7))
+                .foregroundStyle(VPTheme.textTertiary)
+                Spacer()
+                Button(L10n.t("Cancel")) { dismiss() }
+                    .buttonStyle(.bordered)
+                Button(L10n.t("Save")) {
+                    Task { await save() }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(busy)
+            }
+        }
+        .padding(20)
+        .frame(width: 560)
+        .background { VPCrystalBackdrop() }
+    }
+
+    private func save() async {
+        busy = true
+        defer { busy = false }
+        let policy = SourceRetrievalPolicy(
+            annEnabled: annEnabled,
+            annMinVectors: annMinVectors,
+            annNProbe: annNProbe,
+            rerank: rerank,
+            queryExpansion: queryExpansion,
+            maxExpandedTerms: maxExpandedTerms
+        )
+        await model.updateSourceRetrievalPolicy(policy)
+        dismiss()
     }
 }

@@ -7548,6 +7548,15 @@ struct SourceSearchHit: Codable, Identifiable, Hashable, Sendable {
     let origins: [String]
     let lexicalScore: Double?
     let semanticScore: Double?
+    /// `off` or `deterministic`. Older payloads decode as `off`.
+    let rerank: String
+    let rerankScore: Double?
+    let lexicalOverlap: Double?
+    let titleMatch: Double?
+    let freshness: Double?
+    let expanded: Bool
+    let expansionTerms: [String]
+    let sourceUpdatedAt: String?
 
     var id: String {
         chunkID
@@ -7568,6 +7577,14 @@ struct SourceSearchHit: Codable, Identifiable, Hashable, Sendable {
         case origins
         case lexicalScore = "lexical_score"
         case semanticScore = "semantic_score"
+        case rerank
+        case rerankScore = "rerank_score"
+        case lexicalOverlap = "lexical_overlap"
+        case titleMatch = "title_match"
+        case freshness
+        case expanded
+        case expansionTerms = "expansion_terms"
+        case sourceUpdatedAt = "source_updated_at"
     }
 
     init(from decoder: Decoder) throws {
@@ -7586,6 +7603,17 @@ struct SourceSearchHit: Codable, Identifiable, Hashable, Sendable {
         origins = try container.decodeIfPresent([String].self, forKey: .origins) ?? ["lexical"]
         lexicalScore = try container.decodeIfPresent(Double.self, forKey: .lexicalScore)
         semanticScore = try container.decodeIfPresent(Double.self, forKey: .semanticScore)
+        rerank = try container.decodeIfPresent(String.self, forKey: .rerank) ?? "off"
+        rerankScore = try container.decodeIfPresent(Double.self, forKey: .rerankScore)
+        lexicalOverlap = try container.decodeIfPresent(Double.self, forKey: .lexicalOverlap)
+        titleMatch = try container.decodeIfPresent(Double.self, forKey: .titleMatch)
+        freshness = try container.decodeIfPresent(Double.self, forKey: .freshness)
+        expanded = try container.decodeIfPresent(Bool.self, forKey: .expanded) ?? false
+        expansionTerms = try container.decodeIfPresent(
+            [String].self,
+            forKey: .expansionTerms
+        ) ?? []
+        sourceUpdatedAt = try container.decodeIfPresent(String.self, forKey: .sourceUpdatedAt)
     }
 
     init(
@@ -7602,7 +7630,15 @@ struct SourceSearchHit: Codable, Identifiable, Hashable, Sendable {
         confidence: Double? = nil,
         origins: [String] = ["lexical"],
         lexicalScore: Double? = nil,
-        semanticScore: Double? = nil
+        semanticScore: Double? = nil,
+        rerank: String = "off",
+        rerankScore: Double? = nil,
+        lexicalOverlap: Double? = nil,
+        titleMatch: Double? = nil,
+        freshness: Double? = nil,
+        expanded: Bool = false,
+        expansionTerms: [String] = [],
+        sourceUpdatedAt: String? = nil
     ) {
         self.sourceID = sourceID
         self.sourceTitle = sourceTitle
@@ -7618,6 +7654,14 @@ struct SourceSearchHit: Codable, Identifiable, Hashable, Sendable {
         self.origins = origins
         self.lexicalScore = lexicalScore
         self.semanticScore = semanticScore
+        self.rerank = rerank
+        self.rerankScore = rerankScore
+        self.lexicalOverlap = lexicalOverlap
+        self.titleMatch = titleMatch
+        self.freshness = freshness
+        self.expanded = expanded
+        self.expansionTerms = expansionTerms
+        self.sourceUpdatedAt = sourceUpdatedAt
     }
 }
 
@@ -7657,6 +7701,14 @@ struct SourceSearchResult: Codable, Sendable {
     let requestedMode: String
     let semanticUnavailable: String?
     let candidatesScanned: Int
+    let indexPath: String
+    let indexGeneration: UInt64?
+    let indexFallbackReason: String?
+    let probedClusters: UInt32
+    let annCandidates: Int
+    let rerank: String
+    let expansion: String
+    let expansionTerms: [String]
 
     enum CodingKeys: String, CodingKey {
         case hits
@@ -7665,6 +7717,14 @@ struct SourceSearchResult: Codable, Sendable {
         case requestedMode = "requested_mode"
         case semanticUnavailable = "semantic_unavailable"
         case candidatesScanned = "candidates_scanned"
+        case indexPath = "index_path"
+        case indexGeneration = "index_generation"
+        case indexFallbackReason = "index_fallback_reason"
+        case probedClusters = "probed_clusters"
+        case annCandidates = "ann_candidates"
+        case rerank
+        case expansion
+        case expansionTerms = "expansion_terms"
     }
 
     init(from decoder: Decoder) throws {
@@ -7678,6 +7738,20 @@ struct SourceSearchResult: Codable, Sendable {
             forKey: .semanticUnavailable
         )
         candidatesScanned = try container.decodeIfPresent(Int.self, forKey: .candidatesScanned) ?? 0
+        indexPath = try container.decodeIfPresent(String.self, forKey: .indexPath) ?? "exact"
+        indexGeneration = try container.decodeIfPresent(UInt64.self, forKey: .indexGeneration)
+        indexFallbackReason = try container.decodeIfPresent(
+            String.self,
+            forKey: .indexFallbackReason
+        )
+        probedClusters = try container.decodeIfPresent(UInt32.self, forKey: .probedClusters) ?? 0
+        annCandidates = try container.decodeIfPresent(Int.self, forKey: .annCandidates) ?? 0
+        rerank = try container.decodeIfPresent(String.self, forKey: .rerank) ?? "off"
+        expansion = try container.decodeIfPresent(String.self, forKey: .expansion) ?? "off"
+        expansionTerms = try container.decodeIfPresent(
+            [String].self,
+            forKey: .expansionTerms
+        ) ?? []
     }
 
     init(
@@ -7686,7 +7760,15 @@ struct SourceSearchResult: Codable, Sendable {
         mode: String = "lexical",
         requestedMode: String = "lexical",
         semanticUnavailable: String? = nil,
-        candidatesScanned: Int = 0
+        candidatesScanned: Int = 0,
+        indexPath: String = "exact",
+        indexGeneration: UInt64? = nil,
+        indexFallbackReason: String? = nil,
+        probedClusters: UInt32 = 0,
+        annCandidates: Int = 0,
+        rerank: String = "off",
+        expansion: String = "off",
+        expansionTerms: [String] = []
     ) {
         self.hits = hits
         self.degraded = degraded
@@ -7694,6 +7776,14 @@ struct SourceSearchResult: Codable, Sendable {
         self.requestedMode = requestedMode
         self.semanticUnavailable = semanticUnavailable
         self.candidatesScanned = candidatesScanned
+        self.indexPath = indexPath
+        self.indexGeneration = indexGeneration
+        self.indexFallbackReason = indexFallbackReason
+        self.probedClusters = probedClusters
+        self.annCandidates = annCandidates
+        self.rerank = rerank
+        self.expansion = expansion
+        self.expansionTerms = expansionTerms
     }
 }
 
@@ -8057,6 +8147,252 @@ struct SourceEmbeddingReindexResult: Codable, Sendable {
             UInt32.self,
             forKey: .maxChunksPerSource
         ) ?? 0
+    }
+}
+
+enum SourceRerankMode: String, CaseIterable, Identifiable, Codable, Equatable, Sendable {
+    case off
+    case deterministic
+
+    var id: String {
+        rawValue
+    }
+
+    var title: String {
+        switch self {
+        case .off: L10n.t("Off")
+        case .deterministic: L10n.t("Deterministic")
+        }
+    }
+}
+
+enum SourceQueryExpansionMode: String, CaseIterable, Identifiable, Codable, Equatable, Sendable {
+    case off
+    case lexical
+
+    var id: String {
+        rawValue
+    }
+
+    var title: String {
+        switch self {
+        case .off: L10n.t("Off")
+        case .lexical: L10n.t("Lexical")
+        }
+    }
+}
+
+/// Retrieval v2 controls layered on top of the opt-in source embedding policy.
+/// ANN and expansion are off by default; rerank defaults to the deterministic,
+/// model-free blend. The daemon clamps numeric values on write.
+struct SourceRetrievalPolicy: Codable, Equatable, Sendable {
+    var annEnabled: Bool
+    var annMinVectors: Int
+    var annNProbe: Int
+    var rerank: SourceRerankMode
+    var queryExpansion: SourceQueryExpansionMode
+    var maxExpandedTerms: Int
+
+    static let defaults = SourceRetrievalPolicy(
+        annEnabled: false,
+        annMinVectors: 256,
+        annNProbe: 8,
+        rerank: .deterministic,
+        queryExpansion: .off,
+        maxExpandedTerms: 8
+    )
+
+    enum CodingKeys: String, CodingKey {
+        case annEnabled = "ann_enabled"
+        case annMinVectors = "ann_min_vectors"
+        case annNProbe = "ann_nprobe"
+        case rerank
+        case queryExpansion = "query_expansion"
+        case maxExpandedTerms = "max_expanded_terms"
+    }
+
+    init(
+        annEnabled: Bool,
+        annMinVectors: Int,
+        annNProbe: Int,
+        rerank: SourceRerankMode,
+        queryExpansion: SourceQueryExpansionMode,
+        maxExpandedTerms: Int
+    ) {
+        self.annEnabled = annEnabled
+        self.annMinVectors = annMinVectors
+        self.annNProbe = annNProbe
+        self.rerank = rerank
+        self.queryExpansion = queryExpansion
+        self.maxExpandedTerms = maxExpandedTerms
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        annEnabled = try container.decodeIfPresent(Bool.self, forKey: .annEnabled) ?? false
+        annMinVectors = try container.decodeIfPresent(Int.self, forKey: .annMinVectors) ?? 256
+        annNProbe = try container.decodeIfPresent(Int.self, forKey: .annNProbe) ?? 8
+        rerank = try container.decodeIfPresent(SourceRerankMode.self, forKey: .rerank)
+            ?? .deterministic
+        queryExpansion = try container.decodeIfPresent(
+            SourceQueryExpansionMode.self,
+            forKey: .queryExpansion
+        ) ?? .off
+        maxExpandedTerms = try container.decodeIfPresent(Int.self, forKey: .maxExpandedTerms)
+            ?? 8
+    }
+
+    func jsonObject() -> [String: JSONValue] {
+        [
+            "ann_enabled": .bool(annEnabled),
+            "ann_min_vectors": .number(Double(annMinVectors)),
+            "ann_nprobe": .number(Double(annNProbe)),
+            "rerank": .string(rerank.rawValue),
+            "query_expansion": .string(queryExpansion.rawValue),
+            "max_expanded_terms": .number(Double(maxExpandedTerms)),
+        ]
+    }
+}
+
+struct SourceRetrievalPolicyResult: Codable, Sendable {
+    let projectId: String
+    let policy: SourceRetrievalPolicy
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case policy
+    }
+}
+
+struct SourceIndexStatusResult: Codable, Sendable {
+    let projectId: String
+    let policy: SourceRetrievalPolicy
+    let embeddingEnabled: Bool
+    let embeddingConfigured: Bool
+    let model: String?
+    let dimensions: Int
+    let annEnabled: Bool
+    let ready: Bool
+    let path: String
+    let generation: UInt64?
+    let vectorCount: UInt32
+    let assignedVectors: UInt32
+    let invalidAssignments: UInt32
+    let centroidCount: UInt32
+    let nlist: UInt32
+    let nprobe: UInt32
+    let minVectors: UInt32
+    let coverage: Double
+    let bytes: UInt64
+    let fallbackReason: String?
+    let lastRebuiltAt: String?
+    let lastError: String?
+
+    var activePathLabel: String {
+        path == "ann" ? L10n.t("ANN") : L10n.t("Exact scan")
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case policy
+        case embeddingEnabled = "embedding_enabled"
+        case embeddingConfigured = "embedding_configured"
+        case model
+        case dimensions
+        case annEnabled = "ann_enabled"
+        case ready
+        case path
+        case generation
+        case vectorCount = "vector_count"
+        case assignedVectors = "assigned_vectors"
+        case invalidAssignments = "invalid_assignments"
+        case centroidCount = "centroid_count"
+        case nlist
+        case nprobe
+        case minVectors = "min_vectors"
+        case coverage
+        case bytes
+        case fallbackReason = "fallback_reason"
+        case lastRebuiltAt = "last_rebuilt_at"
+        case lastError = "last_error"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        projectId = try container.decode(String.self, forKey: .projectId)
+        policy = try container.decodeIfPresent(SourceRetrievalPolicy.self, forKey: .policy)
+            ?? .defaults
+        embeddingEnabled = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .embeddingEnabled
+        ) ?? false
+        embeddingConfigured = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .embeddingConfigured
+        ) ?? false
+        model = try container.decodeIfPresent(String.self, forKey: .model)
+        dimensions = try container.decodeIfPresent(Int.self, forKey: .dimensions) ?? 0
+        annEnabled = try container.decodeIfPresent(Bool.self, forKey: .annEnabled) ?? false
+        ready = try container.decodeIfPresent(Bool.self, forKey: .ready) ?? false
+        path = try container.decodeIfPresent(String.self, forKey: .path) ?? "exact"
+        generation = try container.decodeIfPresent(UInt64.self, forKey: .generation)
+        vectorCount = try container.decodeIfPresent(UInt32.self, forKey: .vectorCount) ?? 0
+        assignedVectors = try container.decodeIfPresent(UInt32.self, forKey: .assignedVectors)
+            ?? 0
+        invalidAssignments = try container.decodeIfPresent(
+            UInt32.self,
+            forKey: .invalidAssignments
+        ) ?? 0
+        centroidCount = try container.decodeIfPresent(UInt32.self, forKey: .centroidCount) ?? 0
+        nlist = try container.decodeIfPresent(UInt32.self, forKey: .nlist) ?? 0
+        nprobe = try container.decodeIfPresent(UInt32.self, forKey: .nprobe) ?? 0
+        minVectors = try container.decodeIfPresent(UInt32.self, forKey: .minVectors) ?? 0
+        coverage = try container.decodeIfPresent(Double.self, forKey: .coverage) ?? 0
+        bytes = try container.decodeIfPresent(UInt64.self, forKey: .bytes) ?? 0
+        fallbackReason = try container.decodeIfPresent(String.self, forKey: .fallbackReason)
+        lastRebuiltAt = try container.decodeIfPresent(String.self, forKey: .lastRebuiltAt)
+        lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
+    }
+}
+
+struct SourceIndexRebuildResult: Codable, Sendable {
+    let projectId: String
+    let rebuilt: Bool
+    let reason: String?
+    let generation: UInt64?
+    let vectorCount: UInt32
+    let assignedVectors: UInt32
+    let centroidCount: UInt32
+    let nlist: UInt32
+    let nprobe: UInt32
+    let path: String
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case rebuilt
+        case reason
+        case generation
+        case vectorCount = "vector_count"
+        case assignedVectors = "assigned_vectors"
+        case centroidCount = "centroid_count"
+        case nlist
+        case nprobe
+        case path
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        projectId = try container.decode(String.self, forKey: .projectId)
+        rebuilt = try container.decodeIfPresent(Bool.self, forKey: .rebuilt) ?? false
+        reason = try container.decodeIfPresent(String.self, forKey: .reason)
+        generation = try container.decodeIfPresent(UInt64.self, forKey: .generation)
+        vectorCount = try container.decodeIfPresent(UInt32.self, forKey: .vectorCount) ?? 0
+        assignedVectors = try container.decodeIfPresent(UInt32.self, forKey: .assignedVectors)
+            ?? 0
+        centroidCount = try container.decodeIfPresent(UInt32.self, forKey: .centroidCount) ?? 0
+        nlist = try container.decodeIfPresent(UInt32.self, forKey: .nlist) ?? 0
+        nprobe = try container.decodeIfPresent(UInt32.self, forKey: .nprobe) ?? 0
+        path = try container.decodeIfPresent(String.self, forKey: .path) ?? "exact"
     }
 }
 

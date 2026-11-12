@@ -330,6 +330,11 @@ pub fn estimate_tokens(text: &str) -> u32 {
     (words + cjk).min(u32::MAX as u64) as u32
 }
 
+/// Public CJK classifier shared with expansion/rerank heuristics.
+pub fn source_is_cjk(character: char) -> bool {
+    is_cjk(character)
+}
+
 fn is_cjk(character: char) -> bool {
     matches!(
         character as u32,
@@ -384,6 +389,13 @@ pub fn source_query(query: &str) -> Option<SourceQuery> {
 
 fn quote_fts(term: &str) -> String {
     format!("\"{}\"*", term.replace('"', "\"\""))
+}
+
+/// Public deterministic tokenizer shared by lexical overlap, rerank, and query
+/// expansion. It returns lowercased word/code tokens plus CJK runs, hyphen and
+/// path segments, and adjacent CJK bigrams. No stemming or model is involved.
+pub fn source_tokens(input: &str) -> Vec<String> {
+    tokenize(input)
 }
 
 fn tokenize(input: &str) -> Vec<String> {

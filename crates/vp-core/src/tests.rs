@@ -12447,6 +12447,10 @@ async fn source_refresh_invalidates_semantic_vectors_and_recovers() {
         .await
         .unwrap();
     assert_eq!(stale.mode, "lexical");
+    assert_eq!(
+        stale.requested_mode, "semantic",
+        "fallback must not rewrite the requested lane"
+    );
     assert_eq!(stale.semantic_unavailable.as_deref(), Some("stale_vectors"));
     assert!(!stale.hits.is_empty(), "lexical search still works");
     let status = engine.source_embedding_status(&project.id).await.unwrap();
@@ -12905,6 +12909,901 @@ async fn source_embedding_status_without_policy_is_disabled_and_cheap() {
     assert!(!lexical.hits.is_empty());
 }
 
+fn source_retrieval_policy_for(
+    ann_enabled: bool,
+    ann_min_vectors: u32,
+    ann_nprobe: u32,
+) -> vp_protocol::types::SourceRetrievalPolicy {
+    vp_protocol::types::SourceRetrievalPolicy {
+        ann_enabled,
+        ann_min_vectors,
+        ann_nprobe,
+        rerank: vp_protocol::types::SourceRerankMode::Deterministic,
+        query_expansion: vp_protocol::types::SourceQueryExpansionMode::Off,
+        max_expanded_terms: 8,
+    }
+}
+
+#[tokio::test]
+async fn source_retrieval_policy_status_and_rebuild_surface() {
+    let server = source_embedding_success_server().await;
+    let env_name = "VERLINPARK_TEST_SOURCE_RETRIEVAL_SURFACE";
+    set_source_embedding_env(env_name, &server.uri());
+    let (_data, _repo, engine, project) = source_embedding_engine("retrieval-surface").await;
+    engine
+        .set_source_embedding_policy(&project.id, source_embedding_policy_for(env_name))
+        .await
+        .unwrap();
+    engine
+        .add_source_note(SourceCreateNoteParams {
+            project_id: project.id.clone(),
+            collection: Some("retrieval".into()),
+            title: "Retrieval notes".into(),
+            content: "The derived index is deterministic and generation scoped.".into(),
+            labels: vec!["runtime".into()],
+        })
+        .await
+        .unwrap();
+    let (_projects, indexed, failed, _done) = engine.reconcile_source_embeddings().await.unwrap();
+    assert!(indexed >= 1);
+    assert_eq!(failed, 0);
+
+    // Normalization clamps numeric policy fields instead of persisting an
+    // unbounded probe or expansion budget.
+    let mut policy = source_retrieval_policy_for(true, 0, 99);
+    policy.max_expanded_terms = 0;
+    let stored = engine
+        .set_source_retrieval_policy(&project.id, policy)
+        .await
+        .unwrap();
+    assert_eq!(stored.policy.ann_min_vectors, 1);
+    assert_eq!(stored.policy.ann_nprobe, 32);
+    assert_eq!(stored.policy.max_expanded_terms, 1);
+    let read = engine
+        .get_source_retrieval_policy(&project.id)
+        .await
+        .unwrap();
+    assert_eq!(read.policy, stored.policy);
+
+    // Before a rebuild the index reports not_built and the exact path. The
+    // status never serializes centroid or vector bytes.
+    let mut policy = stored.policy.clone();
+    policy.ann_min_vectors = 1;
+    policy.ann_nprobe = 1;
+    engine
+        .set_source_retrieval_policy(&project.id, policy.clone())
+        .await
+        .unwrap();
+    let status = engine.source_index_status(&project.id).await.unwrap();
+    assert_eq!(status.project_id, project.id);
+    assert!(status.embedding_enabled);
+    assert!(status.embedding_configured);
+    assert!(status.ann_enabled);
+    assert!(!status.ready);
+    assert_eq!(status.path, "exact");
+    assert_eq!(status.fallback_reason.as_deref(), Some("not_built"));
+    assert!(status.vector_count >= 1);
+    assert_eq!(status.nprobe, 1);
+    assert_eq!(status.min_vectors, 1);
+    let encoded = serde_json::to_value(&status).unwrap();
+    assert!(encoded.get("centroids").is_none());
+    assert!(encoded.get("vectors").is_none());
+
+    let rebuild = engine.rebuild_source_index(&project.id).await.unwrap();
+    assert!(rebuild.rebuilt, "rebuild should produce an index");
+    assert_eq!(rebuild.path, "ann");
+    assert!(rebuild.generation.is_some());
+    assert!(rebuild.assigned_vectors >= 1);
+    assert_eq!(rebuild.centroid_count, 1);
+    assert_eq!(rebuild.nprobe, 1);
+    assert!(rebuild.reason.is_none());
+    let first_centroids = engine
+        .store()
+        .source_ann_index(&project.id)
+        .unwrap()
+        .unwrap()
+        .centroids;
+    let after = engine.source_index_status(&project.id).await.unwrap();
+    assert!(after.ready);
+    assert_eq!(after.path, "ann");
+    assert_eq!(after.generation, rebuild.generation);
+    assert!(after.coverage > 0.999);
+    assert!(after.last_rebuilt_at.is_some());
+    assert!(after.fallback_reason.is_none());
+    let encoded = serde_json::to_value(&after).unwrap();
+    assert!(!encoded.to_string().contains("\"vector\""));
+    assert!(!encoded.to_string().contains("\"centroids\""));
+
+    // A rebuild with unchanged vectors is idempotent in content: same centroid
+    // count and byte length, with a new monotonic generation.
+    let rebuilt_again = engine.rebuild_source_index(&project.id).await.unwrap();
+    assert!(rebuilt_again.rebuilt);
+    assert!(rebuilt_again.generation > rebuild.generation);
+    assert_eq!(rebuilt_again.centroid_count, rebuild.centroid_count);
+    let row_first = engine
+        .store()
+        .source_ann_index(&project.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row_first.generation, rebuilt_again.generation.unwrap());
+    assert_eq!(
+        row_first.centroids, first_centroids,
+        "unchanged vectors must produce byte-identical centroids"
+    );
+
+    // Disabling ANN keeps the derived index but reports the exact path.
+    let mut disabled = policy.clone();
+    disabled.ann_enabled = false;
+    engine
+        .set_source_retrieval_policy(&project.id, disabled)
+        .await
+        .unwrap();
+    let disabled_status = engine.source_index_status(&project.id).await.unwrap();
+    assert!(!disabled_status.ready);
+    assert_eq!(disabled_status.path, "exact");
+    assert_eq!(
+        disabled_status.fallback_reason.as_deref(),
+        Some("ann_disabled")
+    );
+    assert!(
+        engine
+            .store()
+            .source_ann_index(&project.id)
+            .unwrap()
+            .is_some()
+    );
+    remove_source_embedding_env(env_name);
+}
+
+#[tokio::test]
+async fn source_index_status_reports_disabled_unconfigured_and_small_corpora() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("index-status".into()),
+        )
+        .await
+        .unwrap();
+
+    // No embedding policy at all: the index is explicitly unavailable.
+    let status = engine.source_index_status(&project.id).await.unwrap();
+    assert!(!status.embedding_enabled);
+    assert!(!status.embedding_configured);
+    assert!(!status.ready);
+    assert_eq!(status.path, "exact");
+    assert_eq!(
+        status.fallback_reason.as_deref(),
+        Some("embedding_disabled")
+    );
+    assert_eq!(
+        status.policy,
+        vp_protocol::types::SourceRetrievalPolicy::default()
+    );
+
+    // An enabled-but-unconfigured stored policy reports not_configured without
+    // touching the network.
+    let unconfigured = vp_protocol::types::SourceEmbeddingPolicy {
+        enabled: true,
+        endpoint_env: None,
+        model: None,
+        ..vp_protocol::types::SourceEmbeddingPolicy::default()
+    };
+    engine
+        .store()
+        .set_source_embedding_policy(&project.id, &unconfigured)
+        .unwrap();
+    let status = engine.source_index_status(&project.id).await.unwrap();
+    assert!(status.embedding_enabled);
+    assert!(!status.embedding_configured);
+    assert_eq!(status.path, "exact");
+    assert_eq!(status.fallback_reason.as_deref(), Some("not_configured"));
+
+    // A configured lane with ANN disabled reports ann_disabled even when no
+    // vectors exist yet.
+    let env_name = "VERLINPARK_TEST_SOURCE_INDEX_STATUS";
+    set_source_embedding_env(env_name, "http://127.0.0.1:9/v1");
+    engine
+        .set_source_embedding_policy(&project.id, source_embedding_policy_for(env_name))
+        .await
+        .unwrap();
+    let status = engine.source_index_status(&project.id).await.unwrap();
+    assert_eq!(status.path, "exact");
+    assert_eq!(status.fallback_reason.as_deref(), Some("ann_disabled"));
+    assert_eq!(status.vector_count, 0);
+    assert_eq!(status.nprobe, 8);
+
+    // Enabling ANN on an empty corpus reports below_min_vectors; the exact
+    // path remains returned for the next semantic query.
+    engine
+        .set_source_retrieval_policy(&project.id, source_retrieval_policy_for(true, 256, 2))
+        .await
+        .unwrap();
+    let status = engine.source_index_status(&project.id).await.unwrap();
+    assert_eq!(status.path, "exact");
+    assert_eq!(status.fallback_reason.as_deref(), Some("below_min_vectors"));
+    assert_eq!(status.min_vectors, 256);
+    assert_eq!(status.nprobe, 2);
+    let encoded = serde_json::to_value(&status).unwrap();
+    assert!(encoded.get("centroids").is_none());
+    assert!(encoded.get("vectors").is_none());
+    remove_source_embedding_env(env_name);
+}
+
+#[tokio::test]
+async fn source_ann_search_uses_the_index_and_falls_back_on_corruption() {
+    let server = source_embedding_success_server().await;
+    let env_name = "VERLINPARK_TEST_SOURCE_ANN_SEARCH";
+    set_source_embedding_env(env_name, &server.uri());
+    let (_data, _repo, engine, project) = source_embedding_engine("ann-search").await;
+    engine
+        .set_source_embedding_policy(&project.id, source_embedding_policy_for(env_name))
+        .await
+        .unwrap();
+    engine
+        .set_source_retrieval_policy(&project.id, source_retrieval_policy_for(true, 1, 1))
+        .await
+        .unwrap();
+    engine
+        .add_source_note(SourceCreateNoteParams {
+            project_id: project.id.clone(),
+            collection: None,
+            title: "ANN source".into(),
+            content: "Deterministic leases use generation-scoped candidates.".into(),
+            labels: Vec::new(),
+        })
+        .await
+        .unwrap();
+    engine.reconcile_source_embeddings().await.unwrap();
+    engine.rebuild_source_index(&project.id).await.unwrap();
+
+    let semantic = engine
+        .search_sources_with_mode(
+            project.id.clone(),
+            "generation candidates".into(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(5),
+            Some(vp_protocol::types::SourceSearchMode::Semantic),
+        )
+        .await
+        .unwrap();
+    assert_eq!(semantic.mode, "semantic");
+    assert_eq!(semantic.index_path, "ann");
+    assert!(semantic.index_fallback_reason.is_none());
+    assert!(semantic.index_generation.is_some());
+    assert_eq!(semantic.probed_clusters, 1);
+    assert!(semantic.ann_candidates >= 1);
+    assert!(!semantic.hits.is_empty());
+    let encoded = serde_json::to_value(&semantic).unwrap();
+    assert!(encoded["hits"][0].get("vector").is_none());
+
+    // A corrupt centroid blob fails closed to the exact scan and reports why.
+    let row = engine
+        .store()
+        .source_ann_index(&project.id)
+        .unwrap()
+        .unwrap();
+    engine
+        .store()
+        .save_source_ann_index(
+            &project.id,
+            &row.model,
+            row.dimensions,
+            row.nlist,
+            row.centroid_count,
+            row.vector_count,
+            &[0u8; 3],
+            Some(row.generation),
+        )
+        .unwrap();
+    let corrupt = engine
+        .search_sources_with_mode(
+            project.id.clone(),
+            "generation candidates".into(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(5),
+            Some(vp_protocol::types::SourceSearchMode::Semantic),
+        )
+        .await
+        .unwrap();
+    assert_eq!(corrupt.index_path, "exact");
+    assert_eq!(corrupt.mode, "semantic");
+    assert!(
+        corrupt
+            .index_fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("index_corrupt:")),
+        "got {:?}",
+        corrupt.index_fallback_reason
+    );
+    assert!(!corrupt.hits.is_empty(), "exact scan still works");
+    assert_eq!(corrupt.candidates_scanned, 1);
+
+    // A generation bump without assignments (the rebuild window) falls back
+    // explicitly instead of returning a silently empty ANN candidate set.
+    let corrupt_row = engine
+        .store()
+        .source_ann_index(&project.id)
+        .unwrap()
+        .unwrap();
+    engine
+        .store()
+        .save_source_ann_index(
+            &project.id,
+            &corrupt_row.model,
+            corrupt_row.dimensions,
+            corrupt_row.nlist,
+            corrupt_row.centroid_count,
+            corrupt_row.vector_count,
+            &row.centroids,
+            Some(corrupt_row.generation),
+        )
+        .unwrap();
+    let no_assignments = engine
+        .search_sources_with_mode(
+            project.id.clone(),
+            "generation candidates".into(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(5),
+            Some(vp_protocol::types::SourceSearchMode::Semantic),
+        )
+        .await
+        .unwrap();
+    assert_eq!(no_assignments.index_path, "exact");
+    assert_eq!(
+        no_assignments.index_fallback_reason.as_deref(),
+        Some("no_assignments")
+    );
+    assert!(!no_assignments.hits.is_empty());
+
+    // Below the minimum, the exact scan is explicit even with a healthy row.
+    engine.rebuild_source_index(&project.id).await.unwrap();
+    let mut too_small = source_retrieval_policy_for(true, 100, 1);
+    too_small.ann_min_vectors = 100;
+    engine
+        .set_source_retrieval_policy(&project.id, too_small)
+        .await
+        .unwrap();
+    let below = engine
+        .search_sources_with_mode(
+            project.id.clone(),
+            "generation candidates".into(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(5),
+            Some(vp_protocol::types::SourceSearchMode::Hybrid),
+        )
+        .await
+        .unwrap();
+    assert_eq!(below.index_path, "exact");
+    assert_eq!(
+        below.index_fallback_reason.as_deref(),
+        Some("below_min_vectors")
+    );
+    assert!(!below.hits.is_empty());
+    remove_source_embedding_env(env_name);
+}
+
+#[tokio::test]
+async fn source_hybrid_expansion_uses_ann_and_one_embedding_batch() {
+    let server = source_embedding_success_server().await;
+    let env_name = "VERLINPARK_TEST_SOURCE_HYBRID_EXPANSION";
+    set_source_embedding_env(env_name, &server.uri());
+    let (_data, _repo, engine, project) = source_embedding_engine("hybrid-expansion").await;
+    engine
+        .set_source_embedding_policy(&project.id, source_embedding_policy_for(env_name))
+        .await
+        .unwrap();
+    let mut policy = source_retrieval_policy_for(true, 1, 1);
+    policy.query_expansion = vp_protocol::types::SourceQueryExpansionMode::Lexical;
+    policy.max_expanded_terms = 4;
+    engine
+        .set_source_retrieval_policy(&project.id, policy)
+        .await
+        .unwrap();
+    let first = engine
+        .add_source_note(SourceCreateNoteParams {
+            project_id: project.id.clone(),
+            collection: None,
+            title: "Sandbox runtime".into(),
+            content: "Deterministic leases and integration evidence.".into(),
+            labels: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let second = engine
+        .add_source_note(SourceCreateNoteParams {
+            project_id: project.id.clone(),
+            collection: None,
+            title: "Lease notes".into(),
+            content: "The sandbox isolates worktrees and tool output.".into(),
+            labels: Vec::new(),
+        })
+        .await
+        .unwrap();
+    engine.reconcile_source_embeddings().await.unwrap();
+    engine.rebuild_source_index(&project.id).await.unwrap();
+    let result = engine
+        .search_sources_with_mode(
+            project.id.clone(),
+            "leases".into(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(5),
+            Some(vp_protocol::types::SourceSearchMode::Hybrid),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.mode, "hybrid");
+    assert_eq!(result.index_path, "ann");
+    assert_eq!(result.expansion, "lexical");
+    assert!(result.index_generation.is_some());
+    assert!(result.probed_clusters >= 1);
+    assert!(result.hits.iter().any(|hit| hit.source_id == first.id));
+    let expanded = result
+        .hits
+        .iter()
+        .find(|hit| hit.source_id == second.id)
+        .expect("lexical expansion should resurface the second source");
+    assert!(expanded.expanded);
+    assert!(
+        expanded
+            .expansion_terms
+            .iter()
+            .any(|term| term == "sandbox")
+    );
+
+    // The original and expanded queries share one bounded embedding batch.
+    let requests = server.received_requests().await.unwrap();
+    let batch_sizes = requests
+        .iter()
+        .filter_map(|request| {
+            let value: serde_json::Value = serde_json::from_slice(&request.body).ok()?;
+            value
+                .get("input")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        batch_sizes.contains(&2),
+        "expected one two-input query batch, saw {batch_sizes:?}"
+    );
+    assert!(
+        batch_sizes.iter().all(|size| *size <= 2),
+        "query embedding must stay bounded"
+    );
+
+    // Rerank off restores lane scores and clears every component.
+    let mut off = source_retrieval_policy_for(true, 1, 1);
+    off.rerank = vp_protocol::types::SourceRerankMode::Off;
+    engine
+        .set_source_retrieval_policy(&project.id, off)
+        .await
+        .unwrap();
+    let lexical = engine
+        .search_sources_with_mode(
+            project.id.clone(),
+            "leases".into(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(5),
+            Some(vp_protocol::types::SourceSearchMode::Lexical),
+        )
+        .await
+        .unwrap();
+    assert_eq!(lexical.rerank, "off");
+    assert_eq!(lexical.expansion, "off");
+    for hit in &lexical.hits {
+        assert_eq!(hit.rerank, "off");
+        assert!(hit.rerank_score.is_none());
+        assert!(hit.lexical_overlap.is_none());
+        assert!(hit.title_match.is_none());
+        assert!(hit.freshness.is_none());
+        assert_eq!(hit.score, hit.lexical_score.unwrap_or(0.0));
+    }
+    remove_source_embedding_env(env_name);
+}
+
+#[tokio::test]
+async fn source_ann_maintenance_builds_and_assigns_incrementally() {
+    let server = source_embedding_success_server().await;
+    let env_name = "VERLINPARK_TEST_SOURCE_ANN_MAINTENANCE";
+    set_source_embedding_env(env_name, &server.uri());
+    let (_data, _repo, engine, project) = source_embedding_engine("ann-maintenance").await;
+    engine
+        .set_source_embedding_policy(&project.id, source_embedding_policy_for(env_name))
+        .await
+        .unwrap();
+    engine
+        .set_source_retrieval_policy(&project.id, source_retrieval_policy_for(true, 1, 1))
+        .await
+        .unwrap();
+    engine
+        .add_source_note(SourceCreateNoteParams {
+            project_id: project.id.clone(),
+            collection: None,
+            title: "First maintenance source".into(),
+            content: "The daemon keeps derived index state current.".into(),
+            labels: Vec::new(),
+        })
+        .await
+        .unwrap();
+    engine.reconcile_source_embeddings().await.unwrap();
+    let first_row = engine
+        .store()
+        .source_ann_index(&project.id)
+        .unwrap()
+        .expect("maintenance builds an index after embedding");
+    assert_eq!(first_row.vector_count, 1);
+    assert_eq!(first_row.centroid_count, 1);
+    let first_counts = engine
+        .store()
+        .source_ann_counts(
+            &project.id,
+            &first_row.model,
+            first_row.dimensions,
+            200,
+            first_row.generation,
+            first_row.centroid_count,
+        )
+        .unwrap();
+    assert_eq!(first_counts.assigned_vectors, 1);
+
+    // A second small source is assigned incrementally; the generation and
+    // centroid count stay stable because the growth threshold is not crossed.
+    engine
+        .add_source_note(SourceCreateNoteParams {
+            project_id: project.id.clone(),
+            collection: None,
+            title: "Second maintenance source".into(),
+            content: "Incremental assignment avoids a full rebuild.".into(),
+            labels: Vec::new(),
+        })
+        .await
+        .unwrap();
+    engine.reconcile_source_embeddings().await.unwrap();
+    let second_row = engine
+        .store()
+        .source_ann_index(&project.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(second_row.generation, first_row.generation);
+    assert_eq!(second_row.centroid_count, first_row.centroid_count);
+    // `vector_count` is the training snapshot size; live coverage is reported
+    // by counts/status and grows incrementally.
+    assert_eq!(second_row.vector_count, 1);
+    let second_counts = engine
+        .store()
+        .source_ann_counts(
+            &project.id,
+            &second_row.model,
+            second_row.dimensions,
+            200,
+            second_row.generation,
+            second_row.centroid_count,
+        )
+        .unwrap();
+    assert_eq!(second_counts.vector_count, 2);
+    assert_eq!(second_counts.assigned_vectors, 2);
+    let status = engine.source_index_status(&project.id).await.unwrap();
+    assert!(status.ready);
+    assert_eq!(status.coverage, 1.0);
+    assert_eq!(status.vector_count, 2);
+
+    // A corrupt index is rebuilt by maintenance; a derived-state failure never
+    // breaks source writes or embedding reconciliation.
+    engine
+        .store()
+        .save_source_ann_index(
+            &project.id,
+            &second_row.model,
+            second_row.dimensions,
+            second_row.nlist,
+            second_row.centroid_count,
+            second_row.vector_count,
+            &[0u8; 3],
+            Some(second_row.generation),
+        )
+        .unwrap();
+    let source = engine
+        .add_source_note(SourceCreateNoteParams {
+            project_id: project.id.clone(),
+            collection: None,
+            title: "Third maintenance source".into(),
+            content: "Source writes survive derived index corruption.".into(),
+            labels: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(source.status, "indexed");
+    let (projects, indexed, failed, _done) = engine.reconcile_source_embeddings().await.unwrap();
+    assert_eq!(projects, 1);
+    assert!(indexed >= 1);
+    assert_eq!(failed, 0);
+    let repaired = engine
+        .store()
+        .source_ann_index(&project.id)
+        .unwrap()
+        .unwrap();
+    assert!(repaired.generation > second_row.generation);
+    assert!(repaired.centroids.len() > 3);
+    let status = engine.source_index_status(&project.id).await.unwrap();
+    assert!(status.ready);
+    assert!(status.vector_count >= 3);
+    remove_source_embedding_env(env_name);
+}
+
+#[tokio::test]
+async fn source_ann_probe_fallbacks_are_explicit_and_never_error() {
+    let server = source_embedding_success_server().await;
+    let env_name = "VERLINPARK_TEST_SOURCE_ANN_FALLBACKS";
+    set_source_embedding_env(env_name, &server.uri());
+    let (_data, _repo, engine, project) = source_embedding_engine("ann-fallbacks").await;
+    let embedding_policy = source_embedding_policy_for(env_name);
+    engine
+        .set_source_embedding_policy(&project.id, embedding_policy.clone())
+        .await
+        .unwrap();
+    engine
+        .add_source_note(SourceCreateNoteParams {
+            project_id: project.id.clone(),
+            collection: None,
+            title: "Fallback source".into(),
+            content: "Fallbacks are explicit and never fail a search.".into(),
+            labels: Vec::new(),
+        })
+        .await
+        .unwrap();
+    engine.reconcile_source_embeddings().await.unwrap();
+    let model = embedding_policy.model.clone().unwrap();
+    let dimensions = embedding_policy.dimensions;
+    let query = vec![0.5f32; dimensions as usize];
+    let policy = source_retrieval_policy_for(true, 1, 1);
+    engine
+        .set_source_retrieval_policy(&project.id, policy.clone())
+        .await
+        .unwrap();
+
+    // Not built yet: an explicit reason, not an empty ANN result.
+    match crate::source_ann::probe_source_ann(
+        engine.store(),
+        &project.id,
+        &policy,
+        &model,
+        dimensions,
+        embedding_policy.max_chunks_per_source,
+        &[],
+        &[],
+        &[],
+        &query,
+        64,
+    ) {
+        crate::source_ann::SourceAnnProbe::Fallback(fallback) => {
+            assert_eq!(fallback.reason, "not_built");
+        }
+        crate::source_ann::SourceAnnProbe::Ready(_) => panic!("index was not built"),
+    }
+    let rebuild = engine.rebuild_source_index(&project.id).await.unwrap();
+    assert!(rebuild.rebuilt, "rebuild reason: {:?}", rebuild.reason);
+    match crate::source_ann::probe_source_ann(
+        engine.store(),
+        &project.id,
+        &policy,
+        "other-model",
+        dimensions,
+        embedding_policy.max_chunks_per_source,
+        &[],
+        &[],
+        &[],
+        &query,
+        64,
+    ) {
+        crate::source_ann::SourceAnnProbe::Fallback(fallback) => {
+            assert_eq!(fallback.reason, "below_min_vectors");
+        }
+        crate::source_ann::SourceAnnProbe::Ready(_) => panic!("wrong model must not probe"),
+    }
+    match crate::source_ann::probe_source_ann(
+        engine.store(),
+        &project.id,
+        &policy,
+        &model,
+        dimensions + 8,
+        embedding_policy.max_chunks_per_source,
+        &[],
+        &[],
+        &[],
+        &vec![0.5f32; dimensions as usize + 8],
+        64,
+    ) {
+        crate::source_ann::SourceAnnProbe::Fallback(fallback) => {
+            assert_eq!(fallback.reason, "below_min_vectors");
+        }
+        crate::source_ann::SourceAnnProbe::Ready(_) => panic!("wrong dimensions must not probe"),
+    }
+    let mut disabled = policy.clone();
+    disabled.ann_enabled = false;
+    match crate::source_ann::probe_source_ann(
+        engine.store(),
+        &project.id,
+        &disabled,
+        &model,
+        dimensions,
+        embedding_policy.max_chunks_per_source,
+        &[],
+        &[],
+        &[],
+        &query,
+        64,
+    ) {
+        crate::source_ann::SourceAnnProbe::Fallback(fallback) => {
+            assert_eq!(fallback.reason, "ann_disabled");
+        }
+        crate::source_ann::SourceAnnProbe::Ready(_) => panic!("disabled ANN must not probe"),
+    }
+    match crate::source_ann::probe_source_ann(
+        engine.store(),
+        &project.id,
+        &policy,
+        &model,
+        dimensions,
+        embedding_policy.max_chunks_per_source,
+        &[],
+        &[],
+        &[],
+        &[],
+        64,
+    ) {
+        crate::source_ann::SourceAnnProbe::Fallback(fallback) => {
+            assert_eq!(fallback.reason, "query_invalid");
+        }
+        crate::source_ann::SourceAnnProbe::Ready(_) => panic!("invalid query must not probe"),
+    }
+    // A healthy probe still works with every fallback path already exercised.
+    match crate::source_ann::probe_source_ann(
+        engine.store(),
+        &project.id,
+        &policy,
+        &model,
+        dimensions,
+        embedding_policy.max_chunks_per_source,
+        &[],
+        &[],
+        &[],
+        &query,
+        64,
+    ) {
+        crate::source_ann::SourceAnnProbe::Ready(ready) => {
+            assert_eq!(ready.probed_clusters, 1);
+            assert!(!ready.candidates.is_empty());
+            assert!(ready.generation >= 1);
+        }
+        crate::source_ann::SourceAnnProbe::Fallback(fallback) => {
+            panic!("healthy probe fell back: {}", fallback.reason)
+        }
+    }
+    remove_source_embedding_env(env_name);
+}
+
+#[tokio::test]
+async fn source_lexical_expansion_resurfaces_stored_chunks_with_labels() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("expansion".into()),
+        )
+        .await
+        .unwrap();
+    let first = engine
+        .add_source_note(SourceCreateNoteParams {
+            project_id: project.id.clone(),
+            collection: None,
+            title: "Sandbox runtime".into(),
+            content: "Deterministic leases and integration evidence.".into(),
+            labels: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let second = engine
+        .add_source_note(SourceCreateNoteParams {
+            project_id: project.id.clone(),
+            collection: None,
+            title: "Lease notes".into(),
+            content: "The sandbox isolates worktrees and tool output.".into(),
+            labels: Vec::new(),
+        })
+        .await
+        .unwrap();
+    // Expansion is off by default: only the first pass returns a hit.
+    let baseline = engine
+        .search_sources(project.id.clone(), "leases".into(), Vec::new(), Some(5))
+        .await
+        .unwrap();
+    assert_eq!(baseline.expansion, "off");
+    assert!(baseline.expansion_terms.is_empty());
+    assert!(baseline.hits.iter().any(|hit| hit.source_id == first.id));
+    assert!(!baseline.hits.iter().any(|hit| hit.source_id == second.id));
+
+    let policy = vp_protocol::types::SourceRetrievalPolicy {
+        query_expansion: vp_protocol::types::SourceQueryExpansionMode::Lexical,
+        max_expanded_terms: 4,
+        ..vp_protocol::types::SourceRetrievalPolicy::default()
+    };
+    engine
+        .set_source_retrieval_policy(&project.id, policy.clone())
+        .await
+        .unwrap();
+    let expanded = engine
+        .search_sources(project.id.clone(), "leases".into(), Vec::new(), Some(5))
+        .await
+        .unwrap();
+    assert_eq!(expanded.expansion, "lexical");
+    assert!(!expanded.expansion_terms.is_empty());
+    assert!(
+        expanded
+            .expansion_terms
+            .iter()
+            .any(|term| term == "sandbox")
+    );
+    assert!(expanded.hits.iter().any(|hit| hit.source_id == first.id));
+    let second_hit = expanded
+        .hits
+        .iter()
+        .find(|hit| hit.source_id == second.id)
+        .expect("the sandbox term should resurface the second stored chunk");
+    assert!(second_hit.expanded);
+    assert!(
+        second_hit
+            .expansion_terms
+            .iter()
+            .any(|term| term == "sandbox")
+    );
+    assert_eq!(second_hit.source, "lexical");
+    assert!(second_hit.rerank == "deterministic");
+    assert!(second_hit.rerank_score.is_some());
+    // Every returned hit is an existing stored chunk; expansion never invents
+    // a citation or a chunk id outside the store.
+    let page = engine
+        .get_source(second.id.clone(), None, None)
+        .await
+        .unwrap();
+    assert!(
+        page.chunks
+            .iter()
+            .any(|chunk| chunk.id == second_hit.chunk_id)
+    );
+
+    // The expansion plan is bounded by the persisted term cap.
+    let mut tiny = policy.clone();
+    tiny.max_expanded_terms = 1;
+    engine
+        .set_source_retrieval_policy(&project.id, tiny)
+        .await
+        .unwrap();
+    let bounded = engine
+        .search_sources(project.id.clone(), "leases".into(), Vec::new(), Some(5))
+        .await
+        .unwrap();
+    assert!(bounded.expansion_terms.len() <= 1);
+}
+
 #[tokio::test]
 async fn db_rebuild_restores_source_embedding_policy_and_queues_generations() {
     let data = TempDir::new().unwrap();
@@ -12921,6 +13820,18 @@ async fn db_rebuild_restores_source_embedding_policy_and_queues_generations() {
     let policy = source_embedding_policy_for("VERLINPARK_TEST_SOURCE_REBUILD_ENV");
     engine
         .set_source_embedding_policy(&project.id, policy.clone())
+        .await
+        .unwrap();
+    let retrieval_policy = vp_protocol::types::SourceRetrievalPolicy {
+        ann_enabled: true,
+        ann_min_vectors: 32,
+        ann_nprobe: 4,
+        rerank: vp_protocol::types::SourceRerankMode::Off,
+        query_expansion: vp_protocol::types::SourceQueryExpansionMode::Lexical,
+        max_expanded_terms: 3,
+    };
+    engine
+        .set_source_retrieval_policy(&project.id, retrieval_policy.clone())
         .await
         .unwrap();
     let source = engine
@@ -12944,6 +13855,10 @@ async fn db_rebuild_restores_source_embedding_policy_and_queues_generations() {
     assert_eq!(
         store.get_source_embedding_policy(&project.id).unwrap(),
         policy
+    );
+    assert_eq!(
+        store.get_source_retrieval_policy(&project.id).unwrap(),
+        retrieval_policy
     );
     let restored = store.get_source(&source.id).unwrap().expect("source");
     assert_eq!(restored.title, "Rebuild source");
