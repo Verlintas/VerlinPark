@@ -280,8 +280,17 @@ impl Drop for BrowserHelper {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct BrowserSnapshotState {
+    generation: u64,
+    valid: bool,
+    tree: Option<Value>,
+    text: String,
+}
+
 pub struct BrowserManager {
     helpers: Mutex<HashMap<String, Arc<AsyncMutex<BrowserHelper>>>>,
+    snapshots: Mutex<HashMap<String, BrowserSnapshotState>>,
     spawn_lock: AsyncMutex<()>,
     data_dir: PathBuf,
     #[cfg(test)]
@@ -292,6 +301,7 @@ impl BrowserManager {
     pub fn new(data_dir: PathBuf) -> Self {
         Self {
             helpers: Mutex::new(HashMap::new()),
+            snapshots: Mutex::new(HashMap::new()),
             spawn_lock: AsyncMutex::new(()),
             data_dir,
             #[cfg(test)]
@@ -303,9 +313,59 @@ impl BrowserManager {
     fn with_helper(data_dir: PathBuf, helper: PathBuf) -> Self {
         Self {
             helpers: Mutex::new(HashMap::new()),
+            snapshots: Mutex::new(HashMap::new()),
             spawn_lock: AsyncMutex::new(()),
             data_dir,
             helper_override: Some(helper),
+        }
+    }
+
+    fn snapshot_generation(&self, key: &str) -> u64 {
+        self.snapshots
+            .lock()
+            .ok()
+            .and_then(|snapshots| snapshots.get(key).map(|state| state.generation))
+            .unwrap_or(0)
+    }
+
+    fn invalidate_snapshot(&self, key: &str) {
+        if let Ok(mut snapshots) = self.snapshots.lock()
+            && let Some(state) = snapshots.get_mut(key)
+        {
+            state.generation = state.generation.saturating_add(1);
+            state.valid = false;
+            state.tree = None;
+            state.text.clear();
+        }
+    }
+
+    fn next_snapshot(&self, key: &str) -> (u64, Option<(u64, Option<Value>, String)>) {
+        let mut snapshots = self.snapshots.lock().ok();
+        let state = snapshots
+            .as_mut()
+            .map(|map| map.entry(key.to_string()).or_default());
+        let Some(state) = state else {
+            return (0, None);
+        };
+        let previous = state
+            .valid
+            .then(|| (state.generation, state.tree.clone(), state.text.clone()));
+        state.generation = state.generation.saturating_add(1);
+        state.valid = false;
+        (state.generation, previous)
+    }
+
+    fn store_snapshot(&self, key: &str, generation: u64, tree: Option<Value>, text: String) {
+        if let Ok(mut snapshots) = self.snapshots.lock() {
+            snapshots.insert(
+                key.to_string(),
+                BrowserSnapshotState {
+                    generation,
+                    valid: tree.is_some(),
+                    tree,
+                    text,
+                },
+            );
         }
     }
 
@@ -350,6 +410,7 @@ impl BrowserManager {
         }
         let key = helper_key(target);
         if action == "close" {
+            self.invalidate_snapshot(&key);
             let helper = self
                 .helpers
                 .lock()
@@ -394,6 +455,28 @@ impl BrowserManager {
                 ));
             }
         };
+        if matches!(action.as_str(), "click" | "type" | "press" | "select")
+            && let Some(requested) = input.get("snapshot_generation").and_then(Value::as_u64)
+        {
+            let current = self.snapshot_generation(&key);
+            if snapshot_generation_is_stale(requested, current) {
+                return Ok(ToolOutput::error_structured(
+                    format!(
+                        "browser {action} rejected: snapshot generation {requested} is stale; current generation is {current}"
+                    ),
+                    json!({
+                        "code": "STALE_REF",
+                        "action": action,
+                        "retryable": true,
+                        "auto_retry": false,
+                        "fresh_snapshot_required": true,
+                        "snapshot_generation": current,
+                        "provided_generation": requested,
+                        "hint": "take a fresh browser snapshot and use its generation and refs",
+                    }),
+                ));
+            }
+        }
         let ticket = match engine
             .gui_begin_action(
                 GuiSurface::Browser,
@@ -477,6 +560,7 @@ impl BrowserManager {
             }
         };
         if let Some(snapshot) = preempted {
+            self.invalidate_snapshot(&key);
             outcome.latency_ms = started.elapsed().as_millis() as u64;
             outcome.result = "preempted".to_string();
             outcome.error_code = Some("PREEMPTED".to_string());
@@ -506,6 +590,7 @@ impl BrowserManager {
                         let mut helper = helper.lock().await;
                         helper.shutdown().await;
                     }
+                    self.invalidate_snapshot(&key);
                 }
                 outcome.result = "error".to_string();
                 outcome.error_code = Some(code.clone());
@@ -608,6 +693,7 @@ impl BrowserManager {
         if let Some(stale) = stale {
             let mut helper = stale.lock().await;
             helper.shutdown().await;
+            self.invalidate_snapshot(key);
         }
         None
     }
@@ -784,29 +870,78 @@ impl BrowserManager {
                 ))
             }
             "snapshot" => {
+                let key = helper_key(target);
+                let (generation, previous) = self.next_snapshot(&key);
                 let url = result.get("url").and_then(Value::as_str).unwrap_or("");
                 let title = result.get("title").and_then(Value::as_str).unwrap_or("");
-                let mut text = String::new();
-                text.push_str(&format!("{title} ({url})\n"));
-                if let Some(tree) = result.get("tree") {
-                    render_tree(tree, 0, &mut text);
-                }
-                if let Some(body) = result.get("text").and_then(Value::as_str)
-                    && !body.is_empty()
-                {
-                    text.push_str("\nVisible text:\n");
-                    text.push_str(body);
-                }
+                let tree = result.get("tree").cloned();
+                let text = result
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
                 let max_chars = input
                     .get("max_chars")
                     .and_then(Value::as_u64)
                     .unwrap_or(12_000) as usize;
-                let content = truncate(text.chars().take(max_chars.max(500)).collect());
+                let delta_requested = input.get("delta").and_then(Value::as_bool).unwrap_or(true);
+                let delta = if delta_requested {
+                    previous
+                        .as_ref()
+                        .map(|(base_generation, previous_tree, previous_text)| {
+                            snapshot_delta(
+                                *base_generation,
+                                generation,
+                                previous_tree.as_ref(),
+                                previous_text,
+                                &text,
+                                tree.as_ref(),
+                            )
+                        })
+                } else {
+                    None
+                };
+                self.store_snapshot(&key, generation, tree.clone(), text.clone());
+                if let Some(delta) = delta {
+                    let summary = delta_summary(&delta, generation, url, title);
+                    let content =
+                        truncate(summary.chars().take(max_chars.max(500)).collect::<String>());
+                    let mut structured = delta;
+                    structured["ok"] = json!(true);
+                    structured["action"] = json!("snapshot");
+                    structured["url"] = json!(url);
+                    structured["title"] = json!(title);
+                    structured["node_count"] =
+                        result.get("node_count").cloned().unwrap_or(Value::Null);
+                    structured["truncated"] = result
+                        .get("truncated")
+                        .cloned()
+                        .unwrap_or(Value::Bool(false));
+                    return Ok(ToolOutput::ok_structured(content, structured));
+                }
+                let mut text_output = String::new();
+                text_output.push_str(&format!("{title} ({url}) snapshot {generation}\n"));
+                if let Some(tree) = tree.as_ref() {
+                    render_tree(tree, 0, &mut text_output);
+                }
+                if !text.is_empty() {
+                    text_output.push_str("\nVisible text:\n");
+                    text_output.push_str(&text);
+                }
+                let content = truncate(
+                    text_output
+                        .chars()
+                        .take(max_chars.max(500))
+                        .collect::<String>(),
+                );
                 Ok(ToolOutput::ok_structured(
                     content,
                     json!({
                         "ok": true,
                         "action": "snapshot",
+                        "delta": false,
+                        "base_generation": Value::Null,
+                        "generation": generation,
                         "url": url,
                         "title": title,
                         "node_count": result.get("node_count").cloned().unwrap_or(Value::Null),
@@ -995,11 +1130,12 @@ impl BrowserManager {
                 .map(|(key, _)| key.clone())
                 .collect::<Vec<_>>();
             keys.into_iter()
-                .filter_map(|key| map.remove(&key))
+                .filter_map(|key| map.remove(&key).map(|helper| (key, helper)))
                 .collect::<Vec<_>>()
         };
         let mut stopped = 0usize;
-        for helper in stale {
+        for (key, helper) in stale {
+            self.invalidate_snapshot(&key);
             let mut helper = helper.lock().await;
             helper.shutdown().await;
             stopped += 1;
@@ -1021,11 +1157,12 @@ impl BrowserManager {
                 .cloned()
                 .collect::<Vec<_>>();
             keys.into_iter()
-                .filter_map(|key| map.remove(&key))
+                .filter_map(|key| map.remove(&key).map(|helper| (key, helper)))
                 .collect::<Vec<_>>()
         };
         let mut stopped = 0usize;
-        for helper in stale {
+        for (key, helper) in stale {
+            self.invalidate_snapshot(&key);
             let mut helper = helper.lock().await;
             helper.shutdown().await;
             stopped += 1;
@@ -1081,6 +1218,192 @@ fn action_deadline(action: &str, input: &Value) -> Duration {
         return Duration::from_millis(wait).saturating_add(Duration::from_secs(15));
     }
     ACTION_TIMEOUT
+}
+
+fn snapshot_generation_is_stale(requested: u64, current: u64) -> bool {
+    current == 0 || requested != current
+}
+
+fn node_summary(node: &Value) -> Value {
+    json!({
+        "role": node.get("role").cloned().unwrap_or(Value::Null),
+        "name": node.get("name").cloned().unwrap_or(Value::Null),
+        "text": node.get("text").cloned().unwrap_or(Value::Null),
+        "tag": node.get("tag").cloned().unwrap_or(Value::Null),
+        "value": node.get("value").cloned().unwrap_or(Value::Null),
+        "checked": node.get("checked").cloned().unwrap_or(Value::Null),
+        "disabled": node.get("disabled").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn collect_refs(node: &Value, refs: &mut std::collections::BTreeMap<String, Value>) {
+    if let Some(reference) = node
+        .get("ref")
+        .and_then(Value::as_str)
+        .filter(|reference| !reference.is_empty())
+    {
+        refs.insert(reference.to_string(), node_summary(node));
+    }
+    if let Some(children) = node.get("children").and_then(Value::as_array) {
+        for child in children.iter().take(2_000) {
+            collect_refs(child, refs);
+        }
+    }
+}
+
+fn line_delta(previous: &str, current: &str) -> Value {
+    if previous == current {
+        return json!({"changed": false, "removed_lines": [], "added_lines": [], "truncated": false});
+    }
+    let previous_lines = previous
+        .lines()
+        .take(4_000)
+        .map(|line| line.chars().take(400).collect::<String>())
+        .collect::<Vec<_>>();
+    let current_lines = current
+        .lines()
+        .take(4_000)
+        .map(|line| line.chars().take(400).collect::<String>())
+        .collect::<Vec<_>>();
+    let mut prefix = 0usize;
+    while prefix < previous_lines.len()
+        && prefix < current_lines.len()
+        && previous_lines[prefix] == current_lines[prefix]
+    {
+        prefix += 1;
+    }
+    let mut suffix = 0usize;
+    while suffix < previous_lines.len().saturating_sub(prefix)
+        && suffix < current_lines.len().saturating_sub(prefix)
+        && previous_lines[previous_lines.len() - 1 - suffix]
+            == current_lines[current_lines.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    let removed = previous_lines[prefix..previous_lines.len().saturating_sub(suffix)]
+        .iter()
+        .take(100)
+        .cloned()
+        .collect::<Vec<_>>();
+    let added = current_lines[prefix..current_lines.len().saturating_sub(suffix)]
+        .iter()
+        .take(100)
+        .cloned()
+        .collect::<Vec<_>>();
+    let removed_total = previous_lines.len().saturating_sub(prefix + suffix);
+    let added_total = current_lines.len().saturating_sub(prefix + suffix);
+    json!({
+        "changed": true,
+        "prefix_lines": prefix,
+        "suffix_lines": suffix,
+        "removed_lines": removed,
+        "added_lines": added,
+        "truncated": removed_total > 100 || added_total > 100 || previous.lines().count() > 4_000 || current.lines().count() > 4_000,
+    })
+}
+
+fn snapshot_delta(
+    base_generation: u64,
+    generation: u64,
+    previous_tree: Option<&Value>,
+    previous_text: &str,
+    current_text: &str,
+    current_tree: Option<&Value>,
+) -> Value {
+    let mut previous_refs = std::collections::BTreeMap::new();
+    if let Some(tree) = previous_tree {
+        collect_refs(tree, &mut previous_refs);
+    }
+    let mut current_refs = std::collections::BTreeMap::new();
+    if let Some(tree) = current_tree {
+        collect_refs(tree, &mut current_refs);
+    }
+    let new_refs = current_refs
+        .keys()
+        .filter(|reference| !previous_refs.contains_key(*reference))
+        .take(200)
+        .cloned()
+        .collect::<Vec<_>>();
+    let removed_refs = previous_refs
+        .keys()
+        .filter(|reference| !current_refs.contains_key(*reference))
+        .take(200)
+        .cloned()
+        .collect::<Vec<_>>();
+    let changed_refs = current_refs
+        .iter()
+        .filter(|(reference, summary)| {
+            previous_refs
+                .get(*reference)
+                .is_some_and(|previous| previous != *summary)
+        })
+        .map(|(reference, _)| reference.clone())
+        .take(200)
+        .collect::<Vec<_>>();
+    json!({
+        "delta": true,
+        "generation": generation,
+        "base_generation": base_generation,
+        "new_refs": new_refs,
+        "removed_refs": removed_refs,
+        "changed_refs": changed_refs,
+        "refs_truncated": previous_refs.len().saturating_add(current_refs.len()) > 400,
+        "text_delta": line_delta(previous_text, current_text),
+    })
+}
+
+fn delta_summary(delta: &Value, generation: u64, url: &str, title: &str) -> String {
+    let mut text = format!("{title} ({url}) snapshot {generation} (delta)\n");
+    for (label, key) in [
+        ("New refs", "new_refs"),
+        ("Removed refs", "removed_refs"),
+        ("Changed refs", "changed_refs"),
+    ] {
+        let values = delta
+            .get(key)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if !values.is_empty() {
+            text.push_str(label);
+            text.push_str(": ");
+            text.push_str(
+                &values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .take(20)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            text.push('\n');
+        }
+    }
+    if let Some(text_delta) = delta.get("text_delta") {
+        let removed = text_delta
+            .get("removed_lines")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let added = text_delta
+            .get("added_lines")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if !removed.is_empty() || !added.is_empty() {
+            text.push_str("Text changes:\n");
+            for line in removed.iter().filter_map(Value::as_str).take(20) {
+                text.push_str("- ");
+                text.push_str(line);
+                text.push('\n');
+            }
+            for line in added.iter().filter_map(Value::as_str).take(20) {
+                text.push_str("+ ");
+                text.push_str(line);
+                text.push('\n');
+            }
+        }
+    }
+    text
 }
 
 fn render_tree(node: &Value, depth: usize, output: &mut String) {
@@ -1553,6 +1876,125 @@ done
     }
 
     #[tokio::test]
+    async fn browser_snapshot_delta_and_generation_stale_ref_are_runtime_checked() {
+        if !Path::new(SANDBOX_EXEC).is_file() {
+            eprintln!("skipping: sandbox-exec is not available");
+            return;
+        }
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let browser_path = data.path().join("fake-delta-browser-helper.sh");
+        write_script(
+            &browser_path,
+            r#"#!/bin/sh
+count=0
+printf '{"event":"ready","version":"1","pid":%s}\n' "$$"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"action":"snapshot"'*)
+      count=$((count+1))
+      if [ "$count" = "1" ]; then
+        printf '{"id":"%s","ok":true,"result":{"url":"file:///tmp/index.html","title":"Fake","tree":{"ref":"e1","role":"link","name":"Home","children":[]},"text":"Home","node_count":1,"truncated":false}}\n' "$id"
+      else
+        printf '{"id":"%s","ok":true,"result":{"url":"file:///tmp/index.html","title":"Fake","tree":{"ref":"e1","role":"link","name":"Home page","children":[{"ref":"e2","role":"button","name":"Save","children":[]}]},"text":"Home page","node_count":2,"truncated":false}}\n' "$id"
+      fi
+      ;;
+    *'"action":"click"'*)
+      printf '{"id":"%s","ok":true,"result":{"name":"Home","clicked":true}}\n' "$id"
+      ;;
+    *'"action":"close"'*)
+      printf '{"id":"%s","ok":true,"result":{"closed":true}}\n' "$id"
+      exit 0
+      ;;
+    *)
+      printf '{"id":"%s","ok":true,"result":{}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+        );
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("browser delta".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id, "delta".into(), None)
+            .await
+            .unwrap();
+        let worktree = PathBuf::from(session.worktree.clone().unwrap());
+        let manager = BrowserManager::with_helper(data.path().to_path_buf(), browser_path);
+        let target = BrowserTarget {
+            session_id: &session.id,
+            worktree: &worktree,
+            agent_id: "agent",
+            agent_name: "Agent",
+        };
+        let first = manager
+            .action(&engine, &target, json!({"action": "snapshot"}))
+            .await
+            .unwrap();
+        assert!(!first.is_error, "{}", first.content);
+        let first_structured = first.structured.as_ref().unwrap();
+        assert_eq!(first_structured["delta"], false);
+        assert_eq!(first_structured["generation"], 1);
+        let second = manager
+            .action(&engine, &target, json!({"action": "snapshot"}))
+            .await
+            .unwrap();
+        assert!(!second.is_error, "{}", second.content);
+        let second_structured = second.structured.as_ref().unwrap();
+        assert_eq!(second_structured["delta"], true);
+        assert_eq!(second_structured["generation"], 2);
+        assert_eq!(second_structured["base_generation"], 1);
+        assert!(
+            second_structured["new_refs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "e2")
+        );
+        assert!(
+            second_structured["changed_refs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "e1")
+        );
+        assert_eq!(second_structured["text_delta"]["changed"], true);
+        assert!(second_structured.get("tree").is_none());
+        let stale = manager
+            .action(
+                &engine,
+                &target,
+                json!({"action": "click", "ref": "e1", "snapshot_generation": 1}),
+            )
+            .await
+            .unwrap();
+        assert!(stale.is_error);
+        assert_eq!(stale.structured.as_ref().unwrap()["code"], "STALE_REF");
+        assert_eq!(stale.structured.as_ref().unwrap()["snapshot_generation"], 2);
+        let fresh = manager
+            .action(
+                &engine,
+                &target,
+                json!({"action": "click", "ref": "e1", "snapshot_generation": 2}),
+            )
+            .await
+            .unwrap();
+        assert!(!fresh.is_error, "{}", fresh.content);
+        manager
+            .action(&engine, &target, json!({"action": "close"}))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn browser_and_computer_contend_for_one_gui_lease() {
         if !Path::new(SANDBOX_EXEC).is_file() {
             eprintln!("skipping: sandbox-exec is not available");
@@ -1789,5 +2231,60 @@ done
             engine.list_computer_leases().await.unwrap().is_empty(),
             "a preempted browser action must release the GUI lease"
         );
+    }
+
+    #[test]
+    fn delta_reports_new_removed_changed_refs_and_text_delta() {
+        let previous = json!({
+            "ref": "e1", "role": "root", "name": "Root",
+            "children": [
+                {"ref": "e2", "role": "link", "name": "Home", "text": "Home", "children": []},
+                {"ref": "e3", "role": "button", "name": "Save", "children": []}
+            ]
+        });
+        let current = json!({
+            "ref": "e1", "role": "root", "name": "Root",
+            "children": [
+                {"ref": "e2", "role": "link", "name": "Home page", "text": "Home page", "children": []},
+                {"ref": "e4", "role": "button", "name": "Cancel", "children": []}
+            ]
+        });
+        let delta = snapshot_delta(
+            1,
+            2,
+            Some(&previous),
+            "Home\nSave",
+            "Home page\nCancel",
+            Some(&current),
+        );
+        assert_eq!(delta["delta"], true);
+        assert_eq!(delta["base_generation"], 1);
+        assert_eq!(delta["generation"], 2);
+        assert_eq!(delta["new_refs"], json!(["e4"]));
+        assert_eq!(delta["removed_refs"], json!(["e3"]));
+        assert_eq!(delta["changed_refs"], json!(["e2"]));
+        assert_eq!(delta["text_delta"]["changed"], true);
+        assert!(
+            delta["text_delta"]["removed_lines"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|line| line == "Save")
+        );
+        assert!(
+            delta["text_delta"]["added_lines"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|line| line == "Cancel")
+        );
+        assert_eq!(line_delta("same", "same")["changed"], false);
+    }
+
+    #[test]
+    fn snapshot_generation_staleness_is_explicit() {
+        assert!(snapshot_generation_is_stale(1, 0));
+        assert!(snapshot_generation_is_stale(1, 2));
+        assert!(!snapshot_generation_is_stale(2, 2));
     }
 }

@@ -13055,6 +13055,88 @@ async fn tool_activity_projection_caps_names_hints_and_counts() {
 }
 
 #[tokio::test]
+async fn tool_search_promotes_out_of_bundle_schema_at_the_next_turn() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "search_promote".into(),
+                    name: "tool_search".into(),
+                    arguments: serde_json::json!({
+                        "query": "browser",
+                        "promote": true
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![StreamEvent::TextDelta("promoted".into()), StreamEvent::Done],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "promote a tool".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service.start(&session.id, "promote a tool").await.unwrap();
+    let settled = wait_until_idle(&engine, &session).await;
+    assert_eq!(settled.status, "idle");
+    let events = engine
+        .list_events(session.id.clone(), 0, 400)
+        .await
+        .unwrap();
+    let revision = events
+        .iter()
+        .find(|event| event.kind == "bundle.revision")
+        .expect("bundle revision");
+    assert_eq!(revision.payload["applied"], true);
+    assert!(
+        revision.payload["added_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool == "browser")
+    );
+    assert_eq!(
+        revision.payload["cache_epoch_change_reason"],
+        "tools_changed"
+    );
+    assert!(
+        revision.payload["estimated_lost_cache_read_usd"]
+            .as_f64()
+            .is_some()
+    );
+    let prefixes = events
+        .iter()
+        .filter(|event| event.kind == "context.prompt_prefix")
+        .collect::<Vec<_>>();
+    assert!(prefixes.len() >= 2, "promotion must publish a new prefix");
+    let latest = prefixes.last().unwrap();
+    assert_eq!(latest.payload["bundle_revision"], 1);
+    assert_eq!(latest.payload["tool_bundle_frozen"], false);
+    assert_eq!(latest.payload["cache_epoch_change_reason"], "tools_changed");
+    let search = events
+        .iter()
+        .find(|event| {
+            event.kind == "tool.finished" && event.payload["tool_call_id"] == "search_promote"
+        })
+        .expect("search result");
+    assert_eq!(search.payload["structured"]["promotion"]["requested"], true);
+    assert!(
+        search.payload["structured"]["promotion"]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool == "browser")
+    );
+}
+
+#[tokio::test]
 async fn exposes_runtime_budget_search_and_artifact_tools() {
     let dir = TempDir::new().unwrap();
     let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
@@ -13133,6 +13215,19 @@ async fn exposes_runtime_budget_search_and_artifact_tools() {
         .expect("read_file search result");
     assert_eq!(read_file["in_bundle"], true);
     assert_eq!(read_file["category"], "files");
+    assert!(
+        search.payload["structured"]["set"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|name| name == "read_file")
+    );
+    assert!(
+        search.payload["structured"]["completeness_estimate"]
+            .as_f64()
+            .is_some_and(|estimate| (0.0..=1.0).contains(&estimate))
+    );
+    assert!(search.payload["structured"]["missing"].is_array());
     let browser_search = events
         .iter()
         .find(|event| {

@@ -16045,9 +16045,9 @@ async fn run_loop_body(
     let dynamic_mcp_tools =
         collect_dynamic_mcp_tools(engine, spec.role, &project.id, Some(&session.id)).await;
     let frozen_bundle = frozen_tool_bundle(config, spec, &dynamic_mcp_tools);
-    let tools = frozen_bundle.tools.clone();
+    let mut tools = frozen_bundle.tools.clone();
     let system_tokens = estimate_context_tokens(&system);
-    let tool_tokens = serde_json::to_string(&tools)
+    let mut tool_tokens = serde_json::to_string(&tools)
         .map(|schema| estimate_context_tokens(&schema))
         .unwrap_or(0);
     let compaction_policy = context_compaction_policy(config, spec.role);
@@ -16063,8 +16063,8 @@ async fn run_loop_body(
         ));
     }
     let model_name = model_for(config, spec.role);
-    let prompt_hashes = sections.hashes(&model_name, &tools);
-    let prefix_hash = prompt_hashes.prefix_hash.clone();
+    let mut prompt_hashes = sections.hashes(&model_name, &tools);
+    let mut prefix_hash = prompt_hashes.prefix_hash.clone();
     let contract_section = prompt_hashes
         .head_sections
         .iter()
@@ -16080,7 +16080,7 @@ async fn run_loop_body(
         .get_cache_policy(&project.id)
         .await
         .unwrap_or_default();
-    let cache_plan = crate::prompt_cache::request_cache_plan(
+    let mut cache_plan = crate::prompt_cache::request_cache_plan(
         &config.provider_name,
         &sections,
         tools.len(),
@@ -16088,12 +16088,13 @@ async fn run_loop_body(
         &cache_policy,
         spec.role.as_str(),
     );
-    let cache_config = crate::prompt_cache::prompt_cache_config(&cache_policy, spec.role.as_str());
+    let mut cache_config =
+        crate::prompt_cache::prompt_cache_config(&cache_policy, spec.role.as_str());
     let provider_capabilities = config.provider.cache_capabilities();
     // L4 finalizes the shareable epoch. It commits to the model, canonical
     // tool hash, and ordered core/project section hashes. Session context, run
     // task, prompt, memory, and tail bytes are deliberately excluded.
-    let prompt_epoch = crate::cache_epoch::CacheEpoch::from_hashes(&model_name, &prompt_hashes);
+    let mut prompt_epoch = crate::cache_epoch::CacheEpoch::from_hashes(&model_name, &prompt_hashes);
     let previous_prefix_event = engine
         .recent_events_of_kind(&session.id, "context.prompt_prefix", 1)
         .await?
@@ -16106,7 +16107,7 @@ async fn run_loop_body(
         previous_epoch.as_ref().map(|epoch| &epoch.identity),
         &prompt_epoch.identity,
     );
-    let epoch_reuse = engine
+    let mut epoch_reuse = engine
         .cache_epoch_reuse(&project.id, &prompt_epoch.hash, &session.id)
         .await?;
     let identity_section_count = prompt_hashes.identity_sections.len();
@@ -16200,6 +16201,7 @@ async fn run_loop_body(
             object.insert(key, value);
         }
     }
+    let base_prefix_payload = prefix_payload.clone();
     emit(
         engine,
         &session.id,
@@ -16357,6 +16359,10 @@ async fn run_loop_body(
     // session; later calls would double-count the conversation prefix this
     // session itself created.
     let mut epoch_observed_calls = epoch_reuse.session_calls;
+    let mut pending_promotions: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    let mut tool_bundle_revision = 0u32;
+    let mut active_bundle_hash = frozen_bundle.bundle_hash.clone();
 
     for turn in 0..config.max_turns {
         // A long plan can outlive the assignment/workspace lease taken when
@@ -16428,6 +16434,232 @@ async fn run_loop_body(
                 }),
             )
             .await?;
+        }
+        // C8 schema promotion is applied only at a turn boundary. The current
+        // provider request still used the frozen bundle that produced the
+        // tool_search result; the next request sees the new schema set.
+        if !pending_promotions.is_empty() {
+            let candidates = std::mem::take(&mut pending_promotions);
+            let available = tool_schemas(config, spec.role, spec.profile, spec.allow_delegation);
+            let mut added = Vec::new();
+            for name in candidates {
+                if tools.iter().any(|tool| tool.name == name) {
+                    continue;
+                }
+                if let Some(schema) = available.iter().find(|tool| tool.name == name) {
+                    added.push(schema.clone());
+                }
+            }
+            if !added.is_empty() {
+                let old_tools_hash = prompt_hashes.tools_hash.clone();
+                let old_epoch = prompt_epoch.hash.clone();
+                let old_tool_tokens = tool_tokens;
+                let prices = role_prices(config, spec.role);
+                let added_names = added
+                    .iter()
+                    .map(|tool| tool.name.clone())
+                    .collect::<Vec<_>>();
+                let mut candidate_tools = tools.clone();
+                candidate_tools.extend(added);
+                candidate_tools.sort_by(|left, right| left.name.cmp(&right.name));
+                candidate_tools.dedup_by(|left, right| left.name == right.name);
+                let candidate_tool_tokens = serde_json::to_string(&candidate_tools)
+                    .map(|schema| estimate_context_tokens(&schema))
+                    .unwrap_or(0);
+                if context_hard_limit != u64::MAX
+                    && system_tokens.saturating_add(candidate_tool_tokens) > context_hard_limit
+                {
+                    if let Err(error) = emit(
+                        engine,
+                        &session.id,
+                        spec,
+                        "bundle.revision",
+                        serde_json::json!({
+                            "bundle": frozen_bundle.selection.kind.as_str(),
+                            "revision": tool_bundle_revision,
+                            "applied": false,
+                            "reason": "context_limit",
+                            "added_tools": added_names,
+                            "tool_count": tools.len(),
+                            "tool_tokens": candidate_tool_tokens,
+                            "hard_limit": context_hard_limit,
+                            "estimated": true,
+                        }),
+                    )
+                    .await
+                    {
+                        tracing::warn!(%error, "could not persist rejected bundle revision");
+                    }
+                } else {
+                    tools = candidate_tools;
+                    tool_tokens = candidate_tool_tokens;
+                    prompt_hashes = sections.hashes(&model_name, &tools);
+                    prefix_hash = prompt_hashes.prefix_hash.clone();
+                    cache_plan = crate::prompt_cache::request_cache_plan(
+                        &config.provider_name,
+                        &sections,
+                        tools.len(),
+                        conversation.len(),
+                        &cache_policy,
+                        spec.role.as_str(),
+                    );
+                    cache_config =
+                        crate::prompt_cache::prompt_cache_config(&cache_policy, spec.role.as_str());
+                    prompt_epoch =
+                        crate::cache_epoch::CacheEpoch::from_hashes(&model_name, &prompt_hashes);
+                    epoch_reuse = engine
+                        .cache_epoch_reuse(&project.id, &prompt_epoch.hash, &session.id)
+                        .await?;
+                    epoch_observed_calls = epoch_reuse.session_calls;
+                    tool_bundle_revision = tool_bundle_revision.saturating_add(1);
+                    active_bundle_hash = crate::tool_bundle::canonical_tools_hash(&tools);
+                    let schema_tokens_added = tool_tokens.saturating_sub(old_tool_tokens);
+                    let lost_cache_read_usd = crate::prompt_cache::round_usd(
+                        (schema_tokens_added as f64 / 1_000_000.0) * prices.cache_read,
+                    );
+                    if let Err(error) = emit(
+                        engine,
+                        &session.id,
+                        spec,
+                        "bundle.revision",
+                        serde_json::json!({
+                            "bundle": frozen_bundle.selection.kind.as_str(),
+                            "revision": tool_bundle_revision,
+                            "applied": true,
+                            "previous_tools_hash": old_tools_hash,
+                            "tools_hash": prompt_hashes.tools_hash,
+                            "previous_cache_epoch": old_epoch,
+                            "cache_epoch": prompt_epoch.hash,
+                            "cache_epoch_changed": true,
+                            "cache_epoch_change_reason": "tools_changed",
+                            "added_tools": added_names,
+                            "removed_tools": [],
+                            "tool_count": tools.len(),
+                            "target_limit": frozen_bundle.target_limit,
+                            "over_target": frozen_bundle.target_limit.is_some_and(|limit| tools.len() > limit),
+                            "previous_tool_tokens": old_tool_tokens,
+                            "tool_tokens": tool_tokens,
+                            "schema_tokens_added": schema_tokens_added,
+                            "estimated_cache_invalidation_tokens": tool_tokens.max(old_tool_tokens),
+                            "cache_read_price_per_million": prices.cache_read,
+                            "estimated_lost_cache_read_usd": lost_cache_read_usd,
+                            "estimated": true,
+                        }),
+                    )
+                    .await
+                    {
+                        tracing::warn!(%error, "could not persist bundle revision");
+                    }
+                    let mut promoted_prefix = base_prefix_payload.clone();
+                    if let Some(object) = promoted_prefix.as_object_mut() {
+                        object.insert("prefix_hash".into(), serde_json::json!(prefix_hash));
+                        object.insert("cache_generation".into(), serde_json::json!(prefix_hash));
+                        object.insert(
+                            "tools_hash".into(),
+                            serde_json::json!(prompt_hashes.tools_hash),
+                        );
+                        object.insert(
+                            "tool_bundle_hash".into(),
+                            serde_json::json!(active_bundle_hash),
+                        );
+                        object.insert(
+                            "bundle_revision".into(),
+                            serde_json::json!(tool_bundle_revision),
+                        );
+                        object.insert("tool_bundle_frozen".into(), serde_json::json!(false));
+                        object.insert("tool_count".into(), serde_json::json!(tools.len()));
+                        object.insert(
+                            "tool_bundle_tool_count".into(),
+                            serde_json::json!(tools.len()),
+                        );
+                        object.insert(
+                            "tool_bundle_total_tool_count".into(),
+                            serde_json::json!(tools.len()),
+                        );
+                        object.insert(
+                            "cache_epoch_change_reason".into(),
+                            serde_json::json!("tools_changed"),
+                        );
+                        object.insert("cache_epoch_changed".into(), serde_json::json!(true));
+                        object.insert("cache_epoch_previous".into(), serde_json::json!(old_epoch));
+                        object.insert("cache_epoch_source".into(), serde_json::json!("l4"));
+                        object.insert("cache_epoch_placeholder".into(), serde_json::json!(false));
+                        object.insert(
+                            "cache_epoch_reused_from_sessions".into(),
+                            serde_json::json!(epoch_reuse.prior_sessions),
+                        );
+                        object.insert(
+                            "cache_epoch_session_seen_before".into(),
+                            serde_json::json!(!epoch_reuse.first_session_call),
+                        );
+                        object.insert(
+                            "cache_epoch_session_calls".into(),
+                            serde_json::json!(epoch_reuse.session_calls),
+                        );
+                        object.insert(
+                            "stable_prefix_hash".into(),
+                            serde_json::json!(prompt_hashes.stable_prefix_hash),
+                        );
+                        object.insert(
+                            "stable_system_hash".into(),
+                            serde_json::json!(prompt_hashes.stable_system_hash),
+                        );
+                        object.insert(
+                            "core_hash".into(),
+                            serde_json::json!(prompt_hashes.core_hash),
+                        );
+                        object.insert(
+                            "project_hash".into(),
+                            serde_json::json!(prompt_hashes.project_hash),
+                        );
+                        object.insert(
+                            "volatile_hash".into(),
+                            serde_json::json!(prompt_hashes.volatile_hash),
+                        );
+                        object.insert(
+                            "head_sections".into(),
+                            serde_json::json!(prompt_hashes.head_sections),
+                        );
+                        object.insert(
+                            "tail_sections".into(),
+                            serde_json::json!(prompt_hashes.tail_sections),
+                        );
+                        object.insert(
+                            "section_chars".into(),
+                            serde_json::json!(prompt_hashes.section_chars),
+                        );
+                        object.insert("cache_plan".into(), cache_plan.payload());
+                        object.insert(
+                            "system_tokens_estimate".into(),
+                            serde_json::json!(system_tokens),
+                        );
+                        object.insert(
+                            "tool_tokens_estimate".into(),
+                            serde_json::json!(tool_tokens),
+                        );
+                        object.insert(
+                            "preamble_tokens_estimate".into(),
+                            serde_json::json!(system_tokens.saturating_add(tool_tokens)),
+                        );
+                    }
+                    for (key, value) in prompt_epoch.payload_fields() {
+                        if let Some(object) = promoted_prefix.as_object_mut() {
+                            object.insert(key, value);
+                        }
+                    }
+                    if let Err(error) = emit(
+                        engine,
+                        &session.id,
+                        spec,
+                        "context.prompt_prefix",
+                        promoted_prefix,
+                    )
+                    .await
+                    {
+                        tracing::warn!(%error, "could not persist promoted prompt prefix");
+                    }
+                }
+            }
         }
         {
             let compaction_before = crate::run_journal::journal_cursors(engine, &session.id)
@@ -16906,8 +17138,9 @@ async fn run_loop_body(
                     "project_hash": prompt_hashes.project_hash,
                     "tools_hash": prompt_hashes.tools_hash,
                     "tool_bundle": frozen_bundle.selection.kind.as_str(),
-                    "tool_bundle_hash": frozen_bundle.bundle_hash,
-                    "tool_bundle_tool_count": frozen_bundle.builtin_count(),
+                    "tool_bundle_hash": active_bundle_hash,
+                    "bundle_revision": tool_bundle_revision,
+                    "tool_bundle_tool_count": tools.len(),
                     "tool_bundle_mcp_count": frozen_bundle.mcp_count(),
                     "volatile_hash": prompt_hashes.volatile_hash,
                     "prompt_prefix_hash": prefix_hash,
@@ -18344,7 +18577,7 @@ async fn run_loop_body(
                     }),
                 )
                 .await?;
-                match run_tool_search(
+                let output = match run_tool_search(
                     config,
                     engine,
                     spec,
@@ -18356,7 +18589,25 @@ async fn run_loop_body(
                 {
                     Ok(output) => output,
                     Err(error) => ToolOutput::error(format!("tool search error: {error}")),
+                };
+                if let Some(candidates) = output
+                    .structured
+                    .as_ref()
+                    .and_then(|value| value.get("promotion"))
+                    .filter(|promotion| {
+                        promotion
+                            .get("requested")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                    })
+                    .and_then(|promotion| promotion.get("candidates"))
+                    .and_then(Value::as_array)
+                {
+                    for candidate in candidates.iter().filter_map(Value::as_str) {
+                        pending_promotions.insert(candidate.to_string());
+                    }
                 }
+                output
             } else if is_artifact_file {
                 emit(
                     engine,
@@ -20510,6 +20761,11 @@ async fn run_tool_search(
     frozen_bundle: &crate::tool_bundle::FrozenToolBundle,
     input: Value,
 ) -> Result<ToolOutput> {
+    use crate::tooling::search::{
+        MissingPrerequisite, SearchDocument, completeness_estimate, prerequisite_closure,
+        rank_documents,
+    };
+
     let query = input
         .get("query")
         .and_then(Value::as_str)
@@ -20525,42 +20781,68 @@ async fn run_tool_search(
         .get("include_schema")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let mut results = Vec::new();
-    // Search the full role-allowed surface, not only the frozen advertisement.
-    // That is the documented recovery path when a named bundle is too small:
-    // an out-of-bundle result is marked `in_bundle=false` and can still be
-    // called because role policy remains the authorization gate.
+    let promote = input
+        .get("promote")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let requested_task_kind = input
+        .get("task_kind")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| spec.task_kind.clone());
     let advertised = frozen_bundle
         .tools
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<std::collections::HashSet<_>>();
-    for tool in tool_schemas(config, spec.role, spec.profile, spec.allow_delegation)
+
+    struct SearchEntry {
+        key: String,
+        name: String,
+        description: String,
+        task_kind: String,
+        category: String,
+        kind: &'static str,
+        callable: bool,
+        in_bundle: bool,
+        pinned: bool,
+        server_id: Option<String>,
+        server_name: Option<String>,
+        tool_name: Option<String>,
+        trust: Option<String>,
+        schema: Option<Value>,
+    }
+
+    let builtin_schemas = tool_schemas(config, spec.role, spec.profile, spec.allow_delegation)
         .into_iter()
         .filter(|tool| tool.name != "tool_search")
-    {
-        let score = tool_match_score(&tool.name, &tool.description, &query);
-        if score <= 0.0 {
-            continue;
-        }
-        let category = crate::tool_bundle::catalog_entry(&tool.name)
-            .map(|entry| entry.category.as_str())
-            .unwrap_or("unbundled");
-        let mut value = json!({
-            "name": tool.name,
-            "kind": "builtin",
-            "description": tool.description.chars().take(400).collect::<String>(),
-            "callable": true,
-            "in_bundle": advertised.contains(tool.name.as_str()),
-            "bundle": frozen_bundle.selection.kind.as_str(),
-            "category": category,
-            "score": score,
-        });
-        if include_schema {
-            value["parameters_preview"] = json!(bounded_schema(&tool.parameters));
-        }
-        results.push(value);
-    }
+        .collect::<Vec<_>>();
+    let available_builtins = builtin_schemas
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut entries = builtin_schemas
+        .iter()
+        .map(|tool| SearchEntry {
+            key: format!("builtin:{}", tool.name),
+            name: tool.name.clone(),
+            description: tool.description.chars().take(4_000).collect(),
+            task_kind: spec.task_kind.clone().unwrap_or_default(),
+            category: crate::tool_bundle::catalog_entry(&tool.name)
+                .map(|entry| entry.category.as_str().to_string())
+                .unwrap_or_else(|| "unbundled".to_string()),
+            kind: "builtin",
+            callable: true,
+            in_bundle: advertised.contains(tool.name.as_str()),
+            pinned: true,
+            server_id: None,
+            server_name: None,
+            tool_name: None,
+            trust: None,
+            schema: Some(tool.parameters.clone()),
+        })
+        .collect::<Vec<_>>();
+
     let mcp_callable = matches!(
         spec.role,
         AgentRole::Leader | AgentRole::Worker | AgentRole::Labour
@@ -20584,10 +20866,6 @@ async fn run_tool_search(
         let server_has_pins = pin_map.keys().any(|(server_id, _)| *server_id == server.id);
         for tool in tools.tools.into_iter().take(100) {
             let exposed = dynamic_mcp_tool_name(&server.name, &tool.name);
-            let score = tool_match_score(&exposed, &tool.description, &query);
-            if score <= 0.0 {
-                continue;
-            }
             let pin = pin_map.get(&(server.id.clone(), tool.name.clone()));
             let trust = match pin {
                 Some(pin) if crate::mcp_pins::pin_is_callable(pin) => pin.trust(),
@@ -20597,41 +20875,218 @@ async fn run_tool_search(
                 None => "unverified",
             };
             let pinned = pin.is_none_or(crate::mcp_pins::pin_is_callable);
-            let mut value = json!({
-                "name": exposed,
-                "kind": "mcp",
-                "server_id": server.id,
-                "server_name": server.name,
-                "tool_name": tool.name,
-                "description": tool.description.chars().take(400).collect::<String>(),
-                "callable": mcp_callable && pinned,
-                "trust": trust,
-                "pinned": pinned,
-                "in_bundle": advertised.contains(exposed.as_str()),
-                "bundle": frozen_bundle.selection.kind.as_str(),
-                "category": "mcp",
-                "score": score,
+            entries.push(SearchEntry {
+                key: format!("mcp:{}:{}", server.id, tool.name),
+                name: exposed.clone(),
+                description: tool.description.chars().take(4_000).collect(),
+                task_kind: String::new(),
+                category: "mcp".to_string(),
+                kind: "mcp",
+                callable: mcp_callable && pinned,
+                in_bundle: advertised.contains(exposed.as_str()),
+                pinned,
+                server_id: Some(server.id.clone()),
+                server_name: Some(server.name.clone()),
+                tool_name: Some(tool.name.clone()),
+                trust: Some(trust.to_string()),
+                schema: Some(tool.input_schema.clone()),
             });
-            if include_schema {
-                value["parameters_preview"] = json!(bounded_schema(&tool.input_schema));
-            }
-            results.push(value);
         }
+    }
+
+    let documents = entries
+        .iter()
+        .map(|entry| SearchDocument {
+            key: &entry.key,
+            name: &entry.name,
+            description: &entry.description,
+            task_kind: &entry.task_kind,
+            category: &entry.category,
+        })
+        .collect::<Vec<_>>();
+    let ranked = rank_documents(&documents, &query, requested_task_kind.as_deref(), 100);
+    let ranked_truncated = ranked.len() > limit;
+    let selected_keys = ranked
+        .iter()
+        .take(limit)
+        .map(|hit| hit.key.clone())
+        .collect::<Vec<_>>();
+    let omitted_hits = ranked
+        .iter()
+        .skip(limit)
+        .filter_map(|hit| entries.iter().find(|entry| entry.key == hit.key))
+        .map(|entry| entry.name.clone())
+        .collect::<Vec<_>>();
+    let selected_builtin_names = selected_keys
+        .iter()
+        .filter_map(|key| {
+            entries
+                .iter()
+                .find(|entry| &entry.key == key && entry.kind == "builtin")
+                .map(|entry| entry.name.clone())
+        })
+        .collect::<Vec<_>>();
+    let closure = prerequisite_closure(
+        &selected_builtin_names,
+        &available_builtins,
+        crate::tooling::search::MAX_PREREQUISITE_ADDITIONS,
+    );
+    let mut selected = selected_keys
+        .iter()
+        .filter_map(|key| entries.iter().position(|entry| &entry.key == key))
+        .collect::<Vec<_>>();
+    let mut prerequisite_names = std::collections::BTreeSet::new();
+    for addition in &closure.additions {
+        if let Some(index) = entries
+            .iter()
+            .position(|entry| entry.name == addition.name && entry.kind == "builtin")
+        {
+            prerequisite_names.insert(entries[index].name.clone());
+            if !selected.contains(&index) {
+                selected.push(index);
+            }
+        }
+    }
+    // MCP calls require the generic `mcp` bridge. Include it in the returned
+    // set when available, or report it missing; the MCP tool itself is not
+    // promoted as a builtin schema.
+    let selected_mcp = selected.iter().any(|index| entries[*index].kind == "mcp");
+    if selected_mcp
+        && let Some(index) = entries
+            .iter()
+            .position(|entry| entry.name == "mcp" && entry.kind == "builtin")
+    {
+        prerequisite_names.insert(entries[index].name.clone());
+        if !selected.contains(&index) {
+            selected.push(index);
+        }
+    }
+    let promoted_candidates = if promote {
+        selected
+            .iter()
+            .filter_map(|index| {
+                let entry = &entries[*index];
+                (entry.kind == "builtin" && entry.callable && !entry.in_bundle)
+                    .then(|| entry.name.clone())
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let mut missing = closure.missing;
+    if selected_mcp && !available_builtins.contains("mcp") {
+        missing.push(MissingPrerequisite {
+            name: "mcp".to_string(),
+            reason: "not_available_for_role".to_string(),
+            required_by: selected
+                .iter()
+                .filter(|index| entries[**index].kind == "mcp")
+                .map(|index| entries[*index].name.clone())
+                .take(8)
+                .collect(),
+        });
+    }
+    for index in selected
+        .iter()
+        .filter(|index| entries[**index].kind == "mcp")
+    {
+        let entry = &entries[*index];
+        if !entry.callable {
+            missing.push(MissingPrerequisite {
+                name: entry.name.clone(),
+                reason: "mcp_pin_untrusted".to_string(),
+                required_by: vec![entry.name.clone()],
+            });
+        }
+    }
+    for name in omitted_hits {
+        if missing.iter().any(|entry| entry.name == name) {
+            continue;
+        }
+        missing.push(MissingPrerequisite {
+            name,
+            reason: "result_limit".to_string(),
+            required_by: vec!["query".to_string()],
+        });
+    }
+    if ranked_truncated && ranked.len() >= 100 {
+        missing.push(MissingPrerequisite {
+            name: "search_result_cap".to_string(),
+            reason: "result_cap".to_string(),
+            required_by: vec!["query".to_string()],
+        });
+    }
+    missing.sort_by(|left, right| left.name.cmp(&right.name));
+    missing.dedup_by(|left, right| left.name == right.name);
+    missing.truncate(crate::tooling::search::MAX_MISSING_PREREQUISITES);
+
+    let hit_scores = ranked
+        .iter()
+        .map(|hit| (hit.key.clone(), hit.score))
+        .collect::<HashMap<_, _>>();
+    let mut results = Vec::new();
+    for index in selected {
+        let entry = &entries[index];
+        let prerequisite = prerequisite_names.contains(&entry.name);
+        let mut value = json!({
+            "name": entry.name,
+            "kind": entry.kind,
+            "description": entry.description.chars().take(400).collect::<String>(),
+            "callable": entry.callable,
+            "in_bundle": entry.in_bundle,
+            "bundle": frozen_bundle.selection.kind.as_str(),
+            "category": entry.category,
+            "score": hit_scores.get(&entry.key).copied().unwrap_or(0.0),
+            "prerequisite": prerequisite,
+        });
+        if let Some(server_id) = &entry.server_id {
+            value["server_id"] = json!(server_id);
+            value["server_name"] = json!(entry.server_name);
+            value["tool_name"] = json!(entry.tool_name);
+            value["trust"] = json!(entry.trust);
+            value["pinned"] = json!(entry.pinned);
+        }
+        if prerequisite
+            && let Some(addition) = closure
+                .additions
+                .iter()
+                .find(|addition| addition.name == entry.name)
+        {
+            value["required_by"] = json!(addition.required_by);
+        }
+        if include_schema && let Some(schema) = &entry.schema {
+            value["parameters_preview"] = json!(bounded_schema(schema));
+        }
+        results.push(value);
     }
     results.sort_by(|left, right| {
         right["score"]
             .as_f64()
             .partial_cmp(&left["score"].as_f64())
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                left["prerequisite"]
+                    .as_bool()
+                    .cmp(&right["prerequisite"].as_bool())
+            })
             .then_with(|| left["kind"].as_str().cmp(&right["kind"].as_str()))
             .then_with(|| left["name"].as_str().cmp(&right["name"].as_str()))
     });
-    results.truncate(limit);
+    let final_names = results
+        .iter()
+        .filter_map(|result| result["name"].as_str())
+        .collect::<Vec<_>>();
+    let selected_count = final_names.len();
+    let estimate = if selected_count == 0 && !query.is_empty() {
+        0.0
+    } else {
+        completeness_estimate(selected_count, missing.len())
+    };
     let rendered = results
         .iter()
         .map(|result| {
             format!(
-                "{} · {}{}{} · {}",
+                "{} · {}{}{}{} · {}",
                 result["name"].as_str().unwrap_or("?"),
                 result["kind"].as_str().unwrap_or("tool"),
                 if result["kind"] == "mcp" {
@@ -20641,6 +21096,11 @@ async fn run_tool_search(
                         .unwrap_or_default()
                 } else {
                     String::new()
+                },
+                if result["prerequisite"].as_bool().unwrap_or(false) {
+                    " [prerequisite]"
+                } else {
+                    ""
                 },
                 if result["in_bundle"].as_bool().unwrap_or(false) {
                     ""
@@ -20661,45 +21121,35 @@ async fn run_tool_search(
     } else {
         ""
     };
+    let promotion = if promote {
+        json!({
+            "requested": true,
+            "candidates": promoted_candidates,
+            "note": "Promoted schemas are applied only at the next turn boundary; the current request keeps its frozen tool set.",
+        })
+    } else {
+        json!({"requested": false})
+    };
     Ok(ToolOutput::ok_structured(
         truncate(&format!("{rendered}{mcp_hint}")),
         json!({
             "query": query,
+            "task_kind": requested_task_kind,
             "tools": results,
-            "count": results.len(),
+            "set": final_names,
+            "count": selected_count,
+            "missing": missing,
+            "completeness_estimate": estimate,
+            "truncated": ranked_truncated,
+            "prerequisite_additions": closure.additions,
             "mcp_callable": mcp_callable,
             "bundle": frozen_bundle.selection.kind.as_str(),
             "bundle_hash": frozen_bundle.bundle_hash,
             "advertised_count": advertised.len(),
             "outside_bundle": results.iter().filter(|result| !result["in_bundle"].as_bool().unwrap_or(false)).count(),
+            "promotion": promotion,
         }),
     ))
-}
-
-fn tool_match_score(name: &str, description: &str, query: &str) -> f64 {
-    if query.trim().is_empty() {
-        return 1.0;
-    }
-    let name = name.to_ascii_lowercase();
-    let description = description.to_ascii_lowercase();
-    let query = query.to_ascii_lowercase();
-    let tokens = query
-        .split(|ch: char| !ch.is_alphanumeric())
-        .filter(|token| token.len() > 1)
-        .collect::<Vec<_>>();
-    if name == query {
-        return 1.0;
-    }
-    if name.contains(&query) {
-        return 0.9;
-    }
-    if !tokens.is_empty() && tokens.iter().all(|token| name.contains(token)) {
-        return 0.8;
-    }
-    if !tokens.is_empty() && tokens.iter().all(|token| description.contains(token)) {
-        return 0.5;
-    }
-    0.0
 }
 
 fn bounded_schema(value: &Value) -> String {
@@ -23180,7 +23630,7 @@ fn tool_schemas(
     if role.allows_tool(profile, "browser") {
         tools.push(ToolSchema {
             name: "browser".to_string(),
-            description: "Drive a sandboxed local WKWebView: open localhost or worktree pages, inspect the accessibility/DOM tree, click/type/press/select, wait, read console logs, and save screenshots. External navigation is refused. The browser and native computer helpers share one daemon-wide GUI lease; a second session waits briefly and then receives GUI_BUSY with the holder and retry hint. Use evaluate only when the user approves JavaScript execution."
+            description: "Drive a sandboxed local WKWebView: open localhost or worktree pages, inspect the accessibility/DOM tree, click/type/press/select, wait, read console logs, and save screenshots. Snapshot results include snapshot_generation; follow-up snapshots are delta-first (changed/new/removed refs plus a text delta) unless delta=false. Input actions that pass snapshot_generation are rejected with STALE_REF when the generation is old; take a fresh snapshot and use its refs. External navigation is refused. The browser and native computer helpers share one daemon-wide GUI lease; a second session waits briefly and then receives GUI_BUSY with the holder and retry hint. Use evaluate only when the user approves JavaScript execution."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -23200,6 +23650,8 @@ fn tool_schemas(
                     "timeout_ms": {"type": "integer", "minimum": 50, "maximum": 60000},
                     "max_chars": {"type": "integer", "minimum": 200, "maximum": 24000, "description": "snapshot: cap visible text"},
                     "max_nodes": {"type": "integer", "minimum": 1, "maximum": 1200},
+                    "delta": {"type": "boolean", "description": "snapshot: return changed/new/removed refs and a text delta after the first full snapshot; default true"},
+                    "snapshot_generation": {"type": "integer", "minimum": 1, "description": "Input actions: generation from the latest snapshot; a stale generation returns STALE_REF"},
                     "path": {"type": "string", "description": "screenshot: worktree-relative output path; defaults under .verlinpark/browser"},
                     "full_page": {"type": "boolean", "description": "screenshot: accepted for compatibility; v1 captures the viewport"},
                     "script": {"type": "string", "description": "evaluate: explicit approval-gated JavaScript"}
@@ -23351,8 +23803,10 @@ fn tool_schemas(
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Optional search text; empty lists available tools"},
+                "task_kind": {"type": "string", "description": "Optional task kind used to boost the BM25 ranking"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Default 20"},
-                "include_schema": {"type": "boolean", "description": "Include a bounded parameter schema preview; default false"}
+                "include_schema": {"type": "boolean", "description": "Include a bounded parameter schema preview; default false"},
+                "promote": {"type": "boolean", "description": "Request that returned out-of-bundle builtins be promoted at the next turn boundary; the current request keeps its frozen schema set"}
             },
             "additionalProperties": false
         }),
