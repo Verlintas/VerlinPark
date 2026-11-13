@@ -216,6 +216,7 @@
 | [0210](adr/0210-agent-hiring-retirement-and-performance.md) | Hiring, promotion/transfer, evidence-based retirement, and performance ledger | Accepted | Runtime/Orchestration |
 | [0211](adr/0211-project-org-chart-and-identity-console.md) | Project org chart, identity detail console, and lifecycle action sheets | Accepted | Runtime/GUI |
 | [0212](adr/0212-portable-team-templates.md) | Portable content-addressed TeamTemplate/Team Charter export, preview, and apply | Accepted | Runtime/Orchestration |
+| [0213](adr/0213-production-hardening-round.md) | Production hardening round: non-destructive repair, lease heartbeats, workspace bases/land, effect/gate/template isolation | Accepted | Runtime/Security |
 
 ---
 

@@ -478,11 +478,43 @@ impl Store {
             .optional()?;
         if let Some(other_session) = other_session {
             if other_session == session_id {
-                let existing = get_assignment_tx(&tx, session_id, identity_id)?
+                // A repeated assign is not a new assignment, but it must keep
+                // the lease alive. Returning the old row unchanged let an
+                // operator "renew" a run while the 600s lease still expired
+                // underneath it.
+                tx.execute(
+                    "UPDATE session_agent_assignments
+                     SET lease_token = ?1, lease_expires_at = ?2, heartbeat_at = ?3
+                     WHERE session_id = ?4 AND identity_id = ?5 AND status = 'active'",
+                    params![
+                        new_lease_token(),
+                        expires,
+                        now_text,
+                        session_id,
+                        identity_id
+                    ],
+                )?;
+                let renewed = get_assignment_tx(&tx, session_id, identity_id)?
                     .ok_or_else(|| anyhow!("assignment disappeared during idempotent assign"))?;
+                let event = insert_assignment_event_tx(
+                    &tx,
+                    &project_id,
+                    vp_protocol::types::AGENT_ASSIGNMENT_RENEWED_EVENT,
+                    &renewed,
+                    Some((
+                        "operator",
+                        serde_json::json!({
+                            "operator": operator,
+                            "reason": "idempotent_assign",
+                        }),
+                    )),
+                )?;
+                events.push(event);
                 tx.commit()?;
                 return Ok(AssignmentMutation {
-                    assignment: existing,
+                    assignment: renewed,
+                    // No new assignment row was created; only the live lease
+                    // was extended. Callers still receive the renewed event.
                     changed: false,
                     events,
                 });
@@ -711,6 +743,7 @@ impl Store {
                  FROM session_agent_assignments a
                  JOIN sessions s ON s.id = a.session_id
                  WHERE a.status = 'active'
+                   AND s.status NOT IN ('running', 'queued', 'paused', 'waiting_input')
                    AND (a.lease_expires_at IS NULL
                         OR julianday(a.lease_expires_at) <= julianday(?1))
                  ORDER BY a.lease_expires_at ASC, a.session_id ASC
@@ -763,13 +796,28 @@ impl Store {
         payload: &Value,
         expires_at: Option<&str>,
     ) -> Result<AgentInboxMessage> {
+        // Display label only. The stable sender id stays in from_identity_id;
+        // the label prefers the identity title so the inbox does not show a
+        // raw UUID to an operator.
+        let from_label = match from_identity_id {
+            None => "operator".to_string(),
+            Some(id) => tx
+                .query_row(
+                    "SELECT COALESCE(NULLIF(TRIM(title), ''), id)
+                     FROM agent_identities WHERE id = ?1",
+                    params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .unwrap_or_else(|| id.to_string()),
+        };
         let message = AgentInboxMessage {
             id: Uuid::now_v7().to_string(),
             project_id: project_id.to_string(),
             identity_id: identity_id.to_string(),
             session_id: session_id.map(str::to_string),
             from_identity_id: from_identity_id.map(str::to_string),
-            from_label: from_identity_id.unwrap_or("operator").to_string(),
+            from_label,
             kind: kind.to_string(),
             payload: payload.clone(),
             status: "unread".to_string(),
@@ -1788,7 +1836,10 @@ mod tests {
             .create_session_agent_assignment(&session_a.id, &identity_id, None, None, None)
             .unwrap();
         assert!(!same.changed);
-        assert!(same.events.is_empty());
+        // The row is not re-created, but the live lease is renewed and that
+        // renewal is event-backed.
+        assert_eq!(same.events.len(), 1);
+        assert!(same.assignment.lease_active);
 
         let conflict = store
             .create_session_agent_assignment(&session_b.id, &identity_id, None, None, None)
@@ -1916,7 +1967,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(message.from_label, sender);
+        assert_eq!(message.from_label, "manager title");
         assert_eq!(message.status, "unread");
         let (messages, counts) = store
             .list_agent_inbox_messages(Some(&project.id), Some(&recipient), None, None, true, None)

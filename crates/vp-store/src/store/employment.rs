@@ -703,11 +703,22 @@ pub fn list_agent_hire_requests(
     let mut statement = conn.prepare(&format!(
         "{HIRE_REQUEST_SELECT}
          WHERE project_id = ?1 AND (?2 IS NULL OR status = ?2)
-         ORDER BY requested_at DESC, id DESC LIMIT ?3"
+           AND (?3 IS NULL OR identity_id = ?3)
+         ORDER BY requested_at DESC, id DESC LIMIT ?4"
     ))?;
+    let identity_id = params
+        .identity_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let requests = statement
         .query_map(
-            params![params.project_id.trim(), params.status.as_deref(), limit],
+            params![
+                params.project_id.trim(),
+                params.status.as_deref(),
+                identity_id,
+                limit
+            ],
             map_hire_request,
         )?
         .collect::<Result<Vec<_>, _>>()?;
@@ -795,6 +806,25 @@ pub fn promote_agent(store: &Store, params: &AgentPromoteParams) -> Result<Agent
         ));
     }
     ensure_identity_role_capacity_tx(&tx, &existing.project_id, &target_role, Some(&existing.id))?;
+    if target_role == "leader" {
+        // Leader cannot be a parent in the four-tier hierarchy. Promoting a
+        // Manager with live Workers would orphan them under a Leader parent.
+        let direct_reports: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM agent_identities
+             WHERE project_id = ?1 AND parent_identity_id = ?2 AND status <> 'retired'",
+            params![existing.project_id, existing.id],
+            |row| row.get(0),
+        )?;
+        if direct_reports > 0 {
+            return Err(employment_error(
+                agent_identity_codes::PROMOTION_CONFLICT,
+                format!(
+                    "identity {} still has {direct_reports} direct report(s); reparent them before promoting this Manager to Leader",
+                    existing.id
+                ),
+            ));
+        }
+    }
 
     let parent = if target_role == "leader" {
         if params
@@ -2288,7 +2318,12 @@ pub fn compute_agent_performance(
                     acc.performance.diagnosis_findings =
                         acc.performance.diagnosis_findings.saturating_add(1);
                     *acc.reason_counts.entry(reason.to_string()).or_insert(0) += 1;
-                    if reason == agent_retirement_reasons::UNSUBSTANTIATED_HANDOFFS {
+                    // C6 emits `unsubstantiated_handoff` (singular); the S6
+                    // retirement policy constant historically used the plural
+                    // form. Accept both so the threshold is not dead code.
+                    if reason == agent_retirement_reasons::UNSUBSTANTIATED_HANDOFFS
+                        || reason == vp_protocol::diagnosis::reason_codes::UNSUBSTANTIATED_HANDOFF
+                    {
                         acc.performance.unsubstantiated_handoffs =
                             acc.performance.unsubstantiated_handoffs.saturating_add(1);
                     }
@@ -3126,16 +3161,38 @@ pub(crate) fn insert_hire_request_for_import(
 fn employment_projections_from_events(
     project_id: &str,
     events: &[AgentEmploymentEvent],
-) -> (Vec<AgentHireRequest>, Vec<AgentRetirementProposal>) {
+) -> Result<(Vec<AgentHireRequest>, Vec<AgentRetirementProposal>)> {
     let mut requests: BTreeMap<String, AgentHireRequest> = BTreeMap::new();
     let mut proposals: BTreeMap<String, AgentRetirementProposal> = BTreeMap::new();
     for event in events {
+        if event.project_id != project_id {
+            return Err(employment_error(
+                agent_identity_codes::IDENTITY_PROJECT_MISMATCH,
+                format!(
+                    "employment event {} belongs to project {}, not {project_id}",
+                    event.id, event.project_id
+                ),
+            ));
+        }
         match event.kind.as_str() {
             AGENT_HIRE_REQUESTED_EVENT | AGENT_HIRE_APPROVED_EVENT | AGENT_HIRE_REJECTED_EVENT => {
-                if let Some(request) = event.payload.get("request")
-                    && let Ok(mut request) =
-                        serde_json::from_value::<AgentHireRequest>(request.clone())
-                {
+                if let Some(request) = event.payload.get("request") {
+                    let mut request = serde_json::from_value::<AgentHireRequest>(request.clone())
+                        .map_err(|error| {
+                        employment_error(
+                            agent_identity_codes::IDENTITY_INVALID,
+                            format!("invalid hire request in event {}: {error}", event.id),
+                        )
+                    })?;
+                    if request.project_id != project_id || request.id.trim().is_empty() {
+                        return Err(employment_error(
+                            agent_identity_codes::IDENTITY_INVALID,
+                            format!(
+                                "hire request in event {} has a mismatched project or empty id",
+                                event.id
+                            ),
+                        ));
+                    }
                     request.origin = "local".to_string();
                     requests.insert(request.id.clone(), request);
                 }
@@ -3143,10 +3200,27 @@ fn employment_projections_from_events(
             AGENT_RETIREMENT_PROPOSED_EVENT
             | AGENT_RETIREMENT_APPROVED_EVENT
             | AGENT_RETIREMENT_REJECTED_EVENT => {
-                if let Some(proposal) = event.payload.get("proposal")
-                    && let Ok(mut proposal) =
+                if let Some(proposal) = event.payload.get("proposal") {
+                    let mut proposal =
                         serde_json::from_value::<AgentRetirementProposal>(proposal.clone())
-                {
+                            .map_err(|error| {
+                                employment_error(
+                                    agent_identity_codes::IDENTITY_INVALID,
+                                    format!(
+                                        "invalid retirement proposal in event {}: {error}",
+                                        event.id
+                                    ),
+                                )
+                            })?;
+                    if proposal.project_id != project_id || proposal.id.trim().is_empty() {
+                        return Err(employment_error(
+                            agent_identity_codes::IDENTITY_INVALID,
+                            format!(
+                                "retirement proposal in event {} has a mismatched project or empty id",
+                                event.id
+                            ),
+                        ));
+                    }
                     proposal.origin = "local".to_string();
                     proposals.insert(proposal.id.clone(), proposal);
                 }
@@ -3165,11 +3239,55 @@ fn employment_projections_from_events(
             _ => {}
         }
     }
-    let _ = project_id;
-    (
+    Ok((
         requests.into_values().collect(),
         proposals.into_values().collect(),
-    )
+    ))
+}
+
+/// Newest employment events for one identity, returned oldest-first. The
+/// identity detail view uses this so a project-wide event cap cannot hide a
+/// specific identity's recent history.
+pub fn list_employment_events_for_identity(
+    store: &Store,
+    project_id: &str,
+    identity_id: &str,
+    limit: u32,
+) -> Result<Vec<AgentEmploymentEvent>> {
+    let limit = limit.clamp(1, 100_000) as i64;
+    let conn = store.lock()?;
+    let mut statement = conn.prepare(
+        "SELECT id, project_id, seq, identity_id, kind, payload, created_at
+         FROM agent_employment_events
+         WHERE project_id = ?1 AND identity_id = ?2
+         ORDER BY seq DESC LIMIT ?3",
+    )?;
+    let mut events = statement
+        .query_map(params![project_id.trim(), identity_id, limit], |row| {
+            let payload: String = row.get(5)?;
+            Ok(AgentEmploymentEvent {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                seq: row.get::<_, i64>(2)? as u64,
+                identity_id: row.get(3)?,
+                kind: row.get(4)?,
+                payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
+                created_at: row.get(6)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    events.reverse();
+    Ok(events)
+}
+
+pub fn count_employment_events(store: &Store, project_id: &str) -> Result<u64> {
+    let conn = store.lock()?;
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM agent_employment_events WHERE project_id = ?1",
+        params![project_id.trim()],
+        |row| row.get(0),
+    )?;
+    Ok(count.max(0) as u64)
 }
 
 /// Rebuild hire-request and proposal projections from the append-only
@@ -3179,7 +3297,17 @@ fn employment_projections_from_events(
 /// preserved and never overwritten by a local rebuild.
 pub fn rebuild_employment_projections(store: &Store, project_id: &str) -> Result<()> {
     let events = list_employment_events(store, project_id, None)?;
-    let (requests, proposals) = employment_projections_from_events(project_id, &events);
+    let total = count_employment_events(store, project_id)?;
+    if total > events.len() as u64 {
+        return Err(employment_error(
+            agent_identity_codes::EMPLOYMENT_REPLAY_TRUNCATED,
+            format!(
+                "project has {total} employment events but replay reads at most {}; refusing to rebuild from a truncated stream",
+                events.len()
+            ),
+        ));
+    }
+    let (requests, proposals) = employment_projections_from_events(project_id, &events)?;
     let mut conn = store.lock()?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute(
@@ -3293,7 +3421,7 @@ pub fn employment_replay(
 ) -> Result<vp_protocol::types::AgentEmploymentReplayReport> {
     let events = list_employment_events(store, project_id, None)?;
     let (expected_requests, expected_proposals) =
-        employment_projections_from_events(project_id, &events);
+        employment_projections_from_events(project_id, &events)?;
     let mut requests = list_hire_requests_for_replay(store, project_id)?;
     let mut proposals = list_retirement_proposals_for_replay(store, project_id)?;
     let mut mismatches = compare_hire_requests(&expected_requests, &requests);

@@ -1401,7 +1401,7 @@ mod effect_rebuild_tests {
             .unwrap()
             .expect("write plan");
             let crate::effect::EffectPrepare::Proceed(intent) = engine
-                .prepare_tool_effect(&session.id, Some("T1"), &plan)
+                .prepare_tool_effect(&session.id, Some("T1"), "agent-1", "", &plan)
                 .await
                 .unwrap()
             else {

@@ -616,7 +616,8 @@ fn escape_like(value: &str) -> String {
 }
 
 /// Bounded, filterable project memory read. Viewer scope isolation is applied
-/// by the engine after this store query; the store is a trusted local layer.
+/// in SQL so a busy project cannot starve an identity's own memory before the
+/// engine filters the result.
 #[allow(clippy::too_many_arguments)]
 pub fn list_agent_memories(
     store: &Store,
@@ -627,6 +628,8 @@ pub fn list_agent_memories(
     query: Option<&str>,
     include_expired: bool,
     limit: Option<u32>,
+    viewer_identity_id: Option<&str>,
+    viewer_department: Option<&str>,
 ) -> Result<Vec<AgentMemory>> {
     if let Some(scope) = scope
         && agent_memory_scope(scope).is_none()
@@ -659,6 +662,13 @@ pub fn list_agent_memories(
            AND (?4 IS NULL OR department = ?4 COLLATE NOCASE)
            AND (?5 IS NULL OR content LIKE ?5 ESCAPE '\\')
            AND (?6 = 1 OR expires_at IS NULL OR expires_at > ?7)
+           AND (
+             ?9 IS NULL
+             OR (scope = 'agent' AND identity_id = ?9)
+             OR (scope = 'department' AND ?10 IS NOT NULL
+                 AND department = ?10 COLLATE NOCASE)
+             OR scope = 'project'
+           )
          ORDER BY created_at DESC, id ASC
          LIMIT ?8"
     ))?;
@@ -671,7 +681,9 @@ pub fn list_agent_memories(
             like,
             if include_expired { 1 } else { 0 },
             now,
-            limit as i64
+            limit as i64,
+            viewer_identity_id,
+            viewer_department
         ],
         map_memory,
     )?;
@@ -832,6 +844,8 @@ pub fn count_agent_memories(
 pub fn list_agent_memories_for_brief(
     store: &Store,
     project_id: &str,
+    viewer_identity_id: Option<&str>,
+    viewer_department: Option<&str>,
     limit: Option<u32>,
 ) -> Result<Vec<AgentMemory>> {
     let limit = limit.unwrap_or(128).clamp(1, 256);
@@ -844,10 +858,26 @@ pub fn list_agent_memories_for_brief(
            AND status = 'active'
            AND origin = 'local'
            AND (expires_at IS NULL OR expires_at > ?2)
+           AND (
+             ?3 IS NULL
+             OR (scope = 'agent' AND identity_id = ?3)
+             OR (scope = 'department' AND ?4 IS NOT NULL
+                 AND department = ?4 COLLATE NOCASE)
+             OR scope = 'project'
+           )
          ORDER BY updated_at DESC, content_hash ASC, id ASC
-         LIMIT ?3"
+         LIMIT ?5"
     ))?;
-    let rows = statement.query_map(params![project_id, now, limit as i64], map_memory)?;
+    let rows = statement.query_map(
+        params![
+            project_id,
+            now,
+            viewer_identity_id,
+            viewer_department,
+            limit as i64
+        ],
+        map_memory,
+    )?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
@@ -1136,6 +1166,9 @@ pub fn verify_agent_memory_with_event(
     })?;
     ensure_local(&existing)?;
     ensure_active(&existing)?;
+    // Verification extends trust/TTL; a retired identity's agent memory is
+    // read-only for content and lifecycle edits. Supersede or expire instead.
+    ensure_identity_writable_tx(&tx, &existing)?;
     let now = OffsetDateTime::now_utc();
     let now_text = format_time(now)?;
     let mut next = existing;
@@ -1269,6 +1302,19 @@ pub fn sweep_agent_memories_with_events(
         remaining: remaining as u64,
         events,
     })
+}
+
+/// Count the project's memory events without decoding payloads. Replay repair
+/// uses this to detect a stream larger than its bounded read; repairing from a
+/// truncated stream would delete rows that still have events.
+pub fn count_agent_memory_events(store: &Store, project_id: &str) -> Result<u64> {
+    let conn = store.lock()?;
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM agent_memory_events WHERE project_id = ?1",
+        params![project_id],
+        |row| row.get(0),
+    )?;
+    Ok(count.max(0) as u64)
 }
 
 pub fn list_agent_memory_events_for_project(
@@ -1431,8 +1477,12 @@ pub fn replace_agent_memory_projection(
             .query_map(params![project_id], |row| row.get::<_, String>(0))?
             .collect::<Result<BTreeSet<_>, _>>()?
     };
+    // Imported rows are archive evidence. A local event stream cannot prove
+    // they are wrong, so repair never deletes them; it only rebuilds local
+    // rows. Expected imported rows are still upserted below with their origin
+    // preserved.
     tx.execute(
-        "DELETE FROM agent_memories WHERE project_id = ?1",
+        "DELETE FROM agent_memories WHERE project_id = ?1 AND origin = 'local'",
         params![project_id],
     )?;
     for memory in memories {

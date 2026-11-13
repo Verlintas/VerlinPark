@@ -192,8 +192,27 @@ impl Engine {
                 )
             })?;
             let root = PathBuf::from(&project.root);
-            let base = crate::worktree::git_output(&root, &["rev-parse", "HEAD"])?;
+            // A component branch must be rooted at the session's stored base,
+            // not at whatever the user's checkout currently points to. Basing
+            // it on HEAD after an unrelated land could introduce history the
+            // session branch never contained.
+            let base = session
+                .as_ref()
+                .and_then(|session| session.base_commit.as_deref())
+                .map(str::trim)
+                .filter(|base| !base.is_empty())
+                .map(str::to_string)
+                .unwrap_or(crate::worktree::git_output(&root, &["rev-parse", "HEAD"])?);
             let component_head = agent_workspace::ensure_component_branch(&root, &branch, &base)?;
+            if !agent_workspace::branches_share_history(&root, &base, &component_head)? {
+                return Err(agent_workspace::workspace_error(
+                    agent_workspace_codes::WORKSPACE_BASE_MISMATCH,
+                    format!(
+                        "component branch {branch} does not share the session base {}; refusing to attach unrelated history",
+                        crate::workspace_engine::short_commit(&base)
+                    ),
+                ));
+            }
             let workspace_worktree =
                 agent_workspace::component_worktree_path(&data_dir, &project_id, &identity.id);
             let prepared = store.prepare_agent_workspace(
@@ -225,6 +244,27 @@ impl Engine {
                 &identity.id,
             );
             let existed_before = binding_path.join(".git").is_file();
+            if existed_before {
+                // Reattaching must not merge a worktree built from an
+                // unrelated base. Both directions are accepted: the component
+                // may have advanced past the session, or the session branch
+                // may contain the component head already.
+                let existing_head = crate::worktree::head_commit(&binding_path)?;
+                if !agent_workspace::branches_share_history(
+                    &root,
+                    &component_head,
+                    &existing_head,
+                )? {
+                    return Err(agent_workspace::workspace_error(
+                        agent_workspace_codes::WORKSPACE_BASE_MISMATCH,
+                        format!(
+                            "existing session worktree {} does not share history with component head {}",
+                            crate::workspace_engine::short_commit(&existing_head),
+                            crate::workspace_engine::short_commit(&component_head)
+                        ),
+                    ));
+                }
+            }
             let attach = agent_workspace::ensure_worktree(
                 &root,
                 &binding_path,
@@ -343,6 +383,21 @@ impl Engine {
                         code = typed.code,
                         "Worker workspace unavailable; using the legacy task worktree"
                     );
+                    // Make the fallback observable. A silent mode switch means
+                    // later Labour merges and S6 attribution no longer match
+                    // the durable component workspace.
+                    let _ = self
+                        .append_event(
+                            session_id,
+                            vp_protocol::types::AGENT_WORKSPACE_FALLBACK_EVENT,
+                            serde_json::json!({
+                                "identity_id": identity.id,
+                                "code": typed.code,
+                                "message": typed.message.chars().take(500).collect::<String>(),
+                                "mode": "legacy_task_worktree",
+                            }),
+                        )
+                        .await;
                     return Ok(None);
                 }
                 Err(error)
@@ -531,17 +586,22 @@ impl Engine {
                     format!("session workspace branch is missing: {}", binding.branch),
                 ));
             }
-            let unaccepted = agent_workspace::unaccepted_commits(
-                &root,
-                &workspace.branch,
-                &binding.branch,
-                &session_branch,
-            )?;
-            if !unaccepted.is_empty() {
+            let workspace_commits =
+                agent_workspace::commits_between(&root, &workspace.branch, &binding.branch)?;
+            let mut accepted_commits = Vec::new();
+            let mut unaccepted = Vec::new();
+            for commit in &workspace_commits {
+                if crate::worktree::is_ancestor(&root, commit, &session_branch)? {
+                    accepted_commits.push(commit.clone());
+                } else {
+                    unaccepted.push(commit.clone());
+                }
+            }
+            if !workspace_commits.is_empty() && accepted_commits.is_empty() {
                 return Err(agent_workspace::workspace_error(
                     agent_workspace_codes::WORKSPACE_NOT_ACCEPTED,
                     format!(
-                        "the session branch has not accepted {} workspace commit(s): {}",
+                        "the session branch has not accepted any of {} workspace commit(s): {}",
                         unaccepted.len(),
                         unaccepted
                             .iter()
@@ -566,6 +626,7 @@ impl Engine {
                 &component_worktree.path,
                 &workspace.branch,
                 &binding.branch,
+                &accepted_commits,
                 &message,
             )?;
             let workspace = if outcome.already_up_to_date {
@@ -592,6 +653,7 @@ impl Engine {
                 landed_commit: outcome.landed_commit,
                 already_up_to_date: outcome.already_up_to_date,
                 commits: outcome.commits,
+                skipped_commits: outcome.skipped_commits,
             })
         })
         .await?

@@ -1522,6 +1522,10 @@ struct AgentSpec {
     title: Option<String>,
     task_id: Option<String>,
     department: Option<String>,
+    /// Project identity that owns this run. Resolved once by the run loop for
+    /// Leader/Manager/Worker; a Labour child inherits the Worker identity that
+    /// owns its workspace so S6 attribution lands on the same component cell.
+    identity_id: Option<String>,
     profile: AgentProfile,
     /// Plan task kind that selects the frozen tool bundle for a Worker or
     /// Labour run. `None` means the legacy full bundle for task agents and the
@@ -3294,6 +3298,7 @@ impl AgentService {
             title: Some("Integration".to_string()),
             task_id: None,
             department: None,
+            identity_id: None,
             profile: AgentProfile::Generic,
             allow_delegation: false,
             task_kind: None,
@@ -3318,6 +3323,7 @@ impl AgentService {
             title: agent.title.clone(),
             task_id: params.task_id.clone(),
             department: None,
+            identity_id: None,
             profile,
             allow_delegation: false,
             task_kind: None,
@@ -3959,6 +3965,7 @@ impl AgentService {
             title: Some("Integration".to_string()),
             task_id: None,
             department: None,
+            identity_id: None,
             profile: AgentProfile::Generic,
             allow_delegation: false,
             task_kind: None,
@@ -3983,6 +3990,7 @@ impl AgentService {
             title: agent.title.clone(),
             task_id: entry.task_id.clone(),
             department: None,
+            identity_id: None,
             profile,
             allow_delegation: false,
             task_kind: None,
@@ -4070,6 +4078,7 @@ impl AgentService {
             title: agent.title.clone(),
             task_id: entry.task_id.clone(),
             department: None,
+            identity_id: None,
             profile,
             allow_delegation: true,
             task_kind: None,
@@ -4330,6 +4339,7 @@ impl AgentService {
             title: Some("Integration".to_string()),
             task_id: entry.task_id.clone(),
             department: None,
+            identity_id: None,
             profile: AgentProfile::Coding,
             allow_delegation: false,
             task_kind: None,
@@ -4604,6 +4614,7 @@ impl AgentService {
             title: Some("Integration".to_string()),
             task_id: None,
             department: None,
+            identity_id: None,
             profile: AgentProfile::Generic,
             allow_delegation: false,
             task_kind: None,
@@ -4628,6 +4639,7 @@ impl AgentService {
             title: worker.title.clone(),
             task_id: entry.task_id.clone(),
             department: None,
+            identity_id: None,
             profile: AgentProfile::Coding,
             allow_delegation: false,
             task_kind: None,
@@ -8562,6 +8574,7 @@ impl AgentService {
                 title: leader.as_ref().and_then(|agent| agent.title.clone()),
                 task_id: None,
                 department: None,
+                identity_id: None,
                 profile,
                 allow_delegation: true,
                 task_kind: None,
@@ -8761,6 +8774,7 @@ impl AgentService {
             title: leader.as_ref().and_then(|agent| agent.title.clone()),
             task_id: None,
             department: None,
+            identity_id: None,
             profile,
             allow_delegation: true,
             task_kind: None,
@@ -9735,6 +9749,7 @@ async fn run_plan_resume(
         title: None,
         task_id: None,
         department: None,
+        identity_id: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
         task_kind: None,
@@ -10104,6 +10119,7 @@ async fn run_agent(
         title: None,
         task_id: None,
         department: None,
+        identity_id: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
         task_kind: None,
@@ -10623,6 +10639,7 @@ fn remote_integrator_spec(
         title: Some("Integration".to_string()),
         task_id: None,
         department: None,
+        identity_id: None,
         profile: AgentProfile::Generic,
         allow_delegation: false,
         task_kind: None,
@@ -11727,6 +11744,7 @@ async fn verify_worker(
         title: Some("Verification".to_string()),
         task_id: worker_spec.task_id.clone(),
         department: worker_spec.department.clone(),
+        identity_id: None,
         profile: AgentProfile::Verification,
         allow_delegation: false,
         task_kind: None,
@@ -12556,6 +12574,7 @@ async fn delegate_acp(
         title: Some(format!("ACP · {}", acp_agent.name)),
         task_id: None,
         department: parent_spec.department.clone(),
+        identity_id: None,
         profile: AgentProfile::Coding,
         allow_delegation: false,
         task_kind: None,
@@ -15754,6 +15773,32 @@ async fn run_loop_body(
     let mut citations = CitationRegistry::default();
     let mut active_skill: Option<Skill> = None;
     let mut deferred_wait: Option<DeferredWait> = None;
+    // Resolve the run's project identity once. Leader/Manager/Worker resolve
+    // from the active assignment; Labour inherits the Worker identity that
+    // owns its workspace. The binding is persisted on the agents row before
+    // the first provider call so S6 performance attribution has durable
+    // evidence even if the run fails later.
+    let run_identity_id = match engine
+        .prompt_identity_for_run(
+            &session.id,
+            spec.role.as_str(),
+            spec.title.as_deref(),
+            spec.department.as_deref(),
+        )
+        .await?
+    {
+        Some(identity) => Some(identity.id),
+        None => spec.identity_id.clone(),
+    };
+    if let Some(identity_id) = &run_identity_id
+        && let Err(error) = engine
+            .set_agent_identity_binding(&spec.id, Some(identity_id))
+            .await
+    {
+        tracing::warn!(%error, agent_id = %spec.id, "failed to persist run identity binding");
+    }
+    let mut last_lease_heartbeat = Instant::now();
+    const RUN_LEASE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(300);
     let task_priority = if let Some(task_id) = &spec.task_id {
         engine
             .get_team_plan(&session.id)
@@ -16247,6 +16292,46 @@ async fn run_loop_body(
     let mut epoch_observed_calls = epoch_reuse.session_calls;
 
     for turn in 0..config.max_turns {
+        // A long plan can outlive the assignment/workspace lease taken when
+        // the run attached. Renew both at a bounded cadence. Lease loss is an
+        // event-backed warning, not a silent switch to the legacy path.
+        if let Some(identity_id) = &run_identity_id
+            && last_lease_heartbeat.elapsed() >= RUN_LEASE_HEARTBEAT_INTERVAL
+        {
+            match engine.heartbeat_run_leases(&session.id, identity_id).await {
+                Ok(report) => {
+                    if !report.warnings.is_empty() {
+                        emit(
+                            engine,
+                            &session.id,
+                            spec,
+                            "agent.lease_heartbeat",
+                            serde_json::json!({
+                                "identity_id": identity_id,
+                                "assignment_renewed": report.assignment_renewed,
+                                "workspaces_renewed": report.workspaces_renewed,
+                                "warnings": report.warnings,
+                            }),
+                        )
+                        .await?;
+                    }
+                }
+                Err(error) => {
+                    emit(
+                        engine,
+                        &session.id,
+                        spec,
+                        "agent.lease_heartbeat_failed",
+                        serde_json::json!({
+                            "identity_id": identity_id,
+                            "error": format!("{error:#}").chars().take(1_000).collect::<String>(),
+                        }),
+                    )
+                    .await?;
+                }
+            }
+            last_lease_heartbeat = Instant::now();
+        }
         // Provider-facing bytes retained for tool results in this assistant
         // turn. It resets each turn and feeds the per-turn aggregate budget.
         let mut turn_tool_bytes = 0u64;
@@ -17368,6 +17453,22 @@ async fn run_loop_body(
             }
         }
 
+        // Capture every serial call id before the iterator consumes the list.
+        // If one call defers the run, the remaining siblings must still get a
+        // persisted tool result: provider tool-call history requires one
+        // result per call, and a resume would otherwise send an invalid turn.
+        let serial_call_ids = tool_calls
+            .iter()
+            .enumerate()
+            .map(|(idx, call)| {
+                let id = if call.id.is_empty() {
+                    format!("call_{}_{}", turn, idx)
+                } else {
+                    call.id.clone()
+                };
+                (id, call.name.clone())
+            })
+            .collect::<Vec<_>>();
         for (index, call) in tool_calls.into_iter().enumerate() {
             if !wait_for_task_resume(engine, &session.id, spec, control).await? {
                 return Ok(LoopOutcome::Cancelled);
@@ -17748,6 +17849,17 @@ async fn run_loop_body(
             } else {
                 None
             };
+            // Scope effect identity to the current checkout. A completed write
+            // must not replay after a reset or a new commit changed the
+            // worktree context.
+            let effect_context = if planned_effect.is_some() {
+                let worktree = spec.worktree.clone();
+                tokio::task::spawn_blocking(move || crate::worktree::head_commit(&worktree))
+                    .await?
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             let mut effect_override: Option<ToolOutput> = None;
             let mut effect_begin: Option<EffectReceipt> = None;
             let mut effect_duplicate: Option<EffectReceipt> = None;
@@ -17757,14 +17869,26 @@ async fn run_loop_body(
                     && let crate::effect::EffectPrepare::Replay(receipt)
                     | crate::effect::EffectPrepare::Blocked(receipt)
                     | crate::effect::EffectPrepare::Proceed(receipt) = engine
-                        .prepare_tool_effect(&session.id, spec.task_id.as_deref(), plan)
+                        .prepare_tool_effect(
+                            &session.id,
+                            spec.task_id.as_deref(),
+                            &spec.id,
+                            &effect_context,
+                            plan,
+                        )
                         .await?
                 {
                     effect_duplicate = Some(receipt);
                 }
             } else if let Some(plan) = &planned_effect {
                 match engine
-                    .prepare_tool_effect(&session.id, spec.task_id.as_deref(), plan)
+                    .prepare_tool_effect(
+                        &session.id,
+                        spec.task_id.as_deref(),
+                        &spec.id,
+                        &effect_context,
+                        plan,
+                    )
                     .await?
                 {
                     crate::effect::EffectPrepare::Replay(receipt) => {
@@ -18241,7 +18365,12 @@ async fn run_loop_body(
                 )
                 .await?;
                 match tool_token
-                    .scoped(run_mcp_tool(engine, spec.role, input.clone()))
+                    .scoped(run_mcp_tool(
+                        engine,
+                        spec.role,
+                        &session.project_id,
+                        input.clone(),
+                    ))
                     .await
                 {
                     Ok(output) => output,
@@ -18636,6 +18765,38 @@ async fn run_loop_body(
                                 } else {
                                     None
                                 };
+                                // Bind the child run to its own project identity.
+                                // A Worker uses the workspace it just attached;
+                                // a Manager/Worker without a workspace resolves by
+                                // role/title/department. Labour inherits the
+                                // Worker cell that owns its work.
+                                let child_identity_id = match role {
+                                    AgentRole::Worker => match workspace_binding.as_ref() {
+                                        Some(binding) => {
+                                            Some(binding.workspace.identity_id.clone())
+                                        }
+                                        None => engine
+                                            .prompt_identity_for_run(
+                                                &session.id,
+                                                AgentRole::Worker.as_str(),
+                                                title.as_deref(),
+                                                spec.department.as_deref(),
+                                            )
+                                            .await?
+                                            .map(|identity| identity.id),
+                                    },
+                                    AgentRole::Manager => engine
+                                        .prompt_identity_for_run(
+                                            &session.id,
+                                            AgentRole::Manager.as_str(),
+                                            title.as_deref(),
+                                            spec.department.as_deref(),
+                                        )
+                                        .await?
+                                        .map(|identity| identity.id),
+                                    AgentRole::Labour => spec.identity_id.clone(),
+                                    _ => None,
+                                };
                                 let labour_child_worktree = role == AgentRole::Labour
                                     && spec.session_workspace_id.is_some();
                                 let (
@@ -18779,6 +18940,7 @@ async fn run_loop_body(
                                         None
                                     },
                                     department: spec.department.clone(),
+                                    identity_id: child_identity_id,
                                     profile: child_profile,
                                     task_kind: spec.task_kind.clone(),
                                     allow_delegation: role.child_role().is_some(),
@@ -19244,7 +19406,45 @@ async fn run_loop_body(
             conversation.push(ChatMessage::tool(call_id, output.content));
             if let Some(wait) = deferred_wait.take() {
                 // A gate wait is a clean handoff: do not execute any remaining
-                // sibling tool calls or make another provider request.
+                // sibling tool calls or make another provider request. Every
+                // skipped sibling still records a tool result so the resumed
+                // conversation has one result per assistant tool call.
+                for (remaining_id, remaining_name) in serial_call_ids.iter().skip(index + 1) {
+                    let skipped = ToolOutput::error_coded(
+                        remaining_name,
+                        crate::tooling::errors::ToolErrorCode::TOOL_FAILED,
+                        "not executed: the run deferred to wait for an external gate; re-issue this call after the gate resolves",
+                    );
+                    emit(
+                        engine,
+                        &session.id,
+                        spec,
+                        "tool.finished",
+                        tool_finished_payload(
+                            remaining_id,
+                            remaining_name,
+                            &skipped,
+                            0,
+                            None,
+                            config.approval_mode,
+                            None,
+                        ),
+                    )
+                    .await?;
+                    if top_level {
+                        let stored = engine
+                            .append_message(
+                                &session.id,
+                                "tool",
+                                &skipped.content,
+                                serde_json::json!([]),
+                                Some(remaining_id.clone()),
+                            )
+                            .await?;
+                        conversation_ids.push(Some(stored.id));
+                    }
+                    conversation.push(ChatMessage::tool(remaining_id.clone(), skipped.content));
+                }
                 return Ok(LoopOutcome::Deferred(wait));
             }
             if terminal_preempt.is_some() {
@@ -19293,14 +19493,26 @@ async fn collect_dynamic_mcp_tools(
                 continue;
             }
         };
+        let mut pin_sync_failed = false;
         let pins = match session_id {
-            Some(session_id) => engine
+            Some(session_id) => match engine
                 .sync_mcp_pins(session_id, project_id, &server, &tools)
                 .await
-                .unwrap_or_else(|error| {
+            {
+                Ok(pins) => pins,
+                Err(error) => {
                     tracing::warn!(%error, server = %server.name, "MCP pin sync failed");
-                    Vec::new()
-                }),
+                    pin_sync_failed = true;
+                    // Use the last approved pins rather than an empty list.
+                    // An empty list would make every discovered tool look
+                    // like first-use TOFU and re-trust drifted tools.
+                    engine
+                        .project_mcp_pins(project_id, Some(&server.id))
+                        .await
+                        .map(|result| result.pins)
+                        .unwrap_or_default()
+                }
+            },
             None => engine
                 .project_mcp_pins(project_id, Some(&server.id))
                 .await
@@ -19311,7 +19523,9 @@ async fn collect_dynamic_mcp_tools(
             .into_iter()
             .map(|pin| (pin.tool_name.clone(), pin))
             .collect::<HashMap<_, _>>();
-        let tofu_pending = pin_by_tool.is_empty();
+        // TOFU is only valid for a session-less preview. A real run whose pin
+        // sync failed must not silently trust every discovered tool.
+        let tofu_pending = pin_by_tool.is_empty() && session_id.is_none() && !pin_sync_failed;
         for tool in tools {
             // A project with no pins for this server is a TOFU-preview path.
             // The real run syncs pins before advertising, so this fallback is
@@ -20755,6 +20969,7 @@ async fn resolve_mcp_pin_trust(
 async fn run_mcp_tool(
     engine: &Engine,
     role: AgentRole,
+    project_id: &str,
     input: serde_json::Value,
 ) -> Result<ToolOutput> {
     let action = input
@@ -20837,10 +21052,39 @@ async fn run_mcp_tool(
         }
         "call" => {
             let server = server.ok_or_else(|| anyhow!("server is required for action=call"))?;
+            if !server.enabled {
+                return Ok(ToolOutput::error_coded(
+                    "mcp",
+                    crate::tooling::errors::ToolErrorCode::MCP_DISABLED,
+                    format!(
+                        "MCP server {} is disabled; enable it before calling its tools",
+                        server.name
+                    ),
+                ));
+            }
             let tool = input
                 .get("tool")
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| anyhow!("tool is required for action=call"))?;
+            // Pin trust is enforced here, independent of ContractPolicy mode.
+            // The generic `mcp` tool must not become a bypass for a drifted,
+            // unverified, or removed tool.
+            let trust = engine
+                .mcp_pin_trust_for_tool(project_id, &server.id, tool)
+                .await
+                .unwrap_or(crate::contract::McpPinTrust::Unknown);
+            if trust != crate::contract::McpPinTrust::Trusted {
+                return Ok(ToolOutput::error_coded(
+                    "mcp",
+                    crate::tooling::errors::ToolErrorCode::PERMISSION_DENIED,
+                    format!(
+                        "MCP tool {}/{} is not approved for execution (trust: {}); approve its current pin first",
+                        server.name,
+                        tool,
+                        trust.label()
+                    ),
+                ));
+            }
             let arguments = input
                 .get("arguments")
                 .cloned()
@@ -23312,6 +23556,7 @@ async fn run_scout(
         title: Some("Scout".to_string()),
         task_id: parent.task_id.clone(),
         department: parent.department.clone(),
+        identity_id: None,
         profile: AgentProfile::Research,
         allow_delegation: false,
         task_kind: None,
@@ -23827,6 +24072,18 @@ async fn run_parallel_workers(
         let workspace_binding = engine
             .attach_worker_workspace_for_run(&session.id, None, spec.department.as_deref())
             .await?;
+        let child_identity_id = match workspace_binding.as_ref() {
+            Some(binding) => Some(binding.workspace.identity_id.clone()),
+            None => engine
+                .prompt_identity_for_run(
+                    &session.id,
+                    AgentRole::Worker.as_str(),
+                    None,
+                    spec.department.as_deref(),
+                )
+                .await?
+                .map(|identity| identity.id),
+        };
         let (info, workspace_id, session_workspace_id) = match workspace_binding {
             Some(binding) => {
                 let head_path = PathBuf::from(&binding.session.worktree_path);
@@ -23871,6 +24128,7 @@ async fn run_parallel_workers(
             title: None,
             task_id: None,
             department: spec.department.clone(),
+            identity_id: child_identity_id,
             profile: task.profile,
             allow_delegation: true,
             task_kind: None,
@@ -25117,6 +25375,7 @@ async fn ensure_plan_manager(
         title: Some(department.manager_title.clone()),
         task_id: None,
         department: Some(department.name.clone()),
+        identity_id: None,
         profile,
         allow_delegation: false,
         task_kind: None,
@@ -25536,6 +25795,18 @@ async fn execute_team_plan(
             let workspace_binding = engine
                 .attach_worker_workspace_for_run(&session.id, None, Some(task.department.as_str()))
                 .await?;
+            let worker_identity_id = match workspace_binding.as_ref() {
+                Some(binding) => Some(binding.workspace.identity_id.clone()),
+                None => engine
+                    .prompt_identity_for_run(
+                        &session.id,
+                        AgentRole::Worker.as_str(),
+                        None,
+                        Some(task.department.as_str()),
+                    )
+                    .await?
+                    .map(|identity| identity.id),
+            };
             let (info, workspace_id, session_workspace_id) = match workspace_binding {
                 Some(binding) => {
                     let head_path = PathBuf::from(&binding.session.worktree_path);
@@ -25581,6 +25852,7 @@ async fn execute_team_plan(
                 title: None,
                 task_id: Some(task.id.clone()),
                 department: Some(task.department.clone()),
+                identity_id: worker_identity_id,
                 profile,
                 allow_delegation: true,
                 // The plan task kind is the deterministic bundle selector for
@@ -26425,6 +26697,7 @@ fn stable_agent_spec(
         title: agent.as_ref().and_then(|agent| agent.title.clone()),
         task_id: None,
         department: None,
+        identity_id: None,
         profile,
         task_kind,
         allow_delegation: role.child_role().is_some(),
@@ -26943,6 +27216,7 @@ fn preview_spec(role: AgentRole, profile: AgentProfile, task_kind: Option<String
         title: None,
         task_id: None,
         department: None,
+        identity_id: None,
         profile,
         task_kind,
         allow_delegation: role.child_role().is_some(),

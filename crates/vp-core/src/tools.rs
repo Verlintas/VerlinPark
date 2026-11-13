@@ -2476,14 +2476,21 @@ pub(crate) fn bounded_structured(value: Option<Value>) -> Option<Value> {
         .get("summary")
         .and_then(Value::as_str)
         .unwrap_or("structured result exceeded the event cap");
+    // Test/test-cache evidence relies on these small fields. Dropping them
+    // from a verbose result made a real passing test look like no evidence.
+    let source = value.get("result").unwrap_or(&value);
     Some(json!({
         "truncated": true,
         "summary": summary,
         "original_bytes": text.len(),
-        "output_ref": value.get("output_ref"),
-        "total_bytes": value.get("total_bytes"),
-        "preview_bytes": value.get("preview_bytes"),
-        "lines": value.get("lines"),
+        "command": source.get("command"),
+        "kind": source.get("kind"),
+        "ok": source.get("ok"),
+        "exit_code": source.get("exit_code"),
+        "output_ref": value.get("output_ref").or_else(|| source.get("output_ref")),
+        "total_bytes": value.get("total_bytes").or_else(|| source.get("total_bytes")),
+        "preview_bytes": value.get("preview_bytes").or_else(|| source.get("preview_bytes")),
+        "lines": value.get("lines").or_else(|| source.get("lines")),
         "note": "full result is available in the tool text; structured data was capped at 32 KiB",
     }))
 }

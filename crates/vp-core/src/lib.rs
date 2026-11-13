@@ -243,6 +243,16 @@ struct ExpectedArtifact {
     has_size: bool,
 }
 
+/// Result of one run-loop lease heartbeat. Warnings are observations, not
+/// terminal errors: the run may continue on the legacy path, but the caller
+/// records the loss so a silent mode switch is impossible.
+#[derive(Debug, Clone, Default)]
+pub struct RunLeaseHeartbeat {
+    pub assignment_renewed: bool,
+    pub workspaces_renewed: usize,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Clone)]
 pub struct Engine {
     store: Store,
@@ -17722,6 +17732,98 @@ impl Engine {
         Ok(())
     }
 
+    /// Persist the run→identity binding resolved by the run loop.
+    pub async fn set_agent_identity_binding(
+        &self,
+        agent_id: &str,
+        identity_id: Option<&str>,
+    ) -> Result<()> {
+        let store = self.store.clone();
+        let id = agent_id.to_string();
+        let identity_id = identity_id.map(str::to_string);
+        let updated = tokio::task::spawn_blocking(move || {
+            store.set_agent_identity_with_snapshot(&id, identity_id.as_deref())
+        })
+        .await??;
+        if let Some((_, event)) = updated {
+            let _ = self.events.send(event);
+        }
+        Ok(())
+    }
+
+    /// Heartbeat the S2 assignment and S4 workspace leases for a live run.
+    ///
+    /// Lease loss is reported as a warning rather than aborting the run: the
+    /// run may continue on the legacy path, but the observation is event-backed
+    /// so it cannot silently switch execution modes. Fatal store errors still
+    /// propagate.
+    pub async fn heartbeat_run_leases(
+        &self,
+        session_id: &str,
+        identity_id: &str,
+    ) -> Result<RunLeaseHeartbeat> {
+        if identity_id.trim().is_empty() {
+            return Ok(RunLeaseHeartbeat::default());
+        }
+        let store = self.store.clone();
+        let session_id_owned = session_id.to_string();
+        let identity_id_owned = identity_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut report = RunLeaseHeartbeat::default();
+            match store.renew_session_agent_assignment(
+                &session_id_owned,
+                &identity_id_owned,
+                Some(3_600),
+                Some("engine:run-heartbeat"),
+            ) {
+                Ok(_) => report.assignment_renewed = true,
+                Err(error) => {
+                    if let Some(typed) =
+                        error.downcast_ref::<vp_protocol::types::AgentCoordinationError>()
+                        && matches!(
+                            typed.code,
+                            vp_protocol::types::agent_coordination_codes::ASSIGNMENT_NOT_FOUND
+                                | vp_protocol::types::agent_coordination_codes::ASSIGNMENT_LEASE_EXPIRED
+                        )
+                    {
+                        report
+                            .warnings
+                            .push(format!("{}: {}", typed.code, typed.message));
+                    } else {
+                        return Err(error);
+                    }
+                }
+            }
+            match store.renew_session_worker_workspaces(
+                &session_id_owned,
+                Some(&identity_id_owned),
+                Some(3_600),
+                Some("engine:run-heartbeat"),
+            ) {
+                Ok(mutations) => report.workspaces_renewed = mutations.len(),
+                Err(error) => {
+                    if let Some(typed) =
+                        error.downcast_ref::<vp_protocol::types::AgentWorkspaceError>()
+                        && matches!(
+                            typed.code,
+                            vp_protocol::types::agent_workspace_codes::WORKSPACE_LEASE_EXPIRED
+                                | vp_protocol::types::agent_workspace_codes::WORKSPACE_CONFLICT
+                                | vp_protocol::types::agent_workspace_codes::WORKSPACE_NOT_FOUND
+                        )
+                    {
+                        report
+                            .warnings
+                            .push(format!("{}: {}", typed.code, typed.message));
+                    } else {
+                        return Err(error);
+                    }
+                }
+            }
+            Ok(report)
+        })
+        .await?
+    }
+
     pub async fn update_agent_status(&self, agent_id: &str, status: &str) -> Result<()> {
         let store = self.store.clone();
         let id = agent_id.to_string();
@@ -18009,6 +18111,16 @@ impl Engine {
                     identities.insert(identity.id.clone(), identity);
                 }
             }
+            // `status = active` alone is not a live lease: the 30s sweep can
+            // lag behind `lease_expires_at`, and an expired row must not keep
+            // rendering an identity prompt. Live runs renew before expiry.
+            let assignments = assignments
+                .into_iter()
+                .filter(|assignment| assignment.lease_active)
+                .collect::<Vec<_>>();
+            if assignments.is_empty() {
+                return Ok(None);
+            }
             let Some(assignment) = crate::identity_prompt::prefer_identity_assignment(
                 &assignments,
                 &identities,
@@ -18059,10 +18171,14 @@ impl Engine {
         }
         let memory_store = self.store.clone();
         let project_id = session.project_id.clone();
+        let viewer_identity_id = identity.id.clone();
+        let viewer_department = identity.department.clone();
         let candidates = tokio::task::spawn_blocking(move || {
             vp_store::store::identity_memory::list_agent_memories_for_brief(
                 &memory_store,
                 &project_id,
+                Some(viewer_identity_id.as_str()),
+                viewer_department.as_deref(),
                 Some(128),
             )
         })
@@ -18183,6 +18299,8 @@ impl Engine {
         let limit = params.limit;
         let has_viewer = viewer.is_some();
         let memory_store = self.store.clone();
+        let viewer_identity_id = viewer.as_ref().map(|viewer| viewer.id.clone());
+        let viewer_department = viewer.as_ref().and_then(|viewer| viewer.department.clone());
         let (mut memories, total) = tokio::task::spawn_blocking(move || {
             let rows = vp_store::store::identity_memory::list_agent_memories(
                 &memory_store,
@@ -18193,6 +18311,8 @@ impl Engine {
                 query.as_deref(),
                 include_expired,
                 limit,
+                viewer_identity_id.as_deref(),
+                viewer_department.as_deref(),
             )?;
             let total = if has_viewer {
                 0
@@ -18406,6 +18526,22 @@ impl Engine {
         let repair = params.repair;
         tokio::task::spawn_blocking(move || {
             let events = store.list_agent_memory_events_for_project(&project_id, None)?;
+            if repair {
+                let total = vp_store::store::identity_memory::count_agent_memory_events(
+                    &store,
+                    &project_id,
+                )?;
+                if total > events.len() as u64 {
+                    return Err(vp_protocol::types::AgentMemoryError::new(
+                        vp_protocol::types::agent_memory_codes::MEMORY_REPLAY_TRUNCATED,
+                        format!(
+                            "project has {total} memory events but replay reads at most {}; refusing to repair from a truncated stream",
+                            events.len()
+                        ),
+                    )
+                    .into());
+                }
+            }
             let expected = crate::identity_memory::memories_from_events(&events)?;
             let mut actual = store.list_agent_memories_for_replay(&project_id)?;
             let mut mismatches =
@@ -21089,6 +21225,8 @@ impl Engine {
         &self,
         session_id: &str,
         task_id: Option<&str>,
+        agent_id: &str,
+        worktree_head: &str,
         plan: &crate::effect::ToolEffectPlan,
     ) -> Result<crate::effect::EffectPrepare> {
         let store = self.store.clone();
@@ -21096,11 +21234,21 @@ impl Engine {
         let task = task_id.map(str::to_string);
         let tool = plan.tool.clone();
         let target = plan.target.canonical();
-        let request_hash = plan.request_hash.clone();
+        // One logical effect includes the agent and checkout context. A
+        // Verifier must not replay a Worker's task, and a write after a reset
+        // or new commit must not be skipped as already done.
+        let request_hash = crate::effect::scope_request_hash(
+            &plan.request_hash,
+            agent_id.trim(),
+            worktree_head.trim(),
+        );
+        let lookup_hash = request_hash.clone();
         let existing = tokio::task::spawn_blocking(move || {
-            store.latest_effect(&session, task.as_deref(), &tool, &target, &request_hash)
+            store.latest_effect(&session, task.as_deref(), &tool, &target, &lookup_hash)
         })
         .await??;
+        let mut scoped_plan = plan.clone();
+        scoped_plan.request_hash = request_hash;
         let prepared = match existing {
             Some(receipt) if receipt.state == EffectState::Done => {
                 crate::effect::EffectPrepare::Replay(receipt)
@@ -21113,11 +21261,14 @@ impl Engine {
             Some(receipt) => crate::effect::EffectPrepare::Proceed(crate::effect::intent_receipt(
                 session_id,
                 task_id,
-                plan,
+                &scoped_plan,
                 receipt.attempt.saturating_add(1),
             )),
             None => crate::effect::EffectPrepare::Proceed(crate::effect::intent_receipt(
-                session_id, task_id, plan, 1,
+                session_id,
+                task_id,
+                &scoped_plan,
+                1,
             )),
         };
         Ok(prepared)
@@ -21207,10 +21358,15 @@ impl Engine {
         Ok(rows
             .into_iter()
             .filter(|receipt| {
-                let in_scope = receipt.task_id.is_none()
-                    || task
-                        .as_deref()
-                        .is_some_and(|task| receipt.task_id.as_deref() == Some(task));
+                // A session-scope gate (`task_id = None`) must include
+                // task-scoped receipts too, otherwise `session.land` can merge
+                // a branch whose task effect is still unknown.
+                let in_scope = match task.as_deref() {
+                    None => true,
+                    Some(task) => {
+                        receipt.task_id.is_none() || receipt.task_id.as_deref() == Some(task)
+                    }
+                };
                 in_scope
                     && receipt.state.blocks_merge()
                     && policy.enabled
@@ -21298,6 +21454,18 @@ impl Engine {
             && session_id != receipt.session_id
         {
             anyhow::bail!("effect receipt belongs to a different session");
+        }
+        let session_store = self.store.clone();
+        let session_id = receipt.session_id.clone();
+        let session = tokio::task::spawn_blocking(move || session_store.get_session(&session_id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("session not found: {}", receipt.session_id))?;
+        if matches!(session.status.as_str(), "imported" | "landed") {
+            anyhow::bail!(
+                "session {} is {} and its effect receipts are read-only evidence",
+                session.id,
+                session.status
+            );
         }
         let evidence = crate::effect::reconcile_evidence(params.decision, &params.evidence)?;
         let store = self.store.clone();

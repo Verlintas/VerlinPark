@@ -11794,6 +11794,9 @@ pub mod agent_identity_codes {
     pub const IDENTITY_CAP_EXCEEDED: &str = "IDENTITY_CAP_EXCEEDED";
     pub const IDENTITY_IMPORTED_READONLY: &str = "IDENTITY_IMPORTED_READONLY";
     pub const IDENTITY_POLICY_INVALID: &str = "IDENTITY_POLICY_INVALID";
+    /// Projection repair would change or delete an identity that still owns a
+    /// live assignment or workspace. Resolve the live work first.
+    pub const IDENTITY_REPAIR_LIVE_WORK: &str = "IDENTITY_REPAIR_LIVE_WORK";
     // S6 hiring, promotion, transfer, retirement, and performance.
     pub const IDENTITY_APPROVAL_REQUIRED: &str = "IDENTITY_APPROVAL_REQUIRED";
     pub const IDENTITY_APPROVAL_REJECTED: &str = "IDENTITY_APPROVAL_REJECTED";
@@ -11818,6 +11821,9 @@ pub mod agent_identity_codes {
     pub const SUCCESSOR_INVALID: &str = "SUCCESSOR_INVALID";
     pub const PERFORMANCE_INVALID: &str = "PERFORMANCE_INVALID";
     pub const PERFORMANCE_REPLAY_INVALID: &str = "PERFORMANCE_REPLAY_INVALID";
+    /// The employment event stream exceeds the bounded replay read. Rebuilding
+    /// from a truncated stream would delete rows that still have events.
+    pub const EMPLOYMENT_REPLAY_TRUNCATED: &str = "EMPLOYMENT_REPLAY_TRUNCATED";
     pub const EMPLOYMENT_CONFIRMATION_REQUIRED: &str = "EMPLOYMENT_CONFIRMATION_REQUIRED";
     // S7 org snapshot and identity detail read model.
     pub const ORG_PROJECT_NOT_FOUND: &str = "ORG_PROJECT_NOT_FOUND";
@@ -12739,8 +12745,15 @@ pub const AGENT_WORKSPACE_ARCHIVED_EVENT: &str = "agent.workspace.archived";
 pub const AGENT_WORKSPACE_RETIRED_EVENT: &str = "agent.workspace.retired";
 pub const AGENT_WORKSPACE_RELEASED_EVENT: &str = "agent.workspace.released";
 pub const AGENT_WORKSPACE_LEASE_EXPIRED_EVENT: &str = "agent.workspace.lease_expired";
+/// A live run renewed its session/workspace lease at a turn boundary. The
+/// payload carries expiry and heartbeat metadata only, never a lease token.
+pub const AGENT_WORKSPACE_LEASE_RENEWED_EVENT: &str = "agent.workspace.lease_renewed";
+/// A session event recording that a Worker run could not use its durable
+/// component workspace and fell back to the legacy task worktree. This is an
+/// observation, not a silent mode switch.
+pub const AGENT_WORKSPACE_FALLBACK_EVENT: &str = "agent.workspace.fallback";
 
-pub const AGENT_WORKSPACE_EVENT_KINDS: [&str; 8] = [
+pub const AGENT_WORKSPACE_EVENT_KINDS: [&str; 10] = [
     AGENT_WORKSPACE_CREATED_EVENT,
     AGENT_WORKSPACE_SESSION_ATTACHED_EVENT,
     AGENT_WORKSPACE_LABOUR_MERGED_EVENT,
@@ -12749,6 +12762,8 @@ pub const AGENT_WORKSPACE_EVENT_KINDS: [&str; 8] = [
     AGENT_WORKSPACE_RETIRED_EVENT,
     AGENT_WORKSPACE_RELEASED_EVENT,
     AGENT_WORKSPACE_LEASE_EXPIRED_EVENT,
+    AGENT_WORKSPACE_LEASE_RENEWED_EVENT,
+    AGENT_WORKSPACE_FALLBACK_EVENT,
 ];
 
 /// Default workspace lease: ten minutes, renewed by an explicit operator or
@@ -12786,9 +12801,15 @@ pub mod agent_workspace_codes {
     pub const WORKSPACE_NOT_ACTIVE: &str = "WORKSPACE_NOT_ACTIVE";
     pub const WORKSPACE_LAND_CONFLICT: &str = "WORKSPACE_LAND_CONFLICT";
     pub const WORKSPACE_LAND_CHECK_FAILED: &str = "WORKSPACE_LAND_CHECK_FAILED";
+    /// A land failed and the component branch could not be restored to its
+    /// exact pre-land commit. The caller must inspect the branch before retrying.
+    pub const WORKSPACE_LAND_ROLLBACK_FAILED: &str = "WORKSPACE_LAND_ROLLBACK_FAILED";
     pub const WORKSPACE_CONFIRMATION_REQUIRED: &str = "WORKSPACE_CONFIRMATION_REQUIRED";
     pub const WORKSPACE_LEASE_EXPIRED: &str = "WORKSPACE_LEASE_EXPIRED";
     pub const WORKSPACE_BRANCH_INVALID: &str = "WORKSPACE_BRANCH_INVALID";
+    /// The existing component/session branch does not share the session base
+    /// commit, so merging it would import unrelated history. Fail closed.
+    pub const WORKSPACE_BASE_MISMATCH: &str = "WORKSPACE_BASE_MISMATCH";
     pub const WORKSPACE_WORKTREE_INVALID: &str = "WORKSPACE_WORKTREE_INVALID";
     pub const WORKSPACE_INVALID_EVENT: &str = "WORKSPACE_INVALID_EVENT";
 }
@@ -13039,6 +13060,10 @@ pub struct AgentWorkspaceLandResult {
     pub already_up_to_date: bool,
     #[serde(default)]
     pub commits: Vec<String>,
+    /// Workspace commits that the session branch never accepted and therefore
+    /// were deliberately not landed with the accepted subset.
+    #[serde(default)]
+    pub skipped_commits: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -13298,6 +13323,9 @@ pub mod agent_memory_codes {
     pub const MEMORY_TOO_LARGE: &str = "MEMORY_TOO_LARGE";
     pub const MEMORY_EVIDENCE_INVALID: &str = "MEMORY_EVIDENCE_INVALID";
     pub const MEMORY_INVALID_EVENT: &str = "MEMORY_INVALID_EVENT";
+    /// The event stream is larger than the bounded replay window. Repairing
+    /// from a truncated read would delete rows that still have events.
+    pub const MEMORY_REPLAY_TRUNCATED: &str = "MEMORY_REPLAY_TRUNCATED";
 }
 
 /// Typed memory failure. It carries only a stable code and a bounded message;
@@ -14399,6 +14427,10 @@ pub struct AgentHireListParams {
     pub project_id: String,
     #[serde(default)]
     pub status: Option<String>,
+    /// Optional identity filter. Used by the identity detail view so a busy
+    /// project cannot starve an identity's own request history.
+    #[serde(default)]
+    pub identity_id: Option<String>,
     #[serde(default)]
     pub limit: Option<u32>,
 }

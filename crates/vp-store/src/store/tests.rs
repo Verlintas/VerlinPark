@@ -17752,6 +17752,7 @@ fn plan_and_migration_snapshot_updates_are_atomic_and_plan_preserving() {
         .migrate_plan_runtime_snapshot_with_event(
             &session.id,
             &snapshot_json,
+            &[],
             serde_json::json!({"reason": "test", "approval_risk": "host_state"}),
         )
         .unwrap();
@@ -18619,5 +18620,85 @@ mod agent_identity_view_tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn identity_repair_refuses_live_work_and_preserves_assignment() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("repair"))
+            .unwrap();
+        store
+            .set_agent_identity_policy(
+                &project.id,
+                &AgentIdentityPolicy {
+                    enabled: true,
+                    ..AgentIdentityPolicy::default()
+                },
+            )
+            .unwrap();
+        let (identity, _) = store
+            .create_agent_identity(&create_params(&project.id, "leader", None))
+            .unwrap();
+        let session = store.create_session(&project.id, "repair goal").unwrap();
+        store
+            .create_session_agent_assignment(&session.id, &identity.id, None, None, None)
+            .unwrap();
+        let mut corrupt = identity.clone();
+        corrupt.generation = 99;
+        let error = store
+            .replace_agent_identity_projection(&project.id, &[corrupt])
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<AgentIdentityError>()
+                .map(|typed| typed.code),
+            Some(agent_identity_codes::IDENTITY_REPAIR_LIVE_WORK)
+        );
+        // Neither the row nor the assignment may be touched by a refused repair.
+        let loaded = store.get_agent_identity(&identity.id).unwrap().unwrap();
+        assert_eq!(loaded.generation, identity.generation);
+        let assignments = store
+            .list_session_agent_assignments(Some(&session.id), None, None, Some("active"), None)
+            .unwrap();
+        assert_eq!(assignments.len(), 1);
+    }
+
+    #[test]
+    fn assignment_expiry_skips_live_sessions() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("leases"))
+            .unwrap();
+        store
+            .set_agent_identity_policy(
+                &project.id,
+                &AgentIdentityPolicy {
+                    enabled: true,
+                    ..AgentIdentityPolicy::default()
+                },
+            )
+            .unwrap();
+        let (identity, _) = store
+            .create_agent_identity(&create_params(&project.id, "leader", None))
+            .unwrap();
+        let session = store.create_session(&project.id, "lease goal").unwrap();
+        store
+            .create_session_agent_assignment(&session.id, &identity.id, None, Some(60), None)
+            .unwrap();
+        store.update_session_status(&session.id, "running").unwrap();
+        let now = time::OffsetDateTime::now_utc() + time::Duration::hours(2);
+        let live = store
+            .expire_session_agent_assignments_at(now, None)
+            .unwrap();
+        assert!(
+            live.is_empty(),
+            "a live run must keep its identity through a lease sweep"
+        );
+        store.update_session_status(&session.id, "idle").unwrap();
+        let expired = store
+            .expire_session_agent_assignments_at(now, None)
+            .unwrap();
+        assert_eq!(expired.len(), 1);
     }
 }

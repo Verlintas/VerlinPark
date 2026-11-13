@@ -423,14 +423,13 @@ pub fn render_inbox_wake_body(messages: &[AgentInboxMessage]) -> String {
 }
 
 pub fn render_assignment_wake_body(assignment: &AgentAssignment) -> String {
+    // Deliberately excludes the lease timestamp: an idempotent re-assign
+    // renews the lease, and a body change would conflict with the completed
+    // `session_operations` receipt for the same assignment wake.
     format!(
-        "[inbox] assignment: identity {} is assigned to this session as {} until the identity lease expires ({}).\nThis wake is cooperative only; approvals, sandboxing, Verifier, and budgets are unchanged.\n",
+        "[inbox] assignment: identity {} is assigned to this session as {} for the current identity lease.\nThis wake is cooperative only; approvals, sandboxing, Verifier, and budgets are unchanged.\n",
         truncate_chars(&assignment.identity_id, 128),
         truncate_chars(&assignment.role, 32),
-        assignment
-            .lease_expires_at
-            .as_deref()
-            .unwrap_or("lease expiry not set")
     )
 }
 

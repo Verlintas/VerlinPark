@@ -504,8 +504,8 @@ should wait until the identity/role contracts and Worker workspace phases
 | S8 Portable team templates | **implemented** | `265e55d`, ADR-0212, 3,882 Rust / 403+132 Swift tests |
 | **Identity program complete** | **S1–S8** | stable identities, assignments, inbox, prompts, workspaces, memory, hiring/retirement, org chart, team templates |
 | C6 Failure attribution | **implemented** | `feb2a71`, ADR-0198, 3,805 Rust / 513 Swift tests |
+| Production hardening C1–C6 / S1–S8 | **implemented** | ADR-0213, 3,887 Rust, app + helper Swift; C4 replay, OTel cursor, S5 erasure, S8 hash validation remain explicit gaps |
 | C7 Bounded fan-out | planned | next |
-| C7 Bounded fan-out | planned | |
 | C8 Tool search v2 + delta snapshots | planned | |
 | C9 MCP tasks/elicitation | planned | |
 | C10 Code Mode | planned | |

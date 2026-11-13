@@ -1069,8 +1069,12 @@ impl Engine {
         let cap = limit
             .unwrap_or(policy.batch_limit)
             .clamp(1, MAX_OTEL_BATCH_LIMIT) as usize;
-        let selected = &projected.spans[..projected.spans.len().min(cap)];
-        let truncated = events_truncated || selected.len() < projected.spans.len();
+        // Export the newest spans. Selecting the head made repeated limited
+        // exports replay the same early spans forever and never reach later
+        // agents/tools. A cursor is still absent, so `truncated` stays honest.
+        let start = projected.spans.len().saturating_sub(cap);
+        let selected = &projected.spans[start..];
+        let truncated = events_truncated || start > 0;
         let mut result = OtelExportResult {
             session_id: session_id.to_string(),
             endpoint: endpoint.traces_url.clone(),

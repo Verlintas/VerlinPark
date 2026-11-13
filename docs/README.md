@@ -26,10 +26,11 @@
 | **Current** | [GAP_CLOSURE_PLAN.md](GAP_CLOSURE_PLAN.md) | I1–I6 第七轮计划与实现记录：source ANN/rerank/expansion、archive/media、Bitbucket、backup revocation/rekey、boot persistence/retention、remote bootstrap/test evidence；已完成 +45.3k 行验收，含完整已知缺口清单与非目标 |
 | **Current** | [CACHE_LOSSLESS_PLAN.md](CACHE_LOSSLESS_PLAN.md) | L1–L5 第八轮已实现：99.84% DeepSeek cache 目标、instruction store、append-only prefix、tool bundle 分区、cache epoch/compaction、telemetry/benchmark/GUI；Rust 3,363 tests，simulator 99.9077%@420k/100 turns，live 待 env key |
 | **Current** | [cache-lossless-plan.json](cache-lossless-plan.json) | 第八轮机器可读无损计划：任务、依赖、文件、测试、验收、非目标 |
-| **Current** | [CONTRACTED_EXECUTION_PLAN.md](CONTRACTED_EXECUTION_PLAN.md) | 第九轮计划：C1–C6 已实现（contract/intent/MCP pins、effect receipts、durable gates、runtime pinning/replay、reliability/OTel、failure attribution）；C7–C12 与 S1–S8 分阶段 |
+| **Current** | [CONTRACTED_EXECUTION_PLAN.md](CONTRACTED_EXECUTION_PLAN.md) | 第九轮计划：C1–C6 已实现并完成生产硬化（ADR-0213；contract/intent/MCP pins、effect receipts、durable gates、runtime pinning/replay、reliability/OTel、failure attribution）；C7–C12 与 S1–S8 分阶段 |
 | **Current** | [contracted-execution-plan.json](contracted-execution-plan.json) | 第九轮机器可读计划：C1–C12、依赖、文件、测试、验收、非目标 |
 | **Current** | [PROJECT_SCOPED_AGENT_IDENTITIES_PLAN.md](PROJECT_SCOPED_AGENT_IDENTITIES_PLAN.md) | 并行计划：project-scoped 稳定 Leader/Manager/Worker 身份（S1–S8 已完成）、session assignment、agent inbox、Worker workspace、身份记忆、招聘/退休/绩效、团队模板；Labour 仍 task-scoped |
 | **Current** | [project-scoped-agent-identities-plan.json](project-scoped-agent-identities-plan.json) | project-scoped 身份计划 S1–S8、依赖、迁移、测试、验收、非目标 |
+| **Current** | [adr/0213-production-hardening-round.md](adr/0213-production-hardening-round.md) | C1–C6 / S1–S8 生产审查修复：非破坏性 identity repair、lease heartbeat、workspace base/land、effect/gate/template 隔离；含未解决缺口 |
 | **Reference** | [OBSCURA_ASSESSMENT.md](OBSCURA_ASSESSMENT.md) | Obscura（Rust/V8/CDP/MCP headless browser）评估：适用场景、安全约束、三种集成方案、结论为 cache 轮之后再做可选外部网页后端 |
 | **Reference** | [PRIDE_FLAGS.md](PRIDE_FLAGS.md) | Pride flag 资产来源与许可 |
 | **Reference** | [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) | FlagKit 等第三方资产许可 |

@@ -27,13 +27,13 @@ use vp_protocol::types::{
     AGENT_ORG_DEFAULT_DETAIL_MEMORY, AGENT_ORG_DEFAULT_DETAIL_PROPOSALS, AGENT_ORG_MAX_DEPARTMENTS,
     AGENT_ORG_MAX_DETAIL_ASSIGNMENTS, AGENT_ORG_MAX_DETAIL_INBOX, AGENT_ORG_MAX_DETAIL_MEMORY,
     AGENT_ORG_MAX_DETAIL_PROPOSALS, AGENT_ORG_MAX_HIRE_REQUESTS, AGENT_ORG_MAX_NODES,
-    AGENT_ORG_MAX_WORKSPACES, AgentAssignment, AgentEmploymentEvent, AgentHireRequest,
-    AgentIdentity, AgentIdentityDetail, AgentIdentityDetailParams, AgentIdentityError,
-    AgentIdentityInboxEntry, AgentIdentityPolicy, AgentOrgAssignmentState, AgentOrgCounts,
-    AgentOrgDepartment, AgentOrgNode, AgentOrgPerformanceSummary, AgentOrgRetirementState,
-    AgentOrgSnapshot, AgentOrgSnapshotParams, AgentOrgWorkspaceState, AgentPerformance,
-    AgentRetirementCandidate, AgentRetirementPolicy, AgentRetirementProposal,
-    AgentRetirementProposalListParams, AgentWorkspace, agent_identity_codes,
+    AGENT_ORG_MAX_WORKSPACES, AgentAssignment, AgentHireRequest, AgentIdentity,
+    AgentIdentityDetail, AgentIdentityDetailParams, AgentIdentityError, AgentIdentityInboxEntry,
+    AgentIdentityPolicy, AgentOrgAssignmentState, AgentOrgCounts, AgentOrgDepartment, AgentOrgNode,
+    AgentOrgPerformanceSummary, AgentOrgRetirementState, AgentOrgSnapshot, AgentOrgSnapshotParams,
+    AgentOrgWorkspaceState, AgentPerformance, AgentRetirementCandidate, AgentRetirementPolicy,
+    AgentRetirementProposal, AgentRetirementProposalListParams, AgentWorkspace,
+    agent_identity_codes,
 };
 use vp_store::Store;
 
@@ -110,9 +110,14 @@ fn load_context(store: &Store, project_id: &str) -> Result<OrgContext> {
     // because the org chart shows the advisory state; no proposal is created.
     let last_proposal_at =
         vp_store::store::employment::last_retirement_proposal_times(store, project_id)?;
+    let local_identities = identities
+        .iter()
+        .filter(|identity| identity.origin == "local")
+        .cloned()
+        .collect::<Vec<_>>();
     let candidates = vp_store::store::employment::retirement_candidates(
         project_id,
-        &identities,
+        &local_identities,
         &performances,
         &retirement_policy,
         &last_proposal_at,
@@ -193,6 +198,7 @@ fn load_context(store: &Store, project_id: &str) -> Result<OrgContext> {
     let pending_hire_requests = vp_store::store::employment::list_agent_hire_requests(
         store,
         &vp_protocol::types::AgentHireListParams {
+            identity_id: None,
             project_id: project_id.to_string(),
             status: Some("pending".to_string()),
             limit: Some(AGENT_ORG_MAX_HIRE_REQUESTS),
@@ -860,20 +866,16 @@ impl Engine {
                 truncated = true;
             }
 
-            let all_hire_requests = vp_store::store::employment::list_agent_hire_requests(
+            let hire_requests = vp_store::store::employment::list_agent_hire_requests(
                 &store,
                 &vp_protocol::types::AgentHireListParams {
                     project_id: project_id.clone(),
-                    limit: Some(AGENT_ORG_MAX_HIRE_REQUESTS),
+                    identity_id: Some(identity.id.clone()),
+                    limit: Some(AGENT_ORG_DEFAULT_DETAIL_HIRE_REQUESTS),
                     ..vp_protocol::types::AgentHireListParams::default()
                 },
             )?
             .requests;
-            let hire_requests = all_hire_requests
-                .into_iter()
-                .filter(|request| request.identity_id == identity.id)
-                .take(AGENT_ORG_DEFAULT_DETAIL_HIRE_REQUESTS as usize)
-                .collect::<Vec<_>>();
 
             let workspaces = context
                 .workspaces_by_identity
@@ -888,11 +890,13 @@ impl Engine {
             let parent = identity
                 .parent_identity_id
                 .as_deref()
-                .and_then(|parent_id| store.get_agent_identity(parent_id).ok().flatten());
+                .and_then(|parent_id| store.get_agent_identity(parent_id).ok().flatten())
+                .filter(|parent| parent.project_id == identity.project_id);
             let successor = identity
                 .successor_id
                 .as_deref()
-                .and_then(|successor_id| store.get_agent_identity(successor_id).ok().flatten());
+                .and_then(|successor_id| store.get_agent_identity(successor_id).ok().flatten())
+                .filter(|successor| successor.project_id == identity.project_id);
             let mut reports = context
                 .identities
                 .iter()
@@ -906,14 +910,13 @@ impl Engine {
             });
             reports.truncate(AGENT_ORG_MAX_NODES as usize);
 
-            let mut employment_events =
-                vp_store::store::employment::list_employment_events(&store, &project_id, Some(AGENT_ORG_MAX_NODES))?
-                .into_iter()
-                .filter(|event| event.identity_id == identity.id)
-                .collect::<Vec<AgentEmploymentEvent>>();
-            employment_events.reverse();
-            employment_events
-                .truncate(AGENT_ORG_DEFAULT_DETAIL_EMPLOYMENT_EVENTS as usize);
+            let employment_events =
+                vp_store::store::employment::list_employment_events_for_identity(
+                    &store,
+                    &project_id,
+                    &identity.id,
+                    AGENT_ORG_DEFAULT_DETAIL_EMPLOYMENT_EVENTS,
+                )?;
 
             let (read_only, read_only_reason) = if identity.origin == "imported" {
                 (

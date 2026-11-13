@@ -1,7 +1,7 @@
 # VerlinPark 进度
 
 > 最后更新：2026-11-13
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark + task contracts/intent authorization/MCP schema pins + effect receipts/postconditions + external gates/durable waits + runtime pinning/controller replay + reliability/OTel + project-scoped identities S1–S8 + failure attribution/cascade 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark + task contracts/intent authorization/MCP schema pins + effect receipts/postconditions + external gates/durable waits + runtime pinning/controller replay + reliability/OTel + project-scoped identities S1–S8 + failure attribution/cascade + production hardening (ADR-0213) 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
@@ -279,6 +279,34 @@ C5 已实现并合入 `782cb19`，ADR-0197。Rust **3,571 passed / 0 failed / 6 
 - Coordination accounting 是 role/task attribution，不是 work classifier。
 - OTel metadata-only，最多 5,000 events；无 background exporter、remote collector、collector auth、cross-host correlation。
 - Reliability report 是描述性的，不是 leaderboard、significance test 或 merge gate。
+
+---
+
+## 2026-11-13 Production hardening round: C1–C6 / S1–S8
+
+四个只读生产审查（C1–C3、C4–C6、S1–S4、S5–S8）发现的问题已按 ADR-0213 修复。Rust **3,887 passed / 0 failed**，Swift app + helper 套件通过，clippy/swiftformat/xcodebuild 通过。
+
+主要修复：
+
+- **S1–S4**：identity replay 改为非破坏性 upsert + targeted delete，imported 行保留，live work 直接 `IDENTITY_REPAIR_LIVE_WORK`；`agents.identity_id` 在 run 开始时持久化，Labour 继承 Worker identity；assignment/workspace lease 在 turn 边界 heartbeat，sweep 跳过 live session；workspace release owner-fenced；component base 改为 `session.base_commit` 并拒绝无关历史；`workspace.land` 只 land session 已接受的 commit，失败回滚读回 HEAD 验证；fallback 发 `agent.workspace.fallback`。
+- **C1–C2**：stale effect sweep 跳过 live session，live completion 可把 sweep 产生的 unknown settle 成真实结果；effect key 加入 agent id 与 worktree head；HTTP query 入 request hash，3xx mutation 为 unknown；`session.land` 纳入 task-scoped receipts；reconcile 拒绝 imported/landed；out-of-scope shell write 即使 advisory 也 escalate；egress exact host 不再匹配子域；generic `mcp call` 独立检查 server.enabled + pin。
+- **C3**：gate wait 为未执行的 sibling tool call 生成结果；gate note/label 作为单行 `<external>` 数据，不再原样注入。
+- **C4**：`plan.migrated` 进入 repair/import/rebuild 快照来源；`plan.migrate` 同步 repin interrupted/failed runs；schema version 参与兼容性比较。
+- **C5–C6**：diagnosis 只把 test-like `run_project_task` 当测试证据；started 无终态且 session 不活跃视为 interrupted；false consensus 只取最新失败 merge，后续成功则取消；verbose structured 结果保留 command/kind/ok/exit_code；saved report 校验 trial 重复；OTel 导出取最新 spans。
+- **S5–S8**：memory brief/list 在 SQL 层按 viewer 过滤；imported memory 不被 repair 删除；memory/employment 截断流拒绝 repair；retired identity 不能 verify；employment 事件校验 project；C6 `unsubstantiated_handoff` 计入 S6；Manager→Leader 有直属 Worker 时拒绝；imported identity 不进 retirement candidates；identity detail 按 project/identity 查询；template apply 永远要求 approval（即使 dry_run），list/get 按项目隔离，import-only 为目标项目写 event。
+
+仍未解决（明确记录，不声称已解决）：
+
+- C4 controller replay 仍是全 event window + 超线性重建；diagnosis 在全局 SQLite lock 下解码 payload。
+- S5 prune 是 projection-only；旧事件仍保留 memory content，没有 crypto-erasure/event retention。
+- OTel 没有 cursor/offset，也没有 transient vs permanent retry 区分。
+- S8 bundle/rebuild 不重算 template hash；imported template link 仍可能显示为 applied。
+- S6 无显式 run binding 时仍是保守 heuristic；successor 不自动转移 memory/component branch。
+- S7 org truncation/ledger 重算未优化；GUI 无 automated UI suite。
+- `vp-remote` cancellation test 在全量负载下偶发 flake。
+- 尚未提交 coverage、seeded old-DB migration fixture、系统化 adversarial path/URL/shell corpus。
+
+新增回归测试：identity repair live-work 拒绝、assignment sweep 跳过 live session、accepted-subset land、template `apply && dry_run` approval、project-scoped template reads。
 
 ---
 

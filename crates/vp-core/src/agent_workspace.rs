@@ -62,6 +62,9 @@ pub struct LandOutcome {
     pub previous_component_commit: String,
     pub landed_commit: String,
     pub commits: Vec<String>,
+    /// Commits deliberately excluded because the session branch never
+    /// accepted them. They remain on the workspace branch as evidence.
+    pub skipped_commits: Vec<String>,
 }
 
 /// Validate a Worker identity id before it becomes a directory or ref suffix.
@@ -345,6 +348,15 @@ pub fn commits_between(worktree_root: &Path, base: &str, branch: &str) -> Result
         .collect())
 }
 
+/// True when two commits share history in either direction. Unrelated roots
+/// must never be merged into a session component branch.
+pub fn branches_share_history(project_root: &Path, left: &str, right: &str) -> Result<bool> {
+    let root = project_root
+        .canonicalize()
+        .with_context(|| format!("resolving project root {}", project_root.display()))?;
+    Ok(worktree::is_ancestor(&root, left, right)? || worktree::is_ancestor(&root, right, left)?)
+}
+
 /// All commits in the workspace branch must be reachable from the session
 /// branch before an explicit land. Integrator merges exact verified commits, so
 /// a subset is expected; an unaccepted commit fails closed.
@@ -512,6 +524,7 @@ pub fn land_component_branch(
     component_worktree: &Path,
     component_branch: &str,
     workspace_branch: &str,
+    accepted_commits: &[String],
     message: &str,
 ) -> Result<LandOutcome> {
     validate_component_branch(component_branch)?;
@@ -541,45 +554,147 @@ pub fn land_component_branch(
             previous_component_commit: previous.clone(),
             landed_commit: previous,
             commits: Vec::new(),
+            skipped_commits: Vec::new(),
         });
     }
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(component_worktree)
-        .args(["merge", "--no-ff", workspace_branch, "-m", message])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .context("landing workspace branch")?;
-    if !output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let detail = if stderr.is_empty() { stdout } else { stderr };
-        let conflicts = worktree::conflicted_paths(component_worktree).unwrap_or_default();
-        let _ = worktree::git_output(component_worktree, &["merge", "--abort"]);
-        let _ = worktree::reset_hard(component_worktree, &previous);
+    let accepted = accepted_commits
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let skipped_commits = commits
+        .iter()
+        .filter(|commit| !accepted.contains(*commit))
+        .cloned()
+        .collect::<Vec<_>>();
+    if accepted_commits.is_empty() {
         return Err(workspace_error(
-            agent_workspace_codes::WORKSPACE_LAND_CONFLICT,
-            format!(
-                "workspace land conflicted and was rolled back to {previous}: {}; conflicts: {}",
-                truncate(&detail, 1_200),
-                truncate(&conflicts.join(", "), 400)
-            ),
+            agent_workspace_codes::WORKSPACE_NOT_ACCEPTED,
+            "the session branch has not accepted any workspace commit",
         ));
+    }
+    if skipped_commits.is_empty() {
+        // Every workspace commit is accepted: keep the deterministic merge
+        // shape so a normal land remains one --no-ff commit.
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(component_worktree)
+            .args(["merge", "--no-ff", workspace_branch, "-m", message])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .context("landing workspace branch")?;
+        if !output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let detail = if stderr.is_empty() { stdout } else { stderr };
+            let conflicts = worktree::conflicted_paths(component_worktree).unwrap_or_default();
+            rollback_component_branch(component_worktree, &previous, "workspace land conflicted")?;
+            return Err(workspace_error(
+                agent_workspace_codes::WORKSPACE_LAND_CONFLICT,
+                format!(
+                    "workspace land conflicted and was rolled back to {previous}: {}; conflicts: {}",
+                    truncate(&detail, 1_200),
+                    truncate(&conflicts.join(", "), 400)
+                ),
+            ));
+        }
+        let landed = worktree::head_commit(component_worktree)?;
+        if let Err(error) = worktree::check_merged_diff(component_worktree, &previous) {
+            rollback_component_branch(
+                component_worktree,
+                &previous,
+                "workspace land check failed",
+            )?;
+            return Err(workspace_error(
+                agent_workspace_codes::WORKSPACE_LAND_CHECK_FAILED,
+                format!("workspace land check failed and was rolled back: {error}"),
+            ));
+        }
+        return Ok(LandOutcome {
+            already_up_to_date: false,
+            previous_component_commit: previous,
+            landed_commit: landed,
+            commits,
+            skipped_commits: Vec::new(),
+        });
+    }
+    // A rejected commit must not permanently block land. Apply only the
+    // accepted commits (those already reachable from the session branch) in
+    // history order, and report the skipped ones explicitly.
+    let ordered = commits
+        .iter()
+        .filter(|commit| accepted.contains(*commit))
+        .cloned()
+        .collect::<Vec<_>>();
+    for commit in &ordered {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(component_worktree)
+            .args(["cherry-pick", "-x", commit])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .context("landing accepted workspace commit")?;
+        if !output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let detail = if stderr.is_empty() { stdout } else { stderr };
+            let conflicts = worktree::conflicted_paths(component_worktree).unwrap_or_default();
+            let _ = worktree::git_output(component_worktree, &["cherry-pick", "--abort"]);
+            rollback_component_branch(
+                component_worktree,
+                &previous,
+                "accepted-subset land conflicted",
+            )?;
+            return Err(workspace_error(
+                agent_workspace_codes::WORKSPACE_LAND_CONFLICT,
+                format!(
+                    "accepted-subset land conflicted at {} and was rolled back to {previous}: {}; conflicts: {}",
+                    truncate(commit, 40),
+                    truncate(&detail, 1_200),
+                    truncate(&conflicts.join(", "), 400)
+                ),
+            ));
+        }
     }
     let landed = worktree::head_commit(component_worktree)?;
     if let Err(error) = worktree::check_merged_diff(component_worktree, &previous) {
-        let _ = worktree::reset_hard(component_worktree, &previous);
+        rollback_component_branch(
+            component_worktree,
+            &previous,
+            "accepted-subset land check failed",
+        )?;
         return Err(workspace_error(
             agent_workspace_codes::WORKSPACE_LAND_CHECK_FAILED,
-            format!("workspace land check failed and was rolled back: {error}"),
+            format!("accepted-subset land check failed and was rolled back: {error}"),
         ));
     }
     Ok(LandOutcome {
         already_up_to_date: false,
         previous_component_commit: previous,
         landed_commit: landed,
-        commits,
+        commits: ordered,
+        skipped_commits,
     })
+}
+
+/// Reset the component branch to its exact pre-land commit and verify HEAD.
+/// A rollback that cannot prove the old HEAD is returned as a distinct typed
+/// failure so an operator never assumes the branch is clean.
+fn rollback_component_branch(
+    component_worktree: &Path,
+    previous: &str,
+    context: &str,
+) -> Result<()> {
+    let _ = worktree::git_output(component_worktree, &["cherry-pick", "--abort"]);
+    let _ = worktree::git_output(component_worktree, &["merge", "--abort"]);
+    let reset = worktree::reset_hard(component_worktree, previous);
+    let head = worktree::head_commit(component_worktree).unwrap_or_default();
+    if reset.is_ok() && head == previous {
+        return Ok(());
+    }
+    Err(workspace_error(
+        agent_workspace_codes::WORKSPACE_LAND_ROLLBACK_FAILED,
+        format!("{context}; rollback verification failed: HEAD is {head}, expected {previous}"),
+    ))
 }
 
 fn truncate(value: &str, limit: usize) -> String {
@@ -1148,6 +1263,7 @@ mod tests {
             &component_worktree.path,
             component_branch,
             session_branch,
+            std::slice::from_ref(&workspace_head),
             "land worker",
         )
         .unwrap();
@@ -1165,11 +1281,75 @@ mod tests {
             &component_worktree.path,
             component_branch,
             session_branch,
+            &[],
             "land worker again",
         )
         .unwrap();
         assert!(again.already_up_to_date);
         assert_eq!(again.landed_commit, outcome.landed_commit);
+    }
+
+    #[test]
+    fn land_applies_only_the_accepted_subset() {
+        let repo = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let base = worktree::head_commit(repo.path()).unwrap();
+        let component_branch = "verlinpark/components/c-1--a-1";
+        let session_branch = "verlinpark/sessions/s-1/worker-a-1";
+        ensure_component_branch(repo.path(), component_branch, &base).unwrap();
+        let component_worktree = ensure_component_worktree(
+            repo.path(),
+            data.path(),
+            "prj-1",
+            "a-1",
+            component_branch,
+            &base,
+        )
+        .unwrap();
+        run(repo.path(), &["branch", session_branch, &base]);
+        let session_worktree = ensure_worktree(
+            repo.path(),
+            &data.path().join("session-worktree"),
+            session_branch,
+            &base,
+        )
+        .unwrap();
+        let first = commit_file(
+            &session_worktree.path,
+            "accepted.txt",
+            "accepted\n",
+            "accepted commit",
+        );
+        let rejected = commit_file(
+            &session_worktree.path,
+            "rejected.txt",
+            "rejected\n",
+            "rejected commit",
+        );
+        let outcome = land_component_branch(
+            &component_worktree.path,
+            component_branch,
+            session_branch,
+            std::slice::from_ref(&first),
+            "land accepted subset",
+        )
+        .unwrap();
+        assert_eq!(outcome.commits, vec![first]);
+        assert_eq!(outcome.skipped_commits, vec![rejected.clone()]);
+        assert!(
+            component_worktree.path.join("accepted.txt").is_file(),
+            "accepted work must land"
+        );
+        assert!(
+            !component_worktree.path.join("rejected.txt").exists(),
+            "a rejected commit must not ride along with the accepted subset"
+        );
+        // The rejected commit remains evidence on the workspace branch.
+        assert!(
+            worktree::is_ancestor(repo.path(), &rejected, session_branch).unwrap(),
+            "workspace branch keeps the rejected commit"
+        );
     }
 
     #[test]
@@ -1211,10 +1391,12 @@ mod tests {
             "session\n",
             "session change",
         );
+        let session_head = worktree::head_commit(&session_worktree.path).unwrap();
         let error = land_component_branch(
             &component_worktree.path,
             component_branch,
             session_branch,
+            &[session_head],
             "land worker",
         )
         .unwrap_err();

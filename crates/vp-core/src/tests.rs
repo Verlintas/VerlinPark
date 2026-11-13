@@ -15546,7 +15546,7 @@ async fn effect_receipts_gate_merge_until_an_explicit_reconcile() {
     .unwrap()
     .expect("remote write plan");
     let prepare = engine
-        .prepare_tool_effect(&session.id, Some("task-1"), &plan)
+        .prepare_tool_effect(&session.id, Some("task-1"), "agent-1", "", &plan)
         .await
         .unwrap();
     let intent = match prepare {
@@ -15578,7 +15578,7 @@ async fn effect_receipts_gate_merge_until_an_explicit_reconcile() {
 
     // The same logical effect is blocked before execution.
     let prepare = engine
-        .prepare_tool_effect(&session.id, Some("task-1"), &plan)
+        .prepare_tool_effect(&session.id, Some("task-1"), "agent-1", "", &plan)
         .await
         .unwrap();
     assert!(matches!(
@@ -15665,7 +15665,7 @@ async fn done_effect_replays_and_unknown_effects_survive_daemon_restart() {
     .unwrap()
     .expect("write plan");
     let crate::effect::EffectPrepare::Proceed(intent) = engine
-        .prepare_tool_effect(&session.id, Some("task-1"), &plan)
+        .prepare_tool_effect(&session.id, Some("task-1"), "agent-1", "", &plan)
         .await
         .unwrap()
     else {
@@ -15684,7 +15684,7 @@ async fn done_effect_replays_and_unknown_effects_survive_daemon_restart() {
 
     // A done receipt replays its evidence and never executes again.
     let prepare = engine
-        .prepare_tool_effect(&session.id, Some("task-1"), &plan)
+        .prepare_tool_effect(&session.id, Some("task-1"), "agent-1", "", &plan)
         .await
         .unwrap();
     assert!(matches!(
@@ -15757,7 +15757,7 @@ async fn unknown_effect_blocks_landing_and_session_scope_is_included() {
     .unwrap()
     .unwrap();
     let crate::effect::EffectPrepare::Proceed(intent) = engine
-        .prepare_tool_effect(&session.id, None, &plan)
+        .prepare_tool_effect(&session.id, None, "agent-1", "", &plan)
         .await
         .unwrap()
     else {

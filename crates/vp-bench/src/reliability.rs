@@ -1418,6 +1418,26 @@ pub fn from_saved_report(path: &Path, selected: &[String], k: u32) -> Result<Rel
         .into_iter()
         .filter(|run| selected_ids.contains(run.scenario_id.as_str()))
         .collect::<Vec<_>>();
+    // A saved report must contain the same unique repetitions it declares.
+    // Duplicate or missing trials silently change k/flake denominators.
+    for scenario_id in &selected_ids {
+        let repetitions = runs
+            .iter()
+            .filter(|run| run.scenario_id == *scenario_id)
+            .map(|run| run.repetition)
+            .collect::<Vec<_>>();
+        if repetitions.len() != report.selection.repetitions as usize {
+            bail!(
+                "scenario {scenario_id} has {} saved trials, expected {}",
+                repetitions.len(),
+                report.selection.repetitions
+            );
+        }
+        let unique = repetitions.iter().copied().collect::<HashSet<_>>();
+        if unique.len() != repetitions.len() {
+            bail!("scenario {scenario_id} has duplicate trial repetitions");
+        }
+    }
     ReliabilityReport::build(
         &runs,
         &selected_scenarios,

@@ -207,6 +207,38 @@ Limits:
 - GUI model/state tested; no interactive manual GUI smoke.
 - No C7+ work.
 
+## 0.17 2026-11-13 Production hardening round
+
+Four read-only production reviews covered C1–C3, C4–C6, S1–S4, and S5–S8. The
+resulting fixes are recorded in ADR-0213 and include: non-destructive identity
+repair with live-work refusal; run→identity binding persisted on `agents`;
+assignment/workspace lease heartbeats and live-session sweep guards;
+owner-fenced workspace release; component bases from `session.base_commit`;
+accepted-subset workspace land with rollback verification; effect sweeps
+restricted to non-live sessions; agent-scoped effect identity; MCP pin and
+disabled-server enforcement on the generic `mcp` call; sibling tool results on
+gate deferral; `plan.migrated` durable through repair/import; and scoped,
+approval-gated team template reads.
+
+Remaining gaps (explicitly not solved):
+
+- C4 controller replay still reads a large event window and is superlinear;
+  diagnosis decodes payloads under the global SQLite mutex.
+- S5 identity-memory prune is projection-only; older events retain content.
+  There is no crypto-erasure or event retention policy.
+- OTel export has no cursor/offset and no transient/permanent retry distinction.
+- S8 bundle/rebuild does not recompute template hashes; imported links can look
+  applied.
+- S6 attribution is conservative without an explicit run binding; successor
+  ownership transfer is not automatic.
+- S7 org truncation/ledger recomputation is not optimized; GUI has no automated
+  UI suite.
+- The `vp-remote` cancellation test can flake under full-workspace load.
+- No coverage tooling, seeded old-DB migration fixture, or committed adversarial
+  path/URL/shell corpus yet.
+
+Verification: 3,887 Rust tests passed; app + helper Swift suites passed.
+
 ## 0. 2026-10-30 跟进
 
 第一轮硬化已完成（同一 `main` 线，提交见仓库历史）：

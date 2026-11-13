@@ -245,6 +245,11 @@ fn entry_for_template(
             Some(project) => record.source_project_id.as_deref() != Some(project),
             None => true,
         };
+    // Never leak another project's local id through a shared library entry.
+    let source_project = match project_id {
+        Some(project) if record.source_project_id.as_deref() != Some(project) => None,
+        _ => record.source_project_id.clone(),
+    };
     Ok(TeamTemplateEntry {
         template_id: record.id.clone(),
         name: record.name.clone(),
@@ -252,7 +257,7 @@ fn entry_for_template(
         schema_version: record.schema_version,
         content_hash: record.content_hash.clone(),
         created_at: record.created_at.clone(),
-        source_project: record.source_project_id.clone(),
+        source_project,
         applied: applied_at.is_some(),
         applied_at,
         applied_by,
@@ -302,6 +307,17 @@ pub fn register_team_template(
             true
         }
     };
+    // A global template row can already exist from another project's export.
+    // Registration is still a per-project event: without it, a later scoped
+    // list/get/diff has no evidence that this project imported the template.
+    let project_event_exists: bool = tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM team_template_events
+            WHERE project_id = ?1 AND template_id = ?2 AND kind = ?3)",
+        params![project_id, template.template_id, event_kind],
+        |row| row.get(0),
+    )?;
+    let changed = changed || !project_event_exists;
     let event = if changed {
         insert_team_template_event_tx(
             &tx,
@@ -593,6 +609,27 @@ pub fn get_team_template(
     let Some(record) = get_team_template_record(store, template_id)? else {
         return Ok(None);
     };
+    if let Some(project_id) = project_id {
+        // A project-scoped read may only see its own exported templates or a
+        // template it has registered/applied. The library is not a global
+        // cross-project data pool.
+        let conn = store.lock()?;
+        let allowed: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM team_templates t
+                WHERE t.id = ?1
+                  AND (t.source_project_id = ?2
+                       OR EXISTS (SELECT 1 FROM project_team_templates l
+                                  WHERE l.template_id = t.id AND l.project_id = ?2)
+                       OR EXISTS (SELECT 1 FROM team_template_events e
+                                  WHERE e.template_id = t.id AND e.project_id = ?2)))",
+            params![record.id, project_id],
+            |row| row.get(0),
+        )?;
+        if !allowed {
+            return Ok(None);
+        }
+    }
     let entry = entry_for_template(store, &record, project_id)?;
     Ok(Some((record, entry)))
 }
@@ -614,6 +651,11 @@ pub fn list_team_templates(
                  FROM team_templates t
                  LEFT JOIN project_team_templates p
                    ON p.template_id = t.id AND p.project_id = ?1
+                 WHERE t.source_project_id = ?1
+                    OR EXISTS (SELECT 1 FROM project_team_templates l
+                               WHERE l.template_id = t.id AND l.project_id = ?1)
+                    OR EXISTS (SELECT 1 FROM team_template_events e
+                               WHERE e.template_id = t.id AND e.project_id = ?1)
                  ORDER BY t.created_at DESC, t.id ASC
                  LIMIT ?2",
             )?;
@@ -648,6 +690,10 @@ pub fn list_team_templates(
                         Some(project) => record.source_project_id.as_deref() != Some(project),
                         None => true,
                     };
+                let source_project = match project_id {
+                    Some(project) if record.source_project_id.as_deref() != Some(project) => None,
+                    _ => record.source_project_id,
+                };
                 TeamTemplateEntry {
                     template_id: record.id.clone(),
                     name: record.name,
@@ -655,7 +701,7 @@ pub fn list_team_templates(
                     schema_version: record.schema_version,
                     content_hash: record.content_hash,
                     created_at: record.created_at,
-                    source_project: record.source_project_id,
+                    source_project,
                     applied: applied_at.is_some(),
                     applied_at,
                     applied_by,

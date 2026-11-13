@@ -270,9 +270,14 @@ impl Engine {
             )?;
             let last =
                 vp_store::store::employment::last_retirement_proposal_times(&store, &project_id)?;
+            let local_identities = identities
+                .iter()
+                .filter(|identity| identity.origin == "local")
+                .cloned()
+                .collect::<Vec<_>>();
             let candidates = vp_store::store::employment::retirement_candidates(
                 &project_id,
-                &identities,
+                &local_identities,
                 &performances,
                 &policy,
                 &last,

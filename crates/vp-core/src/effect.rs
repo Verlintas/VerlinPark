@@ -629,12 +629,23 @@ pub fn classify_tool_effect_for_host(
                         .and_then(Value::as_str)
                         .map(|body| sha256_bytes(body.as_bytes()))
                 });
+            // The persisted target stays query-free (queries can carry
+            // tokens), but the request identity must distinguish
+            // `?job=a` from `?job=b`.
+            let query_hash = reqwest::Url::parse(raw)
+                .ok()
+                .and_then(|url| url.query().map(|query| sha256_bytes(query.as_bytes())));
             Some(ToolEffectPlan {
                 tool: name.to_string(),
                 target: EffectTarget::new(kinds::HTTP_REQUEST, format!("{method}:{canonical}")),
                 request_hash: request_hash(
                     name,
-                    json!({"method": method, "url": canonical, "body_hash": body_hash}),
+                    json!({
+                        "method": method,
+                        "url": canonical,
+                        "query_hash": query_hash,
+                        "body_hash": body_hash
+                    }),
                 )?,
                 provider_key: Some("http".to_string()),
                 family: EffectFamily::Http { method, read_only },
@@ -1238,7 +1249,18 @@ fn probe_http(
             EffectProbe::done(evidence).with_response_hash(response_hash)
         }
         Some(status) if (300..400).contains(&status) => {
-            EffectProbe::done(evidence).with_response_hash(response_hash)
+            if read_only {
+                EffectProbe::done(evidence).with_response_hash(response_hash)
+            } else {
+                // A 3xx without following the redirect does not prove the
+                // mutation reached its target.
+                evidence.outcome = "unverifiable".to_string();
+                evidence.reason = Some("redirect_not_followed".to_string());
+                evidence.note = Some(format!(
+                    "HTTP {status} redirect was not followed; the effect is unknown"
+                ));
+                EffectProbe::unknown(evidence).with_response_hash(response_hash)
+            }
         }
         Some(status) if (400..500).contains(&status) => {
             evidence.outcome = "mismatch".to_string();
@@ -1667,6 +1689,18 @@ fn request_hash(tool: &str, fields: Value) -> Result<String> {
         return Err(anyhow!("effect request identity is too large"));
     }
     Ok(sha256_bytes(encoded.as_bytes()))
+}
+
+/// Scope an effect identity to one agent run.
+///
+/// Replaying a completed effect across agents is wrong: a Verifier issuing the
+/// same `run_project_task` as a Worker must execute it in its own detached
+/// clone, not receive the Worker's stale output. The run-journal fingerprint
+/// guard still handles duplicate writes within the same agent.
+pub fn scope_request_hash(base: &str, agent_id: &str, worktree_head: &str) -> String {
+    // The worktree head is part of the context: after a reset or a new
+    // commit, the same logical write is a new effect and must execute again.
+    sha256_bytes(format!("{base}\u{1f}{agent_id}\u{1f}{worktree_head}").as_bytes())
 }
 
 fn bounded_string(value: Option<&Value>, max_chars: usize, field: &str) -> Result<String> {

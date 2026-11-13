@@ -1127,6 +1127,24 @@ async fn retired_identity_is_not_used_by_a_new_run() {
             .unwrap()
             .is_some()
     );
+    // S1 retirement is terminal and refuses live work; release the lease first.
+    let error = engine
+        .retire_agent_identity(vp_protocol::types::RetireAgentIdentityParams {
+            identity_id: identity_id.clone(),
+            successor_id: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("IDENTITY_BUSY"));
+    engine
+        .release_session_identity(vp_protocol::types::SessionReleaseParams {
+            session_id: session.id.clone(),
+            identity_id: identity_id.clone(),
+            operator: true,
+            reason: Some("retirement test cleanup".to_string()),
+        })
+        .await
+        .unwrap();
     engine
         .retire_agent_identity(vp_protocol::types::RetireAgentIdentityParams {
             identity_id: identity_id.clone(),

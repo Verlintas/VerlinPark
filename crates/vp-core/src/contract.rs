@@ -137,7 +137,10 @@ fn host_matches(entry: &str, host: &str) -> bool {
     if let Some(suffix) = entry.strip_prefix("*.") {
         return host == suffix || host.ends_with(&format!(".{suffix}"));
     }
-    host == entry || host.ends_with(&format!(".{entry}"))
+    // An exact allowlist entry means exactly that host. Subdomains must opt in
+    // with `*.example.com`; otherwise a shared-hosting domain such as
+    // `github.io` would silently authorize every user subdomain.
+    host == entry
 }
 
 /// Optional per-contract mutation caps. `None` means the project did not set
@@ -1295,6 +1298,20 @@ fn authorize_shell(
             spec.risk.max(RiskLevel::HostState),
         ));
     }
+    // Out-of-scope writes are a contract contradiction, not merely a syntax
+    // hint. Enforce them even when `enforce_shell=false`; the remaining shell
+    // hints stay advisory in that mode.
+    if analysis.writes_outside_scope {
+        return Some(ContractDecision::escalate(
+            codes::CONTRACT_SHELL_AMBIGUOUS,
+            format!(
+                "shell command writes outside the declared contract ({}); explicit approval required",
+                analysis.summary()
+            ),
+            rules::SHELL_ARGUMENT,
+            spec.risk.max(RiskLevel::HostState),
+        ));
+    }
     if !policy.enforce_shell {
         return Some(ContractDecision::advisory_allow(
             ContractOutcome::Escalate,
@@ -2271,17 +2288,35 @@ mod tests {
             &input.policy,
         );
         assert_eq!(decision.code, codes::CONTRACT_EGRESS_VIOLATION);
+        // An exact host entry does not authorize its subdomains.
         let value = json!({"url": "https://api.example.com/x"});
         let decision = authorize(
             &call("fetch_url", &value, &worktree),
             &contract,
             &input.policy,
         );
+        assert_eq!(decision.code, codes::CONTRACT_EGRESS_VIOLATION);
+        let value = json!({"url": "https://example.com/x"});
+        let decision = authorize(
+            &call("fetch_url", &value, &worktree),
+            &contract,
+            &input.policy,
+        );
+        assert!(decision.is_allow());
+        let mut wildcard = input.clone();
+        wildcard.policy.egress_allowlist = vec!["*.example.com".into()];
+        let wildcard_contract = derive_contract(wildcard.clone()).unwrap();
+        let value = json!({"url": "https://api.example.com/x"});
+        let decision = authorize(
+            &call("fetch_url", &value, &worktree),
+            &wildcard_contract,
+            &wildcard.policy,
+        );
         assert!(decision.is_allow());
     }
 
     #[test]
-    fn shell_mutation_outside_scope_escalates_only_when_enforced() {
+    fn shell_mutation_outside_scope_escalates_even_in_advisory_mode() {
         let (worktree, _keep) = worktree();
         let contract = derive_contract(derivation(vec!["crates/vp-core".into()])).unwrap();
         let input = json!({"command": "cp docs/x crates/vp-core/src/y"});
@@ -2291,8 +2326,9 @@ mod tests {
             &contract,
             &advisory_policy,
         );
-        assert!(decision.is_allow());
-        assert!(decision.advisory);
+        // Out-of-scope writes are a contract contradiction, not a syntax hint.
+        assert_eq!(decision.outcome, ContractOutcome::Escalate);
+        assert!(!decision.advisory);
         assert_eq!(decision.code, codes::CONTRACT_SHELL_AMBIGUOUS);
 
         let mut enforced = policy();

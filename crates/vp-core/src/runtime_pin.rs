@@ -344,6 +344,13 @@ pub fn compare_snapshots(
             };
         }
         compare!(
+            "schema_version",
+            stored.schema_version,
+            current.schema_version,
+            "incompatible",
+            "schema_version_changed"
+        );
+        compare!(
             "runtime_version",
             stored.runtime_version,
             current.runtime_version,
@@ -951,11 +958,38 @@ impl Engine {
             "warnings": warnings,
         });
         let snapshot_json = serde_json::to_string(&snapshot)?;
+        // Repin interrupted/failed runs in the same explicit migration. A run
+        // that pinned the old revision can otherwise never pass resume
+        // preflight, even though the operator just approved the new snapshot.
+        let runs_store = self.store.clone();
+        let runs_session_id = session.id.clone();
+        let runs =
+            tokio::task::spawn_blocking(move || runs_store.list_all_session_runs(&runs_session_id))
+                .await??;
+        let run_snapshots = runs
+            .into_iter()
+            .filter(|run| {
+                run.runtime_snapshot.is_some()
+                    && matches!(run.status.as_str(), "interrupted" | "failed")
+            })
+            .filter_map(|run| {
+                let current =
+                    current_run_snapshot(&session, &run, Some(&plan), plan_revision, &inputs);
+                serde_json::to_string(&current)
+                    .ok()
+                    .map(|json| (run.run_id, json, plan_revision))
+            })
+            .collect::<Vec<_>>();
         let store = self.store.clone();
         let id = session.id.clone();
         let payload_for_store = payload.clone();
         let event = tokio::task::spawn_blocking(move || {
-            store.migrate_plan_runtime_snapshot_with_event(&id, &snapshot_json, payload_for_store)
+            store.migrate_plan_runtime_snapshot_with_event(
+                &id,
+                &snapshot_json,
+                &run_snapshots,
+                payload_for_store,
+            )
         })
         .await??;
         let _ = self.events.send(event.clone());

@@ -323,7 +323,7 @@ impl Engine {
                 format!("gate {gate_id} does not exist"),
             )
         })?;
-        self.ensure_gate_session_live(&existing.gate.session_id)
+        self.ensure_gate_session_live(&existing.gate.session_id, false)
             .await?;
         if !verify_gate_token(token.expose(), &existing.token_hash) {
             return Err(gate_error(
@@ -380,7 +380,7 @@ impl Engine {
                 format!("gate {gate_id} does not exist"),
             )
         })?;
-        self.ensure_gate_session_live(&existing.gate.session_id)
+        self.ensure_gate_session_live(&existing.gate.session_id, true)
             .await?;
         let note = normalize_note(reason)?;
         let actor = normalize_actor(cancelled_by)?;
@@ -454,9 +454,16 @@ impl Engine {
             move || store.gate_counts(&session_id)
         })
         .await??;
+        let expected = match state {
+            Some(GateState::Open) => counts.open,
+            Some(GateState::Resolved) => counts.resolved,
+            Some(GateState::Expired) => counts.expired,
+            Some(GateState::Cancelled) => counts.cancelled,
+            None => counts.total,
+        };
         Ok(GateListResult {
             session_id,
-            truncated: counts.total > rows.len() as u64,
+            truncated: expected > rows.len() as u64,
             gates: rows.into_iter().map(|record| record.gate).collect(),
             counts,
         })
@@ -636,7 +643,7 @@ impl Engine {
         Ok((record.gate, continuation.continuation))
     }
 
-    async fn ensure_gate_session_live(&self, session_id: &str) -> Result<()> {
+    async fn ensure_gate_session_live(&self, session_id: &str, allow_landed: bool) -> Result<()> {
         let store = self.store().clone();
         let id = session_id.to_string();
         let session = tokio::task::spawn_blocking(move || store.get_session(&id))
@@ -648,10 +655,10 @@ impl Engine {
                 "imported sessions are read-only archives",
             ));
         }
-        if session.status == "landed" {
+        if session.status == "landed" && !allow_landed {
             return Err(gate_error(
                 codes::GATE_ARCHIVED,
-                "landed sessions are final",
+                "landed sessions are final; cancel an open gate instead of resolving it",
             ));
         }
         Ok(())

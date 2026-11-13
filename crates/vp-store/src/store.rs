@@ -6225,13 +6225,19 @@ impl Store {
         let now = now_rfc3339();
         let mut stored = receipt.clone();
         stored.resolved_at = Some(now.clone());
+        // A live completion may replace the sweep's synthetic `unknown` with
+        // the real probe result. Genuine unknown receipts stay terminal and
+        // still require explicit reconciliation.
         let changed = tx.execute(
             "UPDATE effect_receipts
              SET state = ?2, provider_key = COALESCE(?3, provider_key),
                  external_id = COALESCE(?4, external_id),
                  response_hash = COALESCE(?5, response_hash),
                  evidence_json = ?6, resolved_at = ?7
-             WHERE id = ?1 AND state = 'intent'",
+             WHERE id = ?1
+               AND (state = 'intent'
+                    OR (state = 'unknown'
+                        AND instr(evidence_json, 'stale_intent_sweep') > 0))",
             params![
                 stored.id,
                 stored.state.as_str(),
@@ -6434,11 +6440,15 @@ impl Store {
         let limit = limit.clamp(1, 1_000) as i64;
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
+        // Never sweep an intent owned by a live session. The grace period is a
+        // post-restart recovery bound, not a wall-clock timeout on a tool that
+        // is still running; a long `cargo test` must be allowed to settle.
         let mut statement = tx.prepare(
             "SELECT e.id, e.session_id, e.created_at
              FROM effect_receipts e
              JOIN sessions s ON s.id = e.session_id
              WHERE s.project_id = ?1 AND e.state = 'intent'
+               AND s.status NOT IN ('running', 'queued', 'paused', 'waiting_input')
              ORDER BY e.created_at ASC
              LIMIT ?2",
         )?;
@@ -21877,6 +21887,42 @@ impl Store {
         Ok(Some((agent, event)))
     }
 
+    /// Persist the project identity resolved for one run. The `agents` row is
+    /// the durable run→identity binding S6 attribution prefers; without this
+    /// write the column stayed NULL for every real run and performance silently
+    /// fell back to role/department heuristics.
+    pub fn set_agent_identity_with_snapshot(
+        &self,
+        id: &str,
+        identity_id: Option<&str>,
+    ) -> Result<Option<(AgentRecord, Event)>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE agents SET identity_id = ?1 WHERE id = ?2",
+            params![identity_id, id],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let agent = get_agent_tx(&tx, id)?;
+        let event = insert_event_tx(
+            &tx,
+            &agent.session_id,
+            "agent.identity_binding",
+            serde_json::json!({
+                "agent_id": id,
+                "identity_id": identity_id,
+                "agent": agent,
+            }),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some((agent, event)))
+    }
+
     pub fn set_agent_profile_with_snapshot(
         &self,
         id: &str,
@@ -22409,6 +22455,10 @@ impl Store {
         if existing.status == to {
             return Ok(None);
         }
+        // Pause is a cooperative status change: a live assignment remains
+        // until the run ends, but prompt selection already requires an active
+        // identity. Retirement is the terminal operation that must refuse
+        // live work unless S6 explicitly releases it.
         if existing.status != from {
             return Err(AgentIdentityError::new(
                 agent_identity_codes::IDENTITY_CONFLICT,
@@ -22465,6 +22515,16 @@ impl Store {
                 .into());
             }
             return Ok(None);
+        }
+        if identity_has_live_work_tx(&tx, &existing.id)? {
+            return Err(AgentIdentityError::new(
+                agent_identity_codes::IDENTITY_BUSY,
+                format!(
+                    "identity {} still owns an active assignment or workspace; use the S6 retirement path to release live work explicitly",
+                    existing.id
+                ),
+            )
+            .into());
         }
         if let Some(successor_id) = &successor {
             validate_identity_successor_tx(&tx, &existing.project_id, &existing.id, successor_id)?;
@@ -22553,12 +22613,81 @@ impl Store {
                 .into());
             }
         }
-        tx.execute(
-            "DELETE FROM agent_identities WHERE project_id = ?1",
-            params![project_id],
-        )?;
+        // Repair is deliberately non-destructive for live work. The previous
+        // implementation deleted every projection row and relied on
+        // INSERT OR REPLACE, whose delete half cascaded through S2
+        // assignments, the S2 inbox, S4 workspaces/bindings, and S5 identity
+        // memory. A generation mismatch could therefore erase live
+        // coordination state and still report a consistent projection.
+        //
+        // Now expected rows are upserted, only rows absent from the event
+        // stream are deleted, and any touched identity that still owns an
+        // active assignment or workspace fails the whole transaction closed.
+        let existing = {
+            let mut statement = tx.prepare(&format!(
+                "SELECT {AGENT_IDENTITY_COLUMNS} FROM agent_identities
+                 WHERE project_id = ?1 ORDER BY id ASC"
+            ))?;
+            statement
+                .query_map(params![project_id], map_agent_identity)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut expected = std::collections::BTreeMap::new();
         for identity in identities {
+            if expected.insert(identity.id.as_str(), identity).is_some() {
+                return Err(AgentIdentityError::new(
+                    agent_identity_codes::IDENTITY_CONFLICT,
+                    format!("replayed identity {} appears more than once", identity.id),
+                )
+                .into());
+            }
+        }
+        let actual = existing
+            .iter()
+            .map(|identity| (identity.id.as_str(), identity))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for identity in identities {
+            let changed = actual
+                .get(identity.id.as_str())
+                .is_some_and(|current| *current != identity);
+            if !changed && actual.contains_key(identity.id.as_str()) {
+                continue;
+            }
+            if identity_has_live_work_tx(&tx, &identity.id)? {
+                return Err(AgentIdentityError::new(
+                    agent_identity_codes::IDENTITY_REPAIR_LIVE_WORK,
+                    format!(
+                        "identity {} still owns an active assignment or workspace; end that work before repairing its projection",
+                        identity.id
+                    ),
+                )
+                .into());
+            }
             insert_agent_identity_row_tx(&tx, identity)?;
+        }
+        for identity in &existing {
+            if expected.contains_key(identity.id.as_str()) {
+                continue;
+            }
+            // Imported rows are archive evidence. Local events cannot prove
+            // they are wrong, so repair never deletes them.
+            if identity.origin == "imported" {
+                continue;
+            }
+            if identity_has_live_work_tx(&tx, &identity.id)? {
+                return Err(AgentIdentityError::new(
+                    agent_identity_codes::IDENTITY_REPAIR_LIVE_WORK,
+                    format!(
+                        "identity {} is absent from the event stream but still owns active work; refusing to delete it",
+                        identity.id
+                    ),
+                )
+                .into());
+            }
+            tx.execute(
+                "DELETE FROM agent_identities WHERE id = ?1 AND project_id = ?2",
+                params![identity.id, project_id],
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -24707,6 +24836,7 @@ impl Store {
         &self,
         session_id: &str,
         runtime_snapshot_json: &str,
+        run_snapshots: &[(String, String, u32)],
         payload: serde_json::Value,
     ) -> Result<Event> {
         let snapshot: vp_protocol::runtime::RuntimeSnapshot =
@@ -24720,6 +24850,25 @@ impl Store {
         )?;
         if changed == 0 {
             return Err(anyhow!("session not found: {session_id}"));
+        }
+        // An interrupted/failed run pinned to the old revision could never
+        // resume after an explicit plan migration: preflight rejects the
+        // revision mismatch and `plan.migrate` otherwise touches only the
+        // plan snapshot. Rewrite those run pins in the same transaction.
+        for (run_id, run_snapshot_json, plan_revision) in run_snapshots {
+            tx.execute(
+                "UPDATE session_runs
+                 SET runtime_snapshot_json = ?1, plan_revision = ?2, updated_at = ?3
+                 WHERE run_id = ?4 AND session_id = ?5
+                   AND status IN ('interrupted', 'failed')",
+                params![
+                    run_snapshot_json,
+                    *plan_revision as i64,
+                    now_rfc3339(),
+                    run_id,
+                    session_id
+                ],
+            )?;
         }
         let mut payload = payload;
         if let Some(object) = payload.as_object_mut() {
@@ -27759,15 +27908,24 @@ impl Store {
                 .query_row(
                     "SELECT payload FROM events
                      WHERE session_id = ?1
-                       AND type IN ('team_plan.submitted', 'team_plan.revised')
+                       AND type IN ('team_plan.submitted', 'team_plan.revised', 'plan.migrated')
                      ORDER BY seq DESC LIMIT 1",
                     params![session_id],
                     |row| row.get(0),
                 )
                 .optional()?;
+            // `plan.migrated` carries the updated snapshot under `snapshot`;
+            // plan lifecycle events use `runtime_snapshot`. Ignoring the
+            // migration event let a routine repair reintroduce the old
+            // (incompatible) snapshot.
             let snapshot_json = latest_plan_payload
                 .and_then(|payload| serde_json::from_str::<serde_json::Value>(&payload).ok())
-                .and_then(|payload| payload.get("runtime_snapshot").cloned())
+                .and_then(|payload| {
+                    payload
+                        .get("runtime_snapshot")
+                        .or_else(|| payload.get("snapshot"))
+                        .cloned()
+                })
                 .and_then(|snapshot| {
                     serde_json::from_value::<vp_protocol::runtime::RuntimeSnapshot>(snapshot).ok()
                 })
@@ -29044,10 +29202,16 @@ impl Store {
             .filter(|event| {
                 matches!(
                     event.kind.as_str(),
-                    "team_plan.submitted" | "team_plan.revised"
+                    "team_plan.submitted" | "team_plan.revised" | "plan.migrated"
                 )
             })
-            .find_map(|event| event.payload.get("runtime_snapshot").cloned())
+            .find_map(|event| {
+                event
+                    .payload
+                    .get("runtime_snapshot")
+                    .or_else(|| event.payload.get("snapshot"))
+                    .cloned()
+            })
             .and_then(|snapshot| {
                 serde_json::from_value::<vp_protocol::runtime::RuntimeSnapshot>(snapshot).ok()
             })
@@ -30701,6 +30865,37 @@ fn insert_agent_identity_row_tx(tx: &Transaction<'_>, identity: &AgentIdentity) 
     insert_agent_identity_row_conn(tx, identity)
 }
 
+/// True when an identity still owns live execution state. Projection repair
+/// must never rewrite or delete such a row: foreign-key cascades would erase
+/// assignments, inbox, workspaces, bindings, and identity memory for a live run.
+fn identity_has_live_work_tx(tx: &Transaction<'_>, identity_id: &str) -> Result<bool> {
+    let assignments: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM session_agent_assignments
+         WHERE identity_id = ?1 AND status = 'active'",
+        params![identity_id],
+        |row| row.get(0),
+    )?;
+    if assignments > 0 {
+        return Ok(true);
+    }
+    let bindings: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM session_worker_workspaces
+         WHERE identity_id = ?1 AND status = 'active'",
+        params![identity_id],
+        |row| row.get(0),
+    )?;
+    if bindings > 0 {
+        return Ok(true);
+    }
+    let workspaces: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM agent_workspaces
+         WHERE identity_id = ?1 AND status = 'active'",
+        params![identity_id],
+        |row| row.get(0),
+    )?;
+    Ok(workspaces > 0)
+}
+
 fn validate_agent_identity_row(identity: &AgentIdentity) -> Result<()> {
     if identity.id.trim().is_empty() || identity.project_id.trim().is_empty() {
         return Err(AgentIdentityError::new(
@@ -30744,12 +30939,32 @@ fn validate_agent_identity_row(identity: &AgentIdentity) -> Result<()> {
 fn insert_agent_identity_row_conn(conn: &Connection, identity: &AgentIdentity) -> Result<()> {
     validate_agent_identity_row(identity)?;
     let policy_json = serde_json::to_string(&identity.policy)?;
+    // Upsert, never INSERT OR REPLACE: REPLACE deletes the old row first, and
+    // the identity foreign keys cascade. An import or repair must not erase
+    // dependent coordination state just because the row already exists.
     conn.execute(
-        "INSERT OR REPLACE INTO agent_identities
+        "INSERT INTO agent_identities
          (id, project_id, role, department, component, title, profile, model,
           parent_identity_id, status, generation, created_at, updated_at, retired_at,
           successor_id, policy_json, origin)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+         ON CONFLICT(id) DO UPDATE SET
+            project_id = excluded.project_id,
+            role = excluded.role,
+            department = excluded.department,
+            component = excluded.component,
+            title = excluded.title,
+            profile = excluded.profile,
+            model = excluded.model,
+            parent_identity_id = excluded.parent_identity_id,
+            status = excluded.status,
+            generation = excluded.generation,
+            created_at = excluded.created_at,
+            updated_at = excluded.updated_at,
+            retired_at = excluded.retired_at,
+            successor_id = excluded.successor_id,
+            policy_json = excluded.policy_json,
+            origin = excluded.origin",
         params![
             identity.id,
             identity.project_id,

@@ -433,7 +433,7 @@ async fn inbox_lifecycle_counts_and_cross_project_rejections() {
         .await
         .unwrap();
     assert_eq!(sent.message.status, "unread");
-    assert_eq!(sent.message.from_label, manager);
+    assert_eq!(sent.message.from_label, "manager title");
     assert!(!sent.wake.requested);
 
     let listed = engine
@@ -695,7 +695,7 @@ async fn wake_is_an_idempotent_deferred_continuation_without_a_slot() {
         .await
         .unwrap();
     assert!(!second.created);
-    assert!(second.wake.created);
+    assert!(second.wake.created, "{:?}", second.wake);
     assert_eq!(
         second.wake.continuation_id, first.wake.continuation_id,
         "the operation receipt must replay the same continuation"

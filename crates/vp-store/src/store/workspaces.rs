@@ -1159,6 +1159,10 @@ impl Store {
                 ),
             ));
         }
+        // The binding and its workspace share one lease token. Release can
+        // then be owner-fenced: a stale session cannot clear a workspace lease
+        // that a different session has since acquired.
+        let lease_token = new_lease_token();
         match existing {
             Some(existing) => {
                 tx.execute(
@@ -1172,7 +1176,7 @@ impl Store {
                         request.branch,
                         request.base_commit,
                         now_text,
-                        new_lease_token(),
+                        lease_token.clone(),
                         expires,
                         existing.id
                     ],
@@ -1209,7 +1213,7 @@ impl Store {
                         binding.base_commit,
                         binding.created_at,
                         binding.updated_at,
-                        new_lease_token(),
+                        lease_token.clone(),
                         expires
                     ],
                 )?;
@@ -1220,7 +1224,7 @@ impl Store {
              SET lease_token = ?1, lease_expires_at = ?2, last_session_id = ?3, updated_at = ?4
              WHERE id = ?5",
             params![
-                new_lease_token(),
+                lease_token,
                 expires,
                 request.session_id,
                 now_text,
@@ -1274,6 +1278,11 @@ impl Store {
         let now_text = now_rfc3339();
         let mut events = Vec::new();
         for binding in bindings {
+            let binding_token: Option<String> = tx.query_row(
+                "SELECT lease_token FROM session_worker_workspaces WHERE id = ?1",
+                params![binding.id],
+                |row| row.get(0),
+            )?;
             tx.execute(
                 "UPDATE session_worker_workspaces
                  SET status = 'released', lease_token = NULL, lease_expires_at = NULL,
@@ -1281,11 +1290,22 @@ impl Store {
                  WHERE id = ?2 AND status = 'active'",
                 params![now_text, binding.id],
             )?;
+            // Owner-fenced: only clear the workspace lease when this binding's
+            // token still owns it (or this session is the recorded owner).
+            // A stale session ending after expiry/reclaim must not clear the
+            // new session's live lease.
             tx.execute(
                 "UPDATE agent_workspaces
                  SET lease_token = NULL, lease_expires_at = NULL, updated_at = ?1
-                 WHERE id = ?2 AND project_id = ?3",
-                params![now_text, binding.workspace_id, project_id],
+                 WHERE id = ?2 AND project_id = ?3
+                   AND (lease_token = ?4 OR last_session_id = ?5)",
+                params![
+                    now_text,
+                    binding.workspace_id,
+                    project_id,
+                    binding_token,
+                    session_id
+                ],
             )?;
             let released = get_session_workspace_tx(&tx, session_id, &binding.identity_id)?
                 .ok_or_else(|| anyhow!("session workspace disappeared during release"))?;
@@ -1312,6 +1332,117 @@ impl Store {
         }
         tx.commit()?;
         Ok(events)
+    }
+
+    /// Heartbeat one session's active Worker workspace binding(s).
+    ///
+    /// A plan task can outlive the short lease that was taken when the run
+    /// attached. The run loop calls this at turn/tool boundaries. Renewal
+    /// rotates the binding token and the workspace token together, never
+    /// revives an already-expired lease, and never renews a workspace whose
+    /// token now belongs to a different session.
+    pub fn renew_session_worker_workspaces(
+        &self,
+        session_id: &str,
+        identity_id: Option<&str>,
+        lease_secs: Option<u64>,
+        operator: Option<&str>,
+    ) -> Result<Vec<WorkspaceMutation>> {
+        let lease_secs = normalize_workspace_lease_secs(lease_secs)?;
+        let operator = validate_operator(operator)?;
+        let now = OffsetDateTime::now_utc();
+        let now_text = format_time(now)?;
+        let expires = lease_expiry(now, lease_secs)?;
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_session_open_tx(&tx, session_id)?;
+        let project_id = project_for_session_tx(&tx, session_id)?;
+        let bindings = {
+            let mut statement = tx.prepare(&format!(
+                "{SESSION_WORKSPACE_SELECT}
+                 WHERE session_id = ?1 AND status = 'active'
+                   AND (?2 IS NULL OR identity_id = ?2)"
+            ))?;
+            statement
+                .query_map(params![session_id, identity_id], map_session_workspace)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut mutations = Vec::with_capacity(bindings.len());
+        for binding in bindings {
+            let (binding_token, binding_expiry): (Option<String>, Option<String>) = tx.query_row(
+                "SELECT lease_token, lease_expires_at
+                     FROM session_worker_workspaces WHERE id = ?1",
+                params![binding.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let live = binding_expiry
+                .as_deref()
+                .and_then(parse_time)
+                .is_some_and(|expiry| expiry > now);
+            if !live {
+                return Err(workspace_error(
+                    agent_workspace_codes::WORKSPACE_LEASE_EXPIRED,
+                    "the Worker workspace lease expired before it could be renewed; re-attach the workspace",
+                ));
+            }
+            let workspace = get_workspace_tx(&tx, &binding.workspace_id)?.ok_or_else(|| {
+                workspace_error(
+                    agent_workspace_codes::WORKSPACE_NOT_FOUND,
+                    format!("workspace not found: {}", binding.workspace_id),
+                )
+            })?;
+            ensure_local_active(&workspace)?;
+            let workspace_token: Option<String> = tx.query_row(
+                "SELECT lease_token FROM agent_workspaces WHERE id = ?1",
+                params![workspace.id],
+                |row| row.get(0),
+            )?;
+            if workspace_token != binding_token {
+                return Err(workspace_error(
+                    agent_workspace_codes::WORKSPACE_CONFLICT,
+                    "workspace lease is owned by another session or operator; re-attach before renewing",
+                ));
+            }
+            let token = new_lease_token();
+            tx.execute(
+                "UPDATE session_worker_workspaces
+                 SET lease_token = ?1, lease_expires_at = ?2, updated_at = ?3
+                 WHERE id = ?4 AND status = 'active'",
+                params![token, expires, now_text, binding.id],
+            )?;
+            tx.execute(
+                "UPDATE agent_workspaces
+                 SET lease_token = ?1, lease_expires_at = ?2, updated_at = ?3
+                 WHERE id = ?4 AND status = 'active'",
+                params![token, expires, now_text, workspace.id],
+            )?;
+            let workspace = get_workspace_tx(&tx, &workspace.id)?
+                .ok_or_else(|| anyhow!("workspace disappeared during lease renewal"))?;
+            let binding = get_session_workspace_tx(&tx, session_id, &workspace.identity_id)?
+                .ok_or_else(|| anyhow!("session workspace disappeared during lease renewal"))?;
+            let event = insert_workspace_event_tx(
+                &tx,
+                &project_id,
+                vp_protocol::types::AGENT_WORKSPACE_LEASE_RENEWED_EVENT,
+                &workspace,
+                Some(&binding),
+                Some((
+                    "operator",
+                    serde_json::json!({
+                        "operator": operator,
+                        "reason": "run_heartbeat",
+                    }),
+                )),
+            )?;
+            mutations.push(WorkspaceMutation {
+                workspace,
+                session: Some(binding),
+                changed: true,
+                events: vec![event],
+            });
+        }
+        tx.commit()?;
+        Ok(mutations)
     }
 
     /// Record one internal Labour→Worker merge. The Git outcome is passed in by

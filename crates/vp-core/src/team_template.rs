@@ -2257,7 +2257,10 @@ impl Engine {
                 "project_id is required",
             ));
         }
-        if params.apply && !params.approved && !force_preview && !params.dry_run {
+        // `dry_run` is a preview request, never a way to skip the approval
+        // gate. Apply always requires explicit approval; the preview entry
+        // point passes `force_preview` instead of `apply`.
+        if params.apply && !params.approved && !force_preview {
             return Err(template_error(
                 team_template_codes::TEMPLATE_APPROVAL_REQUIRED,
                 "applying a team template requires explicit approved: true",
@@ -2275,6 +2278,7 @@ impl Engine {
         let pending_requests = vp_store::store::employment::list_agent_hire_requests(
             &store,
             &vp_protocol::types::AgentHireListParams {
+                identity_id: None,
                 project_id: project.id.clone(),
                 status: Some("pending".to_string()),
                 limit: Some(500),
@@ -2297,19 +2301,21 @@ impl Engine {
             &context,
         )?;
         let mut warnings = plan.preview.warnings.clone();
+        // A dry run always returns the preview, even if `apply` was also set.
+        // Mutations happen only on the explicit apply path below.
+        if force_preview || params.dry_run {
+            return Ok(TeamTemplateImportResult {
+                project_id: project.id,
+                template,
+                preview: plan.preview,
+                applied: false,
+                changed: false,
+                entry: None,
+                pending_hire_request_ids: Vec::new(),
+                warnings,
+            });
+        }
         if !params.apply {
-            if force_preview || params.dry_run {
-                return Ok(TeamTemplateImportResult {
-                    project_id: project.id,
-                    template,
-                    preview: plan.preview,
-                    applied: false,
-                    changed: false,
-                    entry: None,
-                    pending_hire_request_ids: Vec::new(),
-                    warnings,
-                });
-            }
             // Import-only: register the read-only library record. It creates no
             // link, identity, hire request, or policy change.
             let register = template.clone();
@@ -2512,6 +2518,7 @@ impl Engine {
         let pending_requests = vp_store::store::employment::list_agent_hire_requests(
             &store,
             &vp_protocol::types::AgentHireListParams {
+                identity_id: None,
                 project_id: project.id.clone(),
                 status: Some("pending".to_string()),
                 limit: Some(500),
@@ -2989,6 +2996,7 @@ mod tests {
         let requests = vp_store::store::employment::list_agent_hire_requests(
             engine.store(),
             &vp_protocol::types::AgentHireListParams {
+                identity_id: None,
                 project_id: target_id.clone(),
                 status: Some("pending".to_string()),
                 limit: Some(50),
@@ -3026,6 +3034,7 @@ mod tests {
         let requests = vp_store::store::employment::list_agent_hire_requests(
             engine.store(),
             &vp_protocol::types::AgentHireListParams {
+                identity_id: None,
                 project_id: target_id.clone(),
                 status: Some("pending".to_string()),
                 limit: Some(50),
@@ -3300,6 +3309,7 @@ mod tests {
         let requests = vp_store::store::employment::list_agent_hire_requests(
             engine.store(),
             &vp_protocol::types::AgentHireListParams {
+                identity_id: None,
                 project_id: target_id.clone(),
                 status: None,
                 limit: Some(50),
@@ -3555,6 +3565,7 @@ mod tests {
         let requests = vp_store::store::employment::list_agent_hire_requests(
             &import_store,
             &vp_protocol::types::AgentHireListParams {
+                identity_id: None,
                 project_id: target_id.clone(),
                 status: None,
                 limit: Some(50),
@@ -3648,5 +3659,101 @@ mod tests {
         let decoded: vp_protocol::types::SessionBundle =
             serde_json::from_str(&encoded).expect("decode");
         assert_eq!(decoded.team_templates.len(), bundle.team_templates.len());
+    }
+
+    #[tokio::test]
+    async fn apply_with_dry_run_still_requires_approval() {
+        let dir = TempDir::new().expect("tempdir");
+        let (engine, source_id) = test_engine(&dir, "source");
+        source_project(&engine, &source_id).await;
+        let export = engine
+            .export_team_template(export_params(&source_id, "Platform Team"))
+            .await
+            .expect("export");
+        let (engine, target_id) = test_engine(&dir, "target");
+        enable_identity_policy(&engine, &target_id).await;
+        create_identity(&engine, &target_id, "leader", "Leader", None, None, None).await;
+        let error = engine
+            .import_team_template(
+                TeamTemplateImportParams {
+                    project_id: target_id.clone(),
+                    json: export.json.clone(),
+                    dry_run: true,
+                    apply: true,
+                    approved: false,
+                    operator: Some("test".to_string()),
+                    resolutions: Vec::new(),
+                },
+                vec!["test-model".to_string()],
+            )
+            .await
+            .unwrap_err();
+        let typed = error.downcast_ref::<AgentIdentityError>().expect("typed");
+        assert_eq!(
+            typed.code,
+            vp_protocol::types::team_template_codes::TEMPLATE_APPROVAL_REQUIRED
+        );
+        // A dry run returns a preview even when approval is supplied.
+        let preview = engine
+            .import_team_template(
+                TeamTemplateImportParams {
+                    project_id: target_id.clone(),
+                    json: export.json.clone(),
+                    dry_run: true,
+                    apply: true,
+                    approved: true,
+                    operator: Some("test".to_string()),
+                    resolutions: Vec::new(),
+                },
+                vec!["test-model".to_string()],
+            )
+            .await
+            .expect("preview");
+        assert!(!preview.applied);
+        assert!(preview.entry.is_none());
+        assert!(
+            vp_store::store::employment::list_agent_hire_requests(
+                engine.store(),
+                &vp_protocol::types::AgentHireListParams {
+                    project_id: target_id.clone(),
+                    ..vp_protocol::types::AgentHireListParams::default()
+                },
+            )
+            .expect("requests")
+            .requests
+            .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn template_reads_are_project_scoped() {
+        let dir = TempDir::new().expect("tempdir");
+        let (engine, source_id) = test_engine(&dir, "source");
+        source_project(&engine, &source_id).await;
+        let export = engine
+            .export_team_template(export_params(&source_id, "Platform Team"))
+            .await
+            .expect("export");
+        let (engine, target_id) = test_engine(&dir, "target");
+        enable_identity_policy(&engine, &target_id).await;
+        create_identity(&engine, &target_id, "leader", "Leader", None, None, None).await;
+        let error = engine
+            .get_team_template(&export.template.template_id, Some(&target_id))
+            .await
+            .expect_err("a project that never imported the template must not read it");
+        assert_eq!(
+            error
+                .downcast_ref::<AgentIdentityError>()
+                .map(|typed| typed.code),
+            Some(vp_protocol::types::team_template_codes::TEMPLATE_NOT_FOUND)
+        );
+        assert!(
+            engine
+                .list_team_templates(Some(target_id.clone()), Some(10))
+                .await
+                .expect("list")
+                .templates
+                .is_empty()
+        );
     }
 }

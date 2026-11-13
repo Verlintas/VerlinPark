@@ -122,6 +122,10 @@ pub struct DiagnosisInput {
     pub target_task_id: Option<String>,
     pub include_graph: bool,
     pub assignments: Vec<DiagnosisAssignment>,
+    /// A task that started but never finished is `running` only while the
+    /// session is live; after a crash it is `interrupted`, not an eternal
+    /// in-flight task.
+    pub session_active: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -327,7 +331,14 @@ pub fn build_provenance_graph(session_id: &str, events: &[Event]) -> ProvenanceG
 /// window; this function does not touch SQLite, Git, providers, approvals, or
 /// the merge queue.
 pub fn diagnose(input: &DiagnosisInput) -> SessionDiagnosisResult {
-    let scan = scan_events(&input.events);
+    let mut scan = scan_events(&input.events);
+    if !input.session_active {
+        for task in scan.tasks.values_mut() {
+            if task.status == "running" {
+                task.status = "interrupted".to_string();
+            }
+        }
+    }
     let mut graph = build_graph(&input.session_id, &scan);
     let mut warnings = Vec::new();
     let mut truncated = false;
@@ -630,16 +641,19 @@ impl crate::Engine {
         }
         let session_id = session_id.to_string();
         let store = self.store.clone();
-        let (events, total_events, assignments) = tokio::task::spawn_blocking({
+        let (events, total_events, assignments, session_active) = tokio::task::spawn_blocking({
             let session_id = session_id.clone();
-            move || -> Result<(Vec<Event>, u64, Vec<DiagnosisAssignment>)> {
-                if store.get_session(&session_id)?.is_none() {
-                    return Err(DiagnosisError::new(
+            move || -> Result<(Vec<Event>, u64, Vec<DiagnosisAssignment>, bool)> {
+                let session = store.get_session(&session_id)?.ok_or_else(|| {
+                    DiagnosisError::new(
                         codes::DIAGNOSIS_SESSION_NOT_FOUND,
                         format!("session not found: {session_id}"),
                     )
-                    .into());
-                }
+                })?;
+                let session_active = matches!(
+                    session.status.as_str(),
+                    "running" | "queued" | "paused" | "waiting_input"
+                );
                 let events = store.list_recent_events_window(&session_id, limit)?;
                 let total_events = store.event_count(&session_id)?;
                 let assignments = store
@@ -653,7 +667,7 @@ impl crate::Engine {
                         lease_expires_at: assignment.lease_expires_at,
                     })
                     .collect();
-                Ok((events, total_events, assignments))
+                Ok((events, total_events, assignments, session_active))
             }
         })
         .await??;
@@ -664,6 +678,7 @@ impl crate::Engine {
             target_task_id,
             include_graph,
             assignments,
+            session_active,
         };
         Ok(diagnose(&input))
     }
@@ -1101,6 +1116,7 @@ fn scan_tool_finished(scan: &mut Scan, event: &Event) {
     entry.is_error = is_error;
     entry.error_code = text(&event.payload, "error_code").map(str::to_string);
     if name == "run_project_task"
+        && run_project_task_is_test(&event.payload)
         && let Some(task_id) = task_id
     {
         scan.tests.push(TestState {
@@ -1114,6 +1130,42 @@ fn scan_tool_finished(scan: &mut Scan, event: &Event) {
             inputs_hash: None,
         });
     }
+}
+
+/// A `run_project_task` is test evidence only when its structured result says
+/// it was a test run (kind or command). A build/lint task must not become a
+/// passing check that drives a false-consensus finding.
+fn run_project_task_is_test(payload: &serde_json::Value) -> bool {
+    let structured = payload.get("structured").unwrap_or(payload);
+    let result = structured.get("result").unwrap_or(structured);
+    if result.get("kind").and_then(serde_json::Value::as_str) == Some("test") {
+        return true;
+    }
+    result
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(command_indicates_test)
+}
+
+fn command_indicates_test(command: &str) -> bool {
+    command
+        .to_ascii_lowercase()
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|token| {
+            matches!(
+                token,
+                "test"
+                    | "tests"
+                    | "pytest"
+                    | "vitest"
+                    | "jest"
+                    | "rspec"
+                    | "phpunit"
+                    | "ctest"
+                    | "tox"
+                    | "unittest"
+            )
+        })
 }
 
 fn scan_artifact(scan: &mut Scan, event: &Event) {
@@ -2809,16 +2861,29 @@ fn false_consensus_findings(
     target: &DiagnosisTarget,
 ) -> Option<Vec<AttributionFinding>> {
     let merge_failure = target.kind == "merge_queue" || target.kind == "integration";
-    let merge_for_task = scan.merges.values().find(|merge| {
-        merge.task_id.as_deref() == Some(task.id.as_str())
-            && matches!(merge.status.as_str(), "conflict" | "failed" | "interrupted")
-    });
+    let merge_for_task = scan
+        .merges
+        .values()
+        .filter(|merge| {
+            merge.task_id.as_deref() == Some(task.id.as_str())
+                && matches!(merge.status.as_str(), "conflict" | "failed" | "interrupted")
+        })
+        .max_by_key(|merge| merge.seq);
     if !merge_failure && merge_for_task.is_none() {
         return None;
     }
     let failure_seq = merge_for_task
         .map(|merge| merge.seq)
         .unwrap_or(target.at_seq);
+    // A failed-then-retried-and-merged task is not false consensus. Only a
+    // failure that remains the latest merge outcome counts.
+    if scan.merges.values().any(|merge| {
+        merge.task_id.as_deref() == Some(task.id.as_str())
+            && merge.status == "merged"
+            && merge.seq > failure_seq
+    }) {
+        return None;
+    }
     let verifier = scan
         .verifications
         .iter()
@@ -3464,6 +3529,7 @@ mod tests {
                 "agent_name": format!("Worker {task}"),
                 "agent_role": "worker",
                 "is_error": !passed,
+                "structured": {"kind": "test", "command": "cargo test"},
             }),
         )
     }
@@ -3516,6 +3582,7 @@ mod tests {
             target_task_id: target.map(str::to_string),
             include_graph,
             assignments: Vec::new(),
+            session_active: true,
         };
         input.total_events = input.events.len() as u64;
         input

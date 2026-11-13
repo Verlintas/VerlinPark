@@ -383,8 +383,11 @@ async fn caps_retirement_and_imported_read_only_are_typed() {
         .unwrap_err();
     assert_eq!(typed_code(&error), agent_identity_codes::IDENTITY_RETIRED);
 
+    // Use a Worker snapshot: a second live Leader would correctly violate the
+    // one-live-Leader constraint even for imported evidence.
     let mut imported = leader.identity.clone();
-    imported.id = "imported-leader".to_string();
+    imported.id = "imported-worker".to_string();
+    imported.role = "worker".to_string();
     imported.origin = "imported".to_string();
     imported.status = "active".to_string();
     engine
