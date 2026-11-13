@@ -2147,13 +2147,16 @@ fn validate_session_bundle(bundle: &SessionBundle) -> Result<()> {
         if record.id.trim().is_empty() || record.template.template_id != record.id {
             return Err(anyhow!("bundle template has an invalid id"));
         }
+        let recomputed = vp_protocol::types::compute_team_template_hash(&record.template)
+            .map_err(|error| anyhow!("bundle template {} cannot be hashed: {error}", record.id))?;
         if record.template.content_hash != record.content_hash
+            || record.content_hash != recomputed
             || record.template.name != record.name
             || record.template.version != record.version
             || record.template.schema_version != record.schema_version
         {
             return Err(anyhow!(
-                "bundle template {} metadata does not match its portable body",
+                "bundle template {} metadata does not match its portable body or recomputed hash",
                 record.id
             ));
         }
@@ -3310,6 +3313,7 @@ impl Store {
                 template_id TEXT NOT NULL REFERENCES team_templates(id) ON DELETE CASCADE,
                 applied_at  TEXT NOT NULL,
                 applied_by  TEXT,
+                origin      TEXT NOT NULL DEFAULT 'local',
                 PRIMARY KEY (project_id, template_id)
             );
 
@@ -5350,6 +5354,12 @@ impl Store {
             "TEXT NOT NULL DEFAULT 'stdio'",
         )?;
         ensure_column(&conn, "mcp_servers", "url", "TEXT")?;
+        ensure_column(
+            &conn,
+            "project_team_templates",
+            "origin",
+            "TEXT NOT NULL DEFAULT 'local'",
+        )?;
         ensure_column(
             &conn,
             "mcp_servers",
@@ -20717,26 +20727,41 @@ impl Store {
     /// The payload is the same JSON already stored for mirror/replay; callers
     /// read only allowlisted structural fields.
     pub fn list_recent_events_window(&self, session_id: &str, limit: u32) -> Result<Vec<Event>> {
-        let conn = self.lock()?;
-        let mut statement = conn.prepare(
-            "SELECT session_id, seq, type, payload, created_at
-             FROM events WHERE session_id = ?1
-             ORDER BY seq DESC LIMIT ?2",
-        )?;
-        let rows = statement.query_map(
-            params![session_id, i64::from(limit.clamp(1, 50_000))],
-            |row| {
-                let payload: String = row.get(3)?;
-                Ok(Event {
-                    session_id: row.get(0)?,
-                    seq: row.get::<_, i64>(1)? as u64,
-                    kind: row.get(2)?,
-                    payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
-                    created_at: row.get(4)?,
-                })
-            },
-        )?;
-        let mut events = rows.collect::<Result<Vec<_>, _>>()?;
+        // Read payload strings under the global SQLite lock, then decode after
+        // releasing it. Diagnosis/replay windows can be tens of thousands of
+        // rows; parsing them while holding the lock stalled every other session.
+        let rows = {
+            let conn = self.lock()?;
+            let mut statement = conn.prepare(
+                "SELECT session_id, seq, type, payload, created_at
+                 FROM events WHERE session_id = ?1
+                 ORDER BY seq DESC LIMIT ?2",
+            )?;
+            statement
+                .query_map(
+                    params![session_id, i64::from(limit.clamp(1, 50_000))],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    },
+                )?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut events = rows
+            .into_iter()
+            .map(|(session_id, seq, kind, payload, created_at)| Event {
+                session_id,
+                seq: seq.max(0) as u64,
+                kind,
+                payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
+                created_at,
+            })
+            .collect::<Vec<_>>();
         events.reverse();
         Ok(events)
     }
@@ -28999,10 +29024,11 @@ impl Store {
             }
         }
         for link in &bundle.project_team_templates {
+            // Restored links are archive evidence, never a local apply.
             tx.execute(
                 "INSERT OR IGNORE INTO project_team_templates
-                 (project_id, template_id, applied_at, applied_by)
-                 VALUES (?1, ?2, ?3, ?4)",
+                 (project_id, template_id, applied_at, applied_by, origin)
+                 VALUES (?1, ?2, ?3, ?4, 'imported')",
                 params![
                     link.project_id,
                     link.template_id,

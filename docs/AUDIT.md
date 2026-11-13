@@ -239,6 +239,25 @@ Remaining gaps (explicitly not solved):
 
 Verification: 3,887 Rust tests passed; app + helper Swift suites passed.
 
+## 0.18 2026-11-13 Production hardening round two
+
+ADR-0214 closes four remaining gaps from round one: `orchestration.replay` now
+reads a bounded newest-event window (20k) and reports truncation; diagnosis/replay
+decode JSON outside the global SQLite lock; OTel export supports `offset` /
+`next_offset` / `retryable` and the CLI/Swift surfaces carry them; team template
+bundles recompute the content hash in `vp-store`, and imported template links are
+`origin=imported`, read-only, and not counted as locally applied. The org chart
+orders Leader/Manager/Worker before truncation, and the `vp-remote` cancellation
+test no longer races its default timeout.
+
+Still open: S5 prune is projection-only (events retain memory content); S8 bundle
+import recomputes the hash but does not run the full shape validator; S6
+attribution is conservative without a run binding; S7 recomputes the performance
+ledger and has no automated UI suite; no coverage/seeded-migration/adversarial
+corpus is committed.
+
+Verification: 3,890 Rust tests passed; app + helper Swift suites passed.
+
 ## 0. 2026-10-30 跟进
 
 第一轮硬化已完成（同一 `main` 线，提交见仓库历史）：

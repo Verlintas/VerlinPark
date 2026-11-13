@@ -1045,6 +1045,7 @@ impl Engine {
         &self,
         session_id: &str,
         limit: Option<u32>,
+        offset: Option<u32>,
     ) -> Result<OtelExportResult> {
         let store = self.store().clone();
         let lookup = session_id.to_string();
@@ -1069,17 +1070,23 @@ impl Engine {
         let cap = limit
             .unwrap_or(policy.batch_limit)
             .clamp(1, MAX_OTEL_BATCH_LIMIT) as usize;
-        // Export the newest spans. Selecting the head made repeated limited
-        // exports replay the same early spans forever and never reach later
-        // agents/tools. A cursor is still absent, so `truncated` stays honest.
-        let start = projected.spans.len().saturating_sub(cap);
-        let selected = &projected.spans[start..];
-        let truncated = events_truncated || start > 0;
+        // Page from the explicit offset. An omitted offset starts at the
+        // oldest span so a caller can walk the whole session deterministically
+        // with `next_offset`; repeated default calls no longer re-export the
+        // same head.
+        let offset = offset.unwrap_or(0) as usize;
+        let start = offset.min(projected.spans.len());
+        let end = start.saturating_add(cap).min(projected.spans.len());
+        let selected = &projected.spans[start..end];
+        let truncated = events_truncated || end < projected.spans.len();
+        let next_offset = (end < projected.spans.len()).then_some(end as u64);
         let mut result = OtelExportResult {
             session_id: session_id.to_string(),
             endpoint: endpoint.traces_url.clone(),
             available_spans: available,
             truncated,
+            offset: start as u64,
+            next_offset,
             generated_at: now_rfc3339(),
             ..OtelExportResult::default()
         };
@@ -1133,18 +1140,19 @@ impl Engine {
                     result.exported = true;
                     result.status = "exported".to_string();
                 } else {
+                    let status = response.status().as_u16();
                     result.status = "failed".to_string();
                     result.error_code = Some(otel_codes::OTEL_EXPORT_FAILED.to_string());
-                    result.message = Some(format!(
-                        "the local collector returned HTTP {}",
-                        response.status().as_u16()
-                    ));
+                    result.retryable = status >= 500 || status == 429;
+                    result.message = Some(format!("the local collector returned HTTP {status}"));
                 }
             }
             Err(error) => {
                 result.duration_ms = started.elapsed().as_millis() as u64;
                 result.status = "failed".to_string();
                 result.error_code = Some(otel_codes::OTEL_EXPORT_FAILED.to_string());
+                // Connection refused/timeouts are usually transient.
+                result.retryable = true;
                 result.message = Some(bounded_error(&error));
             }
         }
@@ -1746,7 +1754,7 @@ mod tests {
         assert!(!policy.enabled);
         let error = fixture
             .engine
-            .otel_export(&fixture.session.id, None)
+            .otel_export(&fixture.session.id, None, None)
             .await
             .unwrap_err();
         assert_eq!(code(&error), otel_codes::OTEL_DISABLED);
@@ -1798,7 +1806,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/traces"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-            .expect(3)
+            .expect(4)
             .mount(&mock)
             .await;
         let fixture = fixture().await;
@@ -1825,7 +1833,7 @@ mod tests {
             .unwrap();
         let result = fixture
             .engine
-            .otel_export(&fixture.session.id, None)
+            .otel_export(&fixture.session.id, None, None)
             .await
             .unwrap();
         assert!(result.exported, "{result:?}");
@@ -1834,15 +1842,30 @@ mod tests {
         assert_eq!(result.span_count, 4);
         assert_eq!(result.available_spans, 4);
         assert!(!result.truncated);
+        assert_eq!(result.offset, 0);
+        assert_eq!(result.next_offset, None);
+        assert!(!result.retryable);
         assert!(result.request_bytes > 0);
         let bounded = fixture
             .engine
-            .otel_export(&fixture.session.id, Some(2))
+            .otel_export(&fixture.session.id, Some(2), None)
             .await
             .unwrap();
         assert!(bounded.exported);
         assert_eq!(bounded.span_count, 2);
+        assert_eq!(bounded.offset, 0);
+        assert_eq!(bounded.next_offset, Some(2));
         assert!(bounded.truncated);
+        let second_page = fixture
+            .engine
+            .otel_export(&fixture.session.id, Some(2), Some(2))
+            .await
+            .unwrap();
+        assert!(second_page.exported);
+        assert_eq!(second_page.span_count, 2);
+        assert_eq!(second_page.offset, 2);
+        assert_eq!(second_page.next_offset, None);
+        assert!(!second_page.truncated);
 
         let requests = mock.received_requests().await.unwrap();
         let body = String::from_utf8(requests[0].body.clone()).unwrap();
@@ -1864,8 +1887,8 @@ mod tests {
         assert!(test.ok, "{test:?}");
         assert_eq!(test.http_status, Some(200));
         let requests = mock.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 3);
-        let test_body = String::from_utf8(requests[2].body.clone()).unwrap();
+        assert_eq!(requests.len(), 4);
+        let test_body = String::from_utf8(requests[3].body.clone()).unwrap();
         assert!(test_body.contains("verlinpark.otel.test"));
         assert!(!test_body.contains(&fixture.session.id));
         mock.verify().await;
@@ -1904,7 +1927,7 @@ mod tests {
             .unwrap();
         let error = fixture
             .engine
-            .otel_export(&fixture.session.id, None)
+            .otel_export(&fixture.session.id, None, None)
             .await
             .unwrap_err();
         assert_eq!(code(&error), otel_codes::OTEL_DISABLED);
@@ -1947,7 +1970,7 @@ mod tests {
             .unwrap();
         let result = fixture
             .engine
-            .otel_export(&fixture.session.id, None)
+            .otel_export(&fixture.session.id, None, None)
             .await
             .unwrap();
         assert!(!result.exported);

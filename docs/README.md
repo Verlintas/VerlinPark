@@ -31,6 +31,7 @@
 | **Current** | [PROJECT_SCOPED_AGENT_IDENTITIES_PLAN.md](PROJECT_SCOPED_AGENT_IDENTITIES_PLAN.md) | 并行计划：project-scoped 稳定 Leader/Manager/Worker 身份（S1–S8 已完成）、session assignment、agent inbox、Worker workspace、身份记忆、招聘/退休/绩效、团队模板；Labour 仍 task-scoped |
 | **Current** | [project-scoped-agent-identities-plan.json](project-scoped-agent-identities-plan.json) | project-scoped 身份计划 S1–S8、依赖、迁移、测试、验收、非目标 |
 | **Current** | [adr/0213-production-hardening-round.md](adr/0213-production-hardening-round.md) | C1–C6 / S1–S8 生产审查修复：非破坏性 identity repair、lease heartbeat、workspace base/land、effect/gate/template 隔离；含未解决缺口 |
+| **Current** | [adr/0214-hardening-round-two.md](adr/0214-hardening-round-two.md) | 硬化第二轮：bounded replay/lock-free event decode、OTel offset/retryable、template snapshot hash/provenance、org truncation order |
 | **Reference** | [OBSCURA_ASSESSMENT.md](OBSCURA_ASSESSMENT.md) | Obscura（Rust/V8/CDP/MCP headless browser）评估：适用场景、安全约束、三种集成方案、结论为 cache 轮之后再做可选外部网页后端 |
 | **Reference** | [PRIDE_FLAGS.md](PRIDE_FLAGS.md) | Pride flag 资产来源与许可 |
 | **Reference** | [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) | FlagKit 等第三方资产许可 |

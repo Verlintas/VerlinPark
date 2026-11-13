@@ -228,23 +228,27 @@ fn entry_for_template(
     project_id: Option<&str>,
 ) -> Result<TeamTemplateEntry> {
     let conn = store.lock()?;
-    let (applied_at, applied_by): (Option<String>, Option<String>) = match project_id {
-        Some(project_id) => conn
-            .query_row(
-                "SELECT applied_at, applied_by FROM project_team_templates
-                 WHERE project_id = ?1 AND template_id = ?2",
-                params![project_id, record.id],
-                |row| Ok((Some(row.get(0)?), row.get(1)?)),
-            )
-            .optional()?
-            .unwrap_or((None, None)),
-        None => (None, None),
-    };
-    let read_only = applied_at.is_none()
-        && match project_id {
-            Some(project) => record.source_project_id.as_deref() != Some(project),
-            None => true,
+    let (applied_at, applied_by, origin): (Option<String>, Option<String>, Option<String>) =
+        match project_id {
+            Some(project_id) => conn
+                .query_row(
+                    "SELECT applied_at, applied_by, origin FROM project_team_templates
+                     WHERE project_id = ?1 AND template_id = ?2",
+                    params![project_id, record.id],
+                    |row| Ok((Some(row.get(0)?), row.get(1)?, Some(row.get(2)?))),
+                )
+                .optional()?
+                .unwrap_or((None, None, None)),
+            None => (None, None, None),
         };
+    let origin = origin.unwrap_or_else(vp_protocol::types::default_team_template_origin);
+    let locally_applied = applied_at.is_some() && origin == "local";
+    let read_only = !locally_applied
+        && (origin == "imported"
+            || match project_id {
+                Some(project) => record.source_project_id.as_deref() != Some(project),
+                None => true,
+            });
     // Never leak another project's local id through a shared library entry.
     let source_project = match project_id {
         Some(project) if record.source_project_id.as_deref() != Some(project) => None,
@@ -258,10 +262,11 @@ fn entry_for_template(
         content_hash: record.content_hash.clone(),
         created_at: record.created_at.clone(),
         source_project,
-        applied: applied_at.is_some(),
+        applied: locally_applied,
         applied_at,
         applied_by,
         read_only,
+        origin,
     })
 }
 
@@ -393,7 +398,7 @@ pub fn apply_team_template(
     let already_applied: Option<(String, Option<String>)> = tx
         .query_row(
             "SELECT applied_at, applied_by FROM project_team_templates
-             WHERE project_id = ?1 AND template_id = ?2",
+             WHERE project_id = ?1 AND template_id = ?2 AND origin = 'local'",
             params![project_id, template.template_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -478,8 +483,13 @@ pub fn apply_team_template(
     if !was_applied {
         let applied_at = now_rfc3339();
         tx.execute(
-            "INSERT INTO project_team_templates (project_id, template_id, applied_at, applied_by)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO project_team_templates
+             (project_id, template_id, applied_at, applied_by, origin)
+             VALUES (?1, ?2, ?3, ?4, 'local')
+             ON CONFLICT(project_id, template_id) DO UPDATE SET
+                applied_at = excluded.applied_at,
+                applied_by = excluded.applied_by,
+                origin = 'local'",
             params![project_id, template.template_id, applied_at, operator],
         )?;
     }
@@ -647,7 +657,7 @@ pub fn list_team_templates(
             let mut statement = conn.prepare(
                 "SELECT t.id, t.name, t.version, t.schema_version, t.content_hash, t.json,
                         t.created_at, t.source_project_id,
-                        p.applied_at, p.applied_by
+                        p.applied_at, p.applied_by, p.origin
                  FROM team_templates t
                  LEFT JOIN project_team_templates p
                    ON p.template_id = t.id AND p.project_id = ?1
@@ -668,7 +678,7 @@ pub fn list_team_templates(
         None => {
             let mut statement = conn.prepare(
                 "SELECT t.id, t.name, t.version, t.schema_version, t.content_hash, t.json,
-                        t.created_at, t.source_project_id, NULL, NULL
+                        t.created_at, t.source_project_id, NULL, NULL, NULL
                  FROM team_templates t
                  ORDER BY t.created_at DESC, t.id ASC
                  LIMIT ?1",
@@ -684,12 +694,16 @@ pub fn list_team_templates(
     }
     Ok((
         rows.into_iter()
-            .map(|(record, applied_at, applied_by)| {
-                let read_only = applied_at.is_none()
-                    && match project_id {
-                        Some(project) => record.source_project_id.as_deref() != Some(project),
-                        None => true,
-                    };
+            .map(|(record, applied_at, applied_by, origin)| {
+                let origin =
+                    origin.unwrap_or_else(vp_protocol::types::default_team_template_origin);
+                let locally_applied = applied_at.is_some() && origin == "local";
+                let read_only = !locally_applied
+                    && (origin == "imported"
+                        || match project_id {
+                            Some(project) => record.source_project_id.as_deref() != Some(project),
+                            None => true,
+                        });
                 let source_project = match project_id {
                     Some(project) if record.source_project_id.as_deref() != Some(project) => None,
                     _ => record.source_project_id,
@@ -702,10 +716,11 @@ pub fn list_team_templates(
                     content_hash: record.content_hash,
                     created_at: record.created_at,
                     source_project,
-                    applied: applied_at.is_some(),
+                    applied: locally_applied,
                     applied_at,
                     applied_by,
                     read_only,
+                    origin,
                 }
             })
             .collect(),
@@ -713,11 +728,16 @@ pub fn list_team_templates(
     ))
 }
 
-type AppliedRecordRow = (TeamTemplateRecord, Option<String>, Option<String>);
+type AppliedRecordRow = (
+    TeamTemplateRecord,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 fn map_record_with_applied(row: &rusqlite::Row<'_>) -> rusqlite::Result<AppliedRecordRow> {
     let record = map_record(row)?;
-    Ok((record, row.get(8)?, row.get(9)?))
+    Ok((record, row.get(8)?, row.get(9)?, row.get(10)?))
 }
 
 /// Every template relevant to one project: linked, exported from it, or
@@ -750,7 +770,7 @@ pub fn list_project_team_templates(
 ) -> Result<Vec<ProjectTeamTemplate>> {
     let conn = store.lock()?;
     let mut statement = conn.prepare(
-        "SELECT project_id, template_id, applied_at, applied_by
+        "SELECT project_id, template_id, applied_at, applied_by, origin
          FROM project_team_templates WHERE project_id = ?1
          ORDER BY applied_at ASC, template_id ASC",
     )?;
@@ -760,6 +780,9 @@ pub fn list_project_team_templates(
             template_id: row.get(1)?,
             applied_at: row.get(2)?,
             applied_by: row.get(3)?,
+            origin: row
+                .get::<_, Option<String>>(4)?
+                .unwrap_or_else(vp_protocol::types::default_team_template_origin),
         })
     })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -785,16 +808,25 @@ pub fn list_team_template_events_for_project(
 }
 
 pub fn insert_team_template_snapshot(store: &Store, record: &TeamTemplateRecord) -> Result<()> {
+    let recomputed =
+        vp_protocol::types::compute_team_template_hash(&record.template).map_err(|error| {
+            template_error(
+                team_template_codes::TEMPLATE_REPLAY_INVALID,
+                format!("template snapshot {} cannot be hashed: {error}", record.id),
+            )
+        })?;
     if record.template.template_id != record.id
         || record.template.content_hash != record.content_hash
+        || record.content_hash != recomputed
         || record.template.name != record.name
         || record.template.version != record.version
         || record.template.schema_version != record.schema_version
+        || record.template.schema_version != vp_protocol::types::TEAM_TEMPLATE_SCHEMA_VERSION
     {
         return Err(template_error(
             team_template_codes::TEMPLATE_REPLAY_INVALID,
             format!(
-                "template snapshot {} metadata does not match its portable body",
+                "template snapshot {} metadata does not match its portable body, recomputed hash, or schema",
                 record.id
             ),
         ));
@@ -831,18 +863,26 @@ pub fn insert_project_team_template_snapshot(
     store: &Store,
     link: &ProjectTeamTemplate,
 ) -> Result<()> {
+    let origin = if link.origin == "imported" {
+        "imported"
+    } else {
+        "local"
+    };
     let conn = store.lock()?;
     conn.execute(
-        "INSERT INTO project_team_templates (project_id, template_id, applied_at, applied_by)
-         VALUES (?1, ?2, ?3, ?4)
+        "INSERT INTO project_team_templates
+         (project_id, template_id, applied_at, applied_by, origin)
+         VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(project_id, template_id) DO UPDATE SET
             applied_at = excluded.applied_at,
-            applied_by = excluded.applied_by",
+            applied_by = excluded.applied_by,
+            origin = excluded.origin",
         params![
             link.project_id,
             link.template_id,
             link.applied_at,
-            link.applied_by
+            link.applied_by,
+            origin
         ],
     )?;
     Ok(())
@@ -938,7 +978,7 @@ pub fn replay_team_templates(
     };
     let mut links = {
         let mut statement = tx.prepare(
-            "SELECT project_id, template_id, applied_at, applied_by
+            "SELECT project_id, template_id, applied_at, applied_by, origin
              FROM project_team_templates WHERE project_id = ?1",
         )?;
         statement
@@ -948,6 +988,9 @@ pub fn replay_team_templates(
                     template_id: row.get(1)?,
                     applied_at: row.get(2)?,
                     applied_by: row.get(3)?,
+                    origin: row
+                        .get::<_, Option<String>>(4)?
+                        .unwrap_or_else(vp_protocol::types::default_team_template_origin),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?
@@ -1039,9 +1082,13 @@ pub fn replay_team_templates(
                 .and_then(Value::as_str)
                 .map(str::to_string);
             tx.execute(
-                "INSERT OR IGNORE INTO project_team_templates
-                 (project_id, template_id, applied_at, applied_by)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO project_team_templates
+                 (project_id, template_id, applied_at, applied_by, origin)
+                 VALUES (?1, ?2, ?3, ?4, 'local')
+                 ON CONFLICT(project_id, template_id) DO UPDATE SET
+                    applied_at = excluded.applied_at,
+                    applied_by = excluded.applied_by,
+                    origin = 'local'",
                 params![project_id, event.template_id, event.created_at, applied_by],
             )?;
             repaired_links += 1;
@@ -1050,6 +1097,7 @@ pub fn replay_team_templates(
                 template_id: event.template_id.clone(),
                 applied_at: event.created_at.clone(),
                 applied_by,
+                origin: "local".to_string(),
             });
         }
     }
@@ -1204,13 +1252,13 @@ mod tests {
     };
 
     fn test_template(id: &str) -> TeamTemplate {
-        TeamTemplate {
+        let mut template = TeamTemplate {
             schema_version: vp_protocol::types::TEAM_TEMPLATE_SCHEMA_VERSION,
             template_id: id.to_string(),
             name: "Platform Team".to_string(),
             version: "1.0.0".to_string(),
             description: "portable".to_string(),
-            content_hash: "a".repeat(64),
+            content_hash: String::new(),
             leader: TeamTemplateRoleSlot {
                 title: "Leader".to_string(),
                 role: "leader".to_string(),
@@ -1239,7 +1287,10 @@ mod tests {
             budgets: TeamTemplateBudgets::default(),
             provenance: TeamTemplateProvenance::default(),
             ..TeamTemplate::default()
-        }
+        };
+        template.content_hash =
+            vp_protocol::types::compute_team_template_hash(&template).expect("hash");
+        template
     }
 
     fn test_store(dir: &TempDir) -> (Store, String) {
@@ -1367,6 +1418,7 @@ mod tests {
             template_id: template.template_id.clone(),
             applied_at: "2026-11-13T00:00:00Z".to_string(),
             applied_by: Some("archive".to_string()),
+            origin: "local".to_string(),
         };
         insert_project_team_template_snapshot(&store, &link).expect("link snapshot");
         let loaded = get_team_template_record(&store, &template.template_id)
@@ -1428,5 +1480,76 @@ mod tests {
                 .expect("count"),
             0
         );
+    }
+
+    #[test]
+    fn archive_snapshot_rejects_a_tampered_template_body() {
+        let dir = TempDir::new().expect("tempdir");
+        let (store, project_id) = test_store(&dir);
+        let template = test_template("tt_tamper");
+        let record = TeamTemplateRecord {
+            id: template.template_id.clone(),
+            name: template.name.clone(),
+            version: template.version.clone(),
+            schema_version: template.schema_version,
+            content_hash: template.content_hash.clone(),
+            template: template.clone(),
+            created_at: "2026-11-13T00:00:00Z".to_string(),
+            source_project_id: Some(project_id),
+        };
+        insert_team_template_snapshot(&store, &record).expect("valid snapshot");
+        let mut tampered = record;
+        tampered.template.name = "Tampered".to_string();
+        let error = insert_team_template_snapshot(&store, &tampered).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<AgentIdentityError>()
+                .map(|typed| typed.code),
+            Some(team_template_codes::TEMPLATE_REPLAY_INVALID)
+        );
+    }
+
+    #[test]
+    fn imported_link_is_not_a_local_apply() {
+        let dir = TempDir::new().expect("tempdir");
+        let (store, project_id) = test_store(&dir);
+        let template = test_template("tt_imported_link");
+        register_team_template(
+            &store,
+            &project_id,
+            &template,
+            Some(&project_id),
+            TEAM_TEMPLATE_EXPORTED_EVENT,
+        )
+        .expect("register");
+        insert_project_team_template_snapshot(
+            &store,
+            &ProjectTeamTemplate {
+                project_id: project_id.clone(),
+                template_id: template.template_id.clone(),
+                applied_at: "2026-11-13T00:00:00Z".to_string(),
+                applied_by: Some("archive".to_string()),
+                origin: "imported".to_string(),
+            },
+        )
+        .expect("imported link");
+        let (_, entry) = get_team_template(&store, &template.template_id, Some(&project_id))
+            .expect("get")
+            .expect("entry");
+        assert!(!entry.applied, "archive evidence is not a local apply");
+        assert!(entry.read_only);
+        assert_eq!(entry.origin, "imported");
+
+        let (applied, _, _) = apply_team_template(
+            &store,
+            &project_id,
+            &template,
+            Some(&project_id),
+            Some("operator"),
+            &[],
+        )
+        .expect("local apply");
+        assert!(applied.applied);
+        assert_eq!(applied.origin, "local");
     }
 }

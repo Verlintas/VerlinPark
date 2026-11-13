@@ -229,6 +229,10 @@ pub struct OtelExportParams {
     /// always clamped to 1..=1000.
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Zero-based span offset for paging. The result returns `next_offset`
+    /// when more spans remain.
+    #[serde(default)]
+    pub offset: Option<u32>,
 }
 
 /// Status of one explicit export attempt. `exported` is true only for a 2xx
@@ -248,6 +252,15 @@ pub struct OtelExportResult {
     pub available_spans: u64,
     #[serde(default)]
     pub truncated: bool,
+    /// First span index selected for this page.
+    #[serde(default)]
+    pub offset: u64,
+    /// Offset for the next page, or `None` when this page reached the end.
+    #[serde(default)]
+    pub next_offset: Option<u64>,
+    /// True when retrying the same request may succeed (transport/5xx/429).
+    #[serde(default)]
+    pub retryable: bool,
     #[serde(default)]
     pub http_status: Option<u16>,
     #[serde(default)]
@@ -396,5 +409,24 @@ mod tests {
         let export: OtelExportParams =
             serde_json::from_value(json!({"session_id": "ses-1"})).unwrap();
         assert!(export.limit.is_none());
+        assert!(export.offset.is_none());
+    }
+
+    #[test]
+    fn export_result_decodes_paging_and_retryability() {
+        let result: OtelExportResult = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "status": "failed",
+            "offset": 20,
+            "next_offset": 40,
+            "retryable": true,
+            "http_status": 503,
+            "truncated": true
+        }))
+        .unwrap();
+        assert_eq!(result.offset, 20);
+        assert_eq!(result.next_offset, Some(40));
+        assert!(result.retryable);
+        assert_eq!(result.http_status, Some(503));
     }
 }

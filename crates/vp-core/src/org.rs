@@ -411,18 +411,25 @@ fn build_snapshot(
         .clamp(1, AGENT_ORG_MAX_NODES) as usize;
     let mut warnings = Vec::new();
     let mut included: HashMap<String, AgentIdentity> = HashMap::new();
-    let mut filtered = Vec::new();
-    for identity in &context.identities {
-        if !include_retired && identity.status == "retired" {
-            continue;
-        }
-        if filtered.len() >= limit {
-            break;
-        }
-        filtered.push(identity.clone());
+    let mut eligible = context
+        .identities
+        .iter()
+        .filter(|identity| include_retired || identity.status != "retired")
+        .cloned()
+        .collect::<Vec<_>>();
+    // Truncation must never hide the chart root or department managers behind
+    // a wall of older Workers. Role order is stable, then creation order.
+    eligible.sort_by(|left, right| {
+        role_rank(&left.role)
+            .cmp(&role_rank(&right.role))
+            .then_with(|| left.created_at.cmp(&right.created_at))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let mut truncated = eligible.len() > limit;
+    let filtered = eligible.into_iter().take(limit).collect::<Vec<_>>();
+    for identity in &filtered {
         included.insert(identity.id.clone(), identity.clone());
     }
-    let mut truncated = filtered.len() < context.identities.len();
 
     let mut nodes: HashMap<String, AgentOrgNode> = filtered
         .iter()

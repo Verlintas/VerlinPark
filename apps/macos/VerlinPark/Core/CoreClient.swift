@@ -1372,13 +1372,21 @@ actor CoreClient {
         .decode(OtelPolicyEnvelope.self)
     }
 
-    func exportOtel(sessionID: String, limit: Int = 200) async throws -> OtelExportResult {
-        try await request(
+    func exportOtel(
+        sessionID: String,
+        limit: Int = 200,
+        offset: Int? = nil
+    ) async throws -> OtelExportResult {
+        var params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "limit": .number(Double(limit)),
+        ]
+        if let offset {
+            params["offset"] = .number(Double(offset))
+        }
+        return try await request(
             method: "telemetry.otel.export",
-            params: [
-                "session_id": .string(sessionID),
-                "limit": .number(Double(limit)),
-            ]
+            params: params
         )
         .decode(OtelExportResult.self)
     }

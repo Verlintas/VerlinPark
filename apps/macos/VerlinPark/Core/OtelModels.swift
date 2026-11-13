@@ -195,6 +195,9 @@ struct OtelExportResult: Codable, Sendable, Equatable {
     let spanCount: Int
     let availableSpans: Int
     let truncated: Bool
+    let offset: Int
+    let nextOffset: Int?
+    let retryable: Bool
     let httpStatus: Int?
     let durationMs: Int
     let endpoint: String
@@ -210,6 +213,9 @@ struct OtelExportResult: Codable, Sendable, Equatable {
         case spanCount = "span_count"
         case availableSpans = "available_spans"
         case truncated
+        case offset
+        case nextOffset = "next_offset"
+        case retryable
         case httpStatus = "http_status"
         case durationMs = "duration_ms"
         case endpoint
@@ -227,6 +233,9 @@ struct OtelExportResult: Codable, Sendable, Equatable {
         spanCount = try container.decodeIfPresent(Int.self, forKey: .spanCount) ?? 0
         availableSpans = try container.decodeIfPresent(Int.self, forKey: .availableSpans) ?? 0
         truncated = try container.decodeIfPresent(Bool.self, forKey: .truncated) ?? false
+        offset = try container.decodeIfPresent(Int.self, forKey: .offset) ?? 0
+        nextOffset = try container.decodeIfPresent(Int.self, forKey: .nextOffset)
+        retryable = try container.decodeIfPresent(Bool.self, forKey: .retryable) ?? false
         httpStatus = try container.decodeIfPresent(Int.self, forKey: .httpStatus)
         durationMs = try container.decodeIfPresent(Int.self, forKey: .durationMs) ?? 0
         endpoint = try container.decodeIfPresent(String.self, forKey: .endpoint) ?? ""

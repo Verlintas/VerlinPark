@@ -443,15 +443,17 @@ mod tests {
         let control = ExecControl::new();
         let clone = control.clone();
         tokio::spawn(async move {
-            sleep(Duration::from_millis(100)).await;
+            sleep(Duration::from_millis(50)).await;
             clone.cancel();
         });
+        // Keep the command timeout well above the cancellation path so a
+        // loaded machine cannot make the 5s default timeout race the 5s bound.
+        let mut exec_params = params("sleep 30 & wait");
+        exec_params.timeout_ms = 30_000;
         let start = Instant::now();
-        let result = run_exec(&jail, &params("sleep 30 & wait"), &[], &control)
-            .await
-            .unwrap();
+        let result = run_exec(&jail, &exec_params, &[], &control).await.unwrap();
         assert!(result.cancelled || result.timed_out);
-        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(start.elapsed() < Duration::from_secs(15));
     }
 
     #[tokio::test]

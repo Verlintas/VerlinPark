@@ -282,6 +282,21 @@ C5 已实现并合入 `782cb19`，ADR-0197。Rust **3,571 passed / 0 failed / 6 
 
 ---
 
+## 2026-11-13 Production hardening round two: bounded replay, OTel paging, template snapshots
+
+ADR-0214 补齐 round one 剩余的四个缺口。Rust **3,890 passed / 0 failed**，Swift app + helper 套件通过。
+
+- **C4/C6**：`orchestration.replay` 读取 newest 20,000 events，超过即 `truncated=true` 并给出 warning；`Store::list_recent_events_window` 在 SQLite lock 内只读 payload 字符串，释放 lock 后再解析 JSON，diagnosis/replay 不再阻塞其他 session。
+- **C5**：`OtelExportParams.offset`、`OtelExportResult.offset/next_offset/retryable`；导出按页选择 `[offset, offset+limit)`；transport/5xx/429 标 `retryable=true`，其他 4xx/本地序列化错误为 false；CLI `vp otel-export --offset`，Swift models/CoreClient 支持 offset。
+- **S8**：canonical template hash 移到 `vp-protocol`；bundle validation 和 `insert_team_template_snapshot` 重算 hash，tampered body 返回 `TEMPLATE_REPLAY_INVALID`；`project_team_templates.origin` 区分 local/imported，imported link 只读且不计为 applied，后续显式 apply 升级为 local；`TeamTemplateEntry` 暴露 origin。
+- **S7 / 测试**：org snapshot 先按 Leader→Manager→Worker 排序再截断，retired 行不计入 truncation；`vp-remote` cancellation 测试使用 30s command timeout + 15s 断言，消除与默认 5s timeout 的竞争。
+
+仍未解决：S5 prune 仍是 projection-only；S8 bundle import 重算 hash 但不跑完整 shape validator；S6 attribution 无 binding 时仍保守；S7 仍全量重算 performance ledger 且无 automated UI suite；coverage/seeded migration/adversarial corpus 仍未提交。
+
+新增测试：OTel paging/retryable decode、OTel offset page selection、tampered template snapshot、imported-link provenance。
+
+---
+
 ## 2026-11-13 Production hardening round: C1–C6 / S1–S8
 
 四个只读生产审查（C1–C3、C4–C6、S1–S4、S5–S8）发现的问题已按 ADR-0213 修复。Rust **3,887 passed / 0 failed**，Swift app + helper 套件通过，clippy/swiftformat/xcodebuild 通过。

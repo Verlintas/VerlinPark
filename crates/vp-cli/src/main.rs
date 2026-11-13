@@ -235,6 +235,9 @@ enum Command {
         /// Span cap for this request (1-1000). Defaults to the project policy.
         #[arg(long)]
         limit: Option<u32>,
+        /// Zero-based span offset for paging.
+        #[arg(long)]
+        offset: Option<u32>,
     },
     /// Send one synthetic span to the configured local collector.
     OtelTest { project: String },
@@ -4845,11 +4848,15 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await?
         }
-        Command::OtelExport { session, limit } => {
+        Command::OtelExport {
+            session,
+            limit,
+            offset,
+        } => {
             rpc(
                 &discovery,
                 "telemetry.otel.export",
-                json!({"session_id": session, "limit": limit}),
+                json!({"session_id": session, "limit": limit, "offset": offset}),
             )
             .await?
         }
@@ -25188,11 +25195,25 @@ mod otel_cli_tests {
             other => panic!("expected otel-policy-set, got {other:?}"),
         }
 
-        let cli = Cli::try_parse_from(["vp", "otel-export", "ses-1", "--limit", "25"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "vp",
+            "otel-export",
+            "ses-1",
+            "--limit",
+            "25",
+            "--offset",
+            "50",
+        ])
+        .unwrap();
         match cli.command {
-            Command::OtelExport { session, limit } => {
+            Command::OtelExport {
+                session,
+                limit,
+                offset,
+            } => {
                 assert_eq!(session, "ses-1");
                 assert_eq!(limit, Some(25));
+                assert_eq!(offset, Some(50));
             }
             other => panic!("expected otel-export, got {other:?}"),
         }

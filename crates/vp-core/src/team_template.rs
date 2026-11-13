@@ -111,13 +111,11 @@ impl TeamTemplateValidationContext {
 /// Canonical bytes for hashing: field order is the Rust declaration order,
 /// maps are `BTreeMap`s, and `content_hash` is blanked.
 pub fn canonical_team_template_bytes(template: &TeamTemplate) -> Result<Vec<u8>> {
-    let mut canonical = template.clone();
-    canonical.content_hash.clear();
-    Ok(serde_json::to_vec(&canonical)?)
+    vp_protocol::types::canonical_team_template_bytes(template).map_err(Into::into)
 }
 
 pub fn compute_team_template_hash(template: &TeamTemplate) -> Result<String> {
-    Ok(crate::sha256_hex(&canonical_team_template_bytes(template)?))
+    vp_protocol::types::compute_team_template_hash(template).map_err(Into::into)
 }
 
 /// Fill a deterministic template id (when absent) and the content hash. Export

@@ -748,6 +748,7 @@ pub(crate) fn replay(
     policy: &OrchestrationPolicy,
     critical_policy: &CriticalPathPolicy,
     limit: u32,
+    event_window_truncated: bool,
 ) -> ControllerReplayReport {
     let limit = limit.clamp(1, MAX_REPLAY_DECISIONS);
     let decision_events = events
@@ -755,7 +756,7 @@ pub(crate) fn replay(
         .filter(|event| REPLAY_KINDS.contains(&event.kind.as_str()))
         .collect::<Vec<_>>();
     let total_recorded = decision_events.len() as u64;
-    let truncated = decision_events.len() > limit as usize;
+    let truncated = event_window_truncated || decision_events.len() > limit as usize;
     let selected = decision_events
         .iter()
         .skip(decision_events.len().saturating_sub(limit as usize))
@@ -801,6 +802,11 @@ pub(crate) fn replay(
         .filter(|entry| entry.status == ControllerReplayStatus::Skipped)
         .count() as u64;
     let mut warnings = Vec::new();
+    if event_window_truncated {
+        warnings.push(
+            "replay read a bounded event window; older plan/task state is not included".to_string(),
+        );
+    }
     if truncated {
         warnings.push(format!(
             "report covers the newest {limit} decision event(s) out of {total_recorded}"
@@ -845,12 +851,25 @@ pub async fn replay_orchestration(
         let session = store
             .get_session(&session_id)?
             .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
-        let events = store.list_all_events(&session_id)?;
+        // Replay reconstructs state from a bounded newest-event window. Reading
+        // the full log was superlinear and decoded every payload under the
+        // global SQLite lock; truncation is now explicit.
+        const REPLAY_EVENT_WINDOW: u32 = 20_000;
+        let events = store.list_recent_events_window(&session_id, REPLAY_EVENT_WINDOW)?;
+        let total_events = store.event_count(&session_id)?;
+        let event_window_truncated = total_events > events.len() as u64;
         let policy = store.get_orchestration_policy(&session.project_id)?;
         let critical = store.get_critical_path_policy(&session.project_id)?;
         let policy_hash =
             crate::runtime_pin::read_policy_inputs(&store, &session.project_id)?.hash();
-        let mut report = replay(&session, &events, &policy, &critical, limit);
+        let mut report = replay(
+            &session,
+            &events,
+            &policy,
+            &critical,
+            limit,
+            event_window_truncated,
+        );
         report.policy_hash = policy_hash;
         Ok(report)
     })

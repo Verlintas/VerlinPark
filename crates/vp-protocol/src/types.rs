@@ -23979,6 +23979,26 @@ pub struct TeamTemplate {
     pub provenance: TeamTemplateProvenance,
 }
 
+/// Canonical bytes for hashing a portable team template: field order follows
+/// the Rust declaration, maps are `BTreeMap`s, and `content_hash` is blanked.
+/// This lives in the protocol crate so bundle/rebuild validation can recompute
+/// the same hash as export without depending on `vp-core`.
+pub fn canonical_team_template_bytes(
+    template: &TeamTemplate,
+) -> std::result::Result<Vec<u8>, serde_json::Error> {
+    let mut canonical = template.clone();
+    canonical.content_hash.clear();
+    serde_json::to_vec(&canonical)
+}
+
+pub fn compute_team_template_hash(
+    template: &TeamTemplate,
+) -> std::result::Result<String, serde_json::Error> {
+    use sha2::{Digest, Sha256};
+    let bytes = canonical_team_template_bytes(template)?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
 /// A stored template's metadata plus its applied state for one project.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TeamTemplateEntry {
@@ -24006,6 +24026,9 @@ pub struct TeamTemplateEntry {
     /// read-only until an explicit apply.
     #[serde(default)]
     pub read_only: bool,
+    /// `local` or `imported` link provenance.
+    #[serde(default = "default_team_template_origin")]
+    pub origin: String,
 }
 
 /// Durable storage record used by the manifest and session bundle. The parsed
@@ -24040,6 +24063,15 @@ pub struct ProjectTeamTemplate {
     pub applied_at: String,
     #[serde(default)]
     pub applied_by: Option<String>,
+    /// `local` for an apply performed in this project; `imported` for archive
+    /// evidence restored from a bundle. Imported links do not count as a local
+    /// apply.
+    #[serde(default = "default_team_template_origin")]
+    pub origin: String,
+}
+
+pub fn default_team_template_origin() -> String {
+    "local".to_string()
 }
 
 /// Bounded project-scoped audit event. The payload carries ids/hashes/names,

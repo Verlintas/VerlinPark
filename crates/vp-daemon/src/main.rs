@@ -1756,7 +1756,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "telemetry.otel.export" => match parse_params::<OtelExportParams>(request.params) {
             Ok(params) => match state
                 .engine
-                .otel_export(&params.session_id, params.limit)
+                .otel_export(&params.session_id, params.limit, params.offset)
                 .await
             {
                 Ok(result) => RpcResponse::success(id, result),

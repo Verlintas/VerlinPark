@@ -17,6 +17,7 @@ struct TeamTemplateEntry: Codable, Identifiable, Hashable, Sendable {
     let appliedAt: String?
     let appliedBy: String?
     let readOnly: Bool
+    let origin: String
 
     var id: String {
         templateID
@@ -34,6 +35,7 @@ struct TeamTemplateEntry: Codable, Identifiable, Hashable, Sendable {
         case appliedAt = "applied_at"
         case appliedBy = "applied_by"
         case readOnly = "read_only"
+        case origin
     }
 
     init(from decoder: Decoder) throws {
@@ -49,6 +51,7 @@ struct TeamTemplateEntry: Codable, Identifiable, Hashable, Sendable {
         appliedAt = try container.decodeIfPresent(String.self, forKey: .appliedAt)
         appliedBy = try container.decodeIfPresent(String.self, forKey: .appliedBy)
         readOnly = try container.decodeIfPresent(Bool.self, forKey: .readOnly) ?? true
+        origin = try container.decodeIfPresent(String.self, forKey: .origin) ?? "local"
     }
 
     init(
@@ -62,7 +65,8 @@ struct TeamTemplateEntry: Codable, Identifiable, Hashable, Sendable {
         applied: Bool,
         appliedAt: String?,
         appliedBy: String?,
-        readOnly: Bool
+        readOnly: Bool,
+        origin: String = "local"
     ) {
         self.templateID = templateID
         self.name = name
@@ -75,6 +79,7 @@ struct TeamTemplateEntry: Codable, Identifiable, Hashable, Sendable {
         self.appliedAt = appliedAt
         self.appliedBy = appliedBy
         self.readOnly = readOnly
+        self.origin = origin
     }
 }
 
