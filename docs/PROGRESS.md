@@ -1,7 +1,7 @@
 # VerlinPark 进度
 
-> 最后更新：2026-11-12
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark + task contracts/intent authorization/MCP schema pins + effect receipts/postconditions + external gates/durable waits + runtime pinning/controller replay + reliability/OTel + project-scoped identities S1–S7 + failure attribution/cascade 已跑通
+> 最后更新：2026-11-13
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark + task contracts/intent authorization/MCP schema pins + effect receipts/postconditions + external gates/durable waits + runtime pinning/controller replay + reliability/OTel + project-scoped identities S1–S8 + failure attribution/cascade 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
@@ -279,6 +279,47 @@ C5 已实现并合入 `782cb19`，ADR-0197。Rust **3,571 passed / 0 failed / 6 
 - Coordination accounting 是 role/task attribution，不是 work classifier。
 - OTel metadata-only，最多 5,000 events；无 background exporter、remote collector、collector auth、cross-host correlation。
 - Reliability report 是描述性的，不是 leaderboard、significance test 或 merge gate。
+
+---
+
+## 2026-11-13 Project-scoped identities S8: portable team templates
+
+S8 已实现并合入 `265e55d`，ADR-0212。Rust **3,882 passed / 0 failed / 6 ignored**，Swift **403 app + 132 helper passed**，clippy/swiftformat/xcodebuild 通过。
+
+### TeamTemplate
+
+- canonical content-addressed `TeamTemplate`：schema/version/name、Leader/Manager/Worker RoleSlot（title/role/department/component/profile/model role/charter/decision/review duties/default budget）、departments、Labour defaults、rules（delegation/review/acceptance/escalation/retirement/handoff/communication）、budgets、explicit model bindings、static tool bundle/allow/deny references、skill name/hash refs、conventions、human-only provenance。
+- `team.json` deterministic；`TEAM.md` deterministic rendering。
+- Export 从 live roster/policies 派生并 redact；import 校验 schema/fields/hash、role/profile/tool/model/budget、absolute paths/URLs/secrets/IDs，fail closed。
+- 不包含：agent/session IDs、context、memory、inbox、worktree、branch、commit、performance、MCP pins/schemas、provider keys、absolute paths、repo URLs、secrets。
+
+### Import / apply
+
+- `team.template.preview/import`：dry-run 展示 proposed org、new/renamed/conflicting identities、budget/model/tool/policy gaps。
+- Apply 需要 explicit `approved: true`；创建 template record + **pending S6 hire requests only**，不直接创建 identity；不覆盖现有 Leader/identity；冲突支持 skip/merge/rename；same-hash apply 幂等。
+- Target policy 永远优先：不能放宽 budget/approval/sandbox/MCP trust/Verifier/Integrator/capacity/identity caps；model bindings 只是显式 metadata；new pending hires 带 template id/version/hash/slot provenance。
+- Leader 是 charter overlay，不覆盖现有 Leader；新 identity 的 memory/inbox/performance 都是全新的。
+
+### 持久化 / 界面
+
+- `team_templates`、`project_team_templates`、`team_template_events`（exported/imported/applied；payload 只含 allowlisted ids/names/hashes/counts）。
+- project manifest、db-rebuild、SessionBundle；`team.template.replay` 从 applied events 修复 missing link。
+- RPC：`team.template.export/preview/import/list/get/diff/replay`。
+- CLI：`vp team-export/import/templates/diff/template/replay`。
+- Swift：Manage Dash Team Templates library、diff sheet、preview org chart、model/tool/budget/policy gaps、conflict skip/merge、separate explicit approval toggle before apply。
+
+### 限制
+
+- Apply 只创建 pending hires；operator 仍需 S6 approve；没有 live Leader 的项目不能 import Managers/Workers，直到 bootstrap Leader。
+- Model bindings 在 import 时按 daemon 当前 role models/presets 校验；配置变化需添加 model 后 re-apply。
+- Tool validation 用 static catalog；MCP tools/trust 仍 project-local。
+- `rename` 改 proposed slot title，不改 existing identity；retirement 需要 S6 后 re-apply。
+- Library 是 same-host SQLite；无 signatures/marketplace/cross-host registry/remote attestation。
+- Bundle import 恢复 template/link/hire-request evidence，但从不 auto-hire/create identity。
+- GUI model/state tests 通过；没有 interactive manual GUI smoke。
+- 无 C7+。
+
+**Project-scoped identities S1–S8 全部完成。**
 
 ---
 

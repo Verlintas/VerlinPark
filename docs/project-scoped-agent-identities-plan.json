@@ -402,7 +402,8 @@
         "identity provenance hash recorded on hire",
         "template diff"
       ],
-      "acceptance": "A successful project can export a portable team charter, import it into another project, and get the same roles/rules with fresh memory and no context leakage."
+      "acceptance": "A successful project can export a portable team charter, import it into another project, and get the same roles/rules with fresh memory and no context leakage.",
+      "status": "implemented"
     }
   ],
   "dependencies": {
@@ -647,6 +648,28 @@
         "same-host SQLite only; no cross-host federation/HR",
         "GUI compiled/model/state tested with manual smoke, no automated UI suite"
       ]
+    },
+    "S8": {
+      "status": "implemented",
+      "commit": "265e55d",
+      "adr": "0212",
+      "tests": {
+        "rust": 3882,
+        "swift_app": 403,
+        "swift_helper": 132
+      },
+      "limits": [
+        "apply creates pending hires only; operators approve in S6; project without live Leader cannot import Managers/Workers",
+        "model bindings validate against current role models/presets at import time",
+        "tool validation uses static catalog; MCP tools/trust remain project-local",
+        "rename changes proposed slot title, not existing identity; retirement requires S6 then re-apply",
+        "same-host SQLite library; no signatures/marketplace/cross-host registry/remote attestation",
+        "bundle import restores evidence but never auto-hires/creates identities",
+        "GUI model/state tested; no interactive manual smoke",
+        "no C7+"
+      ]
     }
-  }
+  },
+  "program_status": "S1-S8 implemented",
+  "program_complete": true
 }

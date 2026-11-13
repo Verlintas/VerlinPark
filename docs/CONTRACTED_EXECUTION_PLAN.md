@@ -501,7 +501,8 @@ should wait until the identity/role contracts and Worker workspace phases
 | S5 Identity memory | **implemented** | `91b40dd`, ADR-0209, 3,784 Rust / 509 Swift tests |
 | S6 Hiring, retirement, performance | **implemented** | `5d308e3`, ADR-0210, 3,833 Rust / 516 Swift tests |
 | S7 Org chart / GUI | **implemented** | `5e5b7b6`, ADR-0211, 3,855 Rust / 529 Swift tests |
-| S8 Portable team templates | planned | final |
+| S8 Portable team templates | **implemented** | `265e55d`, ADR-0212, 3,882 Rust / 403+132 Swift tests |
+| **Identity program complete** | **S1–S8** | stable identities, assignments, inbox, prompts, workspaces, memory, hiring/retirement, org chart, team templates |
 | C6 Failure attribution | **implemented** | `feb2a71`, ADR-0198, 3,805 Rust / 513 Swift tests |
 | C7 Bounded fan-out | planned | next |
 | C7 Bounded fan-out | planned | |

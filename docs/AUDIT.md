@@ -192,6 +192,21 @@ Limits:
 - Same-host SQLite only; no cross-host identity federation or external HR.
 - GUI is compiled/model/state tested with manual macOS smoke; no automated UI suite.
 
+## 0.16 2026-11-13 Project-scoped identities S8
+
+S8 is implemented and merged at `265e55d` (ADR-0212): content-addressed TeamTemplate/team.json + TEAM.md, validated export/import/preview/diff, explicit apply creating only pending S6 hire requests, target-policy precedence, template provenance, same-host SQLite storage, and a Manage Dash Team Templates library. Rust 3,882 passed; Swift 403 app + 132 helper passed. This completes the project-scoped identity program S1–S8.
+
+Limits:
+
+- Apply only creates pending hires; operators approve in S6. A project without a live Leader cannot import Managers/Workers until bootstrapped.
+- Model bindings validate against current role models/presets at import time.
+- Tool validation uses the static catalog; MCP tools/trust remain project-local.
+- `rename` changes the proposed slot title, not an existing identity; retirement requires S6 then re-apply.
+- Library is same-host SQLite; no signatures, marketplace, cross-host registry, or remote attestation.
+- Bundle import restores evidence but never auto-hires or creates identities.
+- GUI model/state tested; no interactive manual GUI smoke.
+- No C7+ work.
+
 ## 0. 2026-10-30 跟进
 
 第一轮硬化已完成（同一 `main` 线，提交见仓库历史）：
