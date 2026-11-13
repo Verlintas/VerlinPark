@@ -177,6 +177,21 @@ Limits:
 - Same-host SQLite coordination only; not distributed employment control.
 - No S7 org-chart GUI, S8 team templates, performance GC, cross-project identity sharing, or mutation UI yet.
 
+## 0.15 2026-11-13 Project-scoped identities S7
+
+S7 is implemented and merged at `5e5b7b6` (ADR-0211): bounded `agent.org.snapshot` / `agent.identity.detail`, Manage Dash Project org with department lanes/cross-session roster/workspace strip/pending actions, 7-tab identity detail, real Hire/Promote/Transfer/Retire sheets with typed errors and explicit approval, `vp agent-org`/`vp agent-detail`, and identity id/generation in OTel spans. Rust 3,855 passed; Swift 529 passed.
+
+Limits:
+
+- No S8 team templates or C7+.
+- No Leader bootstrap UI; Leader creation remains `vp agent-create --role leader`.
+- No workspace attach/land/archive/retire mutations from the console.
+- No automatic hiring/firing/promotion/transfer/rehire.
+- Org chart is bounded at 200 identity nodes/64 department lanes; truncation is reported.
+- Successor recording does not transfer memory or component-branch ownership.
+- Same-host SQLite only; no cross-host identity federation or external HR.
+- GUI is compiled/model/state tested with manual macOS smoke; no automated UI suite.
+
 ## 0. 2026-10-30 跟进
 
 第一轮硬化已完成（同一 `main` 线，提交见仓库历史）：

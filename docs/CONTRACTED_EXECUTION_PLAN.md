@@ -500,7 +500,8 @@ should wait until the identity/role contracts and Worker workspace phases
 | S4 Worker workspace + two-level integration | **implemented** | `349b9bb`, ADR-0208, 3,751 Rust / 508 Swift tests |
 | S5 Identity memory | **implemented** | `91b40dd`, ADR-0209, 3,784 Rust / 509 Swift tests |
 | S6 Hiring, retirement, performance | **implemented** | `5d308e3`, ADR-0210, 3,833 Rust / 516 Swift tests |
-| S7 Org chart / GUI | planned | next |
+| S7 Org chart / GUI | **implemented** | `5e5b7b6`, ADR-0211, 3,855 Rust / 529 Swift tests |
+| S8 Portable team templates | planned | final |
 | C6 Failure attribution | **implemented** | `feb2a71`, ADR-0198, 3,805 Rust / 513 Swift tests |
 | C7 Bounded fan-out | planned | next |
 | C7 Bounded fan-out | planned | |

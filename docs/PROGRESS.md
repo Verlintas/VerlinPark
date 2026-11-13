@@ -1,7 +1,7 @@
 # VerlinPark 进度
 
 > 最后更新：2026-11-12
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark + task contracts/intent authorization/MCP schema pins + effect receipts/postconditions + external gates/durable waits + runtime pinning/controller replay + reliability/OTel + project-scoped identities S1–S6 + failure attribution/cascade 已跑通
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark + task contracts/intent authorization/MCP schema pins + effect receipts/postconditions + external gates/durable waits + runtime pinning/controller replay + reliability/OTel + project-scoped identities S1–S7 + failure attribution/cascade 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
@@ -279,6 +279,46 @@ C5 已实现并合入 `782cb19`，ADR-0197。Rust **3,571 passed / 0 failed / 6 
 - Coordination accounting 是 role/task attribution，不是 work classifier。
 - OTel metadata-only，最多 5,000 events；无 background exporter、remote collector、collector auth、cross-host correlation。
 - Reliability report 是描述性的，不是 leaderboard、significance test 或 merge gate。
+
+---
+
+## 2026-11-13 Project-scoped identities S7: org chart and identity console
+
+S7 已实现并合入 `5e5b7b6`，ADR-0211。Rust **3,855 passed / 0 failed / 6 ignored**，Swift **529 passed**（397 app + 132 helper），clippy/swiftformat/xcodebuild 通过。
+
+### Aggregate read surfaces
+
+- `agent.org.snapshot`：project-scoped bounded hierarchy（Leader→department Managers→component Workers，unassigned/orphan 保留）；identity id/role/title/department/component/status/generation；active assignment/lease；workspace component/branch/status（无绝对 path）；unread inbox count；active identity-memory count；compact performance + advisory retirement；pending hire/retirement；policies/counts/truncation。
+- caps：200 nodes、64 departments、200 assignments/workspaces。
+- `agent.identity.detail`：Overview、recent assignments、inbox metadata（默认不含 content；`include_inbox_content` 才给 short known-field preview）、visible memory rows、performance、retirement candidates/proposals、hire requests、workspaces、parent/successor/direct reports、employment events；imported/retired read-only flags；每 list 独立 cap/truncation。
+- CLI：`vp agent-org <project> [--include-retired] [--limit]`、`vp agent-detail <identity> [--project] [--include-inbox] [--inbox-limit] [--memory-limit] [--assignment-limit]`；`--json`；现有 agent/inbox/memory/workspace CLI 保持权威。
+
+### SwiftUI
+
+- Manage Dash Project org：Leader card、department Manager columns、Worker cards；status/generation/session/workspace/inbox/memory/performance/retirement/imported badges；department lanes、cross-session roster、workspace strip；pending hire/retirement 与 approve/reject/retire actions；empty/disabled/no-Leader/imported/truncated states。
+- Identity detail 7 tabs：Overview、Assignments、Inbox、Memory、Performance、Workspace、Lifecycle。
+- Explicit mutation sheets：Hire（role/department/component/title/profile/model/parent/approval）、Promote（Worker→Manager、Manager→Leader only）、Transfer（department/component/title/parent，只发 changed fields）、Retire（reason/successor/approved proposal/force/terminal copy）。
+- All UI state in AppModel；views declarative；typed Q3 errors retained；VPTheme/VPMotion，Reduce Motion；accessibility labels。
+
+### Approval / observability
+
+- Hire 默认 pending request；approve 前不创建任何东西。
+- Promote/transfer 提交 explicit operator decision，daemon 再校验 caps/hierarchy/busy/generation。
+- Retirement 从不 auto-approve；pending proposal 不满足 gate；approved proposal 或 explicit approval 才行；`force` 只释放/archive，保留 evidence，不中断 provider stream。
+- Imported identities/requests/proposals read-only，actions disabled；daemon 仍 fail closed。
+- OTel agent/tool/usage spans 在 source event 有 identity 时带 `identity_id`/`identity_generation`；无 prompt/tool/file/secret。
+- Org/identity counts 和 pending actions 暴露在 Manage Dash。
+
+### 限制
+
+- 无 S8 team templates/C7+。
+- 无 Leader bootstrap UI；Leader 仍 `vp agent-create --role leader`。
+- Console 没有 workspace attach/land/archive/retire mutations。
+- 无 automatic hiring/firing/promotion/transfer/rehire。
+- Org chart bounded 200 identity nodes/64 department lanes；truncation 有报告。
+- Successor recording 不转移 memory/component-branch ownership。
+- Same-host SQLite projection only；无 cross-host identity federation/external HR。
+- GUI 编译/model/state 测试 + manual macOS smoke；无 automated UI suite。
 
 ---
 

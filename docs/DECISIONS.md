@@ -214,6 +214,7 @@
 | [0209](adr/0209-identity-memory-and-bounded-briefs.md) | Identity/department/project memory, evidence/lifecycle, and bounded tail briefs | Accepted | Runtime/Memory |
 | [0198](adr/0198-failure-attribution-and-cascade-ledger.md) | Bounded provenance DAG, earliest-unsupported-claim attribution, and cascade ledger | Accepted | Runtime/Diagnosis |
 | [0210](adr/0210-agent-hiring-retirement-and-performance.md) | Hiring, promotion/transfer, evidence-based retirement, and performance ledger | Accepted | Runtime/Orchestration |
+| [0211](adr/0211-project-org-chart-and-identity-console.md) | Project org chart, identity detail console, and lifecycle action sheets | Accepted | Runtime/GUI |
 
 ---
 

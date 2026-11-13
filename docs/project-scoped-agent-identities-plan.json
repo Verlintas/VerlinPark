@@ -356,7 +356,8 @@
         "no business logic in views",
         "retired/idle badges"
       ],
-      "acceptance": "Operators can see and manage the project org chart through real RPCs."
+      "acceptance": "Operators can see and manage the project org chart through real RPCs.",
+      "status": "implemented"
     },
     {
       "id": "S8",
@@ -626,6 +627,25 @@
         "same-host SQLite coordination only",
         "no S7 org-chart GUI, S8 team templates, performance GC, cross-project sharing",
         "no mutation UI yet"
+      ]
+    },
+    "S7": {
+      "status": "implemented",
+      "commit": "5e5b7b6",
+      "adr": "0211",
+      "tests": {
+        "rust": 3855,
+        "swift": 529
+      },
+      "limits": [
+        "no S8 team templates or C7+",
+        "no Leader bootstrap UI; still vp agent-create --role leader",
+        "no workspace attach/land/archive/retire mutations in console",
+        "no automatic hiring/firing/promotion/transfer/rehire",
+        "org chart bounded 200 nodes/64 departments with truncation",
+        "successor does not transfer memory/component-branch ownership",
+        "same-host SQLite only; no cross-host federation/HR",
+        "GUI compiled/model/state tested with manual smoke, no automated UI suite"
       ]
     }
   }
