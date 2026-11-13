@@ -180,6 +180,7 @@ pub mod source_ann;
 pub mod source_embedding;
 pub mod source_retrieval;
 pub mod sources;
+pub mod team_template;
 pub mod terminal;
 pub mod test_cache;
 pub mod textdiff;
@@ -17131,6 +17132,13 @@ impl Engine {
             ))
         })
         .await??;
+        let template_store = store.clone();
+        let template_project = project.id.clone();
+        let (team_templates, project_team_templates, team_template_events) =
+            tokio::task::spawn_blocking(move || {
+                vp_store::store::team_template::manifest_records(&template_store, &template_project)
+            })
+            .await??;
         Ok(SessionBundle {
             version: 1,
             exported_at: vp_protocol::now_rfc3339(),
@@ -17182,6 +17190,9 @@ impl Engine {
             agent_retirement_proposals,
             agent_employment_events,
             agent_hire_requests,
+            team_templates,
+            project_team_templates,
+            team_template_events,
         })
     }
 

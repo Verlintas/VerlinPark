@@ -94,6 +94,20 @@ final class AppModel {
     var projectOrgActionError: ProjectOrgErrorSurface?
     var projectOrgActionNotice: String?
     var projectOrgHireDraft = ProjectOrgHireDraft()
+    // S8 team-template library. Preview/apply are explicit; no auto-apply.
+    var teamTemplateEntries: [TeamTemplateEntry] = []
+    var teamTemplatesStatus: String?
+    var teamTemplatesBusy = false
+    var teamTemplateError: ProjectOrgErrorSurface?
+    var teamTemplatePreview: TeamTemplatePreview?
+    var teamTemplateDiff: TeamTemplateDiffResult?
+    var teamTemplateReplay: TeamTemplateReplayReport?
+    var teamTemplateNotice: String?
+    var teamTemplateImportJSON = ""
+    var teamTemplateApplyApproved = false
+    var teamTemplateResolutions: [TeamTemplateResolutionRequest] = []
+    var teamTemplateSheet: TeamTemplateSheet?
+    var teamTemplateSelectedID: String?
     var projectOrgPromoteDraft = ProjectOrgPromoteDraft()
     var projectOrgTransferDraft = ProjectOrgTransferDraft()
     var projectOrgRetireDraft = ProjectOrgRetireDraft()
@@ -8287,6 +8301,210 @@ final class AppModel {
             projectOrgDetail = nil
             projectOrgDetailError = ProjectOrgErrorSurface.from(error)
             projectOrgDetailStatus = projectOrgDetailError?.message
+        }
+    }
+
+    // MARK: - S8 team templates
+
+    /// Bounded library read. Imported templates remain read-only until an
+    /// explicit apply; this function never mutates a template.
+    func loadTeamTemplates() async {
+        guard let projectID = selectedProjectID else {
+            teamTemplateEntries = []
+            teamTemplatesStatus = nil
+            return
+        }
+        teamTemplatesBusy = true
+        teamTemplateError = nil
+        defer { teamTemplatesBusy = false }
+        do {
+            let result = try await core.teamTemplates(projectID: projectID)
+            guard projectID == selectedProjectID else { return }
+            teamTemplateEntries = result.templates
+            teamTemplatesStatus = result.templates.isEmpty
+                ? "No team templates."
+                : "\(result.templates.count) template(s)\(result.truncated ? " · truncated" : "")"
+        } catch {
+            guard projectID == selectedProjectID else { return }
+            teamTemplateEntries = []
+            teamTemplateError = ProjectOrgErrorSurface.from(error)
+            teamTemplatesStatus = teamTemplateError?.message
+        }
+    }
+
+    func presentTeamTemplateImport() {
+        teamTemplateSheet = .importTemplate
+        teamTemplatePreview = nil
+        teamTemplateError = nil
+        teamTemplateNotice = nil
+        teamTemplateApplyApproved = false
+        teamTemplateResolutions = []
+        teamTemplateImportJSON = ""
+    }
+
+    func dismissTeamTemplateSheet() {
+        teamTemplateSheet = nil
+        teamTemplatePreview = nil
+        teamTemplateDiff = nil
+        teamTemplateError = nil
+        teamTemplateApplyApproved = false
+    }
+
+    /// Read-only preview. It never writes a library record, link, hire request,
+    /// identity, or policy value.
+    func previewTeamTemplateImport() async {
+        guard let projectID = selectedProjectID else { return }
+        let json = teamTemplateImportJSON.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !json.isEmpty else {
+            teamTemplateError = ProjectOrgErrorSurface(
+                code: "TEMPLATE_INVALID",
+                message: "Paste or load team.json before previewing.",
+                hint: nil
+            )
+            return
+        }
+        teamTemplatesBusy = true
+        teamTemplateError = nil
+        teamTemplateNotice = nil
+        defer { teamTemplatesBusy = false }
+        do {
+            let result = try await core.previewTeamTemplate(
+                projectID: projectID,
+                json: json,
+                resolutions: teamTemplateResolutions
+            )
+            guard projectID == selectedProjectID else { return }
+            teamTemplatePreview = result.preview
+            teamTemplateApplyApproved = false
+            teamTemplateNotice = result.preview.applyAllowed
+                ? "Preview valid. Apply still requires explicit approval."
+                : "Preview reports conflicts or policy gaps; resolve them before applying."
+        } catch {
+            guard projectID == selectedProjectID else { return }
+            teamTemplatePreview = nil
+            teamTemplateError = ProjectOrgErrorSurface.from(error)
+        }
+    }
+
+    /// Explicit apply. The daemon revalidates every rule and creates only
+    /// pending S6 hire requests; it never creates an identity or overwrites one.
+    func applyTeamTemplateImport() async {
+        guard let projectID = selectedProjectID else { return }
+        guard teamTemplateApplyApproved else {
+            teamTemplateError = ProjectOrgErrorSurface(
+                code: "TEMPLATE_APPROVAL_REQUIRED",
+                message: "Apply requires explicit operator approval.",
+                hint: "Toggle approval after reviewing the preview."
+            )
+            return
+        }
+        guard let preview = teamTemplatePreview, preview.applyAllowed else {
+            teamTemplateError = ProjectOrgErrorSurface(
+                code: "TEMPLATE_APPLY_CONFLICT",
+                message: "Resolve conflicts and preview again before applying.",
+                hint: nil
+            )
+            return
+        }
+        let json = teamTemplateImportJSON.trimmingCharacters(in: .whitespacesAndNewlines)
+        teamTemplatesBusy = true
+        teamTemplateError = nil
+        defer { teamTemplatesBusy = false }
+        do {
+            let result = try await core.importTeamTemplate(
+                projectID: projectID,
+                json: json,
+                apply: true,
+                approved: true,
+                resolutions: teamTemplateResolutions
+            )
+            guard projectID == selectedProjectID else { return }
+            teamTemplatePreview = result.preview
+            teamTemplateApplyApproved = false
+            teamTemplateNotice = result.applied
+                ? (result.changed
+                    ? "Applied. Created \(result.pendingHireRequestIDs.count) pending hire request(s)."
+                    : "Template was already applied; no request was duplicated.")
+                : "Import completed without apply."
+            await loadTeamTemplates()
+            await loadProjectOrg()
+        } catch {
+            guard projectID == selectedProjectID else { return }
+            teamTemplateError = ProjectOrgErrorSurface.from(error)
+        }
+    }
+
+    func addTeamTemplateResolution(
+        action: String,
+        slot: String,
+        identityID: String? = nil,
+        title: String? = nil
+    ) {
+        teamTemplateResolutions.removeAll { $0.slot == slot }
+        teamTemplateResolutions.append(
+            TeamTemplateResolutionRequest(
+                slot: slot,
+                action: action,
+                identityID: identityID,
+                title: title
+            )
+        )
+        teamTemplatePreview = nil
+        teamTemplateNotice = "Resolution staged. Preview again to revalidate."
+    }
+
+    func clearTeamTemplateResolutions() {
+        teamTemplateResolutions = []
+        teamTemplatePreview = nil
+        teamTemplateNotice = "Resolutions cleared. Preview again."
+    }
+
+    func loadTeamTemplateDiff(templateID: String) async {
+        guard let projectID = selectedProjectID else { return }
+        teamTemplateSheet = .diff
+        teamTemplateSelectedID = templateID
+        teamTemplatesBusy = true
+        teamTemplateError = nil
+        defer { teamTemplatesBusy = false }
+        do {
+            let diff = try await core.teamTemplateDiff(
+                projectID: projectID,
+                templateID: templateID
+            )
+            guard projectID == selectedProjectID else { return }
+            teamTemplateDiff = diff
+        } catch {
+            guard projectID == selectedProjectID else { return }
+            teamTemplateDiff = nil
+            teamTemplateError = ProjectOrgErrorSurface.from(error)
+        }
+    }
+
+    func replayTeamTemplates(repair: Bool) async {
+        guard let projectID = selectedProjectID else { return }
+        teamTemplatesBusy = true
+        teamTemplateError = nil
+        defer { teamTemplatesBusy = false }
+        do {
+            let report = try await core.teamTemplateReplay(
+                projectID: projectID,
+                repair: repair
+            )
+            guard projectID == selectedProjectID else { return }
+            teamTemplateReplay = report
+            teamTemplateNotice = report.mismatches.isEmpty
+                ? "Template audit is consistent."
+                : "\(report.mismatches.count) mismatch(es) reported."
+            if !report.mismatches.isEmpty {
+                teamTemplateError = ProjectOrgErrorSurface(
+                    code: "TEMPLATE_REPLAY_INVALID",
+                    message: "Template audit reported a mismatch.",
+                    hint: report.mismatches.first
+                )
+            }
+        } catch {
+            guard projectID == selectedProjectID else { return }
+            teamTemplateError = ProjectOrgErrorSurface.from(error)
         }
     }
 

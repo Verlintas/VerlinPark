@@ -11329,6 +11329,19 @@ pub struct SessionBundle {
     /// and can never be approved locally.
     #[serde(default)]
     pub agent_hire_requests: Vec<AgentHireRequest>,
+    /// Portable team charters relevant to this archive's project. Older
+    /// bundles decode as an empty list. A template without a project link is a
+    /// library record and creates no identity or hire request.
+    #[serde(default)]
+    pub team_templates: Vec<TeamTemplateRecord>,
+    /// Explicit template→project apply links. Imported links are archive
+    /// evidence; they never create local identities or approve hires.
+    #[serde(default)]
+    pub project_team_templates: Vec<ProjectTeamTemplate>,
+    /// Bounded team-template audit events. Payloads carry ids, names, hashes,
+    /// and counts only, never context or template bodies.
+    #[serde(default)]
+    pub team_template_events: Vec<TeamTemplateEvent>,
 }
 
 /// Project policy for automatic crash resume. Manual `session.run.resume`
@@ -20473,6 +20486,9 @@ mod context_checkpoint_bundle_tests {
             agent_retirement_proposals: Vec::new(),
             agent_employment_events: Vec::new(),
             agent_hire_requests: Vec::new(),
+            team_templates: Vec::new(),
+            project_team_templates: Vec::new(),
+            team_template_events: Vec::new(),
         };
         let encoded = serde_json::to_string(&bundle).unwrap();
         let decoded: SessionBundle = serde_json::from_str(&encoded).unwrap();
@@ -23675,6 +23691,631 @@ mod gate_protocol_tests {
     }
 }
 
+// ---------------------------------------------------------------------------
+// S8 portable team templates / team charter
+// ---------------------------------------------------------------------------
+
+/// The one supported on-disk schema. A different integer fails closed rather
+/// than being coerced into the current shape.
+pub const TEAM_TEMPLATE_SCHEMA_VERSION: u32 = 1;
+pub const TEAM_TEMPLATE_MAX_JSON_BYTES: usize = 262_144;
+pub const TEAM_TEMPLATE_MAX_DEPARTMENTS: usize = 64;
+pub const TEAM_TEMPLATE_MAX_WORKERS_PER_DEPARTMENT: usize = 20;
+pub const TEAM_TEMPLATE_MAX_NAME_CHARS: usize = 120;
+pub const TEAM_TEMPLATE_MAX_VERSION_CHARS: usize = 40;
+pub const TEAM_TEMPLATE_MAX_DESCRIPTION_CHARS: usize = 4_000;
+pub const TEAM_TEMPLATE_MAX_TITLE_CHARS: usize = 200;
+pub const TEAM_TEMPLATE_MAX_PROFILE_CHARS: usize = 64;
+pub const TEAM_TEMPLATE_MAX_MODEL_CHARS: usize = 200;
+pub const TEAM_TEMPLATE_MAX_TEXT_CHARS: usize = 2_000;
+pub const TEAM_TEMPLATE_MAX_LIST_ITEMS: usize = 32;
+pub const TEAM_TEMPLATE_MAX_SKILLS: usize = 64;
+pub const TEAM_TEMPLATE_MAX_TOOL_NAMES: usize = 64;
+pub const TEAM_TEMPLATE_MAX_MODEL_BINDINGS: usize = 32;
+pub const TEAM_TEMPLATE_MAX_SLOT_ID_CHARS: usize = 200;
+pub const TEAM_TEMPLATE_MAX_OPERATOR_CHARS: usize = 120;
+pub const TEAM_TEMPLATE_MAX_TOKEN_BUDGET: u64 = 1_000_000_000_000;
+pub const TEAM_TEMPLATE_MAX_COST_BUDGET_USD: f64 = 1_000_000_000.0;
+pub const TEAM_TEMPLATE_MIN_CONCURRENCY: u32 = 1;
+pub const TEAM_TEMPLATE_MAX_CONCURRENCY: u32 = 40;
+pub const TEAM_TEMPLATE_DEFAULT_LIMIT: u32 = 50;
+pub const TEAM_TEMPLATE_MAX_LIMIT: u32 = 200;
+pub const TEAM_TEMPLATE_MAX_EVENTS: usize = 100_000;
+
+pub const TEAM_TEMPLATE_EXPORTED_EVENT: &str = "team.template.exported";
+pub const TEAM_TEMPLATE_IMPORTED_EVENT: &str = "team.template.imported";
+pub const TEAM_TEMPLATE_APPLIED_EVENT: &str = "team.template.applied";
+pub const TEAM_TEMPLATE_EVENT_KINDS: &[&str] = &[
+    TEAM_TEMPLATE_EXPORTED_EVENT,
+    TEAM_TEMPLATE_IMPORTED_EVENT,
+    TEAM_TEMPLATE_APPLIED_EVENT,
+];
+
+/// Stable wire codes for the S8 surface. Message text is never classified.
+pub mod team_template_codes {
+    pub const TEMPLATE_NOT_FOUND: &str = "TEMPLATE_NOT_FOUND";
+    pub const TEMPLATE_INVALID: &str = "TEMPLATE_INVALID";
+    pub const TEMPLATE_SCHEMA_UNSUPPORTED: &str = "TEMPLATE_SCHEMA_UNSUPPORTED";
+    pub const TEMPLATE_HASH_MISMATCH: &str = "TEMPLATE_HASH_MISMATCH";
+    pub const TEMPLATE_ROLE_INVALID: &str = "TEMPLATE_ROLE_INVALID";
+    pub const TEMPLATE_PROFILE_INVALID: &str = "TEMPLATE_PROFILE_INVALID";
+    pub const TEMPLATE_TOOL_INVALID: &str = "TEMPLATE_TOOL_INVALID";
+    pub const TEMPLATE_MODEL_INVALID: &str = "TEMPLATE_MODEL_INVALID";
+    pub const TEMPLATE_BUDGET_INVALID: &str = "TEMPLATE_BUDGET_INVALID";
+    pub const TEMPLATE_BUDGET_WIDENING: &str = "TEMPLATE_BUDGET_WIDENING";
+    pub const TEMPLATE_CONTEXT_LEAK: &str = "TEMPLATE_CONTEXT_LEAK";
+    pub const TEMPLATE_SECRET_DETECTED: &str = "TEMPLATE_SECRET_DETECTED";
+    pub const TEMPLATE_CONFLICT: &str = "TEMPLATE_CONFLICT";
+    pub const TEMPLATE_RESOLUTION_INVALID: &str = "TEMPLATE_RESOLUTION_INVALID";
+    pub const TEMPLATE_APPROVAL_REQUIRED: &str = "TEMPLATE_APPROVAL_REQUIRED";
+    pub const TEMPLATE_APPLY_CONFLICT: &str = "TEMPLATE_APPLY_CONFLICT";
+    pub const TEMPLATE_CAP_EXCEEDED: &str = "TEMPLATE_CAP_EXCEEDED";
+    pub const TEMPLATE_PROJECT_NOT_FOUND: &str = "TEMPLATE_PROJECT_NOT_FOUND";
+    pub const TEMPLATE_REPLAY_INVALID: &str = "TEMPLATE_REPLAY_INVALID";
+}
+
+/// One budget suggestion. It is never applied to the target project during
+/// import; the target project budget always wins.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TeamTemplateBudget {
+    #[serde(default)]
+    pub token_budget: Option<u64>,
+    #[serde(default)]
+    pub cost_budget_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TeamTemplateBudgets {
+    #[serde(default)]
+    pub defaults: TeamTemplateBudget,
+    #[serde(default)]
+    pub caps: TeamTemplateBudget,
+}
+
+/// One portable role slot. It deliberately has no identity id, session id,
+/// worktree, branch, memory, inbox, transcript, or performance evidence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeamTemplateRoleSlot {
+    #[serde(default)]
+    pub title: String,
+    /// leader, manager, or worker. Labour is represented by defaults only.
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub department: Option<String>,
+    #[serde(default)]
+    pub component: Option<String>,
+    #[serde(default)]
+    pub profile: String,
+    /// A key into `TeamTemplate::model_bindings`. It is a label, not a route.
+    #[serde(default)]
+    pub model_role: Option<String>,
+    #[serde(default)]
+    pub charter: String,
+    #[serde(default)]
+    pub decision_rights: Vec<String>,
+    #[serde(default)]
+    pub review_duties: Vec<String>,
+    #[serde(default)]
+    pub default_budget: TeamTemplateBudget,
+}
+
+impl Default for TeamTemplateRoleSlot {
+    fn default() -> Self {
+        Self {
+            title: String::new(),
+            role: String::new(),
+            department: None,
+            component: None,
+            profile: "generic".to_string(),
+            model_role: None,
+            charter: String::new(),
+            decision_rights: Vec::new(),
+            review_duties: Vec::new(),
+            default_budget: TeamTemplateBudget::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeamTemplateDepartment {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub objective: String,
+    #[serde(default)]
+    pub manager: TeamTemplateRoleSlot,
+    #[serde(default)]
+    pub workers: Vec<TeamTemplateRoleSlot>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeamTemplateLabourDefaults {
+    #[serde(default)]
+    pub profile: String,
+    #[serde(default)]
+    pub model_role: Option<String>,
+    #[serde(default)]
+    pub bundle: String,
+    #[serde(default)]
+    pub max_concurrency: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeamTemplateRules {
+    #[serde(default)]
+    pub delegation: String,
+    #[serde(default)]
+    pub review: String,
+    #[serde(default)]
+    pub acceptance: String,
+    #[serde(default)]
+    pub escalation: String,
+    #[serde(default)]
+    pub retirement: String,
+    #[serde(default)]
+    pub handoff: String,
+    #[serde(default)]
+    pub communication: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeamTemplateToolPolicy {
+    /// One named static bundle. The target project still decides execution.
+    #[serde(default)]
+    pub bundle: Option<String>,
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeamTemplateSkillRef {
+    #[serde(default)]
+    pub name: String,
+    /// The source skill's SHA-256 content hash, when exported.
+    #[serde(default)]
+    pub version_hash: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeamTemplateConventions {
+    #[serde(default)]
+    pub coding: String,
+    #[serde(default)]
+    pub commit: String,
+    #[serde(default)]
+    pub test: String,
+    #[serde(default)]
+    pub review_checklist: Vec<String>,
+}
+
+/// Human provenance only. It carries a project name, never a root path, repo
+/// URL, project id, or credential.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeamTemplateProvenance {
+    #[serde(default)]
+    pub source_project: Option<String>,
+}
+
+/// Canonical portable team charter. Unknown fields are rejected so a caller
+/// cannot smuggle context, memory, inbox, worktree, or secret fields into the
+/// schema. The content hash covers the whole value with `content_hash` empty.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeamTemplate {
+    #[serde(default)]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub template_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub content_hash: String,
+    #[serde(default)]
+    pub leader: TeamTemplateRoleSlot,
+    #[serde(default)]
+    pub departments: Vec<TeamTemplateDepartment>,
+    #[serde(default)]
+    pub labour_defaults: TeamTemplateLabourDefaults,
+    #[serde(default)]
+    pub rules: TeamTemplateRules,
+    #[serde(default)]
+    pub budgets: TeamTemplateBudgets,
+    #[serde(default)]
+    pub model_bindings: BTreeMap<String, String>,
+    #[serde(default)]
+    pub tool_policy: BTreeMap<String, TeamTemplateToolPolicy>,
+    #[serde(default)]
+    pub skills: Vec<TeamTemplateSkillRef>,
+    #[serde(default)]
+    pub conventions: TeamTemplateConventions,
+    #[serde(default)]
+    pub provenance: TeamTemplateProvenance,
+}
+
+/// A stored template's metadata plus its applied state for one project.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TeamTemplateEntry {
+    #[serde(default)]
+    pub template_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub content_hash: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub source_project: Option<String>,
+    #[serde(default)]
+    pub applied: bool,
+    #[serde(default)]
+    pub applied_at: Option<String>,
+    #[serde(default)]
+    pub applied_by: Option<String>,
+    /// A template that was imported (not exported from this project) is
+    /// read-only until an explicit apply.
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+/// Durable storage record used by the manifest and session bundle. The parsed
+/// template is nested so a rebuild never has to reinterpret free-form SQL.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TeamTemplateRecord {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub content_hash: String,
+    #[serde(default)]
+    pub template: TeamTemplate,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub source_project_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectTeamTemplate {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub template_id: String,
+    #[serde(default)]
+    pub applied_at: String,
+    #[serde(default)]
+    pub applied_by: Option<String>,
+}
+
+/// Bounded project-scoped audit event. The payload carries ids/hashes/names,
+/// never the template body or any context/memory/inbox/worktree content.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TeamTemplateEvent {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub template_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub content_hash: String,
+    #[serde(default)]
+    pub payload: Value,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TeamTemplateExportParams {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TeamTemplateExportResult {
+    #[serde(default)]
+    pub template: TeamTemplate,
+    #[serde(default)]
+    pub json: String,
+    #[serde(default)]
+    pub markdown: String,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+/// One explicit conflict resolution. `skip` suppresses a slot, `merge` binds a
+/// slot to an existing identity without overwriting it, and `rename` changes the
+/// proposed title before creating a pending hire request. `retire` is not an
+/// apply action; the operator must call the S6 retirement RPC first.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamTemplateResolution {
+    #[serde(default)]
+    pub slot: String,
+    /// skip, merge, or rename.
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub identity_id: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TeamTemplateImportParams {
+    #[serde(default)]
+    pub project_id: String,
+    /// Raw `team.json`. The server bounds and validates it; a client never
+    /// writes a database row directly.
+    #[serde(default)]
+    pub json: String,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub apply: bool,
+    /// Required when `apply` is true.
+    #[serde(default)]
+    pub approved: bool,
+    #[serde(default)]
+    pub operator: Option<String>,
+    #[serde(default)]
+    pub resolutions: Vec<TeamTemplateResolution>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamTemplateConflict {
+    #[serde(default)]
+    pub slot: String,
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub existing_identity_id: Option<String>,
+    #[serde(default)]
+    pub proposed_title: String,
+    #[serde(default)]
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamTemplateSlotPreview {
+    #[serde(default)]
+    pub slot: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub department: Option<String>,
+    #[serde(default)]
+    pub component: Option<String>,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub profile: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    /// existing, create_pending_hire, conflict, blocked, skipped, or renamed.
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub existing_identity_id: Option<String>,
+    #[serde(default)]
+    pub pending_hire_request_id: Option<String>,
+    #[serde(default)]
+    pub conflict_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamTemplateDepartmentPreview {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub objective: String,
+    #[serde(default)]
+    pub manager: TeamTemplateSlotPreview,
+    #[serde(default)]
+    pub workers: Vec<TeamTemplateSlotPreview>,
+}
+
+/// Deterministic import preview. It is descriptive: preview never writes a
+/// template record, hire request, link, identity, session, or policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamTemplatePreview {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub template_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub content_hash: String,
+    #[serde(default)]
+    pub valid: bool,
+    #[serde(default)]
+    pub apply_allowed: bool,
+    #[serde(default)]
+    pub requires_approval: bool,
+    #[serde(default)]
+    pub leader_overlay: bool,
+    #[serde(default)]
+    pub leader_identity_id: Option<String>,
+    #[serde(default)]
+    pub departments: Vec<TeamTemplateDepartmentPreview>,
+    #[serde(default)]
+    pub proposed_org: Vec<String>,
+    #[serde(default)]
+    pub new_hire_slots: Vec<String>,
+    #[serde(default)]
+    pub existing_slots: Vec<String>,
+    #[serde(default)]
+    pub skipped_slots: Vec<String>,
+    #[serde(default)]
+    pub blocked_slots: Vec<String>,
+    #[serde(default)]
+    pub conflicts: Vec<TeamTemplateConflict>,
+    #[serde(default)]
+    pub budget_changes: Vec<String>,
+    #[serde(default)]
+    pub model_gaps: Vec<String>,
+    #[serde(default)]
+    pub tool_gaps: Vec<String>,
+    #[serde(default)]
+    pub policy_conflicts: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TeamTemplateImportResult {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub template: TeamTemplate,
+    #[serde(default)]
+    pub preview: TeamTemplatePreview,
+    #[serde(default)]
+    pub applied: bool,
+    #[serde(default)]
+    pub changed: bool,
+    #[serde(default)]
+    pub entry: Option<TeamTemplateEntry>,
+    #[serde(default)]
+    pub pending_hire_request_ids: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TeamTemplateListParams {
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TeamTemplateListResult {
+    #[serde(default)]
+    pub templates: Vec<TeamTemplateEntry>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TeamTemplateGetParams {
+    #[serde(default)]
+    pub template_id: String,
+    /// Optional project view so the entry reports applied/read-only state.
+    #[serde(default)]
+    pub project_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TeamTemplateGetResult {
+    #[serde(default)]
+    pub entry: TeamTemplateEntry,
+    #[serde(default)]
+    pub json: String,
+    #[serde(default)]
+    pub markdown: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TeamTemplateDiffParams {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub template_id: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamTemplateDiffRow {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub slot: String,
+    #[serde(default)]
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamTemplateDiffResult {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub template_id: String,
+    #[serde(default)]
+    pub content_hash: String,
+    #[serde(default)]
+    pub rows: Vec<TeamTemplateDiffRow>,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TeamTemplateReplayParams {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub repair: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamTemplateReplayReport {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub events: u64,
+    #[serde(default)]
+    pub templates: u64,
+    #[serde(default)]
+    pub links: u64,
+    #[serde(default)]
+    pub repaired_links: u64,
+    #[serde(default)]
+    pub mismatches: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
 #[cfg(test)]
 mod agent_identity_protocol_tests {
     use super::*;
@@ -24564,5 +25205,95 @@ mod project_org_protocol_tests {
         );
         assert_eq!(agent_identity_codes::ORG_INVALID, "ORG_INVALID");
         assert_eq!(agent_identity_codes::DETAIL_INVALID, "DETAIL_INVALID");
+    }
+}
+
+#[cfg(test)]
+mod team_template_protocol_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn team_template_decodes_partial_objects_with_defaults() {
+        let template: TeamTemplate = serde_json::from_value(json!({
+            "schema_version": 1,
+            "template_id": "tt_abc",
+            "name": "Platform Team",
+            "version": "1.0.0",
+            "content_hash": "a".repeat(64),
+        }))
+        .unwrap();
+        assert_eq!(template.leader.profile, "generic");
+        assert!(template.departments.is_empty());
+        assert_eq!(template.labour_defaults.max_concurrency, 0);
+        assert!(template.model_bindings.is_empty());
+        assert!(template.tool_policy.is_empty());
+        assert!(template.provenance.source_project.is_none());
+    }
+
+    #[test]
+    fn team_template_rejects_unknown_context_fields() {
+        let error = serde_json::from_value::<TeamTemplate>(json!({
+            "template_id": "tt_abc",
+            "name": "Team",
+            "version": "1.0.0",
+            "worktree": "/Users/example/repo",
+            "session_id": "ses-1",
+            "memory": ["secret"]
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn team_template_role_slot_rejects_identity_ids() {
+        let error = serde_json::from_value::<TeamTemplateRoleSlot>(json!({
+            "title": "Leader",
+            "role": "leader",
+            "agent_id": "agent-1"
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn team_template_import_params_are_additive_and_bounded() {
+        let params: TeamTemplateImportParams = serde_json::from_value(json!({
+            "project_id": "prj-1",
+            "json": "{}"
+        }))
+        .unwrap();
+        assert!(!params.dry_run);
+        assert!(!params.apply);
+        assert!(!params.approved);
+        assert!(params.resolutions.is_empty());
+
+        let entry: TeamTemplateEntry = serde_json::from_value(json!({
+            "template_id": "tt_abc",
+            "name": "Team"
+        }))
+        .unwrap();
+        assert_eq!(entry.template_id, "tt_abc");
+        assert!(!entry.applied);
+
+        let preview: TeamTemplatePreview = serde_json::from_value(json!({})).unwrap();
+        assert!(preview.departments.is_empty());
+        assert!(!preview.valid);
+    }
+
+    #[test]
+    fn team_template_event_codes_are_stable_wire_values() {
+        assert_eq!(TEAM_TEMPLATE_EXPORTED_EVENT, "team.template.exported");
+        assert_eq!(TEAM_TEMPLATE_IMPORTED_EVENT, "team.template.imported");
+        assert_eq!(TEAM_TEMPLATE_APPLIED_EVENT, "team.template.applied");
+        assert!(TEAM_TEMPLATE_EVENT_KINDS.contains(&TEAM_TEMPLATE_APPLIED_EVENT));
+        assert_eq!(
+            team_template_codes::TEMPLATE_APPROVAL_REQUIRED,
+            "TEMPLATE_APPROVAL_REQUIRED"
+        );
+        assert_eq!(
+            team_template_codes::TEMPLATE_BUDGET_WIDENING,
+            "TEMPLATE_BUDGET_WIDENING"
+        );
     }
 }

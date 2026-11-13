@@ -141,7 +141,9 @@ use vp_protocol::types::{
     SourceListParams, SourceRetrievalPolicyParams, SourceSearchParams, SubscribeParams,
     SupersedeAgentMemoryParams, SweepAgentMemoriesParams, TaskActionParams, TaskActionResult,
     TaskDispatchParams, TaskDispatchResult, TaskQueueParams, TaskSchedulerPolicyParams,
-    TeamPlanParams, TeamPlanResult, TerminalCloseParams, TerminalOpenParams, TerminalReadParams,
+    TeamPlanParams, TeamPlanResult, TeamTemplateDiffParams, TeamTemplateExportParams,
+    TeamTemplateGetParams, TeamTemplateImportParams, TeamTemplateListParams,
+    TeamTemplateReplayParams, TerminalCloseParams, TerminalOpenParams, TerminalReadParams,
     TerminalResizeParams, TerminalWriteParams, ToolActivityParams, ToolBundleDiffParams,
     ToolBundleHistoryParams, ToolBundleMatrixParams, ToolBundleParams, ToolOutputAuditParams,
     ToolOutputListParams, ToolOutputPolicyParams, ToolOutputPolicyResult, ToolOutputPruneParams,
@@ -4155,6 +4157,88 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 Err(response) => response_with_id(id, response),
             }
         }
+        "team.template.export" => match parse_params::<TeamTemplateExportParams>(request.params) {
+            Ok(params) => match state.engine.export_team_template(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => identity_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "team.template.preview" => match parse_params::<TeamTemplateImportParams>(request.params) {
+            Ok(params) => {
+                let known_models = template_known_models(state).await;
+                match state
+                    .engine
+                    .preview_team_template(params, known_models)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => identity_error(id, error),
+                }
+            }
+            Err(response) => response_with_id(id, response),
+        },
+        "team.template.import" => match parse_params::<TeamTemplateImportParams>(request.params) {
+            Ok(params) => {
+                let known_models = template_known_models(state).await;
+                match state
+                    .engine
+                    .import_team_template(params, known_models)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => identity_error(id, error),
+                }
+            }
+            Err(response) => response_with_id(id, response),
+        },
+        "team.template.list" => match parse_params::<TeamTemplateListParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .list_team_templates(params.project_id, params.limit)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => identity_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "team.template.get" => match parse_params::<TeamTemplateGetParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .get_team_template(&params.template_id, params.project_id.as_deref())
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => identity_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "team.template.diff" => match parse_params::<TeamTemplateDiffParams>(request.params) {
+            Ok(params) => {
+                let known_models = template_known_models(state).await;
+                match state
+                    .engine
+                    .diff_team_template(&params.project_id, &params.template_id, known_models)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => identity_error(id, error),
+                }
+            }
+            Err(response) => response_with_id(id, response),
+        },
+        "team.template.replay" => match parse_params::<TeamTemplateReplayParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .replay_team_templates(&params.project_id, params.repair)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => identity_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
         "agent.identity.create" => {
             match parse_params::<CreateAgentIdentityParams>(request.params) {
                 Ok(params) => {
@@ -5728,6 +5812,9 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             | "project.contract_policy.set"
             | "project.agent_identity_policy.set"
             | "agent.identity.create"
+            | "team.template.export"
+            | "team.template.import"
+            | "team.template.replay"
             | "agent.identity.update"
             | "agent.identity.pause"
             | "agent.identity.resume"
@@ -5881,6 +5968,23 @@ fn internal_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
     RpcResponse::error(id, RpcError::new(codes::INTERNAL_ERROR, error.to_string()))
 }
 
+/// Known model references are daemon configuration, never client input. A
+/// template binding to anything outside this set fails closed on import.
+async fn template_known_models(state: &AppState) -> Vec<String> {
+    let mut models = vp_core::team_template::configured_model_references(&state.agent.info());
+    if let Ok(presets) = state.engine.list_model_presets().await {
+        for preset in presets.presets {
+            let model = preset.model.trim();
+            if !model.is_empty() {
+                models.push(model.to_string());
+            }
+        }
+    }
+    models.sort();
+    models.dedup();
+    models
+}
+
 /// Map the stable identity error taxonomy to a bounded RPC failure. Message
 /// text never changes the classification; only the typed code does.
 fn identity_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
@@ -5895,7 +5999,9 @@ fn identity_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
         vp_protocol::types::agent_identity_codes::IDENTITY_NOT_FOUND
         | vp_protocol::types::agent_identity_codes::HIRE_NOT_FOUND
         | vp_protocol::types::agent_identity_codes::RETIREMENT_NOT_FOUND
-        | vp_protocol::types::agent_identity_codes::ORG_PROJECT_NOT_FOUND => codes::NOT_FOUND,
+        | vp_protocol::types::agent_identity_codes::ORG_PROJECT_NOT_FOUND
+        | vp_protocol::types::team_template_codes::TEMPLATE_NOT_FOUND
+        | vp_protocol::types::team_template_codes::TEMPLATE_PROJECT_NOT_FOUND => codes::NOT_FOUND,
         vp_protocol::types::agent_identity_codes::IDENTITY_BUSY
         | vp_protocol::types::agent_identity_codes::IDENTITY_RETIRED
         | vp_protocol::types::agent_identity_codes::IDENTITY_CONFLICT
@@ -5906,7 +6012,9 @@ fn identity_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
         | vp_protocol::types::agent_identity_codes::RETIREMENT_CONFLICT
         | vp_protocol::types::agent_identity_codes::RETIREMENT_COOLDOWN
         | vp_protocol::types::agent_identity_codes::RETIREMENT_NOT_QUIESCENT
-        | vp_protocol::types::agent_identity_codes::RETIREMENT_NOT_ELIGIBLE => codes::CONFLICT,
+        | vp_protocol::types::agent_identity_codes::RETIREMENT_NOT_ELIGIBLE
+        | vp_protocol::types::team_template_codes::TEMPLATE_CONFLICT
+        | vp_protocol::types::team_template_codes::TEMPLATE_APPLY_CONFLICT => codes::CONFLICT,
         _ => codes::INVALID_PARAMS,
     };
     RpcResponse::error(

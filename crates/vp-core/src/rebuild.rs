@@ -332,6 +332,35 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
                     &snapshot.project.id,
                 )?;
             }
+            for record in &snapshot.team_templates {
+                if record.template.template_id != record.id {
+                    anyhow::bail!(
+                        "team template {} body id does not match its record",
+                        record.id
+                    );
+                }
+                vp_store::store::team_template::insert_team_template_snapshot(&store, record)?;
+            }
+            for link in &snapshot.project_team_templates {
+                if link.project_id != snapshot.project.id {
+                    anyhow::bail!(
+                        "team template link {} belongs to another project in the manifest",
+                        link.template_id
+                    );
+                }
+                vp_store::store::team_template::insert_project_team_template_snapshot(
+                    &store, link,
+                )?;
+            }
+            for event in &snapshot.team_template_events {
+                if event.project_id != snapshot.project.id {
+                    anyhow::bail!(
+                        "team template event {} belongs to another project in the manifest",
+                        event.id
+                    );
+                }
+                vp_store::store::team_template::insert_team_template_event_snapshot(&store, event)?;
+            }
             let effect_policy = snapshot.effect_policy.normalized().map_err(|error| {
                 anyhow::anyhow!(
                     "effect policy for project {} is invalid: {error}",

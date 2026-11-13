@@ -1828,6 +1828,90 @@ actor CoreClient {
             .decode(AgentIdentityDetail.self)
     }
 
+    // MARK: - S8 team templates
+
+    /// Bounded team-template library. A nil project lists the global library;
+    /// imported records without an apply link remain read-only.
+    func teamTemplates(
+        projectID: String?,
+        limit: Int = 50
+    ) async throws -> TeamTemplateListResult {
+        var params: [String: JSONValue] = ["limit": .number(Double(limit))]
+        if let projectID {
+            params["project_id"] = .string(projectID)
+        }
+        return try await request(method: "team.template.list", params: params)
+            .decode(TeamTemplateListResult.self)
+    }
+
+    /// Read-only preview. No library row, link, identity, or hire request is
+    /// created by this call.
+    func previewTeamTemplate(
+        projectID: String,
+        json: String,
+        resolutions: [TeamTemplateResolutionRequest] = []
+    ) async throws -> TeamTemplateImportResult {
+        let params: [String: JSONValue] = try [
+            "project_id": .string(projectID),
+            "json": .string(json),
+            "dry_run": .bool(true),
+            "apply": .bool(false),
+            "approved": .bool(false),
+            "resolutions": jsonValue(resolutions),
+        ]
+        return try await request(method: "team.template.preview", params: params)
+            .decode(TeamTemplateImportResult.self)
+    }
+
+    /// Apply requires `approved` explicitly. The daemon still revalidates the
+    /// template, target policy, caps, hierarchy, model bindings, and tool names.
+    func importTeamTemplate(
+        projectID: String,
+        json: String,
+        apply: Bool,
+        approved: Bool,
+        operatorName: String? = nil,
+        resolutions: [TeamTemplateResolutionRequest] = []
+    ) async throws -> TeamTemplateImportResult {
+        var params: [String: JSONValue] = try [
+            "project_id": .string(projectID),
+            "json": .string(json),
+            "dry_run": .bool(false),
+            "apply": .bool(apply),
+            "approved": .bool(approved),
+            "resolutions": jsonValue(resolutions),
+        ]
+        if let operatorName, !operatorName.isEmpty {
+            params["operator"] = .string(operatorName)
+        }
+        return try await request(method: "team.template.import", params: params)
+            .decode(TeamTemplateImportResult.self)
+    }
+
+    func teamTemplateDiff(
+        projectID: String,
+        templateID: String
+    ) async throws -> TeamTemplateDiffResult {
+        let params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "template_id": .string(templateID),
+        ]
+        return try await request(method: "team.template.diff", params: params)
+            .decode(TeamTemplateDiffResult.self)
+    }
+
+    func teamTemplateReplay(
+        projectID: String,
+        repair: Bool
+    ) async throws -> TeamTemplateReplayReport {
+        let params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "repair": .bool(repair),
+        ]
+        return try await request(method: "team.template.replay", params: params)
+            .decode(TeamTemplateReplayReport.self)
+    }
+
     /// Explicit S6 hire request. `approved` is never synthesized by the client;
     /// the operator chooses it and the daemon still revalidates caps/hierarchy.
     func agentHire(

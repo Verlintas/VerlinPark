@@ -402,6 +402,7 @@ struct DashboardView: View {
             QuestionCenterCard()
         case .team:
             ProjectOrgCard()
+            TeamTemplatesCard()
             AgentsCard()
             ProjectIdentitiesCard()
             ProjectAgentPerformanceCard()
@@ -509,6 +510,7 @@ struct DashboardView: View {
             await model.loadPendingQuestions()
         case .team:
             await model.loadProjectOrg()
+            await model.loadTeamTemplates()
             await model.loadAgents()
             await model.loadGuiStatus()
             await model.loadGuiTimeline()

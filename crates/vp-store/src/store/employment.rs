@@ -186,7 +186,7 @@ fn next_employment_seq_tx(tx: &Transaction<'_>, project_id: &str) -> Result<u64>
     Ok(seq.max(1) as u64)
 }
 
-fn insert_employment_event_tx(
+pub(crate) fn insert_employment_event_tx(
     tx: &Transaction<'_>,
     project_id: &str,
     identity_id: &str,
@@ -279,7 +279,10 @@ fn get_hire_request_tx(tx: &Transaction<'_>, id: &str) -> Result<Option<AgentHir
     .map_err(Into::into)
 }
 
-fn insert_hire_request_tx(tx: &Transaction<'_>, request: &AgentHireRequest) -> Result<()> {
+pub(crate) fn insert_hire_request_tx(
+    tx: &Transaction<'_>,
+    request: &AgentHireRequest,
+) -> Result<()> {
     let policy = serde_json::to_string(&request.policy)?;
     tx.execute(
         "INSERT INTO agent_hire_requests
@@ -344,7 +347,10 @@ fn create_params_from_hire(request: &AgentHireRequest) -> CreateAgentIdentityPar
     }
 }
 
-fn validate_hire_preflight_tx(tx: &Transaction<'_>, request: &AgentHireRequest) -> Result<()> {
+pub(crate) fn validate_hire_preflight_tx(
+    tx: &Transaction<'_>,
+    request: &AgentHireRequest,
+) -> Result<()> {
     if !AGENT_HIRE_ROLES.contains(&request.role.as_str()) {
         return Err(employment_error(
             agent_identity_codes::HIRE_INVALID,
@@ -396,7 +402,7 @@ fn validate_hire_preflight_tx(tx: &Transaction<'_>, request: &AgentHireRequest) 
     Ok(())
 }
 
-fn build_hire_request(
+pub(crate) fn build_hire_request(
     params: &vp_protocol::types::AgentHireParams,
     identity_id: String,
     operator: &str,
@@ -4534,6 +4540,9 @@ mod tests {
             agent_retirement_proposals: proposals,
             agent_employment_events: employment_events,
             agent_hire_requests: hire_requests,
+            team_templates: Vec::new(),
+            project_team_templates: Vec::new(),
+            team_template_events: Vec::new(),
         }
     }
 

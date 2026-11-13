@@ -2518,6 +2518,74 @@ enum Command {
         #[arg(long, default_value_t = 50)]
         assignment_limit: u32,
     },
+    /// Export a portable, content-addressed team charter. Writes team.json and
+    /// TEAM.md into the output directory; never includes context, memory,
+    /// inbox, worktree, performance, MCP, path, URL, or secret content.
+    #[command(name = "team-export")]
+    TeamExport {
+        project: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "1.0.0")]
+        version: String,
+        #[arg(long)]
+        description: Option<String>,
+        /// Directory that receives team.json and TEAM.md.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Validate a team.json. Default is a read-only library import; --dry-run
+    /// prints the preview without writing, and --apply requires --approved.
+    #[command(name = "team-import")]
+    TeamImport {
+        project: String,
+        #[arg(long)]
+        file: PathBuf,
+        /// Print the preview without writing a library record or hire request.
+        #[arg(long)]
+        dry_run: bool,
+        /// Explicitly apply the template. Requires --approved.
+        #[arg(long)]
+        apply: bool,
+        /// Operator confirmation for apply. Never implied by --apply.
+        #[arg(long)]
+        approved: bool,
+        #[arg(long)]
+        operator: Option<String>,
+        /// JSON array of {slot, action, identity_id?, title?} resolutions.
+        #[arg(long = "resolution-json")]
+        resolution_json: Option<String>,
+    },
+    /// List the team-template library, optionally scoped to one project.
+    #[command(name = "team-templates")]
+    TeamTemplates {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
+    /// Diff one stored team template against a project's current roster.
+    #[command(name = "team-diff")]
+    TeamDiff {
+        project: String,
+        #[arg(long)]
+        template: String,
+    },
+    /// Show one stored team template as team.json and TEAM.md.
+    #[command(name = "team-template")]
+    TeamTemplateShow {
+        template: String,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Verify (and optionally repair missing apply links in) the project
+    /// template audit stream. Never creates a template, identity, or hire.
+    #[command(name = "team-replay")]
+    TeamReplay {
+        project: String,
+        #[arg(long)]
+        repair: bool,
+    },
     /// Create one explicit project identity. No session is created or assigned.
     AgentCreate {
         project: String,
@@ -8556,6 +8624,119 @@ async fn run(cli: Cli) -> Result<()> {
                     "memory_limit": memory_limit,
                     "assignment_limit": assignment_limit,
                 }),
+            )
+            .await?
+        }
+        Command::TeamExport {
+            project,
+            name,
+            version,
+            description,
+            out,
+        } => {
+            let value = rpc(
+                &discovery,
+                "team.template.export",
+                json!({
+                    "project_id": project,
+                    "name": name,
+                    "version": version,
+                    "description": description,
+                }),
+            )
+            .await?;
+            let json_body = value
+                .get("json")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("team export returned no JSON body"))?;
+            let markdown = value
+                .get("markdown")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("team export returned no Markdown body"))?;
+            std::fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
+            let json_path = out.join("team.json");
+            let markdown_path = out.join("TEAM.md");
+            std::fs::write(&json_path, json_body)
+                .with_context(|| format!("writing {}", json_path.display()))?;
+            std::fs::write(&markdown_path, markdown)
+                .with_context(|| format!("writing {}", markdown_path.display()))?;
+            json!({
+                "out": out.display().to_string(),
+                "json_path": json_path.display().to_string(),
+                "markdown_path": markdown_path.display().to_string(),
+                "template_id": value["template"]["template_id"],
+                "name": value["template"]["name"],
+                "version": value["template"]["version"],
+                "content_hash": value["template"]["content_hash"],
+                "warnings": value["warnings"],
+            })
+        }
+        Command::TeamImport {
+            project,
+            file,
+            dry_run,
+            apply,
+            approved,
+            operator,
+            resolution_json,
+        } => {
+            let json_body = std::fs::read_to_string(&file)
+                .with_context(|| format!("reading {}", file.display()))?;
+            let resolutions: Vec<vp_protocol::types::TeamTemplateResolution> = match resolution_json
+            {
+                Some(raw) => serde_json::from_str(&raw)
+                    .context("--resolution-json must be a JSON array of resolutions")?,
+                None => Vec::new(),
+            };
+            let method = if dry_run {
+                "team.template.preview"
+            } else {
+                "team.template.import"
+            };
+            rpc(
+                &discovery,
+                method,
+                json!({
+                    "project_id": project,
+                    "json": json_body,
+                    "dry_run": dry_run,
+                    "apply": apply && !dry_run,
+                    "approved": approved,
+                    "operator": operator,
+                    "resolutions": resolutions,
+                }),
+            )
+            .await?
+        }
+        Command::TeamTemplates { project, limit } => {
+            rpc(
+                &discovery,
+                "team.template.list",
+                json!({"project_id": project, "limit": limit}),
+            )
+            .await?
+        }
+        Command::TeamDiff { project, template } => {
+            rpc(
+                &discovery,
+                "team.template.diff",
+                json!({"project_id": project, "template_id": template}),
+            )
+            .await?
+        }
+        Command::TeamTemplateShow { template, project } => {
+            rpc(
+                &discovery,
+                "team.template.get",
+                json!({"template_id": template, "project_id": project}),
+            )
+            .await?
+        }
+        Command::TeamReplay { project, repair } => {
+            rpc(
+                &discovery,
+                "team.template.replay",
+                json!({"project_id": project, "repair": repair}),
             )
             .await?
         }
@@ -15178,6 +15359,162 @@ fn agent_memory_lines(value: &Value) -> Option<Vec<String>> {
     None
 }
 
+fn team_template_lines(value: &Value) -> Option<Vec<String>> {
+    let mut lines = Vec::new();
+    if let Some(markdown) = value.get("markdown").and_then(Value::as_str)
+        && value.get("entry").is_some()
+    {
+        lines.extend(markdown.lines().map(str::to_string));
+        return Some(lines);
+    }
+    if let Some(templates) = value.get("templates").and_then(Value::as_array) {
+        if templates.is_empty() {
+            lines.push("No team templates.".to_string());
+            return Some(lines);
+        }
+        for entry in templates {
+            lines.push(format!(
+                "{:<28} {:<10} {:<6} {:<10} {}",
+                entry["template_id"].as_str().unwrap_or("?"),
+                entry["version"].as_str().unwrap_or("?"),
+                if entry["applied"].as_bool().unwrap_or(false) {
+                    "applied"
+                } else {
+                    "library"
+                },
+                short_hash(&entry["content_hash"]),
+                entry["name"].as_str().unwrap_or("")
+            ));
+            if entry["read_only"].as_bool().unwrap_or(false) {
+                lines.push("  read-only until explicit apply".to_string());
+            }
+        }
+        if value["truncated"].as_bool().unwrap_or(false) {
+            lines.push("… truncated".to_string());
+        }
+        return Some(lines);
+    }
+    if let Some(preview) = value.get("preview") {
+        let name = preview["name"].as_str().unwrap_or("?");
+        let version = preview["version"].as_str().unwrap_or("?");
+        lines.push(format!(
+            "{name} v{version}  hash {}  apply {}",
+            short_hash(&preview["content_hash"]),
+            if preview["apply_allowed"].as_bool().unwrap_or(false) {
+                "allowed"
+            } else {
+                "blocked"
+            }
+        ));
+        if preview["leader_overlay"].as_bool().unwrap_or(false) {
+            lines.push("  Leader: existing overlay (never overwritten)".to_string());
+        }
+        for line in preview["proposed_org"].as_array().into_iter().flatten() {
+            if let Some(line) = line.as_str() {
+                lines.push(format!("  {line}"));
+            }
+        }
+        for conflict in preview["conflicts"].as_array().into_iter().flatten() {
+            lines.push(format!(
+                "  conflict {}: {}",
+                conflict["slot"].as_str().unwrap_or("?"),
+                conflict["message"].as_str().unwrap_or("")
+            ));
+        }
+        for gap in preview["model_gaps"].as_array().into_iter().flatten() {
+            lines.push(format!("  model gap: {}", gap.as_str().unwrap_or("")));
+        }
+        for gap in preview["tool_gaps"].as_array().into_iter().flatten() {
+            lines.push(format!("  tool gap: {}", gap.as_str().unwrap_or("")));
+        }
+        for conflict in preview["policy_conflicts"].as_array().into_iter().flatten() {
+            lines.push(format!("  policy: {}", conflict.as_str().unwrap_or("")));
+        }
+        for warning in preview["warnings"].as_array().into_iter().flatten() {
+            lines.push(format!("  warning: {}", warning.as_str().unwrap_or("")));
+        }
+        if value["applied"].as_bool().unwrap_or(false) {
+            lines.push(format!(
+                "  applied {} pending hire request(s)",
+                value["pending_hire_request_ids"]
+                    .as_array()
+                    .map_or(0, Vec::len)
+            ));
+        }
+        return Some(lines);
+    }
+    if let Some(rows) = value.get("rows").and_then(Value::as_array) {
+        lines.push(format!(
+            "diff {}  template {}  hash {}",
+            value["project_id"].as_str().unwrap_or("?"),
+            value["template_id"].as_str().unwrap_or("?"),
+            short_hash(&value["content_hash"])
+        ));
+        if rows.is_empty() {
+            lines.push("  no differences".to_string());
+        }
+        for row in rows {
+            lines.push(format!(
+                "  {:<14} {:<24} {}",
+                row["kind"].as_str().unwrap_or("?"),
+                row["slot"].as_str().unwrap_or("?"),
+                row["detail"].as_str().unwrap_or("")
+            ));
+        }
+        return Some(lines);
+    }
+    if let Some(template) = value.get("template")
+        && value.get("json").is_some()
+    {
+        lines.push(format!(
+            "exported {} v{}  hash {}",
+            template["template_id"].as_str().unwrap_or("?"),
+            template["version"].as_str().unwrap_or("?"),
+            short_hash(&template["content_hash"])
+        ));
+        if let Some(path) = value.get("json_path").and_then(Value::as_str) {
+            lines.push(format!("  json     {path}"));
+        }
+        if let Some(path) = value.get("markdown_path").and_then(Value::as_str) {
+            lines.push(format!("  markdown {path}"));
+        }
+        for warning in value["warnings"].as_array().into_iter().flatten() {
+            lines.push(format!("  warning: {}", warning.as_str().unwrap_or("")));
+        }
+        return Some(lines);
+    }
+    if value.get("template_id").is_some()
+        && value.get("json").is_some()
+        && value.get("out").is_none()
+    {
+        lines.push(format!(
+            "exported {} v{}  hash {}",
+            value["template_id"].as_str().unwrap_or("?"),
+            value["version"].as_str().unwrap_or("?"),
+            short_hash(&value["content_hash"])
+        ));
+        if let Some(path) = value.get("json_path").and_then(Value::as_str) {
+            lines.push(format!("  json     {path}"));
+        }
+        return Some(lines);
+    }
+    if value.get("repaired_links").is_some() && value.get("mismatches").is_some() {
+        lines.push(format!(
+            "template replay {}  events {} · templates {} · links {} · repaired {}",
+            value["project_id"].as_str().unwrap_or("?"),
+            value["events"].as_u64().unwrap_or(0),
+            value["templates"].as_u64().unwrap_or(0),
+            value["links"].as_u64().unwrap_or(0),
+            value["repaired_links"].as_u64().unwrap_or(0)
+        ));
+        for mismatch in value["mismatches"].as_array().into_iter().flatten() {
+            lines.push(format!("  mismatch: {}", mismatch.as_str().unwrap_or("")));
+        }
+        return Some(lines);
+    }
+    None
+}
+
 fn agent_org_lines(value: &Value) -> Option<Vec<String>> {
     let counts = value.get("counts")?;
     counts.get("identities")?;
@@ -16137,6 +16474,12 @@ fn print_human(value: &Value) {
         return;
     }
     if let Some(lines) = agent_identity_lines(value) {
+        for line in lines {
+            println!("{line}");
+        }
+        return;
+    }
+    if let Some(lines) = team_template_lines(value) {
         for line in lines {
             println!("{line}");
         }
@@ -26584,5 +26927,142 @@ mod agent_org_cli_tests {
         assert!(rendered.contains("performance completed 4"));
         assert!(rendered.contains("agent.transfer.approved"));
         assert!(!rendered.contains("SECRET"));
+    }
+}
+
+#[cfg(test)]
+mod team_template_cli_tests {
+    use super::*;
+
+    #[test]
+    fn team_export_parses_name_version_and_output_directory() {
+        let cli = Cli::try_parse_from([
+            "vp",
+            "team-export",
+            "prj-1",
+            "--name",
+            "Platform Team",
+            "--version",
+            "2.1.0",
+            "--description",
+            "portable charter",
+            "--out",
+            "ops/team",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::TeamExport {
+                project,
+                name,
+                version,
+                description,
+                out,
+            } => {
+                assert_eq!(project, "prj-1");
+                assert_eq!(name, "Platform Team");
+                assert_eq!(version, "2.1.0");
+                assert_eq!(description.as_deref(), Some("portable charter"));
+                assert_eq!(out, PathBuf::from("ops/team"));
+            }
+            other => panic!("expected team-export, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn team_import_distinguishes_preview_apply_and_approval() {
+        let cli = Cli::try_parse_from([
+            "vp",
+            "team-import",
+            "prj-1",
+            "--file",
+            "team.json",
+            "--dry-run",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::TeamImport {
+                project,
+                file,
+                dry_run,
+                apply,
+                approved,
+                ..
+            } => {
+                assert_eq!(project, "prj-1");
+                assert_eq!(file, PathBuf::from("team.json"));
+                assert!(dry_run);
+                assert!(!apply);
+                assert!(!approved);
+            }
+            other => panic!("expected team-import, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "team-import",
+            "prj-1",
+            "--file",
+            "team.json",
+            "--apply",
+            "--approved",
+            "--resolution-json",
+            r#"[{"slot":"manager:Platform:","action":"merge","identity_id":"idn-1"}]"#,
+        ])
+        .unwrap();
+        match cli.command {
+            Command::TeamImport {
+                apply,
+                approved,
+                resolution_json,
+                ..
+            } => {
+                assert!(apply);
+                assert!(approved);
+                let resolutions: Vec<vp_protocol::types::TeamTemplateResolution> =
+                    serde_json::from_str(&resolution_json.unwrap()).unwrap();
+                assert_eq!(resolutions.len(), 1);
+                assert_eq!(resolutions[0].action, "merge");
+            }
+            other => panic!("expected team-import apply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn team_library_diff_and_replay_parse() {
+        let cli = Cli::try_parse_from([
+            "vp",
+            "team-templates",
+            "--project",
+            "prj-1",
+            "--limit",
+            "25",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::TeamTemplates { project, limit } => {
+                assert_eq!(project.as_deref(), Some("prj-1"));
+                assert_eq!(limit, 25);
+            }
+            other => panic!("expected team-templates, got {other:?}"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["vp", "team-diff", "prj-1", "--template", "tt_123"]).unwrap();
+        match cli.command {
+            Command::TeamDiff { project, template } => {
+                assert_eq!(project, "prj-1");
+                assert_eq!(template, "tt_123");
+            }
+            other => panic!("expected team-diff, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["vp", "team-replay", "prj-1", "--repair"]).unwrap();
+        match cli.command {
+            Command::TeamReplay { project, repair } => {
+                assert_eq!(project, "prj-1");
+                assert!(repair);
+            }
+            other => panic!("expected team-replay, got {other:?}"),
+        }
     }
 }

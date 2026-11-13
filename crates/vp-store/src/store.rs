@@ -28,7 +28,7 @@ use vp_protocol::types::{
     ModelPreset, OrchestrationDecision, OrchestrationNote, OrchestrationPolicy,
     OrchestrationRecovery, PlanTaskProgress, PreemptionPolicy, PreemptionSessionSummary,
     ProcessPolicy, Program, ProgramEvent, ProgramMilestone, ProgramMilestoneStatus, ProgramPolicy,
-    ProgramStatus, ProgramUsage, Project, ProjectBudget, ProjectUsageSession,
+    ProgramStatus, ProgramUsage, Project, ProjectBudget, ProjectTeamTemplate, ProjectUsageSession,
     PromptPrefixAggregate, PromptPrefixObservation, PromptPrefixRecord, PromptSectionRef, Question,
     RunBudgetSnapshot, RunCheckpoint, RunStep, RunToolCall, ScheduledTask, SearchHit, Session,
     SessionBundle, SessionContinuation, SessionInstructionState, SessionRun, SessionRunPolicy,
@@ -36,8 +36,9 @@ use vp_protocol::types::{
     SourceEmbeddingIntegrity, SourceEmbeddingJobStatus, SourceEmbeddingPolicy,
     SourceEmbeddingStatusResult, SourceEmbeddingUsage, SourceRetrievalPolicy, SourceSearchHit,
     SourceStats, SteeringMessage, StoredMessage, SupervisedProcess, TaskSchedulerPolicy, TaskStall,
-    TeamPlan, TodoItem, ToolOutputAuditResult, ToolOutputPolicy, ToolOutputToolStat, UsageEntry,
-    WorktreeRetentionPolicy, WriteLease, cache_hit_ratio,
+    TeamPlan, TeamTemplateEvent, TeamTemplateRecord, TodoItem, ToolOutputAuditResult,
+    ToolOutputPolicy, ToolOutputToolStat, UsageEntry, WorktreeRetentionPolicy, WriteLease,
+    cache_hit_ratio,
 };
 
 use vp_protocol::types::{
@@ -1400,6 +1401,19 @@ pub struct ProjectManifestSnapshot {
     /// request row; approval creates the identity explicitly.
     #[serde(default)]
     pub agent_hire_requests: Vec<vp_protocol::types::AgentHireRequest>,
+    /// S8 portable team charters relevant to this project. The stored JSON is
+    /// content-addressed and carries no context, memory, inbox, worktree,
+    /// performance, MCP schema, path, URL, or secret content.
+    #[serde(default)]
+    pub team_templates: Vec<TeamTemplateRecord>,
+    /// Explicit template→project apply links. A template without a link is a
+    /// library record only and creates no identity or hire request.
+    #[serde(default)]
+    pub project_team_templates: Vec<ProjectTeamTemplate>,
+    /// Bounded project audit stream for export/import/apply. Payloads carry
+    /// ids, names, hashes, and counts only.
+    #[serde(default)]
+    pub team_template_events: Vec<TeamTemplateEvent>,
     /// Project-scoped effect-receipt policy. Older manifests decode as the
     /// enabled, unknown-blocks-merge, 120s-grace default.
     #[serde(default)]
@@ -1666,6 +1680,17 @@ fn ensure_bundle_session(kind: &str, actual: &str, expected: &str) -> Result<()>
     }
     Ok(())
 }
+
+type ExistingTeamTemplateRow = (
+    String,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    String,
+    Option<String>,
+);
 
 fn validate_session_bundle(bundle: &SessionBundle) -> Result<()> {
     validate_storage_id("project", &bundle.project.id)?;
@@ -2115,6 +2140,102 @@ fn validate_session_bundle(bundle: &SessionBundle) -> Result<()> {
                 "bundle approved hire request {} has no identity snapshot",
                 request.id
             ));
+        }
+    }
+    let mut template_ids = std::collections::HashSet::new();
+    for record in &bundle.team_templates {
+        if record.id.trim().is_empty() || record.template.template_id != record.id {
+            return Err(anyhow!("bundle template has an invalid id"));
+        }
+        if record.template.content_hash != record.content_hash
+            || record.template.name != record.name
+            || record.template.version != record.version
+            || record.template.schema_version != record.schema_version
+        {
+            return Err(anyhow!(
+                "bundle template {} metadata does not match its portable body",
+                record.id
+            ));
+        }
+        if record.template.schema_version != vp_protocol::types::TEAM_TEMPLATE_SCHEMA_VERSION {
+            return Err(anyhow!(
+                "bundle template {} has an unsupported schema",
+                record.id
+            ));
+        }
+        if !template_ids.insert(record.id.clone()) {
+            return Err(anyhow!("bundle template {} is duplicated", record.id));
+        }
+    }
+    let mut template_link_ids = std::collections::HashSet::new();
+    for link in &bundle.project_team_templates {
+        if link.project_id != bundle.project.id {
+            return Err(anyhow!(
+                "bundle template link {} belongs to a different project",
+                link.template_id
+            ));
+        }
+        if !template_ids.contains(&link.template_id) {
+            return Err(anyhow!(
+                "bundle template link {} has no template snapshot",
+                link.template_id
+            ));
+        }
+        if !template_link_ids.insert(link.template_id.clone()) {
+            return Err(anyhow!(
+                "bundle template link {} is duplicated",
+                link.template_id
+            ));
+        }
+    }
+    let mut template_event_ids = std::collections::HashSet::new();
+    let mut template_event_seqs = std::collections::HashSet::new();
+    for event in &bundle.team_template_events {
+        if event.project_id != bundle.project.id {
+            return Err(anyhow!(
+                "bundle template event {} belongs to a different project",
+                event.id
+            ));
+        }
+        if event.id.trim().is_empty() || event.seq == 0 {
+            return Err(anyhow!("bundle template event has an empty id or seq"));
+        }
+        if !template_event_ids.insert(event.id.clone()) {
+            return Err(anyhow!("bundle template event {} is duplicated", event.id));
+        }
+        if !template_event_seqs.insert(event.seq) {
+            return Err(anyhow!("bundle template events repeat seq {}", event.seq));
+        }
+        if !vp_protocol::types::TEAM_TEMPLATE_EVENT_KINDS.contains(&event.kind.as_str()) {
+            return Err(anyhow!(
+                "bundle template event {} has an unknown kind",
+                event.id
+            ));
+        }
+        let allowed = [
+            "template_id",
+            "name",
+            "version",
+            "content_hash",
+            "slot_count",
+            "pending_hire_count",
+            "applied_by",
+        ];
+        match &event.payload {
+            serde_json::Value::Object(map) => {
+                if !map.keys().all(|key| allowed.contains(&key.as_str())) {
+                    return Err(anyhow!(
+                        "bundle template event {} carries non-audit payload keys",
+                        event.id
+                    ));
+                }
+            }
+            _ => {
+                return Err(anyhow!(
+                    "bundle template event {} has a non-object payload",
+                    event.id
+                ));
+            }
         }
     }
     let mut employment_event_ids = std::collections::HashSet::new();
@@ -3160,6 +3281,62 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_agent_performance_project
                 ON agent_performance(project_id, completed_tasks, failed_tasks);
+
+            -- Portable team charters (S8). The JSON body is canonical,
+            -- content-addressed, and contains no context/memory/inbox/
+            -- worktree/performance evidence. `source_project_id` is local
+            -- storage metadata, not part of the portable payload.
+            CREATE TABLE IF NOT EXISTS team_templates (
+                id                TEXT PRIMARY KEY,
+                name              TEXT NOT NULL,
+                version           TEXT NOT NULL,
+                schema_version    INTEGER NOT NULL,
+                content_hash      TEXT NOT NULL,
+                json              TEXT NOT NULL,
+                created_at        TEXT NOT NULL,
+                source_project_id TEXT REFERENCES projects(id) ON DELETE SET NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_team_templates_content
+                ON team_templates(content_hash);
+            CREATE INDEX IF NOT EXISTS idx_team_templates_source
+                ON team_templates(source_project_id, created_at);
+
+            -- Explicit apply links. A template row without a link is a library
+            -- record only: it creates no identity, hire request, session,
+            -- assignment, workspace, memory, or policy change.
+            CREATE TABLE IF NOT EXISTS project_team_templates (
+                project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                template_id TEXT NOT NULL REFERENCES team_templates(id) ON DELETE CASCADE,
+                applied_at  TEXT NOT NULL,
+                applied_by  TEXT,
+                PRIMARY KEY (project_id, template_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_project_team_templates_project
+                ON project_team_templates(project_id, applied_at);
+
+            -- Project-scoped audit stream for export/import/apply. Payloads
+            -- carry ids, names, hashes, and counts only; no template body and
+            -- no context, memory, inbox, worktree, or secret content.
+            CREATE TABLE IF NOT EXISTS team_template_events (
+                id            TEXT PRIMARY KEY,
+                project_id    TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                seq           INTEGER NOT NULL,
+                kind          TEXT NOT NULL,
+                template_id   TEXT NOT NULL,
+                name          TEXT NOT NULL,
+                version       TEXT NOT NULL,
+                content_hash  TEXT NOT NULL,
+                payload       TEXT NOT NULL,
+                created_at    TEXT NOT NULL,
+                UNIQUE (project_id, seq)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_team_template_events_project
+                ON team_template_events(project_id, seq);
+            CREATE INDEX IF NOT EXISTS idx_team_template_events_template
+                ON team_template_events(template_id, seq);
 
             CREATE TABLE IF NOT EXISTS messages (
                 id           TEXT PRIMARY KEY,
@@ -5317,6 +5494,8 @@ impl Store {
                 retirement_policy.lookback_days,
                 OffsetDateTime::now_utc(),
             )?;
+            let (team_templates, project_team_templates, team_template_events) =
+                crate::store::team_template::manifest_records(self, &project.id)?;
             let snapshot = ProjectManifestSnapshot {
                 version: 1,
                 recorded_at: now_rfc3339(),
@@ -5364,6 +5543,9 @@ impl Store {
                     self,
                     &project.id,
                 )?,
+                team_templates,
+                project_team_templates,
+                team_template_events,
                 effect_policy: self.get_effect_policy(&project.id)?,
                 gate_policy: self.get_gate_policy(&project.id)?,
                 otel_policy: self.get_otel_policy(&project.id)?,
@@ -28595,6 +28777,150 @@ impl Store {
                 }
             }
         }
+        for record in &bundle.team_templates {
+            let encoded = serde_json::to_string(&record.template)?;
+            let existing: Option<ExistingTeamTemplateRow> = tx
+                .query_row(
+                    "SELECT id, name, version, schema_version, content_hash, json, created_at,
+                            source_project_id
+                     FROM team_templates WHERE id = ?1",
+                    params![record.id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            match existing {
+                Some((_, name, version, schema_version, content_hash, json, created_at, _))
+                    if name == record.name
+                        && version == record.version
+                        && schema_version == record.schema_version as i64
+                        && content_hash == record.content_hash
+                        && json == encoded
+                        && created_at == record.created_at => {}
+                Some(_) => {
+                    return Err(anyhow!(
+                        "bundle template {} conflicts with the local library",
+                        record.id
+                    ));
+                }
+                None => {
+                    // An archive may originate from another project. The local
+                    // FK must not point at a project that is absent here; the
+                    // portable body still carries the human source name.
+                    let source_project_id = record
+                        .source_project_id
+                        .as_deref()
+                        .filter(|id| *id == bundle.project.id);
+                    tx.execute(
+                        "INSERT INTO team_templates
+                         (id, name, version, schema_version, content_hash, json, created_at,
+                          source_project_id)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        params![
+                            record.id,
+                            record.name,
+                            record.version,
+                            record.schema_version as i64,
+                            record.content_hash,
+                            encoded,
+                            record.created_at,
+                            source_project_id
+                        ],
+                    )?;
+                }
+            }
+        }
+        for link in &bundle.project_team_templates {
+            tx.execute(
+                "INSERT OR IGNORE INTO project_team_templates
+                 (project_id, template_id, applied_at, applied_by)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    link.project_id,
+                    link.template_id,
+                    link.applied_at,
+                    link.applied_by
+                ],
+            )?;
+        }
+        for event in &bundle.team_template_events {
+            let expected_payload = serde_json::to_string(&event.payload)?;
+            let existing: Option<(String, String, String, String, String)> = tx
+                .query_row(
+                    "SELECT kind, template_id, name, version, content_hash
+                     FROM team_template_events WHERE id = ?1",
+                    params![event.id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            match existing {
+                Some((kind, template_id, name, version, content_hash))
+                    if kind == event.kind
+                        && template_id == event.template_id
+                        && name == event.name
+                        && version == event.version
+                        && content_hash == event.content_hash => {}
+                Some(_) => {
+                    return Err(anyhow!(
+                        "bundle template event {} conflicts with the local audit stream",
+                        event.id
+                    ));
+                }
+                None => {
+                    let seq_taken: Option<String> = tx
+                        .query_row(
+                            "SELECT id FROM team_template_events
+                             WHERE project_id = ?1 AND seq = ?2",
+                            params![bundle.project.id, event.seq as i64],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if seq_taken.is_some() {
+                        return Err(anyhow!(
+                            "bundle template event {} conflicts with local seq {}",
+                            event.id,
+                            event.seq
+                        ));
+                    }
+                    tx.execute(
+                        "INSERT INTO team_template_events
+                         (id, project_id, seq, kind, template_id, name, version, content_hash,
+                          payload, created_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        params![
+                            event.id,
+                            event.project_id,
+                            event.seq as i64,
+                            event.kind,
+                            event.template_id,
+                            event.name,
+                            event.version,
+                            event.content_hash,
+                            expected_payload,
+                            event.created_at
+                        ],
+                    )?;
+                }
+            }
+        }
         for event in &bundle.agent_employment_events {
             let expected_payload = serde_json::to_string(&event.payload)?;
             match tx
@@ -33741,6 +34067,7 @@ pub mod employment;
 mod gate;
 pub mod identity_memory;
 mod lease;
+pub mod team_template;
 pub mod workspaces;
 
 pub use continuation_lease::{
