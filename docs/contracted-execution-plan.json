@@ -265,7 +265,7 @@
       "title": "Bounded dynamic fan-out",
       "phase": "phase-2",
       "priority": "P2",
-      "status": "planned",
+      "status": "implemented",
       "depends_on": [
         "C1"
       ],
@@ -277,7 +277,7 @@
         "crates/vp-protocol/src/types.rs",
         "crates/vp-daemon/src/main.rs",
         "crates/vp-cli/src/main.rs",
-        "docs/adr/0199-bounded-dynamic-fanout.md"
+        "docs/adr/0216-bounded-dynamic-fanout.md"
       ],
       "deliverables": [
         "plan.fanout template + JSON item list",
@@ -560,6 +560,14 @@
         "swift": 513
       }
     },
-    "notes": "C1-C5 are Contracted Execution Phase 1; C6 is Phase 2. Swift counts are combined app+helper."
+    "notes": "C1-C5 are Contracted Execution Phase 1; C6 is Phase 2. Swift counts are combined app+helper.",
+    "C7": {
+      "commit": "9941387",
+      "adr": "0216",
+      "tests": {
+        "rust": 3912,
+        "swift": 0
+      }
+    }
   }
 }

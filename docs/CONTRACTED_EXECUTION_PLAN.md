@@ -507,7 +507,7 @@ should wait until the identity/role contracts and Worker workspace phases
 | Production hardening C1–C6 / S1–S8 | **implemented** | ADR-0213, 3,887 Rust, app + helper Swift; C4 replay, OTel cursor, S5 erasure, S8 hash validation remain explicit gaps |
 | Hardening round two | **implemented** | ADR-0214, 3,890 Rust: bounded replay + lock-free decode, OTel paging/retryable, template snapshot hash/provenance, org truncation order; S5 erasure, S8 shape validator, S6 attribution, S7 ledger/UI remain |
 | Hardening round three | **implemented** | ADR-0215, 3,902 Rust: S5 logical erasure, identity id/generation provenance, contract glob/URL corpus, effect dispatch/truncation fail-closed, gate payload/token hardening, C6 evidence filtering, S8 shape validation, S6 lookback cutoff, old-DB migration fixture; crypto-erasure/retention and exhaustive parser corpus remain |
-| C7 Bounded fan-out | planned | next |
+| C7 Bounded fan-out | **implemented** | ADR-0216, Engine `fanout_plan`, Leader `plan_fanout`, RPC/CLI, disjoint scopes, shared join, idempotent replay; join is a real task and there is no automatic expansion |
 | C8 Tool search v2 + delta snapshots | planned | |
 | C9 MCP tasks/elicitation | planned | |
 | C10 Code Mode | planned | |

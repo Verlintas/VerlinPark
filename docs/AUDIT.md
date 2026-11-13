@@ -295,6 +295,29 @@ coverage tooling or exhaustive parser corpus is committed.
 
 Verification: 3,902 Rust tests passed; no Swift code changed.
 
+## 0.20 2026-11-13 Contracted execution C7
+
+ADR-0216 implements bounded dynamic fan-out. `plan_fanout` / `plan.fanout`
+replace one pending template with at most 20 deterministic children and one
+shared join in one `team_plan.revised` event. The tool is HostState-approved;
+the RPC/CLI require explicit approval. Children carry `parent_task_id` and
+`fanout_key`, must have non-empty normalized scopes bounded by the template and
+pairwise disjoint, and inherit per-task budgets. Existing pending dependents
+are retargeted to the join; active/completed dependents and templates fail
+closed. Items are inline or from a same-session text artifact (≤128 KiB).
+Identical duplicate keys dedupe, conflicting duplicates fail, and replay after
+success is idempotent with no new revision. No scheduler/orchestration path
+calls it automatically. `validate_team_plan` enforces metadata/join shape;
+replay/bundles preserve the plan without a new projection table.
+
+Still open: the join is a real task with Worker/budget cost; there is no UI or
+LLM planner; no cross-session fan-out; active-task plus expected-revision checks
+are optimistic, not a distributed plan lock; generated ids fail closed on a
+short-hash collision; after the first expansion only an idempotent replay is
+accepted (no incremental second expansion).
+
+Verification: 3,912 Rust tests passed; no Swift code changed.
+
 ## 0. 2026-10-30 跟进
 
 第一轮硬化已完成（同一 `main` 线，提交见仓库历史）：

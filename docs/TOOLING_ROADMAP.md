@@ -170,7 +170,7 @@ post-wave tool surface is listed in section 0 and in `docs/PROGRESS.md`.
 | dynamic MCP tools | up to 32 tools for Leader/Worker/Labour |
 | `todo_write` | Leader todo list |
 | `delegate`, `delegate_many`, `delegate_acp` | delegation |
-| `submit_team_plan`, `run_team_plan`, `deliberate_team_plan` | Leader planning |
+| `submit_team_plan`, `plan_fanout`, `run_team_plan`, `deliberate_team_plan` | Leader planning (fan-out is explicit HostState-approved plan surgery) |
 | `submit_verdict` | Verifier decision |
 
 ### 2.3 Role matrix (current)
