@@ -318,6 +318,34 @@ accepted (no incremental second expansion).
 
 Verification: 3,912 Rust tests passed; no Swift code changed.
 
+## 0.21 2026-11-14 Contracted execution C8
+
+ADR-0217 implements set-complete tool search and incremental browser snapshots.
+`tool_search` now runs deterministic BM25 over name/category/task-kind/
+description, adds bounded prerequisite closure, returns `set`, `missing`,
+`completeness_estimate`, `truncated`, and `outside_bundle`, and reports omitted
+matches as `result_limit`. MCP results remain pin/trust gated and require the
+`mcp` bridge when callable. `promote=true` queues out-of-bundle built-in schemas
+for the next turn boundary; an applied promotion emits `bundle.revision` with
+old/new `tools_hash`/cache epoch, over-target state, schema-token delta, and an
+estimated cache invalidation cost, plus a new `context.prompt_prefix` so
+`session.cache`/`session.instructions` read post-promotion state. Context hard
+limits reject promotion with `applied=false`; promotion is never automatic.
+Browser snapshots keep a per-session/worktree monotonic generation and last
+tree/text. The first snapshot is full; later ones are delta by default
+(changed/new/removed refs plus line text delta), `delta=false` restores full,
+and input `snapshot_generation` mismatches return `STALE_REF` before any GUI
+lease. Close/crash/sweep/helper replacement invalidates old trees but keeps the
+generation monotonic. The helper protocol and GUI lease are unchanged.
+
+Still open: BM25 is lexical, not semantic; prerequisites are a hand-maintained
+bounded hint map; completeness is an estimate; promotion is built-in only,
+one-turn delayed, may exceed the bundle target, and prices cache loss as an
+estimate; delta compares daemon DOM trees, not layout/visual diffs; generation
+is per-daemon, not cross-host.
+
+Verification: 3,920 Rust tests passed; no Swift code changed.
+
 ## 0. 2026-10-30 跟进
 
 第一轮硬化已完成（同一 `main` 线，提交见仓库历史）：

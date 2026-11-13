@@ -299,7 +299,7 @@
       "title": "Tool search v2 and delta browser snapshots",
       "phase": "phase-2",
       "priority": "P2",
-      "status": "planned",
+      "status": "implemented",
       "depends_on": [
         "C1",
         "C4"
@@ -310,7 +310,7 @@
         "crates/vp-core/src/browser.rs",
         "crates/vp-core/src/prompt_cache.rs",
         "apps/macos/VerlinParkBrowserHelper",
-        "docs/adr/0200-tool-search-v2-and-delta-snapshots.md"
+        "docs/adr/0217-tool-search-v2-and-delta-snapshots.md"
       ],
       "deliverables": [
         "BM25 + prerequisite closure set-complete retrieval",
@@ -566,6 +566,14 @@
       "adr": "0216",
       "tests": {
         "rust": 3912,
+        "swift": 0
+      }
+    },
+    "C8": {
+      "commit": "039b48a",
+      "adr": "0217",
+      "tests": {
+        "rust": 3920,
         "swift": 0
       }
     }

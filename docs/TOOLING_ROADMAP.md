@@ -240,7 +240,7 @@ promise.
 | A-01 | `publish_artifact_file` | P1 | write-capable roles | screenshots/logs/reports as artifacts | 250–400 |
 | T-01 | `budget_status` remaining/spent/unlimited | P1 | all | agent can decide when to stop/ask | 200–350 |
 | T-02 | `task_detail` acceptance/deps/attempts/budget | P1 | Leader/Manager/Worker | self-directed task execution | 250–400 |
-| T-03 | `tool_search` search MCP/tool catalog on demand | P1 | Leader/Worker/Labour | avoid 32-tool injection and guessing | 400–600 |
+| T-03 | `tool_search` v2 BM25 + prerequisite closure + turn-boundary schema promotion | P1 | Leader/Worker/Labour | exact set discovery, no silent schema churn | 700–1,000 |
 | T-04 | `task_control` skip/retry/cancel/pause/resume own plan task | P2 | Leader/Manager | controlled self-recovery for long plans | 250–400 |
 | D-01 | `data_query` JSON/YAML/CSV/TOML query | P2 | read roles | deterministic config/data inspection | 500–800 |
 
@@ -944,9 +944,11 @@ existing content-addressed store and GC.
   flag, reservations; no secrets. Helps the agent decide when to ask or split.
 - `task_detail`: acceptance, deps, attempts, write scope, budget, changed paths,
   current status. `team_status` remains the broad board.
-- `tool_search`: query available MCP tools by name/description and return a small
-  matching schema set on demand; avoids injecting 32 unrelated tools. Respect
-  role restrictions and approvals.
+- `tool_search` v2: BM25 over name/category/task-kind/description plus bounded
+  prerequisite closure and explicit `missing`/`completeness_estimate`; MCP
+  results stay pin/trust gated. `promote=true` applies out-of-bundle built-in
+  schemas only at the next turn boundary through a priced `bundle.revision`;
+  role restrictions and approvals still apply.
 - `task_control` (P2): Leader/Manager-only, event-backed `skip`, `retry`,
   `cancel`, `pause`, `resume` for a task in its own plan. Do not expose this
   before the task lifecycle atomicity gaps in AUDIT A-14 are closed.
