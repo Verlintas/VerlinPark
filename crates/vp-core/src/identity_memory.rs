@@ -532,9 +532,51 @@ fn deleted_mode(event: &AgentMemoryEvent) -> Option<&str> {
         .and_then(serde_json::Value::as_str)
 }
 
+/// Validate one logical-erasure tombstone and return the erased memory id.
+///
+/// An erasure is content-free: it may carry the old content hash, scope, and a
+/// bounded reason, but never a full memory snapshot or the erased content.
+/// `None` means this is not an erasure event.
+pub fn erased_memory_id(event: &AgentMemoryEvent) -> Result<Option<&str>> {
+    if event.kind != vp_protocol::types::AGENT_MEMORY_ERASED_EVENT {
+        return Ok(None);
+    }
+    if event.payload.get("memory").is_some() || event.payload.get("content").is_some() {
+        return Err(AgentMemoryError::new(
+            agent_memory_codes::MEMORY_INVALID_EVENT,
+            format!(
+                "erasure event {} must not carry a memory snapshot or content",
+                event.id
+            ),
+        )
+        .into());
+    }
+    let encoded = serde_json::to_vec(&event.payload).unwrap_or_default();
+    if encoded.len() > 4 * 1024 {
+        return Err(AgentMemoryError::new(
+            agent_memory_codes::MEMORY_INVALID_EVENT,
+            format!("erasure event {} payload is oversized", event.id),
+        )
+        .into());
+    }
+    let memory_id = event
+        .payload
+        .get("memory_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|memory_id| !memory_id.is_empty())
+        .ok_or_else(|| {
+            AgentMemoryError::new(
+                agent_memory_codes::MEMORY_INVALID_EVENT,
+                format!("erasure event {} has no memory id", event.id),
+            )
+        })?;
+    Ok(Some(memory_id))
+}
+
 /// Fold the append-only project stream into the latest row per memory id.
-/// Events must be in project `seq` order. A prune event removes the row; every
-/// other event replaces its snapshot.
+/// Events must be in project `seq` order. A prune or erase event removes the
+/// row; every other event replaces its snapshot.
 pub fn memories_from_events(events: &[AgentMemoryEvent]) -> Result<Vec<AgentMemory>> {
     let mut latest: BTreeMap<String, AgentMemory> = BTreeMap::new();
     let mut previous_seq = None;
@@ -556,6 +598,10 @@ pub fn memories_from_events(events: &[AgentMemoryEvent]) -> Result<Vec<AgentMemo
             .into());
         }
         previous_seq = Some(event.seq);
+        if let Some(memory_id) = erased_memory_id(event)? {
+            latest.remove(memory_id);
+            continue;
+        }
         let memory = memory_from_event(event)?;
         if event.kind == "agent.memory.deleted" && deleted_mode(event) == Some("prune") {
             latest.remove(&memory.id);
@@ -870,6 +916,38 @@ mod tests {
         ])
         .unwrap();
         assert!(pruned_superseded.is_empty());
+    }
+
+    #[test]
+    fn erased_tombstone_drops_the_row_and_rejects_smuggled_content() {
+        let row = memory("m-erased", "project", "2026-11-12T00:00:00Z");
+        let created = event(&row, 1, "agent.memory.created", "local");
+        let erased = AgentMemoryEvent {
+            id: "evt-2".to_string(),
+            project_id: row.project_id.clone(),
+            seq: 2,
+            kind: vp_protocol::types::AGENT_MEMORY_ERASED_EVENT.to_string(),
+            payload: serde_json::json!({
+                "memory_id": row.id,
+                "content_hash": row.content_hash,
+                "scope": row.scope,
+                "reason": "privacy request",
+            }),
+            created_at: "2026-11-12T01:00:00Z".to_string(),
+        };
+        let folded = memories_from_events(&[created, erased]).unwrap();
+        assert!(folded.is_empty(), "erasure must not resurrect the row");
+
+        let mut smuggled = event(&row, 2, "agent.memory.erased", "local");
+        smuggled.payload = serde_json::json!({
+            "memory_id": row.id,
+            "memory": row,
+        });
+        let error = memories_from_events(&[smuggled]).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<AgentMemoryError>().unwrap().code,
+            agent_memory_codes::MEMORY_INVALID_EVENT
+        );
     }
 
     fn event(memory: &AgentMemory, seq: u64, kind: &str, mode: &str) -> AgentMemoryEvent {

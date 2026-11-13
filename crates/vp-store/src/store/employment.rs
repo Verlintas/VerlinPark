@@ -1900,11 +1900,14 @@ pub fn compute_agent_performance(
 
     let assignments = {
         let mut statement = conn.prepare(&format!(
-            "{ASSIGNMENT_SELECT} WHERE s.project_id = ?1 ORDER BY a.session_id ASC, a.identity_id ASC LIMIT ?2"
+            "{ASSIGNMENT_SELECT}
+             WHERE s.project_id = ?1
+               AND (a.status = 'active' OR a.assigned_at >= ?2)
+             ORDER BY a.session_id ASC, a.identity_id ASC LIMIT ?3"
         ))?;
         statement
             .query_map(
-                params![project_id, MAX_PERFORMANCE_EVIDENCE_ROWS as i64],
+                params![project_id, cutoff, MAX_PERFORMANCE_EVIDENCE_ROWS as i64],
                 map_assignment,
             )?
             .collect::<Result<Vec<_>, _>>()?

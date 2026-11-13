@@ -18701,4 +18701,74 @@ mod agent_identity_view_tests {
             .unwrap();
         assert_eq!(expired.len(), 1);
     }
+
+    #[test]
+    fn reopening_an_old_database_restores_hardening_columns_and_tables() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        {
+            let store = Store::open(data.path()).unwrap();
+            let project = store
+                .add_project(repo.path().to_str().unwrap(), Some("migration"))
+                .unwrap();
+            store.create_session(&project.id, "migration goal").unwrap();
+        }
+        {
+            let conn = rusqlite::Connection::open(data.path().join("verlinpark.db")).unwrap();
+            conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+            // Simulate a pre-hardening database: remove the view that depends
+            // on agents.identity_id, drop the additive columns, and drop the
+            // C1/C2 tables.
+            conn.execute_batch(
+                "DROP VIEW IF EXISTS agent_runs;
+                 ALTER TABLE agents DROP COLUMN identity_id;
+                 ALTER TABLE sessions DROP COLUMN plan_runtime_snapshot;
+                 ALTER TABLE project_team_templates DROP COLUMN origin;
+                 DROP TABLE IF EXISTS contracts;
+                 DROP TABLE IF EXISTS effect_receipts;",
+            )
+            .unwrap();
+        }
+        let store = Store::open(data.path()).unwrap();
+        let conn = store.lock().unwrap();
+        for (table, column) in [
+            ("agents", "identity_id"),
+            ("sessions", "plan_runtime_snapshot"),
+            ("project_team_templates", "origin"),
+        ] {
+            let mut statement = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap();
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(
+                columns.iter().any(|name| name == column),
+                "{table}.{column} was not restored"
+            );
+        }
+        for table in ["contracts", "effect_receipts"] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "{table} was not recreated");
+        }
+        let view_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'view' AND name = 'agent_runs')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            view_exists,
+            "agent_runs compatibility view was not restored"
+        );
+    }
 }

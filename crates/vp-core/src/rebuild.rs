@@ -339,6 +339,7 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
                         record.id
                     );
                 }
+                crate::team_template::validate_team_template_shape(&record.template)?;
                 vp_store::store::team_template::insert_team_template_snapshot(&store, record)?;
             }
             for link in &snapshot.project_team_templates {

@@ -1714,3 +1714,69 @@ async fn worker_warm_cache_includes_identity_and_worker_delegation_schema() {
         "warm emits no prompt prefix"
     );
 }
+
+#[tokio::test]
+async fn run_events_carry_identity_id_and_generation() {
+    let dir = TempDir::new().unwrap();
+    let (provider, _requests) = RecordingProvider::new(vec![vec![
+        StreamEvent::TextDelta("identity provenance".into()),
+        StreamEvent::Done,
+    ]]);
+    let (engine, service, project) = test_service(dir.path(), provider);
+    enable_identity_policy(&engine, &project.id).await;
+    let identity_id = create_identity(&engine, &project.id, "leader", "Project Lead").await;
+    let identity = engine
+        .get_agent_identity(&identity_id)
+        .await
+        .unwrap()
+        .identity;
+    let session = engine
+        .create_session(project.id, "provenance goal".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test-model")
+        .await
+        .unwrap();
+    assign(&engine, &session.id, &identity_id).await;
+    run_leader(&engine, &service, &session.id, "provenance prompt").await;
+
+    let events = engine.all_events(&session.id).await.unwrap();
+    let tagged = events
+        .iter()
+        .filter(|event| {
+            event
+                .payload
+                .get("identity_id")
+                .and_then(|value| value.as_str())
+                == Some(identity_id.as_str())
+                && event
+                    .payload
+                    .get("identity_generation")
+                    .and_then(|value| value.as_u64())
+                    == Some(identity.generation)
+        })
+        .count();
+    assert!(
+        tagged > 0,
+        "at least one run event must carry identity id/generation"
+    );
+    for kind in ["agent.started", "agent.turn_finished"] {
+        assert!(
+            events.iter().any(|event| {
+                event.kind == kind
+                    && event
+                        .payload
+                        .get("identity_id")
+                        .and_then(|value| value.as_str())
+                        == Some(identity_id.as_str())
+                    && event
+                        .payload
+                        .get("identity_generation")
+                        .and_then(|value| value.as_u64())
+                        == Some(identity.generation)
+            }),
+            "{kind} must carry identity id/generation"
+        );
+    }
+}

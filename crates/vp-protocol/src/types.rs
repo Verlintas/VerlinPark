@@ -12376,12 +12376,15 @@ fn inbox_key_is_sensitive(key: &str) -> bool {
     )
 }
 
-fn inbox_payload_has_sensitive_key(value: &Value) -> bool {
+/// True when a JSON object/array contains an obvious credential-like key at
+/// any depth. This is a defensive shape check shared by inbox and gate payloads,
+/// not a content classifier.
+pub fn json_has_sensitive_key(value: &Value) -> bool {
     match value {
-        Value::Object(object) => object.iter().any(|(key, value)| {
-            inbox_key_is_sensitive(key) || inbox_payload_has_sensitive_key(value)
-        }),
-        Value::Array(items) => items.iter().any(inbox_payload_has_sensitive_key),
+        Value::Object(object) => object
+            .iter()
+            .any(|(key, value)| inbox_key_is_sensitive(key) || json_has_sensitive_key(value)),
+        Value::Array(items) => items.iter().any(json_has_sensitive_key),
         _ => false,
     }
 }
@@ -12414,7 +12417,7 @@ pub fn validate_agent_inbox_payload(
             ),
         ));
     }
-    if inbox_payload_has_sensitive_key(payload) {
+    if json_has_sensitive_key(payload) {
         return Err(AgentCoordinationError::new(
             agent_coordination_codes::INBOX_PAYLOAD_INVALID,
             "inbox payload uses a credential-like key; send a label and use Keychain for secrets",
@@ -13280,13 +13283,18 @@ pub const AGENT_MEMORY_UPDATED_EVENT: &str = "agent.memory.updated";
 pub const AGENT_MEMORY_SUPERSEDED_EVENT: &str = "agent.memory.superseded";
 pub const AGENT_MEMORY_EXPIRED_EVENT: &str = "agent.memory.expired";
 pub const AGENT_MEMORY_DELETED_EVENT: &str = "agent.memory.deleted";
+/// Explicit logical erasure. The memory projection and all prior events for
+/// that memory id are deleted; only a content-free tombstone remains. This is
+/// not a secure wipe of SQLite free pages or backups.
+pub const AGENT_MEMORY_ERASED_EVENT: &str = "agent.memory.erased";
 
-pub const AGENT_MEMORY_EVENT_KINDS: [&str; 5] = [
+pub const AGENT_MEMORY_EVENT_KINDS: [&str; 6] = [
     AGENT_MEMORY_CREATED_EVENT,
     AGENT_MEMORY_UPDATED_EVENT,
     AGENT_MEMORY_SUPERSEDED_EVENT,
     AGENT_MEMORY_EXPIRED_EVENT,
     AGENT_MEMORY_DELETED_EVENT,
+    AGENT_MEMORY_ERASED_EVENT,
 ];
 
 /// Bounded memory content. A memory is a compact claim with provenance, not a
@@ -13326,6 +13334,8 @@ pub mod agent_memory_codes {
     /// The event stream is larger than the bounded replay window. Repairing
     /// from a truncated read would delete rows that still have events.
     pub const MEMORY_REPLAY_TRUNCATED: &str = "MEMORY_REPLAY_TRUNCATED";
+    /// Logical erasure requires explicit approval (`approved: true`).
+    pub const MEMORY_APPROVAL_REQUIRED: &str = "MEMORY_APPROVAL_REQUIRED";
 }
 
 /// Typed memory failure. It carries only a stable code and a bounded message;
@@ -13610,6 +13620,30 @@ pub struct AgentMemoryForgetResult {
     pub pruned: bool,
     #[serde(default)]
     pub changed: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EraseAgentMemoryParams {
+    #[serde(default)]
+    pub memory_id: String,
+    /// Optional project guard. A mismatched project fails closed.
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Logical erasure is destructive and never automatic.
+    #[serde(default)]
+    pub approved: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentMemoryEraseResult {
+    #[serde(default)]
+    pub memory_id: String,
+    #[serde(default)]
+    pub erased: bool,
+    #[serde(default)]
+    pub events_removed: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

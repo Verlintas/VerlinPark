@@ -26,12 +26,13 @@ use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 use vp_protocol::types::{
     AGENT_MEMORY_EVENT_KINDS, AGENT_MEMORY_MAX_LIST, AGENT_MEMORY_MAX_SWEEP,
-    AGENT_MEMORY_MAX_TTL_DAYS, AGENT_MEMORY_STATUSES, AgentMemory, AgentMemoryError,
-    AgentMemoryEvent, CreateAgentMemoryParams, ForgetAgentMemoryParams, SupersedeAgentMemoryParams,
-    SweepAgentMemoriesParams, UpdateAgentMemoryParams, VerifyAgentMemoryParams, agent_memory_codes,
-    agent_memory_scope, agent_memory_source, normalize_agent_memory_component,
-    normalize_agent_memory_content, normalize_agent_memory_department,
-    validate_agent_memory_evidence, validate_agent_memory_scope_shape,
+    AGENT_MEMORY_MAX_TTL_DAYS, AGENT_MEMORY_STATUSES, AgentMemory, AgentMemoryEraseResult,
+    AgentMemoryError, AgentMemoryEvent, CreateAgentMemoryParams, EraseAgentMemoryParams,
+    ForgetAgentMemoryParams, SupersedeAgentMemoryParams, SweepAgentMemoriesParams,
+    UpdateAgentMemoryParams, VerifyAgentMemoryParams, agent_memory_codes, agent_memory_scope,
+    agent_memory_source, normalize_agent_memory_component, normalize_agent_memory_content,
+    normalize_agent_memory_department, validate_agent_memory_evidence,
+    validate_agent_memory_scope_shape,
 };
 
 use super::{Store, now_rfc3339, validate_storage_id};
@@ -1149,6 +1150,107 @@ pub fn forget_agent_memory_with_event(
     Ok(Some((next, event)))
 }
 
+/// Logically erase one local memory and every prior event for it.
+///
+/// The projection row and matching `agent_memory_events` rows are deleted, and
+/// one content-free `agent.memory.erased` tombstone is appended with the old
+/// content hash. Replay therefore cannot reconstruct the erased content. This
+/// is logical erasure from the live SQLite rows, not a secure wipe of database
+/// free pages, WAL segments, or external backups.
+pub fn erase_agent_memory(
+    store: &Store,
+    params: &EraseAgentMemoryParams,
+) -> Result<AgentMemoryEraseResult> {
+    if !params.approved {
+        return Err(memory_error(
+            agent_memory_codes::MEMORY_APPROVAL_REQUIRED,
+            "logical memory erasure requires explicit approved: true",
+        ));
+    }
+    let reason = params
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .map(|reason| reason.chars().take(500).collect::<String>());
+    if let Some(reason) = &reason
+        && reason.chars().any(char::is_control)
+    {
+        return Err(memory_error(
+            agent_memory_codes::MEMORY_INVALID,
+            "erasure reason must not contain control characters",
+        ));
+    }
+    let mut conn = store.lock()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let existing = get_memory_tx(&tx, &params.memory_id)?.ok_or_else(|| {
+        memory_error(
+            agent_memory_codes::MEMORY_NOT_FOUND,
+            format!("agent memory not found: {}", params.memory_id),
+        )
+    })?;
+    ensure_local(&existing)?;
+    if let Some(project_id) = params
+        .project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|project| !project.is_empty())
+        && project_id != existing.project_id
+    {
+        return Err(memory_error(
+            agent_memory_codes::MEMORY_PROJECT_MISMATCH,
+            "memory belongs to another project",
+        ));
+    }
+    let events_removed = tx.execute(
+        "DELETE FROM agent_memory_events
+         WHERE project_id = ?1
+           AND (json_extract(payload, '$.memory.id') = ?2
+                OR json_extract(payload, '$.memory_id') = ?2)",
+        params![existing.project_id, existing.id],
+    )? as u64;
+    tx.execute(
+        "DELETE FROM agent_memories
+         WHERE id = ?1 AND project_id = ?2 AND origin = 'local'",
+        params![existing.id, existing.project_id],
+    )?;
+    let now = now_rfc3339();
+    let event = AgentMemoryEvent {
+        id: format!("mev-{}", Uuid::new_v4().simple()),
+        project_id: existing.project_id.clone(),
+        seq: next_memory_seq_tx(&tx, &existing.project_id)?,
+        kind: vp_protocol::types::AGENT_MEMORY_ERASED_EVENT.to_string(),
+        payload: serde_json::json!({
+            "memory_id": existing.id,
+            "content_hash": existing.content_hash,
+            "scope": existing.scope,
+            "identity_id": existing.identity_id,
+            "erased_at": now,
+            "reason": reason,
+            "approval_risk": "host_state",
+        }),
+        created_at: now,
+    };
+    tx.execute(
+        "INSERT INTO agent_memory_events (id, project_id, seq, kind, payload, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            event.id,
+            event.project_id,
+            event.seq as i64,
+            event.kind,
+            serde_json::to_string(&event.payload)?,
+            event.created_at
+        ],
+    )?;
+    tx.commit()?;
+    Ok(AgentMemoryEraseResult {
+        memory_id: existing.id,
+        erased: true,
+        events_removed,
+    })
+}
+
 /// Record explicit verification. Verification is evidence, not truth: it only
 /// records that an operator/agent re-checked the claim and optionally extends
 /// its bounded TTL. It never mints governance authority.
@@ -1879,5 +1981,103 @@ mod tests {
         .unwrap();
         assert_eq!(sweep.pruned, 0);
         assert_eq!(sweep.remaining, 1);
+    }
+
+    #[test]
+    fn logical_erasure_removes_projection_and_prior_event_payloads() {
+        let (_dir, store, project) = store();
+        let (memory, _) =
+            create_agent_memory_with_event(&store, &create_params(&project, "project", None))
+                .unwrap();
+        let before = list_agent_memory_events_for_project(&store, &project, None).unwrap();
+        assert!(
+            before
+                .iter()
+                .any(|event| { event.payload.to_string().contains("project memory content") })
+        );
+
+        let error = erase_agent_memory(
+            &store,
+            &EraseAgentMemoryParams {
+                memory_id: memory.id.clone(),
+                project_id: Some(project.clone()),
+                reason: None,
+                approved: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<AgentMemoryError>()
+                .map(|typed| typed.code),
+            Some(agent_memory_codes::MEMORY_APPROVAL_REQUIRED)
+        );
+
+        let result = erase_agent_memory(
+            &store,
+            &EraseAgentMemoryParams {
+                memory_id: memory.id.clone(),
+                project_id: Some(project.clone()),
+                reason: Some("privacy request".to_string()),
+                approved: true,
+            },
+        )
+        .unwrap();
+        assert!(result.erased);
+        assert!(result.events_removed >= 1);
+        let rows = list_agent_memories(
+            &store,
+            &project,
+            None,
+            None,
+            None,
+            None,
+            true,
+            Some(10),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(rows.is_empty(), "erased projection row must be gone");
+        let after = list_agent_memory_events_for_project(&store, &project, None).unwrap();
+        assert_eq!(after.len(), 1, "only one content-free tombstone remains");
+        assert_eq!(after[0].kind, vp_protocol::types::AGENT_MEMORY_ERASED_EVENT);
+        let payload = after[0].payload.to_string();
+        assert!(!payload.contains("project memory content"));
+        assert!(payload.contains(&memory.content_hash));
+        assert!(payload.contains("privacy request"));
+    }
+
+    #[test]
+    fn imported_memory_cannot_be_erased_locally() {
+        let (_dir, store, project) = store();
+        let (memory, _) =
+            create_agent_memory_with_event(&store, &create_params(&project, "project", None))
+                .unwrap();
+        let mut imported = memory.clone();
+        imported.id = "mem-imported".to_string();
+        imported.origin = "imported".to_string();
+        let mut conn = store.lock().unwrap();
+        let tx = conn.transaction().unwrap();
+        insert_memory_row_tx(&tx, &imported).unwrap();
+        tx.commit().unwrap();
+        drop(conn);
+        let memory = imported;
+        let error = erase_agent_memory(
+            &store,
+            &EraseAgentMemoryParams {
+                memory_id: memory.id.clone(),
+                project_id: Some(project),
+                reason: None,
+                approved: true,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<AgentMemoryError>()
+                .map(|typed| typed.code),
+            Some(agent_memory_codes::MEMORY_IMPORTED_READONLY)
+        );
     }
 }

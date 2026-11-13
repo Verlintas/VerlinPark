@@ -788,7 +788,41 @@ fn scan_events(events: &[Event]) -> Scan {
         }
     }
     pair_verifications(&mut scan);
+    filter_cited_hashes(&mut scan);
     scan
+}
+
+/// Keep only cited hash tokens that match a known commit/artifact/test/merge
+/// hash in this scan. Arbitrary hex-looking secrets copied into a summary are
+/// dropped instead of becoming diagnosis evidence.
+fn filter_cited_hashes(scan: &mut Scan) {
+    let mut known = Vec::new();
+    for artifact in scan.artifacts.values() {
+        known.push(artifact.id.clone());
+        known.push(artifact.sha256.clone());
+    }
+    for commit in scan.commits.values() {
+        known.push(commit.hash.clone());
+    }
+    for merge in scan.merges.values() {
+        known.push(merge.commit.clone());
+        known.push(merge.base_commit.clone());
+    }
+    for verification in &scan.verifications {
+        if let Some(commit) = &verification.verified_commit {
+            known.push(commit.clone());
+        }
+    }
+    for test in &scan.tests {
+        if let Some(hash) = &test.inputs_hash {
+            known.push(hash.clone());
+        }
+    }
+    known.retain(|hash| is_hex_hash(hash));
+    for task in scan.tasks.values_mut() {
+        task.cited_hashes
+            .retain(|cited| known.iter().any(|hash| hash_matches(cited, hash)));
+    }
 }
 
 fn pair_verifications(scan: &mut Scan) {
@@ -3062,7 +3096,16 @@ fn cascade_path(
         };
         steps.push(CascadeStep {
             node_id: node_id(node_kinds::TASK, task_id),
-            kind: "task".to_string(),
+            kind: if index == 0 {
+                earliest
+                    .node_id
+                    .split(':')
+                    .next()
+                    .unwrap_or("task")
+                    .to_string()
+            } else {
+                "task".to_string()
+            },
             task_id: Some(task_id.clone()),
             status: task.map(|task| task.status.clone()),
             at_seq: seq,
@@ -3115,7 +3158,21 @@ fn ancestor_tasks(scan: &Scan, target: &str) -> Vec<(String, u32)> {
     out
 }
 
+fn task_evidence_kind(task: &TaskState) -> &'static str {
+    if task.result_seq.is_some() {
+        return "plan_task.finished";
+    }
+    match task.failure_status.as_deref() {
+        Some("blocked") => "plan_task.blocked",
+        Some("cancelled") => "plan_task.cancelled",
+        Some("interrupted") => "plan_task.interrupted",
+        Some("failed") => "plan_task.finished",
+        _ => "plan_task.started",
+    }
+}
+
 fn ancestor_evidence(scan: &Scan, task: &TaskState, note: &str) -> Vec<DiagnosisEvidence> {
+    let status_kind = task_evidence_kind(task);
     let mut evidence = vec![DiagnosisEvidence {
         kind: "task".to_string(),
         reference: task.id.clone(),
@@ -3123,7 +3180,7 @@ fn ancestor_evidence(scan: &Scan, task: &TaskState, note: &str) -> Vec<Diagnosis
             .result_seq
             .or(task.failure_seq)
             .or(Some(task.status_seq)),
-        event_kind: Some("plan_task.finished".to_string()),
+        event_kind: Some(status_kind.to_string()),
         note: Some(note.to_string()),
         ..DiagnosisEvidence::default()
     }];
@@ -3133,11 +3190,12 @@ fn ancestor_evidence(scan: &Scan, task: &TaskState, note: &str) -> Vec<Diagnosis
             reference: truncate_ref(hash, 12),
             hash: Some(hash.clone()),
             event_seq: task.result_seq.or(task.failure_seq),
-            event_kind: Some("plan_task.finished".to_string()),
+            event_kind: Some(status_kind.to_string()),
             note: Some("task result evidence".to_string()),
         });
     }
     for artifact in task.artifact_ids.iter().take(4) {
+        let known = scan.artifacts.contains_key(artifact);
         evidence.push(DiagnosisEvidence {
             kind: "artifact".to_string(),
             reference: truncate_ref(artifact, 120),
@@ -3147,7 +3205,7 @@ fn ancestor_evidence(scan: &Scan, task: &TaskState, note: &str) -> Vec<Diagnosis
                 .map(|artifact| artifact.sha256.clone())
                 .filter(|value| !value.is_empty()),
             event_seq: task.result_seq.or(task.failure_seq),
-            event_kind: Some("artifact.published".to_string()),
+            event_kind: known.then(|| "artifact.published".to_string()),
             note: Some("task artifact".to_string()),
         });
     }
@@ -3590,6 +3648,35 @@ mod tests {
 
     fn report_for(events: Vec<Event>, target: Option<&str>) -> SessionDiagnosisResult {
         diagnose(&input(events, target, true))
+    }
+
+    #[test]
+    fn cited_hashes_only_keep_known_evidence() {
+        let known = "a".repeat(64);
+        let secret = "b".repeat(64);
+        let events = vec![
+            plan(1, &[("t1", &[]), ("t2", &["t1"])]),
+            task_start(2, "t1"),
+            artifact(3, "artifact-1", "t1", &known),
+            task_finish(
+                4,
+                "t1",
+                "failed",
+                &format!("used {known} and pasted {secret}"),
+            ),
+            task_start(5, "t2"),
+            task_finish(6, "t2", "failed", "downstream"),
+        ];
+        let scan = scan_events(&events);
+        let cited = &scan.tasks.get("t1").expect("t1").cited_hashes;
+        assert!(
+            cited.iter().any(|hash| hash.starts_with(&known[..12])),
+            "a known artifact hash should remain cited"
+        );
+        assert!(
+            !cited.iter().any(|hash| hash.starts_with(&secret[..12])),
+            "an unrelated hex token must not become diagnosis evidence"
+        );
     }
 
     #[test]

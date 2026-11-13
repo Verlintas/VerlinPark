@@ -237,13 +237,7 @@ impl Engine {
             }
         }
         let payload = params.payload.unwrap_or_else(|| json!({}));
-        let payload_bytes = serde_json::to_vec(&payload)?;
-        if payload_bytes.len() > MAX_GATE_PAYLOAD_BYTES {
-            return Err(gate_error(
-                codes::GATE_INVALID,
-                format!("gate payload must be at most {MAX_GATE_PAYLOAD_BYTES} bytes"),
-            ));
-        }
+        validate_payload(&payload)?;
         let expires_at = resolve_gate_deadline(
             params.after_secs,
             params.expires_at.as_deref(),
@@ -275,7 +269,7 @@ impl Engine {
             tokio::task::spawn_blocking(move || store.create_gate_with_event(&create)).await??;
         let _ = self.events.send(event);
         let resolve_hint = format!(
-            "vp gate resolve {} --token <one-time-token> [--outcome resolved|rejected|failed] [--note ...]",
+            "printf '%s' <one-time-token> | vp gate resolve {} --token-stdin [--outcome resolved|rejected|failed] [--note ...]",
             stored.gate.id
         );
         Ok(GateOpenOutcome {
@@ -882,6 +876,12 @@ pub fn validate_payload(payload: &Value) -> Result<()> {
             format!("gate payload must be at most {MAX_GATE_PAYLOAD_BYTES} bytes"),
         ));
     }
+    if vp_protocol::types::json_has_sensitive_key(payload) {
+        return Err(gate_error(
+            codes::GATE_INVALID,
+            "gate payload uses a credential-like key; store a label or external id, not a secret",
+        ));
+    }
     Ok(())
 }
 
@@ -993,6 +993,7 @@ mod tests {
         validate_payload(&json!({"pr": 42})).unwrap();
         let oversized = json!({"blob": "x".repeat(MAX_GATE_PAYLOAD_BYTES + 1)});
         assert!(validate_payload(&oversized).is_err());
+        assert!(validate_payload(&json!({"nested": {"api_key": "not-a-secret"}})).is_err());
     }
 
     #[test]

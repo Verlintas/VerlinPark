@@ -1982,6 +1982,39 @@ fn validate_session_bundle(bundle: &SessionBundle) -> Result<()> {
                 event.id
             ));
         }
+        if event.kind == vp_protocol::types::AGENT_MEMORY_ERASED_EVENT {
+            // A logical-erasure tombstone is deliberately content-free. It
+            // must not smuggle the erased row back in through a snapshot.
+            if event.payload.get("memory").is_some() || event.payload.get("content").is_some() {
+                return Err(anyhow!(
+                    "bundle erasure event {} must not carry memory content",
+                    event.id
+                ));
+            }
+            if serde_json::to_vec(&event.payload)
+                .map(|encoded| encoded.len() > 4 * 1024)
+                .unwrap_or(true)
+            {
+                return Err(anyhow!(
+                    "bundle erasure event {} payload is oversized",
+                    event.id
+                ));
+            }
+            let memory_id = event
+                .payload
+                .get("memory_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|memory_id| !memory_id.is_empty())
+                .ok_or_else(|| anyhow!("bundle erasure event {} has no memory id", event.id))?;
+            if memory_id.chars().count() > 256 {
+                return Err(anyhow!(
+                    "bundle erasure event {} memory id is oversized",
+                    event.id
+                ));
+            }
+            continue;
+        }
         let snapshot: vp_protocol::types::AgentMemory = serde_json::from_value(
             event
                 .payload
@@ -2665,6 +2698,8 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_effect_receipts_lookup
                 ON effect_receipts(session_id, tool, target, request_hash, attempt);
+            CREATE INDEX IF NOT EXISTS idx_effect_receipts_state_created
+                ON effect_receipts(state, created_at);
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_effect_receipts_idempotent
                 ON effect_receipts(
@@ -6341,6 +6376,25 @@ impl Store {
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Count unresolved receipts without the 500-row display cap. The effects
+    /// report uses this to fail closed when truncation could hide a blocker.
+    pub fn count_unresolved_effect_receipts(
+        &self,
+        session_id: &str,
+        task_id: Option<&str>,
+    ) -> Result<u64> {
+        let conn = self.lock()?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM effect_receipts
+             WHERE session_id = ?1
+               AND (?2 IS NULL OR task_id = ?2)
+               AND state IN ('intent', 'unknown')",
+            params![session_id, task_id],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as u64)
     }
 
     pub fn replace_effect_receipts(&self, session_id: &str, rows: &[EffectReceipt]) -> Result<()> {

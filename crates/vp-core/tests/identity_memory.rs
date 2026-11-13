@@ -13,8 +13,8 @@ use vp_core::rebuild::rebuild_database;
 use vp_protocol::types::{
     AgentIdentity, AgentIdentityPolicy, AgentMemory, AgentMemoryError, AgentMemoryListParams,
     AgentMemoryParams, AgentMemoryReplayParams, AgentMemorySweepResult, CreateAgentIdentityParams,
-    CreateAgentMemoryParams, ForgetAgentMemoryParams, MemoryEvidence, Project,
-    RetireAgentIdentityParams, Session, SessionAssignParams, SupersedeAgentMemoryParams,
+    CreateAgentMemoryParams, EraseAgentMemoryParams, ForgetAgentMemoryParams, MemoryEvidence,
+    Project, RetireAgentIdentityParams, Session, SessionAssignParams, SupersedeAgentMemoryParams,
     SweepAgentMemoriesParams, UpdateAgentMemoryParams, VerifyAgentMemoryParams, agent_memory_codes,
 };
 use vp_store::Store;
@@ -1126,6 +1126,116 @@ async fn pruned_memory_bundle_imports_and_replays_without_resurrecting() {
     assert_eq!(replay.memories, 0);
     assert!(
         imported_engine
+            .get_agent_memory(AgentMemoryParams {
+                memory_id: memory.id,
+                project_id: None,
+                identity_id: None,
+            })
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn erased_memory_leaves_no_content_in_events_or_bundles_and_never_resurrects() {
+    let harness = harness("erased-bundle");
+    let engine = &harness.engine;
+    let project = &harness.project;
+    enable_policy(engine, &project.id).await;
+    let worker = identity(engine, &project.id, "Auth Lead", "Platform", "auth").await;
+    let session = session(engine, &project.id, "erased bundle");
+    assign(engine, &session.id, &worker.id).await;
+    let secret = "Secret launch coordinates: 47.6062N 122.3321W.";
+    let memory = remember(engine, project, "agent", Some(&worker.id), secret).await;
+    let content_hash = memory.content_hash.clone();
+
+    let erased = engine
+        .erase_agent_memory(EraseAgentMemoryParams {
+            memory_id: memory.id.clone(),
+            project_id: Some(project.id.clone()),
+            reason: Some("privacy request".to_string()),
+            approved: true,
+        })
+        .await
+        .unwrap();
+    assert!(erased.erased);
+    assert!(erased.events_removed >= 1);
+    assert!(list_as(engine, &project.id, None).await.is_empty());
+
+    // A stale projection must be removed by repair, not treated as an
+    // authoritative row that survives the erased tombstone.
+    engine
+        .store()
+        .replace_agent_memory_projection(&project.id, std::slice::from_ref(&memory))
+        .unwrap();
+    let repaired = engine
+        .replay_agent_memories(AgentMemoryReplayParams {
+            project_id: project.id.clone(),
+            repair: true,
+        })
+        .await
+        .unwrap();
+    assert!(repaired.repaired, "{repaired:?}");
+    assert!(repaired.consistent, "{repaired:?}");
+    assert_eq!(repaired.memories, 0);
+    assert!(
+        engine
+            .get_agent_memory(AgentMemoryParams {
+                memory_id: memory.id.clone(),
+                project_id: None,
+                identity_id: None,
+            })
+            .await
+            .is_err()
+    );
+
+    let bundle = engine.export_session(&session.id).await.unwrap();
+    assert!(bundle.agent_memories.is_empty());
+    assert_eq!(bundle.agent_memory_events.len(), 1);
+    assert_eq!(
+        bundle.agent_memory_events[0].kind, "agent.memory.erased",
+        "only the content-free tombstone remains"
+    );
+    let exported = serde_json::to_string(&bundle.agent_memory_events).unwrap();
+    assert!(
+        !exported.contains(secret),
+        "erased content leaked into a bundle"
+    );
+    assert!(exported.contains(&content_hash));
+
+    let mut smuggled = bundle.clone();
+    smuggled.agent_memory_events[0].payload["memory"] = serde_json::json!({
+        "id": memory.id.clone(),
+        "project_id": project.id.clone(),
+        "scope": "project",
+        "content": secret,
+    });
+    let rejected = Store::open(TempDir::new().unwrap().path())
+        .unwrap()
+        .import_session_bundle(&smuggled)
+        .unwrap_err();
+    assert!(
+        rejected
+            .to_string()
+            .contains("must not carry memory content"),
+        "unexpected bundle validation error: {rejected:#}"
+    );
+
+    let imported_data = TempDir::new().unwrap();
+    let imported_store = Store::open(imported_data.path()).unwrap();
+    imported_store.import_session_bundle(&bundle).unwrap();
+    let imported = Engine::new(imported_store);
+    let replay = imported
+        .replay_agent_memories(AgentMemoryReplayParams {
+            project_id: project.id.clone(),
+            repair: false,
+        })
+        .await
+        .unwrap();
+    assert!(replay.consistent, "{replay:?}");
+    assert_eq!(replay.memories, 0);
+    assert!(
+        imported
             .get_agent_memory(AgentMemoryParams {
                 memory_id: memory.id,
                 project_id: None,

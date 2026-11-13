@@ -148,8 +148,16 @@ enum GateCommand {
     /// Resolve an open gate with its one-time scoped token.
     Resolve {
         gate: String,
+        /// One-time token. Prefer --token-stdin or --token-file; command-line
+        /// arguments are visible to local process listings.
+        #[arg(long, conflicts_with_all = ["token_stdin", "token_file"])]
+        token: Option<String>,
+        /// Read the one-time token from stdin (no trailing newline required).
+        #[arg(long, conflicts_with = "token_file")]
+        token_stdin: bool,
+        /// Read the one-time token from a 0600 file.
         #[arg(long)]
-        token: String,
+        token_file: Option<std::path::PathBuf>,
         /// resolved (default), rejected, or failed.
         #[arg(long, default_value = "resolved")]
         outcome: String,
@@ -2921,6 +2929,17 @@ enum Command {
         /// Hard-delete after the row has left active state.
         #[arg(long)]
         prune: bool,
+    },
+    /// Logically erase a memory and all prior event payloads (destructive).
+    AgentMemoryErase {
+        memory: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        reason: Option<String>,
+        /// Required confirmation for logical erasure.
+        #[arg(long)]
+        yes: bool,
     },
     /// Expire due memory and optionally prune old stale/superseded rows.
     AgentMemorySweep {
@@ -9341,6 +9360,24 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await?
         }
+        Command::AgentMemoryErase {
+            memory,
+            project,
+            reason,
+            yes,
+        } => {
+            rpc(
+                &discovery,
+                "agent.memory.erase",
+                json!({
+                    "memory_id": memory,
+                    "project_id": project,
+                    "reason": reason,
+                    "approved": yes,
+                }),
+            )
+            .await?
+        }
         Command::AgentMemorySweep {
             project,
             older_than_days,
@@ -9797,10 +9834,13 @@ async fn run(cli: Cli) -> Result<()> {
             GateCommand::Resolve {
                 gate,
                 token,
+                token_stdin,
+                token_file,
                 outcome,
                 note,
                 operator,
             } => {
+                let token = read_gate_token(token, token_stdin, token_file.as_deref())?;
                 rpc(
                     &discovery,
                     "gate.resolve",
@@ -11466,6 +11506,55 @@ async fn resolve_project(discovery: &Discovery, requested: Option<&str>) -> Resu
         [] => bail!("no projects configured; pass --project"),
         _ => bail!("multiple projects configured; pass --project"),
     }
+}
+
+fn read_gate_token(
+    token: Option<String>,
+    token_stdin: bool,
+    token_file: Option<&Path>,
+) -> Result<String> {
+    const MAX_TOKEN_BYTES: u64 = 4 * 1024;
+    let raw = if let Some(token) = token {
+        eprintln!(
+            "warning: --token is visible to local process listings; prefer --token-stdin or --token-file"
+        );
+        token
+    } else if token_stdin {
+        let mut value = String::new();
+        std::io::stdin()
+            .take(MAX_TOKEN_BYTES + 1)
+            .read_to_string(&mut value)
+            .context("reading the gate token from stdin")?;
+        if value.len() as u64 > MAX_TOKEN_BYTES {
+            bail!("gate token input exceeds {MAX_TOKEN_BYTES} bytes");
+        }
+        value
+    } else if let Some(path) = token_file {
+        let metadata = std::fs::metadata(path)
+            .with_context(|| format!("reading gate token file {}", path.display()))?;
+        if metadata.len() > MAX_TOKEN_BYTES {
+            bail!("gate token file exceeds {MAX_TOKEN_BYTES} bytes");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                bail!(
+                    "gate token file {} is group/world accessible; chmod 600 it first",
+                    path.display()
+                );
+            }
+        }
+        std::fs::read_to_string(path)
+            .with_context(|| format!("reading gate token file {}", path.display()))?
+    } else {
+        bail!("provide --token-stdin, --token-file, or --token");
+    };
+    let token = raw.trim().to_string();
+    if token.is_empty() {
+        bail!("gate token is empty");
+    }
+    Ok(token)
 }
 
 async fn rpc(discovery: &Discovery, method: &str, params: Value) -> Result<Value> {
@@ -25287,11 +25376,52 @@ mod gate_cli_tests {
                     },
             } => {
                 assert_eq!(gate, "gate-1");
-                assert_eq!(token, "vpg_secret");
+                assert_eq!(token.as_deref(), Some("vpg_secret"));
                 assert_eq!(outcome, "rejected");
             }
             other => panic!("expected gate resolve, got {other:?}"),
         }
+
+        let cli =
+            Cli::try_parse_from(["vp", "gate", "resolve", "gate-1", "--token-stdin"]).unwrap();
+        match cli.command {
+            Command::Gate {
+                command:
+                    GateCommand::Resolve {
+                        gate,
+                        token,
+                        token_stdin,
+                        token_file,
+                        ..
+                    },
+            } => {
+                assert_eq!(gate, "gate-1");
+                assert!(token.is_none());
+                assert!(token_stdin);
+                assert!(token_file.is_none());
+            }
+            other => panic!("expected gate resolve, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gate_token_file_must_not_be_group_or_world_accessible() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"vpg_file_token\n").unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_gate_token(None, false, Some(&path)).unwrap(),
+            "vpg_file_token"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let error = read_gate_token(None, false, Some(&path)).unwrap_err();
+        assert!(error.to_string().contains("chmod 600"), "{error:#}");
     }
 
     #[test]
@@ -25810,6 +25940,32 @@ mod agent_identity_cli_tests {
                 assert!(prune);
             }
             other => panic!("expected agent-memory-forget, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "agent-memory-erase",
+            "mem-1",
+            "--project",
+            "prj-1",
+            "--reason",
+            "privacy request",
+            "--yes",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::AgentMemoryErase {
+                memory,
+                project,
+                reason,
+                yes,
+            } => {
+                assert_eq!(memory, "mem-1");
+                assert_eq!(project.as_deref(), Some("prj-1"));
+                assert_eq!(reason.as_deref(), Some("privacy request"));
+                assert!(yes);
+            }
+            other => panic!("expected agent-memory-erase, got {other:?}"),
         }
 
         let cli = Cli::try_parse_from([

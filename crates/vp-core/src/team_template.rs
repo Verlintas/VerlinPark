@@ -3724,6 +3724,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundle_import_rejects_a_self_hashed_malformed_template() {
+        let dir = TempDir::new().expect("tempdir");
+        let (engine, source_id) = test_engine(&dir, "source");
+        source_project(&engine, &source_id).await;
+        let export = engine
+            .export_team_template(export_params(&source_id, "Platform Team"))
+            .await
+            .expect("export");
+        let session = engine
+            .create_session(source_id.clone(), "bundle template".to_string(), None)
+            .await
+            .expect("session");
+        let mut bundle = engine.export_session(&session.id).await.expect("bundle");
+        let record = bundle.team_templates.first_mut().expect("template record");
+        record.template.name = "/Users/secret/team".to_string();
+        record.name = record.template.name.clone();
+        record.template.content_hash =
+            vp_protocol::types::compute_team_template_hash(&record.template).expect("hash");
+        record.content_hash = record.template.content_hash.clone();
+        assert!(!export.template.content_hash.is_empty());
+        let (target, _target_id) = test_engine(&dir, "target");
+        let error = target.import_session(bundle).await.unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("absolute path"),
+            "unexpected import error: {message}"
+        );
+    }
+
+    #[tokio::test]
     async fn template_reads_are_project_scoped() {
         let dir = TempDir::new().expect("tempdir");
         let (engine, source_id) = test_engine(&dir, "source");

@@ -258,6 +258,43 @@ corpus is committed.
 
 Verification: 3,890 Rust tests passed; app + helper Swift suites passed.
 
+## 0.19 2026-11-13 Production hardening round three
+
+ADR-0215 closes the remaining locally verifiable gaps from round two:
+
+- S5 adds explicit logical erasure: `agent.memory.erase` / `vp
+  agent-memory-erase --yes` requires approval, deletes the projection row and
+  all prior event payloads for that memory id, and appends one content-free
+  `agent.memory.erased` tombstone. Replay/repair cannot resurrect the row, and
+  bundle import accepts the tombstone only when it carries no snapshot/content.
+  This is logical SQLite-row erasure, not a secure wipe of free pages, WAL,
+  snapshots, or prior backups.
+- Leader/Manager/Worker/Labour run/tool events carry `identity_id` and
+  `identity_generation` from the effective run identity; cache plan/warm report
+  the generation instead of always `null`. This is provenance only and changes
+  no gate.
+- Contract derivation accepts `src/**` and wildcard scopes with the same
+  meaning as runtime path checks, rejects URL embedded credentials, and has a
+  committed adversarial URL/shell corpus.
+- Effect classification errors become recoverable `INVALID_ARGUMENT` tool
+  results; the effects display window counts unresolved receipts outside its
+  500-row cap and fails closed when truncated.
+- Gate payloads reject credential-like keys; `vp gate resolve` supports
+  `--token-stdin` and a 0600 `--token-file`; gate/effect/land RPC errors preserve
+  typed codes.
+- C6 keeps only cited hashes that match known evidence and reports actual task
+  event kinds. S8 validates portable template shape on Engine import and
+  `db-rebuild`. S6 performance assignments honor the lookback cutoff. A store
+  test reopens a pre-hardening database and verifies additive migration.
+
+Still open: S5 erasure is not cryptographic and has no event retention or
+backup-erasure policy; path/URL/shell analysis remains bounded/syntactic; gate
+payload screening is key-name based; C6 can under-report citations outside its
+event window; direct low-level store import retains only hash validation; no
+coverage tooling or exhaustive parser corpus is committed.
+
+Verification: 3,902 Rust tests passed; no Swift code changed.
+
 ## 0. 2026-10-30 跟进
 
 第一轮硬化已完成（同一 `main` 线，提交见仓库历史）：

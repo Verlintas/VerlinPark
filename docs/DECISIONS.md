@@ -218,6 +218,7 @@
 | [0212](adr/0212-portable-team-templates.md) | Portable content-addressed TeamTemplate/Team Charter export, preview, and apply | Accepted | Runtime/Orchestration |
 | [0213](adr/0213-production-hardening-round.md) | Production hardening round: non-destructive repair, lease heartbeats, workspace bases/land, effect/gate/template isolation | Accepted | Runtime/Security |
 | [0214](adr/0214-hardening-round-two.md) | Hardening round two: bounded replay, lock-free diagnosis decode, OTel paging/retryability, template snapshot hash/provenance, org truncation order | Accepted | Runtime/Observability |
+| [0215](adr/0215-hardening-round-three.md) | Hardening round three: logical memory erasure, identity provenance, contract glob/URL, effect dispatch/truncation, gate payload/token, C6 evidence, S8 shape validation, old-DB migration | Accepted | Runtime/Security/Memory |
 
 ---
 

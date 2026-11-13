@@ -1526,6 +1526,9 @@ struct AgentSpec {
     /// Leader/Manager/Worker; a Labour child inherits the Worker identity that
     /// owns its workspace so S6 attribution lands on the same component cell.
     identity_id: Option<String>,
+    /// Generation of the owning identity at run start. Emitted on agent/tool
+    /// events so OTel and diagnosis can attribute evidence without a DB read.
+    identity_generation: Option<u64>,
     profile: AgentProfile,
     /// Plan task kind that selects the frozen tool bundle for a Worker or
     /// Labour run. `None` means the legacy full bundle for task agents and the
@@ -2254,6 +2257,12 @@ fn agent_fields(payload: &mut serde_json::Value, spec: &AgentSpec) {
         }
         if let Some(department) = &spec.department {
             object.insert("department".into(), serde_json::json!(department));
+        }
+        if let Some(identity_id) = &spec.identity_id {
+            object.insert("identity_id".into(), serde_json::json!(identity_id));
+        }
+        if let Some(generation) = spec.identity_generation {
+            object.insert("identity_generation".into(), serde_json::json!(generation));
         }
     }
 }
@@ -3299,6 +3308,7 @@ impl AgentService {
             task_id: None,
             department: None,
             identity_id: None,
+            identity_generation: None,
             profile: AgentProfile::Generic,
             allow_delegation: false,
             task_kind: None,
@@ -3324,6 +3334,7 @@ impl AgentService {
             task_id: params.task_id.clone(),
             department: None,
             identity_id: None,
+            identity_generation: None,
             profile,
             allow_delegation: false,
             task_kind: None,
@@ -3966,6 +3977,7 @@ impl AgentService {
             task_id: None,
             department: None,
             identity_id: None,
+            identity_generation: None,
             profile: AgentProfile::Generic,
             allow_delegation: false,
             task_kind: None,
@@ -3991,6 +4003,7 @@ impl AgentService {
             task_id: entry.task_id.clone(),
             department: None,
             identity_id: None,
+            identity_generation: None,
             profile,
             allow_delegation: false,
             task_kind: None,
@@ -4079,6 +4092,7 @@ impl AgentService {
             task_id: entry.task_id.clone(),
             department: None,
             identity_id: None,
+            identity_generation: None,
             profile,
             allow_delegation: true,
             task_kind: None,
@@ -4340,6 +4354,7 @@ impl AgentService {
             task_id: entry.task_id.clone(),
             department: None,
             identity_id: None,
+            identity_generation: None,
             profile: AgentProfile::Coding,
             allow_delegation: false,
             task_kind: None,
@@ -4615,6 +4630,7 @@ impl AgentService {
             task_id: None,
             department: None,
             identity_id: None,
+            identity_generation: None,
             profile: AgentProfile::Generic,
             allow_delegation: false,
             task_kind: None,
@@ -4640,6 +4656,7 @@ impl AgentService {
             task_id: entry.task_id.clone(),
             department: None,
             identity_id: None,
+            identity_generation: None,
             profile: AgentProfile::Coding,
             allow_delegation: false,
             task_kind: None,
@@ -8575,6 +8592,7 @@ impl AgentService {
                 task_id: None,
                 department: None,
                 identity_id: None,
+                identity_generation: None,
                 profile,
                 allow_delegation: true,
                 task_kind: None,
@@ -8775,6 +8793,7 @@ impl AgentService {
             task_id: None,
             department: None,
             identity_id: None,
+            identity_generation: None,
             profile,
             allow_delegation: true,
             task_kind: None,
@@ -9738,7 +9757,7 @@ async fn run_plan_resume(
         .into_iter()
         .find(|agent| agent.role == "leader");
     let leader_id = leader.as_ref().map(|agent| agent.id.clone());
-    let spec = AgentSpec {
+    let mut spec = AgentSpec {
         id: leader_id.clone().unwrap_or_else(|| "leader".to_string()),
         role: AgentRole::Leader,
         name: leader
@@ -9750,6 +9769,7 @@ async fn run_plan_resume(
         task_id: None,
         department: None,
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
         task_kind: None,
@@ -9765,6 +9785,25 @@ async fn run_plan_resume(
         session_workspace_id: None,
         parent_workspace_id: None,
     };
+    let (identity_id, identity_generation) =
+        match resolve_run_identity(&engine, &session, &spec).await {
+            Ok(identity) => identity,
+            Err(error) => {
+                let _ = control
+                    .finalize_session(&engine, session_id, "failed")
+                    .await;
+                return Err(error);
+            }
+        };
+    spec.identity_id = identity_id;
+    spec.identity_generation = identity_generation;
+    if let Some(identity_id) = &spec.identity_id
+        && let Err(error) = engine
+            .set_agent_identity_binding(&spec.id, Some(identity_id))
+            .await
+    {
+        tracing::warn!(%error, agent_id = %spec.id, "failed to persist run identity binding");
+    }
     let budget = SessionBudget::new(
         session.token_budget,
         session.tokens_in + session.tokens_out,
@@ -10084,6 +10123,30 @@ async fn record_queued_preemption(
     Ok(())
 }
 
+/// Resolve the project identity for a top-level run once, before the first
+/// event is emitted. The resolved id/generation are observational provenance;
+/// they do not grant authority or change any runtime gate.
+async fn resolve_run_identity(
+    engine: &Engine,
+    session: &Session,
+    spec: &AgentSpec,
+) -> Result<(Option<String>, Option<u64>)> {
+    Ok(
+        match engine
+            .prompt_identity_for_run(
+                &session.id,
+                spec.role.as_str(),
+                spec.title.as_deref(),
+                spec.department.as_deref(),
+            )
+            .await?
+        {
+            Some(identity) => (Some(identity.id), Some(identity.generation)),
+            None => (spec.identity_id.clone(), spec.identity_generation),
+        },
+    )
+}
+
 async fn run_agent(
     engine: Engine,
     config: AgentConfig,
@@ -10108,7 +10171,7 @@ async fn run_agent(
         .into_iter()
         .find(|agent| agent.role == "leader");
     let leader_id = leader.as_ref().map(|agent| agent.id.clone());
-    let spec = AgentSpec {
+    let mut spec = AgentSpec {
         id: leader_id.clone().unwrap_or_else(|| "leader".to_string()),
         role: AgentRole::Leader,
         name: leader
@@ -10120,6 +10183,7 @@ async fn run_agent(
         task_id: None,
         department: None,
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
         task_kind: None,
@@ -10238,6 +10302,29 @@ async fn run_agent(
         return Err(error);
     }
 
+    let (identity_id, identity_generation) =
+        match resolve_run_identity(&engine, &session, &spec).await {
+            Ok(identity) => identity,
+            Err(error) => {
+                let _ = journal
+                    .finish_failed(
+                        &engine,
+                        "error",
+                        &format!("could not resolve run identity: {error:#}"),
+                    )
+                    .await;
+                return Err(error);
+            }
+        };
+    spec.identity_id = identity_id;
+    spec.identity_generation = identity_generation;
+    if let Some(identity_id) = &spec.identity_id
+        && let Err(error) = engine
+            .set_agent_identity_binding(&spec.id, Some(identity_id))
+            .await
+    {
+        tracing::warn!(%error, agent_id = %spec.id, "failed to persist run identity binding");
+    }
     if let Err(error) = emit(
         &engine,
         session_id,
@@ -10640,6 +10727,7 @@ fn remote_integrator_spec(
         task_id: None,
         department: None,
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Generic,
         allow_delegation: false,
         task_kind: None,
@@ -11745,6 +11833,7 @@ async fn verify_worker(
         task_id: worker_spec.task_id.clone(),
         department: worker_spec.department.clone(),
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Verification,
         allow_delegation: false,
         task_kind: None,
@@ -12575,6 +12664,7 @@ async fn delegate_acp(
         task_id: None,
         department: parent_spec.department.clone(),
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Coding,
         allow_delegation: false,
         task_kind: None,
@@ -15773,30 +15863,6 @@ async fn run_loop_body(
     let mut citations = CitationRegistry::default();
     let mut active_skill: Option<Skill> = None;
     let mut deferred_wait: Option<DeferredWait> = None;
-    // Resolve the run's project identity once. Leader/Manager/Worker resolve
-    // from the active assignment; Labour inherits the Worker identity that
-    // owns its workspace. The binding is persisted on the agents row before
-    // the first provider call so S6 performance attribution has durable
-    // evidence even if the run fails later.
-    let run_identity_id = match engine
-        .prompt_identity_for_run(
-            &session.id,
-            spec.role.as_str(),
-            spec.title.as_deref(),
-            spec.department.as_deref(),
-        )
-        .await?
-    {
-        Some(identity) => Some(identity.id),
-        None => spec.identity_id.clone(),
-    };
-    if let Some(identity_id) = &run_identity_id
-        && let Err(error) = engine
-            .set_agent_identity_binding(&spec.id, Some(identity_id))
-            .await
-    {
-        tracing::warn!(%error, agent_id = %spec.id, "failed to persist run identity binding");
-    }
     let mut last_lease_heartbeat = Instant::now();
     const RUN_LEASE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(300);
     let task_priority = if let Some(task_id) = &spec.task_id {
@@ -16295,7 +16361,7 @@ async fn run_loop_body(
         // A long plan can outlive the assignment/workspace lease taken when
         // the run attached. Renew both at a bounded cadence. Lease loss is an
         // event-backed warning, not a silent switch to the legacy path.
-        if let Some(identity_id) = &run_identity_id
+        if let Some(identity_id) = &spec.identity_id
             && last_lease_heartbeat.elapsed() >= RUN_LEASE_HEARTBEAT_INTERVAL
         {
             match engine.heartbeat_run_leases(&session.id, identity_id).await {
@@ -17833,8 +17899,9 @@ async fn run_loop_body(
             // evidence without executing; an unresolved one blocks execution
             // until an operator reconciles it. A denied/skill-blocked call
             // never creates an effect intent because it never runs.
+            let mut effect_classification_error: Option<ToolOutput> = None;
             let planned_effect = if denied_reason.is_none() && skill_denied.is_none() {
-                crate::effect::classify_tool_effect_for_host(
+                match crate::effect::classify_tool_effect_for_host(
                     &call.name,
                     &input,
                     approval_risk,
@@ -17845,7 +17912,20 @@ async fn run_loop_body(
                         .as_ref()
                         .map(|remote| remote.label())
                         .as_deref(),
-                )?
+                ) {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        // Bad path/patch/URL arguments are a recoverable tool
+                        // error, not a reason to abort the whole run before
+                        // the tool can return its normal error contract.
+                        effect_classification_error = Some(ToolOutput::error_coded(
+                            call.name.as_str(),
+                            crate::tooling::errors::ToolErrorCode::INVALID_ARGUMENT,
+                            format!("cannot plan the effect for this call: {error}"),
+                        ));
+                        None
+                    }
+                }
             } else {
                 None
             };
@@ -17860,11 +17940,14 @@ async fn run_loop_body(
             } else {
                 String::new()
             };
-            let mut effect_override: Option<ToolOutput> = None;
+            let effect_classification_failed = effect_classification_error.is_some();
+            let mut effect_override: Option<ToolOutput> = effect_classification_error;
             let mut effect_begin: Option<EffectReceipt> = None;
             let mut effect_duplicate: Option<EffectReceipt> = None;
             let mut journal_pair: Option<(RunStep, RunToolCall)> = None;
-            if duplicate.is_some() {
+            if effect_override.is_some() {
+                // The call never executes; the tool error is the result.
+            } else if duplicate.is_some() {
                 if let Some(plan) = &planned_effect
                     && let crate::effect::EffectPrepare::Replay(receipt)
                     | crate::effect::EffectPrepare::Blocked(receipt)
@@ -17945,9 +18028,11 @@ async fn run_loop_body(
                         "tool_call_id": call_id,
                         "name": call.name,
                         "input": input,
-                        "effect_blocked": effect_override
-                            .as_ref()
-                            .is_some_and(|output| output.is_error),
+                        "effect_blocked": !effect_classification_failed
+                            && effect_override
+                                .as_ref()
+                                .is_some_and(|output| output.is_error),
+                        "effect_classification_failed": effect_classification_failed,
                     }),
                 )
                 .await?;
@@ -18770,10 +18855,16 @@ async fn run_loop_body(
                                 // a Manager/Worker without a workspace resolves by
                                 // role/title/department. Labour inherits the
                                 // Worker cell that owns its work.
-                                let child_identity_id = match role {
+                                let (child_identity_id, child_identity_generation) = match role {
                                     AgentRole::Worker => match workspace_binding.as_ref() {
                                         Some(binding) => {
-                                            Some(binding.workspace.identity_id.clone())
+                                            let identity_id = binding.workspace.identity_id.clone();
+                                            let generation = engine
+                                                .get_agent_identity(&identity_id)
+                                                .await
+                                                .ok()
+                                                .map(|result| result.identity.generation);
+                                            (Some(identity_id), generation)
                                         }
                                         None => engine
                                             .prompt_identity_for_run(
@@ -18783,7 +18874,9 @@ async fn run_loop_body(
                                                 spec.department.as_deref(),
                                             )
                                             .await?
-                                            .map(|identity| identity.id),
+                                            .map(|identity| (identity.id, identity.generation))
+                                            .map(|(id, generation)| (Some(id), Some(generation)))
+                                            .unwrap_or((None, None)),
                                     },
                                     AgentRole::Manager => engine
                                         .prompt_identity_for_run(
@@ -18793,9 +18886,13 @@ async fn run_loop_body(
                                             spec.department.as_deref(),
                                         )
                                         .await?
-                                        .map(|identity| identity.id),
-                                    AgentRole::Labour => spec.identity_id.clone(),
-                                    _ => None,
+                                        .map(|identity| (identity.id, identity.generation))
+                                        .map(|(id, generation)| (Some(id), Some(generation)))
+                                        .unwrap_or((None, None)),
+                                    AgentRole::Labour => {
+                                        (spec.identity_id.clone(), spec.identity_generation)
+                                    }
+                                    _ => (None, None),
                                 };
                                 let labour_child_worktree = role == AgentRole::Labour
                                     && spec.session_workspace_id.is_some();
@@ -18941,6 +19038,7 @@ async fn run_loop_body(
                                     },
                                     department: spec.department.clone(),
                                     identity_id: child_identity_id,
+                                    identity_generation: child_identity_generation,
                                     profile: child_profile,
                                     task_kind: spec.task_kind.clone(),
                                     allow_delegation: role.child_role().is_some(),
@@ -23557,6 +23655,7 @@ async fn run_scout(
         task_id: parent.task_id.clone(),
         department: parent.department.clone(),
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Research,
         allow_delegation: false,
         task_kind: None,
@@ -24072,8 +24171,16 @@ async fn run_parallel_workers(
         let workspace_binding = engine
             .attach_worker_workspace_for_run(&session.id, None, spec.department.as_deref())
             .await?;
-        let child_identity_id = match workspace_binding.as_ref() {
-            Some(binding) => Some(binding.workspace.identity_id.clone()),
+        let (child_identity_id, child_identity_generation) = match workspace_binding.as_ref() {
+            Some(binding) => {
+                let identity_id = binding.workspace.identity_id.clone();
+                let generation = engine
+                    .get_agent_identity(&identity_id)
+                    .await
+                    .ok()
+                    .map(|result| result.identity.generation);
+                (Some(identity_id), generation)
+            }
             None => engine
                 .prompt_identity_for_run(
                     &session.id,
@@ -24082,7 +24189,9 @@ async fn run_parallel_workers(
                     spec.department.as_deref(),
                 )
                 .await?
-                .map(|identity| identity.id),
+                .map(|identity| (identity.id, identity.generation))
+                .map(|(id, generation)| (Some(id), Some(generation)))
+                .unwrap_or((None, None)),
         };
         let (info, workspace_id, session_workspace_id) = match workspace_binding {
             Some(binding) => {
@@ -24129,6 +24238,7 @@ async fn run_parallel_workers(
             task_id: None,
             department: spec.department.clone(),
             identity_id: child_identity_id,
+            identity_generation: child_identity_generation,
             profile: task.profile,
             allow_delegation: true,
             task_kind: None,
@@ -25376,6 +25486,7 @@ async fn ensure_plan_manager(
         task_id: None,
         department: Some(department.name.clone()),
         identity_id: None,
+        identity_generation: None,
         profile,
         allow_delegation: false,
         task_kind: None,
@@ -25795,8 +25906,17 @@ async fn execute_team_plan(
             let workspace_binding = engine
                 .attach_worker_workspace_for_run(&session.id, None, Some(task.department.as_str()))
                 .await?;
-            let worker_identity_id = match workspace_binding.as_ref() {
-                Some(binding) => Some(binding.workspace.identity_id.clone()),
+            let (worker_identity_id, worker_identity_generation) = match workspace_binding.as_ref()
+            {
+                Some(binding) => {
+                    let identity_id = binding.workspace.identity_id.clone();
+                    let generation = engine
+                        .get_agent_identity(&identity_id)
+                        .await
+                        .ok()
+                        .map(|result| result.identity.generation);
+                    (Some(identity_id), generation)
+                }
                 None => engine
                     .prompt_identity_for_run(
                         &session.id,
@@ -25805,7 +25925,9 @@ async fn execute_team_plan(
                         Some(task.department.as_str()),
                     )
                     .await?
-                    .map(|identity| identity.id),
+                    .map(|identity| (identity.id, identity.generation))
+                    .map(|(id, generation)| (Some(id), Some(generation)))
+                    .unwrap_or((None, None)),
             };
             let (info, workspace_id, session_workspace_id) = match workspace_binding {
                 Some(binding) => {
@@ -25853,6 +25975,7 @@ async fn execute_team_plan(
                 task_id: Some(task.id.clone()),
                 department: Some(task.department.clone()),
                 identity_id: worker_identity_id,
+                identity_generation: worker_identity_generation,
                 profile,
                 allow_delegation: true,
                 // The plan task kind is the deterministic bundle selector for
@@ -26698,6 +26821,7 @@ fn stable_agent_spec(
         task_id: None,
         department: None,
         identity_id: None,
+        identity_generation: None,
         profile,
         task_kind,
         allow_delegation: role.child_role().is_some(),
@@ -27217,6 +27341,7 @@ fn preview_spec(role: AgentRole, profile: AgentProfile, task_kind: Option<String
         task_id: None,
         department: None,
         identity_id: None,
+        identity_generation: None,
         profile,
         task_kind,
         allow_delegation: role.child_role().is_some(),

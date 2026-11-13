@@ -1570,7 +1570,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                     .await
                 {
                     Ok(result) => RpcResponse::success(id, result),
-                    Err(error) => internal_error(id, error),
+                    Err(error) => effect_error(id, error),
                 }
             }
             Err(response) => response_with_id(id, response),
@@ -1587,7 +1587,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                         },
                     )
                 }
-                Err(error) => internal_error(id, error),
+                Err(error) => effect_error(id, error),
             },
             Err(response) => response_with_id(id, response),
         },
@@ -1604,7 +1604,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                     .await
                 {
                     Ok(swept) => RpcResponse::success(id, json!({"swept": swept})),
-                    Err(error) => internal_error(id, error),
+                    Err(error) => effect_error(id, error),
                 },
                 Err(response) => response_with_id(id, response),
             }
@@ -1612,7 +1612,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "gate.open" => match parse_params::<GateOpenParams>(request.params) {
             Ok(params) => match state.engine.open_gate(params).await {
                 Ok(outcome) => RpcResponse::success(id, vp_core::gate::open_result(outcome)),
-                Err(error) => internal_error(id, error),
+                Err(error) => gate_error(id, error),
             },
             Err(response) => response_with_id(id, response),
         },
@@ -1629,7 +1629,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 .await
             {
                 Ok(result) => RpcResponse::success(id, result),
-                Err(error) => internal_error(id, error),
+                Err(error) => gate_error(id, error),
             },
             Err(response) => response_with_id(id, response),
         },
@@ -1644,7 +1644,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 .await
             {
                 Ok(result) => RpcResponse::success(id, result),
-                Err(error) => internal_error(id, error),
+                Err(error) => gate_error(id, error),
             },
             Err(response) => response_with_id(id, response),
         },
@@ -1655,14 +1655,14 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 .await
             {
                 Ok(result) => RpcResponse::success(id, result),
-                Err(error) => internal_error(id, error),
+                Err(error) => gate_error(id, error),
             },
             Err(response) => response_with_id(id, response),
         },
         "gate.status" => match parse_params::<GateStatusParams>(request.params) {
             Ok(params) => match state.engine.gate_status(&params.gate_id).await {
                 Ok(result) => RpcResponse::success(id, result),
-                Err(error) => internal_error(id, error),
+                Err(error) => gate_error(id, error),
             },
             Err(response) => response_with_id(id, response),
         },
@@ -1678,7 +1678,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                         expired_gates: expired as u64,
                     },
                 ),
-                Err(error) => internal_error(id, error),
+                Err(error) => gate_error(id, error),
             },
             Err(response) => response_with_id(id, response),
         },
@@ -4544,6 +4544,15 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             },
             Err(response) => response_with_id(id, response),
         },
+        "agent.memory.erase" => {
+            match parse_params::<vp_protocol::types::EraseAgentMemoryParams>(request.params) {
+                Ok(params) => match state.engine.erase_agent_memory(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => memory_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "agent.memory.verify" => match parse_params::<VerifyAgentMemoryParams>(request.params) {
             Ok(params) => match state.engine.verify_agent_memory(params).await {
                 Ok(result) => RpcResponse::success(id, result),
@@ -5516,7 +5525,7 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "session.land" => match parse_params::<LandSessionParams>(request.params) {
             Ok(params) => match state.engine.land_session(&params.session_id).await {
                 Ok(result) => RpcResponse::success(id, result),
-                Err(error) => internal_error(id, error),
+                Err(error) => effect_error(id, error),
             },
             Err(response) => response_with_id(id, response),
         },
@@ -6025,6 +6034,45 @@ fn identity_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
 
 /// Map the stable agent-memory taxonomy to a bounded RPC failure. Message text
 /// never changes the classification; only the typed code does.
+fn gate_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
+    if let Some(typed) = error.downcast_ref::<vp_core::gate::GateError>() {
+        let rpc_code = match typed.code {
+            vp_core::gate::codes::GATE_NOT_FOUND => codes::NOT_FOUND,
+            vp_core::gate::codes::GATE_CONFLICT
+            | vp_core::gate::codes::GATE_TOKEN_INVALID
+            | vp_core::gate::codes::GATE_EXPIRED
+            | vp_core::gate::codes::GATE_CANCELLED
+            | vp_core::gate::codes::GATE_ALREADY_WATCHED
+            | vp_core::gate::codes::GATE_ARCHIVED => codes::CONFLICT,
+            _ => codes::INVALID_PARAMS,
+        };
+        return RpcResponse::error(
+            id,
+            RpcError::with_data(rpc_code, typed.message.clone(), json!({"code": typed.code})),
+        );
+    }
+    internal_error(id, error)
+}
+
+fn effect_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
+    if let Some(blocked) = error.downcast_ref::<vp_core::effect::EffectBlocked>() {
+        return RpcResponse::error(
+            id,
+            RpcError::with_data(
+                codes::CONFLICT,
+                blocked.message.clone(),
+                json!({
+                    "code": "EFFECT_UNKNOWN",
+                    "session_id": blocked.session_id,
+                    "task_id": blocked.task_id,
+                    "receipt_ids": blocked.receipt_ids,
+                }),
+            ),
+        );
+    }
+    internal_error(id, error)
+}
+
 fn memory_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
     if let Some(typed) = error.downcast_ref::<vp_protocol::types::AgentMemoryError>() {
         let rpc_code = match typed.code {

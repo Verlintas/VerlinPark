@@ -176,6 +176,7 @@ fn help_spec(role: AgentRole, profile: AgentProfile) -> AgentSpec {
         task_id: None,
         department: None,
         identity_id: None,
+        identity_generation: None,
         profile,
         allow_delegation: false,
         task_kind: None,
@@ -1142,6 +1143,66 @@ async fn smart_policy_auto_approves_workspace_writes() {
 }
 
 #[tokio::test]
+async fn invalid_effect_arguments_return_a_tool_error_and_continue_the_run() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_bad_effect".into(),
+                    name: "write_file".into(),
+                    // The contract and permission checks accept this path, but
+                    // the effect probe refuses to record a write into `.git`.
+                    // The run must report a normal tool error and continue.
+                    arguments: serde_json::json!({
+                        "path": ".git/config",
+                        "content": "x"
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("recovered from the bad patch".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "bad effect arguments".into(), None)
+        .await
+        .unwrap();
+    service
+        .start(&session.id, "bad effect arguments")
+        .await
+        .unwrap();
+    let settled = wait_until_idle(&engine, &session).await;
+    assert_eq!(settled.status, "idle", "the run must not abort");
+    let events = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "tool.started"
+            && event.payload["tool_call_id"] == "call_bad_effect"
+            && event.payload["effect_classification_failed"] == true
+    }));
+    assert!(events.iter().any(|event| {
+        event.kind == "tool.finished"
+            && event.payload["tool_call_id"] == "call_bad_effect"
+            && event.payload["is_error"] == true
+            && event.payload["error_code"] == "INVALID_ARGUMENT"
+    }));
+    let effects = engine
+        .session_effects(&session.id, None, true, 100)
+        .await
+        .unwrap();
+    assert!(effects.receipts.is_empty(), "the call never executed");
+    assert!(!effects.blocked);
+}
+
+#[tokio::test]
 async fn smart_policy_denies_blocked_shell_without_asking() {
     let dir = TempDir::new().unwrap();
     let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
@@ -1678,6 +1739,7 @@ async fn records_merge_conflicts_in_the_queue() {
         task_id: Some("T1".into()),
         department: Some("impl".into()),
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Coding,
         allow_delegation: true,
         task_kind: None,
@@ -1760,6 +1822,7 @@ async fn retries_a_conflicted_merge_after_rebase() {
         task_id: Some("T1".into()),
         department: Some("impl".into()),
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Coding,
         allow_delegation: true,
         task_kind: None,
@@ -1864,6 +1927,7 @@ async fn auto_resolves_a_conflicted_merge_with_an_agent() {
         task_id: Some("T1".into()),
         department: Some("impl".into()),
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Coding,
         allow_delegation: true,
         task_kind: None,
@@ -2007,6 +2071,7 @@ async fn auto_resolver_policy_resolves_pending_conflicts() {
         task_id: Some("T1".into()),
         department: Some("impl".into()),
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Coding,
         allow_delegation: true,
         task_kind: None,
@@ -4291,6 +4356,7 @@ fn plan_budget_scope_includes_the_project_pool() {
         task_id: None,
         department: None,
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Coding,
         allow_delegation: false,
         task_kind: None,
@@ -5010,6 +5076,7 @@ async fn mailbox_tools_send_read_and_publish() {
         task_id: None,
         department: None,
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
         task_kind: None,
@@ -5109,6 +5176,7 @@ async fn coordination_tool_records_blockers_and_team_status_reads_the_board() {
         task_id: None,
         department: None,
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
         task_kind: None,
@@ -7989,6 +8057,7 @@ async fn prepared_summary_cache_invalidates_on_every_key_component() {
         task_id: None,
         department: None,
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
         task_kind: None,
@@ -8123,6 +8192,7 @@ async fn structured_state_honors_an_explicit_task_id() {
         task_id: Some("T2".into()),
         department: Some("impl".into()),
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Coding,
         allow_delegation: false,
         task_kind: None,
@@ -8169,6 +8239,7 @@ async fn structured_state_without_a_plan_uses_the_session_goal() {
         task_id: None,
         department: None,
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
         task_kind: None,
@@ -8209,6 +8280,7 @@ async fn agent_shaping_uses_the_project_tool_output_policy() {
         task_id: None,
         department: None,
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
         task_kind: None,
@@ -8276,6 +8348,7 @@ async fn error_failure_contract_survives_output_spill_shaping() {
         task_id: None,
         department: None,
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
         task_kind: None,
@@ -8390,6 +8463,7 @@ async fn spills_large_tool_results_and_pages_them_with_read_tool_output() {
         task_id: None,
         department: None,
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
         task_kind: None,
@@ -8549,6 +8623,7 @@ async fn prepare_failure_is_distinct_from_compaction_failure() {
         task_id: None,
         department: None,
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
         task_kind: None,
@@ -8721,6 +8796,7 @@ async fn prepared_summary_is_invalidated_by_a_real_plan_revision() {
         task_id: None,
         department: None,
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
         task_kind: None,
@@ -8890,6 +8966,7 @@ async fn compaction_fallback_preserves_the_authoritative_plan_state() {
         task_id: None,
         department: None,
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
         task_kind: None,
@@ -9020,6 +9097,7 @@ async fn prepared_summary_is_reused_once_at_the_threshold() {
         task_id: None,
         department: None,
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
         task_kind: None,
@@ -9201,6 +9279,7 @@ async fn prepared_summary_is_invalidated_by_model_and_plan_changes() {
         task_id: None,
         department: None,
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
         task_kind: None,
@@ -9757,6 +9836,7 @@ async fn trims_older_messages_when_summarization_fails() {
         task_id: None,
         department: None,
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
         task_kind: None,
@@ -9875,6 +9955,7 @@ async fn compaction_counts_system_and_tool_tokens() {
         task_id: None,
         department: None,
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
         task_kind: None,
@@ -9988,6 +10069,7 @@ async fn compaction_applies_context_calibration() {
         task_id: None,
         department: None,
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
         task_kind: None,
@@ -11954,6 +12036,7 @@ async fn warm_on_resume_is_opt_in_and_adds_one_stable_section_call() {
         task_id: None,
         department: None,
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Generic,
         allow_delegation: true,
         task_kind: None,
@@ -12977,6 +13060,7 @@ async fn task_detail_and_control_wrappers_are_event_backed() {
         task_id: Some("T1".into()),
         department: Some("impl".into()),
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Coding,
         allow_delegation: true,
         task_kind: None,
@@ -16381,6 +16465,7 @@ async fn stale_integration_owner_aborts_before_touching_the_session_branch() {
         task_id: Some("T1".into()),
         department: Some("impl".into()),
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Coding,
         allow_delegation: true,
         task_kind: None,
@@ -23283,6 +23368,7 @@ async fn worker_wait_for_gate_releases_the_worker_slot() {
         task_id: None,
         department: None,
         identity_id: None,
+        identity_generation: None,
         profile: AgentProfile::Coding,
         allow_delegation: false,
         task_kind: None,

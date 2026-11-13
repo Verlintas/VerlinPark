@@ -16828,6 +16828,11 @@ impl Engine {
         if bundle.session.project_id != bundle.project.id {
             anyhow::bail!("bundle session/project ids do not match");
         }
+        // A self-consistent hash is not enough: validate the portable shape
+        // before a tampered archive can persist a malformed template record.
+        for record in &bundle.team_templates {
+            crate::team_template::validate_team_template_shape(&record.template)?;
+        }
         let project_id = bundle.project.id.clone();
         let session_id = bundle.session.id.clone();
         let event_count = bundle.events.len() + 2;
@@ -18466,6 +18471,19 @@ impl Engine {
             pruned: prune && outcome.is_some(),
             changed: outcome.is_some(),
         })
+    }
+
+    /// Logically erase one memory and its prior event payloads. Destructive,
+    /// explicit, and local-only; imported rows fail closed.
+    pub async fn erase_agent_memory(
+        &self,
+        params: vp_protocol::types::EraseAgentMemoryParams,
+    ) -> Result<vp_protocol::types::AgentMemoryEraseResult> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            vp_store::store::identity_memory::erase_agent_memory(&store, &params)
+        })
+        .await?
     }
 
     pub async fn verify_agent_memory(
@@ -21428,17 +21446,39 @@ impl Engine {
             other_store.list_effect_receipts(&other_session, other_task.as_deref(), true, 500)
         })
         .await??;
-        let counts = crate::effect::counts(&rows, &policy);
+        let mut counts = crate::effect::counts(&rows, &policy);
         let blockers = crate::effect::blocking_receipts(&rows, &policy);
-        let blocked = !blockers.is_empty();
+        let mut blocked = !blockers.is_empty();
+        let mut block_reason = blocked.then(|| crate::effect::block_message(&blockers));
+        let truncated = rows.len() >= 500;
+        if truncated && policy.enabled && policy.unknown_blocks_merge {
+            // The newest 500 rows may not include an older unresolved receipt.
+            // Count without the display cap and fail closed if any exist.
+            let count_store = self.store.clone();
+            let count_session = session_id.to_string();
+            let count_task = task_id.map(str::to_string);
+            let unresolved = tokio::task::spawn_blocking(move || {
+                count_store.count_unresolved_effect_receipts(&count_session, count_task.as_deref())
+            })
+            .await??;
+            if unresolved > 0 {
+                counts.blocking = counts.blocking.max(unresolved);
+            }
+            if unresolved > 0 && !blocked {
+                blocked = true;
+                block_reason = Some(format!(
+                    "{unresolved} unresolved effect receipt(s) exist outside the bounded 500-row window; reconcile them before merge or landing"
+                ));
+            }
+        }
         Ok(SessionEffectsResult {
             session_id: session_id.to_string(),
             policy,
             receipts,
             counts,
             blocked,
-            block_reason: blocked.then(|| crate::effect::block_message(&blockers)),
-            truncated: rows.len() >= 500,
+            block_reason,
+            truncated,
         })
     }
 
