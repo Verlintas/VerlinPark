@@ -542,6 +542,9 @@ fn build_team_plan(plan: &crate::scenario::PlanSpec) -> Result<TeamPlan> {
                 acceptance: task.acceptance.clone(),
                 token_budget: None,
                 cost_budget_usd: None,
+                parent_task_id: None,
+                fanout_key: None,
+                fanout_join_for: None,
             })
             .collect(),
     })

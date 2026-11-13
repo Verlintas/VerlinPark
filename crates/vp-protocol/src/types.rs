@@ -15199,6 +15199,19 @@ pub struct PlanTask {
     pub token_budget: Option<u64>,
     #[serde(default)]
     pub cost_budget_usd: Option<f64>,
+    /// Present on a child produced by `plan.fanout`; references the removed
+    /// template task id. Kept in the plan, not the scheduler projection, so a
+    /// replay can prove the child came from an explicit bounded expansion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<String>,
+    /// De-duplicated fan-out item key. Present exactly when `parent_task_id`
+    /// is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fanout_key: Option<String>,
+    /// Present on the shared join task; references the originating template
+    /// task id. Join tasks have no write scope and depend on every child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fanout_join_for: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -15206,6 +15219,76 @@ pub struct TeamPlan {
     pub goal: String,
     pub departments: Vec<PlanDepartment>,
     pub tasks: Vec<PlanTask>,
+}
+
+/// One bounded item in an explicit `plan.fanout` expansion. Unknown fields are
+/// ignored so an artifact can carry extra metadata; only these fields affect
+/// the generated child task.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PlanFanoutItem {
+    /// De-duplication key. ASCII letters, digits, `-`, `_`, and `.` only.
+    pub key: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub priority: Option<i32>,
+    /// Must be non-empty and pairwise disjoint across all children.
+    #[serde(default)]
+    pub write_scope: Vec<String>,
+    #[serde(default)]
+    pub acceptance: Vec<String>,
+    #[serde(default)]
+    pub token_budget: Option<u64>,
+    #[serde(default)]
+    pub cost_budget_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PlanFanoutParams {
+    #[serde(default)]
+    pub session_id: String,
+    pub template_task_id: String,
+    /// Inline item list. Mutually exclusive with `artifact_id`.
+    #[serde(default)]
+    pub items: Vec<PlanFanoutItem>,
+    /// Optional text artifact containing a JSON array of items.
+    #[serde(default)]
+    pub artifact_id: Option<String>,
+    #[serde(default)]
+    pub join_task_id: Option<String>,
+    #[serde(default)]
+    pub join_title: Option<String>,
+    #[serde(default)]
+    pub join_acceptance: Vec<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Optimistic plan-revision guard. A mismatch fails closed.
+    #[serde(default)]
+    pub expected_revision: Option<u32>,
+    /// Explicit operator acknowledgement. The agent tool sets this only after
+    /// the HostState approval broker has allowed the call.
+    #[serde(default)]
+    pub approved: bool,
+    #[serde(default)]
+    pub author: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PlanFanoutResult {
+    pub revision: u32,
+    pub plan: TeamPlan,
+    pub parent_task_id: String,
+    pub join_task_id: String,
+    pub child_task_ids: Vec<String>,
+    pub child_keys: Vec<String>,
+    pub deduped_keys: Vec<String>,
+    /// True when the same expansion was already present and no revision or
+    /// event was written.
+    pub idempotent: bool,
 }
 
 /// A persistent task-DAG node owned by the daemon scheduler. The plan remains

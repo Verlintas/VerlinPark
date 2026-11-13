@@ -1203,6 +1203,134 @@ async fn invalid_effect_arguments_return_a_tool_error_and_continue_the_run() {
 }
 
 #[tokio::test]
+async fn plan_fanout_tool_is_host_state_approved_and_expands_before_the_run() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_fanout".into(),
+                    name: "plan_fanout".into(),
+                    arguments: serde_json::json!({
+                        "template_task_id": "T1",
+                        "items": [
+                            {"key": "auth", "write_scope": ["src/auth"]},
+                            {"key": "api", "write_scope": ["src/api"]}
+                        ]
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("fan-out planned".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "fan out tool".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let plan = TeamPlan {
+        goal: "fan out".to_string(),
+        departments: vec![PlanDepartment {
+            name: "impl".to_string(),
+            manager_title: "Implementation".to_string(),
+            profile: "coding".to_string(),
+            objective: "implement".to_string(),
+            token_budget: None,
+            cost_budget_usd: None,
+        }],
+        tasks: vec![
+            PlanTask {
+                id: "T1".into(),
+                department: "impl".into(),
+                title: "Build".into(),
+                kind: "coding".into(),
+                priority: 0,
+                profile: Some("coding".into()),
+                deps: Vec::new(),
+                write_scope: vec!["src".into()],
+                acceptance: vec!["done".into()],
+                token_budget: None,
+                cost_budget_usd: None,
+                parent_task_id: None,
+                fanout_key: None,
+                fanout_join_for: None,
+            },
+            PlanTask {
+                id: "T2".into(),
+                department: "impl".into(),
+                title: "Verify".into(),
+                kind: "coding".into(),
+                priority: 0,
+                profile: Some("coding".into()),
+                deps: vec!["T1".into()],
+                write_scope: vec!["docs".into()],
+                acceptance: vec!["done".into()],
+                token_budget: None,
+                cost_budget_usd: None,
+                parent_task_id: None,
+                fanout_key: None,
+                fanout_join_for: None,
+            },
+        ],
+    };
+    engine.set_team_plan(&session.id, &plan).await.unwrap();
+
+    let approver_engine = engine.clone();
+    let approver_session = session.id.clone();
+    let approver = tokio::spawn(async move {
+        for _ in 0..100 {
+            if let Ok(approvals) = approver_engine
+                .list_approvals(Some(approver_session.clone()))
+                .await
+            {
+                for approval in approvals
+                    .iter()
+                    .filter(|approval| approval.status == "pending")
+                {
+                    let _ = approver_engine.resolve_approval(&approval.id, true).await;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    service.start(&session.id, "expand the plan").await.unwrap();
+    let settled = wait_until_idle(&engine, &session).await;
+    approver.abort();
+    assert_eq!(settled.status, "idle");
+    let expanded = engine.get_team_plan(&session.id).await.unwrap().unwrap();
+    assert!(!expanded.tasks.iter().any(|task| task.id == "T1"));
+    assert_eq!(
+        expanded
+            .tasks
+            .iter()
+            .filter(|task| task.parent_task_id.as_deref() == Some("T1"))
+            .count(),
+        2
+    );
+    let events = engine
+        .list_events(session.id.clone(), 0, 400)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "approval.requested"
+            && event.payload["tool"] == "plan_fanout"
+            && event.payload["approval_risk"] == "host_state"
+    }));
+    assert!(events.iter().any(|event| {
+        event.kind == "team_plan.revised" && event.payload["fanout"]["parent_task_id"] == "T1"
+    }));
+}
+
+#[tokio::test]
 async fn smart_policy_denies_blocked_shell_without_asking() {
     let dir = TempDir::new().unwrap();
     let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
@@ -3572,6 +3700,9 @@ async fn resumes_only_unfinished_plan_tasks() {
                 acceptance: vec!["done".into()],
                 token_budget: None,
                 cost_budget_usd: None,
+                parent_task_id: None,
+                fanout_key: None,
+                fanout_join_for: None,
             },
             PlanTask {
                 id: "T2".into(),
@@ -3585,6 +3716,9 @@ async fn resumes_only_unfinished_plan_tasks() {
                 acceptance: vec!["done".into()],
                 token_budget: None,
                 cost_budget_usd: None,
+                parent_task_id: None,
+                fanout_key: None,
+                fanout_join_for: None,
             },
         ],
     };
@@ -3697,6 +3831,9 @@ async fn reuses_an_existing_task_commit_when_resuming() {
             acceptance: vec!["done".into()],
             token_budget: None,
             cost_budget_usd: None,
+            parent_task_id: None,
+            fanout_key: None,
+            fanout_join_for: None,
         }],
     };
     engine.set_team_plan(&session.id, &plan).await.unwrap();
@@ -4666,6 +4803,9 @@ fn plan_batch_preserves_scheduler_ready_order() {
             acceptance: vec!["done".to_string()],
             token_budget: None,
             cost_budget_usd: None,
+            parent_task_id: None,
+            fanout_key: None,
+            fanout_join_for: None,
         }
     }
     let batch = select_plan_batch(
@@ -4700,6 +4840,9 @@ fn plan_batch_serializes_unscoped_and_overlapping_tasks() {
             acceptance: vec!["done".to_string()],
             token_budget: None,
             cost_budget_usd: None,
+            parent_task_id: None,
+            fanout_key: None,
+            fanout_join_for: None,
         }
     }
 
@@ -6642,6 +6785,9 @@ async fn pauses_and_resumes_one_running_plan_task() {
             acceptance: vec!["done".into()],
             token_budget: None,
             cost_budget_usd: None,
+            parent_task_id: None,
+            fanout_key: None,
+            fanout_join_for: None,
         }],
     };
     engine.set_team_plan(&session.id, &plan).await.unwrap();
@@ -6740,6 +6886,9 @@ async fn cancels_one_running_plan_task_without_cancelling_the_session() {
             acceptance: vec!["done".into()],
             token_budget: None,
             cost_budget_usd: None,
+            parent_task_id: None,
+            fanout_key: None,
+            fanout_join_for: None,
         }],
     };
     engine.set_team_plan(&session.id, &plan).await.unwrap();
@@ -7619,6 +7768,9 @@ async fn dispatches_one_ready_plan_task_per_call() {
                 acceptance: vec!["done".into()],
                 token_budget: None,
                 cost_budget_usd: None,
+                parent_task_id: None,
+                fanout_key: None,
+                fanout_join_for: None,
             },
             PlanTask {
                 id: "T2".into(),
@@ -7632,6 +7784,9 @@ async fn dispatches_one_ready_plan_task_per_call() {
                 acceptance: vec!["done".into()],
                 token_budget: None,
                 cost_budget_usd: None,
+                parent_task_id: None,
+                fanout_key: None,
+                fanout_join_for: None,
             },
         ],
     };
@@ -7763,6 +7918,9 @@ async fn cancelling_a_dispatched_task_does_not_cancel_the_rest_of_the_plan() {
                 acceptance: vec!["done".into()],
                 token_budget: None,
                 cost_budget_usd: None,
+                parent_task_id: None,
+                fanout_key: None,
+                fanout_join_for: None,
             },
             PlanTask {
                 id: "T2".into(),
@@ -7776,6 +7934,9 @@ async fn cancelling_a_dispatched_task_does_not_cancel_the_rest_of_the_plan() {
                 acceptance: vec!["done".into()],
                 token_budget: None,
                 cost_budget_usd: None,
+                parent_task_id: None,
+                fanout_key: None,
+                fanout_join_for: None,
             },
         ],
     };
@@ -8165,6 +8326,9 @@ async fn structured_state_honors_an_explicit_task_id() {
                 acceptance: vec!["one done".into()],
                 token_budget: None,
                 cost_budget_usd: None,
+                parent_task_id: None,
+                fanout_key: None,
+                fanout_join_for: None,
             },
             PlanTask {
                 id: "T2".into(),
@@ -8178,6 +8342,9 @@ async fn structured_state_honors_an_explicit_task_id() {
                 acceptance: vec!["two done".into()],
                 token_budget: None,
                 cost_budget_usd: None,
+                parent_task_id: None,
+                fanout_key: None,
+                fanout_join_for: None,
             },
         ],
     };
@@ -13047,6 +13214,9 @@ async fn task_detail_and_control_wrappers_are_event_backed() {
             acceptance: vec!["done".into()],
             token_budget: Some(1000),
             cost_budget_usd: None,
+            parent_task_id: None,
+            fanout_key: None,
+            fanout_join_for: None,
         }],
     };
     engine.set_team_plan(&session.id, &plan).await.unwrap();
@@ -13120,6 +13290,9 @@ fn continuation_test_plan() -> TeamPlan {
             acceptance: vec!["done".into()],
             token_budget: None,
             cost_budget_usd: None,
+            parent_task_id: None,
+            fanout_key: None,
+            fanout_join_for: None,
         }],
     }
 }
@@ -13934,6 +14107,9 @@ fn stall_recovery_plan() -> TeamPlan {
             acceptance: vec!["done".into()],
             token_budget: None,
             cost_budget_usd: None,
+            parent_task_id: None,
+            fanout_key: None,
+            fanout_join_for: None,
         }],
     }
 }
@@ -20600,7 +20776,7 @@ async fn frozen_tool_bundle_matches_the_role_matrix_and_stays_stable() {
         crate::tool_bundle::ToolBundleKind::Leader
     );
     assert!(leader_bundle.builtin_count() <= crate::tool_bundle::LEADER_TOOL_LIMIT);
-    assert_eq!(leader_bundle.builtin_count(), 49);
+    assert_eq!(leader_bundle.builtin_count(), 50);
     assert!(leader_bundle.contains("submit_team_plan"));
     assert!(leader_bundle.contains("delegate"));
     assert!(leader_bundle.contains("browser"));
@@ -20890,7 +21066,7 @@ async fn tool_bundle_now_reports_minimal_worker_and_catalog_without_a_run() {
         .find(|role| role.role == "leader")
         .unwrap();
     assert_eq!(default_leader.bundle, "leader");
-    assert_eq!(default_leader.builtin_count, 47);
+    assert_eq!(default_leader.builtin_count, 48);
 }
 
 #[tokio::test]
@@ -20912,7 +21088,7 @@ async fn cache_plan_reports_the_frozen_bundle_for_each_role() {
     assert_eq!(plan.roles.len(), 1);
     let leader = &plan.roles[0];
     assert_eq!(leader.tool_bundle, "leader");
-    assert_eq!(leader.tool_bundle_tool_count, 47);
+    assert_eq!(leader.tool_bundle_tool_count, 48);
     assert_eq!(leader.tool_bundle_within_target, Some(true));
     assert!(!leader.tool_bundle_fallback);
     assert_eq!(leader.tool_bundle_hash.len(), 64);
@@ -21327,7 +21503,7 @@ async fn tool_bundle_matrix_covers_standard_combinations_without_session_state()
     };
     let leader = find("leader", "generic", None);
     assert_eq!(leader.bundle, "leader");
-    assert_eq!(leader.builtin_count, 47);
+    assert_eq!(leader.builtin_count, 48);
     assert_eq!(leader.within_target, Some(true));
     assert!(!leader.fallback);
     let manager = find("manager", "coding", None);
@@ -21410,7 +21586,7 @@ async fn tool_bundle_history_is_bounded_newest_first_and_role_filtered() {
         assert_eq!(entry.bundle, "leader");
         assert_eq!(entry.bundle_hash.len(), 64);
         assert_eq!(entry.tools_hash.len(), 64);
-        assert_eq!(entry.tool_count, 47);
+        assert_eq!(entry.tool_count, 48);
         assert!(!entry.fallback);
         assert!(!entry.created_at.is_empty());
     }
@@ -21442,11 +21618,11 @@ async fn tool_bundle_diff_is_deterministic_and_bounded() {
         .unwrap();
     assert_eq!(diff.from_bundle, "leader");
     assert_eq!(diff.to_bundle, "minimal");
-    assert_eq!(diff.from_count, 47);
+    assert_eq!(diff.from_count, 48);
     assert_eq!(diff.to_count, 6);
     assert!(diff.changed);
     assert!(diff.added.is_empty());
-    assert_eq!(diff.removed.len(), 41);
+    assert_eq!(diff.removed.len(), 42);
     assert_eq!(diff.shared.len(), 6);
     let mut sorted = diff.removed.clone();
     sorted.sort();
@@ -21588,7 +21764,7 @@ for line in sys.stdin:
                 .all(|name| !name.starts_with("mcp_")),
             "MCP tools are appended once after built-ins"
         );
-        assert_eq!(first_mcp, 47);
+        assert_eq!(first_mcp, 48);
         assert_eq!(&names[first_mcp..], ["mcp_mock_alpha", "mcp_mock_zeta"]);
         assert_eq!(
             recorded[0]
@@ -21615,8 +21791,8 @@ for line in sys.stdin:
         .expect("prompt prefix");
     assert_eq!(prefix.payload["tool_bundle"], "leader");
     assert_eq!(prefix.payload["tool_bundle_mcp_count"], 2);
-    assert_eq!(prefix.payload["tool_bundle_tool_count"], 47);
-    assert_eq!(prefix.payload["tool_count"], 49);
+    assert_eq!(prefix.payload["tool_bundle_tool_count"], 48);
+    assert_eq!(prefix.payload["tool_count"], 50);
     let manifest = events
         .iter()
         .find(|event| event.kind == "context.tool_bundle")
@@ -21662,6 +21838,9 @@ async fn cache_plan_uses_the_stored_plan_task_kind_for_a_worker() {
             acceptance: vec!["note.txt exists".into()],
             token_budget: None,
             cost_budget_usd: None,
+            parent_task_id: None,
+            fanout_key: None,
+            fanout_join_for: None,
         }],
     };
     engine.set_team_plan(&session.id, &plan).await.unwrap();

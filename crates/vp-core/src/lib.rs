@@ -142,6 +142,7 @@ mod dashboard;
 pub mod diagnosis;
 pub mod effect;
 pub mod employment;
+pub mod fanout;
 pub mod forge;
 pub mod gate;
 pub mod gui;
@@ -4642,6 +4643,9 @@ impl Engine {
                 acceptance: task.acceptance.clone(),
                 token_budget: task.token_budget,
                 cost_budget_usd: task.cost_budget_usd,
+                parent_task_id: None,
+                fanout_key: None,
+                fanout_join_for: None,
             }],
         }
     }

@@ -24,6 +24,9 @@ fn task(id: &str, deps: &[&str]) -> PlanTask {
         acceptance: vec!["works".to_string()],
         token_budget: None,
         cost_budget_usd: None,
+        parent_task_id: None,
+        fanout_key: None,
+        fanout_join_for: None,
     }
 }
 

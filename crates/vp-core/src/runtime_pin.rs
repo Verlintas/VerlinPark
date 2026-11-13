@@ -1227,6 +1227,9 @@ mod tests {
             acceptance: vec!["done".to_string()],
             token_budget: Some(1000),
             cost_budget_usd: None,
+            parent_task_id: None,
+            fanout_key: None,
+            fanout_join_for: None,
         }
     }
 

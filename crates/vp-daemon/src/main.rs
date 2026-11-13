@@ -1430,6 +1430,14 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             },
             Err(response) => response_with_id(id, response),
         },
+        "plan.fanout" => match parse_params::<vp_protocol::types::PlanFanoutParams>(request.params)
+        {
+            Ok(params) => match state.engine.fanout_plan(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => fanout_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
         "team_plan.revise" => match parse_params::<ReviseTeamPlanParams>(request.params) {
             Ok(params) => match state
                 .agent
@@ -6034,6 +6042,29 @@ fn identity_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
 
 /// Map the stable agent-memory taxonomy to a bounded RPC failure. Message text
 /// never changes the classification; only the typed code does.
+fn fanout_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
+    if let Some(typed) = error.downcast_ref::<vp_core::fanout::FanoutError>() {
+        let rpc_code = match typed.code {
+            vp_core::fanout::codes::FANOUT_NOT_FOUND | vp_core::fanout::codes::FANOUT_NO_PLAN => {
+                codes::NOT_FOUND
+            }
+            vp_core::fanout::codes::FANOUT_APPROVAL_REQUIRED
+            | vp_core::fanout::codes::FANOUT_INVALID
+            | vp_core::fanout::codes::FANOUT_CAP
+            | vp_core::fanout::codes::FANOUT_SCOPE_OVERLAP
+            | vp_core::fanout::codes::FANOUT_RECURSIVE
+            | vp_core::fanout::codes::FANOUT_PROTECTED
+            | vp_core::fanout::codes::FANOUT_ARTIFACT_INVALID => codes::INVALID_PARAMS,
+            _ => codes::CONFLICT,
+        };
+        return RpcResponse::error(
+            id,
+            RpcError::with_data(rpc_code, typed.message.clone(), json!({"code": typed.code})),
+        );
+    }
+    internal_error(id, error)
+}
+
 fn gate_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
     if let Some(typed) = error.downcast_ref::<vp_core::gate::GateError>() {
         let rpc_code = match typed.code {

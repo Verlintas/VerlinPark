@@ -931,6 +931,9 @@ mod tests {
             acceptance: vec!["done".to_string()],
             token_budget: Some(budget),
             cost_budget_usd: None,
+            parent_task_id: None,
+            fanout_key: None,
+            fanout_join_for: None,
         }
     }
 

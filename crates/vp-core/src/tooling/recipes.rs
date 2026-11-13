@@ -314,6 +314,7 @@ pub const RECIPES: &[ToolRecipe] = &[
         audience: &["leader:*", "manager:*", "worker:*"],
         tools: &[
             "submit_team_plan",
+            "plan_fanout",
             "run_team_plan",
             "delegate",
             "delegate_many",
@@ -322,6 +323,7 @@ pub const RECIPES: &[ToolRecipe] = &[
         ],
         steps: &[
             "Write a validated plan with one department per Manager and explicit task dependencies.",
+            "Use plan_fanout only for an explicit, approved expansion of one pending template into <=20 disjoint children plus its join; it never runs automatically.",
             "Give parallel tasks non-overlapping write_scope values; the runtime rejects overlap before integration.",
             "Use team_status before and after a batch, and record decisions/handoffs with coordinate.",
             "A Worker result is not done until the Verifier approves and the Integrator merges; report the real state.",

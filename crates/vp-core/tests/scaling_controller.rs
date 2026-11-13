@@ -45,6 +45,9 @@ fn task(id: &str, scope: &str) -> PlanTask {
         acceptance: vec!["done".into()],
         token_budget: None,
         cost_budget_usd: None,
+        parent_task_id: None,
+        fanout_key: None,
+        fanout_join_for: None,
     }
 }
 

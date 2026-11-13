@@ -296,6 +296,7 @@ pub const BUNDLE_TOOL_CATALOG: &[BundleToolSpec] = &[
         false,
         false,
     ),
+    BundleToolSpec::new("plan_fanout", ToolCategory::Orchestration, false, false),
     BundleToolSpec::new("run_team_plan", ToolCategory::Orchestration, false, false),
     BundleToolSpec::new(
         "deliberate_team_plan",
@@ -383,6 +384,7 @@ pub const LEADER_TOOLS: &[&str] = &[
     "delegate",
     "delegate_acp",
     "submit_team_plan",
+    "plan_fanout",
     "run_team_plan",
     "deliberate_team_plan",
     "scout",
@@ -1597,7 +1599,7 @@ mod tests {
     #[test]
     fn leader_bundle_membership_is_exact() {
         let generic = selected_names(ToolBundleKind::Leader, "leader", "generic");
-        assert_eq!(generic.len(), 47);
+        assert_eq!(generic.len(), 48);
         assert_eq!(
             generic,
             vec![
@@ -1622,6 +1624,7 @@ mod tests {
                 "list_sources",
                 "lsp_query",
                 "mcp",
+                "plan_fanout",
                 "process",
                 "publish_artifact",
                 "read_artifact",
@@ -1652,7 +1655,7 @@ mod tests {
         );
         let coding = selected_names(ToolBundleKind::Leader, "leader", "coding");
         assert!(coding.len() <= LEADER_TOOL_LIMIT);
-        assert_eq!(coding.len(), 49);
+        assert_eq!(coding.len(), 50);
         assert!(coding.contains(&"browser"));
         assert!(coding.contains(&"computer"));
         let research = selected_names(ToolBundleKind::Leader, "leader", "research");
@@ -2244,7 +2247,7 @@ mod tests {
             .iter()
             .find(|entry| entry.kind == ToolBundleKind::Leader)
             .unwrap();
-        assert_eq!(leader.requested_count, 47);
+        assert_eq!(leader.requested_count, 48);
         let coding = entries
             .iter()
             .find(|entry| entry.kind == ToolBundleKind::Coding)
@@ -2867,9 +2870,9 @@ mod tests {
         // These are the static request counts before role-policy resolution.
         // Actual runtime counts are asserted by the agent matrix test.
         let expected = [
-            (ToolBundleKind::Leader, "leader", "generic", 47),
-            (ToolBundleKind::Leader, "leader", "coding", 49),
-            (ToolBundleKind::Leader, "manager", "coding", 43),
+            (ToolBundleKind::Leader, "leader", "generic", 48),
+            (ToolBundleKind::Leader, "leader", "coding", 50),
+            (ToolBundleKind::Leader, "manager", "coding", 44),
             (ToolBundleKind::Coding, "worker", "coding", 38),
             (ToolBundleKind::Coding, "labour", "coding", 36),
             (ToolBundleKind::Coding, "worker", "research", 36),

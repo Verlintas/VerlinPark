@@ -1916,6 +1916,9 @@ fn scheduled_plan() -> TeamPlan {
                 acceptance: vec!["done".into()],
                 token_budget: None,
                 cost_budget_usd: None,
+                parent_task_id: None,
+                fanout_key: None,
+                fanout_join_for: None,
             },
             PlanTask {
                 id: "T2".into(),
@@ -1929,6 +1932,9 @@ fn scheduled_plan() -> TeamPlan {
                 acceptance: vec!["done".into()],
                 token_budget: None,
                 cost_budget_usd: None,
+                parent_task_id: None,
+                fanout_key: None,
+                fanout_join_for: None,
             },
         ],
     }
@@ -17713,6 +17719,9 @@ fn plan_and_migration_snapshot_updates_are_atomic_and_plan_preserving() {
             acceptance: vec!["done".to_string()],
             token_budget: None,
             cost_budget_usd: None,
+            parent_task_id: None,
+            fanout_key: None,
+            fanout_join_for: None,
         }],
     };
     let plan_json = serde_json::to_string(&plan).unwrap();

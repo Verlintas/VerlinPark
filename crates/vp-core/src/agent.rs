@@ -1392,6 +1392,7 @@ pub(crate) fn role_tool_surface(role: AgentRole, profile: AgentProfile) -> Vec<S
         AgentRole::Leader => {
             names.push("todo_write".to_string());
             names.push("submit_team_plan".to_string());
+            names.push("plan_fanout".to_string());
             names.push("run_team_plan".to_string());
             names.push("deliberate_team_plan".to_string());
         }
@@ -17598,6 +17599,7 @@ async fn run_loop_body(
                 && spec.allow_delegation;
             let is_verdict = call.name == "submit_verdict" && spec.role == AgentRole::Verifier;
             let is_team_plan = call.name == "submit_team_plan" && spec.role == AgentRole::Leader;
+            let is_plan_fanout = call.name == "plan_fanout" && spec.role == AgentRole::Leader;
             let is_run_plan = call.name == "run_team_plan" && spec.role == AgentRole::Leader;
             let is_deliberate =
                 call.name == "deliberate_team_plan" && spec.role == AgentRole::Leader;
@@ -18171,6 +18173,63 @@ async fn run_loop_body(
                         ToolOutput::ok(summary)
                     }
                     Err(error) => ToolOutput::error(error.to_string()),
+                }
+            } else if is_plan_fanout {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                    }),
+                )
+                .await?;
+                let params =
+                    serde_json::from_value::<vp_protocol::types::PlanFanoutParams>(input.clone())
+                        .map(|mut params| {
+                            // The HostState approval broker already gated this call;
+                            // the tool itself cannot pre-approve a plan rewrite.
+                            params.session_id = session.id.clone();
+                            params.approved = true;
+                            params.author = Some(spec.role.as_str().to_string());
+                            params
+                        });
+                match params {
+                    Ok(params) => match engine.fanout_plan(params).await {
+                        Ok(result) => ToolOutput::ok_structured(
+                            format!(
+                                "Plan fan-out applied at revision {}: {} child task(s), join {}.",
+                                result.revision,
+                                result.child_task_ids.len(),
+                                result.join_task_id
+                            ),
+                            serde_json::to_value(&result).unwrap_or_else(|_| serde_json::json!({})),
+                        ),
+                        Err(error) => {
+                            let code = error
+                                .downcast_ref::<crate::fanout::FanoutError>()
+                                .map(|typed| typed.code)
+                                .unwrap_or(crate::fanout::codes::FANOUT_INVALID);
+                            let tool_code = if code == crate::fanout::codes::FANOUT_CONFLICT {
+                                crate::tooling::errors::ToolErrorCode::CONFLICT
+                            } else {
+                                crate::tooling::errors::ToolErrorCode::INVALID_ARGUMENT
+                            };
+                            ToolOutput::error_coded(
+                                call.name.as_str(),
+                                tool_code,
+                                format!("plan fanout failed: {error}"),
+                            )
+                        }
+                    },
+                    Err(error) => ToolOutput::error_coded(
+                        call.name.as_str(),
+                        crate::tooling::errors::ToolErrorCode::INVALID_ARGUMENT,
+                        format!("invalid plan fanout arguments: {error}"),
+                    ),
                 }
             } else if is_coordination_tool {
                 emit(
@@ -23011,6 +23070,42 @@ fn tool_schemas(
                 "required": ["goal", "departments", "tasks"]
             }),
         });
+        tools.push(ToolSchema {
+            name: "plan_fanout".to_string(),
+            description: "Explicitly replace one pending template task with at most 20 disjoint child tasks and a shared join task in a new plan revision. This is destructive plan surgery and requires a HostState approval; it never runs automatically. Use items (or artifact_id containing a JSON array) with a unique key and a disjoint write_scope per child.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "template_task_id": {"type": "string", "description": "Pending template task id to replace"},
+                    "items": {
+                        "type": "array",
+                        "maxItems": 20,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "key": {"type": "string", "maxLength": 64, "description": "Unique dedupe key for this child"},
+                                "title": {"type": "string", "maxLength": 200},
+                                "kind": {"type": "string"},
+                                "profile": {"type": "string", "enum": ["coding", "research", "verification", "generic"]},
+                                "priority": {"type": "integer", "minimum": -100, "maximum": 100},
+                                "write_scope": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                                "acceptance": {"type": "array", "items": {"type": "string"}},
+                                "token_budget": {"type": "integer", "minimum": 1},
+                                "cost_budget_usd": {"type": "number", "exclusiveMinimum": 0}
+                            },
+                            "required": ["key", "write_scope"]
+                        }
+                    },
+                    "artifact_id": {"type": "string", "description": "Optional text artifact containing a JSON array of items; mutually exclusive with items"},
+                    "join_task_id": {"type": "string", "maxLength": 40},
+                    "join_title": {"type": "string", "maxLength": 200},
+                    "join_acceptance": {"type": "array", "items": {"type": "string"}},
+                    "reason": {"type": "string", "maxLength": 1000},
+                    "expected_revision": {"type": "integer", "minimum": 0, "description": "Optional optimistic plan revision guard"}
+                },
+                "required": ["template_task_id"]
+            }),
+        });
     }
     if role == AgentRole::Leader {
         tools.push(ToolSchema {
@@ -24555,6 +24650,42 @@ pub(crate) fn validate_team_plan(plan: &TeamPlan, max_managers: usize) -> Result
         if !ids.insert(id.to_string()) {
             return Err(anyhow!("duplicate task id: {id}"));
         }
+        let has_parent = task.parent_task_id.is_some();
+        let has_key = task.fanout_key.is_some();
+        if has_parent != has_key {
+            return Err(anyhow!(
+                "task '{id}' must set parent_task_id and fanout_key together"
+            ));
+        }
+        if let Some(parent) = task.parent_task_id.as_deref()
+            && (parent.trim().is_empty() || parent == id)
+        {
+            return Err(anyhow!("task '{id}' has an invalid fan-out parent"));
+        }
+        if let Some(key) = task.fanout_key.as_deref()
+            && (key.is_empty()
+                || key.chars().count() > 64
+                || !key
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')))
+        {
+            return Err(anyhow!("task '{id}' has an invalid fan-out key"));
+        }
+        if let Some(parent) = task.fanout_join_for.as_deref() {
+            if parent.trim().is_empty() || parent == id {
+                return Err(anyhow!("task '{id}' has an invalid fan-out join parent"));
+            }
+            if has_parent || has_key {
+                return Err(anyhow!(
+                    "task '{id}' cannot be both a fan-out join and a fan-out child"
+                ));
+            }
+            if !task.write_scope.is_empty() {
+                return Err(anyhow!(
+                    "fan-out join task '{id}' must not declare a write scope"
+                ));
+            }
+        }
         let Some(department) = plan
             .departments
             .iter()
@@ -24652,6 +24783,67 @@ pub(crate) fn validate_team_plan(plan: &TeamPlan, max_managers: usize) -> Result
                     "task '{id}' cost budget exceeds its department budget"
                 ));
             }
+        }
+    }
+    // Fan-out children and their shared join form one explicit group. The join
+    // must depend on exactly the children and no child may have a second key.
+    let mut fanout_keys: std::collections::HashMap<(&str, &str), &str> =
+        std::collections::HashMap::new();
+    for task in &plan.tasks {
+        let (Some(parent), Some(key)) =
+            (task.parent_task_id.as_deref(), task.fanout_key.as_deref())
+        else {
+            continue;
+        };
+        if let Some(existing) = fanout_keys.insert((parent, key), task.id.as_str()) {
+            return Err(anyhow!(
+                "fan-out parent '{parent}' repeats key '{key}' in tasks '{existing}' and '{}'",
+                task.id
+            ));
+        }
+        if !plan
+            .tasks
+            .iter()
+            .any(|candidate| candidate.fanout_join_for.as_deref() == Some(parent))
+        {
+            return Err(anyhow!(
+                "fan-out child '{}' has no shared join task for parent '{parent}'",
+                task.id
+            ));
+        }
+    }
+    for join in plan
+        .tasks
+        .iter()
+        .filter(|task| task.fanout_join_for.is_some())
+    {
+        let parent = join.fanout_join_for.as_deref().unwrap_or_default();
+        let children = plan
+            .tasks
+            .iter()
+            .filter(|task| task.parent_task_id.as_deref() == Some(parent))
+            .collect::<Vec<_>>();
+        if children.is_empty() {
+            return Err(anyhow!(
+                "fan-out join task '{}' has no children for parent '{parent}'",
+                join.id
+            ));
+        }
+        let child_ids = children
+            .iter()
+            .map(|child| child.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let dep_ids = join
+            .deps
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        if child_ids != dep_ids {
+            return Err(anyhow!(
+                "fan-out join task '{}' must depend on exactly its {} children",
+                join.id,
+                children.len()
+            ));
         }
     }
     for department in &plan.departments {

@@ -912,6 +912,9 @@ pub fn milestone_plan_with_budget(
             acceptance,
             token_budget,
             cost_budget_usd,
+            parent_task_id: None,
+            fanout_key: None,
+            fanout_join_for: None,
         }],
     }
 }

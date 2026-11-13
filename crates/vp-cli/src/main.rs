@@ -1470,6 +1470,34 @@ enum Command {
         #[arg(long)]
         expected_revision: Option<u32>,
     },
+    /// Explicitly expand one pending plan template into bounded fan-out
+    /// children plus a shared join task. Requires --yes.
+    PlanFanout {
+        session: String,
+        #[arg(long)]
+        template: String,
+        /// Inline JSON array of fan-out items.
+        #[arg(long, conflicts_with = "file")]
+        items: Option<String>,
+        /// JSON file (or stdin with `-`) containing the item array.
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Session artifact containing the item array.
+        #[arg(long)]
+        artifact: Option<String>,
+        #[arg(long)]
+        join_task: Option<String>,
+        #[arg(long)]
+        join_title: Option<String>,
+        #[arg(long = "join-acceptance")]
+        join_acceptance: Vec<String>,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        expected_revision: Option<u32>,
+        #[arg(long)]
+        yes: bool,
+    },
     /// Revise a stored TeamPlan from a JSON file (or stdin).
     TeamPlanRevise {
         session: String,
@@ -6652,6 +6680,47 @@ async fn run(cli: Cli) -> Result<()> {
                     "task": task,
                     "reason": reason,
                     "expected_revision": expected_revision,
+                }),
+            )
+            .await?
+        }
+        Command::PlanFanout {
+            session,
+            template,
+            items,
+            file,
+            artifact,
+            join_task,
+            join_title,
+            join_acceptance,
+            reason,
+            expected_revision,
+            yes,
+        } => {
+            let items: Vec<Value> = match (items, file) {
+                (Some(raw), None) => serde_json::from_str(&raw).context("parsing fan-out items")?,
+                (None, Some(path)) => {
+                    let raw = read_json_input(Some(&path))?;
+                    serde_json::from_str(&raw).context("parsing fan-out items")?
+                }
+                (None, None) => Vec::new(),
+                (Some(_), Some(_)) => bail!("pass either --items or --file, not both"),
+            };
+            rpc(
+                &discovery,
+                "plan.fanout",
+                json!({
+                    "session_id": session,
+                    "template_task_id": template,
+                    "items": items,
+                    "artifact_id": artifact,
+                    "join_task_id": join_task,
+                    "join_title": join_title,
+                    "join_acceptance": join_acceptance,
+                    "reason": reason,
+                    "expected_revision": expected_revision,
+                    "approved": yes,
+                    "author": "operator",
                 }),
             )
             .await?
@@ -25309,6 +25378,81 @@ mod otel_cli_tests {
 
         let cli = Cli::try_parse_from(["vp", "otel-test", "proj-1"]).unwrap();
         assert!(matches!(cli.command, Command::OtelTest { .. }));
+    }
+}
+
+#[cfg(test)]
+mod plan_fanout_cli_tests {
+    use super::*;
+
+    #[test]
+    fn plan_fanout_parses_bounded_items_and_explicit_yes() {
+        let cli = Cli::try_parse_from([
+            "vp",
+            "plan-fanout",
+            "ses-1",
+            "--template",
+            "T1",
+            "--items",
+            r#"[{"key":"auth","write_scope":["src/auth"]}]"#,
+            "--join-title",
+            "Join auth work",
+            "--join-acceptance",
+            "all children pass",
+            "--expected-revision",
+            "3",
+            "--yes",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::PlanFanout {
+                session,
+                template,
+                items,
+                file,
+                artifact,
+                join_title,
+                join_acceptance,
+                expected_revision,
+                yes,
+                ..
+            } => {
+                assert_eq!(session, "ses-1");
+                assert_eq!(template, "T1");
+                assert!(items.as_deref().unwrap().contains("\"auth\""));
+                assert!(file.is_none());
+                assert!(artifact.is_none());
+                assert_eq!(join_title.as_deref(), Some("Join auth work"));
+                assert_eq!(join_acceptance, vec!["all children pass".to_string()]);
+                assert_eq!(expected_revision, Some(3));
+                assert!(yes);
+            }
+            other => panic!("expected plan-fanout, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "plan-fanout",
+            "ses-1",
+            "--template",
+            "T1",
+            "--artifact",
+            "art-1",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::PlanFanout {
+                items,
+                artifact,
+                yes,
+                ..
+            } => {
+                assert!(items.is_none());
+                assert_eq!(artifact.as_deref(), Some("art-1"));
+                assert!(!yes);
+            }
+            other => panic!("expected plan-fanout, got {other:?}"),
+        }
     }
 }
 

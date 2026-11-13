@@ -373,6 +373,10 @@ pub fn assess_tool_call_with_gui(
                 )
             }
         }
+        "plan_fanout" => PermissionAssessment::new(
+            RiskLevel::HostState,
+            "rewrites the plan DAG and expands bounded fan-out tasks",
+        ),
         "read_file"
         | "list_dir"
         | "grep"

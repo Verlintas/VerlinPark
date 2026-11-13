@@ -930,6 +930,9 @@ async fn exports_a_markdown_transcript() {
             acceptance: vec!["done".into()],
             token_budget: None,
             cost_budget_usd: None,
+            parent_task_id: None,
+            fanout_key: None,
+            fanout_join_for: None,
         }],
     };
     engine.set_team_plan(&session.id, &plan).await.unwrap();
@@ -6372,6 +6375,9 @@ fn orchestration_test_plan() -> TeamPlan {
                 acceptance: vec!["done".into()],
                 token_budget: None,
                 cost_budget_usd: None,
+                parent_task_id: None,
+                fanout_key: None,
+                fanout_join_for: None,
             },
             PlanTask {
                 id: "T2".into(),
@@ -6385,6 +6391,9 @@ fn orchestration_test_plan() -> TeamPlan {
                 acceptance: vec!["done".into()],
                 token_budget: None,
                 cost_budget_usd: None,
+                parent_task_id: None,
+                fanout_key: None,
+                fanout_join_for: None,
             },
         ],
     }
@@ -6620,6 +6629,9 @@ async fn plan_revision_records_a_diff_and_rejects_protected_tasks() {
         acceptance: vec!["tests pass".into()],
         token_budget: None,
         cost_budget_usd: None,
+        parent_task_id: None,
+        fanout_key: None,
+        fanout_join_for: None,
     });
     let result = engine
         .revise_team_plan(
@@ -13955,6 +13967,9 @@ mod budget_governor_engine_tests {
             acceptance: vec!["done".to_string()],
             token_budget: Some(budget),
             cost_budget_usd: None,
+            parent_task_id: None,
+            fanout_key: None,
+            fanout_join_for: None,
         }
     }
 
@@ -15818,6 +15833,9 @@ async fn diagnosis_records_one_advisory_event_without_mutating_runtime_state() {
                 acceptance: vec![],
                 token_budget: None,
                 cost_budget_usd: None,
+                parent_task_id: None,
+                fanout_key: None,
+                fanout_join_for: None,
             },
             vp_protocol::types::PlanTask {
                 id: "t2".into(),
@@ -15831,6 +15849,9 @@ async fn diagnosis_records_one_advisory_event_without_mutating_runtime_state() {
                 acceptance: vec![],
                 token_budget: None,
                 cost_budget_usd: None,
+                parent_task_id: None,
+                fanout_key: None,
+                fanout_join_for: None,
             },
         ],
     };
