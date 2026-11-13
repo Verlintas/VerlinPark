@@ -2489,6 +2489,35 @@ enum Command {
         #[arg(long)]
         status: Option<String>,
     },
+    /// Show the bounded project org chart: Leader, departments, Managers,
+    /// Workers, active assignments, workspaces, inbox/memory counts, and
+    /// advisory retirement state. Read-only.
+    AgentOrg {
+        project: String,
+        /// Include retired identities and their preserved evidence.
+        #[arg(long)]
+        include_retired: bool,
+        /// Hard bound on identity nodes (1-200).
+        #[arg(long, default_value_t = 200)]
+        limit: u32,
+    },
+    /// Show one identity's bounded detail: assignments, inbox metadata, memory,
+    /// performance, retirement proposals, workspaces, and lifecycle evidence.
+    AgentDetail {
+        identity: String,
+        /// Optional project guard; a mismatch fails closed.
+        #[arg(long)]
+        project: Option<String>,
+        /// Include a short known-field inbox summary. Metadata is always shown.
+        #[arg(long)]
+        include_inbox: bool,
+        #[arg(long, default_value_t = 20)]
+        inbox_limit: u32,
+        #[arg(long, default_value_t = 20)]
+        memory_limit: u32,
+        #[arg(long, default_value_t = 50)]
+        assignment_limit: u32,
+    },
     /// Create one explicit project identity. No session is created or assigned.
     AgentCreate {
         project: String,
@@ -8491,6 +8520,44 @@ async fn run(cli: Cli) -> Result<()> {
                     rpc(&discovery, "agent.list", json!({"session_id": project})).await?
                 }
             }
+        }
+        Command::AgentOrg {
+            project,
+            include_retired,
+            limit,
+        } => {
+            rpc(
+                &discovery,
+                "agent.org.snapshot",
+                json!({
+                    "project_id": project,
+                    "include_retired": include_retired,
+                    "limit": limit,
+                }),
+            )
+            .await?
+        }
+        Command::AgentDetail {
+            identity,
+            project,
+            include_inbox,
+            inbox_limit,
+            memory_limit,
+            assignment_limit,
+        } => {
+            rpc(
+                &discovery,
+                "agent.identity.detail",
+                json!({
+                    "identity_id": identity,
+                    "project_id": project,
+                    "include_inbox_content": include_inbox,
+                    "inbox_limit": inbox_limit,
+                    "memory_limit": memory_limit,
+                    "assignment_limit": assignment_limit,
+                }),
+            )
+            .await?
         }
         Command::AgentCreate {
             project,
@@ -15111,6 +15178,404 @@ fn agent_memory_lines(value: &Value) -> Option<Vec<String>> {
     None
 }
 
+fn agent_org_lines(value: &Value) -> Option<Vec<String>> {
+    let counts = value.get("counts")?;
+    counts.get("identities")?;
+    let mut lines = Vec::new();
+    let project_id = value["project_id"].as_str().unwrap_or("?");
+    let enabled = value["enabled"].as_bool().unwrap_or(false);
+    lines.push(format!(
+        "Project org {project_id} · {} identities · {} leaders · {} managers · {} workers · policy {}",
+        counts["identities"].as_u64().unwrap_or(0),
+        counts["leaders"].as_u64().unwrap_or(0),
+        counts["managers"].as_u64().unwrap_or(0),
+        counts["workers"].as_u64().unwrap_or(0),
+        if enabled { "enabled" } else { "disabled" }
+    ));
+    lines.push(format!(
+        "status active {} · idle {} · paused {} · retired {} · imported {} · assignments {} · workspaces {} · unread {} · memory {}",
+        counts["active"].as_u64().unwrap_or(0),
+        counts["idle"].as_u64().unwrap_or(0),
+        counts["paused"].as_u64().unwrap_or(0),
+        counts["retired"].as_u64().unwrap_or(0),
+        counts["imported"].as_u64().unwrap_or(0),
+        counts["active_assignments"].as_u64().unwrap_or(0),
+        counts["active_workspaces"].as_u64().unwrap_or(0),
+        counts["unread_inbox"].as_u64().unwrap_or(0),
+        counts["memory_count"].as_u64().unwrap_or(0)
+    ));
+    lines.push(format!(
+        "pending hires {} · pending retirement proposals {} · advisory candidates {}",
+        counts["pending_hire_requests"].as_u64().unwrap_or(0),
+        counts["pending_retirement_proposals"].as_u64().unwrap_or(0),
+        counts["retirement_candidates"].as_u64().unwrap_or(0)
+    ));
+    if let Some(leader) = value.get("leader").filter(|row| !row.is_null()) {
+        lines.push("Leader".to_string());
+        agent_org_node_lines(leader, 1, &mut lines);
+    } else {
+        lines.push("Leader: none".to_string());
+    }
+    if let Some(unassigned) = value["unassigned"].as_array()
+        && !unassigned.is_empty()
+    {
+        lines.push(format!(
+            "Unassigned {} (no parent in the active hierarchy)",
+            unassigned.len()
+        ));
+        for node in unassigned {
+            agent_org_node_lines(node, 1, &mut lines);
+        }
+    }
+    if let Some(departments) = value["departments"].as_array() {
+        for department in departments {
+            lines.push(format!(
+                "Department {} · {} managers · {} workers · {} active · unread {}",
+                department["name"].as_str().unwrap_or("?"),
+                department["manager_count"].as_u64().unwrap_or(0),
+                department["worker_count"].as_u64().unwrap_or(0),
+                department["active_count"].as_u64().unwrap_or(0),
+                department["unread_inbox"].as_u64().unwrap_or(0)
+            ));
+        }
+    }
+    if let Some(requests) = value["pending_hire_requests"].as_array()
+        && !requests.is_empty()
+    {
+        lines.push(format!("Pending hire requests {}", requests.len()));
+        for request in requests {
+            lines.push(format!(
+                "  {} · {} · {} · requested {}",
+                request["id"].as_str().unwrap_or("?"),
+                request["role"].as_str().unwrap_or("?"),
+                request["title"]
+                    .as_str()
+                    .or_else(|| request["component"].as_str())
+                    .unwrap_or(""),
+                request["requested_at"].as_str().unwrap_or("?")
+            ));
+        }
+    }
+    if let Some(proposals) = value["pending_retirement_proposals"].as_array()
+        && !proposals.is_empty()
+    {
+        lines.push(format!("Pending retirement proposals {}", proposals.len()));
+        for proposal in proposals {
+            lines.push(format!(
+                "  {} · identity {} · {} · proposed {}",
+                proposal["id"].as_str().unwrap_or("?"),
+                proposal["identity_id"].as_str().unwrap_or("?"),
+                proposal["reason_code"].as_str().unwrap_or("?"),
+                proposal["proposed_at"].as_str().unwrap_or("?")
+            ));
+        }
+    }
+    if let Some(assignments) = value["active_assignments"].as_array()
+        && !assignments.is_empty()
+    {
+        lines.push(format!("Active assignments {}", assignments.len()));
+        for assignment in assignments {
+            lines.push(format!(
+                "session {} · identity {} · {} · lease {}",
+                assignment["session_id"].as_str().unwrap_or("?"),
+                assignment["identity_id"].as_str().unwrap_or("?"),
+                assignment["status"].as_str().unwrap_or("?"),
+                if assignment["lease_active"].as_bool().unwrap_or(false) {
+                    "active"
+                } else {
+                    "expired"
+                }
+            ));
+        }
+    }
+    for warning in value["warnings"].as_array().into_iter().flatten() {
+        if let Some(warning) = warning.as_str() {
+            lines.push(format!("warning: {warning}"));
+        }
+    }
+    Some(lines)
+}
+
+fn agent_org_node_lines(node: &Value, depth: usize, lines: &mut Vec<String>) {
+    let indent = "  ".repeat(depth);
+    let identity = &node["identity"];
+    let mut detail = vec![format!(
+        "{}{} · {} · {} · gen {}",
+        indent,
+        identity["title"]
+            .as_str()
+            .or_else(|| identity["component"].as_str())
+            .unwrap_or_else(|| identity["role"].as_str().unwrap_or("?")),
+        identity["role"].as_str().unwrap_or("?"),
+        identity["status"].as_str().unwrap_or("?"),
+        identity["generation"].as_u64().unwrap_or(0)
+    )];
+    if let Some(department) = identity["department"].as_str() {
+        detail.push(format!("department {department}"));
+    }
+    if let Some(component) = identity["component"].as_str() {
+        detail.push(format!("component {component}"));
+    }
+    if identity["origin"].as_str() == Some("imported") {
+        detail.push("imported/read-only".to_string());
+    }
+    if let Some(assignment) = node.get("active_assignment").filter(|row| !row.is_null()) {
+        detail.push(format!(
+            "session {} (lease {})",
+            assignment["session_id"].as_str().unwrap_or("?"),
+            if assignment["lease_active"].as_bool().unwrap_or(false) {
+                "active"
+            } else {
+                "expired"
+            }
+        ));
+    }
+    if let Some(workspace) = node.get("workspace").filter(|row| !row.is_null()) {
+        detail.push(format!(
+            "workspace {} · {}",
+            workspace["component"].as_str().unwrap_or("?"),
+            workspace["status"].as_str().unwrap_or("?")
+        ));
+    }
+    let unread = node["unread_inbox"].as_u64().unwrap_or(0);
+    let memory = node["memory_count"].as_u64().unwrap_or(0);
+    if unread > 0 || memory > 0 {
+        detail.push(format!("inbox {unread} · memory {memory}"));
+    }
+    let performance = &node["performance"];
+    let completed = performance["completed_tasks"].as_u64().unwrap_or(0);
+    let failed = performance["failed_tasks"].as_u64().unwrap_or(0);
+    let approvals = performance["verifier_approvals"].as_u64().unwrap_or(0);
+    let rejections = performance["verifier_rejections"].as_u64().unwrap_or(0);
+    if completed > 0 || failed > 0 || approvals > 0 || rejections > 0 {
+        detail.push(format!(
+            "tasks {completed}/{failed} · verifier {approvals}/{rejections}"
+        ));
+    }
+    let retirement = &node["retirement"];
+    if retirement["candidate"].as_bool().unwrap_or(false) {
+        detail.push(format!(
+            "retirement candidate severity {}",
+            retirement["severity"].as_u64().unwrap_or(0)
+        ));
+    }
+    if retirement["pending_proposals"].as_u64().unwrap_or(0) > 0 {
+        detail.push("retirement proposal pending".to_string());
+    }
+    lines.push(detail.join(" · "));
+    for report in node["reports"].as_array().into_iter().flatten() {
+        agent_org_node_lines(report, depth + 1, lines);
+    }
+}
+
+fn agent_detail_lines(value: &Value) -> Option<Vec<String>> {
+    let identity = value.get("identity")?;
+    if identity.get("project_id").is_none() || value.get("node").is_none() {
+        return None;
+    }
+    let mut lines = Vec::new();
+    let mut header = vec![format!(
+        "{} · {} · {} · gen {}",
+        identity["title"]
+            .as_str()
+            .or_else(|| identity["component"].as_str())
+            .unwrap_or_else(|| identity["role"].as_str().unwrap_or("?")),
+        identity["role"].as_str().unwrap_or("?"),
+        identity["status"].as_str().unwrap_or("?"),
+        identity["generation"].as_u64().unwrap_or(0)
+    )];
+    header.push(format!("id {}", identity["id"].as_str().unwrap_or("?")));
+    if let Some(department) = identity["department"].as_str() {
+        header.push(format!("department {department}"));
+    }
+    if let Some(component) = identity["component"].as_str() {
+        header.push(format!("component {component}"));
+    }
+    if let Some(parent) = identity["parent_identity_id"].as_str() {
+        header.push(format!("parent {parent}"));
+    }
+    if let Some(successor) = identity["successor_id"].as_str() {
+        header.push(format!("successor {successor}"));
+    }
+    if value["read_only"].as_bool().unwrap_or(false) {
+        header.push("read-only".to_string());
+    }
+    lines.push(header.join(" · "));
+    if let Some(reason) = value["read_only_reason"].as_str() {
+        lines.push(format!("read-only: {reason}"));
+    }
+    let node = &value["node"];
+    if let Some(assignment) = node.get("active_assignment").filter(|row| !row.is_null()) {
+        lines.push(format!(
+            "active assignment session {} · lease {} · {} assignments / {} sessions",
+            assignment["session_id"].as_str().unwrap_or("?"),
+            if assignment["lease_active"].as_bool().unwrap_or(false) {
+                "active"
+            } else {
+                "expired"
+            },
+            assignment["assignment_count"].as_u64().unwrap_or(0),
+            assignment["session_count"].as_u64().unwrap_or(0)
+        ));
+    } else {
+        lines.push("active assignment: none".to_string());
+    }
+    if let Some(workspace) = node.get("workspace").filter(|row| !row.is_null()) {
+        lines.push(format!(
+            "workspace {} · {} · branch {} · lease {}",
+            workspace["component"].as_str().unwrap_or("?"),
+            workspace["status"].as_str().unwrap_or("?"),
+            workspace["branch"].as_str().unwrap_or("?"),
+            if workspace["lease_active"].as_bool().unwrap_or(false) {
+                "active"
+            } else {
+                "idle"
+            }
+        ));
+    }
+    lines.push(format!(
+        "inbox unread {} / read {} / done {} · memory {}/{}",
+        value["inbox_counts"]["unread"].as_u64().unwrap_or(0),
+        value["inbox_counts"]["read"].as_u64().unwrap_or(0),
+        value["inbox_counts"]["done"].as_u64().unwrap_or(0),
+        value["memories"].as_array().map(Vec::len).unwrap_or(0),
+        value["memory_total"].as_u64().unwrap_or(0)
+    ));
+    let performance = &value["performance"];
+    lines.push(format!(
+        "performance completed {} · failed {} · consecutive {} · verifier {}/{} · tokens {}/{} · cost ${:.3}",
+        performance["completed_tasks"].as_u64().unwrap_or(0),
+        performance["failed_tasks"].as_u64().unwrap_or(0),
+        performance["consecutive_failures"].as_u64().unwrap_or(0),
+        performance["verifier_approvals"].as_u64().unwrap_or(0),
+        performance["verifier_rejections"].as_u64().unwrap_or(0),
+        performance["input_tokens"].as_u64().unwrap_or(0),
+        performance["output_tokens"].as_u64().unwrap_or(0),
+        performance["cost_usd"].as_f64().unwrap_or(0.0)
+    ));
+    if let Some(assignments) = value["assignments"].as_array()
+        && !assignments.is_empty()
+    {
+        lines.push(format!("Assignments {}", assignments.len()));
+        for assignment in assignments {
+            lines.push(format!(
+                "  session {} · {} · assigned {} · lease {}",
+                assignment["session_id"].as_str().unwrap_or("?"),
+                assignment["status"].as_str().unwrap_or("?"),
+                assignment["assigned_at"].as_str().unwrap_or("?"),
+                if assignment["lease_active"].as_bool().unwrap_or(false) {
+                    "active"
+                } else {
+                    "expired"
+                }
+            ));
+        }
+    }
+    if let Some(inbox) = value["inbox"].as_array()
+        && !inbox.is_empty()
+    {
+        lines.push(format!("Inbox {}", inbox.len()));
+        for message in inbox {
+            let mut row = vec![format!(
+                "  {} · {} · {} · from {}",
+                message["kind"].as_str().unwrap_or("?"),
+                message["status"].as_str().unwrap_or("?"),
+                message["created_at"].as_str().unwrap_or("?"),
+                message["from_label"].as_str().unwrap_or("?")
+            )];
+            if let Some(summary) = message["summary"].as_str() {
+                row.push(summary.to_string());
+            }
+            lines.push(row.join(" · "));
+        }
+    }
+    if let Some(memories) = value["memories"].as_array()
+        && !memories.is_empty()
+    {
+        lines.push(format!("Memory {}", memories.len()));
+        for memory in memories {
+            lines.push(format!(
+                "  {} · {} · {} · {}",
+                memory["scope"].as_str().unwrap_or("?"),
+                memory["status"].as_str().unwrap_or("?"),
+                memory["created_at"].as_str().unwrap_or("?"),
+                memory["content"].as_str().unwrap_or("")
+            ));
+        }
+    }
+    if let Some(candidates) = value["retirement_candidates"].as_array()
+        && !candidates.is_empty()
+    {
+        lines.push("Retirement candidates (advisory, explicit approval required)".to_string());
+        for candidate in candidates {
+            lines.push(format!(
+                "  severity {} · {}",
+                candidate["severity"].as_u64().unwrap_or(0),
+                candidate["reasons"]
+                    .as_array()
+                    .map(|reasons| reasons
+                        .iter()
+                        .map(|reason| format!(
+                            "{} {}/{}",
+                            reason["code"].as_str().unwrap_or("?"),
+                            reason["count"].as_u64().unwrap_or(0),
+                            reason["threshold"].as_u64().unwrap_or(0)
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(" · "))
+                    .unwrap_or_default()
+            ));
+        }
+    }
+    if let Some(proposals) = value["retirement_proposals"].as_array()
+        && !proposals.is_empty()
+    {
+        lines.push("Retirement proposals".to_string());
+        for proposal in proposals {
+            lines.push(format!(
+                "  {} · {} · {} · reason {}",
+                proposal["id"].as_str().unwrap_or("?"),
+                proposal["status"].as_str().unwrap_or("?"),
+                proposal["proposed_at"].as_str().unwrap_or("?"),
+                proposal["reason_code"].as_str().unwrap_or("?")
+            ));
+        }
+    }
+    if let Some(requests) = value["hire_requests"].as_array()
+        && !requests.is_empty()
+    {
+        lines.push("Hire requests".to_string());
+        for request in requests {
+            lines.push(format!(
+                "  {} · {} · {} · role {}",
+                request["id"].as_str().unwrap_or("?"),
+                request["status"].as_str().unwrap_or("?"),
+                request["requested_at"].as_str().unwrap_or("?"),
+                request["role"].as_str().unwrap_or("?")
+            ));
+        }
+    }
+    if let Some(events) = value["employment_events"].as_array()
+        && !events.is_empty()
+    {
+        lines.push("Employment events".to_string());
+        for event in events {
+            lines.push(format!(
+                "  {} · {} · {}",
+                event["kind"].as_str().unwrap_or("?"),
+                event["created_at"].as_str().unwrap_or("?"),
+                event["id"].as_str().unwrap_or("?")
+            ));
+        }
+    }
+    for warning in value["warnings"].as_array().into_iter().flatten() {
+        if let Some(warning) = warning.as_str() {
+            lines.push(format!("warning: {warning}"));
+        }
+    }
+    Some(lines)
+}
+
 fn agent_identity_lines(value: &Value) -> Option<Vec<String>> {
     if let Some(identities) = value.get("identities").and_then(Value::as_array)
         && identities
@@ -15635,6 +16100,18 @@ fn performance_line(row: &Value) -> String {
 }
 
 fn print_human(value: &Value) {
+    if let Some(lines) = agent_org_lines(value) {
+        for line in lines {
+            println!("{line}");
+        }
+        return;
+    }
+    if let Some(lines) = agent_detail_lines(value) {
+        for line in lines {
+            println!("{line}");
+        }
+        return;
+    }
     if let Some(lines) = agent_employment_lines(value) {
         for line in lines {
             println!("{line}");
@@ -25807,5 +26284,305 @@ mod coordination_cli_tests {
         assert!(rendered.contains("completed 2"));
         assert!(rendered.contains("verifier 1/1"));
         assert!(!rendered.contains("prompt"));
+    }
+}
+
+#[cfg(test)]
+mod agent_org_cli_tests {
+    use super::*;
+
+    #[test]
+    fn agent_org_and_detail_parse_bounded_reads() {
+        let cli = Cli::try_parse_from([
+            "vp",
+            "agent-org",
+            "prj-1",
+            "--include-retired",
+            "--limit",
+            "50",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::AgentOrg {
+                project,
+                include_retired,
+                limit,
+            } => {
+                assert_eq!(project, "prj-1");
+                assert!(include_retired);
+                assert_eq!(limit, 50);
+            }
+            other => panic!("expected agent-org, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "agent-detail",
+            "identity-1",
+            "--project",
+            "prj-1",
+            "--include-inbox",
+            "--inbox-limit",
+            "10",
+            "--memory-limit",
+            "5",
+            "--assignment-limit",
+            "15",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::AgentDetail {
+                identity,
+                project,
+                include_inbox,
+                inbox_limit,
+                memory_limit,
+                assignment_limit,
+            } => {
+                assert_eq!(identity, "identity-1");
+                assert_eq!(project.as_deref(), Some("prj-1"));
+                assert!(include_inbox);
+                assert_eq!(inbox_limit, 10);
+                assert_eq!(memory_limit, 5);
+                assert_eq!(assignment_limit, 15);
+            }
+            other => panic!("expected agent-detail, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["vp", "agent-org", "prj-1"]).unwrap();
+        match cli.command {
+            Command::AgentOrg {
+                include_retired,
+                limit,
+                ..
+            } => {
+                assert!(!include_retired);
+                assert_eq!(limit, 200);
+            }
+            other => panic!("expected agent-org defaults, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["vp", "agent-detail", "identity-1"]).unwrap();
+        match cli.command {
+            Command::AgentDetail {
+                include_inbox,
+                inbox_limit,
+                ..
+            } => {
+                assert!(!include_inbox);
+                assert_eq!(inbox_limit, 20);
+            }
+            other => panic!("expected agent-detail defaults, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn org_snapshot_human_output_is_bounded_and_text_free() {
+        let snapshot = json!({
+            "project_id": "prj-1",
+            "generated_at": "2026-11-13T00:00:00Z",
+            "enabled": true,
+            "counts": {
+                "identities": 3,
+                "leaders": 1,
+                "managers": 1,
+                "workers": 1,
+                "active": 3,
+                "idle": 0,
+                "paused": 0,
+                "retired": 0,
+                "imported": 0,
+                "active_assignments": 1,
+                "active_workspaces": 1,
+                "unread_inbox": 2,
+                "memory_count": 4,
+                "pending_hire_requests": 1,
+                "pending_retirement_proposals": 0,
+                "retirement_candidates": 0
+            },
+            "leader": {
+                "identity": {
+                    "id": "id-leader",
+                    "project_id": "prj-1",
+                    "role": "leader",
+                    "title": "Leader",
+                    "status": "active",
+                    "generation": 1,
+                    "origin": "local"
+                },
+                "unread_inbox": 0,
+                "memory_count": 0,
+                "performance": {},
+                "retirement": {},
+                "reports": [{
+                    "identity": {
+                        "id": "id-manager",
+                        "project_id": "prj-1",
+                        "role": "manager",
+                        "title": "Platform Manager",
+                        "department": "Platform",
+                        "component": "platform",
+                        "status": "active",
+                        "generation": 2,
+                        "origin": "local"
+                    },
+                    "active_assignment": {
+                        "session_id": "ses-1",
+                        "role": "manager",
+                        "assigned_at": "2026-11-13T00:00:00Z",
+                        "lease_active": true,
+                        "assignment_count": 1,
+                        "session_count": 1
+                    },
+                    "workspace": {
+                        "id": "ws-1",
+                        "identity_id": "id-manager",
+                        "component": "platform",
+                        "branch": "verlinpark/components/platform",
+                        "status": "active",
+                        "lease_active": true
+                    },
+                    "unread_inbox": 2,
+                    "memory_count": 4,
+                    "performance": {
+                        "completed_tasks": 2,
+                        "failed_tasks": 1,
+                        "verifier_approvals": 1,
+                        "verifier_rejections": 0
+                    },
+                    "retirement": {},
+                    "reports": []
+                }]
+            },
+            "unassigned": [],
+            "departments": [{
+                "name": "Platform",
+                "manager_count": 1,
+                "worker_count": 1,
+                "active_count": 2,
+                "active_workers": 1,
+                "unread_inbox": 2,
+                "manager_ids": ["id-manager"],
+                "worker_ids": ["id-worker"]
+            }],
+            "active_assignments": [{
+                "session_id": "ses-1",
+                "project_id": "prj-1",
+                "identity_id": "id-manager",
+                "role": "manager",
+                "status": "active",
+                "assigned_at": "2026-11-13T00:00:00Z",
+                "heartbeat_at": "2026-11-13T00:05:00Z",
+                "lease_active": true
+            }],
+            "workspace_summaries": [],
+            "truncated": false,
+            "warnings": ["retired identities are hidden"]
+        });
+        let rendered = agent_org_lines(&snapshot).expect("org lines").join("\n");
+        assert!(rendered.contains("Project org prj-1"));
+        assert!(rendered.contains("Platform Manager"));
+        assert!(rendered.contains("Department Platform"));
+        assert!(rendered.contains("session ses-1"));
+        assert!(rendered.contains("warning: retired identities are hidden"));
+        assert!(!rendered.contains("prompt"));
+        assert!(!rendered.contains("SECRET"));
+    }
+
+    #[test]
+    fn identity_detail_human_output_shows_metadata_without_payload_text() {
+        let detail = json!({
+            "project_id": "prj-1",
+            "generated_at": "2026-11-13T00:00:00Z",
+            "identity": {
+                "id": "id-1",
+                "project_id": "prj-1",
+                "role": "worker",
+                "title": "Auth Worker",
+                "department": "Platform",
+                "component": "auth",
+                "status": "active",
+                "generation": 3,
+                "origin": "local"
+            },
+            "policy": {},
+            "retirement_policy": {},
+            "node": {
+                "identity": {"id": "id-1", "project_id": "prj-1", "role": "worker", "status": "active", "generation": 3},
+                "active_assignment": {
+                    "session_id": "ses-1",
+                    "role": "worker",
+                    "assigned_at": "2026-11-13T00:00:00Z",
+                    "lease_active": true,
+                    "assignment_count": 1,
+                    "session_count": 1
+                },
+                "unread_inbox": 1,
+                "memory_count": 1,
+                "performance": {},
+                "retirement": {},
+                "reports": []
+            },
+            "assignments": [{
+                "session_id": "ses-1",
+                "project_id": "prj-1",
+                "identity_id": "id-1",
+                "role": "worker",
+                "status": "active",
+                "assigned_at": "2026-11-13T00:00:00Z",
+                "heartbeat_at": "2026-11-13T00:05:00Z",
+                "lease_active": true
+            }],
+            "inbox": [{
+                "id": "msg-1",
+                "kind": "task",
+                "status": "unread",
+                "from_label": "operator",
+                "created_at": "2026-11-13T00:00:00Z"
+            }],
+            "inbox_counts": {"unread": 1, "read": 0, "done": 0, "expired": 0},
+            "memories": [{
+                "id": "mem-1",
+                "project_id": "prj-1",
+                "scope": "agent",
+                "status": "active",
+                "created_at": "2026-11-13T00:00:00Z",
+                "content": "Auth owns JWT validation."
+            }],
+            "memory_total": 1,
+            "performance": {
+                "completed_tasks": 4,
+                "failed_tasks": 1,
+                "consecutive_failures": 0,
+                "verifier_approvals": 3,
+                "verifier_rejections": 1,
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cost_usd": 0.25
+            },
+            "retirement_candidates": [],
+            "retirement_proposals": [],
+            "hire_requests": [],
+            "workspaces": [],
+            "reports": [],
+            "employment_events": [{
+                "id": "evt-1",
+                "project_id": "prj-1",
+                "seq": 1,
+                "identity_id": "id-1",
+                "kind": "agent.transfer.approved",
+                "payload": {},
+                "created_at": "2026-11-13T00:00:00Z"
+            }],
+            "read_only": false,
+            "truncated": false,
+            "warnings": []
+        });
+        let rendered = agent_detail_lines(&detail)
+            .expect("detail lines")
+            .join("\n");
+        assert!(rendered.contains("Auth Worker"));
+        assert!(rendered.contains("performance completed 4"));
+        assert!(rendered.contains("agent.transfer.approved"));
+        assert!(!rendered.contains("SECRET"));
     }
 }

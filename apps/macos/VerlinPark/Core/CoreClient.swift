@@ -1788,6 +1788,245 @@ actor CoreClient {
             .identities
     }
 
+    /// Bounded project org snapshot. This is a read-only projection; no
+    /// assignment, hire, retirement, or repair is triggered by reading it.
+    func agentOrgSnapshot(
+        projectID: String,
+        includeRetired: Bool,
+        limit: Int = 200
+    ) async throws -> AgentOrgSnapshot {
+        let params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "include_retired": .bool(includeRetired),
+            "limit": .number(Double(limit)),
+        ]
+        return try await request(method: "agent.org.snapshot", params: params)
+            .decode(AgentOrgSnapshot.self)
+    }
+
+    /// Bounded identity detail. Inbox content is metadata by default; a short
+    /// known-field summary is opt-in.
+    func agentIdentityDetail(
+        identityID: String,
+        projectID: String? = nil,
+        includeInboxContent: Bool = false,
+        inboxLimit: Int = 20,
+        memoryLimit: Int = 20,
+        assignmentLimit: Int = 50
+    ) async throws -> AgentIdentityDetail {
+        var params: [String: JSONValue] = [
+            "identity_id": .string(identityID),
+            "include_inbox_content": .bool(includeInboxContent),
+            "inbox_limit": .number(Double(inboxLimit)),
+            "memory_limit": .number(Double(memoryLimit)),
+            "assignment_limit": .number(Double(assignmentLimit)),
+        ]
+        if let projectID {
+            params["project_id"] = .string(projectID)
+        }
+        return try await request(method: "agent.identity.detail", params: params)
+            .decode(AgentIdentityDetail.self)
+    }
+
+    /// Explicit S6 hire request. `approved` is never synthesized by the client;
+    /// the operator chooses it and the daemon still revalidates caps/hierarchy.
+    func agentHire(
+        projectID: String,
+        role: String,
+        department: String?,
+        component: String?,
+        title: String?,
+        profile: String?,
+        model: String?,
+        parentIdentityID: String?,
+        approved: Bool,
+        operatorName: String? = nil
+    ) async throws -> AgentHireResult {
+        var params: [String: JSONValue] = [
+            "project_id": .string(projectID),
+            "role": .string(role),
+            "approved": .bool(approved),
+        ]
+        if let department {
+            params["department"] = .string(department)
+        }
+        if let component {
+            params["component"] = .string(component)
+        }
+        if let title {
+            params["title"] = .string(title)
+        }
+        if let profile {
+            params["profile"] = .string(profile)
+        }
+        if let model {
+            params["model"] = .string(model)
+        }
+        if let parentIdentityID {
+            params["parent_identity_id"] = .string(parentIdentityID)
+        }
+        if let operatorName {
+            params["operator"] = .string(operatorName)
+        }
+        return try await request(method: "agent.hire", params: params)
+            .decode(AgentHireResult.self)
+    }
+
+    func agentHireApprove(
+        requestID: String,
+        operatorName: String? = nil
+    ) async throws -> AgentHireResult {
+        var params: [String: JSONValue] = [
+            "request_id": .string(requestID),
+            "approval_risk": .string("host_state"),
+        ]
+        if let operatorName {
+            params["operator"] = .string(operatorName)
+        }
+        return try await request(method: "agent.hire.approve", params: params)
+            .decode(AgentHireResult.self)
+    }
+
+    func agentHireReject(
+        requestID: String,
+        reason: String? = nil,
+        operatorName: String? = nil
+    ) async throws -> AgentHireResult {
+        var params: [String: JSONValue] = ["request_id": .string(requestID)]
+        if let reason {
+            params["reason"] = .string(reason)
+        }
+        if let operatorName {
+            params["operator"] = .string(operatorName)
+        }
+        return try await request(method: "agent.hire.reject", params: params)
+            .decode(AgentHireResult.self)
+    }
+
+    func agentPromote(
+        identityID: String,
+        targetRole: String,
+        parentIdentityID: String?,
+        title: String?,
+        force: Bool,
+        operatorName: String? = nil
+    ) async throws -> AgentPromoteResult {
+        var params: [String: JSONValue] = [
+            "identity_id": .string(identityID),
+            "target_role": .string(targetRole),
+            "approved": .bool(true),
+            "force": .bool(force),
+        ]
+        if let parentIdentityID {
+            params["parent_identity_id"] = .string(parentIdentityID)
+        }
+        if let title {
+            params["title"] = .string(title)
+        }
+        if let operatorName {
+            params["operator"] = .string(operatorName)
+        }
+        return try await request(method: "agent.promote", params: params)
+            .decode(AgentPromoteResult.self)
+    }
+
+    func agentTransfer(
+        identityID: String,
+        department: ProjectOrgPatchField,
+        component: ProjectOrgPatchField,
+        title: ProjectOrgPatchField,
+        parentIdentityID: ProjectOrgPatchField,
+        force: Bool,
+        operatorName: String? = nil
+    ) async throws -> AgentTransferResult {
+        var params: [String: JSONValue] = [
+            "identity_id": .string(identityID),
+            "approved": .bool(true),
+            "force": .bool(force),
+        ]
+        Self.applyPatch(department, key: "department", to: &params)
+        Self.applyPatch(component, key: "component", to: &params)
+        Self.applyPatch(title, key: "title", to: &params)
+        Self.applyPatch(parentIdentityID, key: "parent_identity_id", to: &params)
+        if let operatorName {
+            params["operator"] = .string(operatorName)
+        }
+        return try await request(method: "agent.transfer", params: params)
+            .decode(AgentTransferResult.self)
+    }
+
+    func agentRetire(
+        identityID: String,
+        successorID: String?,
+        proposalID: String?,
+        approved: Bool,
+        force: Bool,
+        reason: String?,
+        operatorName: String? = nil
+    ) async throws -> AgentRetireResult {
+        var params: [String: JSONValue] = [
+            "identity_id": .string(identityID),
+            "approved": .bool(approved),
+            "force": .bool(force),
+        ]
+        if let successorID {
+            params["successor_id"] = .string(successorID)
+        }
+        if let proposalID {
+            params["proposal_id"] = .string(proposalID)
+        }
+        if let reason {
+            params["reason"] = .string(reason)
+        }
+        if let operatorName {
+            params["operator"] = .string(operatorName)
+        }
+        return try await request(method: "agent.retire", params: params)
+            .decode(AgentRetireResult.self)
+    }
+
+    func agentRetirementPropose(identityID: String) async throws
+        -> AgentRetirementProposeResult
+    {
+        let params: [String: JSONValue] = ["identity_id": .string(identityID)]
+        return try await request(method: "agent.retirement.propose", params: params)
+            .decode(AgentRetirementProposeResult.self)
+    }
+
+    func agentRetirementApprove(proposalID: String) async throws
+        -> AgentRetirementDecisionResult
+    {
+        let params: [String: JSONValue] = ["proposal_id": .string(proposalID)]
+        return try await request(method: "agent.retirement.approve", params: params)
+            .decode(AgentRetirementDecisionResult.self)
+    }
+
+    func agentRetirementReject(proposalID: String, reason: String? = nil) async throws
+        -> AgentRetirementDecisionResult
+    {
+        var params: [String: JSONValue] = ["proposal_id": .string(proposalID)]
+        if let reason {
+            params["reason"] = .string(reason)
+        }
+        return try await request(method: "agent.retirement.reject", params: params)
+            .decode(AgentRetirementDecisionResult.self)
+    }
+
+    private static func applyPatch(
+        _ field: ProjectOrgPatchField,
+        key: String,
+        to params: inout [String: JSONValue]
+    ) {
+        switch field {
+        case .unchanged:
+            break
+        case .clear:
+            params[key] = .null
+        case let .value(value):
+            params[key] = .string(value)
+        }
+    }
+
     /// Read-only derived performance ledger. No mutation is exposed.
     func agentPerformanceSummary(projectID: String) async throws
         -> AgentPerformanceSummaryResult

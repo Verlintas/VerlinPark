@@ -401,6 +401,7 @@ struct DashboardView: View {
             ApprovalCenterCard()
             QuestionCenterCard()
         case .team:
+            ProjectOrgCard()
             AgentsCard()
             ProjectIdentitiesCard()
             ProjectAgentPerformanceCard()
@@ -479,7 +480,9 @@ struct DashboardView: View {
         case .team:
             (model.dashboardSnapshot?.summary.runningTasks
                 ?? model.taskQueue?.tasks.count(where: { $0.status == "running" })
-                ?? 0) + model.intakeTasks.count(where: \.isActive)
+                ?? 0)
+                + model.intakeTasks.count(where: \.isActive)
+                + model.projectOrgPendingActions
         case .git:
             model.dashboardSnapshot?.summary.forkRoots
                 ?? model.projectForkForest?.roots.count
@@ -505,6 +508,7 @@ struct DashboardView: View {
             await model.loadPendingApprovals()
             await model.loadPendingQuestions()
         case .team:
+            await model.loadProjectOrg()
             await model.loadAgents()
             await model.loadGuiStatus()
             await model.loadGuiTimeline()

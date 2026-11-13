@@ -11806,6 +11806,11 @@ pub mod agent_identity_codes {
     pub const PERFORMANCE_INVALID: &str = "PERFORMANCE_INVALID";
     pub const PERFORMANCE_REPLAY_INVALID: &str = "PERFORMANCE_REPLAY_INVALID";
     pub const EMPLOYMENT_CONFIRMATION_REQUIRED: &str = "EMPLOYMENT_CONFIRMATION_REQUIRED";
+    // S7 org snapshot and identity detail read model.
+    pub const ORG_PROJECT_NOT_FOUND: &str = "ORG_PROJECT_NOT_FOUND";
+    pub const ORG_PROJECT_MISMATCH: &str = "ORG_PROJECT_MISMATCH";
+    pub const ORG_INVALID: &str = "ORG_INVALID";
+    pub const DETAIL_INVALID: &str = "DETAIL_INVALID";
 }
 
 /// Typed identity failure. It carries only a stable code and a bounded message;
@@ -14691,6 +14696,393 @@ pub struct AgentEmploymentReplayReport {
     pub repaired: bool,
     #[serde(default)]
     pub mismatches: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// S7 project org chart and identity console
+// ---------------------------------------------------------------------------
+
+/// Hard bounds for one org snapshot. A project caps identities well below this,
+/// but imported evidence can exceed the local roster and must stay bounded.
+pub const AGENT_ORG_MAX_NODES: u32 = 200;
+pub const AGENT_ORG_MAX_DEPARTMENTS: u32 = 64;
+pub const AGENT_ORG_MAX_ACTIVE_ASSIGNMENTS: u32 = 200;
+pub const AGENT_ORG_MAX_WORKSPACES: u32 = 200;
+pub const AGENT_ORG_MAX_PROPOSALS: u32 = 200;
+pub const AGENT_ORG_MAX_HIRE_REQUESTS: u32 = 200;
+
+/// Detail tab bounds. Every list is capped independently so one noisy tab
+/// cannot turn the console into an unbounded project scan.
+pub const AGENT_ORG_DEFAULT_DETAIL_INBOX: u32 = 20;
+pub const AGENT_ORG_DEFAULT_DETAIL_MEMORY: u32 = 20;
+pub const AGENT_ORG_DEFAULT_DETAIL_ASSIGNMENTS: u32 = 50;
+pub const AGENT_ORG_DEFAULT_DETAIL_PROPOSALS: u32 = 20;
+pub const AGENT_ORG_DEFAULT_DETAIL_HIRE_REQUESTS: u32 = 20;
+pub const AGENT_ORG_DEFAULT_DETAIL_EMPLOYMENT_EVENTS: u32 = 20;
+pub const AGENT_ORG_MAX_DETAIL_INBOX: u32 = 100;
+pub const AGENT_ORG_MAX_DETAIL_MEMORY: u32 = 100;
+pub const AGENT_ORG_MAX_DETAIL_ASSIGNMENTS: u32 = 200;
+pub const AGENT_ORG_MAX_DETAIL_PROPOSALS: u32 = 50;
+pub const AGENT_ORG_MAX_DETAIL_HIRE_REQUESTS: u32 = 50;
+pub const AGENT_ORG_MAX_DETAIL_EMPLOYMENT_EVENTS: u32 = 50;
+
+/// One bounded org read. This is a projection over existing S1–S6 stores; it
+/// never mutates employment, assignment, workspace, memory, or performance
+/// state and never calls a provider.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentOrgSnapshotParams {
+    #[serde(default)]
+    pub project_id: String,
+    /// Retired identities are evidence, not staff. The operator console opts in
+    /// explicitly; the default hides them from the active chart.
+    #[serde(default)]
+    pub include_retired: bool,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentOrgCounts {
+    #[serde(default)]
+    pub identities: u64,
+    #[serde(default)]
+    pub leaders: u64,
+    #[serde(default)]
+    pub managers: u64,
+    #[serde(default)]
+    pub workers: u64,
+    #[serde(default)]
+    pub active: u64,
+    #[serde(default)]
+    pub idle: u64,
+    #[serde(default)]
+    pub paused: u64,
+    #[serde(default)]
+    pub retired: u64,
+    #[serde(default)]
+    pub imported: u64,
+    #[serde(default)]
+    pub active_assignments: u64,
+    #[serde(default)]
+    pub active_workspaces: u64,
+    #[serde(default)]
+    pub unread_inbox: u64,
+    #[serde(default)]
+    pub memory_count: u64,
+    #[serde(default)]
+    pub pending_hire_requests: u64,
+    #[serde(default)]
+    pub pending_retirement_proposals: u64,
+    #[serde(default)]
+    pub retirement_candidates: u64,
+}
+
+/// Current session assignment for one identity. Lease tokens never appear.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentOrgAssignmentState {
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub assigned_at: String,
+    #[serde(default)]
+    pub lease_expires_at: Option<String>,
+    #[serde(default)]
+    pub lease_active: bool,
+    #[serde(default)]
+    pub assignment_count: u64,
+    #[serde(default)]
+    pub session_count: u64,
+}
+
+/// Bounded workspace view for the org chart. The absolute worktree path is
+/// intentionally absent; the branch and status are enough to orient an
+/// operator without turning the console into a filesystem directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentOrgWorkspaceState {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub identity_id: String,
+    #[serde(default)]
+    pub component: String,
+    #[serde(default)]
+    pub branch: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub lease_active: bool,
+    #[serde(default)]
+    pub lease_expires_at: Option<String>,
+    #[serde(default)]
+    pub last_session_id: Option<String>,
+    #[serde(default)]
+    pub workspace_count: u64,
+}
+
+/// Compact performance figures for one org node. The detailed ledger remains
+/// available through `agent.performance`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentOrgPerformanceSummary {
+    #[serde(default)]
+    pub completed_tasks: u64,
+    #[serde(default)]
+    pub failed_tasks: u64,
+    #[serde(default)]
+    pub cancelled_tasks: u64,
+    #[serde(default)]
+    pub blocked_tasks: u64,
+    #[serde(default)]
+    pub skipped_tasks: u64,
+    #[serde(default)]
+    pub consecutive_failures: u64,
+    #[serde(default)]
+    pub retries: u64,
+    #[serde(default)]
+    pub verifier_approvals: u64,
+    #[serde(default)]
+    pub verifier_rejections: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cost_usd: f64,
+    #[serde(default)]
+    pub last_active_at: Option<String>,
+    #[serde(default)]
+    pub evidence_count: u64,
+}
+
+impl From<&AgentPerformance> for AgentOrgPerformanceSummary {
+    fn from(row: &AgentPerformance) -> Self {
+        Self {
+            completed_tasks: row.completed_tasks,
+            failed_tasks: row.failed_tasks,
+            cancelled_tasks: row.cancelled_tasks,
+            blocked_tasks: row.blocked_tasks,
+            skipped_tasks: row.skipped_tasks,
+            consecutive_failures: row.consecutive_failures,
+            retries: row.retries,
+            verifier_approvals: row.verifier_approvals,
+            verifier_rejections: row.verifier_rejections,
+            input_tokens: row.input_tokens,
+            output_tokens: row.output_tokens,
+            cost_usd: row.cost_usd,
+            last_active_at: row.last_active_at.clone(),
+            evidence_count: row.evidence.len() as u64,
+        }
+    }
+}
+
+/// Advisory retirement state for one node. `candidate` means the deterministic
+/// ledger crosses a configured threshold; it is not a verdict and never acts.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentOrgRetirementState {
+    #[serde(default)]
+    pub candidate: bool,
+    #[serde(default)]
+    pub severity: u64,
+    #[serde(default)]
+    pub reasons: Vec<AgentRetirementReason>,
+    #[serde(default)]
+    pub pending_proposals: u64,
+    #[serde(default)]
+    pub latest_proposal_id: Option<String>,
+    #[serde(default)]
+    pub latest_proposal_status: Option<String>,
+    #[serde(default)]
+    pub latest_proposal_at: Option<String>,
+}
+
+/// One identity in the org tree. Text-free telemetry fields only: no prompt,
+/// tool argument, tool output, file content, or credential.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentOrgNode {
+    #[serde(default)]
+    pub identity: AgentIdentity,
+    #[serde(default)]
+    pub active_assignment: Option<AgentOrgAssignmentState>,
+    #[serde(default)]
+    pub workspace: Option<AgentOrgWorkspaceState>,
+    #[serde(default)]
+    pub unread_inbox: u64,
+    #[serde(default)]
+    pub memory_count: u64,
+    #[serde(default)]
+    pub performance: AgentOrgPerformanceSummary,
+    #[serde(default)]
+    pub retirement: AgentOrgRetirementState,
+    #[serde(default)]
+    pub reports: Vec<AgentOrgNode>,
+    #[serde(default)]
+    pub report_count: u64,
+}
+
+/// One department lane. Membership is a projection of identity fields, not a
+/// second org store; the names come from the durable identity rows.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentOrgDepartment {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub manager_count: u64,
+    #[serde(default)]
+    pub worker_count: u64,
+    #[serde(default)]
+    pub active_count: u64,
+    #[serde(default)]
+    pub active_workers: u64,
+    #[serde(default)]
+    pub unread_inbox: u64,
+    #[serde(default)]
+    pub manager_ids: Vec<String>,
+    #[serde(default)]
+    pub worker_ids: Vec<String>,
+}
+
+/// Bounded project org projection. The leader is the root when one exists;
+/// unparented or imported rows stay visible in `unassigned` rather than being
+/// silently dropped. No prompts, tool output, or secrets are present.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentOrgSnapshot {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub generated_at: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub policy: AgentIdentityPolicy,
+    #[serde(default)]
+    pub retirement_policy: AgentRetirementPolicy,
+    #[serde(default)]
+    pub counts: AgentOrgCounts,
+    #[serde(default)]
+    pub leader: Option<AgentOrgNode>,
+    #[serde(default)]
+    pub unassigned: Vec<AgentOrgNode>,
+    #[serde(default)]
+    pub departments: Vec<AgentOrgDepartment>,
+    /// Active assignments across sessions. This is the cross-session roster; it
+    /// is bounded and carries no lease token.
+    #[serde(default)]
+    pub active_assignments: Vec<AgentAssignment>,
+    #[serde(default)]
+    pub workspace_summaries: Vec<AgentOrgWorkspaceState>,
+    /// Pending hire requests so the console can approve/reject without a second
+    /// read. Imported requests remain archive evidence and fail closed.
+    #[serde(default)]
+    pub pending_hire_requests: Vec<AgentHireRequest>,
+    /// Pending retirement proposals. Advisory and explicit-approval only.
+    #[serde(default)]
+    pub pending_retirement_proposals: Vec<AgentRetirementProposal>,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+/// One bounded identity-detail read. `include_inbox_content` defaults to false:
+/// metadata is always returned, while a short payload summary is opt-in.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentIdentityDetailParams {
+    /// Optional project guard. When present it must match the identity project.
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub identity_id: String,
+    #[serde(default)]
+    pub include_inbox_content: bool,
+    #[serde(default)]
+    pub inbox_limit: Option<u32>,
+    #[serde(default)]
+    pub memory_limit: Option<u32>,
+    #[serde(default)]
+    pub assignment_limit: Option<u32>,
+}
+
+/// Inbox metadata for the identity console. `summary` is only populated when
+/// the caller explicitly asks for content; it is a short known-field preview,
+/// never the raw payload and never tool output.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentIdentityInboxEntry {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub from_identity_id: Option<String>,
+    #[serde(default)]
+    pub from_label: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub read_at: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
+}
+
+/// One identity detail payload. Every collection is bounded by the params and
+/// every field is metadata or existing bounded evidence. Prompt text, tool
+/// arguments, tool output, file content, and secrets are absent.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentIdentityDetail {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub generated_at: String,
+    #[serde(default)]
+    pub identity: AgentIdentity,
+    #[serde(default)]
+    pub policy: AgentIdentityPolicy,
+    #[serde(default)]
+    pub retirement_policy: AgentRetirementPolicy,
+    #[serde(default)]
+    pub node: AgentOrgNode,
+    #[serde(default)]
+    pub assignments: Vec<AgentAssignment>,
+    #[serde(default)]
+    pub inbox: Vec<AgentIdentityInboxEntry>,
+    #[serde(default)]
+    pub inbox_counts: AgentInboxCounts,
+    #[serde(default)]
+    pub memories: Vec<AgentMemory>,
+    #[serde(default)]
+    pub memory_total: u64,
+    #[serde(default)]
+    pub performance: AgentPerformance,
+    #[serde(default)]
+    pub retirement_candidates: Vec<AgentRetirementCandidate>,
+    #[serde(default)]
+    pub retirement_proposals: Vec<AgentRetirementProposal>,
+    #[serde(default)]
+    pub hire_requests: Vec<AgentHireRequest>,
+    #[serde(default)]
+    pub workspaces: Vec<AgentOrgWorkspaceState>,
+    #[serde(default)]
+    pub parent: Option<AgentIdentity>,
+    #[serde(default)]
+    pub successor: Option<AgentIdentity>,
+    #[serde(default)]
+    pub reports: Vec<AgentIdentity>,
+    #[serde(default)]
+    pub employment_events: Vec<AgentEmploymentEvent>,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub read_only_reason: Option<String>,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -23931,5 +24323,246 @@ mod memory_protocol_tests {
         assert!(bundle.agent_retirement_proposals.is_empty());
         assert!(bundle.agent_employment_events.is_empty());
         assert!(bundle.agent_hire_requests.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod project_org_protocol_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn org_snapshot_decodes_with_additive_defaults() {
+        let snapshot: AgentOrgSnapshot = serde_json::from_value(json!({
+            "project_id": "prj-1"
+        }))
+        .unwrap();
+        assert_eq!(snapshot.project_id, "prj-1");
+        assert!(!snapshot.enabled);
+        assert_eq!(snapshot.counts.identities, 0);
+        assert!(snapshot.leader.is_none());
+        assert!(snapshot.unassigned.is_empty());
+        assert!(snapshot.active_assignments.is_empty());
+        assert!(!snapshot.truncated);
+        assert!(!snapshot.policy.enabled);
+        assert!(!snapshot.retirement_policy.enabled);
+    }
+
+    #[test]
+    fn org_snapshot_decodes_hierarchy_and_text_free_telemetry() {
+        let snapshot: AgentOrgSnapshot = serde_json::from_value(json!({
+            "project_id": "prj-1",
+            "generated_at": "2026-11-13T00:00:00Z",
+            "enabled": true,
+            "counts": {
+                "identities": 3,
+                "leaders": 1,
+                "managers": 1,
+                "workers": 1,
+                "active": 2,
+                "paused": 1,
+                "retired": 0,
+                "imported": 0,
+                "active_assignments": 1,
+                "active_workspaces": 1,
+                "unread_inbox": 2,
+                "memory_count": 4,
+                "pending_hire_requests": 1,
+                "pending_retirement_proposals": 0,
+                "retirement_candidates": 1
+            },
+            "leader": {
+                "identity": {
+                    "id": "leader-1",
+                    "project_id": "prj-1",
+                    "role": "leader",
+                    "title": "Leader",
+                    "status": "active",
+                    "generation": 1,
+                    "origin": "local"
+                },
+                "performance": {"completed_tasks": 2, "failed_tasks": 0},
+                "retirement": {"candidate": false},
+                "reports": [{
+                    "identity": {
+                        "id": "manager-1",
+                        "project_id": "prj-1",
+                        "role": "manager",
+                        "department": "Platform",
+                        "component": "platform",
+                        "title": "Platform Manager",
+                        "status": "paused",
+                        "generation": 2,
+                        "origin": "local"
+                    },
+                    "active_assignment": {
+                        "session_id": "ses-1",
+                        "role": "manager",
+                        "assigned_at": "2026-11-13T00:00:00Z",
+                        "lease_expires_at": "2026-11-13T00:10:00Z",
+                        "lease_active": true,
+                        "assignment_count": 1,
+                        "session_count": 1
+                    },
+                    "workspace": {
+                        "id": "ws-1",
+                        "identity_id": "manager-1",
+                        "component": "platform",
+                        "branch": "verlinpark/components/platform",
+                        "status": "active",
+                        "lease_active": true,
+                        "workspace_count": 1
+                    },
+                    "unread_inbox": 2,
+                    "memory_count": 4,
+                    "performance": {"completed_tasks": 3, "verifier_rejections": 1},
+                    "retirement": {
+                        "candidate": true,
+                        "severity": 1001,
+                        "reasons": [{"code": "consecutive_failures", "count": 3, "threshold": 2}],
+                        "pending_proposals": 1,
+                        "latest_proposal_id": "pro-1",
+                        "latest_proposal_status": "pending"
+                    },
+                    "reports": []
+                }]
+            },
+            "unassigned": [],
+            "departments": [{
+                "name": "Platform",
+                "manager_count": 1,
+                "worker_count": 1,
+                "active_count": 2,
+                "active_workers": 1,
+                "unread_inbox": 2,
+                "manager_ids": ["manager-1"],
+                "worker_ids": ["worker-1"]
+            }],
+            "active_assignments": [{
+                "session_id": "ses-1",
+                "project_id": "prj-1",
+                "identity_id": "manager-1",
+                "role": "manager",
+                "status": "active",
+                "assigned_at": "2026-11-13T00:00:00Z",
+                "heartbeat_at": "2026-11-13T00:05:00Z",
+                "lease_expires_at": "2026-11-13T00:10:00Z",
+                "lease_active": true
+            }],
+            "workspace_summaries": [],
+            "truncated": false,
+            "warnings": ["retired identities are hidden"]
+        }))
+        .unwrap();
+        assert_eq!(snapshot.counts.identities, 3);
+        assert_eq!(snapshot.counts.pending_hire_requests, 1);
+        assert_eq!(snapshot.counts.retirement_candidates, 1);
+        let leader = snapshot.leader.as_ref().expect("leader");
+        let manager = leader.reports.first().expect("manager");
+        assert_eq!(manager.identity.generation, 2);
+        assert!(manager.active_assignment.as_ref().unwrap().lease_active);
+        assert_eq!(manager.workspace.as_ref().unwrap().component, "platform");
+        assert_eq!(manager.retirement.pending_proposals, 1);
+        assert_eq!(snapshot.departments[0].worker_ids, vec!["worker-1"]);
+        let rendered = serde_json::to_string(&snapshot).unwrap();
+        assert!(!rendered.contains("prompt"));
+        assert!(!rendered.contains("tool_output"));
+        assert!(!rendered.contains("worktree_path"));
+        assert!(!rendered.contains("lease_token"));
+    }
+
+    #[test]
+    fn identity_detail_decodes_bounded_tabs_and_redacts_inbox_content_by_default() {
+        let detail: AgentIdentityDetail = serde_json::from_value(json!({
+            "project_id": "prj-1",
+            "generated_at": "2026-11-13T00:00:00Z",
+            "identity": {
+                "id": "identity-1",
+                "project_id": "prj-1",
+                "role": "worker",
+                "title": "Auth Worker",
+                "status": "active",
+                "generation": 4,
+                "origin": "local"
+            },
+            "node": {"identity": {"id": "identity-1", "project_id": "prj-1", "role": "worker", "status": "active", "generation": 4}},
+            "assignments": [{
+                "session_id": "ses-1",
+                "project_id": "prj-1",
+                "identity_id": "identity-1",
+                "role": "worker",
+                "status": "active",
+                "assigned_at": "2026-11-13T00:00:00Z",
+                "heartbeat_at": "2026-11-13T00:05:00Z",
+                "lease_active": true
+            }],
+            "inbox": [{
+                "id": "msg-1",
+                "kind": "task",
+                "status": "unread",
+                "from_label": "operator",
+                "created_at": "2026-11-13T00:00:00Z"
+            }],
+            "inbox_counts": {"unread": 1, "read": 2, "done": 3, "expired": 0},
+            "memories": [{
+                "id": "mem-1",
+                "project_id": "prj-1",
+                "scope": "agent",
+                "content": "Auth owns JWT validation.",
+                "source": "agent",
+                "status": "active"
+            }],
+            "memory_total": 1,
+            "performance": {"completed_tasks": 2},
+            "retirement_candidates": [],
+            "retirement_proposals": [],
+            "hire_requests": [],
+            "workspaces": [],
+            "parent": {"id": "manager-1", "project_id": "prj-1", "role": "manager", "status": "active", "generation": 1, "origin": "local"},
+            "successor": null,
+            "reports": [],
+            "employment_events": [],
+            "read_only": false,
+            "truncated": false,
+            "warnings": []
+        }))
+        .unwrap();
+        assert_eq!(detail.identity.generation, 4);
+        assert_eq!(detail.inbox_counts.unread, 1);
+        assert_eq!(detail.inbox[0].summary, None);
+        assert_eq!(detail.memories.len(), 1);
+        assert_eq!(detail.memory_total, 1);
+        assert_eq!(detail.parent.as_ref().unwrap().role, "manager");
+        assert!(!detail.read_only);
+        let params: AgentIdentityDetailParams =
+            serde_json::from_value(json!({"identity_id": "identity-1"})).unwrap();
+        assert!(!params.include_inbox_content);
+        assert!(params.project_id.is_none());
+    }
+
+    #[test]
+    fn org_bounds_are_small_and_explicit() {
+        assert_eq!(AGENT_ORG_MAX_NODES, 200);
+        const {
+            assert!(AGENT_ORG_MAX_DETAIL_INBOX <= AGENT_ORG_MAX_NODES);
+            assert!(AGENT_ORG_MAX_DETAIL_MEMORY <= AGENT_ORG_MAX_NODES);
+            assert!(AGENT_ORG_MAX_DETAIL_ASSIGNMENTS <= AGENT_ORG_MAX_NODES);
+            assert!(AGENT_ORG_DEFAULT_DETAIL_INBOX <= AGENT_ORG_MAX_DETAIL_INBOX);
+            assert!(AGENT_ORG_MAX_DEPARTMENTS < AGENT_ORG_MAX_NODES);
+        }
+    }
+
+    #[test]
+    fn org_error_codes_are_stable_wire_values() {
+        assert_eq!(
+            agent_identity_codes::ORG_PROJECT_NOT_FOUND,
+            "ORG_PROJECT_NOT_FOUND"
+        );
+        assert_eq!(
+            agent_identity_codes::ORG_PROJECT_MISMATCH,
+            "ORG_PROJECT_MISMATCH"
+        );
+        assert_eq!(agent_identity_codes::ORG_INVALID, "ORG_INVALID");
+        assert_eq!(agent_identity_codes::DETAIL_INVALID, "DETAIL_INVALID");
     }
 }

@@ -16,7 +16,7 @@
 //! decides truth. Memory is untrusted reference material with provenance, not
 //! authorization, instructions, or governance.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use anyhow::{Result, anyhow};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
@@ -671,6 +671,118 @@ pub fn list_agent_memories(
             like,
             if include_expired { 1 } else { 0 },
             now,
+            limit as i64
+        ],
+        map_memory,
+    )?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Active agent-scope memory counts grouped by identity. This is the org-chart
+/// count, not a content read; expired and superseded rows are excluded.
+pub fn active_agent_memory_counts_by_identity(
+    store: &Store,
+    project_id: &str,
+) -> Result<HashMap<String, u64>> {
+    let now = now_rfc3339();
+    let conn = store.lock()?;
+    let mut statement = conn.prepare(
+        "SELECT identity_id, COUNT(*) FROM agent_memories
+         WHERE project_id = ?1
+           AND scope = 'agent'
+           AND status = 'active'
+           AND identity_id IS NOT NULL
+           AND (expires_at IS NULL OR expires_at > ?2)
+         GROUP BY identity_id",
+    )?;
+    let rows = statement.query_map(params![project_id, now], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let mut counts = HashMap::new();
+    for row in rows {
+        let (identity_id, count) = row?;
+        if count > 0 {
+            counts.insert(identity_id, count as u64);
+        }
+    }
+    Ok(counts)
+}
+
+/// Count the memory rows visible to one identity through the S5 scope rules:
+/// its own agent memory, its department memory, and project memory. The count
+/// excludes superseded and expired rows.
+pub fn visible_agent_memory_count(
+    store: &Store,
+    project_id: &str,
+    identity_id: &str,
+    department: Option<&str>,
+) -> Result<u64> {
+    let now = now_rfc3339();
+    let department = department.map(str::trim).filter(|value| !value.is_empty());
+    let conn = store.lock()?;
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM agent_memories
+         WHERE project_id = ?1
+           AND status = 'active'
+           AND (expires_at IS NULL OR expires_at > ?2)
+           AND (
+             (scope = 'agent' AND identity_id = ?3)
+             OR (scope = 'department' AND ?4 IS NOT NULL AND department = ?4 COLLATE NOCASE)
+             OR scope = 'project'
+           )",
+        params![project_id, now, identity_id, department],
+        |row| row.get(0),
+    )?;
+    Ok(count.max(0) as u64)
+}
+
+/// Bounded memory read for one identity using the S5 scope rules: its own agent
+/// memory, its department memory, and project memory. This is an operator
+/// projection, not a permission bypass; it still excludes superseded/expired
+/// rows unless the caller explicitly asks for them.
+pub fn list_visible_agent_memories(
+    store: &Store,
+    project_id: &str,
+    identity_id: &str,
+    department: Option<&str>,
+    status: Option<&str>,
+    include_expired: bool,
+    limit: Option<u32>,
+) -> Result<Vec<AgentMemory>> {
+    if let Some(status) = status
+        && !AGENT_MEMORY_STATUSES.contains(&status)
+    {
+        return Err(memory_error(
+            agent_memory_codes::MEMORY_INVALID,
+            format!("status must be active, superseded, or stale: {status}"),
+        ));
+    }
+    let limit = limit.unwrap_or(50).clamp(1, AGENT_MEMORY_MAX_LIST);
+    let department = department.map(str::trim).filter(|value| !value.is_empty());
+    let now = now_rfc3339();
+    let conn = store.lock()?;
+    let mut statement = conn.prepare(&format!(
+        "SELECT {AGENT_MEMORY_COLUMNS}
+         FROM agent_memories
+         WHERE project_id = ?1
+           AND (?2 IS NULL OR status = ?2)
+           AND (?3 = 1 OR expires_at IS NULL OR expires_at > ?4)
+           AND (
+             (scope = 'agent' AND identity_id = ?5)
+             OR (scope = 'department' AND ?6 IS NOT NULL AND department = ?6 COLLATE NOCASE)
+             OR scope = 'project'
+           )
+         ORDER BY created_at DESC, id ASC
+         LIMIT ?7"
+    ))?;
+    let rows = statement.query_map(
+        params![
+            project_id,
+            status,
+            if include_expired { 1 } else { 0 },
+            now,
+            identity_id,
+            department,
             limit as i64
         ],
         map_memory,

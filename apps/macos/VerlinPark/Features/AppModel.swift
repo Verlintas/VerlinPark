@@ -75,6 +75,28 @@ final class AppModel {
     var agentIdentities: [AgentIdentity] = []
     var agentIdentitiesStatus: String?
     var agentIdentitiesBusy = false
+    // S7 project org console. All reads are bounded projections; all writes are
+    // explicit operator submissions through the S6 RPCs.
+    var projectOrgSnapshot: AgentOrgSnapshot?
+    var projectOrgStatus: String?
+    var projectOrgBusy = false
+    var projectOrgError: ProjectOrgErrorSurface?
+    var projectOrgIncludeRetired = true
+    var projectOrgDetail: AgentIdentityDetail?
+    var projectOrgDetailStatus: String?
+    var projectOrgDetailBusy = false
+    var projectOrgDetailError: ProjectOrgErrorSurface?
+    var projectOrgDetailSelection: ProjectOrgIdentitySelection?
+    var projectOrgIncludeInboxContent = false
+    var projectOrgSheet: ProjectOrgSheet?
+    var projectOrgActionIdentityID: String?
+    var projectOrgActionBusy = false
+    var projectOrgActionError: ProjectOrgErrorSurface?
+    var projectOrgActionNotice: String?
+    var projectOrgHireDraft = ProjectOrgHireDraft()
+    var projectOrgPromoteDraft = ProjectOrgPromoteDraft()
+    var projectOrgTransferDraft = ProjectOrgTransferDraft()
+    var projectOrgRetireDraft = ProjectOrgRetireDraft()
     var agentPerformanceSummary: AgentPerformanceSummaryResult?
     var agentRetirementCandidates: [AgentRetirementCandidate] = []
     var agentRetirementProposals: [AgentRetirementProposal] = []
@@ -8195,6 +8217,439 @@ final class AppModel {
                 agentIdentitiesStatus = error.localizedDescription
             }
         }
+    }
+
+    // MARK: - S7 project org console
+
+    /// Bounded project org read. The caller decides when to refresh; there is no
+    /// polling loop and no hidden provider/tool call.
+    func loadProjectOrg(includeRetired: Bool? = nil) async {
+        guard let projectID = selectedProjectID else {
+            projectOrgSnapshot = nil
+            projectOrgStatus = nil
+            projectOrgError = nil
+            return
+        }
+        if let includeRetired {
+            projectOrgIncludeRetired = includeRetired
+        }
+        projectOrgBusy = true
+        projectOrgError = nil
+        defer { projectOrgBusy = false }
+        do {
+            let snapshot = try await core.agentOrgSnapshot(
+                projectID: projectID,
+                includeRetired: projectOrgIncludeRetired
+            )
+            guard projectID == selectedProjectID else { return }
+            projectOrgSnapshot = snapshot
+            projectOrgStatus = snapshot.counts.identities == 0
+                ? (snapshot.enabled ? "No identities in this project." : "Identity policy disabled.")
+                : "\(snapshot.counts.liveIdentities) live · \(snapshot.counts.pendingOrgActions) pending"
+        } catch {
+            guard projectID == selectedProjectID else { return }
+            projectOrgSnapshot = nil
+            projectOrgError = ProjectOrgErrorSurface.from(error)
+            projectOrgStatus = projectOrgError?.message
+        }
+    }
+
+    /// Open one identity detail sheet and load its bounded tabs.
+    func openProjectOrgDetail(identityID: String) async {
+        projectOrgDetailSelection = ProjectOrgIdentitySelection(identityID: identityID)
+        await loadProjectOrgDetail(identityID: identityID)
+    }
+
+    func loadProjectOrgDetail(identityID: String? = nil, includeInboxContent: Bool? = nil) async {
+        let target = identityID ?? projectOrgDetailSelection?.identityID
+        guard let target, !target.isEmpty else {
+            projectOrgDetail = nil
+            projectOrgDetailStatus = nil
+            return
+        }
+        if let includeInboxContent {
+            projectOrgIncludeInboxContent = includeInboxContent
+        }
+        projectOrgDetailBusy = true
+        projectOrgDetailError = nil
+        defer { projectOrgDetailBusy = false }
+        do {
+            let detail = try await core.agentIdentityDetail(
+                identityID: target,
+                projectID: selectedProjectID,
+                includeInboxContent: projectOrgIncludeInboxContent
+            )
+            guard projectOrgDetailSelection?.identityID == target else { return }
+            projectOrgDetail = detail
+            projectOrgDetailStatus = "\(detail.identity.displayName) · gen \(detail.identity.generation)"
+        } catch {
+            guard projectOrgDetailSelection?.identityID == target else { return }
+            projectOrgDetail = nil
+            projectOrgDetailError = ProjectOrgErrorSurface.from(error)
+            projectOrgDetailStatus = projectOrgDetailError?.message
+        }
+    }
+
+    func dismissProjectOrgDetail() {
+        projectOrgDetailSelection = nil
+        projectOrgDetail = nil
+        projectOrgDetailStatus = nil
+        projectOrgDetailError = nil
+    }
+
+    func presentProjectOrgHire() {
+        guard let snapshot = projectOrgSnapshot else {
+            projectOrgActionError = ProjectOrgErrorSurface(
+                code: "ORG_INVALID",
+                message: "Load the project org before hiring.",
+                hint: nil
+            )
+            return
+        }
+        projectOrgActionIdentityID = nil
+        projectOrgActionError = nil
+        projectOrgActionNotice = nil
+        projectOrgHireDraft = ProjectOrgHireDraft()
+        projectOrgHireDraft.approved = !snapshot.policy.hireRequiresApproval
+        if let manager = snapshot.managerChoices.first {
+            projectOrgHireDraft.parentIdentityID = manager.id
+        } else if let leader = snapshot.leaderChoices.first {
+            projectOrgHireDraft.parentIdentityID = leader.id
+        }
+        projectOrgSheet = .hire
+    }
+
+    func projectOrgHireRoleChanged() {
+        let parent: AgentIdentity? = if projectOrgHireDraft.normalizedRole == "manager" {
+            projectOrgSnapshot?.leaderChoices.first
+        } else {
+            projectOrgSnapshot?.managerChoices.first
+        }
+        projectOrgHireDraft.parentIdentityID = parent?.id ?? ""
+    }
+
+    func projectOrgTransferParentChanged() {
+        if !projectOrgTransferDraft.parentIdentityID.isEmpty {
+            projectOrgTransferDraft.clearParent = false
+        }
+    }
+
+    func presentProjectOrgPromote(identityID: String) {
+        guard let identity = projectOrgIdentity(identityID) else { return }
+        projectOrgActionIdentityID = identityID
+        projectOrgActionError = nil
+        projectOrgActionNotice = nil
+        var draft = ProjectOrgPromoteDraft()
+        draft.identityID = identityID
+        draft.currentRole = identity.role
+        draft.targetRole = identity.role == "manager" ? "leader" : "manager"
+        draft.title = identity.title ?? ""
+        if let leader = projectOrgSnapshot?.leaderChoices.first,
+           leader.id != identityID
+        {
+            draft.parentIdentityID = leader.id
+        }
+        projectOrgPromoteDraft = draft
+        projectOrgSheet = .promote
+    }
+
+    func presentProjectOrgTransfer(identityID: String) {
+        guard let identity = projectOrgIdentity(identityID) else { return }
+        projectOrgActionIdentityID = identityID
+        projectOrgActionError = nil
+        projectOrgActionNotice = nil
+        var draft = ProjectOrgTransferDraft()
+        draft.identityID = identityID
+        draft.department = identity.department ?? ""
+        draft.component = identity.component ?? ""
+        draft.title = identity.title ?? ""
+        draft.parentIdentityID = identity.parentIdentityId ?? ""
+        projectOrgTransferDraft = draft
+        projectOrgSheet = .transfer
+    }
+
+    func presentProjectOrgRetire(identityID: String) {
+        guard let identity = projectOrgIdentity(identityID) else { return }
+        projectOrgActionIdentityID = identityID
+        projectOrgActionError = nil
+        projectOrgActionNotice = nil
+        var draft = ProjectOrgRetireDraft()
+        draft.identityID = identityID
+        draft.requiresApproval = projectOrgSnapshot?.policy.retirementRequiresApproval
+            ?? projectOrgDetail?.policy.retirementRequiresApproval
+            ?? true
+        if let detail = projectOrgDetail,
+           detail.identity.id == identityID,
+           let proposal = detail.pendingRetirementProposal
+        {
+            draft.proposalID = proposal.id
+        }
+        if let successor = identity.successorId {
+            draft.successorID = successor
+        }
+        projectOrgRetireDraft = draft
+        projectOrgSheet = .retire
+    }
+
+    func dismissProjectOrgSheet() {
+        projectOrgSheet = nil
+        projectOrgActionIdentityID = nil
+        projectOrgActionError = nil
+    }
+
+    func submitProjectOrgHire() async {
+        guard let projectID = selectedProjectID else { return }
+        if let error = projectOrgHireDraft.validationError() {
+            projectOrgActionError = ProjectOrgErrorSurface(
+                code: "HIRE_INVALID",
+                message: error,
+                hint: nil
+            )
+            return
+        }
+        projectOrgActionBusy = true
+        projectOrgActionError = nil
+        projectOrgActionNotice = nil
+        defer { projectOrgActionBusy = false }
+        do {
+            let result = try await core.agentHire(
+                projectID: projectID,
+                role: projectOrgHireDraft.normalizedRole,
+                department: nilIfEmpty(projectOrgHireDraft.department),
+                component: nilIfEmpty(projectOrgHireDraft.component),
+                title: nilIfEmpty(projectOrgHireDraft.title),
+                profile: nilIfEmpty(projectOrgHireDraft.profile),
+                model: nilIfEmpty(projectOrgHireDraft.model),
+                parentIdentityID: nilIfEmpty(projectOrgHireDraft.parentIdentityID),
+                approved: projectOrgHireDraft.approved,
+                operatorName: "swiftui"
+            )
+            projectOrgActionNotice = result.state == "pending"
+                ? "Hire request pending approval. No identity was created."
+                : "Identity hired: \(result.identity?.displayName ?? result.request.identityId)."
+            projectOrgSheet = nil
+            await loadProjectOrg()
+        } catch {
+            projectOrgActionError = ProjectOrgErrorSurface.from(error)
+        }
+    }
+
+    func approveProjectOrgHire(requestID: String) async {
+        await performProjectOrgAction(success: "Hire request approved.") {
+            let result = try await self.core.agentHireApprove(
+                requestID: requestID,
+                operatorName: "swiftui"
+            )
+            return result.identity?.id
+        }
+    }
+
+    func rejectProjectOrgHire(requestID: String, reason: String? = nil) async {
+        await performProjectOrgAction(success: "Hire request rejected. No identity was created.") {
+            _ = try await self.core.agentHireReject(
+                requestID: requestID,
+                reason: reason,
+                operatorName: "swiftui"
+            )
+            return nil
+        }
+    }
+
+    func submitProjectOrgPromote() async {
+        if let error = projectOrgPromoteDraft.validationError() {
+            projectOrgActionError = ProjectOrgErrorSurface(
+                code: "PROMOTION_INVALID",
+                message: error,
+                hint: nil
+            )
+            return
+        }
+        projectOrgActionBusy = true
+        projectOrgActionError = nil
+        projectOrgActionNotice = nil
+        defer { projectOrgActionBusy = false }
+        do {
+            let result = try await core.agentPromote(
+                identityID: projectOrgPromoteDraft.identityID,
+                targetRole: projectOrgPromoteDraft.targetRole,
+                parentIdentityID: nilIfEmpty(projectOrgPromoteDraft.parentIdentityID),
+                title: nilIfEmpty(projectOrgPromoteDraft.title),
+                force: projectOrgPromoteDraft.force,
+                operatorName: "swiftui"
+            )
+            projectOrgActionNotice = "Promoted \(result.identity.displayName) from \(result.previousRole) to \(result.identity.role)."
+            projectOrgSheet = nil
+            await refreshProjectOrgAfterMutation(identityID: result.identity.id)
+        } catch {
+            projectOrgActionError = ProjectOrgErrorSurface.from(error)
+        }
+    }
+
+    func submitProjectOrgTransfer() async {
+        guard let current = projectOrgIdentity(projectOrgTransferDraft.identityID) else {
+            projectOrgActionError = ProjectOrgErrorSurface(
+                code: "TRANSFER_INVALID",
+                message: "The identity is no longer in the loaded org.",
+                hint: "Refresh the org and try again."
+            )
+            return
+        }
+        let department = projectOrgTransferDraft.patch(
+            current: current.department ?? "",
+            draft: projectOrgTransferDraft.department
+        )
+        let component = projectOrgTransferDraft.patch(
+            current: current.component ?? "",
+            draft: projectOrgTransferDraft.component
+        )
+        let title = projectOrgTransferDraft.patch(
+            current: current.title ?? "",
+            draft: projectOrgTransferDraft.title
+        )
+        let parent: ProjectOrgPatchField = projectOrgTransferDraft.clearParent
+            ? .clear
+            : projectOrgTransferDraft.patch(
+                current: current.parentIdentityId ?? "",
+                draft: projectOrgTransferDraft.parentIdentityID
+            )
+        if department == .unchanged, component == .unchanged, title == .unchanged,
+           parent == .unchanged
+        {
+            projectOrgActionError = ProjectOrgErrorSurface(
+                code: "TRANSFER_INVALID",
+                message: "No transfer field changed.",
+                hint: "Edit a department, component, title, or parent before submitting."
+            )
+            return
+        }
+        projectOrgActionBusy = true
+        projectOrgActionError = nil
+        projectOrgActionNotice = nil
+        defer { projectOrgActionBusy = false }
+        do {
+            let result = try await core.agentTransfer(
+                identityID: projectOrgTransferDraft.identityID,
+                department: department,
+                component: component,
+                title: title,
+                parentIdentityID: parent,
+                force: projectOrgTransferDraft.force,
+                operatorName: "swiftui"
+            )
+            projectOrgActionNotice = result.changed
+                ? "Transferred \(result.identity.displayName); generation \(result.identity.generation)."
+                : "No transfer change was recorded."
+            projectOrgSheet = nil
+            await refreshProjectOrgAfterMutation(identityID: result.identity.id)
+        } catch {
+            projectOrgActionError = ProjectOrgErrorSurface.from(error)
+        }
+    }
+
+    func submitProjectOrgRetire() async {
+        if let error = projectOrgRetireDraft.validationError() {
+            projectOrgActionError = ProjectOrgErrorSurface(
+                code: "RETIREMENT_APPROVAL_REQUIRED",
+                message: error,
+                hint: "Attach an approved proposal or toggle explicit approval."
+            )
+            return
+        }
+        projectOrgActionBusy = true
+        projectOrgActionError = nil
+        projectOrgActionNotice = nil
+        defer { projectOrgActionBusy = false }
+        do {
+            let result = try await core.agentRetire(
+                identityID: projectOrgRetireDraft.identityID,
+                successorID: nilIfEmpty(projectOrgRetireDraft.successorID),
+                proposalID: nilIfEmpty(projectOrgRetireDraft.proposalID),
+                approved: projectOrgRetireDraft.approved,
+                force: projectOrgRetireDraft.force,
+                reason: nilIfEmpty(projectOrgRetireDraft.reason),
+                operatorName: "swiftui"
+            )
+            projectOrgActionNotice = "Retired \(result.identity.displayName). Evidence and branches are preserved."
+            projectOrgSheet = nil
+            await loadProjectOrg()
+            if projectOrgDetailSelection?.identityID == result.identity.id {
+                await loadProjectOrgDetail(identityID: result.identity.id)
+            }
+        } catch {
+            projectOrgActionError = ProjectOrgErrorSurface.from(error)
+        }
+    }
+
+    func proposeProjectOrgRetirement(identityID: String) async {
+        await performProjectOrgAction(
+            success: "Retirement proposal recorded. It is advisory until approved."
+        ) {
+            _ = try await self.core.agentRetirementPropose(identityID: identityID)
+            return identityID
+        }
+    }
+
+    func approveProjectOrgRetirement(proposalID: String) async {
+        await performProjectOrgAction(
+            success: "Retirement proposal approved. Retirement still requires an explicit retire action."
+        ) {
+            let result = try await self.core.agentRetirementApprove(proposalID: proposalID)
+            return result.proposal.identityId
+        }
+    }
+
+    func rejectProjectOrgRetirement(proposalID: String, reason: String? = nil) async {
+        await performProjectOrgAction(success: "Retirement proposal rejected.") {
+            let result = try await self.core.agentRetirementReject(
+                proposalID: proposalID,
+                reason: reason
+            )
+            return result.proposal.identityId
+        }
+    }
+
+    func projectOrgIdentity(_ identityID: String) -> AgentIdentity? {
+        if projectOrgDetail?.identity.id == identityID {
+            return projectOrgDetail?.identity
+        }
+        return projectOrgSnapshot?.node(identityID: identityID)?.identity
+    }
+
+    var projectOrgPendingActions: Int {
+        projectOrgSnapshot?.counts.pendingOrgActions ?? 0
+    }
+
+    private func performProjectOrgAction(
+        success: String,
+        operation: @escaping () async throws -> String?
+    ) async {
+        projectOrgActionBusy = true
+        projectOrgActionError = nil
+        projectOrgActionNotice = nil
+        defer { projectOrgActionBusy = false }
+        do {
+            let identityID = try await operation()
+            projectOrgActionNotice = success
+            projectOrgSheet = nil
+            await loadProjectOrg()
+            if let identityID, projectOrgDetailSelection?.identityID == identityID {
+                await loadProjectOrgDetail(identityID: identityID)
+            }
+        } catch {
+            projectOrgActionError = ProjectOrgErrorSurface.from(error)
+        }
+    }
+
+    private func refreshProjectOrgAfterMutation(identityID: String) async {
+        await loadProjectOrg()
+        if projectOrgDetailSelection?.identityID == identityID {
+            await loadProjectOrgDetail(identityID: identityID)
+        }
+    }
+
+    private func nilIfEmpty(_ value: String) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     /// Read-only performance and retirement evidence. No hire/retire mutation is

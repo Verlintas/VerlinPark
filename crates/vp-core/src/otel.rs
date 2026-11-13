@@ -538,6 +538,7 @@ pub fn project_events(session_id: &str, events: &[Event], truncated: bool) -> Pr
                 }
                 attributes
                     .insert_string("verlinpark.agent.role", string_field(event, "agent_role"));
+                insert_identity_details(&mut attributes, event);
                 let span = ProjectedSpan {
                     trace_id: trace_id.clone(),
                     span_id: span_id_for(session_id, event.seq, "tool"),
@@ -603,6 +604,7 @@ pub fn project_events(session_id: &str, events: &[Event], truncated: bool) -> Pr
                     }
                     attributes.insert_bool("verlinpark.tool.is_error", is_error);
                     insert_tool_details(&mut attributes, event);
+                    insert_identity_details(&mut attributes, event);
                     let span = ProjectedSpan {
                         trace_id: trace_id.clone(),
                         span_id: span_id_for(session_id, event.seq, "tool"),
@@ -643,6 +645,7 @@ pub fn project_events(session_id: &str, events: &[Event], truncated: bool) -> Pr
                         .insert_string("gen_ai.agent.name", string_field(event, "agent_name"));
                 }
                 attributes.insert_string("verlinpark.agent.role", role);
+                insert_identity_details(&mut attributes, event);
                 attributes.insert_int(
                     "gen_ai.usage.input_tokens",
                     int_field(event, "input_tokens"),
@@ -710,6 +713,24 @@ fn span_name(prefix: &str, value: &str) -> String {
     name
 }
 
+fn insert_identity_details(attributes: &mut Attributes, event: &Event) {
+    if let Some(identity_id) = event.payload.get("identity_id").and_then(Value::as_str)
+        && !identity_id.is_empty()
+    {
+        attributes.insert_string("verlinpark.agent.identity_id", identity_id);
+    }
+    if let Some(generation) = event
+        .payload
+        .get("identity_generation")
+        .and_then(Value::as_u64)
+    {
+        attributes.insert_int(
+            "verlinpark.agent.identity_generation",
+            i64::try_from(generation.min(i64::MAX as u64)).unwrap_or(i64::MAX),
+        );
+    }
+}
+
 fn insert_tool_details(attributes: &mut Attributes, event: &Event) {
     if let Some(duration) = event.payload.get("duration_ms").and_then(Value::as_u64) {
         attributes.insert_int(
@@ -772,6 +793,7 @@ fn agent_span(
     if !department.is_empty() {
         attributes.insert_string("verlinpark.agent.department", department);
     }
+    insert_identity_details(&mut attributes, event);
     ProjectedSpan {
         trace_id: trace_id.to_string(),
         span_id: span_id_for(session_id, event.seq, "agent"),
@@ -1994,6 +2016,117 @@ mod tests {
         let store = Store::open(&data_dir).unwrap();
         let engine = Engine::new(store);
         assert_eq!(engine.get_otel_policy(&project_id).await.unwrap(), policy);
+    }
+
+    #[test]
+    fn identity_metadata_is_projected_without_prompt_or_tool_content() {
+        let events = vec![
+            event(
+                1,
+                "session.created",
+                json!({"goal": "SECRET_GOAL", "project_id": "proj-1"}),
+                "2026-11-12T00:00:00.000Z",
+            ),
+            event(
+                2,
+                "agent.spawned",
+                json!({
+                    "agent_id": "agent-1",
+                    "agent_role": "worker",
+                    "identity_id": "identity-1",
+                    "identity_generation": 3,
+                    "prompt": "SECRET_PROMPT",
+                    "objective": "SECRET_OBJECTIVE"
+                }),
+                "2026-11-12T00:00:01.000Z",
+            ),
+            event(
+                3,
+                "tool.started",
+                json!({
+                    "tool_call_id": "call-1",
+                    "name": "write_file",
+                    "agent_id": "agent-1",
+                    "identity_id": "identity-1",
+                    "identity_generation": 3,
+                    "input": {"content": "SECRET_TOOL_ARGS"}
+                }),
+                "2026-11-12T00:00:02.000Z",
+            ),
+            event(
+                4,
+                "agent.usage",
+                json!({
+                    "agent_id": "agent-1",
+                    "agent_role": "worker",
+                    "identity_id": "identity-1",
+                    "identity_generation": 3,
+                    "model": "model-1",
+                    "input_tokens": 10,
+                    "output_tokens": 2,
+                    "prompt": "SECRET_PROMPT"
+                }),
+                "2026-11-12T00:00:03.000Z",
+            ),
+        ];
+        let projected = project_events("ses-1", &events, false);
+        let agent = projected
+            .spans
+            .iter()
+            .find(|span| span.name.starts_with("invoke_agent"))
+            .expect("agent span");
+        assert_eq!(
+            agent
+                .attributes
+                .value("verlinpark.agent.identity_id")
+                .and_then(|value| value.get("stringValue"))
+                .and_then(Value::as_str),
+            Some("identity-1")
+        );
+        assert_eq!(
+            agent
+                .attributes
+                .value("verlinpark.agent.identity_generation")
+                .and_then(|value| value.get("intValue"))
+                .and_then(Value::as_str),
+            Some("3")
+        );
+        let tool = projected
+            .spans
+            .iter()
+            .find(|span| span.name.starts_with("execute_tool"))
+            .expect("tool span");
+        assert_eq!(
+            tool.attributes
+                .value("verlinpark.agent.identity_id")
+                .and_then(|value| value.get("stringValue"))
+                .and_then(Value::as_str),
+            Some("identity-1")
+        );
+        let usage = projected
+            .spans
+            .iter()
+            .find(|span| span.name.starts_with("chat"))
+            .expect("usage span");
+        assert_eq!(
+            usage
+                .attributes
+                .value("verlinpark.agent.identity_generation")
+                .and_then(|value| value.get("intValue"))
+                .and_then(Value::as_str),
+            Some("3")
+        );
+        let body = serde_json::to_string(&otlp_request(
+            &projected,
+            &OtelPolicy::default(),
+            &projected.spans,
+        ))
+        .unwrap();
+        assert!(!body.contains("SECRET_PROMPT"));
+        assert!(!body.contains("SECRET_GOAL"));
+        assert!(!body.contains("SECRET_OBJECTIVE"));
+        assert!(!body.contains("SECRET_TOOL_ARGS"));
+        assert!(body.contains("identity-1"));
     }
 
     #[test]

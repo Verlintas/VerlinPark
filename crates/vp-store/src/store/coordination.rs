@@ -1206,6 +1206,31 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Unread inbox counts grouped by recipient identity. This is a bounded
+    /// aggregate for the S7 org chart: it returns counts only, never row bodies.
+    pub fn unread_agent_inbox_counts_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<HashMap<String, u64>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT identity_id, COUNT(*) FROM agent_inbox
+             WHERE project_id = ?1 AND status = 'unread'
+             GROUP BY identity_id",
+        )?;
+        let rows = statement.query_map(params![project_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut counts = HashMap::new();
+        for row in rows {
+            let (identity_id, count) = row?;
+            if count > 0 {
+                counts.insert(identity_id, count as u64);
+            }
+        }
+        Ok(counts)
+    }
+
     /// Full bounded project projection for replay comparison. Normal read APIs
     /// clamp tighter; replay must see every row that the event stream can
     /// derive or a repair could otherwise hide drift.
