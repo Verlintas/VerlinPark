@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, anyhow};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -21,7 +22,7 @@ use vp_protocol::types::{
     CheckpointRetentionPolicy, ContextCheckpoint, ContextCheckpointPolicy, ContinuationOutcome,
     ContractPolicy, CriticalPathPolicy, EffectEvidence, EffectPolicy, EffectReceipt, EffectState,
     EffectTarget, Event, GatePolicy, GateRecord, GuiActionInfo, GuiPolicy, InstructionBlob,
-    IntakeTask, IntegrationPolicy, MailboxPolicy, McpServer, McpServerConfig, McpToolPin,
+    IntakeTask, IntegrationPolicy, MailboxPolicy, McpServer, McpServerConfig, McpTask, McpToolPin,
     McpTransport, MemoryConflict, MemoryEmbeddingJobStatus, MemoryEmbeddingPolicy,
     MemoryEmbeddingUsage, MemoryEmbeddingsStatusResult, MemoryEvidence, MemoryHealthResult,
     MemoryItem, MemoryPolicy, MemoryStatCount, MergeQueueEntry, MergeQueueSource, MetricCount,
@@ -2776,6 +2777,39 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_mcp_tool_pins_server
                 ON mcp_tool_pins(project_id, server_id);
+
+            -- Durable MCP asynchronous task handles. This is operational state
+            -- backed by session events; the remote task itself remains owned by
+            -- the MCP server.
+            CREATE TABLE IF NOT EXISTS mcp_tasks (
+                id                TEXT PRIMARY KEY,
+                project_id        TEXT NOT NULL DEFAULT '',
+                session_id        TEXT NOT NULL DEFAULT '',
+                agent_id          TEXT NOT NULL DEFAULT '',
+                agent_name        TEXT NOT NULL DEFAULT '',
+                task_id           TEXT,
+                server_id         TEXT NOT NULL,
+                server_name       TEXT NOT NULL,
+                tool_name         TEXT NOT NULL,
+                remote_task_id    TEXT NOT NULL,
+                status            TEXT NOT NULL,
+                ttl_secs          INTEGER NOT NULL DEFAULT 600,
+                poll_interval_ms  INTEGER NOT NULL DEFAULT 1000,
+                created_at        TEXT NOT NULL,
+                updated_at        TEXT NOT NULL,
+                expires_at        TEXT,
+                result_json       TEXT,
+                result_hash       TEXT,
+                result_bytes      INTEGER NOT NULL DEFAULT 0,
+                effect_receipt_id TEXT,
+                last_error        TEXT,
+                UNIQUE (session_id, server_id, remote_task_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_mcp_tasks_session
+                ON mcp_tasks(session_id, status, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_mcp_tasks_project
+                ON mcp_tasks(project_id, updated_at);
 
 
             CREATE TABLE IF NOT EXISTS project_process_policies (
@@ -19677,6 +19711,209 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub fn find_mcp_task_by_remote(
+        &self,
+        session_id: &str,
+        server_id: &str,
+        remote_task_id: &str,
+    ) -> Result<Option<McpTask>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            &format!(
+                "{MCP_TASK_SELECT} WHERE session_id = ?1 AND server_id = ?2 AND remote_task_id = ?3"
+            ),
+            params![session_id, server_id, remote_task_id],
+            map_mcp_task,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn get_mcp_task(&self, task_id: &str) -> Result<Option<McpTask>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            &format!("{MCP_TASK_SELECT} WHERE id = ?1"),
+            params![task_id],
+            map_mcp_task,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_mcp_tasks(
+        &self,
+        project_id: Option<&str>,
+        session_id: Option<&str>,
+        server_id: Option<&str>,
+        status: Option<&str>,
+        limit: u32,
+    ) -> Result<(Vec<McpTask>, bool)> {
+        let limit = limit.clamp(1, 500) as i64;
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(&format!(
+            "{MCP_TASK_SELECT}
+             WHERE (?1 IS NULL OR project_id = ?1)
+               AND (?2 IS NULL OR session_id = ?2)
+               AND (?3 IS NULL OR server_id = ?3)
+               AND (?4 IS NULL OR status = ?4)
+             ORDER BY updated_at DESC, id DESC
+             LIMIT ?5"
+        ))?;
+        let rows = statement
+            .query_map(
+                params![project_id, session_id, server_id, status, limit + 1],
+                map_mcp_task,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let truncated = rows.len() as i64 > limit;
+        Ok((rows.into_iter().take(limit as usize).collect(), truncated))
+    }
+
+    pub fn insert_mcp_task_with_event(&self, task: &McpTask) -> Result<(McpTask, Option<Event>)> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        insert_mcp_task_row_tx(&tx, task)?;
+        let event = if task.session_id.trim().is_empty() {
+            None
+        } else {
+            Some(insert_event_tx(
+                &tx,
+                &task.session_id,
+                "mcp.task.created",
+                serde_json::to_value(task)?,
+            )?)
+        };
+        tx.commit()?;
+        if let Some(event) = &event
+            && let Err(error) = self.append_event_mirror(event)
+        {
+            tracing::warn!(%error, "failed to append MCP task event mirror");
+        }
+        Ok((task.clone(), event))
+    }
+
+    pub fn update_mcp_task_with_event(
+        &self,
+        task: &McpTask,
+        kind: &str,
+        extra: Value,
+    ) -> Result<(McpTask, Option<Event>)> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE mcp_tasks
+             SET status = ?2, ttl_secs = ?3, poll_interval_ms = ?4,
+                 updated_at = ?5, expires_at = ?6, last_error = ?7,
+                 effect_receipt_id = COALESCE(?8, effect_receipt_id)
+             WHERE id = ?1",
+            params![
+                task.id,
+                task.status,
+                task.ttl_secs as i64,
+                task.poll_interval_ms as i64,
+                task.updated_at,
+                task.expires_at,
+                task.last_error,
+                task.effect_receipt_id,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!("MCP task not found: {}", task.id));
+        }
+        let event = if task.session_id.trim().is_empty() {
+            None
+        } else {
+            let mut payload = serde_json::to_value(task)?;
+            if let (Some(object), Some(extra)) = (payload.as_object_mut(), extra.as_object()) {
+                for (key, value) in extra {
+                    object.insert(key.clone(), value.clone());
+                }
+            }
+            Some(insert_event_tx(&tx, &task.session_id, kind, payload)?)
+        };
+        tx.commit()?;
+        if let Some(event) = &event
+            && let Err(error) = self.append_event_mirror(event)
+        {
+            tracing::warn!(%error, "failed to append MCP task event mirror");
+        }
+        Ok((task.clone(), event))
+    }
+
+    pub fn set_mcp_task_result_with_event(
+        &self,
+        task: &McpTask,
+        result_json: &str,
+        result_hash: &str,
+        result_bytes: u64,
+    ) -> Result<(McpTask, Option<Event>)> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE mcp_tasks
+             SET status = ?2, updated_at = ?3, result_json = ?4,
+                 result_hash = ?5, result_bytes = ?6,
+                 last_error = ?7, expires_at = ?8
+             WHERE id = ?1",
+            params![
+                task.id,
+                task.status,
+                task.updated_at,
+                result_json,
+                result_hash,
+                result_bytes as i64,
+                task.last_error,
+                task.expires_at,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!("MCP task not found: {}", task.id));
+        }
+        let mut stored = task.clone();
+        stored.result_available = true;
+        let event = if task.session_id.trim().is_empty() {
+            None
+        } else {
+            Some(insert_event_tx(
+                &tx,
+                &task.session_id,
+                "mcp.task.result",
+                serde_json::json!({
+                    "task": stored,
+                    "result_hash": result_hash,
+                    "result_bytes": result_bytes,
+                    "effect_receipt_id": task.effect_receipt_id,
+                    "note": "task result is evidence; an unknown effect receipt still requires explicit reconciliation",
+                }),
+            )?)
+        };
+        tx.commit()?;
+        if let Some(event) = &event
+            && let Err(error) = self.append_event_mirror(event)
+        {
+            tracing::warn!(%error, "failed to append MCP task result mirror");
+        }
+        Ok((stored, event))
+    }
+
+    pub fn mcp_task_result(&self, task_id: &str) -> Result<Option<(String, String, u64)>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT COALESCE(result_json, ''), COALESCE(result_hash, ''), result_bytes
+             FROM mcp_tasks WHERE id = ?1",
+            params![task_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?.max(0) as u64,
+                ))
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     pub fn list_mcp_servers(&self) -> Result<Vec<McpServer>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
@@ -31237,6 +31474,68 @@ fn write_scopes_overlap(left: &[String], right: &[String]) -> bool {
             let b = normalize_write_scope(b);
             a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
         })
+    })
+}
+
+const MCP_TASK_SELECT: &str = "SELECT id, project_id, session_id, agent_id, agent_name,
+        task_id, server_id, server_name, tool_name, remote_task_id, status, ttl_secs,
+        poll_interval_ms, created_at, updated_at, expires_at,
+        CASE WHEN result_json IS NOT NULL AND result_json <> '' THEN 1 ELSE 0 END,
+        effect_receipt_id, last_error
+     FROM mcp_tasks";
+
+fn insert_mcp_task_row_tx(tx: &rusqlite::Transaction<'_>, task: &McpTask) -> Result<()> {
+    tx.execute(
+        "INSERT INTO mcp_tasks
+         (id, project_id, session_id, agent_id, agent_name, task_id, server_id,
+          server_name, tool_name, remote_task_id, status, ttl_secs, poll_interval_ms,
+          created_at, updated_at, expires_at, effect_receipt_id, last_error)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+        params![
+            task.id,
+            task.project_id,
+            task.session_id,
+            task.agent_id,
+            task.agent_name,
+            task.task_id,
+            task.server_id,
+            task.server_name,
+            task.tool_name,
+            task.remote_task_id,
+            task.status,
+            task.ttl_secs as i64,
+            task.poll_interval_ms as i64,
+            task.created_at,
+            task.updated_at,
+            task.expires_at,
+            task.effect_receipt_id,
+            task.last_error,
+        ],
+    )?;
+    Ok(())
+}
+
+fn map_mcp_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpTask> {
+    Ok(McpTask {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        session_id: row.get(2)?,
+        agent_id: row.get(3)?,
+        agent_name: row.get(4)?,
+        task_id: row.get(5)?,
+        server_id: row.get(6)?,
+        server_name: row.get(7)?,
+        tool_name: row.get(8)?,
+        remote_task_id: row.get(9)?,
+        status: row.get(10)?,
+        ttl_secs: row.get::<_, i64>(11)?.max(0) as u64,
+        poll_interval_ms: row.get::<_, i64>(12)?.max(0) as u64,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
+        expires_at: row.get(15)?,
+        result_available: row.get::<_, i64>(16)? != 0,
+        effect_receipt_id: row.get(17)?,
+        last_error: row.get(18)?,
     })
 }
 

@@ -18781,3 +18781,82 @@ mod agent_identity_view_tests {
         );
     }
 }
+
+#[test]
+fn mcp_task_rows_are_durable_scoped_and_result_bounded() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("mcp tasks"))
+        .unwrap();
+    let session = store.create_session(&project.id, "mcp task").unwrap();
+    let task = vp_protocol::types::McpTask {
+        id: "mcpt-1".to_string(),
+        project_id: project.id.clone(),
+        session_id: session.id.clone(),
+        agent_id: "agent".to_string(),
+        agent_name: "Agent".to_string(),
+        task_id: None,
+        server_id: "server-1".to_string(),
+        server_name: "Server One".to_string(),
+        tool_name: "slow".to_string(),
+        remote_task_id: "remote-1".to_string(),
+        status: "working".to_string(),
+        ttl_secs: 120,
+        poll_interval_ms: 500,
+        created_at: "2026-11-14T00:00:00Z".to_string(),
+        updated_at: "2026-11-14T00:00:00Z".to_string(),
+        expires_at: Some("2026-11-14T00:02:00Z".to_string()),
+        result_available: false,
+        effect_receipt_id: Some("effect-1".to_string()),
+        last_error: None,
+    };
+    let (stored, event) = store.insert_mcp_task_with_event(&task).unwrap();
+    assert_eq!(stored.id, task.id);
+    assert_eq!(event.unwrap().kind, "mcp.task.created");
+    assert_eq!(
+        store
+            .find_mcp_task_by_remote(&session.id, "server-1", "remote-1")
+            .unwrap()
+            .unwrap()
+            .id,
+        task.id
+    );
+    let (tasks, truncated) = store
+        .list_mcp_tasks(Some(&project.id), Some(&session.id), None, None, 10)
+        .unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert!(!truncated);
+    let mut completed = stored.clone();
+    completed.status = "completed".to_string();
+    completed.updated_at = "2026-11-14T00:01:00Z".to_string();
+    completed.result_available = true;
+    let (completed, event) = store
+        .update_mcp_task_with_event(&completed, "mcp.task.completed", serde_json::json!({}))
+        .unwrap();
+    assert_eq!(event.unwrap().kind, "mcp.task.completed");
+    assert_eq!(completed.status, "completed");
+    let (result, event) = store
+        .set_mcp_task_result_with_event(
+            &completed,
+            r#"{"content":[{"type":"text","text":"ok"}]}"#,
+            &"a".repeat(64),
+            12,
+        )
+        .unwrap();
+    assert!(result.result_available);
+    assert_eq!(event.unwrap().kind, "mcp.task.result");
+    let cached = store.mcp_task_result(&task.id).unwrap().unwrap();
+    assert!(cached.0.contains("\"ok\""));
+    assert_eq!(cached.2, 12);
+    assert_eq!(
+        store
+            .get_mcp_task(&task.id)
+            .unwrap()
+            .unwrap()
+            .effect_receipt_id
+            .as_deref(),
+        Some("effect-1")
+    );
+}

@@ -4908,16 +4908,50 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             Err(response) => response_with_id(id, response),
         },
         "mcp.call" => match parse_params::<McpCallParams>(request.params) {
-            Ok(params) => match state
-                .engine
-                .mcp_call(&params.server_id, &params.tool, params.arguments)
-                .await
-            {
+            Ok(params) => match state.engine.mcp_call_for_params(params).await {
                 Ok(result) => RpcResponse::success(id, result),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),
         },
+        "mcp.task.list" => {
+            match parse_params::<vp_protocol::types::McpTaskListParams>(request.params) {
+                Ok(params) => match state.engine.mcp_task_list(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "mcp.task.get" => match parse_params::<vp_protocol::types::McpTaskParams>(request.params) {
+            Ok(params) => match state.engine.mcp_task_get(&params.task_id, true).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "mcp.task.result" => {
+            match parse_params::<vp_protocol::types::McpTaskResultParams>(request.params) {
+                Ok(params) => match state.engine.mcp_task_result(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "mcp.task.cancel" => {
+            match parse_params::<vp_protocol::types::McpTaskCancelParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .mcp_task_cancel(&params.task_id, params.reason.as_deref())
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "mcp.resources" => match parse_params::<McpServerIdParams>(request.params) {
             Ok(params) => match state.engine.mcp_resources(&params.server_id).await {
                 Ok(result) => RpcResponse::success(id, result),

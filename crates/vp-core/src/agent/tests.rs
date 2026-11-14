@@ -6057,18 +6057,24 @@ for line in sys.stdin:
 #[tokio::test]
 async fn managers_and_verifiers_cannot_execute_mcp_tools() {
     let dir = TempDir::new().unwrap();
-    let (engine, _service, _project) = test_service(&dir);
+    let (engine, _service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id, "mcp role check".into(), None)
+        .await
+        .unwrap();
     for role in [AgentRole::Manager, AgentRole::Verifier] {
+        let spec = help_spec(role, AgentProfile::Coding);
         let output = run_mcp_tool(
             &engine,
-            role,
-            "project-1",
+            &session,
+            &spec,
             serde_json::json!({
                 "action": "call",
                 "server": "missing",
                 "tool": "mutate",
                 "arguments": {}
             }),
+            None,
         )
         .await
         .unwrap();

@@ -18736,11 +18736,33 @@ async fn run_loop_body(
                     }),
                 )
                 .await?;
+                let context = crate::mcp::tasks::McpTaskContext::from_session(
+                    &session.project_id,
+                    &session.id,
+                    &spec.id,
+                    &spec.name,
+                    spec.task_id.as_deref(),
+                    effect_begin.as_ref().map(|receipt| receipt.id.as_str()),
+                );
                 match tool_token
-                    .scoped(engine.mcp_call(&binding.server_id, &binding.tool_name, input.clone()))
+                    .scoped(engine.mcp_call_with_context(
+                        &binding.server_id,
+                        &binding.tool_name,
+                        input.clone(),
+                        context,
+                    ))
                     .await
                 {
-                    Ok(result) => ToolOutput::ok(format_mcp_tool_result(&result.result)),
+                    Ok(result) => {
+                        let mut text = format_mcp_tool_result(&result.result);
+                        if let Some(task) = &result.task {
+                            text.push_str(&format!(
+                                "\nAsync MCP task {} is {}. Poll explicitly with mcp action=task_result task_id={} (poll interval {} ms).",
+                                task.id, task.status, task.id, task.poll_interval_ms
+                            ));
+                        }
+                        ToolOutput::ok(text)
+                    }
                     Err(error) => tool_token
                         .snapshot()
                         .map(|snapshot| crate::preemption::tool_output("mcp", &snapshot))
@@ -18762,9 +18784,10 @@ async fn run_loop_body(
                 match tool_token
                     .scoped(run_mcp_tool(
                         engine,
-                        spec.role,
-                        &session.project_id,
+                        session,
+                        spec,
                         input.clone(),
+                        effect_begin.as_ref().map(|receipt| receipt.id.as_str()),
                     ))
                     .await
                 {
@@ -21575,10 +21598,13 @@ async fn resolve_mcp_pin_trust(
 #[allow(clippy::result_large_err)] // the typed failure carries the stable contract
 async fn run_mcp_tool(
     engine: &Engine,
-    role: AgentRole,
-    project_id: &str,
+    session: &Session,
+    spec: &AgentSpec,
     input: serde_json::Value,
+    effect_receipt_id: Option<&str>,
 ) -> Result<ToolOutput> {
+    let role = spec.role;
+    let project_id = session.project_id.as_str();
     let action = input
         .get("action")
         .and_then(serde_json::Value::as_str)
@@ -21696,11 +21722,141 @@ async fn run_mcp_tool(
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({}));
-            let result = engine.mcp_call(&server.id, tool, arguments).await?;
-            Ok(ToolOutput::ok(truncate_to(
-                &serde_json::to_string_pretty(&result.result)?,
-                16_000,
-            )))
+            let context = crate::mcp::tasks::McpTaskContext::from_session(
+                &session.project_id,
+                &session.id,
+                &spec.id,
+                &spec.name,
+                spec.task_id.as_deref(),
+                effect_receipt_id,
+            );
+            let result = engine
+                .mcp_call_with_context(&server.id, tool, arguments, context)
+                .await?;
+            let mut text = format_mcp_tool_result(&result.result);
+            if let Some(task) = &result.task {
+                text.push_str(&format!(
+                    "\nAsync MCP task {} is {}. Inspect explicitly with mcp action=task_get task_id={} or task_result.",
+                    task.id, task.status, task.id
+                ));
+            }
+            Ok(ToolOutput::ok(truncate_to(&text, 16_000)))
+        }
+        "task_list" => {
+            let tasks = engine
+                .mcp_task_list(vp_protocol::types::McpTaskListParams {
+                    project_id: Some(session.project_id.clone()),
+                    session_id: Some(session.id.clone()),
+                    server_id: server.map(|server| server.id),
+                    status: input
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    limit: input
+                        .get("limit")
+                        .and_then(serde_json::Value::as_u64)
+                        .map(|limit| limit.clamp(1, 500) as u32),
+                })
+                .await?;
+            let mut text = String::new();
+            for task in &tasks.tasks {
+                text.push_str(&format!(
+                    "- {} {}/{} [{}] poll={}ms expires={}\n",
+                    task.id,
+                    task.server_name,
+                    task.tool_name,
+                    task.status,
+                    task.poll_interval_ms,
+                    task.expires_at.as_deref().unwrap_or("none")
+                ));
+            }
+            if text.is_empty() {
+                text.push_str("(no MCP async tasks)");
+            }
+            if tasks.truncated {
+                text.push_str("\n(list truncated)");
+            }
+            Ok(ToolOutput::ok_structured(
+                text,
+                serde_json::json!({"tasks": tasks.tasks, "truncated": tasks.truncated}),
+            ))
+        }
+        "task_get" | "task_result" => {
+            let task_id = input
+                .get("task_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("task_id is required for action={action}"))?;
+            if action == "task_get" {
+                let task = engine.mcp_task_get(task_id, true).await?;
+                Ok(ToolOutput::ok_structured(
+                    format!(
+                        "MCP task {} {}/{} [{}] poll={}ms",
+                        task.id,
+                        task.server_name,
+                        task.tool_name,
+                        task.status,
+                        task.poll_interval_ms
+                    ),
+                    serde_json::json!(task),
+                ))
+            } else {
+                let result = engine
+                    .mcp_task_result(vp_protocol::types::McpTaskResultParams {
+                        task_id: task_id.to_string(),
+                        refresh: input.get("refresh").and_then(serde_json::Value::as_bool),
+                    })
+                    .await?;
+                let mut text = format!(
+                    "MCP task {} {}/{} [{}]",
+                    result.task.id,
+                    result.task.server_name,
+                    result.task.tool_name,
+                    result.task.status
+                );
+                if result.pending {
+                    text.push_str(&format!(
+                        "\nStill pending; poll explicitly after {} ms.",
+                        result.task.poll_interval_ms
+                    ));
+                }
+                if let Some(value) = &result.result {
+                    text.push('\n');
+                    text.push_str(&format_mcp_tool_result(value));
+                }
+                Ok(ToolOutput::ok_structured(
+                    truncate_to(&text, 16_000),
+                    serde_json::json!(result),
+                ))
+            }
+        }
+        "task_cancel" => {
+            if !matches!(
+                role,
+                AgentRole::Leader | AgentRole::Manager | AgentRole::Worker | AgentRole::Labour
+            ) {
+                return Ok(ToolOutput::error_coded(
+                    "mcp",
+                    crate::tooling::errors::ToolErrorCode::PERMISSION_DENIED,
+                    "this role may inspect MCP tasks but cannot cancel them",
+                ));
+            }
+            let task_id = input
+                .get("task_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("task_id is required for action=task_cancel"))?;
+            let result = engine
+                .mcp_task_cancel(
+                    task_id,
+                    input.get("reason").and_then(serde_json::Value::as_str),
+                )
+                .await?;
+            Ok(ToolOutput::ok_structured(
+                format!(
+                    "MCP task {} [{}]: {}",
+                    result.task.id, result.task.status, result.message
+                ),
+                serde_json::json!(result),
+            ))
         }
         "resources" => {
             let server =
@@ -23317,7 +23473,10 @@ fn tool_schemas(
             "resources",
             "read_resource",
             "prompts",
-            "get_prompt"
+            "get_prompt",
+            "task_list",
+            "task_get",
+            "task_result"
         ])
     } else {
         serde_json::json!([
@@ -23326,12 +23485,16 @@ fn tool_schemas(
             "resources",
             "read_resource",
             "prompts",
-            "get_prompt"
+            "get_prompt",
+            "task_list",
+            "task_get",
+            "task_result",
+            "task_cancel"
         ])
     };
     tools.push(ToolSchema {
         name: "mcp".to_string(),
-        description: "Inspect configured MCP servers and use their tools, resources, or prompts. Tool executions require approval; Managers and Verifiers can only inspect.".to_string(),
+        description: "Inspect configured MCP servers and use their tools, resources, prompts, or asynchronous task handles. Tool executions require approval; Managers and Verifiers can inspect and read tasks but cannot execute or cancel. Async tasks are polled only when task_get/task_result is called explicitly.".to_string(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -23348,7 +23511,11 @@ fn tool_schemas(
                     "type": "object",
                     "additionalProperties": {"type": "string"},
                     "description": "String arguments for action=get_prompt"
-                }
+                },
+                "task_id": {"type": "string", "description": "Local MCP task id for task_get, task_result, or task_cancel"},
+                "status": {"type": "string", "description": "task_list: optional status filter"},
+                "refresh": {"type": "boolean", "description": "task_result: explicitly poll tasks/result once; default true. No hidden polling."},
+                "reason": {"type": "string", "description": "task_cancel: optional bounded reason"}
             },
             "required": ["action"]
         }),

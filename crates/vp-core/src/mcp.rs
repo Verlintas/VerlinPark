@@ -1,6 +1,11 @@
 mod http;
 mod stdio;
 
+pub mod elicitation;
+pub mod tasks;
+
+use elicitation::ServerRequestHandler;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -130,11 +135,24 @@ impl McpSession {
         method: &str,
         params: Value,
         token: Option<&vp_providers::PreemptToken>,
+        handler: Option<ServerRequestHandler>,
     ) -> Result<Value> {
         match self {
-            Self::Stdio(session) => session.request_preemptible(method, params, token).await,
-            Self::Http(session) => session.request_preemptible(method, params, token).await,
-            Self::Sse(session) => session.request_preemptible(method, params, token).await,
+            Self::Stdio(session) => {
+                session
+                    .request_preemptible(method, params, token, handler)
+                    .await
+            }
+            Self::Http(session) => {
+                session
+                    .request_preemptible(method, params, token, handler)
+                    .await
+            }
+            Self::Sse(session) => {
+                session
+                    .request_preemptible(method, params, token, handler)
+                    .await
+            }
         }
     }
 
@@ -418,6 +436,17 @@ impl McpManager {
         tool: &str,
         arguments: Value,
     ) -> Result<Value> {
+        self.call_tool_with_handler(server, tool, arguments, None)
+            .await
+    }
+
+    pub async fn call_tool_with_handler(
+        &self,
+        server: &McpServer,
+        tool: &str,
+        arguments: Value,
+        handler: Option<ServerRequestHandler>,
+    ) -> Result<Value> {
         ensure_enabled(server)?;
         if tool.trim().is_empty() {
             bail!("MCP tool name is required");
@@ -428,6 +457,7 @@ impl McpManager {
                 &connection,
                 "tools/call",
                 json!({"name": tool, "arguments": arguments}),
+                handler,
             )
             .await;
         if let Err(error) = &result
@@ -435,6 +465,24 @@ impl McpManager {
         {
             // Never retry a tool call: it may have side effects even when the
             // response was lost. Reconnect on the next call instead.
+            self.invalidate_connection(&server.id, &connection).await;
+        }
+        result
+    }
+
+    pub async fn task_request(
+        &self,
+        server: &McpServer,
+        method: &str,
+        params: Value,
+        handler: Option<ServerRequestHandler>,
+    ) -> Result<Value> {
+        ensure_enabled(server)?;
+        let connection = self.connection(server).await?;
+        let result = self.request_on(&connection, method, params, handler).await;
+        if let Err(error) = &result
+            && is_transport(error)
+        {
             self.invalidate_connection(&server.id, &connection).await;
         }
         result
@@ -620,7 +668,10 @@ impl McpManager {
         ensure_enabled(server)?;
         let connection = self.connection(server).await?;
         let info = connection.info().await;
-        let tools = match self.request_on(&connection, "tools/list", json!({})).await {
+        let tools = match self
+            .request_on(&connection, "tools/list", json!({}), None)
+            .await
+        {
             Ok(tools) => tools,
             Err(error) => {
                 if is_transport(&error) {
@@ -631,7 +682,7 @@ impl McpManager {
         };
         let tool_count = array_len(&tools, "tools");
         let (resources_supported, resource_count) = match self
-            .request_on(&connection, "resources/list", json!({}))
+            .request_on(&connection, "resources/list", json!({}), None)
             .await
         {
             Ok(resources) => (true, array_len(&resources, "resources")),
@@ -643,7 +694,7 @@ impl McpManager {
             }
         };
         let (prompts_supported, prompt_count) = match self
-            .request_on(&connection, "prompts/list", json!({}))
+            .request_on(&connection, "prompts/list", json!({}), None)
             .await
         {
             Ok(prompts) => (true, array_len(&prompts, "prompts")),
@@ -764,12 +815,13 @@ impl McpManager {
         connection: &McpConnection,
         method: &str,
         params: Value,
+        handler: Option<ServerRequestHandler>,
     ) -> Result<Value> {
         let token = crate::preemption::current_token();
         let mut session = connection.session.lock().await;
         let result = timeout(
             method,
-            session.request_preemptible(method, params, token.as_ref()),
+            session.request_preemptible(method, params, token.as_ref(), handler),
         )
         .await;
         drop(session);
@@ -796,7 +848,7 @@ impl McpManager {
         params: Value,
     ) -> Result<Value> {
         let connection = self.connection(server).await?;
-        let result = self.request_on(&connection, method, params).await;
+        let result = self.request_on(&connection, method, params, None).await;
         if let Err(error) = &result
             && is_transport(error)
         {
@@ -857,7 +909,9 @@ impl McpManager {
                 .as_ref()
                 .map(|cursor| json!({ "cursor": cursor }))
                 .unwrap_or_else(|| json!({}));
-            let result = self.request_on(&connection, "tools/list", params).await;
+            let result = self
+                .request_on(&connection, "tools/list", params, None)
+                .await;
             let result = match result {
                 Ok(result) => result,
                 Err(error) => {

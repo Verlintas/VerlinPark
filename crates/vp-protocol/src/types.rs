@@ -6500,6 +6500,19 @@ pub struct McpCallParams {
     pub tool: String,
     #[serde(default)]
     pub arguments: Value,
+    /// Optional session context for elicitation routing and durable task
+    /// handles. Operator calls without a session still return the raw result,
+    /// but cannot persist a local task row.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub agent_name: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub effect_receipt_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -6507,6 +6520,105 @@ pub struct McpCallResult {
     pub server_id: String,
     pub tool: String,
     pub result: Value,
+    /// Present when the MCP server returned an asynchronous task handle.
+    #[serde(default)]
+    pub task: Option<McpTask>,
+}
+
+/// Durable local projection of one MCP asynchronous task handle.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpTask {
+    pub id: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub agent_id: String,
+    #[serde(default)]
+    pub agent_name: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    pub server_id: String,
+    pub server_name: String,
+    pub tool_name: String,
+    pub remote_task_id: String,
+    /// working, input_required, completed, failed, cancelled, or expired.
+    pub status: String,
+    pub ttl_secs: u64,
+    pub poll_interval_ms: u64,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub result_available: bool,
+    /// Effect receipt created for the original mutating call, when present.
+    /// Task completion is evidence; it never auto-settles an unknown receipt.
+    #[serde(default)]
+    pub effect_receipt_id: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct McpTaskListParams {
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub server_id: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct McpTaskListResult {
+    pub tasks: Vec<McpTask>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpTaskParams {
+    pub task_id: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct McpTaskResultParams {
+    pub task_id: String,
+    /// Explicitly poll `tasks/get`/`tasks/result` once. There is no hidden
+    /// polling loop; an omitted value defaults to one refresh.
+    #[serde(default)]
+    pub refresh: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct McpTaskResult {
+    pub task: McpTask,
+    #[serde(default)]
+    pub result: Option<Value>,
+    /// True when the remote task is still working or waiting for input.
+    #[serde(default)]
+    pub pending: bool,
+    #[serde(default)]
+    pub result_truncated: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct McpTaskCancelParams {
+    pub task_id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct McpTaskActionResult {
+    pub task: McpTask,
+    pub cancelled: bool,
+    pub message: String,
 }
 
 /// Explicit derivation metadata for an artifact produced from another

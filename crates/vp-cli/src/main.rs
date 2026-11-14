@@ -436,6 +436,40 @@ enum Command {
         tool: String,
         #[arg(long, default_value = "{}")]
         arguments: String,
+        /// Optional session context for elicitation and durable async tasks.
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        agent_id: Option<String>,
+        #[arg(long)]
+        agent_name: Option<String>,
+    },
+    /// List durable MCP async task handles.
+    McpTasks {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        server: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+    /// Show one durable MCP async task, explicitly refreshing tasks/get once.
+    McpTask { task_id: String },
+    /// Read one MCP async task result, explicitly polling tasks/result once.
+    McpTaskResult {
+        task_id: String,
+        #[arg(long)]
+        no_refresh: bool,
+    },
+    /// Cancel one MCP async task through tasks/cancel.
+    McpTaskCancel {
+        task_id: String,
+        #[arg(long)]
+        reason: Option<String>,
     },
     /// List resources exposed by an MCP server.
     McpResources { server: String },
@@ -5247,13 +5281,65 @@ async fn run(cli: Cli) -> Result<()> {
             server,
             tool,
             arguments,
+            session,
+            agent_id,
+            agent_name,
         } => {
             let arguments: serde_json::Value =
                 serde_json::from_str(&arguments).context("parsing --arguments as JSON")?;
             rpc(
                 &discovery,
                 "mcp.call",
-                json!({"server_id": server, "tool": tool, "arguments": arguments}),
+                json!({
+                    "server_id": server,
+                    "tool": tool,
+                    "arguments": arguments,
+                    "session_id": session,
+                    "agent_id": agent_id,
+                    "agent_name": agent_name,
+                }),
+            )
+            .await?
+        }
+        Command::McpTasks {
+            project,
+            session,
+            server,
+            status,
+            limit,
+        } => {
+            rpc(
+                &discovery,
+                "mcp.task.list",
+                json!({
+                    "project_id": project,
+                    "session_id": session,
+                    "server_id": server,
+                    "status": status,
+                    "limit": limit,
+                }),
+            )
+            .await?
+        }
+        Command::McpTask { task_id } => {
+            rpc(&discovery, "mcp.task.get", json!({"task_id": task_id})).await?
+        }
+        Command::McpTaskResult {
+            task_id,
+            no_refresh,
+        } => {
+            rpc(
+                &discovery,
+                "mcp.task.result",
+                json!({"task_id": task_id, "refresh": !no_refresh}),
+            )
+            .await?
+        }
+        Command::McpTaskCancel { task_id, reason } => {
+            rpc(
+                &discovery,
+                "mcp.task.cancel",
+                json!({"task_id": task_id, "reason": reason}),
             )
             .await?
         }
@@ -25452,6 +25538,74 @@ mod plan_fanout_cli_tests {
                 assert!(!yes);
             }
             other => panic!("expected plan-fanout, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod mcp_task_cli_tests {
+    use super::*;
+
+    #[test]
+    fn mcp_task_commands_parse_explicit_polling_and_context() {
+        let cli = Cli::try_parse_from([
+            "vp",
+            "mcp-call",
+            "server-1",
+            "slow",
+            "--arguments",
+            "{}",
+            "--session",
+            "ses-1",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::McpCall {
+                server,
+                tool,
+                session,
+                ..
+            } => {
+                assert_eq!(server, "server-1");
+                assert_eq!(tool, "slow");
+                assert_eq!(session.as_deref(), Some("ses-1"));
+            }
+            other => panic!("expected mcp-call, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["vp", "mcp-task-result", "mcpt-1", "--no-refresh"]).unwrap();
+        match cli.command {
+            Command::McpTaskResult {
+                task_id,
+                no_refresh,
+            } => {
+                assert_eq!(task_id, "mcpt-1");
+                assert!(no_refresh);
+            }
+            other => panic!("expected mcp-task-result, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from([
+            "vp",
+            "mcp-tasks",
+            "--session",
+            "ses-1",
+            "--status",
+            "input_required",
+            "--limit",
+            "25",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::McpTasks {
+                session,
+                status,
+                limit,
+                ..
+            } => {
+                assert_eq!(session.as_deref(), Some("ses-1"));
+                assert_eq!(status.as_deref(), Some("input_required"));
+                assert_eq!(limit, 25);
+            }
+            other => panic!("expected mcp-tasks, got {other:?}"),
         }
     }
 }

@@ -99,11 +99,11 @@ impl HttpSession {
 
     pub(super) async fn notify(&mut self, method: &str, params: Value) -> Result<()> {
         let message = json!({"jsonrpc": "2.0", "method": method, "params": params});
-        self.post(message, false).await.map(|_| ())
+        self.post(message, false, None).await.map(|_| ())
     }
 
     pub(super) async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
-        self.request_preemptible(method, params, None).await
+        self.request_preemptible(method, params, None, None).await
     }
 
     pub(super) async fn request_preemptible(
@@ -111,6 +111,7 @@ impl HttpSession {
         method: &str,
         params: Value,
         token: Option<&vp_providers::PreemptToken>,
+        handler: Option<super::elicitation::ServerRequestHandler>,
     ) -> Result<Value> {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
@@ -135,10 +136,10 @@ impl HttpSession {
                             .await;
                         bail!("MCP {method} was preempted");
                     }
-                    response = self.post(message, true) => response,
+                    response = self.post(message, true, handler.clone()) => response,
                 }
             }
-            None => self.post(message, true).await,
+            None => self.post(message, true, handler).await,
         };
         response?.ok_or_else(|| transport(format!("MCP {method} was accepted without a response")))
     }
@@ -164,7 +165,12 @@ impl HttpSession {
         let _ = tokio::time::timeout(ACK_TIMEOUT, self.client.execute(request)).await;
     }
 
-    async fn post(&mut self, message: Value, expect_response: bool) -> Result<Option<Value>> {
+    async fn post(
+        &mut self,
+        message: Value,
+        expect_response: bool,
+        handler: Option<super::elicitation::ServerRequestHandler>,
+    ) -> Result<Option<Value>> {
         let mut request = self
             .client
             .post(self.endpoint.clone())
@@ -232,6 +238,7 @@ impl HttpSession {
                 .read_sse(
                     response,
                     Some(json!({"id": self.next_id.saturating_sub(1)})),
+                    handler,
                 )
                 .await;
         }
@@ -250,14 +257,19 @@ impl HttpSession {
         }
         let value: Value = serde_json::from_str(&body)
             .with_context(|| format!("parsing MCP HTTP {} response", self.name))?;
-        self.handle_messages(value, Some(json!({"id": self.next_id.saturating_sub(1)})))
-            .await
+        self.handle_messages(
+            value,
+            Some(json!({"id": self.next_id.saturating_sub(1)})),
+            handler,
+        )
+        .await
     }
 
     async fn read_sse(
         &mut self,
         response: Response,
         expected: Option<Value>,
+        handler: Option<super::elicitation::ServerRequestHandler>,
     ) -> Result<Option<Value>> {
         let mut events = response.bytes_stream().eventsource();
         loop {
@@ -293,7 +305,10 @@ impl HttpSession {
             }
             let value: Value = serde_json::from_str(&event.data)
                 .with_context(|| format!("parsing MCP HTTP {} SSE event", self.name))?;
-            if let Some(result) = self.handle_messages(value, expected.clone()).await? {
+            if let Some(result) = self
+                .handle_messages(value, expected.clone(), handler.clone())
+                .await?
+            {
                 return Ok(Some(result));
             }
         }
@@ -303,18 +318,33 @@ impl HttpSession {
         &mut self,
         value: Value,
         expected: Option<Value>,
+        handler: Option<super::elicitation::ServerRequestHandler>,
     ) -> Result<Option<Value>> {
         let incoming = classify_messages(value, expected.as_ref())?;
         for request in &incoming.server_requests {
             let id = request.get("id").cloned().unwrap_or(Value::Null);
-            let response = json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": {
-                    "code": -32601,
-                    "message": "VerlinPark does not implement server-initiated MCP methods"
-                }
-            });
+            let method = request
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let response = match (method, handler.as_ref()) {
+                ("elicitation/create", Some(handler)) => match handler(request.clone()).await {
+                    Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+                    Err(error) => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {"code": -32603, "message": format!("{error:#}")}
+                    }),
+                },
+                _ => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32601,
+                        "message": "VerlinPark does not implement this server-initiated MCP method"
+                    }
+                }),
+            };
             self.post_response(response).await?;
         }
         Ok(incoming.response)
@@ -448,11 +478,11 @@ impl SseSession {
 
     pub(super) async fn notify(&mut self, method: &str, params: Value) -> Result<()> {
         let message = json!({"jsonrpc": "2.0", "method": method, "params": params});
-        self.post(message, false).await.map(|_| ())
+        self.post(message, false, None).await.map(|_| ())
     }
 
     pub(super) async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
-        self.request_preemptible(method, params, None).await
+        self.request_preemptible(method, params, None, None).await
     }
 
     pub(super) async fn request_preemptible(
@@ -460,6 +490,7 @@ impl SseSession {
         method: &str,
         params: Value,
         token: Option<&vp_providers::PreemptToken>,
+        handler: Option<super::elicitation::ServerRequestHandler>,
     ) -> Result<Value> {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
@@ -484,10 +515,10 @@ impl SseSession {
                             .await;
                         bail!("MCP SSE {method} was preempted");
                     }
-                    response = self.post(message, true) => response,
+                    response = self.post(message, true, handler.clone()) => response,
                 }
             }
-            None => self.post(message, true).await,
+            None => self.post(message, true, handler).await,
         };
         response?
             .ok_or_else(|| transport(format!("MCP SSE {method} was accepted without a response")))
@@ -498,7 +529,12 @@ impl SseSession {
         self.events = futures_util::stream::empty().boxed();
     }
 
-    async fn post(&mut self, message: Value, expect_response: bool) -> Result<Option<Value>> {
+    async fn post(
+        &mut self,
+        message: Value,
+        expect_response: bool,
+        handler: Option<super::elicitation::ServerRequestHandler>,
+    ) -> Result<Option<Value>> {
         let response = timeout_plain(
             "SSE POST",
             self.client
@@ -527,7 +563,10 @@ impl SseSession {
         if status == StatusCode::ACCEPTED && !is_sse {
             if expect_response {
                 return self
-                    .read_response(Some(json!({"id": self.next_id.saturating_sub(1)})))
+                    .read_response(
+                        Some(json!({"id": self.next_id.saturating_sub(1)})),
+                        handler.clone(),
+                    )
                     .await;
             }
             return Ok(None);
@@ -548,14 +587,21 @@ impl SseSession {
             }
             let events = response.bytes_stream().eventsource();
             return self
-                .read_response_from(events, Some(json!({"id": self.next_id.saturating_sub(1)})))
+                .read_response_from(
+                    events,
+                    Some(json!({"id": self.next_id.saturating_sub(1)})),
+                    handler,
+                )
                 .await;
         }
         let body = read_body(response).await?;
         if body.trim().is_empty() {
             if expect_response {
                 return self
-                    .read_response(Some(json!({"id": self.next_id.saturating_sub(1)})))
+                    .read_response(
+                        Some(json!({"id": self.next_id.saturating_sub(1)})),
+                        handler.clone(),
+                    )
                     .await;
             }
             return Ok(None);
@@ -565,11 +611,19 @@ impl SseSession {
         }
         let value: Value = serde_json::from_str(&body)
             .with_context(|| format!("parsing MCP SSE {} POST response", self.name))?;
-        self.handle_messages(value, Some(json!({"id": self.next_id.saturating_sub(1)})))
-            .await
+        self.handle_messages(
+            value,
+            Some(json!({"id": self.next_id.saturating_sub(1)})),
+            handler,
+        )
+        .await
     }
 
-    async fn read_response(&mut self, expected: Option<Value>) -> Result<Option<Value>> {
+    async fn read_response(
+        &mut self,
+        expected: Option<Value>,
+        handler: Option<super::elicitation::ServerRequestHandler>,
+    ) -> Result<Option<Value>> {
         loop {
             let event = self.next_event().await?;
             if !is_rpc_event(&event) {
@@ -583,7 +637,10 @@ impl SseSession {
             }
             let value: Value = serde_json::from_str(&event.data)
                 .with_context(|| format!("parsing MCP SSE {} event", self.name))?;
-            if let Some(result) = self.handle_messages(value, expected.clone()).await? {
+            if let Some(result) = self
+                .handle_messages(value, expected.clone(), handler.clone())
+                .await?
+            {
                 return Ok(Some(result));
             }
         }
@@ -593,6 +650,7 @@ impl SseSession {
         &mut self,
         events: S,
         expected: Option<Value>,
+        handler: Option<super::elicitation::ServerRequestHandler>,
     ) -> Result<Option<Value>>
     where
         S: futures_util::Stream<
@@ -623,7 +681,10 @@ impl SseSession {
             }
             let value: Value = serde_json::from_str(&event.data)
                 .with_context(|| format!("parsing MCP SSE {} event", self.name))?;
-            if let Some(result) = self.handle_messages(value, expected.clone()).await? {
+            if let Some(result) = self
+                .handle_messages(value, expected.clone(), handler.clone())
+                .await?
+            {
                 return Ok(Some(result));
             }
         }
@@ -633,18 +694,33 @@ impl SseSession {
         &mut self,
         value: Value,
         expected: Option<Value>,
+        handler: Option<super::elicitation::ServerRequestHandler>,
     ) -> Result<Option<Value>> {
         let incoming = classify_messages(value, expected.as_ref())?;
         for request in &incoming.server_requests {
             let id = request.get("id").cloned().unwrap_or(Value::Null);
-            let response = json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": {
-                    "code": -32601,
-                    "message": "VerlinPark does not implement server-initiated MCP methods"
-                }
-            });
+            let method = request
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let response = match (method, handler.as_ref()) {
+                ("elicitation/create", Some(handler)) => match handler(request.clone()).await {
+                    Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+                    Err(error) => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {"code": -32603, "message": format!("{error:#}")}
+                    }),
+                },
+                _ => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32601,
+                        "message": "VerlinPark does not implement this server-initiated MCP method"
+                    }
+                }),
+            };
             let _ = timeout_plain(
                 "SSE ack",
                 self.client

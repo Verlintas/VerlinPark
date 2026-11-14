@@ -19855,17 +19855,13 @@ impl Engine {
         tool: &str,
         arguments: serde_json::Value,
     ) -> Result<McpCallResult> {
-        let store = self.store.clone();
-        let id = server_id.to_string();
-        let server = tokio::task::spawn_blocking(move || store.get_mcp_server(&id))
-            .await??
-            .ok_or_else(|| anyhow::anyhow!("MCP server not found: {server_id}"))?;
-        let result = self.mcp.call_tool(&server, tool, arguments).await?;
-        Ok(McpCallResult {
-            server_id: server_id.to_string(),
-            tool: tool.to_string(),
-            result,
-        })
+        self.mcp_call_with_context(
+            server_id,
+            tool,
+            arguments,
+            crate::mcp::tasks::McpTaskContext::default(),
+        )
+        .await
     }
 
     pub async fn mcp_resources(&self, server_id: &str) -> Result<McpResourceListResult> {

@@ -105,7 +105,7 @@ impl StdioSession {
     }
 
     pub(super) async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
-        self.request_preemptible(method, params, None).await
+        self.request_preemptible(method, params, None, None).await
     }
 
     pub(super) async fn request_preemptible(
@@ -113,6 +113,7 @@ impl StdioSession {
         method: &str,
         params: Value,
         token: Option<&vp_providers::PreemptToken>,
+        handler: Option<super::elicitation::ServerRequestHandler>,
     ) -> Result<Value> {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
@@ -158,19 +159,31 @@ impl StdioSession {
             }
             let value: Value = serde_json::from_str(&line)
                 .with_context(|| format!("parsing MCP {method} response"))?;
-            if value.get("method").is_some() {
+            if let Some(server_method) = value.get("method").and_then(Value::as_str) {
                 if let Some(request_id) = value.get("id").cloned() {
-                    self.write_message(&json!({
-                        "jsonrpc": "2.0",
-                        "id": request_id,
-                        "error": {
-                            "code": -32601,
-                            "message": "VerlinPark does not implement server-initiated MCP methods"
-                        }
-                    }))
-                    .await
-                    .map_err(|error| {
-                        transport(format!("MCP {method} rejection failed: {error}"))
+                    let response = match (server_method, handler.as_ref()) {
+                        ("elicitation/create", Some(handler)) => match handler(value.clone()).await
+                        {
+                            Ok(result) => {
+                                json!({"jsonrpc": "2.0", "id": request_id, "result": result})
+                            }
+                            Err(error) => json!({
+                                "jsonrpc": "2.0",
+                                "id": request_id,
+                                "error": {"code": -32603, "message": format!("{error:#}")}
+                            }),
+                        },
+                        _ => json!({
+                            "jsonrpc": "2.0",
+                            "id": request_id,
+                            "error": {
+                                "code": -32601,
+                                "message": "VerlinPark does not implement this server-initiated MCP method"
+                            }
+                        }),
+                    };
+                    self.write_message(&response).await.map_err(|error| {
+                        transport(format!("MCP {method} response failed: {error}"))
                     })?;
                 }
                 continue;
