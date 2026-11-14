@@ -167,6 +167,7 @@ post-wave tool surface is listed in section 0 and in `docs/PROGRESS.md`.
 | `coordinate`, `team_status` | team board, blockers, handoffs |
 | `ask_user` | blocking user question |
 | `mcp` | MCP inspect/call plus explicit async task list/get/result/cancel |
+| `run_script` | bounded QuickJS composition of frozen read-only tools (opt-in file writes) with inner-call approvals/effects |
 | dynamic MCP tools | up to 32 tools for Leader/Worker/Labour |
 | `todo_write` | Leader todo list |
 | `delegate`, `delegate_many`, `delegate_acp` | delegation |
@@ -949,6 +950,12 @@ existing content-addressed store and GC.
   results stay pin/trust gated. `promote=true` applies out-of-bundle built-in
   schemas only at the next turn boundary through a priced `bundle.revision`;
   role restrictions and approvals still apply.
+- `run_script` (C10, implemented): a capability-minimal QuickJS runner over
+  the frozen bundle. Static `oxc` checks plus a native `tools.<name>` proxy;
+  no filesystem/network/shell/process/GUI/MCP/native bindings. Read-only by
+  default; `allow_write` adds three file tools under separate approval and
+  effect tracking. 64 MiB heap, 5s default CPU, 1–32 calls, 1–8 writes.
+  Every inner call is a normal gated tool call with `tool.finished` evidence.
 - `task_control` (P2): Leader/Manager-only, event-backed `skip`, `retry`,
   `cancel`, `pause`, `resume` for a task in its own plan. Do not expose this
   before the task lifecycle atomicity gaps in AUDIT A-14 are closed.

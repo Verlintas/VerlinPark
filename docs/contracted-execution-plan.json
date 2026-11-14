@@ -368,7 +368,7 @@
       "title": "Code Mode run_script",
       "phase": "phase-3",
       "priority": "P1",
-      "status": "planned",
+      "status": "implemented",
       "depends_on": [
         "C1",
         "C2"
@@ -376,13 +376,11 @@
       "files": [
         "crates/vp-core/src/script.rs",
         "crates/vp-core/src/agent.rs",
-        "crates/vp-core/src/tools.rs",
+        "crates/vp-core/src/permissions.rs",
         "crates/vp-core/src/tool_bundle.rs",
-        "crates/vp-store/src/store.rs",
-        "crates/vp-protocol/src/types.rs",
-        "crates/vp-daemon/src/main.rs",
-        "crates/vp-cli/src/main.rs",
-        "docs/adr/0202-code-mode-run-script.md"
+        "crates/vp-core/src/tooling/errors.rs",
+        "crates/vp-core/src/tooling/recipes.rs",
+        "docs/adr/0219-code-mode-run-script.md"
       ],
       "deliverables": [
         "rquickjs + oxc script runner with 64 MB/CPU budget",
@@ -582,6 +580,14 @@
       "adr": "0218",
       "tests": {
         "rust": 3932,
+        "swift": 0
+      }
+    },
+    "C10": {
+      "commit": "1cef0e9",
+      "adr": "0219",
+      "tests": {
+        "rust": 3951,
         "swift": 0
       }
     }

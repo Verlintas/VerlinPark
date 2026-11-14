@@ -510,7 +510,7 @@ should wait until the identity/role contracts and Worker workspace phases
 | C7 Bounded fan-out | **implemented** | ADR-0216, Engine `fanout_plan`, Leader `plan_fanout`, RPC/CLI, disjoint scopes, shared join, idempotent replay; join is a real task and there is no automatic expansion |
 | C8 Tool search v2 + delta snapshots | **implemented** | ADR-0217, BM25/prerequisite closure/completeness, turn-boundary schema promotion with `bundle.revision` and cache pricing, delta browser snapshots with generation/STALE_REF |
 | C9 MCP tasks/elicitation | **implemented** | ADR-0218, durable `mcp_tasks`/get/result/cancel/list, explicit polling only, TTL/effect evidence, form elicitation to question inbox, URL denial |
-| C10 Code Mode | planned | |
+| C10 Code Mode | **implemented** | ADR-0219, QuickJS+oxc, 64 MiB/CPU/call budgets, frozen-bundle typed bindings, no ambient capabilities, inner contract/approval/effect/journal gates, read-only first + opt-in file writes |
 | C11 A2A loopback | planned | |
 | C12 Advisory progress ledger | planned | |
 

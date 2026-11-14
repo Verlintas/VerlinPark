@@ -372,6 +372,41 @@ HTTP/SSE MCP servers remain trusted external endpoints.
 
 Verification: 3,932 Rust tests passed; no Swift code changed.
 
+## 0.23 2026-11-14 Contracted execution C10
+
+ADR-0219 implements Code Mode `run_script` with a capability-minimal QuickJS
+sandbox (`rquickjs`) and `oxc` static validation. Scripts can compose only the
+registry-backed tools in the current advertised bundle: a fixed read-only set
+by default, plus `write_file`/`edit_file`/`apply_patch` only when `allow_write`
+is set and the outer call receives a HostState approval. There are no shell,
+process, network, filesystem, GUI, MCP, mailbox, artifact, source, memory, team,
+gate, delegation, timer, module, or native bindings inside the script; `eval`
+and the `Function` global are removed before user code runs. Unknown names are
+rejected by the binding proxy.
+
+Every inner call re-enters the dispatcher policy stack: role policy, task
+contract authorization, approval broker (synthetic inner call ids), run-journal
+intent/completion and duplicate-write protection, effect classification,
+pre/postcondition probe, settlement/replay/`unknown` blocking, active-skill
+allow/deny, preemption/tool deadline, and `tool.started`/`tool.finished` events
+with script parent/sequence metadata. The outer `run_script` approval is not a
+blanket write grant; each inner write is separately authorized. Limits are
+64 MiB heap, 512 KiB stack, 100–30,000 ms CPU, 1–32 calls, 1–8 writes, 64 KiB
+source/input, 256 KiB result, 64 KiB stdout. `run_script` is advertised only to
+Leader/Worker/Labour; the Leader target moves to 51.
+
+Still open: this is not an OS-level sandbox, cgroup, separate process, seccomp
+profile, or native-safety boundary; QuickJS runs in the daemon process. Only
+registry tools are bound (no MCP/mailbox/artifact/source/memory/gate/delegation).
+Schema checking is bounded best-effort, not full JSON Schema; dynamically
+constructed code is capability-limited but not statically inspected; effect
+replay is idempotent re-execution, not exactly-once or a separate deterministic
+replay engine; call/write caps are per invocation, not a global quota; no
+script RPC, cross-host execution, or write expansion beyond the three file
+tools.
+
+Verification: 3,951 Rust tests passed; no Swift code changed.
+
 ## 0. 2026-10-30 跟进
 
 第一轮硬化已完成（同一 `main` 线，提交见仓库历史）：

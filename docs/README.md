@@ -36,6 +36,7 @@
 | **Current** | [adr/0216-bounded-dynamic-fanout.md](adr/0216-bounded-dynamic-fanout.md) | C7 bounded dynamic fan-out：显式 template 展开、disjoint child scope、shared join、dedupe/cap/approval、no recursion/automatic rewrite |
 | **Current** | [adr/0217-tool-search-v2-and-delta-snapshots.md](adr/0217-tool-search-v2-and-delta-snapshots.md) | C8 tool search v2：BM25 + prerequisite closure、completeness/missing、turn-boundary schema promotion/cache pricing、delta browser snapshots + generation/STALE_REF |
 | **Current** | [adr/0218-mcp-async-tasks-and-elicitation.md](adr/0218-mcp-async-tasks-and-elicitation.md) | C9 MCP async tasks：durable task handle/get/result/cancel/list、TTL/effect evidence、form elicitation → question inbox、URL denial |
+| **Current** | [adr/0219-code-mode-run-script.md](adr/0219-code-mode-run-script.md) | C10 Code Mode：QuickJS+oxc、64 MiB/CPU/call budgets、frozen-bundle typed bindings、无 ambient capability、inner calls 重新进入 contract/approval/effect/journal gates、read-only 优先 + opt-in 文件写入 |
 | **Reference** | [OBSCURA_ASSESSMENT.md](OBSCURA_ASSESSMENT.md) | Obscura（Rust/V8/CDP/MCP headless browser）评估：适用场景、安全约束、三种集成方案、结论为 cache 轮之后再做可选外部网页后端 |
 | **Reference** | [PRIDE_FLAGS.md](PRIDE_FLAGS.md) | Pride flag 资产来源与许可 |
 | **Reference** | [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) | FlagKit 等第三方资产许可 |
