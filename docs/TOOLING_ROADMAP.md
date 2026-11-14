@@ -166,7 +166,7 @@ post-wave tool surface is listed in section 0 and in `docs/PROGRESS.md`.
 | `use_skill` | activate a project skill |
 | `coordinate`, `team_status` | team board, blockers, handoffs |
 | `ask_user` | blocking user question |
-| `mcp` | MCP inspect/call entry point |
+| `mcp` | MCP inspect/call plus explicit async task list/get/result/cancel |
 | dynamic MCP tools | up to 32 tools for Leader/Worker/Labour |
 | `todo_write` | Leader todo list |
 | `delegate`, `delegate_many`, `delegate_acp` | delegation |

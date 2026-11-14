@@ -509,7 +509,7 @@ should wait until the identity/role contracts and Worker workspace phases
 | Hardening round three | **implemented** | ADR-0215, 3,902 Rust: S5 logical erasure, identity id/generation provenance, contract glob/URL corpus, effect dispatch/truncation fail-closed, gate payload/token hardening, C6 evidence filtering, S8 shape validation, S6 lookback cutoff, old-DB migration fixture; crypto-erasure/retention and exhaustive parser corpus remain |
 | C7 Bounded fan-out | **implemented** | ADR-0216, Engine `fanout_plan`, Leader `plan_fanout`, RPC/CLI, disjoint scopes, shared join, idempotent replay; join is a real task and there is no automatic expansion |
 | C8 Tool search v2 + delta snapshots | **implemented** | ADR-0217, BM25/prerequisite closure/completeness, turn-boundary schema promotion with `bundle.revision` and cache pricing, delta browser snapshots with generation/STALE_REF |
-| C9 MCP tasks/elicitation | planned | |
+| C9 MCP tasks/elicitation | **implemented** | ADR-0218, durable `mcp_tasks`/get/result/cancel/list, explicit polling only, TTL/effect evidence, form elicitation to question inbox, URL denial |
 | C10 Code Mode | planned | |
 | C11 A2A loopback | planned | |
 | C12 Advisory progress ledger | planned | |

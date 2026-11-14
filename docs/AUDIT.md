@@ -346,6 +346,32 @@ is per-daemon, not cross-host.
 
 Verification: 3,920 Rust tests passed; no Swift code changed.
 
+## 0.22 2026-11-14 Contracted execution C9
+
+ADR-0218 implements durable MCP asynchronous task handles and elicitation.
+`tools/call` task handles are persisted in `mcp_tasks` with owner/session/server/
+tool/remote id, normalized status, bounded TTL/poll interval/expiry, result
+hash/bytes, optional effect receipt id, and bounded errors. `mcp.task.list/get/
+result/cancel` and the CLI/agent actions are explicit; the daemon never polls
+on its own, `input_required` is reported as pending, and TTL expiry is marked on
+explicit read. MCP transports now handle only `elicitation/create` when a
+session-scoped handler is installed; form requests become normal question-inbox
+questions and return accept/decline/cancel, while URL mode is denied and never
+opened. `mcp.elicitation` audit events contain mode/action/reason/question id
+but no message, schema, or answer content. Other server-initiated methods keep
+`-32601`; dynamic MCP server lifecycle remains operator-driven. Mutating calls
+still create normal effect receipts; a task references the receipt but
+completion never auto-settles an unknown receipt.
+
+Still open: MCP task rows are local operational SQLite plus events and are not
+rebuilt by bundle import/`db-rebuild`; task result bodies are excluded from
+events; there is no push task notification, cross-session task sharing, or
+automatic reconciliation; handle/status detection is a server-variant
+heuristic; elicitation is one bounded question and URL mode is unavailable;
+HTTP/SSE MCP servers remain trusted external endpoints.
+
+Verification: 3,932 Rust tests passed; no Swift code changed.
+
 ## 0. 2026-10-30 跟进
 
 第一轮硬化已完成（同一 `main` 线，提交见仓库历史）：

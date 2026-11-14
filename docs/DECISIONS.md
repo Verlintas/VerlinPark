@@ -221,6 +221,7 @@
 | [0215](adr/0215-hardening-round-three.md) | Hardening round three: logical memory erasure, identity provenance, contract glob/URL, effect dispatch/truncation, gate payload/token, C6 evidence, S8 shape validation, old-DB migration | Accepted | Runtime/Security/Memory |
 | [0216](adr/0216-bounded-dynamic-fanout.md) | Bounded dynamic fan-out: explicit template expansion, disjoint child scopes, shared join, dedupe/cap, approval, no recursion or automatic rewrite | Accepted | Runtime/Orchestration |
 | [0217](adr/0217-tool-search-v2-and-delta-snapshots.md) | Tool search v2: BM25 + prerequisite closure, completeness/missing, turn-boundary schema promotion with priced cache epoch, delta browser snapshots with generation/STALE_REF | Accepted | Runtime/Observability |
+| [0218](adr/0218-mcp-async-tasks-and-elicitation.md) | MCP async tasks: durable explicit task handles/get/result/cancel/list, TTL/effect evidence, form elicitation via question inbox, URL denial | Accepted | MCP/Runtime/Security |
 
 ---
 

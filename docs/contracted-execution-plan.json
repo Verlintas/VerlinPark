@@ -332,7 +332,7 @@
       "title": "MCP tasks and elicitation",
       "phase": "phase-2",
       "priority": "P2",
-      "status": "planned",
+      "status": "implemented",
       "depends_on": [
         "C2",
         "C3"
@@ -345,7 +345,7 @@
         "crates/vp-protocol/src/types.rs",
         "crates/vp-daemon/src/main.rs",
         "crates/vp-cli/src/main.rs",
-        "docs/adr/0201-mcp-tasks-and-elicitation.md"
+        "docs/adr/0218-mcp-async-tasks-and-elicitation.md"
       ],
       "deliverables": [
         "MCP tools/call task handle: working/input_required/completed",
@@ -574,6 +574,14 @@
       "adr": "0217",
       "tests": {
         "rust": 3920,
+        "swift": 0
+      }
+    },
+    "C9": {
+      "commit": "d03d18c",
+      "adr": "0218",
+      "tests": {
+        "rust": 3932,
         "swift": 0
       }
     }
