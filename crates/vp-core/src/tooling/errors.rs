@@ -496,6 +496,17 @@ tool_error_codes! {
     TOOL_OUTPUT_INVALID => "TOOL_OUTPUT_INVALID", false, "tool_output", "Use a valid line/byte range and a literal pattern; see the read_tool_output schema.";
     TOOL_OUTPUT_FAILED => "TOOL_OUTPUT_FAILED", false, "tool_output", "Inspect the paging error; the original tool result may still be available in the transcript.";
 
+    // Code Mode scripts
+    SCRIPT_INVALID => "SCRIPT_INVALID", false, "script", "Fix the JavaScript syntax or remove forbidden ambient globals, then resubmit the script.";
+    SCRIPT_FAILED => "SCRIPT_FAILED", false, "script", "Read the script error, fix the JavaScript, and avoid retrying the identical script unchanged.";
+    SCRIPT_TIMEOUT => "SCRIPT_TIMEOUT", false, "script", "Reduce loops or split the work into smaller scripts; the CPU budget is fixed per call.";
+    SCRIPT_MEMORY_LIMIT => "SCRIPT_MEMORY_LIMIT", false, "script", "Process data in smaller pages instead of materializing large arrays or strings.";
+    SCRIPT_CALL_BUDGET => "SCRIPT_CALL_BUDGET", false, "script", "Stay within the declared max_calls budget or split the composition across multiple script calls.";
+    SCRIPT_WRITE_BUDGET => "SCRIPT_WRITE_BUDGET", false, "script", "Stay within the declared max_write_calls budget; do not use a script as an unbounded edit loop.";
+    SCRIPT_OUTPUT_LIMIT => "SCRIPT_OUTPUT_LIMIT", false, "script", "Return a smaller summary and write large output through the normal artifact or file tools.";
+    SCRIPT_CANCELLED => "SCRIPT_CANCELLED", false, "script", "The script was cancelled; inspect the partial state before starting a new run.";
+    SCRIPT_DISABLED => "SCRIPT_DISABLED", false, "script", "Use the normal tool surface; Code Mode is not available for this role, bundle, or project.";
+
     // MCP
     MCP_SERVER_NOT_FOUND => "MCP_SERVER_NOT_FOUND", false, "mcp", "List MCP servers and use an exact server id or name.";
     MCP_DISABLED => "MCP_DISABLED", false, "mcp", "Enable the MCP server in project settings before calling it.";

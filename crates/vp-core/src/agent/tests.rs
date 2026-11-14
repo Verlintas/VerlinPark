@@ -20877,7 +20877,7 @@ async fn frozen_tool_bundle_matches_the_role_matrix_and_stays_stable() {
         crate::tool_bundle::ToolBundleKind::Leader
     );
     assert!(leader_bundle.builtin_count() <= crate::tool_bundle::LEADER_TOOL_LIMIT);
-    assert_eq!(leader_bundle.builtin_count(), 50);
+    assert_eq!(leader_bundle.builtin_count(), 51);
     assert!(leader_bundle.contains("submit_team_plan"));
     assert!(leader_bundle.contains("delegate"));
     assert!(leader_bundle.contains("browser"));
@@ -21153,7 +21153,7 @@ async fn tool_bundle_now_reports_minimal_worker_and_catalog_without_a_run() {
         .iter()
         .find(|row| row.bundle == "leader")
         .unwrap();
-    assert_eq!(leader.target_limit, Some(50));
+    assert_eq!(leader.target_limit, Some(51));
 
     let snapshot = service
         .tool_bundle_now(&session.id, &[], None, false)
@@ -21167,7 +21167,7 @@ async fn tool_bundle_now_reports_minimal_worker_and_catalog_without_a_run() {
         .find(|role| role.role == "leader")
         .unwrap();
     assert_eq!(default_leader.bundle, "leader");
-    assert_eq!(default_leader.builtin_count, 48);
+    assert_eq!(default_leader.builtin_count, 49);
 }
 
 #[tokio::test]
@@ -21189,7 +21189,7 @@ async fn cache_plan_reports_the_frozen_bundle_for_each_role() {
     assert_eq!(plan.roles.len(), 1);
     let leader = &plan.roles[0];
     assert_eq!(leader.tool_bundle, "leader");
-    assert_eq!(leader.tool_bundle_tool_count, 48);
+    assert_eq!(leader.tool_bundle_tool_count, 49);
     assert_eq!(leader.tool_bundle_within_target, Some(true));
     assert!(!leader.tool_bundle_fallback);
     assert_eq!(leader.tool_bundle_hash.len(), 64);
@@ -21604,7 +21604,7 @@ async fn tool_bundle_matrix_covers_standard_combinations_without_session_state()
     };
     let leader = find("leader", "generic", None);
     assert_eq!(leader.bundle, "leader");
-    assert_eq!(leader.builtin_count, 48);
+    assert_eq!(leader.builtin_count, 49);
     assert_eq!(leader.within_target, Some(true));
     assert!(!leader.fallback);
     let manager = find("manager", "coding", None);
@@ -21613,7 +21613,7 @@ async fn tool_bundle_matrix_covers_standard_combinations_without_session_state()
     assert_eq!(manager.mcp_count, 0);
     let worker_coding = find("worker", "coding", Some("implementation"));
     assert_eq!(worker_coding.bundle, "coding");
-    assert_eq!(worker_coding.builtin_count, 38);
+    assert_eq!(worker_coding.builtin_count, 39);
     assert_eq!(worker_coding.within_target, Some(true));
     let worker_minimal = find("worker", "coding", Some("trivial"));
     assert_eq!(worker_minimal.bundle, "minimal");
@@ -21629,7 +21629,7 @@ async fn tool_bundle_matrix_covers_standard_combinations_without_session_state()
     assert!(unknown.fallback);
     let labour = find("labour", "coding", Some("implementation"));
     assert_eq!(labour.bundle, "coding");
-    assert_eq!(labour.builtin_count, 36);
+    assert_eq!(labour.builtin_count, 37);
     let scout = find("scout", "research", None);
     assert_eq!(scout.bundle, "research");
     assert_eq!(scout.builtin_count, 20);
@@ -21687,7 +21687,7 @@ async fn tool_bundle_history_is_bounded_newest_first_and_role_filtered() {
         assert_eq!(entry.bundle, "leader");
         assert_eq!(entry.bundle_hash.len(), 64);
         assert_eq!(entry.tools_hash.len(), 64);
-        assert_eq!(entry.tool_count, 48);
+        assert_eq!(entry.tool_count, 49);
         assert!(!entry.fallback);
         assert!(!entry.created_at.is_empty());
     }
@@ -21719,11 +21719,11 @@ async fn tool_bundle_diff_is_deterministic_and_bounded() {
         .unwrap();
     assert_eq!(diff.from_bundle, "leader");
     assert_eq!(diff.to_bundle, "minimal");
-    assert_eq!(diff.from_count, 48);
+    assert_eq!(diff.from_count, 49);
     assert_eq!(diff.to_count, 6);
     assert!(diff.changed);
     assert!(diff.added.is_empty());
-    assert_eq!(diff.removed.len(), 42);
+    assert_eq!(diff.removed.len(), 43);
     assert_eq!(diff.shared.len(), 6);
     let mut sorted = diff.removed.clone();
     sorted.sort();
@@ -21865,7 +21865,7 @@ for line in sys.stdin:
                 .all(|name| !name.starts_with("mcp_")),
             "MCP tools are appended once after built-ins"
         );
-        assert_eq!(first_mcp, 48);
+        assert_eq!(first_mcp, 49);
         assert_eq!(&names[first_mcp..], ["mcp_mock_alpha", "mcp_mock_zeta"]);
         assert_eq!(
             recorded[0]
@@ -21892,8 +21892,8 @@ for line in sys.stdin:
         .expect("prompt prefix");
     assert_eq!(prefix.payload["tool_bundle"], "leader");
     assert_eq!(prefix.payload["tool_bundle_mcp_count"], 2);
-    assert_eq!(prefix.payload["tool_bundle_tool_count"], 48);
-    assert_eq!(prefix.payload["tool_count"], 50);
+    assert_eq!(prefix.payload["tool_bundle_tool_count"], 49);
+    assert_eq!(prefix.payload["tool_count"], 51);
     let manifest = events
         .iter()
         .find(|event| event.kind == "context.tool_bundle")
@@ -24005,6 +24005,47 @@ async fn role_contract_prompts_make_worker_the_technical_lead_and_labour_the_imp
 }
 
 #[tokio::test]
+async fn run_script_is_advertised_only_to_write_capable_roles() {
+    let dir = TempDir::new().unwrap();
+    let (_engine, service, _project) = test_service(&dir);
+    let config = service
+        .config
+        .read()
+        .unwrap()
+        .as_ref()
+        .expect("test service configured")
+        .clone();
+    for (role, profile, expected) in [
+        (AgentRole::Leader, AgentProfile::Coding, true),
+        (AgentRole::Worker, AgentProfile::Coding, true),
+        (AgentRole::Labour, AgentProfile::Coding, true),
+        (AgentRole::Manager, AgentProfile::Generic, false),
+        (AgentRole::Verifier, AgentProfile::Verification, false),
+        (AgentRole::Scout, AgentProfile::Research, false),
+    ] {
+        let advertised = tool_schemas(&config, role, profile, true)
+            .iter()
+            .any(|tool| tool.name == "run_script");
+        assert_eq!(advertised, expected, "{} schema", role.as_str());
+        let surface = role_tool_surface(role, profile)
+            .iter()
+            .any(|name| name == "run_script");
+        assert_eq!(surface, expected, "{} policy surface", role.as_str());
+    }
+    let leader = tool_schemas(&config, AgentRole::Leader, AgentProfile::Coding, true);
+    let schema = leader
+        .iter()
+        .find(|tool| tool.name == "run_script")
+        .expect("run_script schema");
+    assert_eq!(schema.parameters["required"], serde_json::json!(["script"]));
+    assert_eq!(
+        schema.parameters["properties"]["allow_write"]["default"],
+        serde_json::json!(false)
+    );
+    assert!(schema.parameters["properties"]["max_write_calls"].is_object());
+}
+
+#[tokio::test]
 async fn delegate_schema_exposes_only_the_child_role_and_leaf_roles_get_none() {
     let dir = TempDir::new().unwrap();
     let (_engine, service, _project) = test_service(&dir);
@@ -25107,5 +25148,244 @@ async fn remember_and_recall_scope_defaults_and_typed_scope_errors() {
     assert_eq!(
         legacy_count, 1,
         "failed agent scope must not write legacy memory"
+    );
+}
+
+#[tokio::test]
+async fn run_script_composes_read_only_tools_through_inner_events() {
+    let dir = TempDir::new().unwrap();
+    let provider = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_script".into(),
+                    name: "run_script".into(),
+                    arguments: serde_json::json!({
+                        "script": r#"
+                            const readme = tools.read_file({path: "README.md"}).text;
+                            const listing = tools.list_dir({path: "."}).text;
+                            return { readme, listing, count: 2 };
+                        "#,
+                        "description": "read two surfaces"
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("script complete".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "code mode read".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service.start(&session.id, "run the script").await.unwrap();
+    let session = wait_until_idle(&engine, &session).await;
+    assert_eq!(session.status, "idle");
+    let events = engine
+        .list_events(session.id.clone(), 0, 400)
+        .await
+        .unwrap();
+    let outer = events
+        .iter()
+        .find(|event| {
+            event.kind == "tool.finished"
+                && event.payload["name"] == "run_script"
+                && event.payload["script"].is_null()
+        })
+        .expect("outer run_script tool.finished");
+    let output = outer.payload["output"].as_str().unwrap_or_default();
+    assert!(output.contains("hello from test"), "{output}");
+    assert_eq!(outer.payload["is_error"], false);
+    let inner_started = events
+        .iter()
+        .filter(|event| event.kind == "tool.started" && event.payload["script"] == true)
+        .count();
+    assert_eq!(inner_started, 2, "two inner calls started");
+    let inner_finished = events
+        .iter()
+        .filter(|event| {
+            event.kind == "tool.finished"
+                && event.payload["script"]["parent_tool_call_id"] == "call_script"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(inner_finished.len(), 2);
+    let mut names = inner_finished
+        .iter()
+        .map(|event| {
+            event.payload["name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, vec!["list_dir", "read_file"]);
+    assert!(
+        inner_finished
+            .iter()
+            .all(|event| event.payload["is_error"] == false)
+    );
+}
+
+#[tokio::test]
+async fn run_script_write_binding_is_separately_approved_and_effect_tracked() {
+    let dir = TempDir::new().unwrap();
+    let provider = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_script_write".into(),
+                    name: "run_script".into(),
+                    arguments: serde_json::json!({
+                        "script": r#"
+                            const before = tools.read_file({path: "README.md"}).text;
+                            tools.write_file({path: "script-notes.txt", content: "hello from script"});
+                            return { before };
+                        "#,
+                        "allow_write": true,
+                        "max_calls": 4,
+                        "max_write_calls": 1
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("script write complete".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "code mode write".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let approver_engine = engine.clone();
+    let approver_session = session.id.clone();
+    let approver = tokio::spawn(async move {
+        for _ in 0..200 {
+            if let Ok(approvals) = approver_engine
+                .list_approvals(Some(approver_session.clone()))
+                .await
+            {
+                for approval in approvals.iter().filter(|a| a.status == "pending") {
+                    let _ = approver_engine.resolve_approval(&approval.id, true).await;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    service
+        .start(&session.id, "run the write script")
+        .await
+        .unwrap();
+    let session = wait_until_idle(&engine, &session).await;
+    approver.abort();
+    assert_eq!(session.status, "idle");
+    let events = engine
+        .list_events(session.id.clone(), 0, 400)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "approval.requested"
+            && event.payload["tool"] == "run_script"
+            && event.payload["approval_risk"] == "host_state"
+    }));
+    let write_finished = events
+        .iter()
+        .find(|event| {
+            event.kind == "tool.finished"
+                && event.payload["name"] == "write_file"
+                && event.payload["script"]["parent_tool_call_id"] == "call_script_write"
+        })
+        .expect("inner write_file tool.finished");
+    assert_eq!(write_finished.payload["is_error"], false);
+    assert_eq!(
+        write_finished.payload["structured"]["effect"]["state"],
+        "done"
+    );
+    assert_eq!(write_finished.payload["script"]["read_only"], false);
+    let written_path = write_finished.payload["structured"]["path"]
+        .as_str()
+        .expect("write path");
+    assert_eq!(
+        std::fs::read_to_string(written_path).unwrap_or_default(),
+        "hello from script"
+    );
+}
+
+#[tokio::test]
+async fn run_script_stops_when_the_session_is_cancelled() {
+    let dir = TempDir::new().unwrap();
+    let provider = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_script_loop".into(),
+                    name: "run_script".into(),
+                    arguments: serde_json::json!({
+                        "script": "while (true) {}",
+                        "timeout_ms": 30000
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("should not be reached".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "code mode cancel".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service.start(&session.id, "run the loop").await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    loop {
+        let events = engine
+            .list_events(session.id.clone(), 0, 100)
+            .await
+            .unwrap();
+        if events
+            .iter()
+            .any(|event| event.kind == "tool.started" && event.payload["name"] == "run_script")
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "run_script did not start"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let started = std::time::Instant::now();
+    assert!(service.cancel(&session.id));
+    let session = wait_until_idle(&engine, &session).await;
+    assert_eq!(session.status, "cancelled");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "cancellation waited for the script CPU deadline: {:?}",
+        started.elapsed()
     );
 }

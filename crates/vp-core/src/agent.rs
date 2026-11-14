@@ -1423,6 +1423,12 @@ pub(crate) fn role_tool_surface(role: AgentRole, profile: AgentProfile) -> Vec<S
     ) {
         names.push("wait_for_gate".to_string());
     }
+    if matches!(
+        role,
+        AgentRole::Leader | AgentRole::Worker | AgentRole::Labour
+    ) {
+        names.push("run_script".to_string());
+    }
     names.sort();
     names.dedup();
     names
@@ -17868,6 +17874,11 @@ async fn run_loop_body(
                 && matches!(spec.role, AgentRole::Leader | AgentRole::Manager);
             let is_tool_search = call.name == "tool_search";
             let is_tool_help = call.name == "tool_help";
+            let is_run_script = call.name == "run_script"
+                && matches!(
+                    spec.role,
+                    AgentRole::Leader | AgentRole::Worker | AgentRole::Labour
+                );
             let is_artifact_file = call.name == "publish_artifact_file";
             let is_archive_tool = matches!(call.name.as_str(), "archive_list" | "archive_extract");
             let is_media_tool = matches!(call.name.as_str(), "media_info" | "media_transcode");
@@ -18306,6 +18317,44 @@ async fn run_loop_body(
                     ),
                 )
                 .with_failure_evidence(format!("skill={}", skill.slug))
+            } else if is_run_script {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                    }),
+                )
+                .await?;
+                match run_script_tool(
+                    engine,
+                    config,
+                    session,
+                    spec,
+                    control,
+                    journal,
+                    &input,
+                    &tools,
+                    &call_id,
+                    turn + 1,
+                    run_contract.as_ref(),
+                    &run_contract_policy,
+                    &mut run_contract_usage,
+                    active_skill.as_ref(),
+                    &gui_policy,
+                    &effect_policy,
+                    &tool_context,
+                    &tool_token,
+                )
+                .await?
+                {
+                    ScriptToolOutcome::Output(output) => output,
+                    ScriptToolOutcome::Cancelled => return Ok(LoopOutcome::Cancelled),
+                }
             } else if is_deliberate {
                 emit(
                     engine,
@@ -21595,6 +21644,768 @@ async fn resolve_mcp_pin_trust(
         .unwrap_or(crate::contract::McpPinTrust::Unknown)
 }
 
+#[allow(clippy::large_enum_variant)]
+enum ScriptToolOutcome {
+    Output(ToolOutput),
+    Cancelled,
+}
+
+struct ScriptInnerOutcome {
+    output: ToolOutput,
+    risk: RiskLevel,
+    approval_wait_ms: Option<u64>,
+    duration_ms: u64,
+    cancelled: bool,
+}
+
+/// Run one Code Mode script and route every inner call back through the
+/// dispatcher gates. The outer `run_script` call is already journaled and
+/// approval-classified by the caller; this function owns only the inner calls.
+#[allow(clippy::too_many_arguments)]
+async fn run_script_tool(
+    engine: &Engine,
+    config: &AgentConfig,
+    session: &Session,
+    spec: &AgentSpec,
+    control: &RunControl,
+    journal: &crate::run_journal::RunJournal,
+    input: &Value,
+    advertised: &[vp_providers::ToolSchema],
+    call_id: &str,
+    turn: u32,
+    run_contract: Option<&crate::contract::TaskContract>,
+    run_contract_policy: &vp_protocol::types::ContractPolicy,
+    run_contract_usage: &mut crate::contract::MutationUsage,
+    active_skill: Option<&Skill>,
+    gui_policy: &vp_protocol::types::GuiPolicy,
+    effect_policy: &vp_protocol::types::EffectPolicy,
+    tool_context: &ToolContext,
+    tool_token: &crate::preemption::Token,
+) -> Result<ScriptToolOutcome> {
+    let Some(source) = input.get("script").and_then(Value::as_str) else {
+        return Ok(ScriptToolOutcome::Output(ToolOutput::error_coded(
+            "run_script",
+            crate::tooling::errors::ToolErrorCode::INVALID_ARGUMENT,
+            "run_script requires a string `script`",
+        )));
+    };
+    let allow_write = input
+        .get("allow_write")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if allow_write
+        && !matches!(
+            spec.role,
+            AgentRole::Leader | AgentRole::Worker | AgentRole::Labour
+        )
+    {
+        return Ok(ScriptToolOutcome::Output(ToolOutput::error_coded(
+            "run_script",
+            crate::tooling::errors::ToolErrorCode::PERMISSION_DENIED,
+            "this role cannot enable script write bindings",
+        )));
+    }
+    let bindings = crate::script::bindings(advertised, allow_write);
+    if bindings.is_empty() {
+        return Ok(ScriptToolOutcome::Output(ToolOutput::error_coded(
+            "run_script",
+            crate::tooling::errors::ToolErrorCode::SCRIPT_DISABLED,
+            "no script-safe tools are available in this frozen bundle",
+        )));
+    }
+    let limits = crate::script::ScriptLimits::from_input(input);
+    let script_input = input.get("input").cloned().unwrap_or(Value::Null);
+    let mut runner = match crate::script::spawn(source, script_input, bindings, limits.clone()) {
+        Ok(runner) => runner,
+        Err(error) => {
+            return Ok(ScriptToolOutcome::Output(ToolOutput::error_coded(
+                "run_script",
+                crate::tooling::errors::ToolErrorCode::SCRIPT_INVALID,
+                format!("{error:#}"),
+            )));
+        }
+    };
+    let mut records: Vec<Value> = Vec::new();
+    let mut cancel_rx = control.cancelled.subscribe();
+    loop {
+        if control.is_cancelled() {
+            return Ok(ScriptToolOutcome::Cancelled);
+        }
+        let event = tokio::select! {
+            _ = cancel_rx.changed() => return Ok(ScriptToolOutcome::Cancelled),
+            _ = tool_token.cancelled() => return Ok(ScriptToolOutcome::Cancelled),
+            event = runner.next_event() => event,
+        };
+        let Some(event) = event else {
+            return Ok(ScriptToolOutcome::Output(ToolOutput::error_coded(
+                "run_script",
+                crate::tooling::errors::ToolErrorCode::SCRIPT_FAILED,
+                "script runner ended without a result",
+            )));
+        };
+        match event {
+            crate::script::ScriptEvent::Finished(result) => {
+                let result = match result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        let code = crate::script::classify_error(&message);
+                        return Ok(ScriptToolOutcome::Output(
+                            ToolOutput::error_coded("run_script", code, message)
+                                .with_failure_evidence(format!(
+                                    "script_calls={}; bindings={}",
+                                    records.len(),
+                                    records
+                                        .iter()
+                                        .filter_map(|record| record
+                                            .get("tool")
+                                            .and_then(Value::as_str))
+                                        .take(8)
+                                        .collect::<Vec<_>>()
+                                        .join(",")
+                                )),
+                        ));
+                    }
+                };
+                let description = input
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|description| !description.is_empty());
+                let mut text = result.summary();
+                if let Some(description) = description {
+                    text = format!("{description}\n{text}");
+                }
+                if !result.stdout.is_empty() {
+                    text.push_str("\nstdout:\n");
+                    text.push_str(&result.stdout);
+                }
+                if let Some(value) = &result.value {
+                    let encoded = serde_json::to_string(value).unwrap_or_else(|_| "null".into());
+                    text.push_str("\nreturned: ");
+                    text.push_str(&crate::tools::truncate(encoded));
+                }
+                let structured = json!({
+                    "stdout": result.stdout,
+                    "value": result.value,
+                    "calls": records,
+                    "elapsed_ms": result.elapsed_ms,
+                    "host_calls": result.host_calls,
+                    "write_calls": result.write_calls,
+                    "stdout_truncated": result.stdout_truncated,
+                    "allow_write": allow_write,
+                    "max_calls": limits.max_calls,
+                    "max_write_calls": limits.max_write_calls,
+                    "timeout_ms": limits.wall_ms,
+                    "tool_bundle": crate::tool_bundle::select_bundle(
+                        spec.role.as_str(),
+                        spec.profile.as_str(),
+                        spec.task_kind.as_deref(),
+                    )
+                    .kind
+                    .as_str(),
+                });
+                return Ok(ScriptToolOutcome::Output(ToolOutput::ok_structured(
+                    crate::tools::truncate(text),
+                    structured,
+                )));
+            }
+            crate::script::ScriptEvent::Call(request) => {
+                let outcome = execute_script_inner_call(
+                    engine,
+                    config,
+                    session,
+                    spec,
+                    control,
+                    journal,
+                    call_id,
+                    turn,
+                    run_contract,
+                    run_contract_policy,
+                    run_contract_usage,
+                    active_skill,
+                    gui_policy,
+                    effect_policy,
+                    tool_context,
+                    tool_token,
+                    &request,
+                )
+                .await?;
+                if outcome.cancelled {
+                    let _ = request.reply.send(crate::script::ScriptReply {
+                        output: ToolOutput::error_coded(
+                            &request.tool,
+                            crate::tooling::errors::ToolErrorCode::SCRIPT_CANCELLED,
+                            "script stopped because the run was cancelled",
+                        ),
+                        aborted: true,
+                    });
+                    return Ok(ScriptToolOutcome::Cancelled);
+                }
+                records.push(json!({
+                    "seq": request.seq,
+                    "tool": request.tool,
+                    "read_only": request.read_only,
+                    "is_error": outcome.output.is_error,
+                    "error_code": outcome
+                        .output
+                        .failure
+                        .as_ref()
+                        .map(|failure| failure.code.as_str()),
+                    "duration_ms": outcome.duration_ms,
+                    "approval_risk": outcome.risk.as_str(),
+                    "approval_wait_ms": outcome.approval_wait_ms,
+                }));
+                let _ = request.reply.send(crate::script::ScriptReply {
+                    output: outcome.output,
+                    aborted: false,
+                });
+            }
+        }
+    }
+}
+
+/// Execute one inner script call through the same policy stack as a normal tool
+/// call. The script bridge is not an authorization shortcut.
+#[allow(clippy::too_many_arguments)]
+async fn execute_script_inner_call(
+    engine: &Engine,
+    config: &AgentConfig,
+    session: &Session,
+    spec: &AgentSpec,
+    control: &RunControl,
+    journal: &crate::run_journal::RunJournal,
+    parent_call_id: &str,
+    turn: u32,
+    run_contract: Option<&crate::contract::TaskContract>,
+    run_contract_policy: &vp_protocol::types::ContractPolicy,
+    run_contract_usage: &mut crate::contract::MutationUsage,
+    active_skill: Option<&Skill>,
+    gui_policy: &vp_protocol::types::GuiPolicy,
+    effect_policy: &vp_protocol::types::EffectPolicy,
+    tool_context: &ToolContext,
+    tool_token: &crate::preemption::Token,
+    request: &crate::script::ScriptCallRequest,
+) -> Result<ScriptInnerOutcome> {
+    let tool_name = request.tool.as_str();
+    let call_id = format!("{parent_call_id}:inner:{}", request.seq);
+    let started = Instant::now();
+    let input = request.arguments.clone();
+    let read_only = request.read_only;
+    let mut approval_wait_ms: Option<u64> = None;
+    let mut risk = RiskLevel::ReadOnly;
+
+    let registry_tool = config
+        .tools
+        .get(tool_name)
+        .filter(|_| spec.role.allows_tool(spec.profile, tool_name))
+        .clone();
+    if registry_tool.is_none() {
+        return Ok(ScriptInnerOutcome {
+            output: ToolOutput::error_coded(
+                tool_name,
+                crate::tooling::errors::ToolErrorCode::TOOL_NOT_AVAILABLE,
+                format!(
+                    "tool '{tool_name}' is not available to {}",
+                    spec.role.as_str()
+                ),
+            ),
+            risk,
+            approval_wait_ms,
+            duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            cancelled: false,
+        });
+    }
+    let allowed = if read_only {
+        crate::script::READ_ONLY_TOOLS.contains(&tool_name)
+    } else {
+        crate::script::WRITE_TOOLS.contains(&tool_name)
+    };
+    if !allowed {
+        return Ok(ScriptInnerOutcome {
+            output: ToolOutput::error_coded(
+                tool_name,
+                crate::tooling::errors::ToolErrorCode::PERMISSION_DENIED,
+                format!("script binding '{tool_name}' is not permitted in this mode"),
+            ),
+            risk,
+            approval_wait_ms,
+            duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            cancelled: false,
+        });
+    }
+    let mut duplicate: Option<ToolOutput> = journal
+        .check_duplicate_write(engine, tool_name, &input)
+        .await?;
+    let mut assessment = crate::permissions::assess_tool_call_with_gui(
+        tool_name,
+        &input,
+        &spec.worktree,
+        gui_policy,
+    );
+    if read_only && assessment.risk >= RiskLevel::WorkspaceWrite {
+        return Ok(ScriptInnerOutcome {
+            output: ToolOutput::error_coded(
+                tool_name,
+                crate::tooling::errors::ToolErrorCode::PERMISSION_DENIED,
+                format!(
+                    "read-only script binding '{tool_name}' assessed as {}; fail closed",
+                    assessment.risk.as_str()
+                ),
+            ),
+            risk: assessment.risk,
+            approval_wait_ms,
+            duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            cancelled: false,
+        });
+    }
+    if !read_only && assessment.risk < RiskLevel::WorkspaceWrite {
+        assessment = crate::permissions::PermissionAssessment::new(
+            RiskLevel::HostState,
+            "script write binding did not classify as a workspace write",
+        );
+    }
+    risk = assessment.risk;
+    let mut contract_pending_mutation: Option<crate::contract::MutationDelta> = None;
+    let mut denied_reason: Option<String> = None;
+    if let Some(contract) = run_contract {
+        let contract_spec = crate::contract::ContractCallSpec {
+            tool: tool_name,
+            contract_tool: None,
+            input: &input,
+            risk: assessment.risk,
+            worktree: &spec.worktree,
+            usage: *run_contract_usage,
+            mcp_trust: None,
+            patch_text: input
+                .get("patch")
+                .and_then(Value::as_str)
+                .or_else(|| input.get("diff").and_then(Value::as_str)),
+        };
+        let decision = crate::contract::authorize(&contract_spec, contract, run_contract_policy);
+        engine
+            .record_intent_decision(contract, &decision, &contract_spec)
+            .await?;
+        match decision.outcome {
+            crate::contract::ContractOutcome::Deny => {
+                denied_reason = Some(format!(
+                    "intent: {} ({} · {})",
+                    decision.reason, decision.code, decision.rule
+                ));
+            }
+            crate::contract::ContractOutcome::Escalate => {
+                assessment = crate::permissions::PermissionAssessment {
+                    risk: assessment.risk.max(decision.effective_risk()),
+                    reason: format!(
+                        "intent: {} ({} · {})",
+                        decision.reason, decision.code, decision.rule
+                    ),
+                    blocked: assessment.blocked,
+                };
+                risk = assessment.risk;
+            }
+            crate::contract::ContractOutcome::Allow => {
+                let delta = crate::contract::mutation_delta(&contract_spec);
+                if !delta.is_zero() {
+                    contract_pending_mutation = Some(delta);
+                }
+            }
+        }
+    }
+    let decision = if let Some(reason) = &denied_reason {
+        crate::permissions::ApprovalDecision::Deny {
+            risk,
+            reason: reason.clone(),
+        }
+    } else {
+        match engine.evaluate_tool_permission(
+            &session.id,
+            &session.project_id,
+            &assessment,
+            tool_name,
+            &input,
+            config.approval_mode,
+            spec.auto_approve,
+        ) {
+            Ok(evaluation) => evaluation.decision,
+            Err(error) => crate::permissions::ApprovalDecision::Deny {
+                risk,
+                reason: format!("approval evaluation failed: {error}"),
+            },
+        }
+    };
+    match decision {
+        crate::permissions::ApprovalDecision::Allow {
+            risk: decision_risk,
+            reason,
+        } => {
+            if decision_risk >= RiskLevel::External {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "permission.allowed",
+                    json!({
+                        "tool": tool_name,
+                        "tool_call_id": call_id,
+                        "risk": decision_risk.as_str(),
+                        "reason": reason,
+                        "script_parent_tool_call_id": parent_call_id,
+                    }),
+                )
+                .await?;
+            }
+        }
+        crate::permissions::ApprovalDecision::Ask {
+            risk: ask_risk,
+            reason,
+        } => {
+            control
+                .preempt
+                .set_phase(crate::preemption::Phase::Queue, None);
+            let mut context = json!({
+                "script": true,
+                "parent_tool_call_id": parent_call_id,
+                "script_call_id": call_id,
+                "seq": request.seq,
+            });
+            agent_fields(&mut context, spec);
+            let (approval, receiver) = Box::pin(engine.request_approval_with_risk(
+                &session.id,
+                &call_id,
+                tool_name,
+                input.clone(),
+                Some(context),
+                Some(ask_risk.as_str()),
+                Some(&reason),
+            ))
+            .await?;
+            let approval_step = match journal
+                .approval_intent(
+                    engine,
+                    turn + 1,
+                    &approval.id,
+                    tool_name,
+                    &call_id,
+                    ask_risk.as_str(),
+                    &reason,
+                )
+                .await
+            {
+                Ok(step) => step,
+                Err(error) => {
+                    let _ = engine.resolve_approval(&approval.id, false).await;
+                    return Err(error);
+                }
+            };
+            let wait_started = Instant::now();
+            let outcome = match wait_for_approval(
+                receiver,
+                control,
+                Duration::from_secs(config.approval_timeout_secs),
+            )
+            .await
+            {
+                crate::agent::ApprovalOutcome::Approved => "approved",
+                crate::agent::ApprovalOutcome::Denied => {
+                    denied_reason = Some("The user denied this script tool call.".to_string());
+                    "denied"
+                }
+                crate::agent::ApprovalOutcome::TimedOut => {
+                    denied_reason = Some("The script tool approval request timed out.".to_string());
+                    let _ = engine.resolve_approval(&approval.id, false).await;
+                    "timed_out"
+                }
+                crate::agent::ApprovalOutcome::Cancelled => {
+                    let _ = engine.resolve_approval(&approval.id, false).await;
+                    journal
+                        .approval_completed(engine, &approval_step, "cancelled")
+                        .await?;
+                    return Ok(ScriptInnerOutcome {
+                        output: ToolOutput::error_coded(
+                            tool_name,
+                            crate::tooling::errors::ToolErrorCode::SCRIPT_CANCELLED,
+                            "script stopped while waiting for approval",
+                        ),
+                        risk,
+                        approval_wait_ms,
+                        duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                        cancelled: true,
+                    });
+                }
+            };
+            journal
+                .approval_completed(engine, &approval_step, outcome)
+                .await?;
+            control
+                .preempt
+                .set_phase(crate::preemption::Phase::Tool, Some(tool_name));
+            approval_wait_ms =
+                Some(wait_started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
+        }
+        crate::permissions::ApprovalDecision::Deny {
+            risk: deny_risk,
+            reason,
+        } => {
+            emit(
+                engine,
+                &session.id,
+                spec,
+                "permission.denied",
+                json!({
+                    "tool": tool_name,
+                    "tool_call_id": call_id,
+                    "risk": deny_risk.as_str(),
+                    "reason": reason,
+                    "script_parent_tool_call_id": parent_call_id,
+                }),
+            )
+            .await?;
+            denied_reason = Some(format!("Blocked by the local permission policy: {reason}"));
+        }
+    }
+    risk = risk.max(assessment.risk);
+    if denied_reason.is_none()
+        && active_skill.is_none_or(|skill| skill_allows_tool(skill, tool_name))
+        && let (Some(contract), Some(delta)) = (run_contract, contract_pending_mutation)
+    {
+        *run_contract_usage = engine.record_intent_mutation(contract, delta).await?;
+    }
+    let skill_denied = active_skill
+        .as_ref()
+        .filter(|skill| !skill_allows_tool(skill, tool_name));
+    let mut effect_override: Option<ToolOutput> = None;
+    let mut effect_begin: Option<EffectReceipt> = None;
+    let mut effect_duplicate: Option<EffectReceipt> = None;
+    let mut journal_pair: Option<(vp_protocol::types::RunStep, vp_protocol::types::RunToolCall)> =
+        None;
+    let planned_effect = if denied_reason.is_none() && skill_denied.is_none() {
+        match crate::effect::classify_tool_effect_for_host(
+            tool_name,
+            &input,
+            risk,
+            false,
+            effect_policy,
+            tool_context
+                .remote
+                .as_ref()
+                .map(|remote| remote.label())
+                .as_deref(),
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                effect_override = Some(ToolOutput::error_coded(
+                    tool_name,
+                    crate::tooling::errors::ToolErrorCode::INVALID_ARGUMENT,
+                    format!("cannot plan the effect for this call: {error}"),
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let effect_context = if planned_effect.is_some() {
+        let worktree = spec.worktree.clone();
+        tokio::task::spawn_blocking(move || crate::worktree::head_commit(&worktree))
+            .await?
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    if effect_override.is_none() {
+        if duplicate.is_some() {
+            if let Some(plan) = &planned_effect
+                && let crate::effect::EffectPrepare::Replay(receipt)
+                | crate::effect::EffectPrepare::Blocked(receipt)
+                | crate::effect::EffectPrepare::Proceed(receipt) = engine
+                    .prepare_tool_effect(
+                        &session.id,
+                        spec.task_id.as_deref(),
+                        &spec.id,
+                        &effect_context,
+                        plan,
+                    )
+                    .await?
+            {
+                effect_duplicate = Some(receipt);
+            }
+        } else if let Some(plan) = &planned_effect {
+            match engine
+                .prepare_tool_effect(
+                    &session.id,
+                    spec.task_id.as_deref(),
+                    &spec.id,
+                    &effect_context,
+                    plan,
+                )
+                .await?
+            {
+                crate::effect::EffectPrepare::Replay(receipt) => {
+                    effect_override = Some(effect_replay_output(tool_name, &receipt));
+                }
+                crate::effect::EffectPrepare::Blocked(receipt) => {
+                    effect_override = Some(effect_blocked_output(tool_name, &receipt));
+                }
+                crate::effect::EffectPrepare::Proceed(receipt) => {
+                    let (step, tool, begin) = journal
+                        .tool_intent(
+                            engine,
+                            turn + 1,
+                            &call_id,
+                            tool_name,
+                            &input,
+                            Some(&receipt),
+                        )
+                        .await?;
+                    match begin {
+                        Some(begin) if begin.inserted => {
+                            effect_begin = Some(begin.receipt);
+                            journal_pair = Some((step, tool));
+                        }
+                        Some(begin) => {
+                            effect_override = Some(if begin.receipt.state == EffectState::Done {
+                                effect_replay_output(tool_name, &begin.receipt)
+                            } else {
+                                effect_blocked_output(tool_name, &begin.receipt)
+                            });
+                            journal_pair = Some((step, tool));
+                        }
+                        None => journal_pair = Some((step, tool)),
+                    }
+                }
+            }
+        } else {
+            let (step, tool, _) = journal
+                .tool_intent(engine, turn + 1, &call_id, tool_name, &input, None)
+                .await?;
+            journal_pair = Some((step, tool));
+        }
+    }
+    let mut output = if let Some(mut output) = effect_override {
+        if let Some(receipt) = &effect_begin {
+            annotate_effect_output(&mut output, receipt);
+        }
+        output
+    } else if let Some(mut output) = duplicate.take() {
+        if let Some(receipt) = &effect_duplicate {
+            annotate_effect_output(&mut output, receipt);
+        }
+        output
+    } else if let Some(reason) = denied_reason {
+        ToolOutput::error_coded(
+            tool_name,
+            crate::tooling::errors::ToolErrorCode::PERMISSION_DENIED,
+            reason,
+        )
+        .with_failure_evidence(format!("tool={tool_name}"))
+    } else if let Some(skill) = skill_denied {
+        ToolOutput::error_coded(
+            tool_name,
+            crate::tooling::errors::ToolErrorCode::SKILL_TOOL_DENIED,
+            format!(
+                "tool '{}' is not allowed by active skill '{}'",
+                tool_name, skill.name
+            ),
+        )
+        .with_failure_evidence(format!("skill={}", skill.slug))
+    } else {
+        emit(
+            engine,
+            &session.id,
+            spec,
+            "tool.started",
+            json!({
+                "tool_call_id": call_id,
+                "name": tool_name,
+                "input": input,
+                "script": true,
+                "script_parent_tool_call_id": parent_call_id,
+                "script_seq": request.seq,
+            }),
+        )
+        .await?;
+        control
+            .preempt
+            .set_phase(crate::preemption::Phase::Tool, Some(tool_name));
+        let registry_tool = registry_tool.expect("checked above");
+        let context = tool_context.clone();
+        let name = tool_name.to_string();
+        let execution = tokio::select! {
+            _ = tool_token.cancelled() => None,
+            result = registry_tool.execute(&context, input.clone()) => Some(result),
+        };
+        match execution {
+            None => {
+                let snapshot = tool_token.snapshot().unwrap_or_else(|| {
+                    crate::preemption::fallback_snapshot(
+                        crate::preemption::Phase::Tool,
+                        Some(tool_name),
+                    )
+                });
+                crate::preemption::tool_output(tool_name, &snapshot)
+            }
+            Some(Ok(output)) => output,
+            Some(Err(error)) => ToolOutput::from_tool_error(&name, &error),
+        }
+    };
+    output.normalize_failure(tool_name);
+    let effect_settled = if let (Some(intent), Some(plan)) =
+        (effect_begin.take(), planned_effect.as_ref())
+    {
+        let probe = crate::effect::probe_tool_effect(plan, &input, &output, &spec.worktree).await;
+        let settled = crate::effect::settled_receipt(intent, probe);
+        annotate_effect_output(&mut output, &settled);
+        Some(settled)
+    } else {
+        None
+    };
+    let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    let mut payload = tool_finished_payload(
+        &call_id,
+        tool_name,
+        &output,
+        duration_ms,
+        Some(risk),
+        config.approval_mode,
+        approval_wait_ms,
+    );
+    agent_fields(&mut payload, spec);
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "script".into(),
+            json!({
+                "parent_tool_call_id": parent_call_id,
+                "seq": request.seq,
+                "read_only": read_only,
+            }),
+        );
+    }
+    if let Some((step, tool)) = &journal_pair {
+        journal
+            .tool_completed_with_effect(
+                engine,
+                step,
+                tool,
+                &output,
+                effect_settled.as_ref(),
+                Some(("tool.finished", payload)),
+            )
+            .await?;
+    } else {
+        engine
+            .append_event(&session.id, "tool.finished", payload)
+            .await?;
+    }
+    Ok(ScriptInnerOutcome {
+        output,
+        risk,
+        approval_wait_ms,
+        duration_ms,
+        cancelled: false,
+    })
+}
+
 #[allow(clippy::result_large_err)] // the typed failure carries the stable contract
 async fn run_mcp_tool(
     engine: &Engine,
@@ -23978,6 +24789,30 @@ fn tool_schemas(
             "additionalProperties": false
         }),
     });
+    if matches!(
+        role,
+        AgentRole::Leader | AgentRole::Worker | AgentRole::Labour
+    ) {
+        tools.push(ToolSchema {
+            name: "run_script".to_string(),
+            description: "Compose the frozen read-only workspace tools in one bounded JavaScript sandbox. No ambient filesystem, network, shell, process, or native bindings exist; only the generated `tools.<name>(args)` functions call back through the normal contract, approval, journal, effect, and budget gates. Read-only by default; `allow_write` opts into separately approved file mutations with a write-call cap. Inner errors throw with `.code`; results return `{text,data,truncated}`. Synchronous only: no async/await, timers, or modules."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "script": {"type": "string", "maxLength": 65536, "description": "JavaScript body; use `return` for the final JSON value"},
+                    "input": {"type": ["object", "array"], "description": "Optional JSON input frozen and exposed as `input`"},
+                    "allow_write": {"type": "boolean", "default": false, "description": "Bind write_file/edit_file/apply_patch; each inner call still needs normal approval and effect tracking. Default false."},
+                    "max_calls": {"type": "integer", "minimum": 1, "maximum": 32, "description": "Pre-declared inner-call budget; default 16"},
+                    "max_write_calls": {"type": "integer", "minimum": 1, "maximum": 8, "description": "Pre-declared inner write cap when allow_write is true; default 4"},
+                    "timeout_ms": {"type": "integer", "minimum": 100, "maximum": 30000, "description": "CPU wall budget for the QuickJS thread; default 5000"},
+                    "description": {"type": "string", "maxLength": 500, "description": "Optional short description for the transcript"}
+                },
+                "required": ["script"],
+                "additionalProperties": false
+            }),
+        });
+    }
     tools.push(ToolSchema {
         name: "publish_artifact_file".to_string(),
         description: "Publish an existing worktree file (screenshot, log, report, generated asset) as a session artifact. Max 5 MiB; content-addressed and retention-managed."

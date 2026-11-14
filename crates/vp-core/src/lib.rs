@@ -175,6 +175,7 @@ pub mod run_journal;
 pub mod runtime_pin;
 pub mod scaling;
 pub mod scheduler;
+pub mod script;
 mod session_graph;
 pub mod skills;
 pub mod source_ann;

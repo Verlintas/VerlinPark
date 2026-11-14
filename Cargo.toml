@@ -35,9 +35,16 @@ fs2 = "0.4"
 futures-util = "0.3"
 chacha20poly1305 = "0.10"
 ignore = "0.4"
+oxc_allocator = "0.158"
+oxc_ast = "0.158"
+oxc_ast_visit = "0.158"
+oxc_diagnostics = "0.158"
+oxc_parser = "0.158"
+oxc_span = "0.158"
 libc = "0.2"
 rand = "0.9"
 regex = "1"
+rquickjs = { version = "0.14", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2", "cookies"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

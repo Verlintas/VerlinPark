@@ -36,7 +36,7 @@ use vp_providers::ToolSchema;
 pub const TOOL_BUNDLE_VERSION: u32 = 1;
 
 /// Default Leader cap, down from the previous role-wide list (72 tools).
-pub const LEADER_TOOL_LIMIT: usize = 50;
+pub const LEADER_TOOL_LIMIT: usize = 51;
 /// Default coding Worker/Labour cap, down from the previous list (64 tools).
 pub const CODING_TOOL_LIMIT: usize = 40;
 /// Minimal cap for a trivial one-file task.
@@ -313,6 +313,7 @@ pub const BUNDLE_TOOL_CATALOG: &[BundleToolSpec] = &[
     BundleToolSpec::new("read_tool_output", ToolCategory::Utility, false, false),
     BundleToolSpec::new("tool_help", ToolCategory::Utility, false, false),
     BundleToolSpec::new("tool_search", ToolCategory::Utility, false, false),
+    BundleToolSpec::new("run_script", ToolCategory::Utility, true, false),
     BundleToolSpec::new("submit_verdict", ToolCategory::Verifier, false, false),
     // GUI surfaces.
     BundleToolSpec::new("browser", ToolCategory::Gui, false, false),
@@ -394,6 +395,7 @@ pub const LEADER_TOOLS: &[&str] = &[
     "read_tool_output",
     "tool_help",
     "tool_search",
+    "run_script",
 ];
 
 /// The coding bundle. It deliberately excludes project-level orchestration,
@@ -435,6 +437,7 @@ pub const CODING_TOOLS: &[&str] = &[
     "wait_for_gate",
     "tool_help",
     "tool_search",
+    "run_script",
 ];
 
 /// The research bundle. Read, search, fetch, web, source, memory, code map, and
@@ -1599,7 +1602,7 @@ mod tests {
     #[test]
     fn leader_bundle_membership_is_exact() {
         let generic = selected_names(ToolBundleKind::Leader, "leader", "generic");
-        assert_eq!(generic.len(), 48);
+        assert_eq!(generic.len(), 49);
         assert_eq!(
             generic,
             vec![
@@ -1636,6 +1639,7 @@ mod tests {
                 "recall",
                 "remember",
                 "repo_map",
+                "run_script",
                 "run_team_plan",
                 "scout",
                 "search_sources",
@@ -1655,7 +1659,7 @@ mod tests {
         );
         let coding = selected_names(ToolBundleKind::Leader, "leader", "coding");
         assert!(coding.len() <= LEADER_TOOL_LIMIT);
-        assert_eq!(coding.len(), 50);
+        assert_eq!(coding.len(), 51);
         assert!(coding.contains(&"browser"));
         assert!(coding.contains(&"computer"));
         let research = selected_names(ToolBundleKind::Leader, "leader", "research");
@@ -1667,7 +1671,7 @@ mod tests {
     fn coding_bundle_membership_is_exact_and_role_conditional() {
         let worker = selected_names(ToolBundleKind::Coding, "worker", "coding");
         assert!(worker.len() <= CODING_TOOL_LIMIT);
-        assert_eq!(worker.len(), 38);
+        assert_eq!(worker.len(), 39);
         assert!(worker.contains(&"delegate"));
         assert!(worker.contains(&"browser"));
         assert!(worker.contains(&"computer"));
@@ -1685,6 +1689,7 @@ mod tests {
             "code_diagnostics",
             "lsp_query",
             "run_project_task",
+            "run_script",
             "publish_artifact",
             "recall",
             "remember",
@@ -2247,12 +2252,12 @@ mod tests {
             .iter()
             .find(|entry| entry.kind == ToolBundleKind::Leader)
             .unwrap();
-        assert_eq!(leader.requested_count, 48);
+        assert_eq!(leader.requested_count, 49);
         let coding = entries
             .iter()
             .find(|entry| entry.kind == ToolBundleKind::Coding)
             .unwrap();
-        assert_eq!(coding.requested_count, 38);
+        assert_eq!(coding.requested_count, 39);
         assert_eq!(coding.target_limit, Some(CODING_TOOL_LIMIT));
         let full = entries
             .iter()
@@ -2294,7 +2299,7 @@ mod tests {
 
     #[test]
     fn target_limits_and_mcp_semantics_are_explicit() {
-        assert_eq!(ToolBundleKind::Leader.target_limit(), Some(50));
+        assert_eq!(ToolBundleKind::Leader.target_limit(), Some(51));
         assert_eq!(ToolBundleKind::Coding.target_limit(), Some(40));
         assert_eq!(ToolBundleKind::Minimal.target_limit(), Some(12));
         assert_eq!(ToolBundleKind::Research.target_limit(), None);
@@ -2870,12 +2875,12 @@ mod tests {
         // These are the static request counts before role-policy resolution.
         // Actual runtime counts are asserted by the agent matrix test.
         let expected = [
-            (ToolBundleKind::Leader, "leader", "generic", 48),
-            (ToolBundleKind::Leader, "leader", "coding", 50),
+            (ToolBundleKind::Leader, "leader", "generic", 49),
+            (ToolBundleKind::Leader, "leader", "coding", 51),
             (ToolBundleKind::Leader, "manager", "coding", 44),
-            (ToolBundleKind::Coding, "worker", "coding", 38),
-            (ToolBundleKind::Coding, "labour", "coding", 36),
-            (ToolBundleKind::Coding, "worker", "research", 36),
+            (ToolBundleKind::Coding, "worker", "coding", 39),
+            (ToolBundleKind::Coding, "labour", "coding", 37),
+            (ToolBundleKind::Coding, "worker", "research", 37),
             (ToolBundleKind::Research, "worker", "research", 34),
             (ToolBundleKind::Research, "scout", "research", 33),
             (ToolBundleKind::Verification, "verifier", "verification", 38),

@@ -22,7 +22,7 @@ pub const MAX_RECIPE_DETAIL_CHARS: usize = 2_600;
 /// Maximum characters for a `tool_help` response.
 pub const MAX_HELP_RENDER_CHARS: usize = 14_000;
 /// Maximum number of recipes returned by one `tool_help` call.
-pub const MAX_HELP_RECIPES: usize = 24;
+pub const MAX_HELP_RECIPES: usize = 32;
 
 /// A deterministic, read-only recipe. `audience` entries are
 /// `role:profile` (or `role:*`, `*:profile`, or `*`).
@@ -568,6 +568,31 @@ pub const RECIPES: &[ToolRecipe] = &[
         ],
         example: "write_file {\"path\":\"src/generated.rs\",\"content\":\"...\"}",
         caveats: "Sandbox and path-jail rules are deterministic policy. Retrying a denial unchanged cannot succeed and is not a tool failure to loop on.",
+    },
+    ToolRecipe {
+        slug: "code_mode_composition",
+        title: "Compose read-only tools in one bounded script",
+        intent: "Use run_script for data shaping across tools instead of many provider round trips.",
+        audience: &["leader:*", "worker:*", "labour:*"],
+        tools: &[
+            "run_script",
+            "read_file",
+            "read_files",
+            "grep",
+            "find_files",
+            "git",
+            "tool_search",
+        ],
+        steps: &[
+            "Search the frozen bundle first; only advertised read-only tools are bound.",
+            "Call tools.<name>(args) synchronously and read {text,data,truncated}; catch errors via error.code.",
+            "Keep output small and return a JSON summary; large text belongs in an artifact.",
+            "Declare max_calls up front; a script cannot make unlimited inner calls.",
+            "Use allow_write only for a small number of file edits; each inner write still needs normal approval and effect tracking.",
+            "No async/await, timers, modules, filesystem, network, shell, or process bindings exist inside the script.",
+        ],
+        example: r#"run_script {"script":"const a=tools.read_file({path:'README.md'}).text; return {a}","max_calls":4}"#,
+        caveats: "The sandbox is capability-minimal, not a general Node runtime. Inner calls are normal gated tool calls and appear as tool.finished events with a script parent.",
     },
     ToolRecipe {
         slug: "error_recovery",

@@ -373,6 +373,23 @@ pub fn assess_tool_call_with_gui(
                 )
             }
         }
+        "run_script" => {
+            let allow_write = input
+                .get("allow_write")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if allow_write {
+                PermissionAssessment::new(
+                    RiskLevel::HostState,
+                    "JavaScript composition may call approved file mutation tools; every inner write is separately authorized",
+                )
+            } else {
+                PermissionAssessment::new(
+                    RiskLevel::ReadOnly,
+                    "bounded JavaScript composition of read-only workspace tools",
+                )
+            }
+        }
         "plan_fanout" => PermissionAssessment::new(
             RiskLevel::HostState,
             "rewrites the plan DAG and expands bounded fan-out tasks",
