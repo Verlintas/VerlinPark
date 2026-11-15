@@ -1,0 +1,25 @@
+# Shell command <TAB> comma-separated expected ShellAnalysis flags ("clean" = none).
+# The test contract allows only the `src` subtree and network=allow.
+cargo test	clean
+git status	clean
+git commit -m "checkpoint"	clean
+ls -la	clean
+git push origin main	push
+git fetch origin	network
+curl https://example.com/a	network
+ssh deploy@example.com	network,remote
+rsync example.com:/srv/x src/a	network,remote
+rm -rf docs/old	destructive,writes_outside_scope
+rm -rf src/old	clean
+rm -rf /	destructive,writes_outside_scope
+mv docs/a src/a	writes_outside_scope
+echo hi > docs/out	writes_outside_scope
+echo hi > src/out	clean
+sudo ls	privileged,destructive
+dd if=/dev/zero of=/tmp/x	destructive,privileged
+kill 42	destructive
+docker ps	remote
+bash -c "git push"	push
+eval "rm -rf /"	destructive,writes_outside_scope
+$(echo hi)	ambiguous
+<EMPTY>	ambiguous

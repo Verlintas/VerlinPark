@@ -2361,6 +2361,69 @@ enum Command {
     },
     /// Show estimated context usage and the last compaction/trim.
     Context { session: String },
+    /// Show the bounded advisory progress ledger for a session.
+    Progress {
+        session: String,
+        #[arg(long)]
+        plan_revision: Option<u64>,
+        #[arg(long, default_value_t = 64)]
+        limit: u32,
+    },
+    /// Record one advisory progress round from a JSON payload.
+    ProgressReport {
+        session: String,
+        /// JSON object with satisfied/in_loop/progressing/blockers/next_task/instruction/evidence.
+        #[arg(long)]
+        payload: String,
+    },
+    /// Show loopback-only A2A facade status (never the bearer token).
+    A2aStatus,
+    /// Show the running A2A Agent Card as JSON.
+    A2aCard,
+    /// Update the stored A2A policy while the facade is stopped.
+    A2aPolicySet {
+        #[arg(long)]
+        enable: bool,
+        #[arg(long)]
+        disable: bool,
+        #[arg(long)]
+        allow_inbound: bool,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        max_tasks: Option<u32>,
+        #[arg(long)]
+        task_ttl_secs: Option<u64>,
+    },
+    /// List bounded in-memory A2A inbound tasks.
+    A2aTasks {
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        #[arg(long)]
+        state: Option<String>,
+    },
+    /// Start the loopback A2A facade and print the one-time bearer token.
+    A2aStart {
+        /// Explicit host-state approval is required to bind the loopback listener.
+        #[arg(long)]
+        approved: bool,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        max_tasks: Option<u32>,
+        #[arg(long)]
+        task_ttl_secs: Option<u64>,
+        #[arg(long)]
+        allow_inbound: bool,
+        /// Enable the policy; omitted policy fields remain bounded defaults.
+        #[arg(long)]
+        enable: bool,
+    },
+    /// Stop the loopback A2A facade.
+    A2aStop {
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Summarize or trim an idle session's active conversation now.
     Compact { session: String },
     /// Create a committed, clean-worktree checkpoint of an idle session.
@@ -8336,6 +8399,98 @@ async fn run(cli: Cli) -> Result<()> {
                 json!({"session_id": session}),
             )
             .await?
+        }
+        Command::Progress {
+            session,
+            plan_revision,
+            limit,
+        } => {
+            rpc(
+                &discovery,
+                "session.progress",
+                json!({
+                    "session_id": session,
+                    "plan_revision": plan_revision,
+                    "limit": limit,
+                }),
+            )
+            .await?
+        }
+        Command::ProgressReport { session, payload } => {
+            let round: serde_json::Value =
+                serde_json::from_str(&payload).context("parsing --payload as JSON")?;
+            rpc(
+                &discovery,
+                "session.progress.report",
+                json!({"session_id": session, "round": round}),
+            )
+            .await?
+        }
+        Command::A2aStatus => rpc(&discovery, "a2a.status", json!({})).await?,
+        Command::A2aCard => rpc(&discovery, "a2a.card", json!({})).await?,
+        Command::A2aPolicySet {
+            enable,
+            disable,
+            allow_inbound,
+            port,
+            max_tasks,
+            task_ttl_secs,
+        } => {
+            let mut policy = vp_protocol::a2a::A2aPolicy {
+                enabled: enable && !disable,
+                allow_inbound,
+                ..Default::default()
+            };
+            if let Some(port) = port {
+                policy.port = port;
+            }
+            if let Some(max_tasks) = max_tasks {
+                policy.max_tasks = max_tasks;
+            }
+            if let Some(task_ttl_secs) = task_ttl_secs {
+                policy.task_ttl_secs = task_ttl_secs;
+            }
+            rpc(&discovery, "a2a.policy.set", json!({"policy": policy})).await?
+        }
+        Command::A2aTasks { limit, state } => {
+            rpc(
+                &discovery,
+                "a2a.tasks",
+                json!({"limit": limit, "state": state}),
+            )
+            .await?
+        }
+        Command::A2aStart {
+            approved,
+            port,
+            max_tasks,
+            task_ttl_secs,
+            allow_inbound,
+            enable,
+        } => {
+            let mut policy = vp_protocol::a2a::A2aPolicy {
+                enabled: enable,
+                allow_inbound,
+                ..Default::default()
+            };
+            if let Some(port) = port {
+                policy.port = port;
+            }
+            if let Some(max_tasks) = max_tasks {
+                policy.max_tasks = max_tasks;
+            }
+            if let Some(task_ttl_secs) = task_ttl_secs {
+                policy.task_ttl_secs = task_ttl_secs;
+            }
+            rpc(
+                &discovery,
+                "a2a.start",
+                json!({"approved": approved, "policy": policy}),
+            )
+            .await?
+        }
+        Command::A2aStop { reason } => {
+            rpc(&discovery, "a2a.stop", json!({"reason": reason})).await?
         }
         Command::Compact { session } => {
             rpc(
@@ -27538,6 +27693,131 @@ mod team_template_cli_tests {
                 assert!(repair);
             }
             other => panic!("expected team-replay, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod progress_a2a_cli_tests {
+    use super::*;
+
+    #[test]
+    fn progress_commands_parse_read_and_report_payloads() {
+        let cli = Cli::try_parse_from([
+            "vp",
+            "progress",
+            "ses-1",
+            "--plan-revision",
+            "7",
+            "--limit",
+            "32",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Progress {
+                session,
+                plan_revision,
+                limit,
+            } => {
+                assert_eq!(session, "ses-1");
+                assert_eq!(plan_revision, Some(7));
+                assert_eq!(limit, 32);
+            }
+            other => panic!("expected progress, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "progress-report",
+            "ses-1",
+            "--payload",
+            r#"{"satisfied":["a"],"progressing":["b"]}"#,
+        ])
+        .unwrap();
+        match cli.command {
+            Command::ProgressReport { session, payload } => {
+                assert_eq!(session, "ses-1");
+                assert!(payload.contains("satisfied"));
+            }
+            other => panic!("expected progress-report, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a2a_commands_parse_status_tasks_policy_and_start() {
+        let cli = Cli::try_parse_from(["vp", "a2a-status"]).unwrap();
+        assert!(matches!(cli.command, Command::A2aStatus));
+        let cli = Cli::try_parse_from(["vp", "a2a-card"]).unwrap();
+        assert!(matches!(cli.command, Command::A2aCard));
+
+        let cli = Cli::try_parse_from(["vp", "a2a-tasks", "--limit", "25", "--state", "rejected"])
+            .unwrap();
+        match cli.command {
+            Command::A2aTasks { limit, state } => {
+                assert_eq!(limit, 25);
+                assert_eq!(state.as_deref(), Some("rejected"));
+            }
+            other => panic!("expected a2a-tasks, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "a2a-policy-set",
+            "--enable",
+            "--port",
+            "7777",
+            "--max-tasks",
+            "64",
+            "--task-ttl-secs",
+            "120",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::A2aPolicySet {
+                enable,
+                disable,
+                allow_inbound,
+                port,
+                max_tasks,
+                task_ttl_secs,
+            } => {
+                assert!(enable);
+                assert!(!disable);
+                assert!(!allow_inbound);
+                assert_eq!(port, Some(7777));
+                assert_eq!(max_tasks, Some(64));
+                assert_eq!(task_ttl_secs, Some(120));
+            }
+            other => panic!("expected a2a-policy-set, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "a2a-start",
+            "--approved",
+            "--enable",
+            "--port",
+            "7777",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::A2aStart {
+                approved,
+                port,
+                enable,
+                ..
+            } => {
+                assert!(approved);
+                assert!(enable);
+                assert_eq!(port, Some(7777));
+            }
+            other => panic!("expected a2a-start, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["vp", "a2a-stop", "--reason", "done"]).unwrap();
+        match cli.command {
+            Command::A2aStop { reason } => assert_eq!(reason.as_deref(), Some("done")),
+            other => panic!("expected a2a-stop, got {other:?}"),
         }
     }
 }

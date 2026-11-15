@@ -151,6 +151,17 @@ final class AppModel {
     var sessionCacheStatus: SessionCacheStatus?
     var sessionCacheCalls: [SessionCacheCall] = []
     var sessionCacheCallsTruncated = false
+    var sessionProgress: ProgressLedger?
+    var progressBusy = false
+    var progressStatus: String?
+    var a2aStatus: A2AStatus?
+    var a2aTasks: [A2ATaskSummary] = []
+    var a2aTasksTruncated = false
+    var a2aBusy = false
+    var a2aStatusMessage: String?
+    /// Transient one-time token from an explicit Start action. It is never
+    /// rendered by a view; the CLI is the primary handoff surface.
+    var a2aOneTimeToken: String?
     var sessionInstructions: SessionInstructionsReport?
     var sessionContract: SessionContractReport?
     var sessionEffects: SessionEffectsReport?
@@ -3772,6 +3783,90 @@ final class AppModel {
     /// session ledger, context usage, and the optional `session.cache` status.
     /// Older daemons do not implement `session.cache`; the dashboard then falls
     /// back to ratios derived from `session.usage` instead of failing.
+    func loadProgress() async {
+        guard let sessionID = selectedSessionID else {
+            sessionProgress = nil
+            progressStatus = nil
+            return
+        }
+        let generation = selectionGeneration
+        progressBusy = true
+        progressStatus = nil
+        defer {
+            if generation == selectionGeneration {
+                progressBusy = false
+            }
+        }
+        do {
+            let ledger = try await core.sessionProgress(sessionID: sessionID)
+            guard sessionID == selectedSessionID, generation == selectionGeneration else {
+                return
+            }
+            sessionProgress = ledger
+        } catch {
+            guard sessionID == selectedSessionID, generation == selectionGeneration else {
+                return
+            }
+            progressStatus = error.localizedDescription
+        }
+    }
+
+    func loadA2AStatus() async {
+        a2aBusy = true
+        defer { a2aBusy = false }
+        do {
+            a2aStatus = try await core.a2aStatus()
+            let tasks = try await core.a2aTasks()
+            a2aTasks = tasks.tasks
+            a2aTasksTruncated = tasks.truncated
+            a2aStatusMessage = nil
+        } catch {
+            a2aStatusMessage = error.localizedDescription
+        }
+    }
+
+    func startA2A(approved: Bool) async {
+        guard approved else {
+            a2aStatusMessage = "Starting the loopback A2A facade requires explicit approval."
+            return
+        }
+        a2aBusy = true
+        defer { a2aBusy = false }
+        var policy = a2aStatus?.policy ?? A2APolicy()
+        policy = A2APolicy(
+            enabled: true,
+            allowInbound: false,
+            port: policy.port,
+            tokenRequired: true,
+            maxTasks: policy.maxTasks,
+            taskTTLSecs: policy.taskTTLSecs
+        )
+        do {
+            let result = try await core.a2aStart(approved: true, policy: policy)
+            a2aStatus = result.status
+            a2aOneTimeToken = result.token
+            a2aStatusMessage = nil
+        } catch {
+            a2aStatusMessage = error.localizedDescription
+        }
+    }
+
+    func stopA2A(reason: String? = nil) async {
+        a2aBusy = true
+        defer { a2aBusy = false }
+        do {
+            a2aStatus = try await core.a2aStop(reason: reason)
+            a2aOneTimeToken = nil
+            a2aStatusMessage = nil
+        } catch {
+            a2aStatusMessage = error.localizedDescription
+        }
+    }
+
+    func clearA2AOneTimeToken() {
+        a2aOneTimeToken = nil
+    }
+
     func loadEfficiency() async {
         guard let projectID = selectedProjectID else {
             projectUsage = nil
@@ -3787,6 +3882,10 @@ final class AppModel {
         let sessionID = selectedSessionID
         efficiencyBusy = true
         efficiencyStatus = nil
+        Task {
+            await self.loadProgress()
+            await self.loadA2AStatus()
+        }
         defer {
             if generation == selectionGeneration {
                 efficiencyBusy = false

@@ -8,6 +8,7 @@
 | 类型 | 文档 | 用途 |
 |---|---|---|
 | **Current** | [PROGRESS.md](PROGRESS.md) | 当前真实可用的能力、限制、测试结果；状态以这里为准 |
+| **Current** | [STATUS.md](STATUS.md) | 当前项目状态、路线完成度、已知边界与下一阶段建议（2026-11-16） |
 | **Current** | [AUDIT.md](AUDIT.md) | 最近一次项目重审：P0/P1/P2 问题、证据、建议顺序 |
 | **Current** | [audit/2026-11-09-findings.md](audit/2026-11-09-findings.md) | 2026-11-09 全量审查完整台账（[CSV](audit/2026-11-09-findings.csv)）；116 个原始 finding 合并为 65 条并保留全部来源 ID |
 | **Design** | [ARCHITECTURE.md](ARCHITECTURE.md) | 目标架构、协议、数据模型、状态机；实现状态见 PROGRESS/AUDIT |
@@ -37,6 +38,9 @@
 | **Current** | [adr/0217-tool-search-v2-and-delta-snapshots.md](adr/0217-tool-search-v2-and-delta-snapshots.md) | C8 tool search v2：BM25 + prerequisite closure、completeness/missing、turn-boundary schema promotion/cache pricing、delta browser snapshots + generation/STALE_REF |
 | **Current** | [adr/0218-mcp-async-tasks-and-elicitation.md](adr/0218-mcp-async-tasks-and-elicitation.md) | C9 MCP async tasks：durable task handle/get/result/cancel/list、TTL/effect evidence、form elicitation → question inbox、URL denial |
 | **Current** | [adr/0219-code-mode-run-script.md](adr/0219-code-mode-run-script.md) | C10 Code Mode：QuickJS+oxc、64 MiB/CPU/call budgets、frozen-bundle typed bindings、无 ambient capability、inner calls 重新进入 contract/approval/effect/journal gates、read-only 优先 + opt-in 文件写入 |
+| **Current** | [adr/0220-advisory-progress-ledger.md](adr/0220-advisory-progress-ledger.md) | C12 advisory progress ledger：bounded Manager rounds、deterministic stall/in-loop assessment、event/projection/replay、`report_progress`、永不自动重试/重规划 |
+| **Current** | [adr/0221-loopback-a2a-facade.md](adr/0221-loopback-a2a-facade.md) | C11 loopback A2A：bounded card/task/SSE library、one-time bearer token、explicit approved start、card-only inbound rejection、无本地工具权限 |
+| **Current** | [adr/0222-store-domain-module-split.md](adr/0222-store-domain-module-split.md) | M3.1 `vp-store` 结构治理：34,939 行 `store.rs` → 6,611 行 parent + 33 个 domain modules，SQL/public API 不变 |
 | **Reference** | [OBSCURA_ASSESSMENT.md](OBSCURA_ASSESSMENT.md) | Obscura（Rust/V8/CDP/MCP headless browser）评估：适用场景、安全约束、三种集成方案、结论为 cache 轮之后再做可选外部网页后端 |
 | **Reference** | [PRIDE_FLAGS.md](PRIDE_FLAGS.md) | Pride flag 资产来源与许可 |
 | **Reference** | [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) | FlagKit 等第三方资产许可 |

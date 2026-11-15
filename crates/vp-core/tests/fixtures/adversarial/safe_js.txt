@@ -1,0 +1,15 @@
+# One JavaScript snippet per line. Each must be accepted by validate_source.
+return 1;
+return { ok: true };
+const x = [1, 2, 3].map((n) => n * 2); return x;
+print("hello");
+console.log("hello");
+return typeof tools;
+return input;
+const { a } = input; return a;
+tools.read_file({ path: "a" });
+return Object.keys(tools).length;
+try { throw new Error("x"); } catch (error) { return error.message; }
+for (let i = 0; i < 2; i++) { print(i); }
+const text = `fetch process eval`; return text;
+function inner(value) { return value + 1; } return inner(1);

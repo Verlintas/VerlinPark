@@ -18860,3 +18860,64 @@ fn mcp_task_rows_are_durable_scoped_and_result_bounded() {
         Some("effect-1")
     );
 }
+
+#[test]
+fn progress_rounds_are_ordered_bounded_and_event_backed() {
+    use vp_protocol::progress::{ProgressEvidence, ProgressEvidenceKind, ProgressRound};
+
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("progress"))
+        .unwrap();
+    let session = store.create_session(&project.id, "progress").unwrap();
+    for index in 0..3u32 {
+        let round = ProgressRound {
+            round_id: format!("round-{index}"),
+            agent_id: Some("manager-1".into()),
+            agent_name: Some("Manager".into()),
+            task_id: Some("T1".into()),
+            satisfied: vec![format!("done-{index}")],
+            in_loop: if index == 2 {
+                vec!["same".into()]
+            } else {
+                Vec::new()
+            },
+            progressing: vec!["next".into()],
+            blockers: Vec::new(),
+            next_task: Some("T2".into()),
+            instruction: Some("continue".into()),
+            evidence: vec![ProgressEvidence {
+                kind: ProgressEvidenceKind::Test,
+                reference: format!("test-{index}"),
+                note: None,
+            }],
+            created_at: Some(format!("2026-11-16T00:00:0{index}Z")),
+        };
+        let (_, event) = store
+            .insert_progress_round_with_event(&session.id, 7, &round)
+            .unwrap();
+        assert_eq!(event.kind, "progress.round");
+    }
+    let (rounds, truncated) = store.list_progress_rounds(&session.id, Some(7), 2).unwrap();
+    assert_eq!(rounds.len(), 2);
+    assert!(truncated);
+    assert_eq!(rounds[0].round_id, "round-1");
+    assert_eq!(rounds[1].round_id, "round-2");
+    assert_eq!(
+        store.latest_progress_revision(&session.id).unwrap(),
+        Some(7)
+    );
+    store
+        .replace_progress_rounds(&session.id, &[(9, rounds[0].clone())])
+        .unwrap();
+    let (replaced, truncated) = store.list_progress_rounds(&session.id, None, 10).unwrap();
+    assert_eq!(replaced.len(), 1);
+    assert!(!truncated);
+    assert_eq!(replaced[0].round_id, "round-1");
+    assert_eq!(
+        store.latest_progress_revision(&session.id).unwrap(),
+        Some(9)
+    );
+}

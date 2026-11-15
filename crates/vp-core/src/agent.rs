@@ -1390,6 +1390,7 @@ pub(crate) fn role_tool_surface(role: AgentRole, profile: AgentProfile) -> Vec<S
         AgentRole::Verifier => names.push("submit_verdict".to_string()),
         AgentRole::Leader => {
             names.push("todo_write".to_string());
+            names.push("report_progress".to_string());
             names.push("submit_team_plan".to_string());
             names.push("plan_fanout".to_string());
             names.push("run_team_plan".to_string());
@@ -1406,6 +1407,7 @@ pub(crate) fn role_tool_surface(role: AgentRole, profile: AgentProfile) -> Vec<S
                 "delegate_many",
                 "delegate_acp",
                 "scout",
+                "report_progress",
             ] {
                 names.push(name.to_string());
             }
@@ -18365,6 +18367,8 @@ async fn run_loop_body(
                 && matches!(spec.role, AgentRole::Leader | AgentRole::Manager);
             let is_tool_search = call.name == "tool_search";
             let is_tool_help = call.name == "tool_help";
+            let is_progress_report = call.name == "report_progress"
+                && matches!(spec.role, AgentRole::Leader | AgentRole::Manager);
             let is_run_script = call.name == "run_script"
                 && matches!(
                     spec.role,
@@ -18522,6 +18526,23 @@ async fn run_loop_body(
                     ),
                 )
                 .with_failure_evidence(format!("skill={}", skill.slug))
+            } else if is_progress_report {
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.started",
+                    serde_json::json!({
+                        "tool_call_id": call_id,
+                        "name": call.name,
+                        "input": input,
+                    }),
+                )
+                .await?;
+                match run_progress_report(engine, session, spec, &input).await {
+                    Ok(output) => output,
+                    Err(error) => ToolOutput::error(format!("report_progress failed: {error}")),
+                }
             } else if is_run_script {
                 emit(
                     engine,
@@ -21831,6 +21852,107 @@ async fn resolve_mcp_pin_trust(
 }
 
 #[allow(clippy::large_enum_variant)]
+async fn run_progress_report(
+    engine: &Engine,
+    session: &Session,
+    spec: &AgentSpec,
+    input: &Value,
+) -> Result<ToolOutput> {
+    let round = crate::progress_ledger::ProgressRound {
+        round_id: input
+            .get("round_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        agent_id: Some(spec.id.clone()),
+        agent_name: Some(spec.name.clone()),
+        task_id: spec.task_id.clone(),
+        satisfied: string_list(input, "satisfied"),
+        in_loop: string_list(input, "in_loop"),
+        progressing: string_list(input, "progressing"),
+        blockers: string_list(input, "blockers"),
+        next_task: input
+            .get("next_task")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        instruction: input
+            .get("instruction")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        evidence: input
+            .get("evidence")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let kind = item.get("kind").and_then(Value::as_str)?;
+                        let kind = match kind {
+                            "task" => crate::progress_ledger::ProgressEvidenceKind::Task,
+                            "test" => crate::progress_ledger::ProgressEvidenceKind::Test,
+                            "commit" => crate::progress_ledger::ProgressEvidenceKind::Commit,
+                            "artifact" => crate::progress_ledger::ProgressEvidenceKind::Artifact,
+                            "event" => crate::progress_ledger::ProgressEvidenceKind::Event,
+                            "note" => crate::progress_ledger::ProgressEvidenceKind::Note,
+                            _ => return None,
+                        };
+                        Some(crate::progress_ledger::ProgressEvidence {
+                            kind,
+                            reference: item
+                                .get("reference")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            note: item.get("note").and_then(Value::as_str).map(str::to_string),
+                        })
+                    })
+                    .take(8)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        created_at: None,
+    };
+    let result = engine.record_progress_round(&session.id, round).await?;
+    let text = format!(
+        "Progress {}: {} (in-loop streak {}, stalled rounds {}, satisfied {}, evidence {}){}",
+        result.assessment.status.as_str(),
+        result.assessment.reason,
+        result.assessment.in_loop_streak,
+        result.assessment.stalled_rounds,
+        result.assessment.satisfied_count,
+        result.assessment.evidence_count,
+        result
+            .assessment
+            .next_task
+            .as_deref()
+            .map(|task| format!("; suggested next task: {task}"))
+            .unwrap_or_default()
+    );
+    Ok(ToolOutput::ok_structured(
+        crate::tools::truncate(text),
+        serde_json::json!(result),
+    ))
+}
+
+fn string_list(input: &Value, key: &str) -> Vec<String> {
+    input
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .take(8)
+                .map(|item| item.chars().take(200).collect())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// `ToolOutput` is intentionally rich (text, structured data, evidence, and
+// failure metadata), so boxing every success would add allocation churn on the
+// common path for an enum with only one non-empty variant.
+#[allow(clippy::large_enum_variant)]
 enum ScriptToolOutcome {
     Output(ToolOutput),
     Cancelled,
@@ -24692,6 +24814,40 @@ fn tool_schemas(
             "additionalProperties": false
         }),
     });
+    if matches!(role, AgentRole::Leader | AgentRole::Manager) {
+        tools.push(ToolSchema {
+            name: "report_progress".to_string(),
+            description: "Record one bounded advisory progress round for this session. Use it after a planning/review round to list what is satisfied, what is repeating in a loop, what is progressing, blockers, a suggested next task, and evidence pointers. This is evidence only: it never selects, skips, retries, cancels, replans, merges, or changes budgets/capacity. Round ids must follow a positive sequence (r1, r2, ...); omit round_id to let the runtime assign the next one."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "round_id": {"type": "string", "maxLength": 80, "description": "Optional sequence id such as r1; must increase by one"},
+                    "satisfied": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 200}},
+                    "in_loop": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 200}},
+                    "progressing": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 200}},
+                    "blockers": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 200}},
+                    "next_task": {"type": "string", "maxLength": 1000},
+                    "instruction": {"type": "string", "maxLength": 1000},
+                    "evidence": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": {"type": "string", "enum": ["task", "test", "commit", "artifact", "event", "note"]},
+                                "reference": {"type": "string", "maxLength": 200},
+                                "note": {"type": "string", "maxLength": 200}
+                            },
+                            "required": ["kind", "reference"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "additionalProperties": false
+            }),
+        });
+    }
     if matches!(
         role,
         AgentRole::Leader | AgentRole::Worker | AgentRole::Labour

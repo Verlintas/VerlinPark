@@ -4,19 +4,20 @@
 
 #![recursion_limit = "512"]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::tools::{ToolContext, ToolOutput};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use async_recursion::async_recursion;
 use ignore::WalkBuilder;
 use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 use vp_protocol::lsp::{LspLanguageStatus, LspStatusResult};
 use vp_protocol::now_rfc3339;
+use vp_protocol::progress::{MAX_PROGRESS_ROUNDS, ProgressLedgerResult, ProgressRound};
 use vp_protocol::remote::RemoteTestEvidence;
 use vp_protocol::types::{
     AcpAgent, AcpAgentConfig, AcpAgentListResult, AcpProbeResult, AcpTransport,
@@ -118,6 +119,7 @@ use vp_store::store::{
 use crate::budget::BudgetRegistry;
 use crate::budget_governor::GovernorBudgetView;
 
+pub mod a2a;
 pub mod acp;
 pub mod agent;
 pub mod agent_workspace;
@@ -165,6 +167,7 @@ pub mod permissions;
 pub mod preemption;
 pub mod process_supervisor;
 pub mod program;
+pub mod progress_ledger;
 pub mod prompt_cache;
 pub mod rebuild;
 pub mod remote;
@@ -211,6 +214,7 @@ struct ReplayData {
     memories: Vec<MemoryItem>,
     memory_conflicts: Vec<MemoryConflict>,
     questions: Vec<Question>,
+    progress: Vec<(u64, ProgressRound)>,
     tasks: Vec<ScheduledTask>,
     steering: Vec<SteeringMessage>,
     continuations: Vec<SessionContinuation>,
@@ -265,6 +269,7 @@ pub struct Engine {
     budget_registry: Arc<BudgetRegistry>,
     unlimited_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     mcp: Arc<mcp::McpManager>,
+    a2a: Arc<a2a::A2aRuntime>,
     remote: Arc<remote::RemoteManager>,
     consoles: Arc<console::ConsoleManager>,
     terminals: Arc<terminal::TerminalManager>,
@@ -819,6 +824,7 @@ impl Engine {
             budget_registry: Arc::new(BudgetRegistry::new()),
             unlimited_flags: Arc::new(Mutex::new(HashMap::new())),
             mcp: Arc::new(mcp::McpManager::from_env()),
+            a2a: Arc::new(a2a::A2aRuntime::default()),
             remote: Arc::new(remote::RemoteManager::new(data_dir.clone())),
             consoles: Arc::new(console::ConsoleManager::new()),
             terminals: Arc::new(terminal::TerminalManager::new()),
@@ -14615,6 +14621,7 @@ impl Engine {
             let memories = store.list_session_memories(&id)?;
             let memory_conflicts = store.list_session_memory_conflicts(&id)?;
             let questions = store.list_session_questions(&id)?;
+            let progress = store.list_progress_rows(&id)?;
             let tasks = store.list_plan_tasks(None, Some(&id))?;
             let steering = store.list_steering(&id, None, Some(2_000))?;
             let continuations = store.list_session_continuations(&id, None, Some(2_000))?;
@@ -14669,6 +14676,7 @@ impl Engine {
                 memories,
                 memory_conflicts,
                 questions,
+                progress,
                 tasks,
                 steering,
                 continuations,
@@ -15855,6 +15863,40 @@ impl Engine {
             ));
         }
 
+        let replay_progress = data
+            .events
+            .iter()
+            .filter(|event| event.kind == "progress.round")
+            .filter_map(|event| {
+                let plan_revision = event.payload.get("plan_revision")?.as_u64()?;
+                let round =
+                    serde_json::from_value::<ProgressRound>(event.payload.get("round")?.clone())
+                        .ok()?;
+                Some((
+                    (plan_revision, round.round_id.clone()),
+                    serde_json::to_value(round).ok()?,
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let projected_progress = data
+            .progress
+            .iter()
+            .filter_map(|(plan_revision, round)| {
+                Some((
+                    (*plan_revision, round.round_id.clone()),
+                    serde_json::to_value(round).ok()?,
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let progress_matches = replay_progress == projected_progress;
+        if !progress_matches {
+            mismatches.push(format!(
+                "progress: projection={}, replay={}",
+                projected_progress.len(),
+                replay_progress.len()
+            ));
+        }
+
         let expected_tasks = Self::expected_tasks(data);
         let task_queue_matches = match &expected_tasks {
             Some(expected) => {
@@ -16231,6 +16273,36 @@ impl Engine {
         })
     }
 
+    fn expected_progress(data: &ReplayData) -> Option<Vec<(u64, ProgressRound)>> {
+        let mut items: Vec<(u64, ProgressRound)> = Vec::new();
+        for event in data
+            .events
+            .iter()
+            .filter(|event| event.kind == "progress.round")
+        {
+            let plan_revision = event
+                .payload
+                .get("plan_revision")
+                .and_then(serde_json::Value::as_u64)?;
+            let round = event
+                .payload
+                .get("round")
+                .cloned()
+                .and_then(|value| serde_json::from_value::<ProgressRound>(value).ok())?;
+            if let Some(existing) = items.iter_mut().find(|(revision, item)| {
+                *revision == plan_revision && item.round_id == round.round_id
+            }) {
+                existing.1 = round;
+            } else {
+                items.push((plan_revision, round));
+            }
+        }
+        // Preserve event order. Sorting by `round_id` would turn r10/r11
+        // lexicographically ahead of r2 and corrupt the seq-ordered window
+        // used by `session.progress` after a repair.
+        Some(items)
+    }
+
     fn build_session_repair(data: &ReplayData) -> Result<SessionRepair> {
         let status = data
             .events
@@ -16527,6 +16599,7 @@ impl Engine {
             memories,
             memory_conflicts: Some(replay_memory_conflicts(&data.events)),
             questions,
+            progress: Self::expected_progress(data),
             tasks: Self::expected_tasks(data),
             steering: Some(replay_steering(&data.events)),
             continuations: Some(replay_continuations(&data.events)),
@@ -19495,6 +19568,145 @@ impl Engine {
                 let _ = sender.send(false);
             }
         }
+    }
+
+    /// Read-only loopback A2A facade status. Never returns a bearer token.
+    pub fn a2a_status(&self) -> vp_protocol::a2a::A2aStatus {
+        self.a2a.status()
+    }
+
+    /// Update the stored A2A policy while the facade is stopped.
+    pub fn a2a_set_policy(
+        &self,
+        policy: vp_protocol::a2a::A2aPolicy,
+    ) -> Result<vp_protocol::a2a::A2aStatus> {
+        self.a2a.set_policy(policy)
+    }
+
+    /// Read the running Agent Card as JSON. Returns `None` when stopped.
+    pub fn a2a_card(&self) -> Option<serde_json::Value> {
+        self.a2a.card()
+    }
+
+    /// Read the bounded in-memory inbound-task list. This is operational state
+    /// and is intentionally not persisted across daemon restarts.
+    pub fn a2a_tasks(
+        &self,
+        limit: u32,
+        state: Option<&str>,
+    ) -> vp_protocol::a2a::A2aTaskListResult {
+        self.a2a.tasks(limit, state)
+    }
+
+    /// Start the loopback A2A facade. `approved` is the explicit host-state
+    /// gate; the facade is disabled by default and binds loopback only.
+    pub async fn a2a_start(
+        &self,
+        approved: bool,
+        policy: Option<vp_protocol::a2a::A2aPolicy>,
+    ) -> Result<vp_protocol::a2a::A2aStartResult> {
+        self.a2a.start(approved, policy).await
+    }
+
+    /// Stop the loopback A2A facade. The one-time token is not retained.
+    pub async fn a2a_stop(&self, reason: Option<&str>) -> Result<vp_protocol::a2a::A2aStatus> {
+        self.a2a.stop(reason).await
+    }
+
+    /// Record one bounded advisory progress round. The ledger is evidence
+    /// only: it never changes the plan, task queue, scheduler, budgets, or
+    /// merge state.
+    pub async fn record_progress_round(
+        &self,
+        session_id: &str,
+        mut round: ProgressRound,
+    ) -> Result<ProgressLedgerResult> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let session = tokio::task::spawn_blocking(move || store.get_session(&id))
+            .await??
+            .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+        if session.status == "imported" {
+            bail!("imported sessions are read-only archives");
+        }
+        let plan_revision = u64::from(self.current_plan_revision(session_id).await.unwrap_or(0));
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let existing = tokio::task::spawn_blocking(move || {
+            store.list_progress_rounds(&id, Some(plan_revision), MAX_PROGRESS_ROUNDS)
+        })
+        .await??;
+        let policy = crate::progress_ledger::ProgressPolicy::default();
+        let existing_rounds = existing.0;
+        let mut ledger =
+            crate::progress_ledger::ProgressLedger::try_new(session_id, plan_revision)?;
+        ledger.rounds = existing_rounds.clone();
+        ledger.assessment = ledger.assess(&policy);
+        if round.round_id.trim().is_empty() {
+            round.round_id = ledger.next_round_id()?;
+        }
+        round.agent_id = round
+            .agent_id
+            .or_else(|| Some("operator".to_string()))
+            .map(|value| value.chars().take(200).collect());
+        round.agent_name = round
+            .agent_name
+            .or_else(|| Some("Operator".to_string()))
+            .map(|value| value.chars().take(200).collect());
+        ledger.push_round(&policy, round)?;
+        let stored = ledger
+            .latest_round()
+            .cloned()
+            .ok_or_else(|| anyhow!("progress round was not appended"))?;
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let (stored, event) = tokio::task::spawn_blocking(move || {
+            store.insert_progress_round_with_event(&id, plan_revision, &stored)
+        })
+        .await??;
+        let mut ledger =
+            crate::progress_ledger::ProgressLedger::try_new(session_id, plan_revision)?;
+        ledger.rounds = existing_rounds;
+        ledger.rounds.push(stored);
+        let result = ledger.to_result(&policy, false);
+        self.broadcast_event(event);
+        Ok(result)
+    }
+
+    /// Read the newest bounded progress ledger for a session and optional plan
+    /// revision. Missing rounds produce the conservative insufficient-evidence
+    /// assessment; this never synthesizes progress.
+    pub async fn session_progress(
+        &self,
+        session_id: &str,
+        plan_revision: Option<u64>,
+        limit: Option<u32>,
+    ) -> Result<ProgressLedgerResult> {
+        let fallback_revision =
+            u64::from(self.current_plan_revision(session_id).await.unwrap_or(0));
+        let revision = match plan_revision {
+            Some(revision) => revision,
+            None => {
+                let store = self.store.clone();
+                let id = session_id.to_string();
+                tokio::task::spawn_blocking(move || store.latest_progress_revision(&id))
+                    .await??
+                    .unwrap_or(fallback_revision)
+            }
+        };
+        let limit = limit
+            .unwrap_or(vp_protocol::progress::DEFAULT_PROGRESS_LIMIT)
+            .clamp(1, MAX_PROGRESS_ROUNDS);
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let (rounds, truncated) = tokio::task::spawn_blocking(move || {
+            store.list_progress_rounds(&id, Some(revision), limit)
+        })
+        .await??;
+        let policy = crate::progress_ledger::ProgressPolicy::default();
+        let mut ledger = crate::progress_ledger::ProgressLedger::try_new(session_id, revision)?;
+        ledger.rounds = rounds;
+        Ok(ledger.to_result(&policy, truncated))
     }
 
     pub async fn request_question(

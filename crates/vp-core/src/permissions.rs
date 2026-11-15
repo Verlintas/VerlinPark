@@ -418,6 +418,7 @@ pub fn assess_tool_call_with_gui(
         | "budget_status"
         | "task_detail"
         | "tool_search"
+        | "report_progress"
         | "publish_artifact_file"
         | "wait_for"
         | "fetch_url"

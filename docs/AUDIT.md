@@ -412,6 +412,35 @@ tools.
 
 Verification: 3,956 Rust tests passed; no Swift code changed.
 
+## 0.24 2026-11-16 Contracted execution C11/C12 and store split
+
+ADR-0221 adds a loopback-only A2A facade (`vp-a2a`): bounded Agent Card,
+JSON-RPC task lifecycle, SSE, in-memory task store, one-time constant-time
+bearer token, loopback-only bind/URL validation, and explicit approved
+`a2a.start`/`a2a.stop`/`a2a.status`/`a2a.tasks`. Inbound tasks are card-only
+rejected until a capability contract exists; the facade cannot execute local
+tools, files, shell, network, providers, or approvals. The task list is
+bounded operational memory and is not a session projection or merge evidence.
+Limits: no inbound execution bridge, `input-required` resume, external-gate
+mapping, push notifications, durable task replay, public listener, or
+cross-host registry; the handler is not an OS sandbox.
+
+ADR-0220 adds the advisory progress ledger: bounded Manager rounds, strict
+monotonic round ids, deterministic `insufficient_evidence|blocked|in_loop|
+stalled|progressing` assessment, `report_progress` for Leader/Manager, a
+`progress_rounds` event/projection with replay/repair, `session.progress`
+RPC/CLI, and a Swift ProgressCard. It is evidence only: no task selection,
+claim/skip/retry/cancel/replan/merge, budget/capacity change, or automatic
+application of `next_task`/`instruction`. Limits: model self-report, text
+heuristics, Leader/Manager-only, same-host SQLite, no cross-session trends or
+UI editing.
+
+M3.1 splits `vp-store/src/store.rs` (34,939 lines) into a 6,611-line parent and
+33 domain modules (~28.5k moved lines) with unchanged SQL/public APIs; 390
+store tests pass. This is structural relocation, not new behavior.
+
+Verification: 4,227 Rust passed / 0 failed / 6 ignored; 535 Swift passed (403 app + 132 helper); `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `swiftformat --lint`, and `xcodebuild test` passed.
+
 ## 0. 2026-10-30 跟进
 
 第一轮硬化已完成（同一 `main` 线，提交见仓库历史）：

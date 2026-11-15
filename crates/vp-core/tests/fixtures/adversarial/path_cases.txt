@@ -1,0 +1,22 @@
+# Raw worktree-relative path input <TAB> expected normalize_contract_path output.
+# !ERR means the input must be rejected (absolute, home expansion, or `..`).
+	.
+.	.
+./src	src
+src/	src
+src//lib.rs	src/lib.rs
+a/./b	a/b
+...	...
+文档/说明.md	文档/说明.md
+src/.	src
+./././a/b	a/b
+../x	!ERR
+/etc/passwd	!ERR
+~/secrets	!ERR
+$HOME/x	!ERR
+${HOME}/x	!ERR
+a/../b	!ERR
+./../x	!ERR
+..	!ERR
+a/b/../../c	!ERR
+//server/share	!ERR

@@ -429,6 +429,18 @@ struct DashboardView: View {
         case .usage:
             if let project = model.selectedProject {
                 EfficiencyCard(project: project)
+                ProgressCard(
+                    ledger: model.sessionProgress,
+                    style: .expanded,
+                    title: model.selectedSession?.goal,
+                    isEnabled: model.selectedSession != nil,
+                    isLoading: model.progressBusy,
+                    errorMessage: model.progressStatus,
+                    onRefresh: {
+                        Task { await model.loadProgress() }
+                    },
+                    onReport: nil
+                )
                 ToolActivityCard()
                 ProjectUsageCard(project: project)
                 ProjectBudgetCard(project: project)
@@ -461,6 +473,23 @@ struct DashboardView: View {
                 ApprovalOptimizerCard(project: project)
                 IntegrationPolicyCard(project: project)
                 GuiPolicyCard(project: project)
+                A2AStatusCard(
+                    status: model.a2aStatus,
+                    tasks: model.a2aTasks,
+                    tasksTruncated: model.a2aTasksTruncated,
+                    policy: model.a2aStatus?.policy,
+                    isLoading: model.a2aBusy,
+                    errorMessage: model.a2aStatusMessage,
+                    onStart: {
+                        Task { await model.startA2A(approved: true) }
+                    },
+                    onStop: {
+                        Task { await model.stopA2A(reason: "operator stop") }
+                    },
+                    onRefresh: {
+                        Task { await model.loadA2AStatus() }
+                    }
+                )
             } else {
                 DashboardNoProjectCard(detail: "Select a project to edit policies.")
             }
@@ -521,6 +550,7 @@ struct DashboardView: View {
             await model.refreshLongTaskState()
         case .usage:
             await model.loadEfficiency()
+            await model.loadProgress()
             await model.loadProjectBudget()
         case .git:
             await model.loadProjectForkForest()
@@ -545,6 +575,7 @@ struct DashboardView: View {
             await model.loadShellPolicy()
             await model.loadIntegrationPolicy()
             await model.loadGuiPolicy()
+            await model.loadA2AStatus()
         case .diagnostics:
             await model.runDoctor()
         }

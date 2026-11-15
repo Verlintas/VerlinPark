@@ -223,6 +223,9 @@
 | [0217](adr/0217-tool-search-v2-and-delta-snapshots.md) | Tool search v2: BM25 + prerequisite closure, completeness/missing, turn-boundary schema promotion with priced cache epoch, delta browser snapshots with generation/STALE_REF | Accepted | Runtime/Observability |
 | [0218](adr/0218-mcp-async-tasks-and-elicitation.md) | MCP async tasks: durable explicit task handles/get/result/cancel/list, TTL/effect evidence, form elicitation via question inbox, URL denial | Accepted | MCP/Runtime/Security |
 | [0219](adr/0219-code-mode-run-script.md) | Code Mode `run_script`: QuickJS+oxc, 64 MiB/CPU/call budgets, frozen-bundle typed bindings, no ambient capabilities, inner calls re-enter contract/approval/effect/journal gates, read-only first with opt-in file writes | Accepted | Runtime/Security/Tooling |
+| [0220](adr/0220-advisory-progress-ledger.md) | Advisory progress ledger: bounded Manager rounds, deterministic status/stall/in-loop assessment, event/projection/replay, `report_progress`, never selects/retries/replans | Accepted | Orchestration/Observability |
+| [0221](adr/0221-loopback-a2a-facade.md) | Loopback-only A2A facade: bounded card/task/SSE library, one-time bearer token, explicit approved start, card-only inbound rejection, no local authority | Accepted | Interop/Security |
+| [0222](adr/0222-store-domain-module-split.md) | `vp-store` structural split: 34,939-line `store.rs` → 6,611-line parent + 33 domain modules, unchanged SQL/public APIs | Accepted | Maintainability |
 
 ---
 

@@ -1112,6 +1112,65 @@ actor CoreClient {
         .decode(ContextCheckpointPolicyResult.self)
     }
 
+    func sessionProgress(
+        sessionID: String,
+        planRevision: Int? = nil,
+        limit: Int = 64
+    ) async throws -> ProgressLedger {
+        var params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "limit": .number(Double(max(1, min(256, limit)))),
+        ]
+        if let planRevision {
+            params["plan_revision"] = .number(Double(max(0, planRevision)))
+        }
+        return try await request(method: "session.progress", params: params)
+            .decode(ProgressLedger.self)
+    }
+
+    func reportProgress(
+        sessionID: String,
+        round: JSONValue
+    ) async throws -> ProgressLedger {
+        try await request(
+            method: "session.progress.report",
+            params: ["session_id": .string(sessionID), "round": round]
+        )
+        .decode(ProgressLedger.self)
+    }
+
+    func a2aStatus() async throws -> A2AStatus {
+        try await request(method: "a2a.status", params: [:]).decode(A2AStatus.self)
+    }
+
+    func a2aTasks(limit: Int = 50, state: String? = nil) async throws -> A2ATaskListResult {
+        var params: [String: JSONValue] = [
+            "limit": .number(Double(max(1, min(200, limit)))),
+        ]
+        if let state, !state.isEmpty {
+            params["state"] = .string(state)
+        }
+        return try await request(method: "a2a.tasks", params: params)
+            .decode(A2ATaskListResult.self)
+    }
+
+    func a2aStart(approved: Bool, policy: A2APolicy) async throws -> A2AStartResult {
+        try await request(
+            method: "a2a.start",
+            params: ["approved": .bool(approved), "policy": policy.jsonValue]
+        )
+        .decode(A2AStartResult.self)
+    }
+
+    func a2aStop(reason: String? = nil) async throws -> A2AStatus {
+        var params: [String: JSONValue] = [:]
+        if let reason, !reason.isEmpty {
+            params["reason"] = .string(reason)
+        }
+        return try await request(method: "a2a.stop", params: params)
+            .decode(A2AStatus.self)
+    }
+
     func sessionCache(sessionID: String) async throws -> SessionCacheStatus {
         try await request(
             method: "session.cache",

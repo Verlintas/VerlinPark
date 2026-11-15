@@ -6,6 +6,7 @@ members = [
     "crates/vp-remote-agent",
     "crates/vp-store",
     "crates/vp-providers",
+    "crates/vp-a2a",
     "crates/vp-core",
     "crates/vp-daemon",
     "crates/vp-cli",

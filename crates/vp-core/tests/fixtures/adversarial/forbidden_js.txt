@@ -1,0 +1,34 @@
+# One JavaScript snippet per line. Each must be rejected by validate_source.
+eval("1")
+Function("return 1")
+globalThis.x = 1
+window.alert(1)
+self.x = 1
+process.exit(0)
+require("fs")
+module.exports = {}
+exports.x = 1
+Deno.readTextFileSync("x")
+Bun.file("x")
+new XMLHttpRequest()
+fetch("https://example.com")
+new WebSocket("ws://example.com")
+new Worker("x.js")
+new SharedWorker("x.js")
+importScripts("x.js")
+WebAssembly.compile(bytes)
+Atomics.load(array, 0)
+new SharedArrayBuffer(8)
+os.platform()
+std.out.println("x")
+scriptArgs[0]
+stdin.read()
+stdout.write("x")
+stderr.write("x")
+import("mod")
+const m = import("mod")
+await fetch("https://example.com")
+globalThis["fetch"]("x")
+const eval = 1; return eval;
+let window = 1; return window;
+const payload = { fetch };

@@ -405,46 +405,53 @@
       "title": "A2A loopback facade",
       "phase": "phase-3",
       "priority": "P3",
-      "status": "planned",
+      "status": "implemented",
       "depends_on": [
         "C3",
         "C4"
       ],
       "files": [
+        "crates/vp-a2a/src/lib.rs",
         "crates/vp-core/src/a2a.rs",
+        "crates/vp-protocol/src/a2a.rs",
         "crates/vp-daemon/src/main.rs",
-        "crates/vp-protocol/src/types.rs",
-        "docs/adr/0203-a2a-loopback-facade.md"
+        "docs/adr/0221-loopback-a2a-facade.md"
       ],
       "deliverables": [
-        "signed/derived Agent Card",
-        "task lifecycle with input-required/auth-required",
+        "bounded derived Agent Card and loopback HTTP/SSE transport",
+        "task lifecycle with input-required/auth-required states",
         "SSE + loopback only; no public push endpoint",
-        "maps external tasks to gates/contracts"
+        "explicit approved start, one-time bearer token, in-memory task bounds",
+        "inbound remains card-only rejected until a capability-attenuation contract exists"
       ],
       "tests": [
-        "agent card decode",
-        "task lifecycle and input-required",
-        "no public bind by default",
-        "capability attenuation"
+        "agent card decode and loopback URL rejection",
+        "task lifecycle, terminal immutability, cancel, and idempotency",
+        "no public bind by default and unauthorized request rejection",
+        "approved start/stop, one-time token redaction, task and TTL caps",
+        "inbound rejection grants no local authority"
       ],
-      "acceptance": "Inbound A2A is loopback-only and cannot exceed the parent contract."
+      "acceptance": "Inbound A2A is loopback-only, card-only rejected, and cannot exceed the parent contract.",
+      "adr": "0221",
+      "note": "Loopback-only card/task/SSE library and approved daemon lifecycle; inbound tasks are card-only rejected until capability attenuation."
     },
     {
       "id": "C12",
       "title": "Advisory progress ledger",
       "phase": "phase-3",
       "priority": "P3",
-      "status": "planned",
+      "status": "implemented",
       "depends_on": [
         "C6"
       ],
       "files": [
-        "crates/vp-core/src/orchestration.rs",
+        "crates/vp-core/src/progress_ledger.rs",
         "crates/vp-core/src/agent.rs",
-        "crates/vp-protocol/src/types.rs",
+        "crates/vp-core/src/lib.rs",
+        "crates/vp-protocol/src/progress.rs",
+        "crates/vp-store/src/store.rs",
         "crates/vp-daemon/src/main.rs",
-        "docs/adr/0204-advisory-progress-ledger.md"
+        "docs/adr/0220-advisory-progress-ledger.md"
       ],
       "deliverables": [
         "bounded progress_ledger: satisfied, in_loop, progressing, next_task, instruction, evidence",
@@ -456,7 +463,9 @@
         "stall evidence only",
         "no automatic plan rewrite"
       ],
-      "acceptance": "Progress is legible without giving an LLM control of the scheduler."
+      "acceptance": "Progress is legible without giving an LLM control of the scheduler.",
+      "adr": "0220",
+      "note": "Bounded advisory rounds, deterministic assessment, event/projection/replay, report_progress tool, no automatic action."
     }
   ],
   "invariants": [
@@ -589,6 +598,20 @@
       "tests": {
         "rust": 3956,
         "swift": 0
+      }
+    },
+    "C11": {
+      "adr": "0221",
+      "tests": {
+        "rust": 4227,
+        "swift": 535
+      }
+    },
+    "C12": {
+      "adr": "0220",
+      "tests": {
+        "rust": 4227,
+        "swift": 535
       }
     }
   }

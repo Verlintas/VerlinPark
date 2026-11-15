@@ -4,10 +4,12 @@
 //! envelope, discovery file, and domain DTOs without pulling in storage or
 //! runtime concerns.
 
+pub mod a2a;
 pub mod diagnosis;
 pub mod discovery;
 pub mod lsp;
 pub mod otel;
+pub mod progress;
 pub mod remote;
 pub mod replay;
 pub mod rpc;

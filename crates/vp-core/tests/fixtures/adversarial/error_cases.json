@@ -1,0 +1,45 @@
+{
+  "non_retryable": [
+    "TOOL_FAILED",
+    "INVALID_ARGUMENT",
+    "WRITE_FAILED",
+    "READ_FAILED",
+    "COMMAND_FAILED",
+    "SHELL_DENIED",
+    "PERMISSION_DENIED",
+    "PATH_ESCAPE",
+    "MCP_FAILED",
+    "REMOTE_WRITE_FAILED",
+    "SCRIPT_TIMEOUT",
+    "SCRIPT_CALL_BUDGET",
+    "BUDGET_EXHAUSTED",
+    "APPROVAL_REQUIRED",
+    "CANCELLED",
+    "PREEMPTED",
+    "FORGE_AUTH_FAILED"
+  ],
+  "retryable": [
+    "PATCH_CONFLICT",
+    "HASH_MISMATCH",
+    "WAIT_TIMEOUT",
+    "TIMEOUT",
+    "REMOTE_UNAVAILABLE",
+    "CAPACITY_EXCEEDED",
+    "CONFLICT",
+    "LSP_TIMEOUT",
+    "STALE_REF",
+    "MCP_TIMEOUT"
+  ],
+  "classify": [
+    {"tool": "read_file", "message": "No such file or directory", "code": "FILE_NOT_FOUND"},
+    {"tool": "read_file", "message": "permission denied", "code": "PERMISSION_DENIED"},
+    {"tool": "write_file", "message": "path escapes the worktree", "code": "PATH_ESCAPE"},
+    {"tool": "remote_write", "message": "path escapes the remote root", "code": "REMOTE_PATH_ESCAPE"},
+    {"tool": "computer", "message": "stale snapshot generation", "code": "STALE_REF"},
+    {"tool": "process", "message": "operation timed out", "code": "WAIT_TIMEOUT"},
+    {"tool": "fetch_url", "message": "connection timed out", "code": "FETCH_TIMEOUT"},
+    {"tool": "mcp", "message": "connection refused", "code": "REMOTE_UNAVAILABLE"},
+    {"tool": "read_tool_output", "message": "handle expired", "code": "TOOL_OUTPUT_EXPIRED"},
+    {"tool": "unknown_tool", "message": "something inexplicable", "code": null}
+  ]
+}

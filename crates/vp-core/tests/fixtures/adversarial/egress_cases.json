@@ -1,0 +1,17 @@
+[
+  {"url": "https://example.com/a", "allowlist": ["example.com"], "expect": "allow"},
+  {"url": "https://sub.example.com/a", "allowlist": ["example.com"], "expect": "escalate"},
+  {"url": "https://a.example.com/x", "allowlist": ["*.example.com"], "expect": "allow"},
+  {"url": "https://example.com/x", "allowlist": ["*.example.com"], "expect": "allow"},
+  {"url": "https://evil.example.net/x", "allowlist": ["*.example.com"], "expect": "escalate"},
+  {"url": "https://user:pass@example.com/x", "allowlist": ["example.com"], "expect": "escalate"},
+  {"url": "http://example.com:8080/x", "allowlist": ["example.com"], "expect": "allow"},
+  {"url": "ftp://example.com/x", "allowlist": ["example.com"], "expect": "escalate"},
+  {"url": "file:///etc/passwd", "allowlist": ["example.com"], "expect": "escalate"},
+  {"url": "not-a-url", "allowlist": ["example.com"], "expect": "escalate"},
+  {"url": "https://example.com/x", "allowlist": ["*"], "expect": "allow"},
+  {"url": "https://example.com/x", "allowlist": [], "expect": "allow"},
+  {"url": "http://localhost:8080/x", "allowlist": ["localhost"], "expect": "allow"},
+  {"url": "https://example.com/x", "allowlist": ["https://example.com/api"], "expect": "allow"},
+  {"url": "https://example.com/x", "allowlist": ["EXAMPLE.COM"], "expect": "allow"}
+]

@@ -3264,6 +3264,72 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
                 Err(response) => response_with_id(id, response),
             }
         }
+        "a2a.status" => match parse_params::<vp_protocol::a2a::A2aStatusParams>(request.params) {
+            Ok(_) => RpcResponse::success(id, state.engine.a2a_status()),
+            Err(response) => response_with_id(id, response),
+        },
+        "a2a.policy.set" => {
+            match parse_params::<vp_protocol::a2a::A2aPolicySetParams>(request.params) {
+                Ok(params) => match state.engine.a2a_set_policy(params.policy) {
+                    Ok(status) => RpcResponse::success(id, status),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "a2a.card" => match parse_params::<vp_protocol::a2a::A2aCardParams>(request.params) {
+            Ok(_) => RpcResponse::success(id, serde_json::json!({"card": state.engine.a2a_card()})),
+            Err(response) => response_with_id(id, response),
+        },
+        "a2a.tasks" => match parse_params::<vp_protocol::a2a::A2aTaskListParams>(request.params) {
+            Ok(params) => RpcResponse::success(
+                id,
+                state
+                    .engine
+                    .a2a_tasks(params.limit.unwrap_or(50), params.state.as_deref()),
+            ),
+            Err(response) => response_with_id(id, response),
+        },
+        "a2a.start" => match parse_params::<vp_protocol::a2a::A2aStartParams>(request.params) {
+            Ok(params) => match state.engine.a2a_start(params.approved, params.policy).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "a2a.stop" => match parse_params::<vp_protocol::a2a::A2aStopParams>(request.params) {
+            Ok(params) => match state.engine.a2a_stop(params.reason.as_deref()).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => internal_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.progress.report" => {
+            match parse_params::<vp_protocol::progress::ReportProgressParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .record_progress_round(&params.session_id, params.round)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "session.progress" => {
+            match parse_params::<vp_protocol::progress::SessionProgressParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .session_progress(&params.session_id, params.plan_revision, params.limit)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "session.context" => match parse_params::<SessionContextParams>(request.params) {
             Ok(params) => match state
                 .engine

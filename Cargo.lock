@@ -3920,6 +3920,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "vp-a2a"
+version = "0.1.0-dev"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "axum",
+ "base64 0.22.1",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "tokio-stream",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "vp-bench"
 version = "0.1.0-dev"
 dependencies = [
@@ -4010,6 +4031,7 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+ "vp-a2a",
  "vp-protocol",
  "vp-providers",
  "vp-remote",

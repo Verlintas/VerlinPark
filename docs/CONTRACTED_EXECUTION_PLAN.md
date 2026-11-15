@@ -511,8 +511,8 @@ should wait until the identity/role contracts and Worker workspace phases
 | C8 Tool search v2 + delta snapshots | **implemented** | ADR-0217, BM25/prerequisite closure/completeness, turn-boundary schema promotion with `bundle.revision` and cache pricing, delta browser snapshots with generation/STALE_REF |
 | C9 MCP tasks/elicitation | **implemented** | ADR-0218, durable `mcp_tasks`/get/result/cancel/list, explicit polling only, TTL/effect evidence, form elicitation to question inbox, URL denial |
 | C10 Code Mode | **implemented** | ADR-0219, QuickJS+oxc, 64 MiB/CPU/call budgets, frozen-bundle typed bindings, no ambient capabilities, inner contract/approval/effect/journal gates, read-only first + opt-in file writes |
-| C11 A2A loopback | planned | |
-| C12 Advisory progress ledger | planned | |
+| C11 A2A loopback | **implemented (card-only)** | ADR-0221, `vp-a2a` bounded card/task/SSE + one-time token, approved loopback start, inbound tasks rejected until capability contract; no execution bridge |
+| C12 Advisory progress ledger | **implemented** | ADR-0220, bounded rounds/assessment, event/projection/replay, `report_progress`, advisory-only, no auto retry/replan |
 
 ## 10. References
 
