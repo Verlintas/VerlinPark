@@ -57,7 +57,7 @@ read-only spike and a capability-minimal runner, not a general Node runtime.
   best-effort check of the advertised schema (required fields, primitive types,
   enums, arrays, string/number bounds, `additionalProperties: false`). The tool
   still performs its own authoritative validation after dispatch.
-- A generated `tools.<name>(args)` call returns `{text, data, truncated}`.
+- A generated `tools.<name>(args)` call returns `{text, data, truncated, dataTruncated}`. `dataTruncated` is true when a structured payload exceeded 32 KiB and was intentionally dropped from the script reply.
   Tool errors throw a JavaScript `Error` with `.code` (for example
   `FILE_NOT_FOUND`); scripts may catch and summarize them. `input` is frozen
   JSON; `print`/`console.*` append to the bounded stdout buffer.
@@ -128,14 +128,19 @@ engine.
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace`: 3,951 passed, 0 failed
+- `cargo test --workspace`: 3,955 passed, 0 failed
 - New tests cover syntax/forbidden-global rejection, nesting/source caps,
   frozen-bundle binding construction, unknown proxy bindings, absence of
   ambient capabilities (including via dynamic `Function`), typed argument
   checks, call/write budgets, CPU and heap limits, stdout caps, deterministic
   inner-call sequences, catchable tool errors, stable error mapping, role
   advertisement, and end-to-end read-only/write scripts with inner
-  `tool.finished` and effect evidence.
+  `tool.finished` and effect evidence. A strict-mode test denies one inner
+  write while approving the outer script, proves the script can catch the typed
+  error, and proves no file is created. A second-run test proves a completed
+  inner write replays from its effect receipt instead of executing again.
+  Oversized stdout spills through `ToolOutputPolicy`, and invalid source maps
+  to `SCRIPT_INVALID`.
 
 ## Limits
 
@@ -147,6 +152,10 @@ engine.
   validator.
 - `oxc` checks the original source; dynamically constructed code is not
   statically inspected, only capability-limited at the bridge.
+- A script that times out or is cancelled after a completed inner write leaves
+  that write in place with its `done` receipt; a retry replays it instead of
+  re-executing, but the script's later steps did not run. Scripts should
+  therefore order writes late or make later steps independently retryable.
 - The runner is one daemon process with no per-script OS isolation and no
   cross-host execution. Output/result bodies remain tool output, not a new
   event projection.

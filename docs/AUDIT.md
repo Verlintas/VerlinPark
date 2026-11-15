@@ -395,7 +395,11 @@ blanket write grant; each inner write is separately authorized. Limits are
 source/input, 256 KiB result, 64 KiB stdout. `run_script` is advertised only to
 Leader/Worker/Labour; the Leader target moves to 51.
 
-Still open: this is not an OS-level sandbox, cgroup, separate process, seccomp
+Still open: the inner-call gate sequence in `agent.rs` intentionally mirrors
+the outer dispatcher (contracts, approvals, journal, effects, skill policy,
+preemption) rather than sharing one extracted function; future gate changes
+must update both paths, and extracting a common policy stage is the next
+maintainability step. This is not an OS-level sandbox, cgroup, separate process, seccomp
 profile, or native-safety boundary; QuickJS runs in the daemon process. Only
 registry tools are bound (no MCP/mailbox/artifact/source/memory/gate/delegation).
 Schema checking is bounded best-effort, not full JSON Schema; dynamically
@@ -405,7 +409,7 @@ replay engine; call/write caps are per invocation, not a global quota; no
 script RPC, cross-host execution, or write expansion beyond the three file
 tools.
 
-Verification: 3,951 Rust tests passed; no Swift code changed.
+Verification: 3,955 Rust tests passed; no Swift code changed.
 
 ## 0. 2026-10-30 跟进
 
