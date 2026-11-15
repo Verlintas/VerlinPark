@@ -395,11 +395,12 @@ blanket write grant; each inner write is separately authorized. Limits are
 source/input, 256 KiB result, 64 KiB stdout. `run_script` is advertised only to
 Leader/Worker/Labour; the Leader target moves to 51.
 
-Still open: the inner and outer dispatchers share `finish_tool_call` for
-effect settlement and `tool.finished`, but the pre-execution gate sequence
-(duplicate check, contract, approval, effect prepare, journal intent) is still
-mirrored; future gate changes must update both paths, and extracting that stage
-is the next maintainability step. This is not an OS-level sandbox, cgroup, separate process, seccomp
+Still open: the inner and outer dispatchers share `authorize_tool_call`,
+`prepare_tool_effect_gate`, and `finish_tool_call` for assessment, contracts,
+approvals, mutation accounting, skill denial, effect planning/prepare/journal,
+settlement, and event commit. Only the execution branch and output selection
+remain path-specific; a future gate change should land in the shared helpers
+and be covered by both dispatcher tests. This is not an OS-level sandbox, cgroup, separate process, seccomp
 profile, or native-safety boundary; QuickJS runs in the daemon process. Only
 registry tools are bound (no MCP/mailbox/artifact/source/memory/gate/delegation).
 Schema checking is bounded best-effort, not full JSON Schema; dynamically

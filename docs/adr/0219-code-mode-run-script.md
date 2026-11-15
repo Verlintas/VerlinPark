@@ -79,10 +79,12 @@ runs the same policy stack as a normal tool call:
 - `tool.started` and `tool.finished` events with `script=true`,
   `script_parent_tool_call_id`, and `script_seq`.
 
-The outer dispatcher and the inner path share one `finish_tool_call` helper for
-effect settlement, effect annotation, `tool.finished` payload construction, and
-the journal/event commit. The pre-execution gate sequence is still mirrored;
-that duplication is recorded as a maintainability gap rather than hidden.
+The outer dispatcher and the inner path share `authorize_tool_call` (risk
+assessment, contracts, approvals, mutation accounting, skill denial),
+`prepare_tool_effect_gate` (effect classification/prepare/replay/journal
+intent), and `finish_tool_call` (settlement, effect annotation,
+`tool.finished` payload construction, and the journal/event commit). Only the
+execution branch and output selection remain path-specific.
 
 `allow_write: true` raises the outer `run_script` approval to `HostState`. Each
 inner write then goes through the normal approval policy again (WorkspaceWrite
