@@ -25389,3 +25389,284 @@ async fn run_script_stops_when_the_session_is_cancelled() {
         started.elapsed()
     );
 }
+
+#[tokio::test]
+async fn run_script_inner_write_denial_is_catchable_and_does_not_write() {
+    let dir = TempDir::new().unwrap();
+    let provider = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_script_denied".into(),
+                    name: "run_script".into(),
+                    arguments: serde_json::json!({
+                        "script": r#"
+                            let denied = null;
+                            try {
+                              tools.write_file({path: "denied.txt", content: "must not exist"});
+                            } catch (error) {
+                              denied = { code: error.code, message: error.message };
+                            }
+                            return { denied };
+                        "#,
+                        "allow_write": true
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("denial handled".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    set_approval_mode(&service, ApprovalMode::Strict);
+    let session = engine
+        .create_session(project.id, "code mode denied write".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let approver_engine = engine.clone();
+    let approver_session = session.id.clone();
+    let approver = tokio::spawn(async move {
+        for _ in 0..200 {
+            if let Ok(approvals) = approver_engine
+                .list_approvals(Some(approver_session.clone()))
+                .await
+            {
+                for approval in approvals.iter().filter(|a| a.status == "pending") {
+                    let approve = approval.tool == "run_script";
+                    let _ = approver_engine
+                        .resolve_approval(&approval.id, approve)
+                        .await;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    service
+        .start(&session.id, "run the denied write")
+        .await
+        .unwrap();
+    let session = wait_until_idle(&engine, &session).await;
+    approver.abort();
+    assert_eq!(session.status, "idle");
+    let events = engine
+        .list_events(session.id.clone(), 0, 400)
+        .await
+        .unwrap();
+    let outer = events
+        .iter()
+        .find(|event| {
+            event.kind == "tool.finished"
+                && event.payload["name"] == "run_script"
+                && event.payload["script"].is_null()
+        })
+        .expect("outer run_script tool.finished");
+    let output = outer.payload["output"].as_str().unwrap_or_default();
+    assert!(output.contains("PERMISSION_DENIED"), "{output}");
+    let write = events
+        .iter()
+        .find(|event| {
+            event.kind == "tool.finished"
+                && event.payload["name"] == "write_file"
+                && event.payload["script"]["parent_tool_call_id"] == "call_script_denied"
+        })
+        .expect("inner write_file tool.finished");
+    assert_eq!(write.payload["is_error"], true);
+    assert_eq!(write.payload["error_code"], "PERMISSION_DENIED");
+    let worktree = session.worktree.as_deref().expect("session worktree");
+    assert!(
+        !std::path::Path::new(worktree).join("denied.txt").exists(),
+        "denied inner write created a file"
+    );
+}
+
+#[tokio::test]
+async fn run_script_replays_a_completed_inner_write_on_a_second_run() {
+    let dir = TempDir::new().unwrap();
+    let script = r#"
+        const result = tools.write_file({path: "replay.txt", content: "first"});
+        return { text: result.text };
+    "#;
+    let call = || {
+        vec![
+            StreamEvent::ToolCall(ToolCall {
+                id: "call_script_replay".into(),
+                name: "run_script".into(),
+                arguments: serde_json::json!({
+                    "script": script,
+                    "allow_write": true
+                })
+                .to_string(),
+            }),
+            StreamEvent::Done,
+        ]
+    };
+    let final_turn = || {
+        vec![
+            StreamEvent::TextDelta("replay run complete".into()),
+            StreamEvent::Done,
+        ]
+    };
+    let provider = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            call(),
+            final_turn(),
+            call(),
+            final_turn(),
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "code mode effect replay".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let approver_engine = engine.clone();
+    let approver_session = session.id.clone();
+    let approver = tokio::spawn(async move {
+        for _ in 0..400 {
+            if let Ok(approvals) = approver_engine
+                .list_approvals(Some(approver_session.clone()))
+                .await
+            {
+                for approval in approvals.iter().filter(|a| a.status == "pending") {
+                    let _ = approver_engine.resolve_approval(&approval.id, true).await;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    service
+        .start(&session.id, "first replay run")
+        .await
+        .unwrap();
+    let first = wait_until_idle(&engine, &session).await;
+    assert_eq!(first.status, "idle");
+    service
+        .start(&session.id, "second replay run")
+        .await
+        .unwrap();
+    let second = wait_until_idle(&engine, &first).await;
+    approver.abort();
+    assert_eq!(second.status, "idle");
+    let events = engine
+        .list_events(session.id.clone(), 0, 800)
+        .await
+        .unwrap();
+    let writes = events
+        .iter()
+        .filter(|event| {
+            event.kind == "tool.finished"
+                && event.payload["name"] == "write_file"
+                && event.payload["script"]["parent_tool_call_id"] == "call_script_replay"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(writes.len(), 2, "two inner write attempts");
+    assert_eq!(writes[0].payload["is_error"], false);
+    assert_eq!(writes[0].payload["structured"]["effect"]["state"], "done");
+    let replay_output = writes[1].payload["output"].as_str().unwrap_or_default();
+    assert!(
+        replay_output.contains("effect already completed"),
+        "{replay_output}"
+    );
+    assert_eq!(writes[1].payload["is_error"], false);
+    let worktree = second.worktree.as_deref().expect("session worktree");
+    assert_eq!(
+        std::fs::read_to_string(std::path::Path::new(worktree).join("replay.txt"))
+            .unwrap_or_default(),
+        "first"
+    );
+}
+
+#[tokio::test]
+async fn run_script_stdout_goes_through_output_spill_and_invalid_source_is_typed() {
+    let dir = TempDir::new().unwrap();
+    let provider = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_script_spill".into(),
+                    name: "run_script".into(),
+                    arguments: serde_json::json!({
+                        "script": "for (let i = 0; i < 2000; i++) print('0123456789'); return 'done';"
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_script_syntax".into(),
+                    name: "run_script".into(),
+                    arguments: serde_json::json!({
+                        "script": "let broken = (;"
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("spill and syntax complete".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "code mode spill".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service
+        .start(&session.id, "run the spill script")
+        .await
+        .unwrap();
+    let session = wait_until_idle(&engine, &session).await;
+    assert_eq!(session.status, "idle");
+    let events = engine
+        .list_events(session.id.clone(), 0, 500)
+        .await
+        .unwrap();
+    let spill = events
+        .iter()
+        .find(|event| {
+            event.kind == "tool.finished"
+                && event.payload["name"] == "run_script"
+                && event.payload["tool_call_id"] == "call_script_spill"
+        })
+        .expect("spill tool.finished");
+    assert_eq!(spill.payload["is_error"], false);
+    assert!(
+        spill.payload["output_ref"].as_str().is_some(),
+        "script stdout was not spilled: {}",
+        spill.payload
+    );
+    assert_eq!(spill.payload["truncated"], true);
+    assert!(
+        spill.payload["total_bytes"].as_u64().unwrap_or_default() > 16 * 1024,
+        "spilled output is smaller than the spill threshold"
+    );
+    let syntax = events
+        .iter()
+        .find(|event| {
+            event.kind == "tool.finished"
+                && event.payload["name"] == "run_script"
+                && event.payload["tool_call_id"] == "call_script_syntax"
+        })
+        .expect("syntax tool.finished");
+    assert_eq!(syntax.payload["is_error"], true);
+    assert_eq!(syntax.payload["error_code"], "SCRIPT_INVALID");
+}

@@ -617,7 +617,10 @@ fn run_sync(
                                 &format!("{tool} arguments are invalid: {error}"),
                             ));
                         }
-                        let used = call_count.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+                        // The closure is single-threaded; check before
+                        // committing the counters so a rejected budget attempt
+                        // does not inflate the reported call/write totals.
+                        let used = call_count.load(Ordering::Relaxed).saturating_add(1);
                         if used > limits.max_calls {
                             return Err(Exception::throw_message(
                                 &js_ctx,
@@ -630,9 +633,7 @@ fn run_sync(
                         let write_used = if binding.read_only {
                             0
                         } else {
-                            write_count
-                                .fetch_add(1, Ordering::Relaxed)
-                                .saturating_add(1)
+                            write_count.load(Ordering::Relaxed).saturating_add(1)
                         };
                         if write_used > limits.max_write_calls {
                             return Err(Exception::throw_message(
@@ -642,6 +643,10 @@ fn run_sync(
                                     limits.max_write_calls
                                 ),
                             ));
+                        }
+                        call_count.store(used, Ordering::Relaxed);
+                        if !binding.read_only {
+                            write_count.store(write_used, Ordering::Relaxed);
                         }
                         let (reply_tx, reply_rx) = oneshot::channel();
                         request_tx
@@ -827,7 +832,12 @@ function __vp_make(name) {
       error.code = reply.error_code || "TOOL_FAILED";
       throw error;
     }
-    return { text: reply.text, data: reply.data, truncated: reply.truncated === true };
+    return {
+      text: reply.text,
+      data: reply.data,
+      truncated: reply.truncated === true,
+      dataTruncated: reply.data_truncated === true
+    };
   };
 }
 for (const name of __vp_names) {
@@ -869,6 +879,7 @@ fn render_reply(tool: &str, output: &ToolOutput) -> String {
             Some(value.clone())
         }
     });
+    let data_truncated = data.is_none() && output.structured.is_some();
     let failure = output.failure.as_ref();
     let error_code = failure
         .map(|failure| failure.code.as_str())
@@ -881,6 +892,7 @@ fn render_reply(tool: &str, output: &ToolOutput) -> String {
         "text": text,
         "message": message,
         "data": data,
+        "data_truncated": data_truncated,
         "truncated": truncated,
         "error_code": error_code,
         "tool": tool,
@@ -1108,8 +1120,18 @@ mod tests {
                 parameters: json!({"type": "object"}),
             },
             ToolSchema {
+                name: "apply_patch".into(),
+                description: "patch".into(),
+                parameters: json!({"type": "object"}),
+            },
+            ToolSchema {
                 name: "shell".into(),
                 description: "shell".into(),
+                parameters: json!({"type": "object"}),
+            },
+            ToolSchema {
+                name: "run_script".into(),
+                description: "recursion".into(),
                 parameters: json!({"type": "object"}),
             },
             ToolSchema {
@@ -1121,10 +1143,14 @@ mod tests {
         let read_only = bindings(&advertised, false);
         assert!(read_only.contains_key("read_file"));
         assert!(!read_only.contains_key("write_file"));
+        assert!(!read_only.contains_key("apply_patch"));
         assert!(!read_only.contains_key("shell"));
+        assert!(!read_only.contains_key("run_script"));
         assert!(!read_only.contains_key("not_in_bundle"));
         let writable = bindings(&advertised, true);
         assert!(writable.contains_key("write_file"));
+        assert!(writable.contains_key("apply_patch"));
+        assert!(!writable.contains_key("run_script"));
         assert!(writable["read_file"].read_only);
         assert!(!writable["write_file"].read_only);
     }
@@ -1392,6 +1418,21 @@ mod tests {
             classify_error("some other failure"),
             crate::tooling::errors::ToolErrorCode::SCRIPT_FAILED
         );
+    }
+
+    #[test]
+    fn structured_reply_reports_when_data_was_dropped() {
+        let small = ToolOutput::ok_structured("ok", json!({"a": 1}));
+        let reply: Value = serde_json::from_str(&render_reply("read_file", &small)).unwrap();
+        assert_eq!(reply["data"], json!({"a": 1}));
+        assert_eq!(reply["data_truncated"], false);
+
+        let huge =
+            ToolOutput::ok_structured("ok", json!({"blob": "x".repeat(MAX_CALL_VALUE_BYTES + 1)}));
+        let reply: Value = serde_json::from_str(&render_reply("read_file", &huge)).unwrap();
+        assert!(reply["data"].is_null());
+        assert_eq!(reply["data_truncated"], true);
+        assert_eq!(reply["truncated"], false);
     }
 
     #[test]

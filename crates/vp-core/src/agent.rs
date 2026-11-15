@@ -24795,7 +24795,7 @@ fn tool_schemas(
     ) {
         tools.push(ToolSchema {
             name: "run_script".to_string(),
-            description: "Compose the frozen read-only workspace tools in one bounded JavaScript sandbox. No ambient filesystem, network, shell, process, or native bindings exist; only the generated `tools.<name>(args)` functions call back through the normal contract, approval, journal, effect, and budget gates. Read-only by default; `allow_write` opts into separately approved file mutations with a write-call cap. Inner errors throw with `.code`; results return `{text,data,truncated}`. Synchronous only: no async/await, timers, or modules."
+            description: "Compose the frozen read-only workspace tools in one bounded JavaScript sandbox. No ambient filesystem, network, shell, process, or native bindings exist; only the generated `tools.<name>(args)` functions call back through the normal contract, approval, journal, effect, and budget gates. Read-only by default; `allow_write` opts into separately approved file mutations with a write-call cap. Inner errors throw with `.code`; results return `{text,data,truncated,dataTruncated}`. Synchronous only: no async/await, timers, or modules."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
