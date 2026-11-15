@@ -587,7 +587,7 @@
       "commit": "1cef0e9",
       "adr": "0219",
       "tests": {
-        "rust": 3955,
+        "rust": 3956,
         "swift": 0
       }
     }

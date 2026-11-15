@@ -79,6 +79,11 @@ runs the same policy stack as a normal tool call:
 - `tool.started` and `tool.finished` events with `script=true`,
   `script_parent_tool_call_id`, and `script_seq`.
 
+The outer dispatcher and the inner path share one `finish_tool_call` helper for
+effect settlement, effect annotation, `tool.finished` payload construction, and
+the journal/event commit. The pre-execution gate sequence is still mirrored;
+that duplication is recorded as a maintainability gap rather than hidden.
+
 `allow_write: true` raises the outer `run_script` approval to `HostState`. Each
 inner write then goes through the normal approval policy again (WorkspaceWrite
 under `smart`, a prompt under `strict`, denied under `unattended` when
@@ -128,7 +133,7 @@ engine.
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace`: 3,955 passed, 0 failed
+- `cargo test --workspace`: 3,956 passed, 0 failed
 - New tests cover syntax/forbidden-global rejection, nesting/source caps,
   frozen-bundle binding construction, unknown proxy bindings, absence of
   ambient capabilities (including via dynamic `Function`), typed argument
@@ -137,8 +142,10 @@ engine.
   advertisement, and end-to-end read-only/write scripts with inner
   `tool.finished` and effect evidence. A strict-mode test denies one inner
   write while approving the outer script, proves the script can catch the typed
-  error, and proves no file is created. A second-run test proves a completed
-  inner write replays from its effect receipt instead of executing again.
+  error, and proves no file is created. A contract-forbidden path is denied by
+  the task contract before approval and produces no file. A second-run test
+  proves a completed inner write replays from its effect receipt instead of
+  executing again. The write test also composes `write_file` with `edit_file`.
   Oversized stdout spills through `ToolOutputPolicy`, and invalid source maps
   to `SCRIPT_INVALID`.
 

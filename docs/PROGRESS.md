@@ -284,7 +284,7 @@ C5 已实现并合入 `782cb19`，ADR-0197。Rust **3,571 passed / 0 failed / 6 
 
 ## 2026-11-14 Contracted execution C10: Code Mode `run_script`
 
-ADR-0219 实现 **C10 Code Mode**。Rust **3,955 passed / 0 failed**，Swift 本轮未修改。
+ADR-0219 实现 **C10 Code Mode**。Rust **3,956 passed / 0 failed**，Swift 本轮未修改。
 
 - **Runner**：`crates/vp-core/src/script.rs` 使用 `rquickjs`（QuickJS）+ `oxc`。每次调用新建 runtime/context；64 MiB heap、512 KiB stack、64 KiB source/input、256 KiB result、64 KiB stdout、每次 inner call 128 KiB text + 32 KiB structured。`timeout_ms` 100–30000（默认 5000）、`max_calls` 1–32（默认 16）、`max_write_calls` 1–8（默认 4）；CPU deadline 由 QuickJS interrupt handler 执行，取消会设置 flag 并关闭 reply channel。脚本同步执行，无 async/await、timer、module loader。
 - **零 ambient capability**：QuickJS 只注入一个私有 dispatch 函数和 `print`，随后删除 global；没有 filesystem/network/shell/process/GUI/MCP/native binding；`eval`/`Function` 在用户代码前删除。`oxc` 做语法、嵌套深度和 forbidden ambient identifier 检查；这只是 defense-in-depth，真正的 capability 边界是 native binding 白名单。
