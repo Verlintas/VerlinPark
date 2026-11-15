@@ -25249,11 +25249,12 @@ async fn run_script_write_binding_is_separately_approved_and_effect_tracked() {
                         "script": r#"
                             const before = tools.read_file({path: "README.md"}).text;
                             tools.write_file({path: "script-notes.txt", content: "hello from script"});
+                            tools.edit_file({path: "script-notes.txt", old_string: "hello", new_string: "edited"});
                             return { before };
                         "#,
                         "allow_write": true,
                         "max_calls": 4,
-                        "max_write_calls": 1
+                        "max_write_calls": 2
                     })
                     .to_string(),
                 }),
@@ -25319,12 +25320,25 @@ async fn run_script_write_binding_is_separately_approved_and_effect_tracked() {
         "done"
     );
     assert_eq!(write_finished.payload["script"]["read_only"], false);
+    let edit_finished = events
+        .iter()
+        .find(|event| {
+            event.kind == "tool.finished"
+                && event.payload["name"] == "edit_file"
+                && event.payload["script"]["parent_tool_call_id"] == "call_script_write"
+        })
+        .expect("inner edit_file tool.finished");
+    assert_eq!(edit_finished.payload["is_error"], false);
+    assert_eq!(
+        edit_finished.payload["structured"]["effect"]["state"],
+        "done"
+    );
     let written_path = write_finished.payload["structured"]["path"]
         .as_str()
         .expect("write path");
     assert_eq!(
         std::fs::read_to_string(written_path).unwrap_or_default(),
-        "hello from script"
+        "edited from script"
     );
 }
 
@@ -25669,4 +25683,139 @@ async fn run_script_stdout_goes_through_output_spill_and_invalid_source_is_typed
         .expect("syntax tool.finished");
     assert_eq!(syntax.payload["is_error"], true);
     assert_eq!(syntax.payload["error_code"], "SCRIPT_INVALID");
+}
+
+#[tokio::test]
+async fn run_script_inner_contract_denial_fails_closed_without_approval() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_contract_manager".into(),
+                    name: "delegate".into(),
+                    arguments: serde_json::json!({
+                        "role": "manager",
+                        "title": "Contract",
+                        "objective": "deliver"
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_contract_worker".into(),
+                    name: "delegate".into(),
+                    arguments: serde_json::json!({
+                        "role": "worker",
+                        "objective": "attempt a forbidden script write",
+                        "write_scope": ["src"]
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_script_contract".into(),
+                    name: "run_script".into(),
+                    arguments: serde_json::json!({
+                        "script": r#"
+                            let denied = null;
+                            try {
+                              tools.write_file({path: "docs/out.txt", content: "forbidden"});
+                            } catch (error) {
+                              denied = { code: error.code, message: error.message };
+                            }
+                            return { denied };
+                        "#,
+                        "allow_write": true
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("worker handled the contract denial".into()),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("manager done".into()),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("leader done".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let mut policy = engine.get_contract_policy(&project.id).await.unwrap();
+    policy.forbidden_paths = vec!["docs".to_string()];
+    engine
+        .set_contract_policy(&project.id, policy)
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id, "script contract denial".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let approver_engine = engine.clone();
+    let approver_session = session.id.clone();
+    let approver = tokio::spawn(async move {
+        for _ in 0..200 {
+            if let Ok(approvals) = approver_engine
+                .list_approvals(Some(approver_session.clone()))
+                .await
+            {
+                for approval in approvals.iter().filter(|a| a.status == "pending") {
+                    let _ = approver_engine.resolve_approval(&approval.id, true).await;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    service
+        .start(&session.id, "run the contract script")
+        .await
+        .unwrap();
+    let session = wait_until_idle(&engine, &session).await;
+    approver.abort();
+    assert_eq!(session.status, "idle");
+    let events = engine
+        .list_events(session.id.clone(), 0, 500)
+        .await
+        .unwrap();
+    let write = events
+        .iter()
+        .find(|event| {
+            event.kind == "tool.finished"
+                && event.payload["name"] == "write_file"
+                && event.payload["script"]["parent_tool_call_id"] == "call_script_contract"
+        })
+        .expect("inner write_file tool.finished");
+    assert_eq!(write.payload["is_error"], true);
+    assert_eq!(write.payload["error_code"], "PERMISSION_DENIED");
+    assert!(events.iter().any(|event| {
+        event.kind == "intent.decision"
+            && event.payload["tool"] == "write_file"
+            && event.payload["decision"] == "deny"
+            && event.payload["rule"] == "path.forbidden"
+    }));
+    assert!(
+        !events.iter().any(|event| {
+            event.kind == "approval.requested" && event.payload["tool"] == "write_file"
+        }),
+        "a contract denial must not ask for approval"
+    );
+    let worktree = session.worktree.as_deref().expect("session worktree");
+    assert!(
+        !std::path::Path::new(worktree).join("docs/out.txt").exists(),
+        "contract-denied inner write created a file"
+    );
 }

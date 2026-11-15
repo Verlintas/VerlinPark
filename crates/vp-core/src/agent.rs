@@ -2410,6 +2410,71 @@ fn tool_finished_payload(
     })
 }
 
+/// Finish one gated tool call: settle its effect receipt, attach the bounded
+/// effect summary, build the `tool.finished` payload, and commit the journal
+/// completion and event together. Both the normal dispatcher and the Code Mode
+/// inner dispatcher call this so the two paths cannot drift in settlement or
+/// event shape.
+#[allow(clippy::too_many_arguments)]
+async fn finish_tool_call(
+    engine: &Engine,
+    session: &Session,
+    spec: &AgentSpec,
+    journal: &crate::run_journal::RunJournal,
+    call_id: &str,
+    tool_name: &str,
+    effect_input: &serde_json::Value,
+    output: &mut ToolOutput,
+    duration_ms: u64,
+    approval_risk: Option<RiskLevel>,
+    approval_mode: ApprovalMode,
+    approval_wait_ms: Option<u64>,
+    planned_effect: Option<&crate::effect::ToolEffectPlan>,
+    effect_begin: Option<EffectReceipt>,
+    journal_pair: Option<&(vp_protocol::types::RunStep, vp_protocol::types::RunToolCall)>,
+    extra: Option<(&str, serde_json::Value)>,
+) -> Result<Option<EffectReceipt>> {
+    let effect_settled = if let (Some(intent), Some(plan)) = (effect_begin, planned_effect) {
+        let probe =
+            crate::effect::probe_tool_effect(plan, effect_input, output, &spec.worktree).await;
+        let settled = crate::effect::settled_receipt(intent, probe);
+        annotate_effect_output(output, &settled);
+        Some(settled)
+    } else {
+        None
+    };
+    let mut payload = tool_finished_payload(
+        call_id,
+        tool_name,
+        output,
+        duration_ms,
+        approval_risk,
+        approval_mode,
+        approval_wait_ms,
+    );
+    agent_fields(&mut payload, spec);
+    if let (Some((key, value)), Some(object)) = (extra, payload.as_object_mut()) {
+        object.insert(key.to_string(), value);
+    }
+    if let Some((step, tool)) = journal_pair {
+        journal
+            .tool_completed_with_effect(
+                engine,
+                step,
+                tool,
+                output,
+                effect_settled.as_ref(),
+                Some(("tool.finished", payload)),
+            )
+            .await?;
+    } else {
+        engine
+            .append_event(&session.id, "tool.finished", payload)
+            .await?;
+    }
+    Ok(effect_settled)
+}
+
 /// Bounded, secret-free effect metadata attached to a tool result. This is
 /// how a completed write returns its receipt even when the run-journal
 /// fingerprint gate, not the dispatcher, produced the output.
@@ -19833,44 +19898,25 @@ async fn run_loop_body(
                 .output;
             output.annotate_shape_metadata();
 
-            let effect_settled = if let (Some(intent), Some(plan)) =
-                (effect_begin.take(), planned_effect.as_ref())
-            {
-                let probe =
-                    crate::effect::probe_tool_effect(plan, &effect_input, &output, &spec.worktree)
-                        .await;
-                let settled = crate::effect::settled_receipt(intent, probe);
-                annotate_effect_output(&mut output, &settled);
-                Some(settled)
-            } else {
-                None
-            };
-            let mut finished_payload = tool_finished_payload(
+            finish_tool_call(
+                engine,
+                session,
+                spec,
+                journal,
                 &call_id,
                 &call.name,
-                &output,
+                &effect_input,
+                &mut output,
                 tool_duration_ms,
                 Some(approval_risk),
                 config.approval_mode,
                 approval_wait_ms,
-            );
-            agent_fields(&mut finished_payload, spec);
-            if let Some((journal_step, journal_tool)) = &journal_pair {
-                journal
-                    .tool_completed_with_effect(
-                        engine,
-                        journal_step,
-                        journal_tool,
-                        &output,
-                        effect_settled.as_ref(),
-                        Some(("tool.finished", finished_payload)),
-                    )
-                    .await?;
-            } else {
-                engine
-                    .append_event(&session.id, "tool.finished", finished_payload)
-                    .await?;
-            }
+                planned_effect.as_ref(),
+                effect_begin.take(),
+                journal_pair.as_ref(),
+                None,
+            )
+            .await?;
             if top_level {
                 let stored = engine
                     .append_message(
@@ -21682,6 +21728,16 @@ async fn run_script_tool(
     tool_context: &ToolContext,
     tool_token: &crate::preemption::Token,
 ) -> Result<ScriptToolOutcome> {
+    if !matches!(
+        spec.role,
+        AgentRole::Leader | AgentRole::Worker | AgentRole::Labour
+    ) {
+        return Ok(ScriptToolOutcome::Output(ToolOutput::error_coded(
+            "run_script",
+            crate::tooling::errors::ToolErrorCode::PERMISSION_DENIED,
+            "this role cannot run Code Mode scripts",
+        )));
+    }
     let Some(source) = input.get("script").and_then(Value::as_str) else {
         return Ok(ScriptToolOutcome::Output(ToolOutput::error_coded(
             "run_script",
@@ -22350,53 +22406,33 @@ async fn execute_script_inner_call(
         }
     };
     output.normalize_failure(tool_name);
-    let effect_settled = if let (Some(intent), Some(plan)) =
-        (effect_begin.take(), planned_effect.as_ref())
-    {
-        let probe = crate::effect::probe_tool_effect(plan, &input, &output, &spec.worktree).await;
-        let settled = crate::effect::settled_receipt(intent, probe);
-        annotate_effect_output(&mut output, &settled);
-        Some(settled)
-    } else {
-        None
-    };
     let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-    let mut payload = tool_finished_payload(
+    finish_tool_call(
+        engine,
+        session,
+        spec,
+        journal,
         &call_id,
         tool_name,
-        &output,
+        &input,
+        &mut output,
         duration_ms,
         Some(risk),
         config.approval_mode,
         approval_wait_ms,
-    );
-    agent_fields(&mut payload, spec);
-    if let Some(object) = payload.as_object_mut() {
-        object.insert(
-            "script".into(),
+        planned_effect.as_ref(),
+        effect_begin.take(),
+        journal_pair.as_ref(),
+        Some((
+            "script",
             json!({
                 "parent_tool_call_id": parent_call_id,
                 "seq": request.seq,
                 "read_only": read_only,
             }),
-        );
-    }
-    if let Some((step, tool)) = &journal_pair {
-        journal
-            .tool_completed_with_effect(
-                engine,
-                step,
-                tool,
-                &output,
-                effect_settled.as_ref(),
-                Some(("tool.finished", payload)),
-            )
-            .await?;
-    } else {
-        engine
-            .append_event(&session.id, "tool.finished", payload)
-            .await?;
-    }
+        )),
+    )
+    .await?;
     Ok(ScriptInnerOutcome {
         output,
         risk,
