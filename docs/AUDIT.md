@@ -441,6 +441,20 @@ store tests pass. This is structural relocation, not new behavior.
 
 Verification: 4,227 Rust passed / 0 failed / 6 ignored; 535 Swift passed (403 app + 132 helper); `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `swiftformat --lint`, and `xcodebuild test` passed.
 
+## 0.25 2026-11-16 M3.2 core module split
+
+ADR-0223 mechanically splits `vp-core/src/agent.rs` (29,496 lines) into a
+2,738-line parent plus 14 `agent/` modules and `vp-core/src/lib.rs` (24,074
+lines) into a 479-line parent plus 23 `engine/` modules. Public/`pub(crate)`
+signatures, SQL, events, prompts, bounds, approval ordering, and provider
+policy are unchanged; moved private items use `pub(super)`/`pub(crate)` only
+where sibling or test access requires it. `crates/vp-core/tests/module_governance.rs`
+enforces parent files under 8k lines and domain modules under 6k. Remaining
+risks are parent glob re-exports/preludes, mechanical (not perfect domain)
+boundaries, and no performance claim. Verification: 4,231 Rust passed / 0
+failed / 6 ignored; `vp-core` lib 2,442 passed; fmt and clippy passed; Swift
+unchanged at 535.
+
 ## 0. 2026-10-30 跟进
 
 第一轮硬化已完成（同一 `main` 线，提交见仓库历史）：

@@ -282,6 +282,16 @@ C5 已实现并合入 `782cb19`，ADR-0197。Rust **3,571 passed / 0 failed / 6 
 
 ---
 
+## 2026-11-16 M3.2 core module split
+
+ADR-0223 完成 **M3.2 核心结构治理**，纯机械搬迁，不改变行为或公开 API。Rust **4,231 passed / 0 failed / 6 ignored**，Swift 未修改（535 passed），fmt/clippy 通过。
+
+- `crates/vp-core/src/agent.rs`：29,496 行 → **2,738 行 parent + 14 个 `agent/` modules**（context、delegation、dispatch、merge、plan、provider、run_loop、schemas、scout、script、service、service_run、support、tools）。
+- `crates/vp-core/src/lib.rs`：24,074 行 → **479 行 parent + 23 个 `engine/` modules**（leases、gui、projects、intake、programs、sources、sessions、checkpoints、plans、runs、merge、usage、memory、artifacts、agents、approvals、collaboration、integrations、surfaces、effects、worktrees、support、mod）。
+- 原有 `impl Engine` 597 个方法与 51 个 tail helpers 均保留一次；SQL、event、prompt、approval、provider policy、public/`pub(crate)` 签名不变。moved private items 仅在 sibling/test 需要时变为 `pub(super)`/`pub(crate)`。
+- 新增 `crates/vp-core/tests/module_governance.rs`：parent < 8k 行、domain module < 6k 行、`agent`/`engine` 入口存在；`agent/tests.rs` 与 `src/tests.rs` 未改写。
+- 风险：`engine/mod.rs` 和 `agent.rs` 使用 parent glob re-export/prelude，sibling 访问面比理想设计宽；边界按机械聚类，不是完美领域设计；未声称性能变化。
+
 ## 2026-11-16 Contracted execution C11: loopback A2A facade
 
 ADR-0221 实现 **C11 loopback-only A2A facade**。Rust **4,227 passed / 0 failed / 6 ignored**，Swift **535 passed**（403 app + 132 helper），`cargo fmt --check`、`cargo clippy -D warnings`、`xcodebuild test` 通过。

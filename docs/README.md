@@ -41,6 +41,7 @@
 | **Current** | [adr/0220-advisory-progress-ledger.md](adr/0220-advisory-progress-ledger.md) | C12 advisory progress ledger：bounded Manager rounds、deterministic stall/in-loop assessment、event/projection/replay、`report_progress`、永不自动重试/重规划 |
 | **Current** | [adr/0221-loopback-a2a-facade.md](adr/0221-loopback-a2a-facade.md) | C11 loopback A2A：bounded card/task/SSE library、one-time bearer token、explicit approved start、card-only inbound rejection、无本地工具权限 |
 | **Current** | [adr/0222-store-domain-module-split.md](adr/0222-store-domain-module-split.md) | M3.1 `vp-store` 结构治理：34,939 行 `store.rs` → 6,611 行 parent + 33 个 domain modules，SQL/public API 不变 |
+| **Current** | [adr/0223-core-module-split.md](adr/0223-core-module-split.md) | M3.2 `vp-core` 结构治理：29,496 行 `agent.rs` → 2,738 行 parent + 14 modules；24,074 行 `lib.rs` → 479 行 parent + 23 `engine/` modules；行为/API 不变 |
 | **Reference** | [OBSCURA_ASSESSMENT.md](OBSCURA_ASSESSMENT.md) | Obscura（Rust/V8/CDP/MCP headless browser）评估：适用场景、安全约束、三种集成方案、结论为 cache 轮之后再做可选外部网页后端 |
 | **Reference** | [PRIDE_FLAGS.md](PRIDE_FLAGS.md) | Pride flag 资产来源与许可 |
 | **Reference** | [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) | FlagKit 等第三方资产许可 |

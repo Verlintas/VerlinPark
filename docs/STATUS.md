@@ -1,7 +1,7 @@
 # VerlinPark Status
 
 > 最后更新：2026-11-16
-> 当前主线：C1–C12 代码落地（C11 为 loopback + card-only，尚无 inbound 执行桥）；M3.1 store 结构治理完成；下一阶段为生产化与分布式边界。
+> 当前主线：C1–C12 代码落地（C11 为 loopback + card-only，尚无 inbound 执行桥）；M3.1 store / M3.2 core 结构治理完成；下一阶段为生产化与分布式边界。
 
 ## 1. 一句话
 
@@ -12,8 +12,8 @@ VerlinPark 已经是一个可运行的 macOS 原生多 Agent 开发区：Rust da
 | 项 | 当前值 |
 |---|---:|
 | Rust crates | 10（新增 `vp-a2a`） |
-| ADR | 217 |
-| 最近全量 Rust 测试 | 4,227 passed / 0 failed / 6 ignored |
+| ADR | 218 |
+| 最近全量 Rust 测试 | 4,231 passed / 0 failed / 6 ignored |
 | Swift | 535 passed（403 app + 132 helper），`xcodebuild test` 通过 |
 | 当前分支 | `m3-round`（本轮审查前不合并） |
 
@@ -27,8 +27,17 @@ VerlinPark 已经是一个可运行的 macOS 原生多 Agent 开发区：Rust da
 - Hardening 1–3：identity/lease/effect/gate/template/evidence 等生产修复。
 - E1–E8、R1–R4、C1–C4、D1–D4、Q1–Q4、F1–F5、H1–H5、I1–I6、L1–L5：效率、长任务、checkpoint/ACP/ANN/backup、cache、scaling、source/remote/budget、运行硬化、gap closure。
 - M3.1：`vp-store/src/store.rs` 34,939 行 → 6,611 行 parent + 33 个 domain modules；SQL/API 行为不变，390 store tests 通过。
+- M3.2：`vp-core/src/agent.rs` 29,496 行 → 2,738 行 parent + 14 个 modules；`vp-core/src/lib.rs` 24,074 行 → 479 行 parent + 23 个 `engine/` modules；行为/API 不变。
 
 ## 4. 本轮新增
+
+### M3.2 core module split
+
+- `vp-core/src/agent.rs` 29,496 行 → 2,738 行 parent + 14 个 `agent/` modules。
+- `vp-core/src/lib.rs` 24,074 行 → 479 行 parent + 23 个 `engine/` modules。
+- 597 个 `impl Engine` 方法与 51 个 tail helpers 各保留一次；行为/API 不变。
+- 新增 `module_governance` 测试：parent < 8k 行、domain module < 6k 行。
+- 剩余较大模块：`agent/run_loop.rs` 4,822、`engine/runs.rs` 3,245、`engine/plans.rs` 2,738、`engine/sources.rs` 2,618。
 
 ### C11 A2A
 
@@ -60,7 +69,7 @@ VerlinPark 已经是一个可运行的 macOS 原生多 Agent 开发区：Rust da
 
 ## 6. 推荐下一阶段
 
-1. **M3.2 结构治理**：拆 `agent.rs`（约 29k）与 `lib.rs`（约 24k），保持 4,227+ tests。
+1. **M3.3 结构治理**：继续拆 `agent/run_loop.rs`、`engine/runs.rs`、`engine/plans.rs`、`engine/sources.rs`，保持 module budget 与全量测试。
 2. **发布生产化**：Developer ID、notarization、Sparkle/自动更新、干净 Mac smoke。
 3. **C11 partner gated**：只有有真实 partner 时接 inbound execution/gate bridge。
 4. **分布式 runtime**：跨主机 lease/fencing、merge ownership、远程环境复现。
@@ -101,11 +110,12 @@ VerlinPark 已经是一个可运行的 macOS 原生多 Agent 开发区：Rust da
 
 ## 9. Architecture debt
 
-1. `agent.rs` 仍约 29k 行；下一轮应拆 loop/dispatch/gate/delegation/script。
-2. `lib.rs` 约 24k 行；按 session/project/usage/approval/artifact 服务拆分。
+1. `vp-core/src/lib.rs` 已降至 479 行、`agent.rs` 降至 2,738 行；M3.2 完成。
+2. 剩余较大的 core modules：`engine/runs.rs`（3,245）、`engine/plans.rs`（2,738）、`engine/sources.rs`（2,618）、`agent/run_loop.rs`（4,822）。下一轮应优先拆 `run_loop` 与 `runs`。
 3. `store` 已拆成 33 个模块；`sources`/`memory`/`plans`/`backup`/`schema` 仍较大。
 4. 事件投影覆盖仍以关键 session 状态为主；plan_task_progress、A2A task list 等是操作状态。
 5. 审批/契约/effect 的门控顺序已共享 `authorize_tool_call`/`prepare_tool_effect_gate`/`finish_tool_call`；新增 gate 必须改共享 helper。
+6. 新增 `module_governance` 测试：parent < 8k 行、每个 domain module < 6k 行；未来应保持该预算。
 
 ## 10. Release checklist
 
