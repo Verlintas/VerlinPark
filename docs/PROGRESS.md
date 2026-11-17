@@ -282,6 +282,20 @@ C5 已实现并合入 `782cb19`，ADR-0197。Rust **3,571 passed / 0 failed / 6 
 
 ---
 
+## 2026-11-17 M3.4 CLI entrypoint split
+
+ADR-0225 完成 **M3.4 `vp-cli` 入口拆分**，不改变 CLI 行为。Rust **4,231 passed / 0 failed / 6 ignored**，Swift 未修改（535 passed），fmt/clippy 通过。
+
+- `crates/vp-cli/src/main.rs` 27,823 → **1,160 行**：进程/32 MiB stack 包装、pre-dispatch special cases、discovery、共享解析与 keyring/passphrase helpers。
+- `cli.rs` 4,049 行：clap `Cli`、`Command`、provider/transport/action enums。
+- `dispatch.rs` 6,918 行：原命令 match → `run_command(command, discovery, json)`；Ping/Metrics/Export-with-output 用 `None` 表示已自行输出。
+- `render.rs` 7,999 行：JSON/human/CSV renderers 与 `print_*` helpers。
+- `rpc.rs` 180 行：discovery/RPC/gate-token/confirm helpers。
+- `tests.rs` 7,594 行：原 29 个测试模块 / 145 tests，断言未改写。
+- CLI 参数、输出、exit code、RPC method/params、discovery 行为不变；`vp --help` / `vp cache warm --help` smoke 通过。
+- 同一轮继续拆分 `agent/tools.rs`（2,911 → 14 行 parent + 4 modules）和 `agent/context.rs`（2,765 → 36 行 parent + 5 modules）；最大 core module 降为 `agent/plan.rs` 2,495 行。
+- 风险：`dispatch.rs`/`render.rs` 仍较大，下一轮继续按命令族/输出域拆分；`dispatch`/`tests` 通过 `use crate::*` 访问 main 的共享解析器，未来移动时需要同步。
+
 ## 2026-11-17 M3.3 second-level module split
 
 ADR-0224 完成 **M3.3 二级模块拆分**，仍是机械搬迁，不改变行为或公开 API。Rust **4,231 passed / 0 failed / 6 ignored**，Swift 未修改（535 passed），fmt/clippy 通过。
@@ -292,7 +306,7 @@ ADR-0224 完成 **M3.3 二级模块拆分**，仍是机械搬迁，不改变行�
 - `engine/runs.rs` 3,245 → **138 行 parent + 6 个 modules**（support/replay/repair/export/import/diagnostics）。
 - `engine/plans.rs` 2,738 → **49 行 parent + 7 个 modules**（governor/revisions/orchestration/steering/continuations/stalls/tasks）。
 - `engine/sources.rs` 2,618 → **9 行 parent + 7 个 modules**（citations/collections/embeddings/import/retrieval/skills/support）。
-- `module_governance` 改为递归扫描，module budget 从 6k 收紧到 **3k**；当前最大模块 `agent/tools.rs` 2,911 行。
+- `module_governance` 改为递归扫描，module budget 从 6k 收紧到 **3k**；当时最大模块 `agent/tools.rs` 2,911 行。
 - 唯一非纯搬迁点：`run_loop_body` 的串行 tool-call block 提取为 `execute_tool_calls`，保持相同语句/事件顺序；由完整 `vp-core` 与 workspace 测试覆盖。
 - 风险：机械聚类，不是完美领域设计；parent prelude/`pub(super)` 访问面仍较宽；`run_loop/body.rs` 与 `tool_calls.rs` 仍接近 2k。
 

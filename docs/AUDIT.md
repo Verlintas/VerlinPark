@@ -441,6 +441,23 @@ store tests pass. This is structural relocation, not new behavior.
 
 Verification: 4,227 Rust passed / 0 failed / 6 ignored; 535 Swift passed (403 app + 132 helper); `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `swiftformat --lint`, and `xcodebuild test` passed.
 
+## 0.27 2026-11-17 M3.4 CLI entrypoint split
+
+ADR-0225 splits `crates/vp-cli/src/main.rs` (27,823 lines) into a 1,160-line
+entrypoint plus `cli.rs` (4,049, clap model), `dispatch.rs` (6,918, command match
+as `run_command`), `render.rs` (7,999, JSON/human/CSV output), `rpc.rs` (180,
+discovery/RPC helpers), and `tests.rs` (7,594, unchanged 29 modules / 145 tests).
+CLI arguments, output/exit behavior, RPC methods/params, discovery behavior, and
+test assertions are unchanged. Ping/Metrics/Export-with-output return `None`
+from `run_command` instead of early-returning from `run`, preserving net output
+and exit behavior; the 32 MiB dedicated CLI stack remains. `render.rs` and
+`dispatch.rs` are still large and are the next split targets. The same round
+splits `agent/tools.rs` (2,911) and `agent/context.rs` (2,765) into 14/36-line
+parents plus 4/5 modules; the largest current core module is `agent/plan.rs`
+at 2,495. Verification:
+`vp-cli` 145 unit + 10 integration passed; full workspace 4,231 Rust / 6 ignored;
+fmt and clippy passed; Swift unchanged at 535.
+
 ## 0.26 2026-11-17 M3.3 second-level module split
 
 ADR-0224 splits the six largest remaining `vp-core` domain modules without

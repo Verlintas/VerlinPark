@@ -70,6 +70,30 @@ Child modules own cohesive method clusters.
 | `service_run/plan_run.rs` | 240 | dispatch next task/start plan run |
 | `service_run/preemption.rs` | 172 | cancel/preempt/pause/resume |
 
+#### Additional tail modules
+
+`agent/tools.rs` is **14 lines**:
+
+| Module | Lines | Responsibility |
+|---|---:|---|
+| `tools/integrations.rs` | 1,273 | MCP/source/skill/mailbox/memory tools |
+| `tools/coordination.rs` | 688 | coordination/team/status/budget/task tools |
+| `tools/discovery.rs` | 560 | tool search/help/tool-output paging |
+| `tools/artifacts.rs` | 399 | artifact/archive/media/document tools |
+
+`agent/context.rs` is **36 lines**:
+
+| Module | Lines | Responsibility |
+|---|---:|---|
+| `context/compaction.rs` | 863 | compaction/trim/summaries |
+| `context/prompts.rs` | 706 | prompt sections/role prompts/charters |
+| `context/bundles.rs` | 554 | tool bundle/prompt/cache metadata |
+| `context/state.rs` | 520 | structured context state/todos/conversation loading |
+| `context/support.rs` | 120 | bounded shared helpers |
+
+After this tail split, the largest `vp-core` domain module is `agent/plan.rs`
+at 2,495 lines; the recursive governance budget remains 3,000 lines.
+
 ### Engine modules
 
 `engine/runs.rs` is **138 lines**:

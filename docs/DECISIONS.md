@@ -228,6 +228,7 @@
 | [0222](adr/0222-store-domain-module-split.md) | `vp-store` structural split: 34,939-line `store.rs` → 6,611-line parent + 33 domain modules, unchanged SQL/public APIs | Accepted | Maintainability |
 | [0223](adr/0223-core-module-split.md) | `vp-core` structural split: 29,496-line `agent.rs` → 2,738-line parent + 14 modules; 24,074-line `lib.rs` → 479-line parent + 23 `engine/` modules, unchanged behavior/public APIs | Accepted | Maintainability |
 | [0224](adr/0224-second-level-module-split.md) | Second-level `vp-core` split: run_loop/service/service_run/runs/plans/sources into smaller parents and child modules; recursive 3k module budget | Accepted | Maintainability |
+| [0225](adr/0225-cli-entrypoint-split.md) | `vp-cli` entrypoint split: clap model/dispatch/RPC-render helpers/tests into modules without changing CLI behavior | Accepted | Maintainability |
 
 ---
 
