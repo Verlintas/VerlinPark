@@ -1,15 +1,15 @@
-//! Structural governance for the two largest `vp-core` source trees.
+//! Structural governance for the `vp-core` source trees.
 //!
-//! M3.2 split `agent.rs` and `lib.rs` into cohesive domain modules. These
-//! checks intentionally read the source tree at test time: they are a simple
-//! regression guard against recreating a 20k-line catch-all file, not a
+//! M3.2/M3.3 split the original 20k+ line catch-all files into parent modules
+//! and nested domain modules. These checks read the source tree at test time:
+//! they are a simple regression guard against recreating a giant module, not a
 //! statement about runtime behavior.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 const MAX_PARENT_LINES: usize = 8_000;
-const MAX_MODULE_LINES: usize = 6_000;
+const MAX_MODULE_LINES: usize = 3_000;
 
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -23,12 +23,26 @@ fn line_count(path: &Path) -> usize {
 }
 
 fn module_files(directory: &Path) -> Vec<PathBuf> {
-    let mut files = fs::read_dir(directory)
-        .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()))
-        .map(|entry| entry.expect("directory entry").path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
-        .filter(|path| path.file_name().is_some_and(|name| name != "tests.rs"))
-        .collect::<Vec<_>>();
+    let mut files = Vec::new();
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        let entries = fs::read_dir(&current)
+            .unwrap_or_else(|error| panic!("read {}: {error}", current.display()));
+        for entry in entries {
+            let path = entry.expect("directory entry").path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|extension| extension != "rs") {
+                continue;
+            }
+            if path.file_name().is_some_and(|name| name == "tests.rs") {
+                continue;
+            }
+            files.push(path);
+        }
+    }
     files.sort();
     files
 }

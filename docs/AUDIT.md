@@ -441,6 +441,25 @@ store tests pass. This is structural relocation, not new behavior.
 
 Verification: 4,227 Rust passed / 0 failed / 6 ignored; 535 Swift passed (403 app + 132 helper); `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `swiftformat --lint`, and `xcodebuild test` passed.
 
+## 0.26 2026-11-17 M3.3 second-level module split
+
+ADR-0224 splits the six largest remaining `vp-core` domain modules without
+behavior changes: `agent/run_loop.rs` (4,822) → 18-line parent + 8 modules,
+`agent/service.rs` (3,951) → 10 + 8, `agent/service_run.rs` (3,298) → 13 + 11,
+`engine/runs.rs` (3,245) → 138 + 6, `engine/plans.rs` (2,738) → 49 + 7, and
+`engine/sources.rs` (2,618) → 9 + 7. SQL, events, prompts, provider/approval
+policy, ordering, and public/`pub(crate)` signatures are unchanged; moved
+private items use `pub(super)`/`pub(crate)` only for sibling access.
+`module_governance` now walks nested module directories and enforces parent
+files under 8k lines and every domain module under 3k; largest current module
+is `agent/tools.rs` at 2,911. The only non-relocation extraction is
+`run_loop_body`'s serial tool-call block into `execute_tool_calls`, with
+statement/event ordering preserved and covered by the full suites. Remaining
+risks: mechanical clusters, parent preludes/wide internal visibility, and
+`run_loop/body.rs` / `run_loop/tool_calls.rs` near 2k lines.
+Verification: 4,231 Rust passed / 0 failed / 6 ignored; `vp-core` lib 2,442
+passed; fmt and clippy passed; Swift unchanged at 535.
+
 ## 0.25 2026-11-16 M3.2 core module split
 
 ADR-0223 mechanically splits `vp-core/src/agent.rs` (29,496 lines) into a

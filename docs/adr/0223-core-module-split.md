@@ -118,6 +118,8 @@ differ.
   changes.
 - `engine/mod.rs` and `agent.rs` act as shared preludes; future name collisions
   could surface as ambiguity and must be resolved explicitly.
+- The initial 6,000-line module budget was tightened to 3,000 by ADR-0224 after
+  the second-level split.
 - `checkpoint_from_event` remains `pub(crate)` inside `engine::checkpoints`
   without a root re-export; it has no callers outside that module today.
 - Module boundaries are mechanical clusters, not a claim of perfect cohesion.

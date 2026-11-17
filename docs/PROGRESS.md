@@ -282,6 +282,20 @@ C5 已实现并合入 `782cb19`，ADR-0197。Rust **3,571 passed / 0 failed / 6 
 
 ---
 
+## 2026-11-17 M3.3 second-level module split
+
+ADR-0224 完成 **M3.3 二级模块拆分**，仍是机械搬迁，不改变行为或公开 API。Rust **4,231 passed / 0 failed / 6 ignored**，Swift 未修改（535 passed），fmt/clippy 通过。
+
+- `agent/run_loop.rs` 4,822 → **18 行 parent + 8 个 modules**（agent/body/entry/governor/identity/plan_resume/preemption/tool_calls）。
+- `agent/service.rs` 3,951 → **10 行 parent + 8 个 modules**（auto_resolve/constructors/continuations/intake/merge/programs/scaling/scheduler）。
+- `agent/service_run.rs` 3,298 → **13 行 parent + 11 个 modules**（start/checkpoints/operations/plan/stall/cache/tool_bundle/compaction/context/plan_run/preemption）。
+- `engine/runs.rs` 3,245 → **138 行 parent + 6 个 modules**（support/replay/repair/export/import/diagnostics）。
+- `engine/plans.rs` 2,738 → **49 行 parent + 7 个 modules**（governor/revisions/orchestration/steering/continuations/stalls/tasks）。
+- `engine/sources.rs` 2,618 → **9 行 parent + 7 个 modules**（citations/collections/embeddings/import/retrieval/skills/support）。
+- `module_governance` 改为递归扫描，module budget 从 6k 收紧到 **3k**；当前最大模块 `agent/tools.rs` 2,911 行。
+- 唯一非纯搬迁点：`run_loop_body` 的串行 tool-call block 提取为 `execute_tool_calls`，保持相同语句/事件顺序；由完整 `vp-core` 与 workspace 测试覆盖。
+- 风险：机械聚类，不是完美领域设计；parent prelude/`pub(super)` 访问面仍较宽；`run_loop/body.rs` 与 `tool_calls.rs` 仍接近 2k。
+
 ## 2026-11-16 M3.2 core module split
 
 ADR-0223 完成 **M3.2 核心结构治理**，纯机械搬迁，不改变行为或公开 API。Rust **4,231 passed / 0 failed / 6 ignored**，Swift 未修改（535 passed），fmt/clippy 通过。
