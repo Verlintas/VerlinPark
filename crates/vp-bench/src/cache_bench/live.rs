@@ -331,7 +331,7 @@ pub async fn run_live_benchmark_with_provider(
         } else {
             usage.text
         };
-        conversation.push(ChatMessage::assistant_tool_calls(reply, Vec::new()));
+        conversation.push(ChatMessage::assistant(reply));
         previous_input = input_tokens;
         previous_message_hash = Some(current_hash);
         previous_message_count = current_count;

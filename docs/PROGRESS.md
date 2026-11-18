@@ -1,6 +1,6 @@
 # VerlinPark 进度
 
-> 最后更新：2026-11-16
+> 最后更新：2026-11-18
 > 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark + task contracts/intent authorization/MCP schema pins + effect receipts/postconditions + external gates/durable waits + runtime pinning/controller replay + reliability/OTel + project-scoped identities S1–S8 + failure attribution/cascade + production hardening rounds 1–3 (ADR-0213/0214/0215) + C7 bounded fan-out (ADR-0216) + C8 tool search v2 (ADR-0217) + C9 MCP async tasks (ADR-0218) + C10 Code Mode (ADR-0219) + C11 loopback A2A (ADR-0221) + C12 advisory progress ledger (ADR-0220) + M3.1 store split 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
@@ -281,6 +281,17 @@ C5 已实现并合入 `782cb19`，ADR-0197。Rust **3,571 passed / 0 failed / 6 
 - Reliability report 是描述性的，不是 leaderboard、significance test 或 merge gate。
 
 ---
+
+## 2026-11-18 Live DeepSeek validation and reliability fixes
+
+首次真实 DeepSeek 运行发现并修复两个兼容性/可靠性问题（ADR-0229）。Rust **4,236 passed / 0 failed / 6 ignored**，fmt/clippy 通过。
+
+- **空 tool_calls**：`ChatMessage` 新增 plain `assistant`；OpenAI-compatible 序列化在 `tool_calls` 为空时省略字段。DeepSeek 会拒绝 `"tool_calls": []`；真实 tool-call 消息不变。新增 canonical 回归测试。
+- **预算估算**：`estimate_request_tokens` 改为复用语言感知的 `estimate_context_tokens`，对 system/messages/tool schemas 去重计数后加 25% headroom + 64 framing tokens，不再用 raw bytes/2 把 49 个工具的 10.5k 上下文估算成 ~21k；真实 provider usage 仍会结算，超限仍 fail closed。新增 20k budget regression test。
+- **Live 证据**：provider stream 54 chunks / 65 in / 122 out；`vp provider-test` 585 ms / 48 in / 12 out；4-turn cache-bench 95.64–97.09%（small-prefix，不宣称 99.84%）；完整 Leader → `write_file` 流程 **idle**，文件内容精确，3 calls / 35,614 input / 188 output / 34,688 cache-read，**97.1–97.4% cache hit**。
+- **预算语义**：20k/60k 在后续 turn 诚实失败（whole-session budget 要覆盖每轮重发的上下文）；120k 完成。不是失败伪造。
+- Key 只通过环境变量传入；不进入 repo/events/logs/UI。
+- 可重复 smoke：`DEEPSEEK_API_KEY=... DEEPSEEK_MODEL=deepseek-flash scripts/live-smoke-deepseek.sh`；脚本创建临时 data dir/repo、验证 provider stream、small live cache-bench、完整 Leader 写文件与 idle 状态，失败即非零退出。
 
 ## 2026-11-18 M3.6 dispatch and render split
 

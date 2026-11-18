@@ -4672,6 +4672,42 @@ async fn stops_when_token_budget_is_exhausted() {
 }
 
 #[tokio::test]
+async fn token_budget_allows_a_normal_first_prompt_when_the_context_fits() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("budget smoke complete".into()),
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "budget smoke".into(), Some(20_000))
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service.start(&session.id, "budget smoke").await.unwrap();
+    let finished = wait_until_idle(&engine, &session).await;
+    assert_eq!(finished.status, "idle");
+    let events = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "agent.budget_exceeded"),
+        "a 20k budget must allow a prompt whose context estimate fits"
+    );
+    assert!(events.iter().any(|event| {
+        event.kind == "agent.message" && event.payload["text"] == "budget smoke complete"
+    }));
+}
+
+#[tokio::test]
 async fn persists_estimated_usage_when_provider_omits_usage() {
     let dir = TempDir::new().unwrap();
     let provider: Arc<dyn Provider> = Arc::new(QueueProvider {

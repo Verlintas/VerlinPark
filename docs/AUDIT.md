@@ -11,7 +11,7 @@ L1–L5 are implemented and merged at `bc64d6f`: content-addressed instruction s
 
 Honest limits:
 
-- **No live provider validation yet.** This workspace had no `DEEPSEEK_API_KEY` / `VERLINPARK_LIVE_API_KEY`, so the 99.84% target is not measured against the provider after L1–L5. The simulator is deterministic but not a vendor tokenizer: 99.7081% at 200k/50 turns, 99.8099% at 200k/100 turns, 99.9077% at 420k/100 turns. The 420k result is a stretch-target model, not a provider invoice.
+- **Live provider validation is now partial.** A DeepSeek live smoke validated streaming, `provider-test`, a small 4-turn cache-bench, and a full Leader → `write_file` agent flow. The full flow reported 3 calls, 35,614 input / 188 output tokens, 34,688 cache-read tokens, and 97.1–97.4% cache hit ratio; the small-prefix smoke does **not** validate the 200k/99.84% acceptance target. The simulator remains deterministic but is not a vendor tokenizer: 99.7081% at 200k/50 turns, 99.8099% at 200k/100 turns, 99.9077% at 420k/100 turns.
 - **First call is uncached.** `append_only` is `null` on the first observation; a new session/prefix pays the first-call miss. 99.84% only emerges when that miss is small relative to a long, append-only session.
 - **Provider behavior is not ours.** Cache epochs prove byte identity and append-only continuity, not provider TTL, eviction, or a guaranteed hit. Cache reads are still billed; savings use user-configured prices and can be negative.
 - **Compaction breaks the conversation tail.** The stable instruction prefix survives, but a compaction boundary resets the conversation cache generation and records an estimated lost-cache cost. It is explicit and rare, not cache-free.
@@ -440,6 +440,23 @@ M3.1 splits `vp-store/src/store.rs` (34,939 lines) into a 6,611-line parent and
 store tests pass. This is structural relocation, not new behavior.
 
 Verification: 4,227 Rust passed / 0 failed / 6 ignored; 535 Swift passed (403 app + 132 helper); `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `swiftformat --lint`, and `xcodebuild test` passed.
+
+## 0.30 2026-11-18 Live provider compatibility and budget estimation
+
+A real DeepSeek run found two compatibility/reliability bugs and validated the
+provider path. Empty `"tool_calls": []` arrays are now omitted from
+OpenAI-compatible assistant messages (DeepSeek rejects them); real tool-call
+messages are unchanged. Session budget preflight now uses the language-aware
+context estimator plus 25% headroom instead of raw bytes/2, so a normal 49-tool
+Leader prompt no longer over-reserves by ~2x; actual provider usage still
+settles and overruns still fail closed. Live evidence: provider stream 54
+chunks/65 in/122 out; `provider-test` 585 ms/48 in/12 out; small 4-turn
+cache-bench 95.64–97.09% (not a long-prefix acceptance run); full agent flow
+idle with exact file content, 3 calls, 35,614 input/188 output, 34,688
+cache-read, 97.1–97.4% cache hit. A 20k/60k session budget failed honestly on
+later turns because the whole session budget must cover re-sent context; 120k
+completed. No key is stored in repo/events/logs. Remaining limits: estimator is
+heuristic; small-prefix smoke is not 99.84%; live e2e is not default CI.
 
 ## 0.29 2026-11-18 M3.6 dispatch and render split
 

@@ -1078,7 +1078,9 @@ pub(crate) fn openai_history_message(
         "content".to_string(),
         Value::String(message.content.clone()),
     );
-    if let Some(tool_calls) = &message.tool_calls {
+    if let Some(tool_calls) = &message.tool_calls
+        && !tool_calls.is_empty()
+    {
         let calls = tool_calls
             .iter()
             .map(|call| {
@@ -1488,6 +1490,30 @@ mod tests {
             canonical_tools_hash(&[first]),
             canonical_tools_hash(&[second])
         );
+    }
+
+    #[test]
+    fn empty_tool_calls_are_omitted_from_openai_history() {
+        let capabilities = ProviderCacheCapabilities::openai_compatible();
+        let plain = openai_history_message(&ChatMessage::assistant("ok"), capabilities);
+        let empty = openai_history_message(
+            &ChatMessage::assistant_tool_calls("ok", Vec::new()),
+            capabilities,
+        );
+        assert_eq!(plain, empty);
+        assert!(plain.get("tool_calls").is_none());
+        let with_call = openai_history_message(
+            &ChatMessage::assistant_tool_calls(
+                "ok",
+                vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            ),
+            capabilities,
+        );
+        assert_eq!(with_call["tool_calls"][0]["id"], "call-1");
     }
 
     #[test]

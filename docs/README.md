@@ -47,6 +47,7 @@
 | **Current** | [adr/0226-store-second-level-module-split.md](adr/0226-store-second-level-module-split.md) | M3.5 `vp-store` 二级模块拆分：employment/backup/workspaces/memory/sources/plans/identity_memory/coordination；SQL/API 不变 |
 | **Current** | [adr/0227-daemon-entrypoint-split.md](adr/0227-daemon-entrypoint-split.md) | M3.5 `vp-daemon` 入口拆分：8,216 行 `main.rs` → dispatch/http/sweepers/errors/server/tests；RPC/认证/路由不变 |
 | **Current** | [adr/0228-dispatch-module-splits.md](adr/0228-dispatch-module-splits.md) | M3.6 CLI render/dispatch 与 daemon dispatch 按命令族/路由族拆分；输出/RPC 行为不变 |
+| **Current** | [adr/0229-live-provider-and-budget-estimation.md](adr/0229-live-provider-and-budget-estimation.md) | Live DeepSeek 兼容性：空 tool_calls 省略、预算估算一致化、真实 E2E 验证与 97.4% cache smoke |
 | **Reference** | [OBSCURA_ASSESSMENT.md](OBSCURA_ASSESSMENT.md) | Obscura（Rust/V8/CDP/MCP headless browser）评估：适用场景、安全约束、三种集成方案、结论为 cache 轮之后再做可选外部网页后端 |
 | **Reference** | [PRIDE_FLAGS.md](PRIDE_FLAGS.md) | Pride flag 资产来源与许可 |
 | **Reference** | [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) | FlagKit 等第三方资产许可 |

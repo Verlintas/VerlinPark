@@ -115,26 +115,35 @@ pub(super) async fn load_context_calibration(
 }
 
 pub(super) fn estimate_request_tokens(request: &ChatRequest) -> u64 {
-    let mut bytes = request.system.as_deref().map_or(0, str::len);
+    // Share the language-aware estimator with context management, then add a
+    // bounded headroom for provider framing/tokenizer differences. The old
+    // raw-bytes/2 estimate over-reserved large tool bundles by roughly 2x and
+    // could reject a request that actually fit the session budget before any
+    // provider call. This estimate stays conservative without making a normal
+    // 20k-token session impossible on its first turn.
+    const BUDGET_HEADROOM_PERCENT: u64 = 25;
+    let mut tokens = request.system.as_deref().map_or(0, estimate_context_tokens);
     for message in &request.messages {
-        bytes = bytes.saturating_add(message.content.len());
+        tokens = tokens.saturating_add(estimate_context_tokens(&message.content));
         if let Some(tool_calls) = &message.tool_calls {
             for call in tool_calls {
-                bytes = bytes
-                    .saturating_add(call.name.len())
-                    .saturating_add(call.arguments.len());
+                tokens = tokens
+                    .saturating_add(estimate_context_tokens(&call.name))
+                    .saturating_add(estimate_context_tokens(&call.arguments));
             }
         }
     }
     for tool in &request.tools {
-        bytes = bytes
-            .saturating_add(tool.name.len())
-            .saturating_add(tool.description.len());
+        tokens = tokens
+            .saturating_add(estimate_context_tokens(&tool.name))
+            .saturating_add(estimate_context_tokens(&tool.description));
         if let Ok(parameters) = serde_json::to_string(&tool.parameters) {
-            bytes = bytes.saturating_add(parameters.len());
+            tokens = tokens.saturating_add(estimate_context_tokens(&parameters));
         }
     }
-    (bytes as u64).div_ceil(2).saturating_add(64)
+    tokens
+        .saturating_add(tokens.saturating_mul(BUDGET_HEADROOM_PERCENT) / 100)
+        .saturating_add(64)
 }
 
 pub(super) fn string_list(input: &Value, key: &str) -> Vec<String> {

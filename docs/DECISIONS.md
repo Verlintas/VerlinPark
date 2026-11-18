@@ -232,6 +232,7 @@
 | [0226](adr/0226-store-second-level-module-split.md) | Second-level `vp-store` split: eight >2k domain modules into smaller parents and child modules; SQL/API unchanged | Accepted | Maintainability |
 | [0227](adr/0227-daemon-entrypoint-split.md) | `vp-daemon` entrypoint split: dispatch/http/sweepers/errors/server/tests modules without changing RPC, auth, routes, or behavior | Accepted | Maintainability |
 | [0228](adr/0228-dispatch-module-splits.md) | CLI render/dispatch and daemon dispatch split by output/command/route family; behavior and protocol unchanged | Accepted | Maintainability |
+| [0229](adr/0229-live-provider-and-budget-estimation.md) | Live provider compatibility: omit empty `tool_calls`, context-aware budget preflight with 25% headroom, validate DeepSeek streaming and full agent flow | Accepted | Providers/Reliability |
 
 ---
 

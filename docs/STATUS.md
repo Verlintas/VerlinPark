@@ -12,9 +12,10 @@ VerlinPark 已经是一个可运行的 macOS 原生多 Agent 开发区：Rust da
 | 项 | 当前值 |
 |---|---:|
 | Rust crates | 10（新增 `vp-a2a`） |
-| ADR | 223 |
-| 最近全量 Rust 测试 | 4,234 passed / 0 failed / 6 ignored |
+| ADR | 224 |
+| 最近全量 Rust 测试 | 4,236 passed / 0 failed / 6 ignored |
 | Swift | 535 passed（403 app + 132 helper），`xcodebuild test` 通过 |
+| Live provider | DeepSeek `deepseek-flash` 流式/provider-test/完整 Leader 写文件通过；小前缀 cache 97.1–97.4% |
 | 当前分支 | `m3-round`（本轮审查前不合并） |
 
 ## 3. 已完成路线
@@ -34,6 +35,13 @@ VerlinPark 已经是一个可运行的 macOS 原生多 Agent 开发区：Rust da
 - M3.6：`vp-cli/render.rs`、`vp-cli/dispatch.rs`、`vp-daemon/dispatch.rs` 按输出域/命令族/路由族拆分；行为与协议不变。
 
 ## 4. 本轮新增
+
+### Live DeepSeek validation
+
+- 真实 provider 验证：stream、`provider-test`、4-turn live cache-bench、完整 Leader → `write_file` → idle。
+- 完整流程：3 calls / 35,614 input / 188 output / 34,688 cache-read，cache hit **97.1–97.4%**；文件内容精确。
+- 修复空 `tool_calls` 兼容性和预算估算过度保守；20k/60k/120k budget 的行为均已实测（后两者不是伪造成功）。
+- 小前缀 smoke 不宣称 99.84%；200k 长前缀 live acceptance 仍未运行。
 
 ### M3.6 dispatch and render split
 
@@ -109,7 +117,7 @@ VerlinPark 已经是一个可运行的 macOS 原生多 Agent 开发区：Rust da
 
 ## 6. 推荐下一阶段
 
-1. **M3.7 结构治理**：拆 `agent/run_loop/body.rs`/`tool_calls.rs`、`engine/checkpoints.rs`/`usage.rs`/`agents.rs`，并评估 `vp-cli/tests.rs` 与 Swift `AppModel` 的模块化。
+1. **可用性优先**：把本次 live smoke 固化为可重复的 opt-in 测试/脚本，继续验证首次使用、恢复、备份与真实 provider 失败路径；结构拆分降为按需。
 2. **发布生产化**：Developer ID、notarization、Sparkle/自动更新、干净 Mac smoke。
 3. **C11 partner gated**：只有有真实 partner 时接 inbound execution/gate bridge。
 4. **分布式 runtime**：跨主机 lease/fencing、merge ownership、远程环境复现。
