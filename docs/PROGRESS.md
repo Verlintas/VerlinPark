@@ -282,6 +282,16 @@ C5 已实现并合入 `782cb19`，ADR-0197。Rust **3,571 passed / 0 failed / 6 
 
 ---
 
+## 2026-11-18 M3.5 store, core tail, and daemon split
+
+ADR-0226/0227 与 ADR-0224 的尾部工作完成 **M3.5 结构治理**，不改变行为/API。Rust **4,234 passed / 0 failed / 6 ignored**，Swift 未修改（535 passed），fmt/clippy 通过。
+
+- `vp-store`：employment 4,798 → 549 + 8；backup 2,592 → 8 + 4；workspaces 2,402 → 1,174 + 5；memory 2,367 → 9 + 5；sources 2,339 → 11 + 7；plans 2,092 → 10 + 6；identity_memory 2,083 → 979 + 3；coordination 2,041 → 919 + 3。`schema.rs` 保持单一有序单元，`store/tests.rs` 未改写。
+- `vp-core` 尾部：plan 2,495 → 61 + 6；engine/memory 1,955 → 23 + 7；service/merge 1,894 → 5 + 3。当前最大 core module 为 `agent/run_loop/body.rs` 1,954。
+- `vp-daemon/main.rs`：8,216 → 231 + dispatch 5,442 / http 407 / sweepers 649 / errors 351 / tests 1,043 / server 110 / backup_status 77 / params 13。RPC method/params、认证、metrics、discovery、路由与 shutdown 行为不变。
+- 新增 `vp-store`/`vp-cli`/`vp-daemon` module-governance 测试，分别约束 parent/module 行数。
+- 风险：`dispatch.rs`（CLI/daemon）与 `render.rs` 仍是下一批拆分目标；store 的 `schema.rs` 2,931 行未拆以保持建表顺序。
+
 ## 2026-11-17 M3.4 CLI entrypoint split
 
 ADR-0225 完成 **M3.4 `vp-cli` 入口拆分**，不改变 CLI 行为。Rust **4,231 passed / 0 failed / 6 ignored**，Swift 未修改（535 passed），fmt/clippy 通过。
@@ -293,7 +303,7 @@ ADR-0225 完成 **M3.4 `vp-cli` 入口拆分**，不改变 CLI 行为。Rust **4
 - `rpc.rs` 180 行：discovery/RPC/gate-token/confirm helpers。
 - `tests.rs` 7,594 行：原 29 个测试模块 / 145 tests，断言未改写。
 - CLI 参数、输出、exit code、RPC method/params、discovery 行为不变；`vp --help` / `vp cache warm --help` smoke 通过。
-- 同一轮继续拆分 `agent/tools.rs`（2,911 → 14 行 parent + 4 modules）和 `agent/context.rs`（2,765 → 36 行 parent + 5 modules）；最大 core module 降为 `agent/plan.rs` 2,495 行。
+- 同一轮继续拆分 `agent/tools.rs`（2,911 → 14 行 parent + 4 modules）和 `agent/context.rs`（2,765 → 36 行 parent + 5 modules）；最大 core module 降为 `agent/run_loop/body.rs` 1,954 行。
 - 风险：`dispatch.rs`/`render.rs` 仍较大，下一轮继续按命令族/输出域拆分；`dispatch`/`tests` 通过 `use crate::*` 访问 main 的共享解析器，未来移动时需要同步。
 
 ## 2026-11-17 M3.3 second-level module split

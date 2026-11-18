@@ -441,6 +441,23 @@ store tests pass. This is structural relocation, not new behavior.
 
 Verification: 4,227 Rust passed / 0 failed / 6 ignored; 535 Swift passed (403 app + 132 helper); `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `swiftformat --lint`, and `xcodebuild test` passed.
 
+## 0.28 2026-11-18 M3.5 store, core tail, and daemon split
+
+ADR-0226 splits the eight `vp-store` modules above 2k lines (employment,
+backup, workspaces, memory, sources, plans, identity_memory, coordination) into
+parents of 549/8/1,174/9/11/10/979/919 lines plus child modules; `schema.rs`
+remains one ordered unit and `store/tests.rs` is unchanged. ADR-0224's
+second-level work also finishes `agent/plan.rs` (2,495→61+6),
+`engine/memory.rs` (1,955→23+7), and `agent/service/merge.rs` (1,894→5+3).
+ADR-0227 splits `vp-daemon/src/main.rs` (8,216→231) into dispatch/http/sweepers/
+errors/server/backup_status/params/tests while preserving RPC methods, params,
+auth, metrics, discovery, routes, and shutdown behavior. New module-governance
+tests cover `vp-store`, `vp-cli`, and `vp-daemon`; the largest core module is
+`agent/run_loop/body.rs` at 1,954. Risks: CLI/daemon dispatch and CLI render are
+still large; `schema.rs` is deliberately not split. Verification: 4,234 Rust
+passed / 0 failed / 6 ignored; store lib 390; daemon 23; fmt/clippy passed;
+Swift unchanged at 535.
+
 ## 0.27 2026-11-17 M3.4 CLI entrypoint split
 
 ADR-0225 splits `crates/vp-cli/src/main.rs` (27,823 lines) into a 1,160-line
@@ -453,8 +470,8 @@ from `run_command` instead of early-returning from `run`, preserving net output
 and exit behavior; the 32 MiB dedicated CLI stack remains. `render.rs` and
 `dispatch.rs` are still large and are the next split targets. The same round
 splits `agent/tools.rs` (2,911) and `agent/context.rs` (2,765) into 14/36-line
-parents plus 4/5 modules; the largest current core module is `agent/plan.rs`
-at 2,495. Verification:
+parents plus 4/5 modules; the largest current core module is `agent/run_loop/body.rs`
+at 1,954. Verification:
 `vp-cli` 145 unit + 10 integration passed; full workspace 4,231 Rust / 6 ignored;
 fmt and clippy passed; Swift unchanged at 535.
 

@@ -1,7 +1,7 @@
 # VerlinPark Status
 
-> 最后更新：2026-11-17
-> 当前主线：C1–C12 代码落地（C11 为 loopback + card-only，尚无 inbound 执行桥）；M3.1 store / M3.2 core / M3.3 二级模块 / M3.4 CLI 入口结构治理完成；下一阶段为生产化与分布式边界。
+> 最后更新：2026-11-18
+> 当前主线：C1–C12 代码落地（C11 为 loopback + card-only，尚无 inbound 执行桥）；M3.1–M3.5 结构治理完成（store/core/CLI/daemon 入口与领域模块）；下一阶段为生产化与分布式边界。
 
 ## 1. 一句话
 
@@ -12,8 +12,8 @@ VerlinPark 已经是一个可运行的 macOS 原生多 Agent 开发区：Rust da
 | 项 | 当前值 |
 |---|---:|
 | Rust crates | 10（新增 `vp-a2a`） |
-| ADR | 220 |
-| 最近全量 Rust 测试 | 4,231 passed / 0 failed / 6 ignored |
+| ADR | 222 |
+| 最近全量 Rust 测试 | 4,234 passed / 0 failed / 6 ignored |
 | Swift | 535 passed（403 app + 132 helper），`xcodebuild test` 通过 |
 | 当前分支 | `m3-round`（本轮审查前不合并） |
 
@@ -30,8 +30,17 @@ VerlinPark 已经是一个可运行的 macOS 原生多 Agent 开发区：Rust da
 - M3.2：`vp-core/src/agent.rs` 29,496 行 → 2,738 行 parent + 14 个 modules；`vp-core/src/lib.rs` 24,074 行 → 479 行 parent + 23 个 `engine/` modules；行为/API 不变。
 - M3.3：`run_loop`/`service`/`service_run`/`runs`/`plans`/`sources` 完成二级拆分；parent 最高 138 行，所有模块 < 3k；module-governance 改为递归扫描。
 - M3.4：`vp-cli/src/main.rs` 27,823 行 → 1,160 行 parent + `cli`/`dispatch`/`render`/`rpc`/`tests` modules；CLI 行为不变。
+- M3.5：`vp-store` 8 个大模块、`vp-core` plan/memory/service-merge、`vp-daemon/main.rs` 完成二级拆分；新增 store/CLI/daemon module-governance 测试。
 
 ## 4. 本轮新增
+
+### M3.5 store, core tail, and daemon split
+
+- `vp-store`: employment 4,798 → 549 + 8 modules；backup 2,592 → 8 + 4；workspaces 2,402 → 1,174 + 5；memory 2,367 → 9 + 5；sources 2,339 → 11 + 7；plans 2,092 → 10 + 6；identity_memory 2,083 → 979 + 3；coordination 2,041 → 919 + 3。
+- `vp-core`: plan 2,495 → 61 + 6；engine/memory 1,955 → 23 + 7；service/merge 1,894 → 5 + 3。当前最大 core module 为 `agent/run_loop/body.rs` 1,954。
+- `vp-daemon/main.rs` 8,216 → 231 + dispatch/http/sweepers/errors/server/backup_status/params/tests；RPC/认证/路由不变。
+- 新增 `vp-store`/`vp-cli`/`vp-daemon` 的 module-governance 测试；store parent < 8k、module < 3k。
+- 新增 ADR-0226/0227。
 
 ### M3.4 CLI entrypoint split
 
@@ -42,7 +51,7 @@ VerlinPark 已经是一个可运行的 macOS 原生多 Agent 开发区：Rust da
 - `rpc.rs` 180 行：RPC/discovery helpers。
 - `tests.rs` 7,594 行：原 29 个测试模块 / 145 tests，不改写断言。
 - 命令行参数、输出、exit code、RPC method/params、discovery 行为不变。
-- 同一轮继续拆分 `agent/tools.rs`（2,911 → 14 行 parent + 4 modules）与 `agent/context.rs`（2,765 → 36 行 parent + 5 modules）；当前最大 core module 为 `agent/plan.rs` 2,495 行。
+- 同一轮继续拆分 `agent/tools.rs`（2,911 → 14 行 parent + 4 modules）与 `agent/context.rs`（2,765 → 36 行 parent + 5 modules）；当前最大 core module 为 `agent/run_loop/body.rs` 1,954 行。
 
 ### M3.3 second-level module split
 
@@ -92,7 +101,7 @@ VerlinPark 已经是一个可运行的 macOS 原生多 Agent 开发区：Rust da
 
 ## 6. 推荐下一阶段
 
-1. **M3.5 结构治理**：拆 `vp-cli/render.rs`/`dispatch.rs`、`vp-daemon/main.rs`，以及 `agent/tools.rs`/`context.rs`/`plan.rs`/`engine/memory.rs`，维持 module budget 与全量测试。
+1. **M3.6 结构治理**：拆 `vp-cli/render.rs`/`dispatch.rs`、`vp-daemon/dispatch.rs`、`agent/run_loop/body.rs`/`tool_calls.rs`、`engine/checkpoints.rs`。
 2. **发布生产化**：Developer ID、notarization、Sparkle/自动更新、干净 Mac smoke。
 3. **C11 partner gated**：只有有真实 partner 时接 inbound execution/gate bridge。
 4. **分布式 runtime**：跨主机 lease/fencing、merge ownership、远程环境复现。
@@ -133,14 +142,14 @@ VerlinPark 已经是一个可运行的 macOS 原生多 Agent 开发区：Rust da
 
 ## 9. Architecture debt
 
-1. `vp-core` 的 `lib.rs`/`agent.rs` 与六个大模块已完成 M3.2/M3.3 拆分；parent 最高 138 行。
+1. `vp-core` 的 `lib.rs`/`agent.rs` 与主要领域模块已完成 M3.2/M3.3/M3.5 拆分；parent 最高 138 行。
 2. `vp-cli` 入口已完成 M3.4 拆分；`render.rs`（7,999）与 `dispatch.rs`（6,918）仍是下一批拆分目标。
-3. `vp-daemon/src/main.rs` 约 8,216 行，仍是未拆分的 RPC route monolith。
-4. 当前最大 core modules：`agent/plan.rs`（2,495）、`engine/memory.rs`（1,955）、`agent/run_loop/body.rs`（1,954）、`agent/run_loop/tool_calls.rs`（1,923）。下一轮可拆 `plan`/`memory`。
-5. `store` 已拆成 33 个模块；`employment`/`schema`/`backup`/`workspaces` 等仍较大。
+3. `vp-daemon/main.rs` 已完成 M3.5 拆分；`dispatch.rs`（5,442）仍是最大的 route match，可按域拆分。
+4. 当前最大 core modules：`agent/run_loop/body.rs`（1,954）、`agent/run_loop/tool_calls.rs`（1,923）、`engine/checkpoints.rs`（1,558）、`engine/usage.rs`（1,319）、`engine/agents.rs`（1,249）。下一轮可拆 `body`/`tool_calls`/`checkpoints`/`usage`。
+5. `store` 已完成 8 个大模块二级拆分；`schema.rs` 2,931 仍是单一有序单元，`team_template`/`programs` 等仍 >1.5k。
 6. 事件投影覆盖仍以关键 session 状态为主；plan_task_progress、A2A task list 等是操作状态。
 7. 审批/契约/effect 的门控顺序已共享 `authorize_tool_call`/`prepare_tool_effect_gate`/`finish_tool_call`；新增 gate 必须改共享 helper。
-8. `module_governance` 递归检查：parent < 8k 行、每个 domain module < 3k 行；未来应保持该预算。
+8. `module_governance` 覆盖 core/store/CLI/daemon：parent < 8k 行、domain module < 3k（CLI/daemon 使用各自预算）。
 
 ## 10. Release checklist
 

@@ -44,6 +44,8 @@
 | **Current** | [adr/0223-core-module-split.md](adr/0223-core-module-split.md) | M3.2 `vp-core` 结构治理：29,496 行 `agent.rs` → 2,738 行 parent + 14 modules；24,074 行 `lib.rs` → 479 行 parent + 23 `engine/` modules；行为/API 不变 |
 | **Current** | [adr/0224-second-level-module-split.md](adr/0224-second-level-module-split.md) | M3.3 二级模块拆分：run_loop/service/service_run/runs/plans/sources 拆为更小 parent + 子模块；module budget 收紧到 3k |
 | **Current** | [adr/0225-cli-entrypoint-split.md](adr/0225-cli-entrypoint-split.md) | M3.4 `vp-cli` 入口拆分：27,823 行 `main.rs` → clap model / dispatch / helpers / tests 模块；CLI 行为不变 |
+| **Current** | [adr/0226-store-second-level-module-split.md](adr/0226-store-second-level-module-split.md) | M3.5 `vp-store` 二级模块拆分：employment/backup/workspaces/memory/sources/plans/identity_memory/coordination；SQL/API 不变 |
+| **Current** | [adr/0227-daemon-entrypoint-split.md](adr/0227-daemon-entrypoint-split.md) | M3.5 `vp-daemon` 入口拆分：8,216 行 `main.rs` → dispatch/http/sweepers/errors/server/tests；RPC/认证/路由不变 |
 | **Reference** | [OBSCURA_ASSESSMENT.md](OBSCURA_ASSESSMENT.md) | Obscura（Rust/V8/CDP/MCP headless browser）评估：适用场景、安全约束、三种集成方案、结论为 cache 轮之后再做可选外部网页后端 |
 | **Reference** | [PRIDE_FLAGS.md](PRIDE_FLAGS.md) | Pride flag 资产来源与许可 |
 | **Reference** | [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) | FlagKit 等第三方资产许可 |

@@ -91,8 +91,40 @@ Child modules own cohesive method clusters.
 | `context/state.rs` | 520 | structured context state/todos/conversation loading |
 | `context/support.rs` | 120 | bounded shared helpers |
 
-After this tail split, the largest `vp-core` domain module is `agent/plan.rs`
-at 2,495 lines; the recursive governance budget remains 3,000 lines.
+`agent/plan.rs` is **61 lines**:
+
+| Module | Lines | Responsibility |
+|---|---:|---|
+| `plan/execute.rs` | 924 | TeamPlan execution |
+| `plan/worker.rs` | 490 | worker/labour finish and review |
+| `plan/validate.rs` | 317 | plan validation |
+| `plan/memory.rs` | 268 | task memory/provenance |
+| `plan/support.rs` | 251 | batch/selection helpers |
+| `plan/roundtable.rs` | 214 | Manager roundtable |
+
+`engine/memory.rs` is **23 lines**:
+
+| Module | Lines | Responsibility |
+|---|---:|---|
+| `memory/records.rs` | 835 | memory records/lifecycle |
+| `memory/embedding.rs` | 481 | embedding jobs/search |
+| `memory/agent_memory.rs` | 238 | identity memory |
+| `memory/conflicts.rs` | 156 | conflict detection/resolution |
+| `memory/index.rs` | 121 | index status/rebuild |
+| `memory/policy.rs` | 87 | memory policy |
+| `memory/support.rs` | 39 | shared helpers |
+
+`agent/service/merge.rs` is **5 lines**:
+
+| Module | Lines | Responsibility |
+|---|---:|---|
+| `service/merge/remote.rs` | 918 | remote integration |
+| `service/merge/resolve.rs` | 678 | conflict/resolver flow |
+| `service/merge/retry.rs` | 304 | merge retry |
+
+After this tail split, the largest `vp-core` domain module is
+`agent/run_loop/body.rs` at 1,954 lines; the recursive governance budget
+remains 3,000 lines.
 
 ### Engine modules
 

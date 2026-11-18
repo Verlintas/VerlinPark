@@ -1,0 +1,407 @@
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use axum::Json;
+use axum::body::to_bytes;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Request, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use serde_json::{Value, json};
+use tokio::sync::broadcast;
+use tracing::{info, warn};
+use vp_protocol::rpc::{RpcError, RpcNotification, RpcRequest, RpcResponse, codes};
+use vp_protocol::types::{AuthParams, AuthResult, DaemonMetrics, SubscribeParams};
+use vp_protocol::{APP_VERSION, PROTOCOL_VERSION};
+
+use crate::AppState;
+use crate::dispatch::dispatch;
+use crate::metrics;
+use crate::server::{authorized, constant_time_eq, server_info};
+
+pub(crate) async fn health() -> Json<Value> {
+    Json(json!({"ok": true, "version": APP_VERSION, "protocol": PROTOCOL_VERSION}))
+}
+
+/// Optional loopback-only gate resolve endpoint. It is disabled unless the
+/// gate's project sets `loopback_resolve=true`; the scoped gate token is the
+/// only credential. The daemon never binds a public interface, and this route
+/// never resolves approvals, merges work, or exposes the token/verifier.
+#[derive(serde::Deserialize)]
+struct LoopbackGateResolve {
+    gate_id: String,
+    token: String,
+    #[serde(default)]
+    outcome: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+pub(crate) async fn gate_resolve_http(State(state): State<AppState>, request: Request) -> Response {
+    let body = match to_bytes(request.into_body(), 16 * 1024).await {
+        Ok(body) => body,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    json!({"error": {"code": "GATE_INVALID", "message": "request body too large"}}),
+                ),
+            )
+                .into_response();
+        }
+    };
+    let params = match serde_json::from_slice::<LoopbackGateResolve>(&body) {
+        Ok(params) => params,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": {"code": "GATE_INVALID", "message": "invalid request body"}})),
+            )
+                .into_response();
+        }
+    };
+    match state
+        .engine
+        .resolve_gate_loopback(
+            &params.gate_id,
+            &params.token,
+            params.outcome.as_deref(),
+            params.note.as_deref(),
+        )
+        .await
+    {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => {
+            let code = vp_core::gate::gate_error_code(&error).unwrap_or("GATE_INVALID");
+            let status = match code {
+                vp_core::gate::codes::GATE_NOT_FOUND => StatusCode::NOT_FOUND,
+                vp_core::gate::codes::GATE_TOKEN_INVALID => StatusCode::UNAUTHORIZED,
+                vp_core::gate::codes::GATE_LOOPBACK_DISABLED => StatusCode::FORBIDDEN,
+                vp_core::gate::codes::GATE_EXPIRED | vp_core::gate::codes::GATE_CANCELLED => {
+                    StatusCode::GONE
+                }
+                vp_core::gate::codes::GATE_CONFLICT
+                | vp_core::gate::codes::GATE_ALREADY_WATCHED => StatusCode::CONFLICT,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            (
+                status,
+                Json(json!({"error": {"code": code, "message": format!("{error:#}")}})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Prometheus scrape endpoint. It uses the same loopback Bearer token as
+/// `/rpc`; Prometheus can send it through `authorization` in its scrape config.
+pub(crate) async fn metrics_http(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&headers, &state.token) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "unauthorized\n",
+        )
+            .into_response();
+    }
+    match collect_daemon_metrics(&state).await {
+        Ok(metrics) => {
+            let body = metrics::render_prometheus(&metrics);
+            ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
+        }
+        Err(error) => {
+            warn!(%error, "failed to collect daemon metrics");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                "metrics unavailable\n",
+            )
+                .into_response()
+        }
+    }
+}
+
+pub(crate) async fn collect_daemon_metrics(state: &AppState) -> Result<DaemonMetrics> {
+    let store = state.engine.store().clone();
+    let snapshot = tokio::task::spawn_blocking(move || store.daemon_metrics_snapshot()).await??;
+    Ok(DaemonMetrics {
+        version: APP_VERSION.to_string(),
+        protocol: PROTOCOL_VERSION,
+        uptime_secs: state.started.elapsed().as_secs(),
+        projects: snapshot.projects,
+        sessions: snapshot.sessions,
+        plan_tasks: snapshot.plan_tasks,
+        merge_queue: snapshot.merge_queue,
+        intake: snapshot.intake,
+        continuations: snapshot.continuations,
+        recoveries: snapshot.recoveries,
+        memories: snapshot.memories,
+        memory_conflicts: snapshot.memory_conflicts,
+        runtime_leases: snapshot.runtime_leases,
+        supervised_processes: snapshot.supervised_processes,
+        supervised_process_output_bytes: snapshot.supervised_process_output_bytes,
+        preemptions_by_phase: snapshot.preemptions_by_phase,
+        preemptions_by_reason: snapshot.preemptions_by_reason,
+        tokens_in: snapshot.tokens_in,
+        tokens_out: snapshot.tokens_out,
+        cache_read_tokens: snapshot.cache_read_tokens,
+        cache_write_tokens: snapshot.cache_write_tokens,
+        cache_hit_ratio: vp_protocol::types::cache_hit_ratio(
+            snapshot.tokens_in,
+            snapshot.cache_read_tokens,
+            snapshot.cache_write_tokens,
+        ),
+        preamble_tokens_estimate: snapshot.preamble_tokens_estimate,
+        cost_spent_usd: snapshot.cost_spent_usd,
+    })
+}
+
+const MAX_RPC_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+pub(crate) async fn rpc_http(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: Request,
+) -> Response {
+    if !authorized(&headers, &state.token) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized"})),
+        )
+            .into_response();
+    }
+
+    let body = match to_bytes(request.into_body(), MAX_RPC_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(_) => {
+            return Json(RpcResponse::error(
+                None,
+                RpcError::new(codes::INVALID_REQUEST, "request body too large"),
+            ))
+            .into_response();
+        }
+    };
+    let body = match String::from_utf8(body.to_vec()) {
+        Ok(body) => body,
+        Err(_) => {
+            return Json(RpcResponse::error(
+                None,
+                RpcError::new(codes::PARSE_ERROR, "request body is not UTF-8"),
+            ))
+            .into_response();
+        }
+    };
+    let request: RpcRequest = match serde_json::from_str(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            return Json(RpcResponse::error(
+                None,
+                RpcError::new(codes::PARSE_ERROR, error.to_string()),
+            ))
+            .into_response();
+        }
+    };
+    let response = dispatch(&state, request).await;
+    Json(response).into_response()
+}
+
+pub(crate) async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_socket(socket, state))
+}
+
+async fn handle_socket(mut socket: WebSocket, state: AppState) {
+    let auth = tokio::time::timeout(Duration::from_secs(10), socket.recv()).await;
+    let request = match auth {
+        Ok(Some(Ok(Message::Text(text)))) => serde_json::from_str::<RpcRequest>(&text).ok(),
+        _ => None,
+    };
+    let Some(request) = request else {
+        let _ = send_json(
+            &mut socket,
+            &RpcResponse::error(
+                None,
+                RpcError::new(codes::UNAUTHORIZED, "authentication required"),
+            ),
+        )
+        .await;
+        return;
+    };
+
+    if request.method != "auth" {
+        let _ = send_json(
+            &mut socket,
+            &RpcResponse::error(
+                request.id,
+                RpcError::new(codes::UNAUTHORIZED, "first request must be auth"),
+            ),
+        )
+        .await;
+        return;
+    }
+
+    let params: AuthParams = match serde_json::from_value(request.params) {
+        Ok(params) => params,
+        Err(error) => {
+            let _ = send_json(
+                &mut socket,
+                &RpcResponse::error(
+                    request.id,
+                    RpcError::new(codes::INVALID_PARAMS, error.to_string()),
+                ),
+            )
+            .await;
+            return;
+        }
+    };
+
+    if params
+        .protocol
+        .is_some_and(|protocol| protocol != PROTOCOL_VERSION)
+    {
+        let _ = send_json(
+            &mut socket,
+            &RpcResponse::error(
+                request.id,
+                RpcError::new(
+                    codes::INVALID_REQUEST,
+                    format!(
+                        "protocol version mismatch: client {} server {}",
+                        params.protocol.unwrap_or_default(),
+                        PROTOCOL_VERSION
+                    ),
+                ),
+            ),
+        )
+        .await;
+        return;
+    }
+
+    if !constant_time_eq(&params.token, &state.token) {
+        let _ = send_json(
+            &mut socket,
+            &RpcResponse::error(
+                request.id,
+                RpcError::new(codes::UNAUTHORIZED, "invalid token"),
+            ),
+        )
+        .await;
+        return;
+    }
+
+    let server = match server_info(&state).await {
+        Ok(server) => server,
+        Err(error) => {
+            let _ = send_json(
+                &mut socket,
+                &RpcResponse::error(
+                    request.id,
+                    RpcError::new(codes::INTERNAL_ERROR, error.to_string()),
+                ),
+            )
+            .await;
+            return;
+        }
+    };
+    if send_json(
+        &mut socket,
+        &RpcResponse::success(request.id, AuthResult { ok: true, server }),
+    )
+    .await
+    .is_err()
+    {
+        return;
+    }
+
+    info!(pid = state.pid, "websocket client authenticated");
+    let mut events = state.engine.subscribe();
+    let mut filter: Option<String> = None;
+
+    loop {
+        tokio::select! {
+            outgoing = socket.recv() => {
+                match outgoing {
+                    Some(Ok(Message::Text(text))) => {
+                        let request: RpcRequest = match serde_json::from_str(&text) {
+                            Ok(request) => request,
+                            Err(error) => {
+                                let _ = send_json(
+                                    &mut socket,
+                                    &RpcResponse::error(None, RpcError::new(codes::PARSE_ERROR, error.to_string())),
+                                ).await;
+                                continue;
+                            }
+                        };
+                        if request.method == "event.subscribe" {
+                            let params: SubscribeParams = if request.params.is_null() {
+                                SubscribeParams { session_id: None }
+                            } else {
+                                match serde_json::from_value(request.params) {
+                                    Ok(params) => params,
+                                    Err(error) => {
+                                        let _ = send_json(
+                                            &mut socket,
+                                            &RpcResponse::error(
+                                                request.id,
+                                                RpcError::new(codes::INVALID_PARAMS, error.to_string()),
+                                            ),
+                                        ).await;
+                                        continue;
+                                    }
+                                }
+                            };
+                            filter = params.session_id;
+                            let _ = send_json(
+                                &mut socket,
+                                &RpcResponse::success(request.id, json!({"subscribed": true})),
+                            ).await;
+                            continue;
+                        }
+                        let response = dispatch(&state, request).await;
+                        if send_json(&mut socket, &response).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => {
+                        warn!(%error, "websocket receive error");
+                        break;
+                    }
+                }
+            }
+            event = events.recv() => {
+                match event {
+                    Ok(event) => {
+                        if filter.as_deref().is_some_and(|id| id != event.session_id) {
+                            continue;
+                        }
+                        let notification = RpcNotification::new("event.appended", &event);
+                        if send_json(&mut socket, &notification).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(skipped, "websocket event subscriber lagged");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
+}
+
+async fn send_json(socket: &mut WebSocket, value: &impl serde::Serialize) -> Result<()> {
+    let text = serde_json::to_string(value)?;
+    socket
+        .send(Message::Text(text.into()))
+        .await
+        .context("sending websocket message")
+}
