@@ -11,8 +11,8 @@ impl Store {
         limit: Option<u32>,
     ) -> Result<Vec<AgentWorkspaceEvent>> {
         let limit = limit
-            .unwrap_or(AGENT_WORKSPACE_EVENT_LIMIT)
-            .clamp(1, AGENT_WORKSPACE_EVENT_LIMIT) as i64;
+            .map(|value| value.clamp(1, AGENT_WORKSPACE_EVENT_LIMIT) as i64)
+            .unwrap_or(-1);
         let conn = self.lock()?;
         let mut statement = conn.prepare(
             "SELECT id, project_id, seq, kind, payload, created_at

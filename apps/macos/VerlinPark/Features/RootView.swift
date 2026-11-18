@@ -56,6 +56,9 @@ struct RootView: View {
             .onChange(of: commandRouter.sequence) { _, _ in
                 handle(commandRouter.lastCommand)
             }
+            .onChange(of: model.approvalAttentionRequestID) { _, _ in
+                showDashboard = true
+            }
             .animation(VPMotion.snap, value: showCommandPalette)
             .animation(VPMotion.smooth, value: focusMode)
             .task {

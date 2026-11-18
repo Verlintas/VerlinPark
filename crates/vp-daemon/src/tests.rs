@@ -1041,3 +1041,604 @@ mod agent_coordination_rpc_error_tests {
         assert!(error.data.is_none());
     }
 }
+
+#[cfg(test)]
+mod protocol_transport_tests {
+    use super::*;
+    use crate::errors::{operation_error, operation_receipt_error, validation_error};
+    use crate::sweepers::sweep_interval_secs;
+    use axum::body::Body;
+    use axum::body::to_bytes;
+    use axum::extract::State;
+    use axum::http::{Request as HttpRequest, StatusCode, header};
+    use std::path::Path;
+    use std::process::Command;
+    use tempfile::TempDir;
+    use vp_core::agent::AgentService;
+    use vp_protocol::rpc::RpcRequest;
+    use vp_protocol::types::GuiPolicy;
+    use vp_store::store::Claim;
+
+    fn init_repo(path: &Path) {
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["add", "."],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "init",
+            ],
+        ] {
+            let status = Command::new("git")
+                .args(&args)
+                .current_dir(path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+            if args[0] == "init" {
+                std::fs::write(path.join("README.md"), "protocol daemon test\n").unwrap();
+            }
+        }
+    }
+
+    fn state(data: &TempDir, engine: Engine, agent: AgentService) -> AppState {
+        AppState {
+            engine,
+            agent,
+            token: Arc::new("test-token".to_string()),
+            data_dir: data.path().to_path_buf(),
+            started_at: now_rfc3339(),
+            started: Instant::now(),
+            pid: std::process::id(),
+        }
+    }
+
+    fn empty_state() -> (TempDir, AppState) {
+        let data = TempDir::new().unwrap();
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let agent = AgentService::unconfigured(engine.clone());
+        let state = state(&data, engine, agent);
+        (data, state)
+    }
+
+    async fn project_state() -> (TempDir, TempDir, AppState) {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        engine
+            .add_project(repo.path().to_str().unwrap().to_string(), None)
+            .await
+            .unwrap();
+        let agent = AgentService::unconfigured(engine.clone());
+        let state = state(&data, engine, agent);
+        (data, repo, state)
+    }
+
+    async fn first_project_id(state: &AppState) -> String {
+        state.engine.list_projects().await.unwrap()[0].id.clone()
+    }
+
+    #[tokio::test]
+    async fn absent_or_null_params_decode_as_an_empty_object() {
+        let (_data, state) = empty_state();
+        for method in ["host.list", "dashboard.snapshot", "session.list"] {
+            let response = dispatch(&state, RpcRequest::new(json!(1), method, Value::Null)).await;
+            assert!(
+                response.error.is_none(),
+                "{method} with omitted params failed: {:?}",
+                response.error
+            );
+        }
+        // An explicit JSON object still decodes normally.
+        let response = dispatch(&state, RpcRequest::new(json!(2), "session.list", json!({}))).await;
+        assert!(response.error.is_none());
+
+        // Malformed params keep their typed validation failure.
+        let response = dispatch(&state, RpcRequest::new(json!(3), "host.list", json!(5))).await;
+        let error = response.error.expect("scalar params must fail");
+        assert_eq!(error.code, codes::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn http_auth_failure_uses_the_rpc_error_shape() {
+        let (_data, state) = empty_state();
+        let response = crate::http::rpc_http(
+            State(state.clone()),
+            header::HeaderMap::new(),
+            HttpRequest::builder().body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::WWW_AUTHENTICATE)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer")
+        );
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(envelope["jsonrpc"], "2.0");
+        assert_eq!(envelope["error"]["code"], codes::UNAUTHORIZED);
+        assert_eq!(envelope["error"]["message"], "unauthorized");
+        assert!(envelope["result"].is_null());
+
+        // The wrong token is indistinguishable from a missing one.
+        let mut headers = header::HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer wrong-token".parse().unwrap());
+        let response = crate::http::rpc_http(
+            State(state),
+            headers,
+            HttpRequest::builder().body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn http_event_subscribe_does_not_claim_success() {
+        let (_data, state) = empty_state();
+        let response = dispatch(
+            &state,
+            RpcRequest::new(json!(7), "event.subscribe", json!({})),
+        )
+        .await;
+        let error = response.error.expect("HTTP subscribe must fail");
+        assert_eq!(error.code, codes::METHOD_NOT_FOUND);
+        let data = error.data.expect("typed hint");
+        assert_eq!(data["code"], "UNSUPPORTED_TRANSPORT");
+        assert_eq!(data["required_transport"], "ws");
+    }
+
+    #[tokio::test]
+    async fn session_create_without_provider_reports_the_start_failure() {
+        let (_data, _repo, state) = project_state().await;
+        let project = first_project_id(&state).await;
+        let response = dispatch(
+            &state,
+            RpcRequest::new(
+                json!(8),
+                "session.create",
+                json!({"project_id": project, "goal": "needs a provider"}),
+            ),
+        )
+        .await;
+        let error = response.error.expect("a failed start must not be success");
+        assert_eq!(error.code, codes::INTERNAL_ERROR);
+        let data = error.data.expect("typed start failure");
+        assert_eq!(data["code"], "SESSION_START_FAILED");
+        assert_eq!(data["phase"], "agent.start");
+        assert_eq!(data["retryable"], true);
+        let session_id = data["session_id"].as_str().unwrap().to_string();
+
+        // The session exists exactly once and records the unavailable agent.
+        let sessions = state.engine.list_sessions(None).await.unwrap();
+        assert_eq!(
+            sessions.iter().filter(|row| row.id == session_id).count(),
+            1
+        );
+        let events = state.engine.list_events(session_id, 0, 200).await.unwrap();
+        assert!(
+            events.iter().any(|event| event.kind == "agent.unavailable"),
+            "missing agent.unavailable event"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_create_validation_failure_keeps_a_typed_code() {
+        let (_data, _repo, state) = project_state().await;
+        let project = first_project_id(&state).await;
+        let response = dispatch(
+            &state,
+            RpcRequest::new(
+                json!(9),
+                "session.create",
+                json!({
+                    "project_id": project,
+                    "goal": "unlimited with a budget",
+                    "unlimited": true,
+                    "token_budget": 1_000,
+                }),
+            ),
+        )
+        .await;
+        let error = response.error.expect("invalid budgets must fail");
+        assert_eq!(error.code, codes::INVALID_PARAMS);
+        assert_eq!(
+            error.data.expect("typed code")["code"],
+            "SESSION_UNLIMITED_CONFLICT"
+        );
+        assert!(state.engine.list_sessions(None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn operation_receipt_conflict_is_a_typed_rpc_error() {
+        let (_data, _repo, state) = project_state().await;
+        let project = first_project_id(&state).await;
+        let session = state
+            .engine
+            .create_session(project, "operation receipt".to_string(), None)
+            .await
+            .unwrap();
+        // A pending receipt for a different payload fingerprint makes the
+        // core layer report `Claim::Conflict`, which must keep a stable code.
+        let store = state.engine.store().clone();
+        assert!(matches!(
+            store
+                .claim_session_operation(
+                    &session.id,
+                    "op-conflict",
+                    "session.prompt",
+                    "not-the-daemon-fingerprint",
+                )
+                .unwrap(),
+            Claim::New
+        ));
+        let response = dispatch(
+            &state,
+            RpcRequest::new(
+                json!(10),
+                "session.prompt",
+                json!({
+                    "session_id": session.id,
+                    "content": "hello",
+                    "operation_id": "op-conflict",
+                }),
+            ),
+        )
+        .await;
+        let error = response.error.expect("conflicting operation id must fail");
+        assert_eq!(error.code, codes::CONFLICT);
+        let data = error.data.expect("typed operation code");
+        assert_eq!(data["code"], "OPERATION_CONFLICT");
+        assert_eq!(data["retryable"], false);
+    }
+
+    #[test]
+    fn operation_receipt_outcomes_keep_distinct_typed_codes() {
+        let cases = [
+            (
+                "operation op-1 is already in progress for session ses-1; not starting a duplicate",
+                codes::CONFLICT,
+                "OPERATION_IN_PROGRESS",
+                true,
+            ),
+            (
+                "operation id op-1 was already used for session ses-1 with a different method or payload",
+                codes::CONFLICT,
+                "OPERATION_CONFLICT",
+                false,
+            ),
+            (
+                "operation op-1 has an unknown outcome after a daemon restart; inspect session ses-1 before retrying",
+                codes::CONFLICT,
+                "OPERATION_UNKNOWN",
+                false,
+            ),
+            (
+                "operation_id must not contain control characters",
+                codes::INVALID_PARAMS,
+                "INVALID_OPERATION_ID",
+                false,
+            ),
+        ];
+        for (message, rpc_code, code, retryable) in cases {
+            let response = operation_error(Some(json!(1)), anyhow::anyhow!(message));
+            let error = response.error.expect("error");
+            assert_eq!(error.code, rpc_code, "{message}");
+            let data = error.data.expect("typed data");
+            assert_eq!(data["code"], code, "{message}");
+            assert_eq!(data["retryable"], retryable, "{message}");
+        }
+        // An unrelated store failure stays INTERNAL_ERROR with no invented code.
+        assert!(
+            operation_receipt_error(Some(json!(1)), &anyhow::anyhow!("database is closed"))
+                .is_none()
+        );
+        let response = operation_error(Some(json!(1)), anyhow::anyhow!("database is closed"));
+        let error = response.error.expect("error");
+        assert_eq!(error.code, codes::INTERNAL_ERROR);
+        assert!(error.data.is_none());
+    }
+
+    #[test]
+    fn policy_validation_failures_are_invalid_params() {
+        let response = validation_error(
+            Some(json!(1)),
+            &anyhow::anyhow!("invalid critical-path policy: reserve_ratio must be 0..1"),
+        )
+        .expect("typed policy error");
+        let error = response.error.expect("error");
+        assert_eq!(error.code, codes::INVALID_PARAMS);
+        assert_eq!(error.data.expect("data")["code"], "POLICY_INVALID");
+
+        let response = validation_error(
+            Some(json!(2)),
+            &anyhow::anyhow!("gui grace_secs must be at most 600"),
+        )
+        .expect("typed gui policy error");
+        assert_eq!(response.error.expect("error").code, codes::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn gui_policy_set_preserves_the_user_supplied_grace() {
+        let (_data, _repo, state) = project_state().await;
+        let project = first_project_id(&state).await;
+        for grace_secs in [0u64, 7] {
+            let response = dispatch(
+                &state,
+                RpcRequest::new(
+                    json!(11),
+                    "gui.policy.set",
+                    json!({
+                        "project_id": project,
+                        "policy": {"grace_secs": grace_secs},
+                    }),
+                ),
+            )
+            .await;
+            assert!(response.error.is_none(), "{:?}", response.error);
+            let result = response.result.unwrap();
+            assert_eq!(
+                result["policy"]["grace_secs"], grace_secs,
+                "the effective policy must be the user-supplied value"
+            );
+            let stored = state.engine.get_gui_policy(&project).await.unwrap();
+            assert_eq!(stored.grace_secs, grace_secs);
+        }
+        // An out-of-range value still fails validation; the policy is not
+        // silently rewritten into range.
+        let response = dispatch(
+            &state,
+            RpcRequest::new(
+                json!(12),
+                "gui.policy.set",
+                json!({"project_id": project, "policy": {"grace_secs": 601}}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            response.error.expect("out of range").code,
+            codes::INVALID_PARAMS
+        );
+    }
+
+    #[tokio::test]
+    async fn grace_sweep_does_not_release_an_in_flight_action() {
+        let (_data, _repo, state) = project_state().await;
+        let project = first_project_id(&state).await;
+        let first = state
+            .engine
+            .create_session(project.clone(), "gui in flight".to_string(), None)
+            .await
+            .unwrap();
+        let second = state
+            .engine
+            .create_session(project.clone(), "gui waiter".to_string(), None)
+            .await
+            .unwrap();
+        // Zero grace is the worst case for the old sweeper.
+        let policy = GuiPolicy {
+            grace_secs: 0,
+            wait_ms: 0,
+            ..GuiPolicy::default()
+        };
+        state
+            .engine
+            .store()
+            .set_gui_policy(&project, &policy)
+            .unwrap();
+        let ticket = match state
+            .engine
+            .gui_begin_action_with_policy(
+                &policy,
+                vp_core::gui::GuiSurface::Browser,
+                &first.id,
+                "agent-a",
+                "Agent A",
+            )
+            .await
+            .unwrap()
+        {
+            vp_core::gui::GuiAcquire::Acquired(ticket) => ticket,
+            other => panic!("expected an acquired ticket, got {other:?}"),
+        };
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        // `spawn_gui_grace_sweeper` calls exactly this every second. It must
+        // not release a holder whose action is still in flight.
+        assert_eq!(state.engine.sweep_gui_grace().await, 0);
+        let (holder, _) = state.engine.gui_lease_snapshot().await;
+        assert_eq!(
+            holder.expect("in-flight holder was released").session_id,
+            first.id
+        );
+        let busy = state
+            .engine
+            .gui_begin_action_with_policy(
+                &policy,
+                vp_core::gui::GuiSurface::Computer,
+                &second.id,
+                "agent-b",
+                "Agent B",
+            )
+            .await
+            .unwrap();
+        match busy {
+            vp_core::gui::GuiAcquire::Busy(busy) => {
+                assert_eq!(busy.code, "GUI_BUSY");
+                assert_eq!(busy.holder_session_id.as_deref(), Some(first.id.as_str()));
+            }
+            vp_core::gui::GuiAcquire::Acquired(_) => {
+                panic!("a second session acquired the GUI during an in-flight action")
+            }
+        }
+
+        // After `finish`, zero grace releases normally and the other session
+        // acquires with a new generation.
+        state
+            .engine
+            .gui_finish_action(&ticket, vp_core::gui::GuiActionOutcome::new("snapshot"))
+            .await;
+        assert_eq!(state.engine.sweep_gui_grace().await, 1);
+        let (holder, _) = state.engine.gui_lease_snapshot().await;
+        assert!(holder.is_none());
+        let next = match state
+            .engine
+            .gui_begin_action_with_policy(
+                &policy,
+                vp_core::gui::GuiSurface::Computer,
+                &second.id,
+                "agent-b",
+                "Agent B",
+            )
+            .await
+            .unwrap()
+        {
+            vp_core::gui::GuiAcquire::Acquired(ticket) => ticket,
+            other => panic!("expected a zero-grace acquisition, got {other:?}"),
+        };
+        assert!(next.lease_generation > ticket.lease_generation);
+        state.engine.gui_end_session(&second.id, "cleanup").await;
+    }
+
+    #[tokio::test]
+    async fn stale_in_flight_ticket_does_not_block_after_the_lease_row_is_gone() {
+        let (_data, _repo, state) = project_state().await;
+        let project = first_project_id(&state).await;
+        let first = state
+            .engine
+            .create_session(project.clone(), "stale ticket".to_string(), None)
+            .await
+            .unwrap();
+        let second = state
+            .engine
+            .create_session(project, "stale ticket waiter".to_string(), None)
+            .await
+            .unwrap();
+        let policy = GuiPolicy {
+            grace_secs: 300,
+            wait_ms: 0,
+            ..GuiPolicy::default()
+        };
+        let ticket = match state
+            .engine
+            .gui_begin_action_with_policy(
+                &policy,
+                vp_core::gui::GuiSurface::Browser,
+                &first.id,
+                "agent-a",
+                "Agent A",
+            )
+            .await
+            .unwrap()
+        {
+            vp_core::gui::GuiAcquire::Acquired(ticket) => ticket,
+            other => panic!("expected an acquired ticket, got {other:?}"),
+        };
+        // Simulate a killed action whose ticket is never finished, while the
+        // SQLite lease is removed out from under the coordinator (operator
+        // release or the store's own lease expiry).
+        assert!(
+            state
+                .engine
+                .release_computer_lease(&ticket.lease_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !state
+                .engine
+                .computer_lease_active(&ticket.lease_id)
+                .await
+                .unwrap()
+        );
+
+        // The stale in-memory ticket must not block a different session: the
+        // existing `vanished` path reclaims the holder even though grace is
+        // still 300s away.
+        let next = match state
+            .engine
+            .gui_begin_action_with_policy(
+                &policy,
+                vp_core::gui::GuiSurface::Computer,
+                &second.id,
+                "agent-b",
+                "Agent B",
+            )
+            .await
+            .unwrap()
+        {
+            vp_core::gui::GuiAcquire::Acquired(ticket) => ticket,
+            other => panic!("a vanished lease still blocked reclaim: {other:?}"),
+        };
+        assert_eq!(next.session_id, second.id);
+        assert!(next.lease_generation > ticket.lease_generation);
+        state.engine.gui_end_session(&second.id, "cleanup").await;
+    }
+
+    #[test]
+    fn disabling_orchestration_keeps_lease_sweeps_active() {
+        let env =
+            |key: &str| (key == "VERLINPARK_ORCHESTRATION_TICK_SECS").then(|| "0".to_string());
+        assert_eq!(
+            sweep_interval_secs(env, "VERLINPARK_ORCHESTRATION_TICK_SECS", 20),
+            None
+        );
+        assert_eq!(
+            sweep_interval_secs(env, "VERLINPARK_RUNTIME_LEASE_SWEEP_SECS", 30),
+            Some(30),
+            "the lease sweep must have its own gate"
+        );
+        assert_eq!(
+            sweep_interval_secs(
+                |key| (key == "VERLINPARK_RUNTIME_LEASE_SWEEP_SECS").then(|| "0".to_string()),
+                "VERLINPARK_RUNTIME_LEASE_SWEEP_SECS",
+                30
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_failure_starts_no_background_work_and_writes_no_discovery() {
+        let data = TempDir::new().unwrap();
+        // A crashed daemon may have left a stale discovery file behind.
+        std::fs::create_dir_all(data.path().join("run")).unwrap();
+        std::fs::write(
+            data.path().join("run").join("daemon.json"),
+            r#"{"pid":1,"port":1,"token":"stale","protocol":1,"version":"0","started_at":"x"}"#,
+        )
+        .unwrap();
+        // Occupy a loopback port, then ask the daemon to bind the same one.
+        let occupied = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let error = crate::run_daemon(data.path().to_path_buf(), Some(port))
+            .await
+            .expect_err("a bound port must fail startup");
+        assert!(
+            format!("{error:#}").contains("binding 127.0.0.1"),
+            "{error:#}"
+        );
+        assert!(
+            !data.path().join("run").join("daemon.json").exists(),
+            "a failed bind must not leave a discovery file pointing at a dead port"
+        );
+        assert!(
+            !data.path().join("run").join("daemon.json.tmp").exists(),
+            "a failed bind must not leave a discovery temp file"
+        );
+        // No session work was created by the aborted startup.
+        let store = Store::open(data.path()).unwrap();
+        assert!(store.list_projects().unwrap().is_empty());
+    }
+}

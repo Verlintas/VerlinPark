@@ -50,9 +50,65 @@ impl Store {
         Ok(event)
     }
 
-    /// Persist a plan revision and its event atomically. The payload is
-    /// supplied by the orchestration layer so the event carries the revision,
-    /// author, reason, and task diff.
+    /// Persist the first `team_plan.submitted` for a session only when no plan
+    /// is stored yet. `Ok(None)` means a plan already exists and nothing was
+    /// written; callers must use the explicit revision path instead of
+    /// replacing the plan and resetting the task projection.
+    pub fn set_team_plan_if_absent_with_runtime_snapshot_and_event(
+        &self,
+        session_id: &str,
+        plan: &str,
+        runtime_snapshot_json: Option<&str>,
+    ) -> Result<Option<Event>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let existing = tx
+            .query_row(
+                "SELECT team_plan FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        let Some(existing) = existing else {
+            return Err(anyhow!("session not found: {session_id}"));
+        };
+        let existing_submissions: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE session_id = ?1 AND type = 'team_plan.submitted'",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        if existing.is_some() || existing_submissions > 0 {
+            return Ok(None);
+        }
+        let changed = tx.execute(
+            "UPDATE sessions
+             SET team_plan = ?1,
+                 plan_runtime_snapshot = COALESCE(?3, plan_runtime_snapshot)
+             WHERE id = ?2",
+            params![plan, session_id, runtime_snapshot_json],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!("session not found: {session_id}"));
+        }
+        let mut payload = serde_json::from_str(plan).unwrap_or(serde_json::Value::Null);
+        if let (Some(snapshot_json), Some(object)) =
+            (runtime_snapshot_json, payload.as_object_mut())
+            && let Ok(snapshot) = serde_json::from_str::<serde_json::Value>(snapshot_json)
+        {
+            object.insert("runtime_snapshot".into(), snapshot);
+        }
+        let event = insert_event_tx(&tx, session_id, "team_plan.submitted", payload)?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some(event))
+    }
+
+    /// Legacy fixture/import helper for a plan revision without a runtime
+    /// snapshot. It does not compare revisions; production writers must use
+    /// the runtime-snapshot or explicit compare-and-set method.
     pub fn set_team_plan_revision_with_event(
         &self,
         session_id: &str,
@@ -60,27 +116,58 @@ impl Store {
         kind: &str,
         payload: serde_json::Value,
     ) -> Result<Event> {
-        self.set_team_plan_revision_with_runtime_snapshot_and_event(
-            session_id, plan, kind, payload, None,
-        )
+        if !matches!(kind, "team_plan.submitted" | "team_plan.revised") {
+            return Err(anyhow!("invalid team plan event kind: {kind}"));
+        }
+        self.write_team_plan_revision_unchecked(session_id, plan, kind, payload, None)
     }
 
-    /// Persist a plan revision, its optional runtime snapshot, and the plan
-    /// lifecycle event atomically. The snapshot is stored on the session row
-    /// and embedded in the event payload.
-    pub fn set_team_plan_revision_with_runtime_snapshot_and_event(
+    fn write_team_plan_revision_unchecked(
         &self,
+        session_id: &str,
+        plan: &str,
+        kind: &str,
+        payload: serde_json::Value,
+        runtime_snapshot_json: Option<&str>,
+    ) -> Result<Event> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let event = Self::insert_team_plan_revision_tx(
+            &tx,
+            session_id,
+            plan,
+            kind,
+            payload,
+            runtime_snapshot_json,
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(event)
+    }
+
+    /// Number of plan lifecycle events (`team_plan.submitted|revised`) in the
+    /// same transaction as a revision write. This is the authoritative
+    /// revision number; it does not depend on a bounded recent-event window.
+    fn plan_revision_count_tx(tx: &Transaction<'_>, session_id: &str) -> Result<u32> {
+        let count = tx.query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE session_id = ?1 AND type IN ('team_plan.submitted', 'team_plan.revised')",
+            params![session_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count.clamp(0, i64::from(u32::MAX)) as u32)
+    }
+
+    fn insert_team_plan_revision_tx(
+        tx: &Transaction<'_>,
         session_id: &str,
         plan: &str,
         kind: &str,
         mut payload: serde_json::Value,
         runtime_snapshot_json: Option<&str>,
     ) -> Result<Event> {
-        if !matches!(kind, "team_plan.submitted" | "team_plan.revised") {
-            return Err(anyhow!("invalid team plan event kind: {kind}"));
-        }
-        let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
         let changed = tx.execute(
             "UPDATE sessions
              SET team_plan = ?1,
@@ -97,12 +184,119 @@ impl Store {
         {
             object.insert("runtime_snapshot".into(), snapshot);
         }
-        let event = insert_event_tx(&tx, session_id, kind, payload)?;
+        insert_event_tx(tx, session_id, kind, payload)
+    }
+
+    /// Persist a plan revision, its optional runtime snapshot, and the plan
+    /// lifecycle event atomically. The snapshot is stored on the session row
+    /// and embedded in the event payload.
+    ///
+    /// When the payload declares its new `revision`, the write is a
+    /// compare-and-set against the transaction-local revision count so two
+    /// concurrent writers cannot both record the same revision number. A
+    /// payload without revision metadata keeps the legacy unchecked write for
+    /// fixture/import compatibility; every production fan-out/revision caller
+    /// supplies a revision.
+    pub fn set_team_plan_revision_with_runtime_snapshot_and_event(
+        &self,
+        session_id: &str,
+        plan: &str,
+        kind: &str,
+        payload: serde_json::Value,
+        runtime_snapshot_json: Option<&str>,
+    ) -> Result<Event> {
+        if !matches!(kind, "team_plan.submitted" | "team_plan.revised") {
+            return Err(anyhow!("invalid team plan event kind: {kind}"));
+        }
+        let Some(new_revision) = payload.get("revision").and_then(serde_json::Value::as_u64) else {
+            return self.write_team_plan_revision_unchecked(
+                session_id,
+                plan,
+                kind,
+                payload,
+                runtime_snapshot_json,
+            );
+        };
+        let expected = new_revision.saturating_sub(1).min(u64::from(u32::MAX)) as u32;
+        match self.compare_and_set_team_plan_revision_with_runtime_snapshot_and_event(
+            session_id,
+            plan,
+            kind,
+            payload,
+            runtime_snapshot_json,
+            expected,
+        )? {
+            Some(event) => Ok(event),
+            None => {
+                let latest = self.plan_revision_count(session_id)?;
+                Err(anyhow!(
+                    "PLAN_REVISION_CONFLICT: plan revision conflict: revision {new_revision} is stale; current revision is {latest}"
+                ))
+            }
+        }
+    }
+
+    /// Compare-and-set revision write. Reads the plan revision count inside a
+    /// `BEGIN IMMEDIATE` transaction and applies the plan only when it still
+    /// equals `expected_revision`. `Ok(None)` means a newer revision won; the
+    /// stored plan and event log are left untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compare_and_set_team_plan_revision_with_runtime_snapshot_and_event(
+        &self,
+        session_id: &str,
+        plan: &str,
+        kind: &str,
+        payload: serde_json::Value,
+        runtime_snapshot_json: Option<&str>,
+        expected_revision: u32,
+    ) -> Result<Option<Event>> {
+        if !matches!(kind, "team_plan.submitted" | "team_plan.revised") {
+            return Err(anyhow!("invalid team plan event kind: {kind}"));
+        }
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if Self::plan_revision_count_tx(&tx, session_id)? != expected_revision {
+            // Dropping the transaction rolls back without changing the plan.
+            return Ok(None);
+        }
+        let event = Self::insert_team_plan_revision_tx(
+            &tx,
+            session_id,
+            plan,
+            kind,
+            payload,
+            runtime_snapshot_json,
+        )?;
         tx.commit()?;
         if let Err(error) = self.append_event_mirror(&event) {
             tracing::warn!(%error, "failed to append event mirror");
         }
-        Ok(event)
+        Ok(Some(event))
+    }
+
+    /// Full plan lifecycle history (`team_plan.submitted|revised`) in sequence
+    /// order. Revision numbering and history must not depend on the bounded
+    /// recent-event window.
+    pub fn plan_lifecycle_events(&self, session_id: &str) -> Result<Vec<Event>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT session_id, seq, type, payload, created_at
+             FROM events
+             WHERE session_id = ?1
+               AND type IN ('team_plan.submitted', 'team_plan.revised')
+             ORDER BY seq ASC",
+        )?;
+        let rows = statement.query_map(params![session_id], |row| {
+            let payload: String = row.get(3)?;
+            Ok(Event {
+                session_id: row.get(0)?,
+                seq: row.get::<_, i64>(1)? as u64,
+                kind: row.get(2)?,
+                payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
+                created_at: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Update only the stored plan runtime snapshot and append `plan.migrated`.
@@ -295,5 +489,187 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+    use tempfile::TempDir;
+
+    fn store_with_session() -> (TempDir, Store, Session) {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("plans"))
+            .unwrap();
+        let session = store.create_session(&project.id, "revision cas").unwrap();
+        (data, store, session)
+    }
+
+    #[test]
+    fn stale_revision_writer_cannot_overwrite_a_newer_plan() {
+        let (_data, store, session) = store_with_session();
+        store
+            .set_team_plan_with_runtime_snapshot_and_event(
+                &session.id,
+                r#"{"goal":"submitted"}"#,
+                None,
+            )
+            .unwrap();
+        let current = store.plan_revision_count(&session.id).unwrap();
+        assert_eq!(current, 1);
+
+        let applied = store
+            .compare_and_set_team_plan_revision_with_runtime_snapshot_and_event(
+                &session.id,
+                r#"{"goal":"revision two"}"#,
+                "team_plan.revised",
+                serde_json::json!({"revision": 2, "reason": "first writer"}),
+                None,
+                1,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(applied.kind, "team_plan.revised");
+        assert_eq!(store.plan_revision_count(&session.id).unwrap(), 2);
+
+        let stale = store
+            .compare_and_set_team_plan_revision_with_runtime_snapshot_and_event(
+                &session.id,
+                r#"{"goal":"stale writer"}"#,
+                "team_plan.revised",
+                serde_json::json!({"revision": 2, "reason": "stale writer"}),
+                None,
+                1,
+            )
+            .unwrap();
+        assert!(stale.is_none());
+        assert_eq!(
+            store.get_team_plan(&session.id).unwrap().as_deref(),
+            Some(r#"{"goal":"revision two"}"#)
+        );
+        assert_eq!(store.plan_revision_count(&session.id).unwrap(), 2);
+
+        // The payload-revision path used by fan-out has the same guard.
+        let error = store
+            .set_team_plan_revision_with_runtime_snapshot_and_event(
+                &session.id,
+                r#"{"goal":"fanout stale"}"#,
+                "team_plan.revised",
+                serde_json::json!({"revision": 2, "reason": "stale fanout"}),
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("PLAN_REVISION_CONFLICT"),
+            "{error}"
+        );
+        assert_eq!(
+            store.get_team_plan(&session.id).unwrap().as_deref(),
+            Some(r#"{"goal":"revision two"}"#)
+        );
+    }
+
+    #[test]
+    fn revision_metadata_without_a_submission_is_not_a_bootstrap_bypass() {
+        let (_data, store, session) = store_with_session();
+        let error = store
+            .set_team_plan_revision_with_runtime_snapshot_and_event(
+                &session.id,
+                r#"{"goal":"no baseline"}"#,
+                "team_plan.revised",
+                serde_json::json!({"revision": 2, "reason": "stale bootstrap"}),
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("PLAN_REVISION_CONFLICT"),
+            "{error}"
+        );
+        assert!(store.get_team_plan(&session.id).unwrap().is_none());
+        assert_eq!(store.plan_revision_count(&session.id).unwrap(), 0);
+    }
+
+    #[test]
+    fn concurrent_revision_writers_with_the_same_expected_revision_have_one_winner() {
+        let (_data, store, session) = store_with_session();
+        store
+            .set_team_plan_with_runtime_snapshot_and_event(
+                &session.id,
+                r#"{"goal":"submitted"}"#,
+                None,
+            )
+            .unwrap();
+        let store = Arc::new(store);
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for author in ["writer-a", "writer-b"] {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            let session_id = session.id.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .compare_and_set_team_plan_revision_with_runtime_snapshot_and_event(
+                        &session_id,
+                        &format!(r#"{{"goal":"{author}"}}"#),
+                        "team_plan.revised",
+                        serde_json::json!({"revision": 2, "reason": author}),
+                        None,
+                        1,
+                    )
+                    .unwrap()
+            }));
+        }
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|event| event.is_some()).count(), 1);
+        assert_eq!(store.plan_revision_count(&session.id).unwrap(), 2);
+        let events = store.plan_lifecycle_events(&session.id).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].kind, "team_plan.revised");
+        assert_eq!(events[1].payload["revision"], 2);
+    }
+
+    #[test]
+    fn plan_lifecycle_history_is_not_limited_by_the_recent_event_window() {
+        let (_data, store, session) = store_with_session();
+        store
+            .set_team_plan_with_runtime_snapshot_and_event(
+                &session.id,
+                r#"{"goal":"submitted"}"#,
+                None,
+            )
+            .unwrap();
+        for index in 0..2_100 {
+            store
+                .append_event(
+                    &session.id,
+                    "tool.finished",
+                    serde_json::json!({"index": index}),
+                )
+                .unwrap();
+        }
+        store
+            .compare_and_set_team_plan_revision_with_runtime_snapshot_and_event(
+                &session.id,
+                r#"{"goal":"revision two"}"#,
+                "team_plan.revised",
+                serde_json::json!({"revision": 2}),
+                None,
+                1,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.plan_revision_count(&session.id).unwrap(), 2);
+        let events = store.plan_lifecycle_events(&session.id).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, "team_plan.submitted");
+        assert_eq!(events[1].payload["revision"], 2);
     }
 }

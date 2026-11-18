@@ -218,6 +218,8 @@ fn comparison_refuses_mismatched_pricing_and_can_label_override() {
     let left = report();
     let mut right = report();
     right.pricing = CacheBenchPricing::caller(Pricing::new(9.0, 9.0, 9.0, 9.0));
+    right.pricing.source = PricingSource::IllustrativeDefault;
+    right.pricing.field_sources = Some(CacheBenchPriceFieldSources::default());
     let error = compare_cache_bench_reports(&left, &right, false).unwrap_err();
     assert!(error.to_string().contains("pricing"));
     let comparison = compare_cache_bench_reports(&left, &right, true).unwrap();
@@ -331,6 +333,35 @@ fn report_decodes_legacy_payload_without_l5_fields() {
     // A legacy report still validates structurally; acceptance is recomputed
     // explicitly by the caller, never inferred from a missing field.
     legacy.validate().unwrap_err();
+}
+
+#[test]
+fn new_control_and_provenance_fields_are_additive() {
+    let dir = TempDir::new().unwrap();
+    let report = report();
+    let mut value = serde_json::to_value(&report).unwrap();
+    value.as_object_mut().unwrap().remove("scenario_kind");
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("prefix_break_injected");
+    value["acceptance"]
+        .as_object_mut()
+        .unwrap()
+        .remove("control");
+    value["pricing"]
+        .as_object_mut()
+        .unwrap()
+        .remove("field_sources");
+    let path = dir.path().join("legacy-additive.json");
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let loaded = load_cache_bench_report(&path).unwrap();
+    assert!(!loaded.acceptance.control);
+    assert!(!loaded.prefix_break_injected);
+    assert_eq!(
+        loaded.pricing.effective_field_sources().input,
+        PricingSource::IllustrativeDefault
+    );
 }
 
 #[test]
@@ -518,6 +549,272 @@ async fn verify_command_gates_floor_provider_and_controls() {
     )
     .await;
     assert!(invalid.is_err());
+}
+
+#[test]
+fn prefix_break_without_initial_context_is_rejected() {
+    let error = run_simulated_benchmark(
+        CacheBenchScenarioConfig {
+            kind: CacheBenchScenarioKind::PrefixBreakControl,
+            initial_context_tokens: 0,
+            ..CacheBenchScenarioConfig::default()
+        },
+        CacheBenchPricing::illustrative_default(),
+    )
+    .expect_err("a zero-token prefix-break control would prove nothing");
+    assert!(
+        error.to_string().contains("initial-context-tokens"),
+        "{error}"
+    );
+}
+
+#[test]
+fn prefix_break_control_without_an_injected_break_is_invalid() {
+    let warm = report();
+    let mut unbroken = warm.clone();
+    unbroken.scenario = "prefix_break_control_50_turn".to_string();
+    unbroken.scenario_kind = CacheBenchScenarioKind::PrefixBreakControl;
+    unbroken.prefix_break_injected = false;
+    unbroken.aggregate.prefix_breaks = 0;
+    let acceptance = unbroken.compute_acceptance();
+    assert_eq!(acceptance.verdict, "prefix_break_control_invalid");
+    assert!(acceptance.control);
+    assert!(!unbroken.live_target_met());
+}
+
+#[tokio::test]
+async fn target_gate_accepts_a_warm_reported_simulator_result() {
+    let code = execute(
+        CacheBenchCommand::Run(CacheBenchRunArgs {
+            turns: 50,
+            stable_prefix_tokens: 180_000,
+            initial_context_tokens: 20_000,
+            require_target: true,
+            ..CacheBenchRunArgs::default()
+        }),
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, 0);
+}
+
+#[tokio::test]
+async fn target_gate_rejects_unrealistic_reports_even_when_the_ratio_is_high() {
+    let code = execute(
+        CacheBenchCommand::Run(CacheBenchRunArgs {
+            turns: 50,
+            stable_prefix_tokens: 1_000,
+            initial_context_tokens: 1_000,
+            allow_unrealistic_scenario: true,
+            require_target: true,
+            ..CacheBenchRunArgs::default()
+        }),
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        code, 1,
+        "an unrealistic scenario cannot satisfy --require-target"
+    );
+}
+
+#[tokio::test]
+async fn target_gate_rejects_negative_controls() {
+    let code = execute(
+        CacheBenchCommand::Run(CacheBenchRunArgs {
+            require_target: true,
+            prefix_break: true,
+            turns: 50,
+            stable_prefix_tokens: 180_000,
+            initial_context_tokens: 20_000,
+            ..CacheBenchRunArgs::default()
+        }),
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        code, 1,
+        "a negative control cannot satisfy --require-target"
+    );
+}
+
+#[tokio::test]
+async fn verify_rejects_an_invalid_prefix_break_control_even_when_allowed() {
+    let dir = TempDir::new().unwrap();
+    let mut unbroken = report();
+    unbroken.scenario = "prefix_break_control_50_turn".to_string();
+    unbroken.scenario_kind = CacheBenchScenarioKind::PrefixBreakControl;
+    unbroken.prefix_break_injected = false;
+    unbroken.aggregate.prefix_breaks = 0;
+    let acceptance = unbroken.compute_acceptance();
+    unbroken.acceptance = acceptance;
+    let path = dir.path().join("invalid-control.json");
+    std::fs::write(&path, serde_json::to_vec(&unbroken).unwrap()).unwrap();
+    let code = execute(
+        CacheBenchCommand::Verify {
+            file: path,
+            min_hit_ratio: 0.0,
+            require_provider_reported: false,
+            allow_control: true,
+        },
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, 1);
+}
+
+#[test]
+fn target_gate_rejects_provider_estimated_live_reports() {
+    let mut live = report();
+    live.mode = CacheBenchMode::Live;
+    live.provider = "openai-compatible".to_string();
+    live.deterministic = false;
+    live.live_gate = Some(LiveGate {
+        allow_live: true,
+        key_source: "test".to_string(),
+        base_url: "http://127.0.0.1:1".to_string(),
+        model: "fake".to_string(),
+        extra_env_gate: None,
+    });
+    live.calls[1].estimated_usage = true;
+    assert!(!live.live_target_met());
+    live.calls[1].estimated_usage = false;
+    assert!(live.live_target_met());
+}
+
+#[tokio::test]
+async fn verify_rejects_tampered_provider_reported_acceptance() {
+    let dir = TempDir::new().unwrap();
+    let report = report();
+    let path = dir.path().join("tampered-provider.json");
+    let mut value = serde_json::to_value(&report).unwrap();
+    value["acceptance"]["provider_reported"] = serde_json::json!(true);
+    value["acceptance"]["measurement"] = serde_json::json!("provider_reported");
+    value["acceptance"]["verdict"] = serde_json::json!("pass");
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let error = execute(
+        CacheBenchCommand::Verify {
+            file: path,
+            min_hit_ratio: 0.995,
+            require_provider_reported: true,
+            allow_control: false,
+        },
+        true,
+    )
+    .await
+    .expect_err("tampered acceptance metadata must fail closed");
+    let message = format!("{error:#}");
+    assert!(message.contains("validation"), "{message}");
+    assert!(
+        message.contains("acceptance"),
+        "error must explain the tampered acceptance: {message}"
+    );
+}
+
+#[tokio::test]
+async fn verify_rejects_a_tampered_scenario_shape_verdict() {
+    let dir = TempDir::new().unwrap();
+    let unrealistic = run_simulated_benchmark(
+        CacheBenchScenarioConfig {
+            stable_prefix_tokens: 1_000,
+            initial_context_tokens: 1_000,
+            allow_unrealistic: true,
+            ..CacheBenchScenarioConfig::default()
+        },
+        CacheBenchPricing::illustrative_default(),
+    )
+    .unwrap();
+    let path = dir.path().join("tampered-shape.json");
+    let mut value = serde_json::to_value(&unrealistic).unwrap();
+    value["scenario_size"]["passed"] = serde_json::json!(true);
+    value["acceptance"]["scenario_shape_valid"] = serde_json::json!(true);
+    value["acceptance"]["verdict"] = serde_json::json!("pass");
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let error = execute(
+        CacheBenchCommand::Verify {
+            file: path,
+            min_hit_ratio: 0.995,
+            require_provider_reported: false,
+            allow_control: false,
+        },
+        true,
+    )
+    .await
+    .expect_err("a tampered shape verdict must fail closed");
+    assert!(error.to_string().contains("validation"), "{error:#}");
+}
+
+#[test]
+fn partial_cache_bench_prices_are_not_labeled_caller() {
+    let args = CacheBenchRunArgs {
+        input_price: Some(1.0),
+        ..CacheBenchRunArgs::default()
+    };
+    let pricing = args.pricing().unwrap();
+    assert_eq!(pricing.source, PricingSource::PartialCaller);
+    let fields = pricing.effective_field_sources();
+    assert_eq!(fields.input, PricingSource::Caller);
+    assert_eq!(fields.output, PricingSource::IllustrativeDefault);
+    assert_eq!(fields.cache_read, PricingSource::IllustrativeDefault);
+    assert_eq!(fields.cache_write, PricingSource::IllustrativeDefault);
+    assert!(pricing.validate().is_ok());
+
+    let none = CacheBenchRunArgs::default().pricing().unwrap();
+    assert_eq!(none.source, PricingSource::IllustrativeDefault);
+    let all = CacheBenchRunArgs {
+        input_price: Some(1.0),
+        output_price: Some(2.0),
+        cache_read_price: Some(0.1),
+        cache_write_price: Some(0.2),
+        ..CacheBenchRunArgs::default()
+    }
+    .pricing()
+    .unwrap();
+    assert_eq!(all.source, PricingSource::Caller);
+}
+
+#[test]
+fn comparison_refuses_different_live_endpoints_and_measurements() {
+    let warm = report();
+    let mut left = warm.clone();
+    left.mode = CacheBenchMode::Live;
+    left.provider = "openai-compatible".to_string();
+    left.deterministic = false;
+    left.live_gate = Some(LiveGate {
+        allow_live: true,
+        key_source: "test".to_string(),
+        base_url: "https://a.example/v1".to_string(),
+        model: "fake".to_string(),
+        extra_env_gate: None,
+    });
+    let mut right = left.clone();
+    right.live_gate.as_mut().unwrap().base_url = "https://b.example/v1".to_string();
+    let error = compare_cache_bench_reports(&left, &right, false).unwrap_err();
+    assert!(error.to_string().contains("live_base_url"), "{error}");
+
+    let mut estimated = left.clone();
+    estimated.calls[1].estimated_usage = true;
+    let error = compare_cache_bench_reports(&left, &estimated, false).unwrap_err();
+    assert!(error.to_string().contains("measurement"), "{error}");
+}
+
+#[test]
+fn comparison_refuses_different_pricing_sources_with_identical_values() {
+    let left = report();
+    let mut right = left.clone();
+    right.pricing.source = PricingSource::Caller;
+    right.pricing.field_sources = Some(CacheBenchPriceFieldSources {
+        input: PricingSource::Caller,
+        output: PricingSource::Caller,
+        cache_read: PricingSource::Caller,
+        cache_write: PricingSource::Caller,
+    });
+    let error = compare_cache_bench_reports(&left, &right, false).unwrap_err();
+    assert!(error.to_string().contains("pricing_source"), "{error}");
 }
 
 #[test]

@@ -331,6 +331,7 @@ pub(super) async fn dispatch(
         }
         Command::MemoryPolicySet {
             project,
+            enable,
             disable,
             max_items,
             max_age_days,
@@ -374,13 +375,6 @@ pub(super) async fn dispatch(
             {
                 bail!("--embedding-clear cannot be combined with other embedding flags");
             }
-            let (max_items, max_age_days) = if clear {
-                (None, None)
-            } else if max_items.is_none() && max_age_days.is_none() {
-                (Some(1000), Some(180))
-            } else {
-                (max_items, max_age_days)
-            };
             // Preserve v2 lifecycle settings that this command does not edit.
             let current = rpc(
                 &discovery,
@@ -388,7 +382,12 @@ pub(super) async fn dispatch(
                 json!({"project_id": project}),
             )
             .await?;
-            let policy = current.get("policy").cloned().unwrap_or_default();
+            let policy = current
+                .get("policy")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("memory policy get returned no policy"))?;
+            let (enabled, max_items, max_age_days) =
+                resolve_memory_retention(&policy, enable, disable, clear, max_items, max_age_days)?;
             let current_embedding = policy.get("embedding").cloned().unwrap_or(Value::Null);
             let embedding_flags = embedding_enable
                 || embedding_disable
@@ -501,7 +500,7 @@ pub(super) async fn dispatch(
                 json!({
                     "project_id": project,
                     "policy": {
-                        "enabled": !clear && !disable,
+                        "enabled": enabled,
                         "max_items": max_items,
                         "max_age_days": max_age_days,
                         "task_result_verify_days": policy.get("task_result_verify_days").cloned().unwrap_or(json!(90)),

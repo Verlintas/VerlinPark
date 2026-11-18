@@ -2293,6 +2293,7 @@ mod process_command_tests {
                         process,
                         signal,
                         grace_secs,
+                        ..
                     } => {
                         assert_eq!(session, "ses-1");
                         assert_eq!(process, "psup_1");
@@ -3144,7 +3145,9 @@ mod remote_integration_cli_tests {
                     Cli::try_parse_from(["vp", "preempt", "ses-1", "--reason", "rotate the run"])
                         .unwrap();
                 match cli.command {
-                    Command::Preempt { session, reason } => {
+                    Command::Preempt {
+                        session, reason, ..
+                    } => {
                         assert_eq!(session, "ses-1");
                         assert_eq!(reason.as_deref(), Some("rotate the run"));
                     }
@@ -7590,5 +7593,558 @@ mod progress_a2a_cli_tests {
             Command::A2aStop { reason } => assert_eq!(reason.as_deref(), Some("done")),
             other => panic!("expected a2a-stop, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod cli_reliability_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        let args = args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(args).unwrap())
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    #[test]
+    fn cache_warm_normalizes_across_global_flags() {
+        let normalized = normalize_cache_warm_args(vec![
+            "vp".into(),
+            "--json".into(),
+            "--data-dir".into(),
+            "/tmp/vp-data".into(),
+            "cache".into(),
+            "warm".into(),
+            "ses-1".into(),
+        ]);
+        assert_eq!(
+            normalized,
+            vec![
+                "vp",
+                "--json",
+                "--data-dir",
+                "/tmp/vp-data",
+                "cache-warm",
+                "ses-1"
+            ]
+        );
+        let cli = {
+            let normalized = normalize_cache_warm_args(vec![
+                "vp".into(),
+                "--json".into(),
+                "--data-dir".into(),
+                "/tmp/vp-data".into(),
+                "cache".into(),
+                "warm".into(),
+                "ses-1".into(),
+                "--role".into(),
+                "worker".into(),
+            ]);
+            std::thread::Builder::new()
+                .stack_size(32 * 1024 * 1024)
+                .spawn(move || Cli::try_parse_from(normalized).unwrap())
+                .unwrap()
+                .join()
+                .unwrap()
+        };
+        match cli.command {
+            Command::CacheWarm { session, role } => {
+                assert_eq!(session, "ses-1");
+                assert_eq!(role.as_deref(), Some("worker"));
+            }
+            other => panic!("expected cache-warm, got {other:?}"),
+        }
+
+        let normalized = normalize_cache_warm_args(vec![
+            "vp".into(),
+            "cache".into(),
+            "--json".into(),
+            "warm".into(),
+            "ses-1".into(),
+        ]);
+        assert_eq!(normalized, vec!["vp", "cache-warm", "--json", "ses-1"]);
+
+        // The historical `cache <session>` status command is unchanged.
+        let normalized =
+            normalize_cache_warm_args(vec!["vp".into(), "cache".into(), "ses-1".into()]);
+        assert_eq!(normalized, vec!["vp", "cache", "ses-1"]);
+    }
+
+    #[test]
+    fn dash_file_reads_stdin_instead_of_a_literal_file() {
+        let stdin = b"{\"items\":[1]}\n".to_vec();
+        let mut reader = std::io::Cursor::new(stdin);
+        let text = read_json_input_from(Some(std::path::Path::new("-")), &mut reader).unwrap();
+        assert_eq!(text, "{\"items\":[1]}\n");
+
+        let mut reader = std::io::Cursor::new(b"[]".to_vec());
+        assert_eq!(read_json_input_from(None, &mut reader).unwrap(), "[]");
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("items.json");
+        std::fs::write(&file, "[{\"write_scope\":[\"src/a\"]}]").unwrap();
+        let mut reader = std::io::Cursor::new(Vec::new());
+        assert_eq!(
+            read_json_input_from(Some(&file), &mut reader).unwrap(),
+            "[{\"write_scope\":[\"src/a\"]}]"
+        );
+    }
+
+    #[test]
+    fn shell_policy_merge_preserves_unspecified_security_fields() {
+        let current = json!({
+            "network": "deny",
+            "read_deny": ["/Users/apple/.ssh"],
+            "restrict_home": true,
+            "read_jail": true,
+        });
+        let merged = merge_shell_policy(
+            current.clone(),
+            None,
+            vec![],
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(merged["network"], "deny");
+        assert_eq!(merged["read_deny"], json!(["/Users/apple/.ssh"]));
+        assert_eq!(merged["restrict_home"], true);
+        assert_eq!(merged["read_jail"], true);
+
+        let merged = merge_shell_policy(
+            current.clone(),
+            None,
+            vec!["/Users/apple/.aws".into()],
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            merged["read_deny"],
+            json!(["/Users/apple/.ssh", "/Users/apple/.aws"])
+        );
+
+        let merged = merge_shell_policy(
+            current.clone(),
+            Some("deny".into()),
+            vec![],
+            false,
+            true,
+            true,
+            false,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(merged["read_deny"], json!([]));
+        assert_eq!(merged["network"], "deny");
+
+        assert!(
+            merge_shell_policy(
+                current.clone(),
+                None,
+                vec![],
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+            )
+            .is_err(),
+            "a no-flag update must fail instead of widening"
+        );
+        assert!(
+            merge_shell_policy(
+                current,
+                None,
+                vec![],
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn approval_template_enabled_state_is_preserved() {
+        assert!(!resolve_template_enabled(false, true, None).unwrap());
+        assert!(resolve_template_enabled(false, false, None).unwrap());
+        assert!(!resolve_template_enabled(false, false, Some(false)).unwrap());
+        assert!(!resolve_template_enabled(false, true, Some(true)).unwrap());
+        assert!(resolve_template_enabled(true, false, Some(false)).unwrap());
+        assert!(
+            resolve_template_enabled(true, true, Some(false)).is_err(),
+            "contradictory explicit flags fail closed"
+        );
+
+        let args = [
+            "vp",
+            "approval-template-set",
+            "--name",
+            "x",
+            "--tool-pattern",
+            "write_file",
+            "--action",
+            "allow",
+            "--enabled",
+            "--disabled",
+        ];
+        let args = args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        let error = std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(args).unwrap_err().to_string())
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(error.contains("cannot be used with"));
+    }
+
+    #[test]
+    fn optional_switches_are_tri_state() {
+        assert_eq!(
+            resolve_optional_switch(false, false, "--enabled", "--disabled").unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_optional_switch(true, false, "--enabled", "--disabled").unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            resolve_optional_switch(false, true, "--enabled", "--disabled").unwrap(),
+            Some(false)
+        );
+        assert!(resolve_optional_switch(true, true, "--enabled", "--disabled").is_err());
+    }
+
+    #[test]
+    fn memory_retention_preserves_embedding_only_updates() {
+        let current = json!({
+            "enabled": false,
+            "max_items": 50,
+            "max_age_days": 30,
+            "sweep_stale": true,
+        });
+        let (enabled, max_items, max_age_days) =
+            resolve_memory_retention(&current, false, false, false, None, None).unwrap();
+        assert!(!enabled);
+        assert_eq!(max_items, Some(50));
+        assert_eq!(max_age_days, Some(30));
+
+        let (enabled, max_items, max_age_days) =
+            resolve_memory_retention(&current, false, false, false, Some(80), None).unwrap();
+        assert!(!enabled);
+        assert_eq!(max_items, Some(80));
+        assert_eq!(max_age_days, Some(30));
+
+        let (enabled, max_items, max_age_days) =
+            resolve_memory_retention(&current, true, false, false, None, None).unwrap();
+        assert!(enabled);
+        assert_eq!(max_items, Some(50));
+        assert_eq!(max_age_days, Some(30));
+
+        let (enabled, max_items, max_age_days) =
+            resolve_memory_retention(&current, false, true, false, None, None).unwrap();
+        assert!(!enabled);
+        assert_eq!(max_items, Some(50));
+        assert_eq!(max_age_days, Some(30));
+
+        let (enabled, max_items, max_age_days) =
+            resolve_memory_retention(&current, false, false, true, None, None).unwrap();
+        assert!(!enabled);
+        assert_eq!(max_items, None);
+        assert_eq!(max_age_days, None);
+
+        assert!(resolve_memory_retention(&current, true, true, false, None, None).is_err());
+        assert!(resolve_memory_retention(&current, false, false, true, Some(10), None).is_err());
+    }
+
+    #[test]
+    fn model_preset_update_preserves_unspecified_fields() {
+        let current = json!({
+            "id": "preset-1",
+            "name": "fast",
+            "provider": "openai-compatible",
+            "model": "deepseek-flash",
+            "context_window": 128000,
+            "input_usd_per_million": 0.27,
+            "output_usd_per_million": 1.1,
+            "notes": "keep me",
+            "created_at": "2026-01-01T00:00:00Z",
+        });
+        let merged = merge_model_preset(
+            current.clone(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(merged["name"], "fast");
+        assert_eq!(merged["model"], "deepseek-flash");
+        assert_eq!(merged["context_window"], 128000);
+        assert_eq!(merged["input_usd_per_million"], 0.27);
+        assert_eq!(merged["notes"], "keep me");
+
+        let merged = merge_model_preset(
+            current.clone(),
+            Some("renamed".into()),
+            None,
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+            false,
+            Some("new notes".into()),
+        )
+        .unwrap();
+        assert_eq!(merged["name"], "renamed");
+        assert_eq!(merged["context_window"], 128000);
+        assert_eq!(merged["notes"], "new notes");
+
+        let merged = merge_model_preset(
+            current, None, None, None, None, true, None, true, None, true, None,
+        )
+        .unwrap();
+        assert_eq!(merged["context_window"], Value::Null);
+        assert_eq!(merged["input_usd_per_million"], Value::Null);
+        assert_eq!(merged["output_usd_per_million"], Value::Null);
+    }
+
+    #[test]
+    fn removal_renderers_are_command_scoped() {
+        assert_eq!(
+            removal_line(Some("runtime.leases.sweep"), &json!({"removed": 3})).as_deref(),
+            Some("Removed 3 expired runtime lease(s).")
+        );
+        assert_eq!(
+            removal_line(Some("mcp.server.remove"), &json!({"removed": true})).as_deref(),
+            Some("MCP server removed=true")
+        );
+        assert_eq!(
+            removal_line(Some("acp.agent.remove"), &json!({"removed": true})).as_deref(),
+            Some("ACP agent removed=true")
+        );
+        assert_eq!(
+            removal_line(Some("host.remove"), &json!({"removed": false})).as_deref(),
+            Some("execution host removed=false")
+        );
+        assert_eq!(
+            removal_line(Some("model.preset.delete"), &json!({"removed": true})).as_deref(),
+            Some("model preset removed=true")
+        );
+        assert_eq!(
+            removal_line(Some("mailbox.gc"), &json!({"removed": 2})).as_deref(),
+            Some("mailbox GC removed 2 message(s)")
+        );
+        assert_eq!(
+            removal_line(
+                Some("artifact.gc"),
+                &json!({"removed": 1, "bytes_freed": 42})
+            )
+            .as_deref(),
+            Some("artifact GC removed 1 artifact(s), freed 42 bytes")
+        );
+        assert_eq!(
+            removal_line(
+                Some("memory.prune"),
+                &json!({"candidates": 2, "removed": 1, "dry_run": false})
+            )
+            .as_deref(),
+            Some("memory prune: candidates=2 removed=1 dry_run=false")
+        );
+        assert!(removal_line(None, &json!({"removed": 3})).is_none());
+        assert!(removal_line(Some("mcp.server.remove"), &json!({"removed": 3})).is_none());
+    }
+
+    #[test]
+    fn human_render_hints_cover_ambiguous_removal_commands() {
+        let cases: &[(&[&str], &str)] = &[
+            (&["vp", "mcp-remove", "mcp-1"], "mcp.server.remove"),
+            (&["vp", "acp-remove", "acp-1"], "acp.agent.remove"),
+            (&["vp", "host-remove", "prj-1"], "host.remove"),
+            (
+                &["vp", "model-preset-delete", "preset-1"],
+                "model.preset.delete",
+            ),
+            (&["vp", "mailbox-gc", "prj-1"], "mailbox.gc"),
+            (&["vp", "gc", "prj-1"], "artifact.gc"),
+            (&["vp", "memory-delete", "mem-1"], "memory.delete"),
+            (&["vp", "memory-prune", "prj-1"], "memory.prune"),
+            (&["vp", "leases-sweep"], "runtime.leases.sweep"),
+        ];
+        for (args, expected) in cases {
+            let cli = parse(args);
+            assert_eq!(human_hint(&cli.command), Some(*expected), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn destructive_commands_parse_the_yes_flag() {
+        let cli = parse(&["vp", "discard", "ses-1", "--yes"]);
+        assert!(matches!(cli.command, Command::Discard { yes: true, .. }));
+        let cli = parse(&["vp", "checkpoint-restore", "ses-1", "cp-1", "--yes"]);
+        assert!(matches!(
+            cli.command,
+            Command::CheckpointRestore { yes: true, .. }
+        ));
+        let cli = parse(&["vp", "restore-log", "ses-1", "--yes"]);
+        assert!(matches!(cli.command, Command::RestoreLog { yes: true, .. }));
+        let cli = parse(&["vp", "process-stop", "ses-1", "psup-1", "--yes"]);
+        assert!(matches!(
+            cli.command,
+            Command::ProcessStop { yes: true, .. }
+        ));
+        let cli = parse(&["vp", "preempt", "ses-1", "--yes"]);
+        assert!(matches!(cli.command, Command::Preempt { yes: true, .. }));
+
+        let cli = parse(&["vp", "preempt", "ses-1"]);
+        assert!(matches!(cli.command, Command::Preempt { yes: false, .. }));
+    }
+
+    #[test]
+    fn noninteractive_confirmation_fails_closed() {
+        let mut empty = std::io::Cursor::new(Vec::new());
+        assert!(!confirm_action_with("Proceed?", &mut empty).unwrap());
+        let mut no = std::io::Cursor::new(b"n\n".to_vec());
+        assert!(!confirm_action_with("Proceed?", &mut no).unwrap());
+        let mut blank = std::io::Cursor::new(b"\n".to_vec());
+        assert!(!confirm_action_with("Proceed?", &mut blank).unwrap());
+        let mut yes = std::io::Cursor::new(b"yes\n".to_vec());
+        assert!(confirm_action_with("Proceed?", &mut yes).unwrap());
+        let mut upper = std::io::Cursor::new(b"Y\n".to_vec());
+        assert!(confirm_action_with("Proceed?", &mut upper).unwrap());
+    }
+
+    #[test]
+    fn a2a_enable_and_disable_conflict_is_rejected() {
+        let args = ["vp", "a2a-policy-set", "--enable", "--disable"];
+        let args = args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        let error = std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(args).unwrap_err().to_string())
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(error.contains("cannot be used with"));
+    }
+
+    #[test]
+    fn evidence_references_keep_url_colons() {
+        let evidence = parse_memory_evidence("source:https://example.com/x").unwrap();
+        assert_eq!(evidence["kind"], "source");
+        assert_eq!(evidence["reference"], "https://example.com/x");
+        assert!(evidence.get("note").is_none());
+
+        let evidence =
+            parse_memory_evidence(r#"{"kind":"task","reference":"T1","note":"reviewed"}"#).unwrap();
+        assert_eq!(evidence["kind"], "task");
+        assert_eq!(evidence["reference"], "T1");
+        assert_eq!(evidence["note"], "reviewed");
+
+        let evidence = parse_memory_evidence("task:T1:reviewed").unwrap();
+        assert_eq!(evidence["reference"], "T1");
+        assert_eq!(evidence["note"], "reviewed");
+    }
+
+    #[test]
+    fn rpc_errors_preserve_machine_readable_codes() {
+        let error = CliRpcError::from_rpc(vp_protocol::rpc::RpcError::with_data(
+            -32602,
+            "budget exhausted",
+            json!({"code": "BUDGET_EXHAUSTED", "retryable": false}),
+        ));
+        let value = error.to_json();
+        assert_eq!(value["error"]["kind"], "rpc");
+        assert_eq!(value["error"]["code"], -32602);
+        assert_eq!(value["error"]["typed_code"], "BUDGET_EXHAUSTED");
+        assert_eq!(value["error"]["message"], "budget exhausted");
+        let rendered = error.to_string();
+        assert!(rendered.contains("budget exhausted"));
+        assert!(rendered.contains("(code -32602)"));
+        assert!(rendered.contains("[BUDGET_EXHAUSTED]"));
+    }
+
+    #[test]
+    fn streaming_exit_codes_are_errors() {
+        use crate::dispatch::streamed_exit_error;
+        assert!(streamed_exit_error("console", "exited", Some(0)).is_none());
+        assert_eq!(
+            streamed_exit_error("console", "failed", Some(7)).as_deref(),
+            Some("console command exited with code 7")
+        );
+        assert_eq!(
+            streamed_exit_error("terminal", "exited", None).as_deref(),
+            Some("terminal command ended with status exited and no exit code")
+        );
+        assert!(streamed_exit_error("terminal", "running", None).is_some());
+    }
+
+    #[test]
+    fn rpc_timeout_configuration_rejects_zero() {
+        assert!(configure_timeouts(0, 10).is_err());
+        assert!(configure_timeouts(60, 0).is_err());
+        assert!(configure_timeouts(3601, 10).is_err());
+    }
+
+    #[test]
+    fn rpc_request_timeout_bounds_a_stalled_daemon() {
+        use std::time::{Duration, Instant};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((_stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        });
+        configure_timeouts(1, 1).unwrap();
+        let discovery = vp_protocol::discovery::Discovery {
+            pid: 1,
+            port,
+            token: "test-token".into(),
+            protocol: 1,
+            version: "test".into(),
+            started_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let started = Instant::now();
+        let error = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(rpc(&discovery, "ping", json!({})))
+            .unwrap_err();
+        configure_timeouts(300, 10).unwrap();
+        let typed = error
+            .downcast_ref::<CliRpcError>()
+            .expect("stalled daemon must produce a typed RPC error");
+        assert_eq!(typed.kind, "timeout");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the bounded request timeout should fire promptly"
+        );
     }
 }

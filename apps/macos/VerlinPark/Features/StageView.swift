@@ -744,6 +744,7 @@ private struct ProjectStageView: View {
         let status = model.selectedSession?.status
         let running = status == "running" || status == "paused" || status == "queued"
         return textEmpty || model.isBusy || model.compactBusy || running
+            || model.connection != .connected
     }
 
     private var enabledSkills: [ProjectSkill] {
@@ -764,8 +765,14 @@ private struct ProjectStageView: View {
         let goal = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !goal.isEmpty else { return }
         if model.selectedSession != nil {
-            draft = ""
-            Task { await model.sendMessage(goal) }
+            // Keep the draft until the daemon accepts the prompt. A failed or
+            // offline send must not silently discard the user's text.
+            Task {
+                let sent = await model.sendMessage(goal)
+                if sent, draft == goal {
+                    draft = ""
+                }
+            }
         } else {
             Task {
                 if await model.createSession(goal: goal) {

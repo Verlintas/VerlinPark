@@ -619,6 +619,12 @@ pub(super) async fn integrate_worker(
     verifier_summary: &str,
     integration_command: Option<&str>,
 ) -> Result<String> {
+    if let Some(reason) = merge_cancel_reason(engine, &session.id, spec.task_id.as_deref()).await? {
+        return Err(anyhow!(
+            "{reason}; commit {} was not enqueued for integration",
+            truncate_to(commit, 12)
+        ));
+    }
     let worktree = spec.session_worktree.clone();
     let base_commit =
         tokio::task::spawn_blocking(move || worktree::head_commit(&worktree)).await??;
@@ -653,10 +659,138 @@ pub(super) async fn process_merge_entry(
             std::time::Duration::from_secs(900),
         )
         .await?;
-    let result =
-        process_merge_entry_fenced(engine, session, spec, entry, integration_command, &lease).await;
+    let result = Box::pin(process_merge_entry_fenced(
+        engine,
+        session,
+        spec,
+        entry,
+        integration_command,
+        &lease,
+    ))
+    .await;
     lease.release().await;
     result
+}
+
+/// A cancel observed at the integration boundary. Task cancellation is
+/// persisted by `task.cancel`; session cancellation is persisted by
+/// `session.run.cancel`. The in-memory `session.cancel` control is not visible
+/// here and remains a cooperative, turn-boundary signal.
+pub(super) async fn merge_cancel_reason(
+    engine: &Engine,
+    session_id: &str,
+    task_id: Option<&str>,
+) -> Result<Option<String>> {
+    if let Some(task_id) = task_id
+        && engine
+            .plan_task_cancel_requested(session_id, task_id)
+            .await?
+    {
+        return Ok(Some(format!(
+            "plan task {task_id} cancellation was requested by the operator"
+        )));
+    }
+    if crate::run_journal::session_run_cancel_requested(engine, session_id).await? {
+        return Ok(Some(
+            "session run cancellation was requested by the operator".to_string(),
+        ));
+    }
+    Ok(None)
+}
+
+const MERGE_STATUS_WRITE_ATTEMPTS: usize = 3;
+
+/// Best-effort terminal queue transition with a bounded retry. A transient
+/// SQLite/event failure must not leave a row `merging`/`checking` forever.
+async fn set_merge_entry_status(
+    engine: &Engine,
+    entry_id: &str,
+    status: &str,
+    detail: Option<String>,
+) -> Result<Option<MergeQueueEntry>> {
+    let mut last_error = None;
+    for attempt in 0..MERGE_STATUS_WRITE_ATTEMPTS {
+        match engine
+            .update_merge_queue_entry(entry_id, status, detail.clone())
+            .await
+        {
+            Ok(updated) => return Ok(updated),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt + 1 < MERGE_STATUS_WRITE_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(25 * (attempt as u64 + 1))).await;
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("merge queue status update failed")))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn emit_integrator_finished(
+    engine: &Engine,
+    session_id: &str,
+    spec: &AgentSpec,
+    entry_id: &str,
+    status: &str,
+    detail: &str,
+    reason: Option<&str>,
+    attempt: Option<u32>,
+) {
+    let mut payload = serde_json::json!({
+        "entry_id": entry_id,
+        "status": status,
+        "detail": detail,
+    });
+    if let Some(reason) = reason {
+        payload["reason"] = serde_json::json!(reason);
+    }
+    if let Some(attempt) = attempt {
+        payload["attempt"] = serde_json::json!(attempt);
+    }
+    if let Err(error) = emit(engine, session_id, spec, "integrator.finished", payload).await {
+        // Event emission is audit evidence, not the merge gate. Log it and
+        // keep the durable queue row authoritative.
+        tracing::warn!(%error, entry_id, "failed to emit integrator.finished");
+    }
+}
+
+/// Move a non-terminal queue row to `failed` and record a bounded reason. The
+/// status write is retried; if it still fails, the error is logged so the
+/// caller can return the original failure.
+async fn fail_merge_entry(
+    engine: &Engine,
+    session_id: &str,
+    spec: &AgentSpec,
+    entry_id: &str,
+    detail: &str,
+    reason: &str,
+) {
+    match set_merge_entry_status(engine, entry_id, "failed", Some(detail.to_string())).await {
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!(
+                %error,
+                entry_id,
+                "failed to mark merge queue entry failed; the row may need restart repair"
+            );
+        }
+    }
+    emit_integrator_finished(
+        engine,
+        session_id,
+        spec,
+        entry_id,
+        "failed",
+        detail,
+        Some(reason),
+        None,
+    )
+    .await;
+}
+
+async fn rollback_session_branch(worktree: PathBuf, base: String) -> Result<()> {
+    tokio::task::spawn_blocking(move || worktree::reset_hard(&worktree, &base)).await?
 }
 
 /// Merge and integration-check an existing queue entry under an already-held
@@ -681,23 +815,52 @@ pub(super) async fn process_merge_entry_fenced(
         .await
     {
         let detail = truncate(&format!("{error:#}"));
-        engine
-            .update_merge_queue_entry(&entry.id, "failed", Some(detail.clone()))
-            .await?;
-        emit(
+        fail_merge_entry(
             engine,
             &session.id,
             spec,
-            "integrator.finished",
-            serde_json::json!({
-                "entry_id": entry.id,
-                "status": "failed",
-                "detail": detail,
-                "reason": "effect_unsettled",
-            }),
+            &entry.id,
+            &detail,
+            "effect_unsettled",
         )
-        .await?;
+        .await;
         return Err(error);
+    }
+    // A task/session cancel may have arrived while the entry waited in the
+    // queue. Never enqueue/merge work the operator already cancelled.
+    match merge_cancel_reason(engine, &session.id, entry.task_id.as_deref()).await {
+        Ok(Some(reason)) => {
+            let detail = truncate(&format!(
+                "{reason}; commit {} was not merged",
+                truncate_to(&entry.commit, 12)
+            ));
+            fail_merge_entry(
+                engine,
+                &session.id,
+                spec,
+                &entry.id,
+                &detail,
+                "cancelled_before_merge",
+            )
+            .await;
+            return Err(anyhow!(detail));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let detail = truncate(&format!(
+                "could not check task/session cancellation before merge: {error}"
+            ));
+            fail_merge_entry(
+                engine,
+                &session.id,
+                spec,
+                &entry.id,
+                &detail,
+                "cancel_check_failed",
+            )
+            .await;
+            return Err(error);
+        }
     }
     let preflight_worktree = spec.session_worktree.clone();
     let git_lock = engine.git_mutex();
@@ -719,21 +882,15 @@ pub(super) async fn process_merge_entry_fenced(
         Ok(commit) => commit,
         Err(error) => {
             let detail = truncate(&format!("merge preflight failed: {error}"));
-            engine
-                .update_merge_queue_entry(&entry.id, "failed", Some(detail.clone()))
-                .await?;
-            emit(
+            fail_merge_entry(
                 engine,
                 &session.id,
                 spec,
-                "integrator.finished",
-                serde_json::json!({
-                    "entry_id": entry.id,
-                    "status": "failed",
-                    "detail": detail,
-                }),
+                &entry.id,
+                &detail,
+                "preflight_failed",
             )
-            .await?;
+            .await;
             return Err(anyhow!(detail));
         }
     };
@@ -741,28 +898,52 @@ pub(super) async fn process_merge_entry_fenced(
         let detail = truncate(&format!(
             "integration lease lost before merge: {error}; session branch was not changed"
         ));
-        engine
-            .update_merge_queue_entry(&entry.id, "failed", Some(detail.clone()))
-            .await?;
-        emit(
+        fail_merge_entry(
             engine,
             &session.id,
             spec,
-            "integrator.finished",
-            serde_json::json!({
-                "entry_id": entry.id,
-                "status": "failed",
-                "detail": detail,
-                "reason": "lease_lost_before_merge",
-            }),
+            &entry.id,
+            &detail,
+            "lease_lost_before_merge",
         )
-        .await?;
+        .await;
         return Err(anyhow!(detail));
     }
-    engine
-        .begin_merge_queue_entry(&entry.id, &preflight)
-        .await?;
-    emit(
+    match engine.begin_merge_queue_entry(&entry.id, &preflight).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let detail = truncate(&format!(
+                "merge queue entry {} is already terminal; refusing to merge it again",
+                entry.id
+            ));
+            emit_integrator_finished(
+                engine,
+                &session.id,
+                spec,
+                &entry.id,
+                "failed",
+                &detail,
+                Some("entry_already_terminal"),
+                Some(entry.attempt),
+            )
+            .await;
+            return Err(anyhow!(detail));
+        }
+        Err(error) => {
+            let detail = truncate(&format!("could not start merge: {error}"));
+            fail_merge_entry(
+                engine,
+                &session.id,
+                spec,
+                &entry.id,
+                &detail,
+                "begin_merge_failed",
+            )
+            .await;
+            return Err(error);
+        }
+    }
+    if let Err(error) = emit(
         engine,
         &session.id,
         spec,
@@ -776,7 +957,12 @@ pub(super) async fn process_merge_entry_fenced(
             "has_command": integration_command.is_some(),
         }),
     )
-    .await?;
+    .await
+    {
+        // The queue row is authoritative; a failed audit append must not leave
+        // it `merging`.
+        tracing::warn!(%error, entry_id = %entry.id, "failed to emit integrator.started");
+    }
 
     let merge_worktree = spec.session_worktree.clone();
     let merge_commit = entry.commit.clone();
@@ -804,10 +990,10 @@ pub(super) async fn process_merge_entry_fenced(
         worktree::merge_commit(&merge_worktree, &merge_commit, &message)?;
         Ok(actual_base)
     })
-    .await?;
+    .await;
     let actual_base = match merge_result {
-        Ok(base) => base,
-        Err(error) => {
+        Ok(Ok(base)) => base,
+        Ok(Err(error)) => {
             let message = format!("{error:#}");
             let conflict = message.to_lowercase().contains("conflict")
                 || message.contains("Automatic merge failed");
@@ -817,21 +1003,46 @@ pub(super) async fn process_merge_entry_fenced(
             } else {
                 format!("merge failed: {message}")
             });
-            engine
-                .update_merge_queue_entry(&entry.id, status, Some(detail.clone()))
-                .await?;
-            emit(
+            // A merge that did not produce a commit leaves the branch at the
+            // pre-merge base; a failed or conflicting row is terminal.
+            let _ = set_merge_entry_status(engine, &entry.id, status, Some(detail.clone())).await;
+            emit_integrator_finished(
                 engine,
                 &session.id,
                 spec,
-                "integrator.finished",
-                serde_json::json!({
-                    "entry_id": entry.id,
-                    "status": status,
-                    "detail": detail,
-                }),
+                &entry.id,
+                status,
+                &detail,
+                Some("merge_failed"),
+                Some(entry.attempt),
             )
-            .await?;
+            .await;
+            return Err(anyhow!(detail));
+        }
+        Err(error) => {
+            // The blocking merge task panicked or was cancelled. The branch
+            // state is unknown, so roll back to the exact pre-merge commit and
+            // fail the entry. Never leave it `merging`.
+            let detail =
+                match rollback_session_branch(spec.session_worktree.clone(), preflight.clone())
+                    .await
+                {
+                    Ok(()) => truncate(&format!(
+                        "merge worker failed: {error}; rolled back to {preflight}"
+                    )),
+                    Err(reset_error) => truncate(&format!(
+                        "merge worker failed: {error}; rollback failed: {reset_error}"
+                    )),
+                };
+            fail_merge_entry(
+                engine,
+                &session.id,
+                spec,
+                &entry.id,
+                &detail,
+                "merge_worker_failed",
+            )
+            .await;
             return Err(anyhow!(detail));
         }
     };
@@ -840,46 +1051,140 @@ pub(super) async fn process_merge_entry_fenced(
     // the pre-merge HEAD before touching the queue state so a newer owner
     // never observes a half-finished integration from a stale generation.
     if let Err(error) = lease.assert_held().await {
-        let reset_worktree = spec.session_worktree.clone();
-        let reset_base = actual_base.clone();
-        let reset =
-            tokio::task::spawn_blocking(move || worktree::reset_hard(&reset_worktree, &reset_base))
-                .await?;
-        let detail = truncate(&match reset {
-            Ok(()) => {
-                format!("integration lease lost after merge: {error}; rolled back to {actual_base}")
-            }
-            Err(reset_error) => format!(
-                "integration lease lost after merge: {error}; rollback failed: {reset_error}"
-            ),
-        });
-        engine
-            .update_merge_queue_entry(&entry.id, "failed", Some(detail.clone()))
-            .await?;
-        emit(
+        let detail =
+            match rollback_session_branch(spec.session_worktree.clone(), actual_base.clone()).await
+            {
+                Ok(()) => truncate(&format!(
+                    "integration lease lost after merge: {error}; rolled back to {actual_base}"
+                )),
+                Err(reset_error) => truncate(&format!(
+                    "integration lease lost after merge: {error}; rollback failed: {reset_error}"
+                )),
+            };
+        fail_merge_entry(
             engine,
             &session.id,
             spec,
-            "integrator.finished",
-            serde_json::json!({
-                "entry_id": entry.id,
-                "status": "failed",
-                "detail": detail,
-                "reason": "lease_lost_after_merge",
-            }),
+            &entry.id,
+            &detail,
+            "lease_lost_after_merge",
         )
-        .await?;
+        .await;
         return Err(anyhow!(detail));
     }
-    engine
-        .update_merge_queue_entry(&entry.id, "checking", None)
-        .await?;
+
+    // A cancel that arrived while `git merge` ran must not land work the
+    // operator cancelled. The merge is already on the branch; roll it back to
+    // the exact pre-merge commit before marking the task/entry failed.
+    match merge_cancel_reason(engine, &session.id, entry.task_id.as_deref()).await {
+        Ok(Some(reason)) => {
+            let detail =
+                match rollback_session_branch(spec.session_worktree.clone(), actual_base.clone())
+                    .await
+                {
+                    Ok(()) => truncate(&format!(
+                        "{reason}; merged commit {} was rolled back to {actual_base}",
+                        truncate_to(&entry.commit, 12)
+                    )),
+                    Err(reset_error) => truncate(&format!(
+                        "{reason}; merged commit {} could not be rolled back: {reset_error}",
+                        truncate_to(&entry.commit, 12)
+                    )),
+                };
+            fail_merge_entry(
+                engine,
+                &session.id,
+                spec,
+                &entry.id,
+                &detail,
+                "cancelled_after_merge",
+            )
+            .await;
+            return Err(anyhow!(detail));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let detail =
+                match rollback_session_branch(spec.session_worktree.clone(), actual_base.clone())
+                    .await
+                {
+                    Ok(()) => truncate(&format!(
+                        "cancel check failed after merge: {error}; rolled back to {actual_base}"
+                    )),
+                    Err(reset_error) => truncate(&format!(
+                        "cancel check failed after merge: {error}; rollback failed: {reset_error}"
+                    )),
+                };
+            fail_merge_entry(
+                engine,
+                &session.id,
+                spec,
+                &entry.id,
+                &detail,
+                "cancel_check_failed",
+            )
+            .await;
+            return Err(error);
+        }
+    }
+
+    if let Err(error) = set_merge_entry_status(engine, &entry.id, "checking", None).await {
+        let detail = match rollback_session_branch(
+            spec.session_worktree.clone(),
+            actual_base.clone(),
+        )
+        .await
+        {
+            Ok(()) => truncate(&format!(
+                "could not mark the merge entry checking: {error}; rolled back to {actual_base}"
+            )),
+            Err(reset_error) => truncate(&format!(
+                "could not mark the merge entry checking: {error}; rollback failed: {reset_error}"
+            )),
+        };
+        fail_merge_entry(
+            engine,
+            &session.id,
+            spec,
+            &entry.id,
+            &detail,
+            "checking_status_write_failed",
+        )
+        .await;
+        return Err(error);
+    }
     let check_worktree = spec.session_worktree.clone();
     let check_base = actual_base.clone();
     let check_result = tokio::task::spawn_blocking(move || {
         worktree::check_merged_diff(&check_worktree, &check_base)
     })
-    .await?;
+    .await;
+    let check_result = match check_result {
+        Ok(result) => result,
+        Err(error) => {
+            let detail =
+                match rollback_session_branch(spec.session_worktree.clone(), actual_base.clone())
+                    .await
+                {
+                    Ok(()) => truncate(&format!(
+                        "integration check task failed: {error}; rolled back to {actual_base}"
+                    )),
+                    Err(reset_error) => truncate(&format!(
+                        "integration check task failed: {error}; rollback failed: {reset_error}"
+                    )),
+                };
+            fail_merge_entry(
+                engine,
+                &session.id,
+                spec,
+                &entry.id,
+                &detail,
+                "check_task_failed",
+            )
+            .await;
+            return Err(anyhow!(detail));
+        }
+    };
     let check_result = match check_result {
         Ok(()) => {
             if let Some(command) = integration_command {
@@ -915,33 +1220,26 @@ pub(super) async fn process_merge_entry_fenced(
                 }
             };
             if owned {
-                let reset_worktree = spec.session_worktree.clone();
-                let reset_base = actual_base.clone();
-                let reset = tokio::task::spawn_blocking(move || {
-                    worktree::reset_hard(&reset_worktree, &reset_base)
-                })
-                .await?;
-                detail = match reset {
+                detail = match rollback_session_branch(
+                    spec.session_worktree.clone(),
+                    actual_base.clone(),
+                )
+                .await
+                {
                     Ok(()) => detail,
                     Err(reset_error) => format!("{detail}; rollback failed: {reset_error}"),
                 };
             }
             let detail = truncate(&detail);
-            engine
-                .update_merge_queue_entry(&entry.id, "failed", Some(detail.clone()))
-                .await?;
-            emit(
+            fail_merge_entry(
                 engine,
                 &session.id,
                 spec,
-                "integrator.finished",
-                serde_json::json!({
-                    "entry_id": entry.id,
-                    "status": "failed",
-                    "detail": detail,
-                }),
+                &entry.id,
+                &detail,
+                "integration_check_failed",
             )
-            .await?;
+            .await;
             return Err(anyhow!(detail));
         }
     };
@@ -950,54 +1248,146 @@ pub(super) async fn process_merge_entry_fenced(
     // minutes. If ownership moved, discard this generation's merge instead of
     // publishing a merged entry that a newer owner cannot reason about.
     if let Err(error) = lease.assert_held().await {
-        let reset_worktree = spec.session_worktree.clone();
-        let reset_base = actual_base.clone();
-        let reset =
-            tokio::task::spawn_blocking(move || worktree::reset_hard(&reset_worktree, &reset_base))
-                .await?;
-        let detail = truncate(&match reset {
-            Ok(()) => format!(
+        let detail = match rollback_session_branch(
+            spec.session_worktree.clone(),
+            actual_base.clone(),
+        )
+        .await
+        {
+            Ok(()) => truncate(&format!(
                 "integration lease lost before finalize: {error}; rolled back to {actual_base}"
-            ),
-            Err(reset_error) => format!(
+            )),
+            Err(reset_error) => truncate(&format!(
                 "integration lease lost before finalize: {error}; rollback failed: {reset_error}"
-            ),
-        });
-        engine
-            .update_merge_queue_entry(&entry.id, "failed", Some(detail.clone()))
-            .await?;
-        emit(
+            )),
+        };
+        fail_merge_entry(
             engine,
             &session.id,
             spec,
-            "integrator.finished",
-            serde_json::json!({
-                "entry_id": entry.id,
-                "status": "failed",
-                "detail": detail,
-                "reason": "lease_lost_before_finalize",
-            }),
+            &entry.id,
+            &detail,
+            "lease_lost_before_finalize",
         )
-        .await?;
+        .await;
         return Err(anyhow!(detail));
     }
+    // Last cancel check: a cancel that arrived while the integration command
+    // ran must not publish a merged task.
+    match merge_cancel_reason(engine, &session.id, entry.task_id.as_deref()).await {
+        Ok(Some(reason)) => {
+            let detail = match rollback_session_branch(
+                spec.session_worktree.clone(),
+                actual_base.clone(),
+            )
+            .await
+            {
+                Ok(()) => truncate(&format!(
+                    "{reason}; merged commit {} was rolled back to {actual_base} before finalize",
+                    truncate_to(&entry.commit, 12)
+                )),
+                Err(reset_error) => truncate(&format!(
+                    "{reason}; merged commit {} could not be rolled back: {reset_error}",
+                    truncate_to(&entry.commit, 12)
+                )),
+            };
+            fail_merge_entry(
+                engine,
+                &session.id,
+                spec,
+                &entry.id,
+                &detail,
+                "cancelled_before_finalize",
+            )
+            .await;
+            return Err(anyhow!(detail));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let detail = match rollback_session_branch(
+                spec.session_worktree.clone(),
+                actual_base.clone(),
+            )
+            .await
+            {
+                Ok(()) => truncate(&format!(
+                    "cancel check failed before finalize: {error}; rolled back to {actual_base}"
+                )),
+                Err(reset_error) => truncate(&format!(
+                    "cancel check failed before finalize: {error}; rollback failed: {reset_error}"
+                )),
+            };
+            fail_merge_entry(
+                engine,
+                &session.id,
+                spec,
+                &entry.id,
+                &detail,
+                "cancel_check_failed_before_finalize",
+            )
+            .await;
+            return Err(error);
+        }
+    }
     record_integration_merge_effect(engine, session, spec, entry).await;
-    engine
-        .update_merge_queue_entry(&entry.id, "merged", Some(integration_detail.clone()))
-        .await?;
-    emit(
+    if let Err(error) = set_merge_entry_status(
+        engine,
+        &entry.id,
+        "merged",
+        Some(integration_detail.clone()),
+    )
+    .await
+    {
+        // The write can fail after its transaction committed. Re-read before
+        // declaring a failure: a row that is already `merged` is the true
+        // result, not a fake success.
+        if let Ok(Some(current)) = engine.get_merge_queue_entry(&entry.id).await
+            && current.status == "merged"
+        {
+            emit_integrator_finished(
+                engine,
+                &session.id,
+                spec,
+                &entry.id,
+                "merged",
+                &integration_detail,
+                None,
+                Some(entry.attempt),
+            )
+            .await;
+            return Ok(format!("merged; {integration_detail}"));
+        }
+        // The git merge and checks succeeded, but the terminal ledger write did
+        // not. Fail the row explicitly (never leave `checking`) and tell the
+        // operator that the branch already contains the merge.
+        let detail = truncate(&format!(
+            "merge landed at {actual_base} but the final queue status write failed: {error}; operator reconciliation is required"
+        ));
+        let _ = set_merge_entry_status(engine, &entry.id, "failed", Some(detail.clone())).await;
+        emit_integrator_finished(
+            engine,
+            &session.id,
+            spec,
+            &entry.id,
+            "failed",
+            &detail,
+            Some("final_status_write_failed"),
+            Some(entry.attempt),
+        )
+        .await;
+        return Err(anyhow!(detail));
+    }
+    emit_integrator_finished(
         engine,
         &session.id,
         spec,
-        "integrator.finished",
-        serde_json::json!({
-            "entry_id": entry.id,
-            "status": "merged",
-            "detail": integration_detail,
-            "attempt": entry.attempt,
-        }),
+        &entry.id,
+        "merged",
+        &integration_detail,
+        None,
+        Some(entry.attempt),
     )
-    .await?;
+    .await;
     Ok(format!("merged; {integration_detail}"))
 }
 
@@ -1433,5 +1823,277 @@ pub(super) async fn verify_worker(
             .await?;
             Ok(VerificationOutcome::Error(error.to_string()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn init_repo(path: &Path) {
+        std::fs::write(path.join("README.md"), "hello\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@verlinpark.local"],
+            vec!["config", "user.name", "VerlinPark Test"],
+            vec!["add", "."],
+            vec!["commit", "-q", "-m", "initial"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(path)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+    }
+
+    struct MergeFixture {
+        _data: TempDir,
+        _repo: TempDir,
+        engine: Engine,
+        project: Project,
+        session: Session,
+        info: crate::worktree::WorktreeInfo,
+        spec: AgentSpec,
+        commit: String,
+    }
+
+    async fn fixture() -> MergeFixture {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("merge-boundary".into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id.clone(), "merge boundary".into(), None)
+            .await
+            .unwrap();
+        let session_worktree = PathBuf::from(session.worktree.clone().unwrap());
+        let session_branch = session.branch.clone().unwrap();
+        let plan: TeamPlan = serde_json::from_value(serde_json::json!({
+            "goal": "merge boundary",
+            "departments": [{
+                "name": "impl",
+                "manager_title": "Implementation",
+                "profile": "coding",
+                "objective": "write one file"
+            }],
+            "tasks": [{
+                "id": "T1",
+                "department": "impl",
+                "title": "Write the task file",
+                "kind": "coding",
+                "deps": [],
+                "acceptance": ["task.txt exists"],
+                "write_scope": ["task.txt"]
+            }]
+        }))
+        .unwrap();
+        engine.set_team_plan(&session.id, &plan).await.unwrap();
+        let (plan_seq, _) = engine.scheduler().sync_plan(&session, &plan).await.unwrap();
+        engine
+            .scheduler()
+            .claim(&session.id, plan_seq, &["T1".to_string()])
+            .await
+            .unwrap();
+        let info = engine
+            .create_task_worktree(
+                &project.root,
+                &project.id,
+                &session.id,
+                "T1",
+                &session_branch,
+            )
+            .await
+            .unwrap();
+        std::fs::write(info.path.join("task.txt"), "task\n").unwrap();
+        let commit = worktree::commit_all(&info.path, "task one")
+            .unwrap()
+            .unwrap();
+        let spec = AgentSpec {
+            id: "worker-merge-boundary".into(),
+            role: AgentRole::Worker,
+            name: "Worker boundary".into(),
+            depth: 2,
+            parent_name: Some("Manager".into()),
+            title: None,
+            task_id: Some("T1".into()),
+            department: Some("impl".into()),
+            identity_id: None,
+            identity_generation: None,
+            profile: AgentProfile::Coding,
+            allow_delegation: true,
+            task_kind: None,
+            auto_approve: false,
+            worktree: info.path.clone(),
+            branch: info.branch.clone(),
+            session_worktree,
+            session_branch,
+            write_scope: vec!["task.txt".into()],
+            base_commit: info.base_commit.clone(),
+            workspace_id: None,
+            session_workspace_id: None,
+            parent_workspace_id: None,
+        };
+        MergeFixture {
+            _data: data,
+            _repo: repo,
+            engine,
+            project,
+            session,
+            info,
+            spec,
+            commit,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancel_before_integration_enqueues_nothing() {
+        let fixture = fixture().await;
+        fixture
+            .engine
+            .request_plan_task_cancel(&fixture.session.id, "T1")
+            .await
+            .unwrap();
+        let error = integrate_worker(
+            &fixture.engine,
+            &fixture.session,
+            &fixture.spec,
+            &fixture.commit,
+            "verified",
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("cancellation"),
+            "the pre-merge cancel must be named: {error:#}"
+        );
+        assert!(
+            fixture
+                .engine
+                .list_merge_queue(&fixture.session.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a cancelled task must not enqueue a merge"
+        );
+        let session_worktree = PathBuf::from(fixture.session.worktree.clone().unwrap());
+        assert!(!session_worktree.join("task.txt").exists());
+        assert!(
+            fixture
+                .engine
+                .plan_task_status(&fixture.session.id, "T1")
+                .await
+                .unwrap()
+                .as_deref()
+                == Some("cancelling"),
+            "the plan task remains cancelling; the plan runner records the terminal state"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_during_the_integration_command_rolls_back_and_never_merges() {
+        let fixture = fixture().await;
+        let session_worktree = PathBuf::from(fixture.session.worktree.clone().unwrap());
+        let pre_merge_head = worktree::head_commit(&session_worktree).unwrap();
+        let integration = integrate_worker(
+            &fixture.engine,
+            &fixture.session,
+            &fixture.spec,
+            &fixture.commit,
+            "verified",
+            Some("sleep 5"),
+        );
+        let cancel = async {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let queue = fixture
+                    .engine
+                    .list_merge_queue(&fixture.session.id)
+                    .await
+                    .unwrap();
+                if queue.iter().any(|entry| entry.status == "checking") {
+                    fixture
+                        .engine
+                        .request_plan_task_cancel(&fixture.session.id, "T1")
+                        .await
+                        .unwrap();
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "integration never reached the checking phase"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        let (result, ()) = tokio::join!(integration, cancel);
+        let error = result.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("cancellation"),
+            "the mid-integration cancel must be reported: {error:#}"
+        );
+        let queue = fixture
+            .engine
+            .list_merge_queue(&fixture.session.id)
+            .await
+            .unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(
+            queue[0].status, "failed",
+            "a cancelled integration must not publish a merged row: {queue:?}"
+        );
+        assert_eq!(
+            worktree::head_commit(&session_worktree).unwrap(),
+            pre_merge_head,
+            "the session branch must be rolled back to the pre-merge commit"
+        );
+        assert!(
+            !session_worktree.join("task.txt").exists(),
+            "the cancelled commit must not remain on the session branch"
+        );
+        assert!(
+            !fixture
+                .engine
+                .list_merge_queue(&fixture.session.id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|entry| entry.status == "merged"),
+            "no merged entry may exist after a mid-integration cancel"
+        );
+        let events = fixture
+            .engine
+            .list_events(fixture.session.id.clone(), 0, 200)
+            .await
+            .unwrap();
+        assert!(
+            events.iter().any(|event| {
+                event.kind == "integrator.finished"
+                    && event.payload["status"] == "failed"
+                    && event.payload["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.starts_with("cancelled_"))
+            }),
+            "the failed integration must record a cancellation reason: {events:?}"
+        );
+        // The task worktree still holds the unmerged commit for explicit
+        // cleanup/retry.
+        assert!(fixture.info.path.join("task.txt").exists());
+        let branch = fixture.info.branch.clone();
+        assert!(worktree::branch_exists(Path::new(&fixture.project.root), &branch).unwrap());
     }
 }

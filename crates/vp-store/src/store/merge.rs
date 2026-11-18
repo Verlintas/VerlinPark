@@ -139,12 +139,15 @@ impl Store {
         detail: Option<&str>,
     ) -> Result<Option<MergeQueueEntry>> {
         let conn = self.lock()?;
-        conn.execute(
+        let changed = conn.execute(
             "UPDATE merge_queue
              SET status = ?1, detail = COALESCE(?2, detail), updated_at = ?3
-             WHERE id = ?4",
+             WHERE id = ?4 AND status <> 'merged'",
             params![status, detail, now_rfc3339(), id],
         )?;
+        if changed == 0 {
+            return Ok(None);
+        }
         conn.query_row(
             "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, remote_test_evidence_id, remote_test_digest, remote_test_status, created_at, updated_at
              FROM merge_queue WHERE id = ?1",
@@ -208,18 +211,22 @@ impl Store {
     }
 
     /// Mark a queue entry as merging and persist the exact pre-merge HEAD.
+    /// A `merged` entry is terminal and cannot be reopened.
     pub fn begin_merge_queue_entry(
         &self,
         id: &str,
         pre_merge_commit: &str,
     ) -> Result<Option<MergeQueueEntry>> {
         let conn = self.lock()?;
-        conn.execute(
+        let changed = conn.execute(
             "UPDATE merge_queue
              SET status = 'merging', pre_merge_commit = ?1, updated_at = ?2
-             WHERE id = ?3",
+             WHERE id = ?3 AND status <> 'merged'",
             params![pre_merge_commit, now_rfc3339(), id],
         )?;
+        if changed == 0 {
+            return Ok(None);
+        }
         conn.query_row(
             "SELECT id, session_id, agent_id, agent_name, task_id, branch, commit_hash, base_commit, pre_merge_commit, status, attempt, detail, source, remote_host, remote_branch, bundle_sha256, imported_ref, verifier_approved, verifier_summary, environment_caveat, remote_test_evidence_id, remote_test_digest, remote_test_status, created_at, updated_at
              FROM merge_queue WHERE id = ?1",
@@ -327,7 +334,7 @@ impl Store {
         let changed = tx.execute(
             "UPDATE merge_queue
              SET status = ?1, detail = COALESCE(?2, detail), updated_at = ?3
-             WHERE id = ?4",
+             WHERE id = ?4 AND status <> 'merged'",
             params![status, detail, now_rfc3339(), id],
         )?;
         if changed == 0 {

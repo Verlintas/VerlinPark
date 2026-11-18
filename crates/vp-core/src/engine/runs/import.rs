@@ -21,6 +21,11 @@ impl Engine {
         let session_id = bundle.session.id.clone();
         let event_count = bundle.events.len() + 2;
         let bundle_test_results = bundle.test_results.clone();
+        let bundle_contracts = bundle.contracts.clone();
+        let bundle_contract_usage = bundle.contract_usage.clone();
+        let bundle_progress = bundle.progress.clone();
+        let bundle_remote_test_evidence = bundle.remote_test_evidence.clone();
+        validate_supplemental_bundle_rows(&bundle)?;
         let store = self.store.clone();
         let event =
             tokio::task::spawn_blocking(move || store.import_session_bundle(&bundle)).await??;
@@ -38,6 +43,47 @@ impl Engine {
         let decisions = crate::orchestration::decisions_from_events(&events);
         let scaling_decisions = crate::scaling::decisions_from_events(&events);
         let recoveries = crate::orchestration::recoveries_from_events(&events);
+        // C1/C12 projections are event-backed. Rebuild them from the archived
+        // event stream when it carries the authority; otherwise preserve the
+        // rows the bundle carried so legacy archives stay inspectable.
+        let contracts = if events.iter().any(|event| event.kind == "contract.derived") {
+            Self::contract_rows_from_events(&events)
+        } else {
+            Some(
+                bundle_contracts
+                    .iter()
+                    .map(bundle_contract_row_to_store)
+                    .collect(),
+            )
+        };
+        let contract_usage = if events.iter().any(|event| event.kind == "intent.mutation") {
+            Self::contract_usage_rows_from_events(&events, &project_id, &session_id)
+        } else {
+            Some(
+                bundle_contract_usage
+                    .iter()
+                    .map(bundle_contract_usage_row_to_store)
+                    .collect(),
+            )
+        };
+        let progress = if events.iter().any(|event| event.kind == "progress.round") {
+            Self::progress_from_events(&events)
+        } else {
+            Some(
+                bundle_progress
+                    .iter()
+                    .map(|row| (row.plan_revision, row.round.clone()))
+                    .collect(),
+            )
+        };
+        let remote_test_evidence = if events
+            .iter()
+            .any(|event| event.kind == "remote_test.completed")
+        {
+            Self::remote_test_evidence_from_events(&events)
+        } else {
+            Some(bundle_remote_test_evidence.clone())
+        };
         tokio::task::spawn_blocking(move || -> Result<()> {
             projection_store.replace_coordination_notes(&projection_id, &notes, &events)?;
             projection_store.replace_orchestration_decisions(
@@ -98,6 +144,23 @@ impl Engine {
             }) && let Some(effects) = crate::effect::receipts_from_events(&events)
             {
                 projection_store.replace_effect_receipts(&projection_id, &effects)?;
+            }
+            if contracts.is_some()
+                || contract_usage.is_some()
+                || progress.is_some()
+                || remote_test_evidence.is_some()
+            {
+                let session = projection_store
+                    .get_session(&projection_id)?
+                    .ok_or_else(|| anyhow::anyhow!("session not found: {projection_id}"))?;
+                let repair = supplemental_session_repair(
+                    &session,
+                    contracts,
+                    contract_usage,
+                    progress,
+                    remote_test_evidence,
+                );
+                projection_store.repair_session_projections(&projection_id, &repair)?;
             }
             Ok(())
         })
@@ -273,5 +336,123 @@ impl Engine {
             agents_remapped,
             warnings,
         })
+    }
+}
+
+/// Validate archive-owned supplemental rows before the bundle is persisted.
+/// A cross-session or cross-project row fails closed.
+fn validate_supplemental_bundle_rows(bundle: &SessionBundle) -> Result<()> {
+    for row in &bundle.contracts {
+        if row.session_id != bundle.session.id || row.project_id != bundle.project.id {
+            anyhow::bail!(
+                "bundle contract {} does not belong to {}/{}",
+                row.contract_id,
+                bundle.project.id,
+                bundle.session.id
+            );
+        }
+    }
+    for row in &bundle.contract_usage {
+        if row.session_id != bundle.session.id || row.project_id != bundle.project.id {
+            anyhow::bail!(
+                "bundle contract usage {} does not belong to {}/{}",
+                row.contract_id,
+                bundle.project.id,
+                bundle.session.id
+            );
+        }
+    }
+    for row in &bundle.remote_test_evidence {
+        if row.session_id != bundle.session.id || row.project_id != bundle.project.id {
+            anyhow::bail!(
+                "bundle remote test evidence {} does not belong to {}/{}",
+                row.id,
+                bundle.project.id,
+                bundle.session.id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn bundle_contract_row_to_store(row: &vp_protocol::types::BundleContractRow) -> StoredContractRow {
+    StoredContractRow {
+        contract_id: row.contract_id.clone(),
+        project_id: row.project_id.clone(),
+        session_id: row.session_id.clone(),
+        task_id: row.task_id.clone(),
+        plan_revision: row.plan_revision,
+        role: row.role.clone(),
+        hash: row.hash.clone(),
+        source_hash: row.source_hash.clone(),
+        contract: row.contract.clone(),
+        created_at: row.created_at.clone(),
+    }
+}
+
+fn bundle_contract_usage_row_to_store(
+    row: &vp_protocol::types::BundleContractUsageRow,
+) -> ContractUsageRow {
+    ContractUsageRow {
+        contract_id: row.contract_id.clone(),
+        project_id: row.project_id.clone(),
+        session_id: row.session_id.clone(),
+        task_id: row.task_id.clone(),
+        writes: row.writes,
+        bytes: row.bytes,
+        commits: row.commits,
+        updated_at: row.updated_at.clone(),
+    }
+}
+
+/// Build the narrow projection repair used by archive import. The session
+/// status/token fields already equal the imported values; passing them keeps
+/// the single store transaction honest without touching the plan or tasks.
+fn supplemental_session_repair(
+    session: &Session,
+    contracts: Option<Vec<StoredContractRow>>,
+    contract_usage: Option<Vec<ContractUsageRow>>,
+    progress: Option<Vec<(u64, ProgressRound)>>,
+    remote_test_evidence: Option<Vec<RemoteTestEvidence>>,
+) -> SessionRepair {
+    SessionRepair {
+        status: session.status.clone(),
+        priority: None,
+        unlimited: None,
+        prompt_layout: None,
+        tokens_in: session.tokens_in,
+        tokens_out: session.tokens_out,
+        cost_spent_usd: session.cost_spent_usd,
+        replace_plan: false,
+        plan: None,
+        todos: None,
+        messages: None,
+        agent_messages: None,
+        agents: None,
+        queue: None,
+        artifacts: None,
+        approvals: None,
+        memories: None,
+        memory_conflicts: None,
+        questions: None,
+        tasks: None,
+        steering: None,
+        continuations: None,
+        gates: None,
+        recoveries: None,
+        runs: None,
+        run_steps: None,
+        run_checkpoints: None,
+        context_checkpoints: None,
+        supervised_processes: None,
+        test_results: None,
+        remote_test_evidence,
+        prompt_prefix_observations: None,
+        instructions: None,
+        contracts,
+        contract_usage,
+        effects: None,
+        progress,
+        artifact_warnings: Vec::new(),
     }
 }

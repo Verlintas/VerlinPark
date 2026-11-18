@@ -2,12 +2,39 @@ import Foundation
 
 /// Finds or launches the local `verlinpadd` helper and returns its discovery
 /// record. The app is a client; the daemon owns all session state.
+///
+/// Discovery is only removed after bounded health retries plus positive
+/// evidence that the recorded process is dead (or is no longer verlinpadd).
 @MainActor
 final class DaemonController {
-    private let fileManager = FileManager.default
+    private let fileManager: FileManager
+    private let healthProbe: any DaemonHealthProbe
+    private let processEvidence: any DaemonProcessEvidenceProviding
+    private let dataDirectory: URL?
+    private let locateOverride: (() -> URL?)?
+    private let healthRetryDelays: [Duration]
     private var process: Process?
 
-    var dataDirectory: URL {
+    init(
+        dataDirectory: URL? = nil,
+        fileManager: FileManager = .default,
+        healthProbe: any DaemonHealthProbe = URLSessionDaemonHealthProbe(),
+        processEvidence: any DaemonProcessEvidenceProviding = SystemDaemonProcessEvidence(),
+        locateOverride: (() -> URL?)? = nil,
+        healthRetryDelays: [Duration] = [.zero, .milliseconds(500), .milliseconds(1500)]
+    ) {
+        self.dataDirectory = dataDirectory
+        self.fileManager = fileManager
+        self.healthProbe = healthProbe
+        self.processEvidence = processEvidence
+        self.locateOverride = locateOverride
+        self.healthRetryDelays = healthRetryDelays
+    }
+
+    var resolvedDataDirectory: URL {
+        if let dataDirectory {
+            return dataDirectory
+        }
         if let path = ProcessInfo.processInfo.environment["VERLINPARK_DATA_DIR"] {
             return URL(fileURLWithPath: path, isDirectory: true)
         }
@@ -19,15 +46,34 @@ final class DaemonController {
     }
 
     var discoveryURL: URL {
-        dataDirectory.appendingPathComponent("run/daemon.json")
+        resolvedDataDirectory.appendingPathComponent("run/daemon.json")
     }
 
     func ensureRunning() async throws -> Discovery {
-        if let discovery = readDiscovery(), await isHealthy(discovery) {
-            return discovery
+        if let discovery = readDiscovery() {
+            let alive = processEvidence.isAlive(pid: discovery.pid)
+            let isDaemon = alive && processEvidence.isVerlinParkDaemon(pid: discovery.pid)
+            let decision = DiscoveryRecoveryPolicy.decide(
+                healthy: false,
+                processAlive: alive,
+                isVerlinParkDaemon: isDaemon
+            )
+            switch decision {
+            case .reuse:
+                return discovery
+            case .keepUnhealthy:
+                if await waitForHealth(discovery) {
+                    return discovery
+                }
+                throw CoreError.daemonNotFound(
+                    "verlinpadd (pid \(discovery.pid)) is running but /health did not respond after \(healthRetryDelays.count) attempts. The discovery file was preserved. Check \(resolvedDataDirectory.appendingPathComponent("logs/daemon.log").path)."
+                )
+            case .removeStale:
+                // The recorded process is dead or its pid now belongs to a
+                // different binary; only then is the record stale.
+                try? fileManager.removeItem(at: discoveryURL)
+            }
         }
-
-        try? fileManager.removeItem(at: discoveryURL)
 
         guard let binary = locateDaemon() else {
             throw CoreError.daemonNotFound(
@@ -39,13 +85,15 @@ final class DaemonController {
 
         for _ in 0 ..< 100 {
             try await Task.sleep(for: .milliseconds(100))
-            if let discovery = readDiscovery(), await isHealthy(discovery) {
+            if let discovery = readDiscovery(),
+               await healthProbe.isHealthy(discovery: discovery, timeout: 0.5)
+            {
                 return discovery
             }
         }
 
         throw CoreError.daemonNotFound(
-            "verlinpadd did not become healthy. Check \(dataDirectory.appendingPathComponent("logs/daemon.log").path)."
+            "verlinpadd did not become healthy. Check \(resolvedDataDirectory.appendingPathComponent("logs/daemon.log").path)."
         )
     }
 
@@ -56,22 +104,23 @@ final class DaemonController {
         return try? JSONDecoder().decode(Discovery.self, from: data)
     }
 
-    private func isHealthy(_ discovery: Discovery) async -> Bool {
-        guard let url = URL(string: "http://127.0.0.1:\(discovery.port)/health") else {
-            return false
+    private func waitForHealth(_ discovery: Discovery) async -> Bool {
+        for (index, delay) in healthRetryDelays.enumerated() {
+            if Task.isCancelled {
+                return false
+            }
+            if index > 0, delay > .zero {
+                try? await Task.sleep(for: delay)
+            }
+            if await healthProbe.isHealthy(discovery: discovery, timeout: 2) {
+                return true
+            }
         }
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 1
-        do {
-            let (_, response) = try await URLSession.shared.data(for: request)
-            return (response as? HTTPURLResponse)?.statusCode == 200
-        } catch {
-            return false
-        }
+        return false
     }
 
     private func launch(_ binary: URL) throws {
-        let logURL = dataDirectory.appendingPathComponent("logs/daemon.log")
+        let logURL = resolvedDataDirectory.appendingPathComponent("logs/daemon.log")
         try fileManager.createDirectory(
             at: logURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
@@ -92,6 +141,10 @@ final class DaemonController {
     }
 
     private func locateDaemon() -> URL? {
+        if let locateOverride {
+            return locateOverride()
+        }
+
         if let path = ProcessInfo.processInfo.environment["VERLINPARK_DAEMON"],
            fileManager.isExecutableFile(atPath: path)
         {

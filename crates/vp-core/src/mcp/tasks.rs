@@ -149,6 +149,15 @@ pub fn is_terminal(status: &str) -> bool {
     matches!(status, "completed" | "failed" | "cancelled" | "expired")
 }
 
+/// A task is addressable by an agent only when the current session owns it and
+/// the project matches. Operator-created rows with no session owner are never
+/// addressable through the agent tool surface.
+fn task_owned_by(task: &McpTask, project_id: &str, session_id: &str) -> bool {
+    !session_id.trim().is_empty()
+        && task.session_id == session_id
+        && (project_id.trim().is_empty() || task.project_id == project_id)
+}
+
 fn task_status_event(status: &str) -> &'static str {
     match status {
         "completed" => "mcp.task.completed",
@@ -402,8 +411,31 @@ impl Engine {
         })
     }
 
+    /// Owner-scoped `task_get`. A task that belongs to another session or
+    /// project is indistinguishable from a missing task, so an agent can never
+    /// read, refresh, or expire a foreign handle.
+    pub async fn mcp_task_get_scoped(
+        &self,
+        task_id: &str,
+        project_id: &str,
+        session_id: &str,
+        refresh: bool,
+    ) -> Result<Option<McpTask>> {
+        let Some(task) = self
+            .mcp_task_row_for_owner(task_id, project_id, session_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.mcp_task_get_row(task, refresh).await.map(Some)
+    }
+
     pub async fn mcp_task_get(&self, task_id: &str, refresh: bool) -> Result<McpTask> {
         let task = self.mcp_task_row(task_id).await?;
+        self.mcp_task_get_row(task, refresh).await
+    }
+
+    async fn mcp_task_get_row(&self, task: McpTask, refresh: bool) -> Result<McpTask> {
         let task = expire_if_needed(self, task).await;
         if !refresh || is_terminal(&task.status) {
             return Ok(task);
@@ -425,10 +457,37 @@ impl Engine {
             .await
     }
 
+    /// Owner-scoped `task_result`. Foreign tasks return `None` before any
+    /// remote request, cached result read, or expiry event.
+    pub async fn mcp_task_result_scoped(
+        &self,
+        params: McpTaskResultParams,
+        project_id: &str,
+        session_id: &str,
+    ) -> Result<Option<McpTaskResult>> {
+        let Some(task) = self
+            .mcp_task_row_for_owner(&params.task_id, project_id, session_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.mcp_task_result_row(task, params.refresh)
+            .await
+            .map(Some)
+    }
+
     pub async fn mcp_task_result(&self, params: McpTaskResultParams) -> Result<McpTaskResult> {
         let task = self.mcp_task_row(&params.task_id).await?;
+        self.mcp_task_result_row(task, params.refresh).await
+    }
+
+    async fn mcp_task_result_row(
+        &self,
+        task: McpTask,
+        refresh: Option<bool>,
+    ) -> Result<McpTaskResult> {
         let task = expire_if_needed(self, task).await;
-        let refresh = params.refresh.unwrap_or(true);
+        let refresh = refresh.unwrap_or(true);
         if task.result_available {
             let cached = self.cached_task_result(&task.id).await?;
             return Ok(task_result(&task, cached, false));
@@ -468,12 +527,39 @@ impl Engine {
         Ok(task_result(&stored, None, is_pending(&stored.status)))
     }
 
+    /// Owner-scoped `task_cancel`. Foreign tasks return `None` before any
+    /// remote cancel request or local status event, so one session can never
+    /// cancel another session's task.
+    pub async fn mcp_task_cancel_scoped(
+        &self,
+        task_id: &str,
+        reason: Option<&str>,
+        project_id: &str,
+        session_id: &str,
+    ) -> Result<Option<McpTaskActionResult>> {
+        let Some(task) = self
+            .mcp_task_row_for_owner(task_id, project_id, session_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.mcp_task_cancel_row(task, reason).await.map(Some)
+    }
+
     pub async fn mcp_task_cancel(
         &self,
         task_id: &str,
         reason: Option<&str>,
     ) -> Result<McpTaskActionResult> {
         let task = self.mcp_task_row(task_id).await?;
+        self.mcp_task_cancel_row(task, reason).await
+    }
+
+    async fn mcp_task_cancel_row(
+        &self,
+        task: McpTask,
+        reason: Option<&str>,
+    ) -> Result<McpTaskActionResult> {
         if is_terminal(&task.status) {
             return Ok(McpTaskActionResult {
                 task,
@@ -510,15 +596,38 @@ impl Engine {
     }
 
     async fn mcp_task_row(&self, task_id: &str) -> Result<McpTask> {
+        let requested = task_id.trim().to_string();
+        self.mcp_task_row_opt(task_id)
+            .await?
+            .ok_or_else(|| anyhow!("MCP task not found: {requested}"))
+    }
+
+    async fn mcp_task_row_opt(&self, task_id: &str) -> Result<Option<McpTask>> {
         let store = self.store.clone();
         let requested = task_id.trim().to_string();
         if requested.is_empty() {
             bail!("task_id is required");
         }
-        let lookup = requested.clone();
-        tokio::task::spawn_blocking(move || store.get_mcp_task(&lookup))
-            .await??
-            .ok_or_else(|| anyhow!("MCP task not found: {requested}"))
+        let lookup = requested;
+        tokio::task::spawn_blocking(move || store.get_mcp_task(&lookup)).await?
+    }
+
+    /// Resolve a task only when the owner session and project both match. A
+    /// missing session owner on the row (operator-only call) never matches an
+    /// agent session.
+    async fn mcp_task_row_for_owner(
+        &self,
+        task_id: &str,
+        project_id: &str,
+        session_id: &str,
+    ) -> Result<Option<McpTask>> {
+        let Some(task) = self.mcp_task_row_opt(task_id).await? else {
+            return Ok(None);
+        };
+        if !task_owned_by(&task, project_id, session_id) {
+            return Ok(None);
+        }
+        Ok(Some(task))
     }
 
     async fn mcp_server_or_error(&self, server_id: &str) -> Result<McpServer> {
@@ -594,6 +703,120 @@ fn task_result(task: &McpTask, result: Option<Value>, pending: bool) -> McpTaskR
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+    use vp_store::Store;
+
+    fn task_fixture(project_id: &str, session_id: &str) -> McpTask {
+        let now = vp_protocol::now_rfc3339();
+        McpTask {
+            id: "mcpt_foreign".to_string(),
+            project_id: project_id.to_string(),
+            session_id: session_id.to_string(),
+            agent_id: "worker-b".to_string(),
+            agent_name: "Worker B".to_string(),
+            task_id: None,
+            server_id: "server-b".to_string(),
+            server_name: "Server B".to_string(),
+            tool_name: "long_job".to_string(),
+            remote_task_id: "remote-1".to_string(),
+            status: "working".to_string(),
+            ttl_secs: 600,
+            poll_interval_ms: 1_000,
+            created_at: now.clone(),
+            updated_at: now,
+            expires_at: None,
+            result_available: false,
+            effect_receipt_id: None,
+            last_error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_task_access_rejects_foreign_sessions_and_projects() {
+        let data = TempDir::new().unwrap();
+        let repo_a = TempDir::new().unwrap();
+        let repo_b = TempDir::new().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        let project_a = store
+            .add_project(repo_a.path().to_str().unwrap(), Some("a"))
+            .unwrap();
+        let project_b = store
+            .add_project(repo_b.path().to_str().unwrap(), Some("b"))
+            .unwrap();
+        let session_a = store.create_session(&project_a.id, "session a").unwrap();
+        let session_a_sibling = store.create_session(&project_a.id, "session a2").unwrap();
+        let session_b = store.create_session(&project_b.id, "session b").unwrap();
+        let engine = Engine::new(store);
+        let task = task_fixture(&project_b.id, &session_b.id);
+        engine.store().insert_mcp_task_with_event(&task).unwrap();
+        let before = engine
+            .list_events(session_b.id.clone(), 0, 1_000)
+            .await
+            .unwrap()
+            .len();
+
+        // Foreign project, same project/different session, and a refresh must
+        // all fail before any remote request or expiry write.
+        assert!(
+            engine
+                .mcp_task_get_scoped(&task.id, &project_a.id, &session_a.id, true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            engine
+                .mcp_task_get_scoped(&task.id, &project_a.id, &session_a_sibling.id, true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            engine
+                .mcp_task_result_scoped(
+                    McpTaskResultParams {
+                        task_id: task.id.clone(),
+                        refresh: Some(true),
+                    },
+                    &project_a.id,
+                    &session_a.id,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            engine
+                .mcp_task_cancel_scoped(
+                    &task.id,
+                    Some("foreign cancel"),
+                    &project_a.id,
+                    &session_a.id,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let after = engine
+            .list_events(session_b.id.clone(), 0, 1_000)
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(
+            before, after,
+            "a foreign MCP task action must not append victim-session events"
+        );
+
+        // Positive control: the owning session still resolves the task.
+        let owned = engine
+            .mcp_task_get_scoped(&task.id, &project_b.id, &session_b.id, false)
+            .await
+            .unwrap()
+            .expect("owner task");
+        assert_eq!(owned.id, task.id);
+        assert_eq!(owned.status, "working");
+    }
 
     #[test]
     fn task_handle_supports_nested_and_top_level_forms() {

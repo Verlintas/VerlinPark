@@ -9,71 +9,24 @@ impl AgentService {
             .ok_or_else(|| anyhow!("agent provider is not configured"))
     }
 
+    /// Compatibility wrapper for callers that only need the resolved spec,
+    /// base-token estimate, and real prompt-prefix hash. The estimate and hash
+    /// come from the same layout-aware assembly the run loop uses.
     pub(in crate::agent) async fn context_preamble(
         &self,
         config: &AgentConfig,
         session: &Session,
         project: &Project,
     ) -> Result<(AgentSpec, u64, String)> {
-        let agents = self.engine.list_agents(&session.id).await?;
-        let leader = agents.into_iter().find(|agent| agent.role == "leader");
-        let profile = leader
-            .as_ref()
-            .and_then(|agent| agent.profile.as_deref())
-            .and_then(AgentProfile::parse)
-            .unwrap_or(AgentProfile::Generic);
-        let worktree = PathBuf::from(session.worktree.clone().unwrap_or_default());
-        let branch = session.branch.clone().unwrap_or_default();
-        let spec = AgentSpec {
-            id: leader
-                .as_ref()
-                .map(|agent| agent.id.clone())
-                .unwrap_or_else(|| "leader".to_string()),
-            role: AgentRole::Leader,
-            name: leader
-                .as_ref()
-                .map(|agent| agent.name.clone())
-                .unwrap_or_else(|| "Leader".to_string()),
-            depth: 0,
-            parent_name: None,
-            title: leader.as_ref().and_then(|agent| agent.title.clone()),
-            task_id: None,
-            department: None,
-            identity_id: None,
-            identity_generation: None,
-            profile,
-            allow_delegation: true,
-            task_kind: None,
-            auto_approve: false,
-            worktree: worktree.clone(),
-            branch: branch.clone(),
-            session_worktree: worktree,
-            session_branch: branch,
-            write_scope: Vec::new(),
-            base_commit: session.base_commit.clone().unwrap_or_default(),
-
-            workspace_id: None,
-            session_workspace_id: None,
-            parent_workspace_id: None,
-        };
-        let system = role_system_prompt(spec.role, project, session, &spec, &session.goal).render();
-        let dynamic_mcp =
-            collect_dynamic_mcp_tools(&self.engine, spec.role, &session.project_id, None).await;
-        let frozen_bundle = frozen_tool_bundle(config, &spec, &dynamic_mcp);
-        let tools = frozen_bundle.tools.clone();
-        let prefix_hash = crate::sha256_hex(
-            format!(
-                "{system}\n{}",
-                crate::tool_bundle::canonical_tools_json(&tools)
-            )
-            .as_bytes(),
-        );
-        let tokens = estimate_context_tokens(&system).saturating_add(
-            serde_json::to_string(&tools)
-                .map(|schema| estimate_context_tokens(&schema))
-                .unwrap_or(0),
-        );
-        Ok((spec, tokens, prefix_hash))
+        let prompt = build_session_prompt_context(
+            &self.engine,
+            config,
+            session,
+            project,
+            InstructionBuildMode::Materialize,
+        )
+        .await?;
+        Ok((prompt.spec, prompt.base_tokens, prompt.prefix_hash))
     }
 
     /// Capture the current active-context boundary without running a prompt or
@@ -98,8 +51,17 @@ impl AgentService {
         }
         self.begin_operation(session_id)?;
         let result = async {
-            let (spec, base_tokens, prefix_hash) =
-                self.context_preamble(&config, &session, &project).await?;
+            let prompt = build_session_prompt_context(
+                &self.engine,
+                &config,
+                &session,
+                &project,
+                InstructionBuildMode::Materialize,
+            )
+            .await?;
+            let spec = prompt.spec.clone();
+            let base_tokens = prompt.base_tokens;
+            let prefix_hash = prompt.prefix_hash.clone();
             let store = self.engine.store().clone();
             let revision_session = session.id.clone();
             let current_revision =
@@ -372,14 +334,36 @@ impl AgentService {
         }
         preflight.active_messages = restored.len();
         if let Some(config) = config {
-            match self.context_preamble(config, session, project).await {
-                Ok((spec, base_tokens, _)) => {
-                    let model_name = model_for(config, spec.role);
+            // Imported/rehydrated archives are read-only. They are already
+            // refused by the errors above, so estimate with a non-persisting
+            // preview instead of materializing instruction state/events into an
+            // archive that must not change.
+            let mode = if imported {
+                InstructionBuildMode::Preview
+            } else {
+                InstructionBuildMode::Materialize
+            };
+            match build_session_prompt_context(&self.engine, config, session, project, mode).await {
+                Ok(prompt) => {
+                    // A checkpoint prefix must describe the prompt that would be
+                    // sent now. Older checkpoints recorded a synthetic
+                    // `sha256(system + tools)` value that no `context.prompt_prefix`
+                    // event ever produced; comparing fails those closed instead
+                    // of restoring an incompatible boundary.
+                    if !checkpoint.prompt_prefix_hash.is_empty()
+                        && checkpoint.prompt_prefix_hash != prompt.prefix_hash
+                    {
+                        preflight.errors.push(format!(
+                            "prompt prefix changed: checkpoint={}, current={}",
+                            checkpoint.prompt_prefix_hash, prompt.prefix_hash
+                        ));
+                    }
+                    let model_name = prompt.model.clone();
                     let calibration =
                         load_context_calibration(&self.engine, &session.id, &model_name).await;
-                    let (threshold, hard_limit) = context_limits(config, spec.role);
+                    let (threshold, hard_limit) = context_limits(config, prompt.spec.role);
                     let estimated = calibrate_context_tokens(
-                        estimate_messages_tokens(&restored).saturating_add(base_tokens),
+                        estimate_messages_tokens(&restored).saturating_add(prompt.base_tokens),
                         calibration.factor,
                     );
                     preflight.estimated_tokens = estimated;

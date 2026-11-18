@@ -111,13 +111,21 @@ struct DashboardView: View {
         .tint(VPTheme.accent)
         .background { VPCrystalBackdrop() }
         .onAppear {
-            if let saved = DashboardSection(rawValue: storedSection) {
+            if let requested = model.requestedDashboardSection {
+                section = requested
+                model.requestedDashboardSection = nil
+            } else if let saved = DashboardSection(rawValue: storedSection) {
                 section = saved
             }
             if section != .overview, section != .team {
                 Task { await model.loadDashboardSnapshot() }
             }
             Task { await refreshSection(section) }
+        }
+        .onChange(of: model.approvalAttentionRequestID) { _, _ in
+            guard let requested = model.requestedDashboardSection else { return }
+            section = requested
+            model.requestedDashboardSection = nil
         }
         .onChange(of: section) { _, newValue in
             storedSection = newValue.rawValue

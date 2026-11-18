@@ -954,9 +954,10 @@ impl Store {
             tx.execute(
                 "INSERT INTO plan_tasks
                  (session_id, plan_seq, task_id, project_id, department, title, priority,
-                  status, deps, write_scope, attempts, last_error, enqueued_at, started_at,
-                  finished_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                  status, deps, write_scope, attempts, last_error, next_attempt_at,
+                  enqueued_at, started_at, finished_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                         ?14, ?15, ?16, ?17)",
                 params![
                     task.session_id,
                     task.plan_seq as i64,
@@ -970,6 +971,7 @@ impl Store {
                     serde_json::to_string(&task.write_scope)?,
                     i64::from(task.attempts),
                     task.last_error,
+                    task.next_attempt_at,
                     task.enqueued_at,
                     task.started_at,
                     task.finished_at,
@@ -1413,5 +1415,68 @@ impl Store {
             }
         }
         Ok(imported_event)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn imported_task_rows_keep_retry_backoff() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let source = Store::open(data.path()).unwrap();
+        let project = source
+            .add_project(repo.path().to_str().unwrap(), Some("archive"))
+            .unwrap();
+        let session = source.create_session(&project.id, "import retry").unwrap();
+        let retry_at = "2999-01-01T00:00:00Z";
+        let project_json = serde_json::to_value(&project).unwrap();
+        let session_json = serde_json::to_value(&session).unwrap();
+        let session_id = session.id.clone();
+        let project_id = project.id.clone();
+        let bundle = serde_json::json!({
+            "version": 1,
+            "exported_at": now_rfc3339(),
+            "project": project_json,
+            "session": session_json,
+            "events": [],
+            "agents": [],
+            "messages": [],
+            "todos": [],
+            "merge_queue": [],
+            "tasks": [{
+                "session_id": session_id,
+                "project_id": project_id,
+                "plan_seq": 1,
+                "task_id": "T1",
+                "department": "impl",
+                "title": "Scheduled retry",
+                "priority": 0,
+                "status": "pending",
+                "deps": [],
+                "write_scope": ["src/retry"],
+                "attempts": 2,
+                "enqueued_at": now_rfc3339(),
+                "started_at": null,
+                "finished_at": null,
+                "last_error": "retry later",
+                "next_attempt_at": retry_at,
+            }],
+        });
+        let bundle: SessionBundle = serde_json::from_value(bundle).unwrap();
+
+        let imported_data = TempDir::new().unwrap();
+        let imported = Store::open(imported_data.path()).unwrap();
+        imported.import_session_bundle(&bundle).unwrap();
+        let tasks = imported
+            .list_plan_tasks(Some(&project.id), Some(&session.id))
+            .unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].status, "pending");
+        assert_eq!(tasks[0].attempts, 2);
+        assert_eq!(tasks[0].next_attempt_at.as_deref(), Some(retry_at));
     }
 }

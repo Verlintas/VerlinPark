@@ -846,6 +846,283 @@ impl Provider for CancellingPlanProvider {
     }
 }
 
+struct DeferredSiblingPlanProvider {
+    requests: Arc<Mutex<Vec<ChatRequest>>>,
+    gate_id: Arc<Mutex<Option<String>>>,
+    leader_calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl Provider for DeferredSiblingPlanProvider {
+    fn id(&self) -> &str {
+        "deferred-sibling-plan"
+    }
+
+    async fn stream_chat(&self, request: ChatRequest) -> Result<EventStream, ProviderError> {
+        self.requests.lock().unwrap().push(request.clone());
+        let names = request
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let last_role = request.messages.last().map(|message| message.role.as_str());
+        let user_text = request
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .map(|message| message.content.clone())
+            .unwrap_or_default();
+        let events = if names.contains("submit_verdict") {
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "sibling_verdict".into(),
+                    name: "submit_verdict".into(),
+                    arguments: serde_json::json!({
+                        "approved": true,
+                        "summary": "the sibling task wrote the expected file"
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ]
+        } else if names.contains("submit_team_plan") {
+            let call = self
+                .leader_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                let plan = serde_json::json!({
+                    "goal": "defer one batch sibling and complete the other",
+                    "departments": [{
+                        "name": "impl",
+                        "manager_title": "Implementation",
+                        "profile": "coding",
+                        "objective": "finish the independent sibling"
+                    }],
+                    "tasks": [
+                        {
+                            "id": "T1",
+                            "department": "impl",
+                            "title": "Wait for the external gate",
+                            "kind": "coding",
+                            "deps": [],
+                            "acceptance": ["gate resolved"],
+                            "write_scope": ["src/t1"]
+                        },
+                        {
+                            "id": "T2",
+                            "department": "impl",
+                            "title": "Write the independent sibling",
+                            "kind": "coding",
+                            "deps": [],
+                            "acceptance": ["sibling-note.txt exists"],
+                            "write_scope": ["sibling-note.txt"]
+                        }
+                    ]
+                });
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "sibling_plan".into(),
+                        name: "submit_team_plan".into(),
+                        arguments: plan.to_string(),
+                    }),
+                    StreamEvent::Done,
+                ]
+            } else if call == 1 && last_role == Some("tool") {
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "sibling_run".into(),
+                        name: "run_team_plan".into(),
+                        arguments: "{}".into(),
+                    }),
+                    StreamEvent::Done,
+                ]
+            } else {
+                vec![
+                    StreamEvent::TextDelta("deferred sibling plan complete".into()),
+                    StreamEvent::Done,
+                ]
+            }
+        } else if user_text.contains("Execute plan task T1") {
+            if last_role == Some("tool") {
+                vec![
+                    StreamEvent::TextDelta("gate wait returned".into()),
+                    StreamEvent::Done,
+                ]
+            } else {
+                let gate_id = self.gate_id.lock().unwrap().clone().unwrap_or_default();
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "sibling_gate".into(),
+                        name: "wait_for_gate".into(),
+                        arguments: serde_json::json!({"gate_id": gate_id}).to_string(),
+                    }),
+                    StreamEvent::Done,
+                ]
+            }
+        } else if user_text.contains("Execute plan task T2") {
+            if last_role == Some("tool") {
+                vec![
+                    StreamEvent::TextDelta("independent sibling complete".into()),
+                    StreamEvent::Done,
+                ]
+            } else {
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "sibling_write".into(),
+                        name: "write_file".into(),
+                        arguments: serde_json::json!({
+                            "path": "sibling-note.txt",
+                            "content": "completed beside a deferred sibling\n"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ]
+            }
+        } else {
+            vec![
+                StreamEvent::TextDelta(format!("unexpected sibling request: {user_text}")),
+                StreamEvent::Done,
+            ]
+        };
+        Ok(Box::pin(futures_util::stream::iter(
+            events.into_iter().map(Ok),
+        )))
+    }
+}
+
+struct CancelDuringVerificationProvider {
+    engine: Arc<Mutex<Option<Engine>>>,
+    session_id: Arc<Mutex<Option<String>>>,
+    leader_calls: std::sync::atomic::AtomicUsize,
+    cancelling: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl Provider for CancelDuringVerificationProvider {
+    fn id(&self) -> &str {
+        "cancel-during-verification"
+    }
+
+    async fn stream_chat(&self, request: ChatRequest) -> Result<EventStream, ProviderError> {
+        let names = request
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let last_role = request.messages.last().map(|message| message.role.as_str());
+        let user_text = request
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .map(|message| message.content.clone())
+            .unwrap_or_default();
+        let events = if names.contains("submit_verdict") {
+            if !self
+                .cancelling
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                let engine = self.engine.lock().unwrap().clone();
+                let session_id = self.session_id.lock().unwrap().clone();
+                if let (Some(engine), Some(session_id)) = (engine, session_id) {
+                    // Request the cancel while the Verifier's final turn is
+                    // running. The task is still `running`; the runtime must
+                    // observe it before integration and must not merge.
+                    let _ = engine.request_plan_task_cancel(&session_id, "T1").await;
+                }
+            }
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "cancel_verdict".into(),
+                    name: "submit_verdict".into(),
+                    arguments: serde_json::json!({
+                        "approved": true,
+                        "summary": "the worker wrote the expected file"
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ]
+        } else if names.contains("submit_team_plan") {
+            let call = self
+                .leader_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                let plan = serde_json::json!({
+                    "goal": "cancel during verification",
+                    "departments": [{
+                        "name": "impl",
+                        "manager_title": "Implementation",
+                        "profile": "coding",
+                        "objective": "write one file"
+                    }],
+                    "tasks": [{
+                        "id": "T1",
+                        "department": "impl",
+                        "title": "Write the cancelled file",
+                        "kind": "coding",
+                        "deps": [],
+                        "acceptance": ["cancel-note.txt exists"],
+                        "write_scope": ["cancel-note.txt"]
+                    }]
+                });
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "cancel_plan".into(),
+                        name: "submit_team_plan".into(),
+                        arguments: plan.to_string(),
+                    }),
+                    StreamEvent::Done,
+                ]
+            } else if call == 1 && last_role == Some("tool") {
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "cancel_run".into(),
+                        name: "run_team_plan".into(),
+                        arguments: "{}".into(),
+                    }),
+                    StreamEvent::Done,
+                ]
+            } else {
+                vec![
+                    StreamEvent::TextDelta("cancelled plan complete".into()),
+                    StreamEvent::Done,
+                ]
+            }
+        } else if user_text.contains("Execute plan task T1") {
+            if last_role == Some("tool") {
+                vec![
+                    StreamEvent::TextDelta("cancelled worker complete".into()),
+                    StreamEvent::Done,
+                ]
+            } else {
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "cancel_write".into(),
+                        name: "write_file".into(),
+                        arguments: serde_json::json!({
+                            "path": "cancel-note.txt",
+                            "content": "must not land\n"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ]
+            }
+        } else {
+            vec![
+                StreamEvent::TextDelta(format!("unexpected cancel request: {user_text}")),
+                StreamEvent::Done,
+            ]
+        };
+        Ok(Box::pin(futures_util::stream::iter(
+            events.into_iter().map(Ok),
+        )))
+    }
+}
+
 struct RoundtableProvider;
 
 #[async_trait]
@@ -1814,9 +2091,9 @@ async fn integrates_worker_changes_into_the_session_branch() {
             .iter()
             .any(|event| event.kind == "integrator.started")
     );
-    assert!(events.iter().any(
-            |event| event.kind == "integrator.finished" && event.payload["status"] == "merged"
-        ));
+    assert!(events
+        .iter()
+        .any(|event| event.kind == "integrator.finished" && event.payload["status"] == "merged"));
     let sessions = engine
         .list_sessions(Some(session.project_id.clone()))
         .await
@@ -2266,154 +2543,156 @@ async fn auto_resolver_policy_resolves_pending_conflicts() {
     );
 }
 
-#[tokio::test]
-async fn rolls_back_a_merge_when_integration_checks_fail() {
-    let dir = TempDir::new().unwrap();
-    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
-        responses: Mutex::new(VecDeque::from(vec![
-            vec![
-                StreamEvent::ToolCall(ToolCall {
-                    id: "call_manager".into(),
-                    name: "delegate".into(),
-                    arguments: serde_json::json!({
-                        "role": "manager",
-                        "title": "Implementation",
-                        "objective": "deliver the file"
-                    })
-                    .to_string(),
-                }),
-                StreamEvent::Done,
-            ],
-            vec![
-                StreamEvent::ToolCall(ToolCall {
-                    id: "call_worker".into(),
-                    name: "delegate".into(),
-                    arguments: serde_json::json!({
-                        "role": "worker",
-                        "objective": "write worker.txt",
-                        "write_scope": ["worker.txt"]
-                    })
-                    .to_string(),
-                }),
-                StreamEvent::Done,
-            ],
-            vec![
-                StreamEvent::ToolCall(ToolCall {
-                    id: "call_write".into(),
-                    name: "write_file".into(),
-                    arguments: serde_json::json!({
-                        "path": "worker.txt",
-                        "content": "from worker\n"
-                    })
-                    .to_string(),
-                }),
-                StreamEvent::Done,
-            ],
-            vec![
-                StreamEvent::TextDelta("worker wrote".into()),
-                StreamEvent::Done,
-            ],
-            vec![
-                StreamEvent::ToolCall(ToolCall {
-                    id: "call_verdict".into(),
-                    name: "submit_verdict".into(),
-                    arguments: serde_json::json!({
-                        "approved": true,
-                        "summary": "worker.txt exists and matches the task"
-                    })
-                    .to_string(),
-                }),
-                StreamEvent::Done,
-            ],
-            vec![
-                StreamEvent::TextDelta("manager done".into()),
-                StreamEvent::Done,
-            ],
-            vec![
-                StreamEvent::TextDelta("leader done".into()),
-                StreamEvent::Done,
-            ],
-        ])),
-    });
-    let (engine, service, project) = test_service_with_provider(&dir, provider);
-    set_integration_command(&service, Some("exit 7"));
-    let session = engine
-        .create_session(project.id, "integration failure".into(), None)
-        .await
-        .unwrap();
-    engine
-        .create_leader_agent(&session.id, "test")
-        .await
-        .unwrap();
-
-    let approver_engine = engine.clone();
-    let approver_session = session.id.clone();
-    let approver = tokio::spawn(async move {
-        for _ in 0..100 {
-            if let Ok(approvals) = approver_engine
-                .list_approvals(Some(approver_session.clone()))
-                .await
-            {
-                for approval in approvals.iter().filter(|a| a.status == "pending") {
-                    let _ = approver_engine.resolve_approval(&approval.id, true).await;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    });
-
-    service
-        .start(&session.id, "integration failure")
-        .await
-        .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let queue = loop {
-        let queue = engine.list_merge_queue(&session.id).await.unwrap();
-        if queue.len() == 1 && queue[0].status == "failed" {
-            break queue;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "integration failure was not recorded: {queue:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    };
-    approver.abort();
-
-    let worktree = session.worktree.clone().unwrap();
-    assert!(
-        !std::path::Path::new(&worktree).join("worker.txt").exists(),
-        "a failed integration check must roll the merge back"
-    );
-    assert_eq!(queue.len(), 1);
-    assert!(
-        queue[0]
-            .detail
-            .as_deref()
-            .is_some_and(|detail| detail.contains("integration command exited"))
-    );
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let (worker_status, saw_integrator_failure) = loop {
-        let agents = engine.list_agents(&session.id).await.unwrap();
-        let worker = agents.iter().find(|agent| agent.role == "worker").unwrap();
-        let events = engine
-            .list_events(session.id.clone(), 0, 300)
+#[test]
+fn rolls_back_a_merge_when_integration_checks_fail() {
+    run_with_large_stack(|| async {
+        let dir = TempDir::new().unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+            responses: Mutex::new(VecDeque::from(vec![
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_manager".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::json!({
+                            "role": "manager",
+                            "title": "Implementation",
+                            "objective": "deliver the file"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_worker".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::json!({
+                            "role": "worker",
+                            "objective": "write worker.txt",
+                            "write_scope": ["worker.txt"]
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_write".into(),
+                        name: "write_file".into(),
+                        arguments: serde_json::json!({
+                            "path": "worker.txt",
+                            "content": "from worker\n"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("worker wrote".into()),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "call_verdict".into(),
+                        name: "submit_verdict".into(),
+                        arguments: serde_json::json!({
+                            "approved": true,
+                            "summary": "worker.txt exists and matches the task"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("manager done".into()),
+                    StreamEvent::Done,
+                ],
+                vec![
+                    StreamEvent::TextDelta("leader done".into()),
+                    StreamEvent::Done,
+                ],
+            ])),
+        });
+        let (engine, service, project) = test_service_with_provider(&dir, provider);
+        set_integration_command(&service, Some("exit 7"));
+        let session = engine
+            .create_session(project.id, "integration failure".into(), None)
             .await
             .unwrap();
-        let saw_integrator_failure = events.iter().any(|event| {
-            event.kind == "integrator.finished" && event.payload["status"] == "failed"
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+
+        let approver_engine = engine.clone();
+        let approver_session = session.id.clone();
+        let approver = tokio::spawn(async move {
+            for _ in 0..100 {
+                if let Ok(approvals) = approver_engine
+                    .list_approvals(Some(approver_session.clone()))
+                    .await
+                {
+                    for approval in approvals.iter().filter(|a| a.status == "pending") {
+                        let _ = approver_engine.resolve_approval(&approval.id, true).await;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
         });
-        if worker.status == "failed" && saw_integrator_failure {
-            break (worker.status.clone(), saw_integrator_failure);
-        }
+
+        service
+            .start(&session.id, "integration failure")
+            .await
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let queue = loop {
+            let queue = engine.list_merge_queue(&session.id).await.unwrap();
+            if queue.len() == 1 && queue[0].status == "failed" {
+                break queue;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "integration failure was not recorded: {queue:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        approver.abort();
+
+        let worktree = session.worktree.clone().unwrap();
         assert!(
-            std::time::Instant::now() < deadline,
-            "worker/integrator failure projections did not settle: {worker:?}"
+            !std::path::Path::new(&worktree).join("worker.txt").exists(),
+            "a failed integration check must roll the merge back"
         );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    };
-    assert_eq!(worker_status, "failed");
-    assert!(saw_integrator_failure);
+        assert_eq!(queue.len(), 1);
+        assert!(
+            queue[0]
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("integration command exited"))
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let (worker_status, saw_integrator_failure) = loop {
+            let agents = engine.list_agents(&session.id).await.unwrap();
+            let worker = agents.iter().find(|agent| agent.role == "worker").unwrap();
+            let events = engine
+                .list_events(session.id.clone(), 0, 300)
+                .await
+                .unwrap();
+            let saw_integrator_failure = events.iter().any(|event| {
+                event.kind == "integrator.finished" && event.payload["status"] == "failed"
+            });
+            if worker.status == "failed" && saw_integrator_failure {
+                break (worker.status.clone(), saw_integrator_failure);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker/integrator failure projections did not settle: {worker:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        assert_eq!(worker_status, "failed");
+        assert!(saw_integrator_failure);
+    });
 }
 
 #[tokio::test]
@@ -3208,88 +3487,90 @@ fn matches_write_scopes() {
     assert!(scopes_overlap(&["**".to_string()], &["docs".to_string()]));
 }
 
-#[tokio::test]
-async fn runs_parallel_workers_in_isolated_scopes() {
-    let dir = TempDir::new().unwrap();
-    let provider = Arc::new(RoutingProvider::new());
-    let provider_trait: Arc<dyn Provider> = provider.clone();
-    let (engine, service, project) = test_service_with_provider(&dir, provider_trait);
-    let session = engine
-        .create_session(project.id, "parallel goal".into(), None)
-        .await
-        .unwrap();
-    engine
-        .create_leader_agent(&session.id, "test")
-        .await
-        .unwrap();
-    service.start(&session.id, "parallel goal").await.unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(8);
-    loop {
+#[test]
+fn runs_parallel_workers_in_isolated_scopes() {
+    run_with_large_stack(|| async {
+        let dir = TempDir::new().unwrap();
+        let provider = Arc::new(RoutingProvider::new());
+        let provider_trait: Arc<dyn Provider> = provider.clone();
+        let (engine, service, project) = test_service_with_provider(&dir, provider_trait);
+        let session = engine
+            .create_session(project.id, "parallel goal".into(), None)
+            .await
+            .unwrap();
+        engine
+            .create_leader_agent(&session.id, "test")
+            .await
+            .unwrap();
+        service.start(&session.id, "parallel goal").await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let agents = engine.list_agents(&session.id).await.unwrap();
+            let workers = agents
+                .iter()
+                .filter(|agent| agent.role == "worker")
+                .collect::<Vec<_>>();
+            let status = engine
+                .list_sessions(Some(session.project_id.clone()))
+                .await
+                .unwrap()
+                .first()
+                .map(|session| session.status.clone());
+            if workers.len() == 2
+                && workers.iter().all(|worker| worker.status == "idle")
+                && status.as_deref() == Some("idle")
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "parallel workers did not finish; agents={agents:?}, session={status:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        assert!(
+            provider
+                .max_active
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 2,
+            "workers did not run concurrently"
+        );
         let agents = engine.list_agents(&session.id).await.unwrap();
         let workers = agents
             .iter()
             .filter(|agent| agent.role == "worker")
             .collect::<Vec<_>>();
-        let status = engine
-            .list_sessions(Some(session.project_id.clone()))
+        assert_eq!(workers.len(), 2);
+        assert!(workers.iter().all(|worker| worker.status == "idle"));
+        assert!(workers.iter().all(|worker| worker.branch.is_some()));
+        let events = engine
+            .list_events(session.id.clone(), 0, 300)
             .await
-            .unwrap()
-            .first()
-            .map(|session| session.status.clone());
-        if workers.len() == 2
-            && workers.iter().all(|worker| worker.status == "idle")
-            && status.as_deref() == Some("idle")
-        {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "parallel workers did not finish; agents={agents:?}, session={status:?}"
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "agent.spawned")
+                .count(),
+            3
         );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-
-    assert!(
-        provider
-            .max_active
-            .load(std::sync::atomic::Ordering::SeqCst)
-            >= 2,
-        "workers did not run concurrently"
-    );
-    let agents = engine.list_agents(&session.id).await.unwrap();
-    let workers = agents
-        .iter()
-        .filter(|agent| agent.role == "worker")
-        .collect::<Vec<_>>();
-    assert_eq!(workers.len(), 2);
-    assert!(workers.iter().all(|worker| worker.status == "idle"));
-    assert!(workers.iter().all(|worker| worker.branch.is_some()));
-    let events = engine
-        .list_events(session.id.clone(), 0, 300)
-        .await
-        .unwrap();
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| event.kind == "agent.spawned")
-            .count(),
-        3
-    );
-    assert!(
-        events
-            .iter()
-            .any(|event| event.kind == "agent.message" && event.payload["text"] == "A done")
-    );
-    assert!(
-        events
-            .iter()
-            .any(|event| event.kind == "agent.message" && event.payload["text"] == "B done")
-    );
-    let sessions = engine
-        .list_sessions(Some(session.project_id))
-        .await
-        .unwrap();
-    assert_eq!(sessions[0].status, "idle");
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "agent.message" && event.payload["text"] == "A done")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "agent.message" && event.payload["text"] == "B done")
+        );
+        let sessions = engine
+            .list_sessions(Some(session.project_id))
+            .await
+            .unwrap();
+        assert_eq!(sessions[0].status, "idle");
+    });
 }
 
 #[tokio::test]
@@ -3920,6 +4201,357 @@ async fn settles_sibling_tasks_when_a_batch_is_cancelled() {
             .iter()
             .all(|event| event.payload["task_status"] == "cancelled"),
         "all sibling tasks must settle as cancelled: {finished:?}"
+    );
+}
+
+#[tokio::test]
+async fn batch_abort_preserves_a_completed_and_merged_sibling() {
+    let dir = TempDir::new().unwrap();
+    let gate_id = Arc::new(Mutex::new(None::<String>));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(DeferredSiblingPlanProvider {
+        requests: requests.clone(),
+        gate_id: gate_id.clone(),
+        leader_calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id.clone(), "deferred sibling".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let plan: TeamPlan = serde_json::from_value(serde_json::json!({
+        "goal": "defer one sibling and complete the other",
+        "departments": [{
+            "name": "impl",
+            "manager_title": "Implementation",
+            "profile": "coding",
+            "objective": "finish the independent sibling"
+        }],
+        "tasks": [
+            {
+                "id": "T1",
+                "department": "impl",
+                "title": "Wait for the external gate",
+                "kind": "coding",
+                "deps": [],
+                "acceptance": ["gate resolved"],
+                "write_scope": ["src/t1"]
+            },
+            {
+                "id": "T2",
+                "department": "impl",
+                "title": "Write the independent sibling",
+                "kind": "coding",
+                "deps": [],
+                "acceptance": ["sibling-note.txt exists"],
+                "write_scope": ["sibling-note.txt"]
+            }
+        ]
+    }))
+    .unwrap();
+    engine.set_team_plan(&session.id, &plan).await.unwrap();
+    let gate = engine
+        .open_gate(vp_protocol::types::GateOpenParams {
+            session_id: session.id.clone(),
+            task_id: Some("T1".into()),
+            kind: Some("ci".into()),
+            label: Some("sibling gate".into()),
+            payload: None,
+            expires_at: None,
+            after_secs: None,
+        })
+        .await
+        .unwrap();
+    *gate_id.lock().unwrap() = Some(gate.gate.id.clone());
+    assert!(service.resume_plan(&session.id).await.unwrap());
+    let current = wait_until_idle(&engine, &session).await;
+    assert_eq!(current.status, "idle");
+
+    let queue = engine
+        .task_queue(Some(project.id.clone()), Some(session.id.clone()))
+        .await
+        .unwrap();
+    let status = |task_id: &str| {
+        queue
+            .tasks
+            .iter()
+            .find(|task| task.task_id == task_id)
+            .map(|task| task.status.as_str())
+    };
+    assert_eq!(status("T1"), Some("blocked"));
+    assert_eq!(
+        status("T2"),
+        Some("completed"),
+        "the aborting sibling must not rewrite the completed task: {:?}",
+        queue.tasks
+    );
+
+    let merge_queue = engine.list_merge_queue(&session.id).await.unwrap();
+    assert_eq!(
+        merge_queue
+            .iter()
+            .filter(|entry| entry.task_id.as_deref() == Some("T2"))
+            .count(),
+        1,
+        "the completed sibling must merge exactly once: {merge_queue:?}"
+    );
+    assert!(
+        merge_queue
+            .iter()
+            .any(|entry| entry.task_id.as_deref() == Some("T2") && entry.status == "merged"),
+        "the completed sibling's commit must stay merged: {merge_queue:?}"
+    );
+    assert!(
+        merge_queue
+            .iter()
+            .all(|entry| entry.task_id.as_deref() != Some("T1")),
+        "the deferred sibling must not merge: {merge_queue:?}"
+    );
+    let worktree = PathBuf::from(session.worktree.clone().unwrap());
+    assert!(worktree.join("sibling-note.txt").exists());
+
+    let events = engine
+        .list_events(session.id.clone(), 0, 500)
+        .await
+        .unwrap();
+    let t2_finished = events
+        .iter()
+        .filter(|event| event.kind == "plan_task.finished" && event.payload["task_id"] == "T2")
+        .collect::<Vec<_>>();
+    assert_eq!(t2_finished.len(), 1, "{t2_finished:?}");
+    assert_eq!(t2_finished[0].payload["task_status"], "completed");
+    assert!(
+        !events.iter().any(|event| {
+            event.kind == "plan_task.finished"
+                && event.payload["task_id"] == "T2"
+                && event.payload["task_status"] != "completed"
+        }),
+        "no contradictory finish event may be emitted for the completed sibling"
+    );
+}
+
+#[tokio::test]
+async fn task_cancel_during_verification_does_not_merge_or_complete() {
+    let dir = TempDir::new().unwrap();
+    let engine_slot = Arc::new(Mutex::new(None::<Engine>));
+    let session_slot = Arc::new(Mutex::new(None::<String>));
+    let provider = Arc::new(CancelDuringVerificationProvider {
+        engine: engine_slot.clone(),
+        session_id: session_slot.clone(),
+        leader_calls: std::sync::atomic::AtomicUsize::new(0),
+        cancelling: std::sync::atomic::AtomicBool::new(false),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id.clone(), "cancel verification".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    *engine_slot.lock().unwrap() = Some(engine.clone());
+    *session_slot.lock().unwrap() = Some(session.id.clone());
+    let plan: TeamPlan = serde_json::from_value(serde_json::json!({
+        "goal": "cancel during verification",
+        "departments": [{
+            "name": "impl",
+            "manager_title": "Implementation",
+            "profile": "coding",
+            "objective": "write one file"
+        }],
+        "tasks": [{
+            "id": "T1",
+            "department": "impl",
+            "title": "Write the cancelled file",
+            "kind": "coding",
+            "deps": [],
+            "acceptance": ["cancel-note.txt exists"],
+            "write_scope": ["cancel-note.txt"]
+        }]
+    }))
+    .unwrap();
+    engine.set_team_plan(&session.id, &plan).await.unwrap();
+    assert!(service.resume_plan(&session.id).await.unwrap());
+    let _ = wait_until_idle(&engine, &session).await;
+
+    let queue = engine
+        .task_queue(Some(project.id.clone()), Some(session.id.clone()))
+        .await
+        .unwrap();
+    let task = queue
+        .tasks
+        .iter()
+        .find(|task| task.task_id == "T1")
+        .expect("T1 row");
+    assert_eq!(
+        task.status, "cancelled",
+        "a cancel observed before integration must remain cancelled"
+    );
+    let merge_queue = engine.list_merge_queue(&session.id).await.unwrap();
+    assert!(
+        merge_queue.is_empty(),
+        "the verifier-approved commit must not merge after a cancel: {merge_queue:?}"
+    );
+    let worktree = PathBuf::from(session.worktree.clone().unwrap());
+    assert!(
+        !worktree.join("cancel-note.txt").exists(),
+        "the cancelled commit must not reach the session worktree"
+    );
+    let events = engine
+        .list_events(session.id.clone(), 0, 500)
+        .await
+        .unwrap();
+    assert!(
+        !events.iter().any(|event| {
+            event.kind == "plan_task.finished"
+                && event.payload["task_id"] == "T1"
+                && event.payload["task_status"] == "completed"
+        }),
+        "the cancelled task must not be recorded completed"
+    );
+}
+
+#[tokio::test]
+async fn partial_batch_setup_failure_settles_claims_and_agents() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::new()),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id.clone(), "partial setup failure".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let plan: TeamPlan = serde_json::from_value(serde_json::json!({
+        "goal": "fail the second task's setup",
+        "departments": [{
+            "name": "impl",
+            "manager_title": "Implementation",
+            "profile": "coding",
+            "objective": "start two independent tasks"
+        }],
+        "tasks": [
+            {
+                "id": "T1",
+                "department": "impl",
+                "title": "First task",
+                "kind": "coding",
+                "deps": [],
+                "acceptance": ["t1.txt exists"],
+                "write_scope": ["t1.txt"]
+            },
+            {
+                "id": "T2",
+                "department": "impl",
+                "title": "Second task",
+                "kind": "coding",
+                "deps": [],
+                "acceptance": ["t2.txt exists"],
+                "write_scope": ["t2.txt"]
+            }
+        ]
+    }))
+    .unwrap();
+    engine.set_team_plan(&session.id, &plan).await.unwrap();
+    // A file at the second task's worktree path makes `git worktree add`
+    // fail after T1 has already been prepared.
+    let blocker = dir
+        .path()
+        .join("worktrees")
+        .join(&project.id)
+        .join(&session.id)
+        .join("T2");
+    std::fs::create_dir_all(blocker.parent().unwrap()).unwrap();
+    std::fs::write(&blocker, "not a worktree").unwrap();
+
+    let _ = service.resume_plan(&session.id).await;
+    let _ = wait_until_idle(&engine, &session).await;
+
+    let queue = engine
+        .task_queue(Some(project.id.clone()), Some(session.id.clone()))
+        .await
+        .unwrap();
+    let status = |task_id: &str| {
+        queue
+            .tasks
+            .iter()
+            .find(|task| task.task_id == task_id)
+            .map(|task| task.status.clone())
+    };
+    for task_id in ["T1", "T2"] {
+        let status = status(task_id);
+        assert_ne!(
+            status.as_deref(),
+            Some("running"),
+            "{task_id} must not be left running after setup fails: {:?}",
+            queue.tasks
+        );
+        assert!(
+            matches!(
+                status.as_deref(),
+                Some("failed" | "blocked" | "cancelled" | "interrupted")
+            ) || matches!(status.as_deref(), Some("pending" | "retry_scheduled")),
+            "{task_id} must settle without staying running after setup fails: {:?}",
+            queue.tasks
+        );
+    }
+
+    let agents = engine.list_agents(&session.id).await.unwrap();
+    let events = engine
+        .list_events(session.id.clone(), 0, 500)
+        .await
+        .unwrap();
+    let workers = agents
+        .iter()
+        .filter(|agent| agent.role == "worker")
+        .collect::<Vec<_>>();
+    assert!(
+        !workers.is_empty(),
+        "the first task's Worker was created before setup failed"
+    );
+    for worker in workers {
+        assert_ne!(
+            worker.status, "running",
+            "no setup Worker may stay running: {worker:?}"
+        );
+        assert!(
+            events.iter().any(|event| {
+                event.kind == "agent.finished" && event.payload["agent_id"] == worker.id
+            }),
+            "setup Worker {} must have a terminal event: {events:?}",
+            worker.id
+        );
+    }
+    let t1_worktree = dir
+        .path()
+        .join("worktrees")
+        .join(&project.id)
+        .join(&session.id)
+        .join("T1");
+    assert!(
+        !t1_worktree.exists(),
+        "a clean, unmerged T1 worktree is removed by compensation"
+    );
+    assert!(
+        blocker.is_file(),
+        "the deliberate setup blocker is not a worktree and is left untouched"
+    );
+    assert!(
+        engine
+            .list_merge_queue(&session.id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a setup failure must not enqueue any merge"
     );
 }
 
@@ -5464,6 +6096,41 @@ fn shell_secret_roots_cover_database_sidecars_and_artifacts() {
         "verlinpark.db.pre-rebuild-20261109",
         "projects.jsonl",
         "artifacts",
+    ] {
+        assert!(
+            roots.iter().any(|root| root == &data.path().join(relative)),
+            "missing secret root {relative}"
+        );
+    }
+}
+
+#[test]
+fn shell_secret_roots_cover_session_scoped_daemon_state() {
+    let data = TempDir::new().unwrap();
+    for relative in [
+        "tool-outputs",
+        "processes",
+        "verify",
+        "sandbox",
+        "archive-extracts",
+        "media-transcode",
+        "worktrees",
+        "tmp",
+        "backup-keys",
+    ] {
+        std::fs::create_dir_all(data.path().join(relative)).unwrap();
+    }
+    let roots = shell_secret_roots(data.path());
+    for relative in [
+        "tool-outputs",
+        "processes",
+        "verify",
+        "sandbox",
+        "archive-extracts",
+        "media-transcode",
+        "worktrees",
+        "tmp",
+        "backup-keys",
     ] {
         assert!(
             roots.iter().any(|root| root == &data.path().join(relative)),
@@ -12970,6 +13637,213 @@ async fn parallel_tool_events_carry_independent_metrics() {
 }
 
 #[tokio::test]
+async fn parallel_read_batch_honors_a_path_scoped_deny_template() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "read-a".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"secrets/a.txt"}"#.into(),
+                }),
+                StreamEvent::ToolCall(ToolCall {
+                    id: "read-b".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"secrets/b.txt"}"#.into(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("both reads denied".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    engine
+        .create_approval_template(vp_protocol::types::ApprovalTemplateCreateParams {
+            project_id: project.id.clone(),
+            name: "deny secret reads".into(),
+            tool_pattern: "read_file".into(),
+            risk_levels: vec!["read_only".into()],
+            path_globs: vec!["secrets/**".into()],
+            action: "deny".into(),
+            expires_at: None,
+            max_uses: None,
+            created_by: Some("test".into()),
+        })
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "parallel deny".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service
+        .start(&session.id, "read the secret files in parallel")
+        .await
+        .unwrap();
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "idle");
+
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    let denied = events
+        .iter()
+        .filter(|event| event.kind == "tool.finished" && event.payload["name"] == "read_file")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        denied.len(),
+        2,
+        "every batched call must produce a tool result"
+    );
+    for event in &denied {
+        assert_eq!(event.payload["is_error"], true);
+        assert_eq!(event.payload["error_code"], "PERMISSION_DENIED");
+    }
+    assert!(
+        !events.iter().any(|event| {
+            event.kind == "agent.turn_finished" && event.payload["parallel"] == true
+        }),
+        "a non-Allow candidate must fall back to the sequential dispatcher"
+    );
+    let decisions = events
+        .iter()
+        .filter(|event| {
+            event.kind == "intent.decision"
+                && event.payload["tool"] == "read_file"
+                && event.payload["decision"] == "allow"
+        })
+        .count();
+    assert_eq!(
+        decisions, 2,
+        "each parallel candidate must record its contract intent decision"
+    );
+    let audit = engine.approval_audit(&project.id, None).await.unwrap();
+    let matches = audit
+        .events
+        .iter()
+        .filter(|event| {
+            event.kind == "approval.template.matched"
+                && event.payload["action"] == "deny"
+                && event.payload["tool"] == "read_file"
+        })
+        .count();
+    assert_eq!(
+        matches, 2,
+        "the persisted broker must audit a deny match for each call"
+    );
+}
+
+#[tokio::test]
+async fn invalid_tool_arguments_are_rejected_without_executing_the_tool() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "bad-read".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"#.into(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("recovered from bad arguments".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "bad arguments".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service
+        .start(&session.id, "try malformed arguments")
+        .await
+        .unwrap();
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "idle");
+
+    let events = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    let result = events
+        .iter()
+        .find(|event| event.kind == "tool.finished" && event.payload["tool_call_id"] == "bad-read")
+        .expect("the invalid call must still produce a tool result");
+    assert_eq!(result.payload["is_error"], true);
+    assert_eq!(result.payload["error_code"], "INVALID_ARGUMENT");
+    assert!(
+        !events.iter().any(|event| {
+            event.kind == "tool.started" && event.payload["tool_call_id"] == "bad-read"
+        }),
+        "a tool with invalid arguments must never start"
+    );
+    assert!(
+        !events.iter().any(|event| {
+            event.kind == "agent.message"
+                && event.payload["text"] == "recovered from bad arguments"
+                && event.payload["partial"] == true
+        }),
+        "the tool error must be a normal tool result, not a partial provider turn"
+    );
+}
+
+#[tokio::test]
+async fn empty_assistant_turn_is_a_typed_failure_not_a_success() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![StreamEvent::Done]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "empty turn".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service.start(&session.id, "return nothing").await.unwrap();
+    let finished = wait_until_idle(&engine, &session).await;
+    assert_eq!(finished.status, "failed");
+
+    let events = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "agent.turn_finished"),
+        "an empty turn must not claim a finished turn"
+    );
+    let runs = engine.session_runs(&session.id, 10).await.unwrap().runs;
+    let run = runs.first().expect("the failed run is journaled");
+    assert_eq!(run.status, "failed");
+    assert!(
+        run.failure
+            .as_ref()
+            .is_some_and(|failure| failure.message.contains("PROVIDER_EMPTY_TURN")),
+        "the empty turn must fail with the stable provider-turn error: {:?}",
+        run.failure
+    );
+}
+
+#[tokio::test]
 async fn session_tool_activity_is_bounded_and_projects_legacy_events() {
     let dir = TempDir::new().unwrap();
     let store = Store::open(dir.path()).unwrap();
@@ -15864,8 +16738,23 @@ async fn resumes_a_crashed_run_and_hard_blocks_a_completed_write() {
     assert_eq!(new.status, "completed");
     let old_detail = engine.session_run_detail(&prior_run_id).await.unwrap();
     assert_eq!(
-        old_detail.tool_calls[0].consumed_by_run_id.as_deref(),
-        Some(resumed.run_id.as_str())
+        old_detail.tool_calls[0].consumed_by_run_id, None,
+        "the source completed write must never be consumed by a replay"
+    );
+    let resumed_detail = engine.session_run_detail(&resumed.run_id).await.unwrap();
+    assert!(
+        resumed_detail
+            .tool_calls
+            .iter()
+            .any(|tool| { tool.tool_name == "write_file" && tool.status == "completed" }),
+        "a replay must be journaled as a completed row in the resuming attempt"
+    );
+    assert!(
+        resumed_detail
+            .steps
+            .iter()
+            .any(|step| step.kind == "tool_call" && step.payload["journal_replay"] == true),
+        "the replay intent must be marked in the run journal"
     );
     {
         let captured = requests.lock().unwrap();
@@ -15885,6 +16774,166 @@ async fn resumes_a_crashed_run_and_hard_blocks_a_completed_write() {
     }
     let report = engine.replay_session(&session.id).await.unwrap();
     assert!(report.consistent, "{:?}", report.mismatches);
+}
+
+#[tokio::test]
+async fn resume_twice_does_not_reexecute_a_completed_edit() {
+    let dir = TempDir::new().unwrap();
+    let edit_arguments = serde_json::json!({
+        "path": "README.md",
+        "old_string": "hello from test",
+        "new_string": "hello edited"
+    })
+    .to_string();
+    let edit_call = |id: &str| {
+        StreamEvent::ToolCall(ToolCall {
+            id: id.into(),
+            name: "edit_file".into(),
+            arguments: edit_arguments.clone(),
+        })
+    };
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            // Run A: the real edit, then a post-write failure.
+            vec![edit_call("edit-real"), StreamEvent::Done],
+            vec![StreamEvent::Done],
+            // Run B: the replay, then another post-replay failure.
+            vec![edit_call("edit-replay-1"), StreamEvent::Done],
+            vec![StreamEvent::Done],
+            // Run C: the replay, then a successful final turn.
+            vec![edit_call("edit-replay-2"), StreamEvent::Done],
+            vec![
+                StreamEvent::TextDelta("replayed without re-editing".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "double resume".into(), Some(100_000))
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    engine
+        .set_session_run_policy(
+            &session.project_id,
+            vp_protocol::types::SessionRunPolicy {
+                auto_resume: false,
+                max_attempts: 3,
+                max_age_hours: 24,
+            },
+        )
+        .await
+        .unwrap();
+
+    service
+        .start(&session.id, "edit readme once")
+        .await
+        .unwrap();
+    let first = wait_until_idle(&engine, &session).await;
+    assert_eq!(first.status, "failed", "run A ends after the real edit");
+    let first_run = engine
+        .session_runs(&session.id, 10)
+        .await
+        .unwrap()
+        .runs
+        .into_iter()
+        .find(|run| run.status == "failed")
+        .expect("run A is journaled as failed");
+    let worktree = Path::new(first.worktree.as_deref().expect("session worktree"));
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("README.md")).unwrap_or_default(),
+        "hello edited\n",
+        "the real edit must have been applied exactly once"
+    );
+
+    let resumed = service
+        .resume_session_run(&session.id, Some(&first_run.run_id), None)
+        .await
+        .unwrap();
+    assert!(resumed.resumed);
+    let second = wait_until_idle(&engine, &session).await;
+    assert_eq!(second.status, "failed", "run B ends after the replay");
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("README.md")).unwrap_or_default(),
+        "hello edited\n",
+        "a replay must not mutate the file"
+    );
+
+    let resumed_again = service
+        .resume_session_run(&session.id, Some(&resumed.run_id), None)
+        .await
+        .unwrap();
+    assert!(resumed_again.resumed);
+    let third = wait_until_idle(&engine, &session).await;
+    assert_eq!(third.status, "idle");
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("README.md")).unwrap_or_default(),
+        "hello edited\n",
+        "two resumes must never re-execute the completed edit"
+    );
+
+    let events = engine
+        .list_events(session.id.clone(), 0, 800)
+        .await
+        .unwrap();
+    let edit_results = events
+        .iter()
+        .filter(|event| event.kind == "tool.finished" && event.payload["name"] == "edit_file")
+        .collect::<Vec<_>>();
+    assert_eq!(edit_results.len(), 3, "one real edit and two replays");
+    assert_eq!(
+        edit_results
+            .iter()
+            .filter(|event| event.payload["structured"]["journal_replay"] == true)
+            .count(),
+        2,
+        "both resumes must return the journaled result"
+    );
+    assert_eq!(
+        edit_results
+            .iter()
+            .filter(|event| event.payload["is_error"] == true)
+            .count(),
+        0,
+        "a re-executed edit would fail with a missing old_string"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event.kind == "tool.started"
+                    && event.payload["name"] == "edit_file"
+                    && event.payload["journal_replay"] == true
+            })
+            .count(),
+        2,
+        "each resume records a journal replay start"
+    );
+
+    let first_detail = engine.session_run_detail(&first_run.run_id).await.unwrap();
+    assert_eq!(
+        first_detail.tool_calls[0].consumed_by_run_id, None,
+        "the completed source write is never consumed"
+    );
+    let second_detail = engine.session_run_detail(&resumed.run_id).await.unwrap();
+    assert!(
+        second_detail
+            .tool_calls
+            .iter()
+            .any(|tool| tool.tool_name == "edit_file" && tool.status == "completed"),
+        "the replay is journaled as a completed row in the resuming attempt"
+    );
+    assert!(
+        second_detail
+            .steps
+            .iter()
+            .any(|step| step.kind == "tool_call" && step.payload["journal_replay"] == true),
+        "the replay intent is marked in the journal"
+    );
 }
 
 #[tokio::test]
@@ -17194,6 +18243,67 @@ async fn manual_context_checkpoint_captures_the_active_boundary() {
     assert!(manual.through_message_id.is_some());
     assert!(!manual.automatic);
     assert!(manual.source_compaction_seq.is_some());
+}
+
+#[tokio::test]
+async fn manual_checkpoint_uses_the_live_layout_prefix_hash() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("layout answer".into()),
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    engine
+        .add_source_note(vp_protocol::types::SourceCreateNoteParams {
+            project_id: project.id.clone(),
+            collection: None,
+            title: "Runtime note".into(),
+            content: "The runtime keeps deterministic scheduling.".into(),
+            labels: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let session = engine
+        .create_session(project.id.clone(), "manual layout identity".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service
+        .start(&session.id, "use the live layout")
+        .await
+        .unwrap();
+    let session = wait_until_idle(&engine, &session).await;
+    let prefix = engine
+        .recent_events_of_kind(&session.id, "context.prompt_prefix", 1)
+        .await
+        .unwrap()
+        .pop()
+        .expect("live prompt prefix");
+    let live_hash = prefix.payload["prefix_hash"]
+        .as_str()
+        .expect("live prefix hash");
+    assert_eq!(
+        service
+            .context_checkpoint_now(&session.id, None)
+            .await
+            .unwrap()
+            .prompt_prefix_hash,
+        live_hash
+    );
+    service.compact_now(&session.id).await.unwrap();
+    assert_eq!(
+        service
+            .context_checkpoint_now(&session.id, None)
+            .await
+            .unwrap()
+            .prompt_prefix_hash,
+        live_hash
+    );
 }
 
 #[tokio::test]

@@ -12,8 +12,17 @@
 //!   replayed when the assistant message itself was persisted;
 //! - a completed write tool is hard-blocked by name + canonical input
 //!   fingerprint within a resume lineage and returns the journaled result;
+//!   the replay is journaled as its own completed row in the resuming attempt
+//!   so a failure after the replay cannot cause a later attempt to execute the
+//!   write again;
 //! - shell/process/local_http outcomes are never assumed; an interrupted call
 //!   is reported as unknown and the model must verify state;
+//! - a durable external-gate wait ends the attempt as `deferred`, an explicit
+//!   terminal run state that restart recovery and resume preflight both
+//!   refuse. The gate continuation owns the next attempt;
+//! - the opt-in `warm_on_resume` prompt-cache warm is a provider call outside
+//!   this journal. It is documented as recoverable (a crash can re-pay for one
+//!   warm for the same cache epoch) rather than duplicate-write-protected;
 //! - tool outcomes are not rebuilt by replay/repair. Losing that table loses
 //!   the duplicate-write gate for old runs, so the daemon fails closed on an
 //!   unreadable journal before resuming a run.
@@ -272,8 +281,48 @@ impl RunJournal {
         input: &Value,
         effect: Option<&EffectReceipt>,
     ) -> Result<(RunStep, RunToolCall, Option<vp_store::store::EffectBegin>)> {
+        self.tool_intent_inner(engine, turn, tool_call_id, tool_name, input, effect, false)
+            .await
+    }
+
+    /// Journal a write replayed from a prior attempt as a normal intent. The
+    /// replay is completed with its own `run_tool_calls` row in this attempt,
+    /// so a failure after the replay leaves a durable completed write that a
+    /// later resume can replay instead of executing the write again.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn tool_replay_intent(
+        &self,
+        engine: &Engine,
+        turn: u32,
+        tool_call_id: &str,
+        tool_name: &str,
+        input: &Value,
+    ) -> Result<(RunStep, RunToolCall, Option<vp_store::store::EffectBegin>)> {
+        self.tool_intent_inner(engine, turn, tool_call_id, tool_name, input, None, true)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn tool_intent_inner(
+        &self,
+        engine: &Engine,
+        turn: u32,
+        tool_call_id: &str,
+        tool_name: &str,
+        input: &Value,
+        effect: Option<&EffectReceipt>,
+        replay: bool,
+    ) -> Result<(RunStep, RunToolCall, Option<vp_store::store::EffectBegin>)> {
         let fingerprint = tool_fingerprint(tool_name, input)?;
         let now = now_rfc3339();
+        let mut payload = serde_json::json!({
+            "turn": turn,
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+        });
+        if replay && let Some(object) = payload.as_object_mut() {
+            object.insert("journal_replay".to_string(), Value::Bool(true));
+        }
         let step = RunStep {
             step_id: Uuid::now_v7().to_string(),
             run_id: self.run.run_id.clone(),
@@ -284,11 +333,7 @@ impl RunJournal {
             status: "intent".to_string(),
             input_hash: fingerprint.clone(),
             output_hash: String::new(),
-            payload: serde_json::json!({
-                "turn": turn,
-                "tool_call_id": tool_call_id,
-                "tool_name": tool_name,
-            }),
+            payload,
             created_at: now.clone(),
             updated_at: now.clone(),
         };
@@ -361,6 +406,11 @@ impl RunJournal {
             "content": output.content,
             "is_error": output.is_error,
         }))?;
+        let journal_replay = step
+            .payload
+            .get("journal_replay")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         completed_step.payload = serde_json::json!({
             "turn": step.turn,
             "tool_call_id": tool.tool_call_id,
@@ -375,6 +425,9 @@ impl RunJournal {
                 .as_ref()
                 .is_some_and(|failure| failure.retryable),
         });
+        if journal_replay && let Some(object) = completed_step.payload.as_object_mut() {
+            object.insert("journal_replay".to_string(), Value::Bool(true));
+        }
         completed_step.updated_at = now_rfc3339();
         let mut completed_tool = tool.clone();
         completed_tool.status = completed_step.status.clone();
@@ -609,16 +662,49 @@ impl RunJournal {
         {
             return Ok(());
         }
-        let store = engine.store().clone();
-        let run_id = self.run.run_id.clone();
-        let failure_for_store = failure.clone();
         let status = status.to_string();
-        let stored = tokio::task::spawn_blocking(move || {
-            store.finish_session_run(&run_id, &status, failure_for_store.as_ref())
-        })
-        .await??;
-        engine.broadcast_event(stored.1);
-        Ok(())
+        // A transient SQLite/event failure must not leave a `running` row (the
+        // caller historically downgraded this error to a warning). Retry the
+        // terminal write a bounded number of times; a real "not running"
+        // conflict is terminal and is not retried.
+        const FINISH_ATTEMPTS: usize = 3;
+        let mut last_error: Option<anyhow::Error> = None;
+        for attempt in 0..FINISH_ATTEMPTS {
+            let store = engine.store().clone();
+            let run_id = self.run.run_id.clone();
+            let failure_for_store = failure.clone();
+            let status_for_store = status.clone();
+            let stored = tokio::task::spawn_blocking(move || {
+                store.finish_session_run(&run_id, &status_for_store, failure_for_store.as_ref())
+            })
+            .await;
+            match stored {
+                Ok(Ok(stored)) => {
+                    engine.broadcast_event(stored.1);
+                    return Ok(());
+                }
+                Ok(Err(error)) => {
+                    if format!("{error:#}").contains("not running") {
+                        last_error = Some(error);
+                        break;
+                    }
+                    last_error = Some(error);
+                }
+                Err(error) => {
+                    last_error = Some(error.into());
+                }
+            }
+            if attempt + 1 < FINISH_ATTEMPTS {
+                tokio::time::sleep(std::time::Duration::from_millis(25 * (attempt as u64 + 1)))
+                    .await;
+            }
+        }
+        // A failed terminal write must not make this handle look finished:
+        // callers may retry the same finish at a later boundary, and the run
+        // is still `running` in SQLite until a terminal transition commits.
+        self.finished
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        Err(last_error.unwrap_or_else(|| anyhow!("run finish failed without an error")))
     }
 
     /// Ensure a reconstructed resume conversation is provider-valid: every
@@ -702,9 +788,10 @@ impl RunJournal {
 
     /// Check the duplicate-write gate before executing a tool. Returns a
     /// journaled result when this exact write already completed in a prior
-    /// attempt. Each prior row can be consumed once per attempt; interrupting
-    /// or failing the attempt releases its claims so a later resume can return
-    /// the result again instead of re-running the write.
+    /// attempt. The source row is never consumed here: the caller journals the
+    /// replay as its own completed row in the current attempt, so an attempt
+    /// that fails after the replay can replay the result again instead of
+    /// re-executing the write.
     pub(crate) async fn check_duplicate_write(
         &self,
         engine: &Engine,
@@ -723,7 +810,7 @@ impl RunJournal {
         let tool_name = tool_name.to_string();
         let gate_run_id = gate.run_id.clone();
         let previous = tokio::task::spawn_blocking(move || {
-            store.claim_completed_tool_result(&run_id, &tool_name, &fingerprint, &gate_run_id)
+            store.find_completed_tool_result(&run_id, &tool_name, &fingerprint, &gate_run_id)
         })
         .await??;
         let Some(previous) = previous else {
@@ -801,7 +888,7 @@ pub(crate) async fn preflight(
     }
     if !matches!(run.status.as_str(), "interrupted" | "failed") {
         return Err(anyhow!(
-            "run {} is {}; only interrupted or failed runs can be resumed",
+            "run {} is {}; only interrupted or failed runs can be resumed (a deferred gate wait is terminal and resumes through its continuation)",
             run.run_id,
             run.status
         ));
@@ -1247,6 +1334,19 @@ pub(crate) async fn interrupt_running_runs(engine: &Engine) -> Result<usize> {
     Ok(runs.len())
 }
 
+/// True when an operator cancel was recorded for a run that is still active in
+/// this session (the newest cancel is newer than every terminal run event).
+/// The deterministic Integrator uses this to stop a verified commit from
+/// landing when `session.run.cancel` was requested after the Verifier finished.
+pub(crate) async fn session_run_cancel_requested(
+    engine: &Engine,
+    session_id: &str,
+) -> Result<bool> {
+    let store = engine.store().clone();
+    let session_id = session_id.to_string();
+    tokio::task::spawn_blocking(move || store.session_run_cancel_requested(&session_id)).await?
+}
+
 /// Store-level helper used by RPC/view. Kept here so the store stays free of
 /// protocol-specific resume policy.
 pub(crate) async fn session_runs(
@@ -1338,7 +1438,8 @@ pub(crate) fn truncate_chars(value: &str, max: usize) -> String {
 }
 
 /// The set of prior statuses that make a run resumable. Kept as a helper so
-/// tests and RPC output agree.
+/// tests and RPC output agree. `deferred` is terminal and is excluded: the
+/// external-gate continuation, not a run replay, owns the next attempt.
 pub(crate) fn is_resumable_status(status: &str) -> bool {
     matches!(status, "interrupted" | "failed")
 }
@@ -1372,7 +1473,10 @@ pub(crate) fn projections_from_events(
                     runs.insert(run.run_id.clone(), run);
                 }
             }
-            "session.run.completed" | "session.run.failed" | "session.run.interrupted" => {
+            "session.run.completed"
+            | "session.run.failed"
+            | "session.run.interrupted"
+            | "session.run.deferred" => {
                 let run: SessionRun =
                     serde_json::from_value(event.payload.get("run")?.clone()).ok()?;
                 runs.insert(run.run_id.clone(), run);
@@ -1798,6 +1902,7 @@ mod tests {
         assert!(is_resumable_status("interrupted"));
         assert!(!is_resumable_status("completed"));
         assert!(!is_resumable_status("resumed"));
+        assert!(!is_resumable_status("deferred"));
     }
 }
 
@@ -2133,7 +2238,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn duplicate_write_gate_consumes_once_and_releases_after_failure() {
+    async fn duplicate_write_gate_replays_without_consuming_the_source() {
         let fixture = fixture().await;
         let journal = begin_journal(&fixture, "write", true, None).await;
         let (step, tool, _) = journal
@@ -2183,7 +2288,10 @@ mod integration_tests {
             .check_duplicate_write(&fixture.engine, "write_file", &input)
             .await
             .unwrap();
-        assert!(second.is_none(), "one row must not satisfy two calls");
+        assert!(
+            second.is_some(),
+            "the replay must not consume the source row; a repeated call returns the same journaled result"
+        );
         let different = serde_json::json!({"path": "dup.txt", "content": "two"});
         assert!(
             resumed
@@ -2215,7 +2323,7 @@ mod integration_tests {
             .unwrap();
         assert!(
             third.is_some(),
-            "a failed resume must release the claim for the next attempt"
+            "a failed resume must still replay the original completed write"
         );
 
         let failed_journal = begin_journal(&fixture, "failed write", true, None).await;
@@ -3082,6 +3190,90 @@ mod journal_store_edge_tests {
             .await
             .unwrap();
         assert_eq!(runs[0].status, "completed");
+    }
+
+    #[tokio::test]
+    async fn gate_deferral_finishes_the_run_as_deferred_and_blocks_resume() {
+        let fixture = fixture().await;
+        let journal = journal(&fixture, "external gate wait").await;
+        let run_id = journal.id().to_string();
+        journal
+            .finish_deferred(&fixture.engine, "waiting for gate gate-1")
+            .await
+            .unwrap();
+
+        let runs = crate::run_journal::session_runs(&fixture.engine, &fixture.session.id, 10)
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 1);
+        let run = runs[0].clone();
+        assert_eq!(
+            run.status, "deferred",
+            "a gate handoff must be an explicit terminal run status"
+        );
+        assert_eq!(
+            run.failure.as_ref().map(|failure| failure.kind.as_str()),
+            Some("deferred")
+        );
+        assert!(run.ended_at.is_some(), "deferred runs must be ended");
+        assert!(!is_resumable_status(&run.status));
+
+        let events = fixture
+            .engine
+            .list_events(fixture.session.id.clone(), 0, 100)
+            .await
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "session.run.deferred"),
+            "the deferral must emit a terminal run event"
+        );
+        let report = fixture
+            .engine
+            .replay_session(&fixture.session.id)
+            .await
+            .unwrap();
+        assert!(report.runs_match, "{:?}", report.mismatches);
+        assert!(report.consistent, "{:?}", report.mismatches);
+
+        // The row is terminal, so it is neither resumable nor rewritten by
+        // restart recovery.
+        let store = fixture.engine.store().clone();
+        assert!(
+            store.list_resumable_session_runs(10).unwrap().is_empty(),
+            "a deferred run must not be auto-resumed"
+        );
+        assert_eq!(
+            crate::run_journal::interrupt_running_runs(&fixture.engine)
+                .await
+                .unwrap(),
+            0,
+            "restart recovery must ignore a deferred terminal run"
+        );
+        let error = store
+            .finish_session_run(&run_id, "failed", None)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("not running"));
+
+        let policy = crate::run_journal::policy(&fixture.engine, &fixture.session.project_id)
+            .await
+            .unwrap();
+        let error = preflight(
+            &fixture.engine,
+            &fixture.session,
+            &run,
+            &policy,
+            "test",
+            "test-model",
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("deferred"),
+            "preflight must name the terminal deferral: {error:#}"
+        );
     }
 
     #[tokio::test]

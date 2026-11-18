@@ -40,6 +40,25 @@ pub(super) async fn emit(
     Ok(())
 }
 
+/// Parse one provider tool-call argument string. An empty/whitespace argument
+/// string is the unambiguous no-argument form; any other non-object JSON is
+/// rejected instead of being silently replaced with `{}`. The caller turns the
+/// error into a typed `INVALID_ARGUMENT` tool result and never executes the
+/// tool with guessed input.
+pub(super) fn parse_tool_arguments(
+    arguments: &str,
+) -> std::result::Result<serde_json::Value, String> {
+    if arguments.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    let value: serde_json::Value = serde_json::from_str(arguments)
+        .map_err(|error| format!("tool arguments are not valid JSON: {error}"))?;
+    if !value.is_object() {
+        return Err("tool arguments must be a JSON object".to_string());
+    }
+    Ok(value)
+}
+
 /// Cold diagnostics for a preempted provider stream. Kept in a separate async
 /// function and called through `Box::pin` so the recursive run-loop future
 /// does not retain this formatting/emission state at every delegation depth.
@@ -170,6 +189,49 @@ pub(super) struct ToolAuthorization {
     pub(super) skill_denied: Option<Skill>,
     pub(super) approval_wait_ms: Option<u64>,
     pub(super) cancelled: bool,
+}
+
+/// Non-mutating preview of the persisted approval broker. It runs the same
+/// `approvals::evaluate_approval_rules` precedence matrix with a template hook
+/// that never consumes a use or writes an audit row. The parallel read-only
+/// fast path uses it only to decide whether it may take the fast path at all:
+/// a non-`Allow` preview falls back to the sequential dispatcher, which then
+/// performs the single real evaluation (template use consumption plus
+/// `approval.template.matched` audit). This keeps `deny always wins` for a
+/// batched call without consuming a use-capped deny/escalate template twice.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn preview_tool_permission(
+    engine: &Engine,
+    session: &Session,
+    assessment: &crate::permissions::PermissionAssessment,
+    tool_name: &str,
+    input: &serde_json::Value,
+    mode: ApprovalMode,
+    auto_approve: bool,
+) -> Result<crate::approvals::ApprovalEvaluation> {
+    let templates = engine
+        .store()
+        .list_approval_templates(&session.project_id)?;
+    let grants = engine.store().list_approval_grants(&session.project_id)?;
+    let now = time::OffsetDateTime::now_utc();
+    let mut preview_consume = |template: &vp_protocol::types::ApprovalTemplate| {
+        Some(
+            template
+                .max_uses
+                .map(|max| max.saturating_sub(template.used_count).saturating_sub(1)),
+        )
+    };
+    Ok(crate::approvals::evaluate_approval_rules(
+        &templates,
+        &grants,
+        assessment,
+        tool_name,
+        input,
+        mode,
+        auto_approve,
+        now,
+        &mut preview_consume,
+    ))
 }
 
 /// Run the pre-execution policy stack for one tool call: risk assessment,
@@ -522,6 +584,14 @@ pub(super) async fn prepare_tool_effect_gate(
     if effect_override.is_some() {
         // The call never executes; the tool error is the result.
     } else if duplicate {
+        // A journaled write replay gets its own intent in this attempt and is
+        // completed with the replayed result. If this attempt fails after the
+        // replay, the successor completed row (and the never-consumed source
+        // row) lets a later resume replay again instead of re-executing.
+        let (step, tool, _) = journal
+            .tool_replay_intent(engine, turn, call_id, tool_name, input)
+            .await?;
+        journal_pair = Some((step, tool));
         if let Some(plan) = &planned_effect
             && let crate::effect::EffectPrepare::Replay(receipt)
             | crate::effect::EffectPrepare::Blocked(receipt)

@@ -113,7 +113,14 @@ pub(super) async fn dispatch(
             )
             .await?
         }
-        Command::RestoreLog { session } => {
+        Command::RestoreLog { session, yes } => {
+            let confirmed = yes
+                || confirm_cli_action(
+                    "Restore the event table from the JSONL mirror and rebuild projections?",
+                )?;
+            if !confirmed {
+                bail!("restore-log requires explicit confirmation (pass --yes)");
+            }
             rpc(
                 &discovery,
                 "session.restore_log",
@@ -133,7 +140,12 @@ pub(super) async fn dispatch(
             )
             .await?
         }
-        Command::Discard { session } => {
+        Command::Discard { session, yes } => {
+            let confirmed =
+                yes || confirm_cli_action("Discard uncommitted changes in the session worktree?")?;
+            if !confirmed {
+                bail!("discard requires explicit confirmation (pass --yes)");
+            }
             rpc(
                 &discovery,
                 "session.discard",

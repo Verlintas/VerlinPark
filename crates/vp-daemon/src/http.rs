@@ -17,7 +17,9 @@ use vp_protocol::{APP_VERSION, PROTOCOL_VERSION};
 use crate::AppState;
 use crate::dispatch::dispatch;
 use crate::metrics;
+use crate::params::parse_params;
 use crate::server::{authorized, constant_time_eq, server_info};
+use crate::ws::{self, EventCursor};
 
 pub(crate) async fn health() -> Json<Value> {
     Json(json!({"ok": true, "version": APP_VERSION, "protocol": PROTOCOL_VERSION}))
@@ -164,9 +166,15 @@ pub(crate) async fn rpc_http(
     request: Request,
 ) -> Response {
     if !authorized(&headers, &state.token) {
+        // A JSON-RPC client may ignore the HTTP status; the body is a real
+        // `RpcResponse` error so both transports agree on the error shape.
         return (
             StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "unauthorized"})),
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+            Json(RpcResponse::error(
+                None,
+                RpcError::new(codes::UNAUTHORIZED, "unauthorized"),
+            )),
         )
             .into_response();
     }
@@ -209,13 +217,26 @@ pub(crate) async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    // Explicit, documented bounds instead of axum's 64 MiB defaults. The
+    // pre-auth frame additionally uses the much smaller `MAX_PREAUTH_FRAME_BYTES`
+    // after the upgrade.
+    ws.max_message_size(ws::MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(ws::MAX_WS_FRAME_BYTES)
+        .on_upgrade(move |socket| handle_socket(socket, state))
 }
 
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
     let auth = tokio::time::timeout(Duration::from_secs(10), socket.recv()).await;
     let request = match auth {
-        Ok(Some(Ok(Message::Text(text)))) => serde_json::from_str::<RpcRequest>(&text).ok(),
+        // Size-check before parsing: an unauthenticated peer must not get a
+        // 64 MiB JSON DOM allocated on its behalf.
+        Ok(Some(Ok(Message::Text(text)))) => match ws::parse_auth_frame(&text) {
+            Ok(request) => Some(request),
+            Err(error) => {
+                let _ = send_json(&mut socket, &RpcResponse::error(None, error)).await;
+                return;
+            }
+        },
         _ => None,
     };
     let Some(request) = request else {
@@ -317,46 +338,175 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
 
     info!(pid = state.pid, "websocket client authenticated");
     let mut events = state.engine.subscribe();
-    let mut filter: Option<String> = None;
+    let mut cursor = EventCursor::new(None, None);
 
-    loop {
+    'ws: loop {
         tokio::select! {
             outgoing = socket.recv() => {
                 match outgoing {
                     Some(Ok(Message::Text(text))) => {
-                        let request: RpcRequest = match serde_json::from_str(&text) {
-                            Ok(request) => request,
-                            Err(error) => {
+                        let request: RpcRequest =
+                            match ws::parse_rpc_frame(&text, ws::MAX_WS_MESSAGE_BYTES) {
+                                Ok(request) => request,
+                                Err(error) => {
+                                    let oversized = error.code == codes::INVALID_REQUEST;
+                                    let _ = send_json(
+                                        &mut socket,
+                                        &RpcResponse::error(None, error),
+                                    ).await;
+                                    if oversized {
+                                        // The documented bound is a hard limit; do not
+                                        // keep reading frames from this peer.
+                                        break 'ws;
+                                    }
+                                    continue;
+                                }
+                            };
+                        if request.method == "event.subscribe" {
+                            let params: SubscribeParams =
+                                match parse_params::<SubscribeParams>(request.params) {
+                                    Ok(params) => params,
+                                    Err(error) => {
+                                        let _ = send_json(
+                                            &mut socket,
+                                            &RpcResponse::error(request.id, error),
+                                        ).await;
+                                        continue;
+                                    }
+                                };
+                            // A seq cursor is per session; a global subscriber
+                            // has no cross-session cursor in the protocol.
+                            if params.since_seq.is_some() && params.session_id.is_none() {
                                 let _ = send_json(
                                     &mut socket,
-                                    &RpcResponse::error(None, RpcError::new(codes::PARSE_ERROR, error.to_string())),
+                                    &RpcResponse::error(
+                                        request.id,
+                                        RpcError::with_data(
+                                            codes::INVALID_PARAMS,
+                                            "since_seq requires session_id; cross-session backfill is not supported",
+                                            json!({
+                                                "code": "EVENT_SUBSCRIBE_SESSION_REQUIRED",
+                                                "retryable": false,
+                                                "hint": "subscribe per session with since_seq, or call event.list to resync",
+                                            }),
+                                        ),
+                                    ),
                                 ).await;
                                 continue;
                             }
-                        };
-                        if request.method == "event.subscribe" {
-                            let params: SubscribeParams = if request.params.is_null() {
-                                SubscribeParams { session_id: None }
-                            } else {
-                                match serde_json::from_value(request.params) {
-                                    Ok(params) => params,
+                            if params.since_seq.is_some_and(|seq| seq > i64::MAX as u64) {
+                                let _ = send_json(
+                                    &mut socket,
+                                    &RpcResponse::error(
+                                        request.id,
+                                        RpcError::with_data(
+                                            codes::INVALID_PARAMS,
+                                            "since_seq is outside the persisted event sequence range",
+                                            json!({
+                                                "code": "EVENT_SUBSCRIBE_SEQ_INVALID",
+                                                "retryable": false,
+                                                "hint": "use the last seq reported by event.appended or event.list",
+                                            }),
+                                        ),
+                                    ),
+                                ).await;
+                                continue;
+                            }
+                            let mut replayed: Vec<vp_protocol::types::Event> = Vec::new();
+                            let mut truncated = false;
+                            if let (Some(session_id), Some(since_seq)) =
+                                (params.session_id.clone(), params.since_seq)
+                            {
+                                match state
+                                    .engine
+                                    .list_events(
+                                        session_id.clone(),
+                                        since_seq.saturating_add(1),
+                                        ws::MAX_REPLAY_EVENTS,
+                                    )
+                                    .await
+                                {
+                                    Ok(events) => {
+                                        if events.len() as u32 >= ws::MAX_REPLAY_EVENTS
+                                            && let Some(last) = events.last()
+                                        {
+                                            match state
+                                                .engine
+                                                .list_events(
+                                                    session_id.clone(),
+                                                    last.seq.saturating_add(1),
+                                                    1,
+                                                )
+                                                .await
+                                            {
+                                                Ok(more) => truncated = !more.is_empty(),
+                                                Err(error) => {
+                                                    let _ = send_json(
+                                                        &mut socket,
+                                                        &RpcResponse::error(
+                                                            request.id,
+                                                            RpcError::new(
+                                                                codes::INTERNAL_ERROR,
+                                                                error.to_string(),
+                                                            ),
+                                                        ),
+                                                    ).await;
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        replayed = events;
+                                    }
                                     Err(error) => {
                                         let _ = send_json(
                                             &mut socket,
                                             &RpcResponse::error(
                                                 request.id,
-                                                RpcError::new(codes::INVALID_PARAMS, error.to_string()),
+                                                RpcError::new(
+                                                    codes::INTERNAL_ERROR,
+                                                    error.to_string(),
+                                                ),
                                             ),
                                         ).await;
                                         continue;
                                     }
                                 }
-                            };
-                            filter = params.session_id;
-                            let _ = send_json(
+                            }
+                            let replayed_count = replayed.len();
+                            cursor = EventCursor::new(params.session_id.clone(), params.since_seq);
+                            if send_json(
                                 &mut socket,
-                                &RpcResponse::success(request.id, json!({"subscribed": true})),
-                            ).await;
+                                &RpcResponse::success(
+                                    request.id,
+                                    json!({
+                                        "subscribed": true,
+                                        "since_seq": params.since_seq,
+                                        "replayed": replayed_count,
+                                        "truncated": truncated,
+                                    }),
+                                ),
+                            ).await.is_err()
+                            {
+                                break 'ws;
+                            }
+                            for event in &replayed {
+                                if !cursor.observe(event) {
+                                    continue;
+                                }
+                                let notification = RpcNotification::new("event.appended", event);
+                                if send_json(&mut socket, &notification).await.is_err() {
+                                    break 'ws;
+                                }
+                            }
+                            if truncated {
+                                // The client asked for a seq older than the
+                                // bounded replay window; tell it to resync
+                                // instead of pretending the stream is complete.
+                                let gap = cursor.gap_notification(None, "backfill_truncated");
+                                if send_json(&mut socket, &gap).await.is_err() {
+                                    break 'ws;
+                                }
+                            }
                             continue;
                         }
                         let response = dispatch(&state, request).await;
@@ -380,7 +530,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
             event = events.recv() => {
                 match event {
                     Ok(event) => {
-                        if filter.as_deref().is_some_and(|id| id != event.session_id) {
+                        if !cursor.observe(&event) {
                             continue;
                         }
                         let notification = RpcNotification::new("event.appended", &event);
@@ -389,7 +539,14 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!(skipped, "websocket event subscriber lagged");
+                        // Never drop state silently. The client receives the
+                        // last seq it actually saw and a resync instruction;
+                        // the audit event log remains the source of truth.
+                        warn!(skipped, "websocket event subscriber lagged; sending event.gap");
+                        let gap = cursor.gap_notification(Some(skipped), "lagged");
+                        if send_json(&mut socket, &gap).await.is_err() {
+                            break;
+                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }

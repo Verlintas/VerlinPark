@@ -1093,6 +1093,245 @@ pub(super) fn parse_parallel_tasks(
     Ok(parsed)
 }
 
+/// Snapshot of the agents and task-worktree paths that existed before a batch
+/// begins preparing Workers. On a setup error only items created after this
+/// snapshot are rolled back.
+pub(in crate::agent) struct BatchSetupSnapshot {
+    agent_ids: HashSet<String>,
+    worktree_paths: HashSet<String>,
+    task_root: PathBuf,
+    project_root: PathBuf,
+    session_head: Option<String>,
+}
+
+pub(in crate::agent) async fn batch_setup_snapshot(
+    engine: &Engine,
+    session: &Session,
+) -> Result<BatchSetupSnapshot> {
+    let agents = engine.list_agents(&session.id).await?;
+    let agent_ids = agents.iter().map(|agent| agent.id.clone()).collect();
+    let worktree_paths = agents
+        .iter()
+        .filter_map(|agent| agent.worktree.clone())
+        .collect();
+    let task_root = engine
+        .store()
+        .data_dir()
+        .join("worktrees")
+        .join(&session.project_id)
+        .join(&session.id);
+    let (_, project) = load_session_project(engine.store().clone(), &session.id).await?;
+    let session_head = match session.worktree.clone().map(PathBuf::from) {
+        Some(path) => tokio::task::spawn_blocking(move || worktree::head_commit(&path))
+            .await
+            .ok()
+            .and_then(Result::ok),
+        None => None,
+    };
+    Ok(BatchSetupSnapshot {
+        agent_ids,
+        worktree_paths,
+        task_root,
+        project_root: PathBuf::from(project.root),
+        session_head,
+    })
+}
+
+/// Best-effort compensation for a failed batch preparation. It never deletes
+/// a branch and only removes a newly created task worktree when it is clean
+/// and its branch contains no commit outside the session head. Claims are
+/// settled as `failed`; new agents get a terminal `agent.finished` event.
+pub(in crate::agent) async fn rollback_batch_setup(
+    engine: &Engine,
+    session_id: &str,
+    plan_seq: Option<u64>,
+    claimed_task_ids: &[String],
+    snapshot: &BatchSetupSnapshot,
+    detail: &str,
+) {
+    let agents = match engine.list_agents(session_id).await {
+        Ok(agents) => agents,
+        Err(error) => {
+            tracing::warn!(%error, session_id, "batch setup rollback could not list agents");
+            return;
+        }
+    };
+    let new_agents = agents
+        .iter()
+        .filter(|agent| !snapshot.agent_ids.contains(&agent.id))
+        .collect::<Vec<_>>();
+    for agent in &new_agents {
+        if let Err(error) = engine.update_agent_status(&agent.id, "failed").await {
+            tracing::warn!(%error, agent_id = %agent.id, "batch setup rollback could not fail agent");
+        }
+        if let Err(error) = engine
+            .append_event(
+                session_id,
+                "agent.finished",
+                serde_json::json!({
+                    "agent_id": agent.id,
+                    "agent_name": agent.name,
+                    "agent_role": agent.role,
+                    "status": "failed",
+                    "summary": detail,
+                    "reason": "batch_setup_failed",
+                    "task_id": agent.task_id,
+                    "department": agent.department,
+                    "worktree": agent.worktree,
+                    "branch": agent.branch,
+                }),
+            )
+            .await
+        {
+            tracing::warn!(%error, agent_id = %agent.id, "batch setup rollback could not record agent.finished");
+        }
+    }
+    // A run may have attached a workspace before it recorded the binding on
+    // the agent row. Release every active session binding acquired by this
+    // batch; release is idempotent and keeps component branches/evidence, and
+    // the next attempt re-attaches the same component workspace.
+    if !new_agents.is_empty() {
+        let store = engine.store().clone();
+        let session = session_id.to_string();
+        let reason = detail.to_string();
+        match tokio::task::spawn_blocking(move || {
+            store.release_session_worker_workspace(
+                &session,
+                None,
+                &reason,
+                Some("engine:batch-setup-failed"),
+            )
+        })
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, session_id, "batch setup rollback could not release workspace leases");
+            }
+            Err(error) => {
+                tracing::warn!(%error, session_id, "batch setup rollback workspace release task failed");
+            }
+        }
+    }
+    for agent in &new_agents {
+        if agent.workspace_id.is_some() {
+            continue;
+        }
+        let Some(worktree_path) = agent.worktree.clone() else {
+            continue;
+        };
+        if snapshot.worktree_paths.contains(&worktree_path) {
+            continue;
+        }
+        let path = PathBuf::from(&worktree_path);
+        if !path.starts_with(&snapshot.task_root) {
+            continue;
+        }
+        let branch = agent.branch.clone();
+        let session_head = snapshot.session_head.clone();
+        let probe_path = path.clone();
+        let disposable = tokio::task::spawn_blocking(move || -> bool {
+            if worktree::has_uncommitted_changes(&probe_path).unwrap_or(true) {
+                return false;
+            }
+            let (Some(branch), Some(head)) = (branch, session_head) else {
+                return false;
+            };
+            worktree::is_ancestor(&probe_path, &branch, &head).unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false);
+        if !disposable {
+            continue;
+        }
+        let project_root = snapshot.project_root.clone();
+        if let Err(error) =
+            tokio::task::spawn_blocking(move || worktree::remove_worktree(&project_root, &path))
+                .await
+                .unwrap_or_else(|error| Err(anyhow!(error)))
+        {
+            tracing::warn!(%error, path = %worktree_path, "batch setup rollback could not remove an empty task worktree");
+        }
+    }
+    if let Some(plan_seq) = plan_seq {
+        for task_id in claimed_task_ids {
+            if let Err(error) = record_scheduled_task_finish(
+                engine,
+                session_id,
+                plan_seq,
+                task_id,
+                "failed",
+                Some(detail),
+            )
+            .await
+            {
+                tracing::warn!(%error, task_id, "batch setup rollback could not settle claimed task");
+            }
+        }
+    }
+    // A worktree can be created just before `set_agent_worktree` fails, so it
+    // is not yet visible on an agent row. Scan the bounded session task
+    // directory for such leftovers and remove only clean, merged/ancestor
+    // checkouts; their branches are always preserved.
+    let task_root = snapshot.task_root.clone();
+    let candidates = tokio::task::spawn_blocking(move || {
+        let mut paths = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&task_root) {
+            for entry in entries.flatten().take(64) {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                if path.file_name().and_then(|name| name.to_str()) == Some("leader") {
+                    continue;
+                }
+                paths.push(path);
+            }
+        }
+        paths
+    })
+    .await
+    .unwrap_or_default();
+    for path in candidates {
+        let worktree_path = path.to_string_lossy().to_string();
+        if snapshot.worktree_paths.contains(&worktree_path) {
+            continue;
+        }
+        let Some(name) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let branch = format!("verlinpark/{session_id}--{name}");
+        let session_head = snapshot.session_head.clone();
+        let probe_path = path.clone();
+        let disposable = tokio::task::spawn_blocking(move || -> bool {
+            if worktree::has_uncommitted_changes(&probe_path).unwrap_or(true) {
+                return false;
+            }
+            let Some(head) = session_head else {
+                return false;
+            };
+            worktree::is_ancestor(&probe_path, &branch, &head).unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false);
+        if !disposable {
+            continue;
+        }
+        let project_root = snapshot.project_root.clone();
+        if let Err(error) =
+            tokio::task::spawn_blocking(move || worktree::remove_worktree(&project_root, &path))
+                .await
+                .unwrap_or_else(|error| Err(anyhow!(error)))
+        {
+            tracing::warn!(%error, path = %worktree_path, "batch setup rollback could not remove an unattached task worktree");
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_parallel_workers(
     engine: &Engine,
@@ -1105,132 +1344,158 @@ pub(super) async fn run_parallel_workers(
     input: &serde_json::Value,
 ) -> Result<ParallelResult> {
     let tasks = parse_parallel_tasks(input, spec.profile)?;
+    let snapshot = batch_setup_snapshot(engine, session).await?;
     let mut prepared = Vec::new();
     let mut worker_slots = Vec::new();
-    for task in tasks {
-        if control.is_cancelled() {
-            return Ok(ParallelResult::Cancelled);
-        }
-        let Some((ordinal, slot)) = budget.reserve_slot(AgentRole::Worker) else {
-            return Ok(ParallelResult::Output(ToolOutput::error(
-                "the Worker cap for this session has been reached",
-            )));
-        };
-        worker_slots.push(slot);
-        let child_name = task
-            .name
-            .clone()
-            .unwrap_or_else(|| format!("Worker {}", ordinal));
-        let child = engine
-            .create_agent(
-                &session.id,
-                AgentRole::Worker.as_str(),
-                &child_name,
-                None,
-                Some(spec.id.clone()),
-                &model_for(config, AgentRole::Worker),
-            )
-            .await?;
-        let workspace_binding = engine
-            .attach_worker_workspace_for_run(&session.id, None, spec.department.as_deref())
-            .await?;
-        let (child_identity_id, child_identity_generation) = match workspace_binding.as_ref() {
-            Some(binding) => {
-                let identity_id = binding.workspace.identity_id.clone();
-                let generation = engine
-                    .get_agent_identity(&identity_id)
-                    .await
-                    .ok()
-                    .map(|result| result.identity.generation);
-                (Some(identity_id), generation)
+    let setup_result: Result<Option<ParallelResult>> = Box::pin(async {
+        for task in tasks {
+            if control.is_cancelled() {
+                return Ok(Some(ParallelResult::Cancelled));
             }
-            None => engine
-                .prompt_identity_for_run(
+            let Some((ordinal, slot)) = budget.reserve_slot(AgentRole::Worker) else {
+                return Ok(Some(ParallelResult::Output(ToolOutput::error(
+                    "the Worker cap for this session has been reached",
+                ))));
+            };
+            worker_slots.push(slot);
+            let child_name = task
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("Worker {}", ordinal));
+            let child = engine
+                .create_agent(
                     &session.id,
                     AgentRole::Worker.as_str(),
+                    &child_name,
                     None,
-                    spec.department.as_deref(),
+                    Some(spec.id.clone()),
+                    &model_for(config, AgentRole::Worker),
                 )
-                .await?
-                .map(|identity| (identity.id, identity.generation))
-                .map(|(id, generation)| (Some(id), Some(generation)))
-                .unwrap_or((None, None)),
-        };
-        let (info, workspace_id, session_workspace_id) = match workspace_binding {
-            Some(binding) => {
-                let head_path = PathBuf::from(&binding.session.worktree_path);
-                let head = tokio::task::spawn_blocking(move || worktree::head_commit(&head_path))
-                    .await??;
-                (
-                    crate::worktree::WorktreeInfo {
-                        path: PathBuf::from(&binding.session.worktree_path),
-                        branch: binding.session.branch.clone(),
-                        base_commit: head,
-                    },
-                    Some(binding.workspace.id),
-                    Some(binding.session.id),
-                )
-            }
-            None => (
-                engine
-                    .create_task_worktree(
-                        &project.root,
-                        &project.id,
+                .await?;
+            let workspace_binding = engine
+                .attach_worker_workspace_for_run(&session.id, None, spec.department.as_deref())
+                .await?;
+            let (child_identity_id, child_identity_generation) = match workspace_binding.as_ref() {
+                Some(binding) => {
+                    let identity_id = binding.workspace.identity_id.clone();
+                    let generation = engine
+                        .get_agent_identity(&identity_id)
+                        .await
+                        .ok()
+                        .map(|result| result.identity.generation);
+                    (Some(identity_id), generation)
+                }
+                None => engine
+                    .prompt_identity_for_run(
                         &session.id,
-                        &child.id,
-                        &spec.session_branch,
+                        AgentRole::Worker.as_str(),
+                        None,
+                        spec.department.as_deref(),
                     )
-                    .await?,
-                None,
-                None,
-            ),
-        };
-        engine
-            .set_agent_worktree(&child.id, &info.path.to_string_lossy(), &info.branch)
+                    .await?
+                    .map(|identity| (identity.id, identity.generation))
+                    .map(|(id, generation)| (Some(id), Some(generation)))
+                    .unwrap_or((None, None)),
+            };
+            let (info, workspace_id, session_workspace_id) = match workspace_binding {
+                Some(binding) => {
+                    let head_path = PathBuf::from(&binding.session.worktree_path);
+                    let head =
+                        tokio::task::spawn_blocking(move || worktree::head_commit(&head_path))
+                            .await??;
+                    (
+                        crate::worktree::WorktreeInfo {
+                            path: PathBuf::from(&binding.session.worktree_path),
+                            branch: binding.session.branch.clone(),
+                            base_commit: head,
+                        },
+                        Some(binding.workspace.id),
+                        Some(binding.session.id),
+                    )
+                }
+                None => (
+                    engine
+                        .create_task_worktree(
+                            &project.root,
+                            &project.id,
+                            &session.id,
+                            &child.id,
+                            &spec.session_branch,
+                        )
+                        .await?,
+                    None,
+                    None,
+                ),
+            };
+            engine
+                .set_agent_worktree(&child.id, &info.path.to_string_lossy(), &info.branch)
+                .await?;
+            engine
+                .set_agent_workspace_binding(&child.id, workspace_id.as_deref(), None)
+                .await?;
+            let child_spec = AgentSpec {
+                id: child.id.clone(),
+                role: AgentRole::Worker,
+                name: child_name.clone(),
+                depth: spec.depth.saturating_add(1),
+                parent_name: Some(spec.name.clone()),
+                title: None,
+                task_id: None,
+                department: spec.department.clone(),
+                identity_id: child_identity_id,
+                identity_generation: child_identity_generation,
+                profile: task.profile,
+                allow_delegation: true,
+                task_kind: None,
+                auto_approve: false,
+                worktree: info.path,
+                branch: info.branch,
+                session_worktree: spec.session_worktree.clone(),
+                session_branch: spec.session_branch.clone(),
+                write_scope: task.scope.clone(),
+                base_commit: info.base_commit,
+                workspace_id,
+                session_workspace_id,
+                parent_workspace_id: None,
+            };
+            emit(
+                engine,
+                &session.id,
+                &child_spec,
+                "agent.spawned",
+                serde_json::json!({
+                    "parent_id": spec.id,
+                    "parent_name": spec.name,
+                    "objective": truncate(&task.objective),
+                    "write_scope": child_spec.write_scope,
+                }),
+            )
             .await?;
-        engine
-            .set_agent_workspace_binding(&child.id, workspace_id.as_deref(), None)
-            .await?;
-        let child_spec = AgentSpec {
-            id: child.id.clone(),
-            role: AgentRole::Worker,
-            name: child_name.clone(),
-            depth: spec.depth.saturating_add(1),
-            parent_name: Some(spec.name.clone()),
-            title: None,
-            task_id: None,
-            department: spec.department.clone(),
-            identity_id: child_identity_id,
-            identity_generation: child_identity_generation,
-            profile: task.profile,
-            allow_delegation: true,
-            task_kind: None,
-            auto_approve: false,
-            worktree: info.path,
-            branch: info.branch,
-            session_worktree: spec.session_worktree.clone(),
-            session_branch: spec.session_branch.clone(),
-            write_scope: task.scope.clone(),
-            base_commit: info.base_commit,
-            workspace_id,
-            session_workspace_id,
-            parent_workspace_id: None,
-        };
-        emit(
-            engine,
-            &session.id,
-            &child_spec,
-            "agent.spawned",
-            serde_json::json!({
-                "parent_id": spec.id,
-                "parent_name": spec.name,
-                "objective": truncate(&task.objective),
-                "write_scope": child_spec.write_scope,
-            }),
-        )
-        .await?;
-        let conversation = vec![ChatMessage::user(task.objective.clone())];
-        prepared.push((child_spec, task.objective, conversation));
+            let conversation = vec![ChatMessage::user(task.objective.clone())];
+            prepared.push((child_spec, task.objective, conversation));
+        }
+        Ok(None)
+    })
+    .await;
+    match setup_result {
+        Ok(None) => {}
+        Ok(Some(early)) => {
+            rollback_batch_setup(
+                engine,
+                &session.id,
+                None,
+                &[],
+                &snapshot,
+                "parallel batch setup aborted before dispatch",
+            )
+            .await;
+            return Ok(early);
+        }
+        Err(error) => {
+            let detail = format!("parallel batch setup failed: {error:#}");
+            rollback_batch_setup(engine, &session.id, None, &[], &snapshot, &detail).await;
+            return Err(error);
+        }
     }
 
     let futures = prepared
@@ -1269,9 +1534,9 @@ pub(super) async fn run_parallel_workers(
     let mut budget_exceeded = false;
     let mut handled = vec![false; prepared.len()];
     for (index, result) in results.iter().enumerate() {
-        handled[index] = true;
         match result {
             Ok(LoopOutcome::Cancelled) => {
+                handled[index] = true;
                 cancelled = true;
                 let (child_spec, _, _) = &prepared[index];
                 engine
@@ -1286,8 +1551,34 @@ pub(super) async fn run_parallel_workers(
                 )
                 .await?;
             }
-            Ok(LoopOutcome::Verdict(_)) => {}
+            Ok(LoopOutcome::Verdict(verdict)) => {
+                // A Worker must never receive a verdict from the run loop:
+                // role policy reserves `submit_verdict` for Verifiers. Treat
+                // it as an unsupported terminal outcome instead of leaving the
+                // agent projection `running`.
+                handled[index] = true;
+                let (child_spec, _, _) = &prepared[index];
+                let summary = format!(
+                    "Worker returned an unsupported Verifier verdict: {}",
+                    truncate(&verdict.summary)
+                );
+                engine.update_agent_status(&child_spec.id, "failed").await?;
+                emit(
+                    engine,
+                    &session.id,
+                    child_spec,
+                    "agent.finished",
+                    serde_json::json!({
+                        "status": "failed",
+                        "summary": truncate(&summary),
+                        "unsupported_outcome": "verdict",
+                        "approved": verdict.approved,
+                    }),
+                )
+                .await?;
+            }
             Ok(LoopOutcome::BudgetExceeded(stop)) => {
+                handled[index] = true;
                 if stop.is_abortive() {
                     budget_exceeded = true;
                 }
@@ -1305,7 +1596,7 @@ pub(super) async fn run_parallel_workers(
                 )
                 .await?;
             }
-            _ => {}
+            Ok(LoopOutcome::Final(_)) | Ok(LoopOutcome::Deferred(_)) | Err(_) => {}
         }
     }
     if cancelled || budget_exceeded {
@@ -1394,7 +1685,11 @@ pub(super) async fn run_parallel_workers(
                     }
                 }
             }
-            Ok(LoopOutcome::Verdict(_)) | Ok(LoopOutcome::Cancelled) => {
+            Ok(LoopOutcome::Verdict(_)) => {
+                // Terminalized in the abort scan above; never report success.
+                all_success = false;
+            }
+            Ok(LoopOutcome::Cancelled) => {
                 all_success = false;
             }
             Ok(LoopOutcome::Deferred(wait)) => {

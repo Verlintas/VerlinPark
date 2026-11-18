@@ -298,6 +298,10 @@ pub struct MaterializedInstructions {
     /// True when the persisted ordered state changed (new hash, added key,
     /// removed key, or ordinal/tail change).
     pub state_changed: bool,
+    /// Number of content-addressed blob writes performed by this pass. A
+    /// second materialization with unchanged text must report `0`; tests use
+    /// this counter instead of inferring idempotence from row timestamps.
+    pub blob_writes: u64,
     /// The complete persisted ordered state for the scope, including a
     /// verified tail that a warm preserved without sending. Missing blobs are
     /// represented by their hash with `available=false` only in the RPC; this
@@ -603,6 +607,7 @@ pub fn preview(
         tail,
         rebuilds: Vec::new(),
         state_changed: false,
+        blob_writes: 0,
         persisted,
     })
 }
@@ -651,6 +656,7 @@ pub fn materialize(
 
     let mut sections = Vec::with_capacity(sorted.len());
     let mut rebuilds = Vec::new();
+    let mut blob_writes = 0u64;
     let now = vp_protocol::now_rfc3339();
 
     for candidate in &sorted {
@@ -722,15 +728,33 @@ pub fn materialize(
             )
             .with_key(candidate.key.key()));
         }
-        if store.put_instruction_blob(&source_text).is_err() {
-            return Err(InstructionError::new(
-                InstructionErrorKind::StateWriteFailed,
-                format!(
-                    "could not store instruction blob for {}",
-                    candidate.key.key()
-                ),
-            )
-            .with_key(candidate.key.key()));
+        // Content-addressed blobs are immutable in practice: the normal case
+        // on every run after the first is that the exact body already exists.
+        // Verify it and skip the write, so repeated materialization does not
+        // hold the global store mutex for a no-op INSERT on every section.
+        let already_stored = match store.get_instruction_blob(&chosen_hash) {
+            Ok(Some(blob)) => verify_blob(&blob),
+            Ok(None) => false,
+            Err(error) => {
+                return Err(InstructionError::new(
+                    InstructionErrorKind::StateWriteFailed,
+                    format!("could not read instruction blob: {error:#}"),
+                )
+                .with_key(candidate.key.key()));
+            }
+        };
+        if !already_stored {
+            if store.put_instruction_blob(&source_text).is_err() {
+                return Err(InstructionError::new(
+                    InstructionErrorKind::StateWriteFailed,
+                    format!(
+                        "could not store instruction blob for {}",
+                        candidate.key.key()
+                    ),
+                )
+                .with_key(candidate.key.key()));
+            }
+            blob_writes = blob_writes.saturating_add(1);
         }
         // Materialize only from the store after the write, so a corrupted body
         // is read back through the same verification path as a normal hit.
@@ -904,6 +928,7 @@ pub fn materialize(
         tail,
         rebuilds,
         state_changed,
+        blob_writes,
         persisted,
     })
 }
@@ -1268,6 +1293,11 @@ mod tests {
         assert_eq!(first.stable_prefix_hash(), second.stable_prefix_hash());
         assert!(!second.state_changed);
         assert!(second.rebuilds.is_empty());
+        assert!(first.blob_writes > 0, "the first pass writes new blobs");
+        assert_eq!(
+            second.blob_writes, 0,
+            "an unchanged second pass must not write any instruction blob"
+        );
         for key in [
             InstructionSectionKey::CoreCharter,
             InstructionSectionKey::AgentIdentity,

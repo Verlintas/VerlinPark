@@ -337,6 +337,11 @@ pub(crate) fn spawn_browser_sweeper(engine: Engine) {
 /// Release the logical GUI lease shortly after its grace expires. Helpers stay
 /// warm for their own idle window; this sweeper only releases ownership so the
 /// next session can take the GUI without waiting for the 120s lease TTL.
+///
+/// The core coordinator tracks the action ticket that is currently in flight
+/// and refuses to release that holder, so a long browser/computer action is
+/// never cut off by a user-configured grace (including 0). Once the action
+/// finishes, the configured grace applies normally.
 pub(crate) fn spawn_gui_grace_sweeper(engine: Engine) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -434,17 +439,62 @@ pub(crate) fn spawn_stall_recovery_reconciler(agent: AgentService) {
     });
 }
 
+/// Parse a sweep interval. `0` (or a malformed value falling back to `0`)
+/// disables only that sweep. Each sweep owns its env var so an orchestration
+/// opt-out cannot silently disable lease/audit hygiene.
+pub(crate) fn sweep_interval_secs<F>(get: F, key: &str, default: u64) -> Option<u64>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let seconds = get(key)
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(default);
+    (seconds > 0).then_some(seconds)
+}
+
+fn env_lookup(key: &str) -> Option<String> {
+    std::env::var(key).ok()
+}
+
+/// Runtime/computer lease hygiene and lease-audit retention. These are
+/// independent of the orchestration controller: disabling orchestration must
+/// not leave stale leases visible or grow the audit table.
+pub(crate) fn spawn_runtime_lease_sweeper(engine: Engine) {
+    let Some(seconds) = sweep_interval_secs(env_lookup, "VERLINPARK_RUNTIME_LEASE_SWEEP_SECS", 30)
+    else {
+        return;
+    };
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(seconds.max(5)));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if let Err(error) = engine.sweep_runtime_leases().await {
+                tracing::warn!(%error, "runtime lease sweep failed");
+            }
+            let audit_retention_days = std::env::var("VERLINPARK_LEASE_AUDIT_DAYS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(30);
+            if let Err(error) = engine.prune_runtime_lease_audit(audit_retention_days).await {
+                tracing::warn!(%error, "runtime lease audit prune failed");
+            }
+            if let Err(error) = engine.sweep_computer_leases().await {
+                tracing::warn!(%error, "computer lease sweep failed");
+            }
+        }
+    });
+}
+
 /// Run the deterministic controller for sessions with failed or blocked plan
 /// tasks. Task finishes already trigger a pass; this catches retry gates that
-/// become due later and failures that survived a daemon restart.
+/// become due later and failures that survived a daemon restart. Lease hygiene
+/// runs in its own task (`spawn_runtime_lease_sweeper`).
 pub(crate) fn spawn_orchestration_controller(engine: Engine) {
-    let seconds = std::env::var("VERLINPARK_ORCHESTRATION_TICK_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(20);
-    if seconds == 0 {
+    let Some(seconds) = sweep_interval_secs(env_lookup, "VERLINPARK_ORCHESTRATION_TICK_SECS", 20)
+    else {
         return;
-    }
+    };
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(seconds.max(5)));
         interval.tick().await;
@@ -471,19 +521,6 @@ pub(crate) fn spawn_orchestration_controller(engine: Engine) {
                         tracing::warn!(%error, %session_id, "orchestration controller pass failed");
                     }
                 }
-            }
-            if let Err(error) = engine.sweep_runtime_leases().await {
-                tracing::warn!(%error, "runtime lease sweep failed");
-            }
-            let audit_retention_days = std::env::var("VERLINPARK_LEASE_AUDIT_DAYS")
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(30);
-            if let Err(error) = engine.prune_runtime_lease_audit(audit_retention_days).await {
-                tracing::warn!(%error, "runtime lease audit prune failed");
-            }
-            if let Err(error) = engine.sweep_computer_leases().await {
-                tracing::warn!(%error, "computer lease sweep failed");
             }
         }
     });

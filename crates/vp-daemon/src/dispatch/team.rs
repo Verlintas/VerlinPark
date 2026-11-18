@@ -97,19 +97,25 @@ pub(super) async fn handle(
         }
         "critical_path.policy.set" => {
             match parse_params::<SetCriticalPathPolicyParams>(request.params) {
-                Ok(params) => match state
-                    .engine
-                    .set_critical_path_policy(&params.project_id, &params.policy)
-                    .await
-                {
-                    Ok(policy) => RpcResponse::success(
+                Ok(params) => match params.policy.validate() {
+                    Err(message) => validation_or_internal(
                         id,
-                        CriticalPathPolicyResult {
-                            project_id: params.project_id,
-                            policy,
-                        },
+                        anyhow::anyhow!("invalid critical-path policy: {message}"),
                     ),
-                    Err(error) => internal_error(id, error),
+                    Ok(()) => match state
+                        .engine
+                        .set_critical_path_policy(&params.project_id, &params.policy)
+                        .await
+                    {
+                        Ok(policy) => RpcResponse::success(
+                            id,
+                            CriticalPathPolicyResult {
+                                project_id: params.project_id,
+                                policy,
+                            },
+                        ),
+                        Err(error) => validation_or_internal(id, error),
+                    },
                 },
                 Err(response) => response_with_id(id, response),
             }

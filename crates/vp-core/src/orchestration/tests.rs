@@ -521,6 +521,56 @@ fn controller_unblocks_stale_blocked_tasks() {
 }
 
 #[test]
+fn controller_unblocks_stale_blocked_tasks_after_a_skipped_dependency() {
+    let first = task("a", &[]);
+    let second = task("b", &["a"]);
+    let plan = plan(vec![first.clone(), second.clone()]);
+    let rows = vec![row(&first, "skipped", 1), row(&second, "blocked", 0)];
+    let actions = plan_actions(ControllerInput {
+        session: &session(),
+        plan: &plan,
+        scheduled: &rows,
+        events: &[],
+        notes: &[],
+        policy: &policy(),
+        budget_exhausted: false,
+    });
+    assert!(actions.iter().any(|action| matches!(
+        action,
+        ControllerAction::Unblock { task_id, .. } if task_id == "b"
+    )));
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, ControllerAction::Block { .. })),
+        "a skipped dependency must not re-block or oscillate downstream"
+    );
+}
+
+#[test]
+fn controller_keeps_a_gate_deferred_task_blocked() {
+    let first = task("a", &[]);
+    let plan = plan(vec![first.clone()]);
+    let mut deferred = row(&first, "blocked", 1);
+    deferred.last_error = Some("waiting for external gate".to_string());
+    let actions = plan_actions(ControllerInput {
+        session: &session(),
+        plan: &plan,
+        scheduled: &[deferred],
+        events: &[],
+        notes: &[],
+        policy: &policy(),
+        budget_exhausted: false,
+    });
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, ControllerAction::Unblock { .. })),
+        "an external-gate wait must not be released by the stale-block cleanup"
+    );
+}
+
+#[test]
 fn controller_resolves_blockers_for_completed_tasks() {
     let task = task("a", &[]);
     let plan = plan(vec![task.clone()]);

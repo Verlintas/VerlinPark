@@ -199,6 +199,11 @@ pub fn compare_reports(
         warnings
             .push("pricing profiles differ; cost comparison is not billing-equivalent".to_string());
     }
+    if a.pricing_provenance != b.pricing_provenance {
+        warnings.push(
+            "pricing provenance differs; cost comparison is not billing-equivalent".to_string(),
+        );
+    }
     let now = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "unknown".to_string());
@@ -267,12 +272,50 @@ fn collect_report_mismatches(
             b: b.provider.mode.clone(),
         });
     }
+    if a.provider.id != b.provider.id {
+        mismatches.push(ComparisonMismatch {
+            scenario_id: "(report)".to_string(),
+            field: "provider_id".to_string(),
+            a: a.provider.id.clone(),
+            b: b.provider.id.clone(),
+        });
+    }
     if a.provider.model != b.provider.model {
         mismatches.push(ComparisonMismatch {
             scenario_id: "(report)".to_string(),
             field: "model".to_string(),
             a: a.provider.model.clone(),
             b: b.provider.model.clone(),
+        });
+    }
+    if a.provider.base_url != b.provider.base_url {
+        mismatches.push(ComparisonMismatch {
+            scenario_id: "(report)".to_string(),
+            field: "provider_base_url".to_string(),
+            a: a.provider
+                .base_url
+                .clone()
+                .unwrap_or_else(|| "local/fake".to_string()),
+            b: b.provider
+                .base_url
+                .clone()
+                .unwrap_or_else(|| "local/fake".to_string()),
+        });
+    }
+    if a.provider.usage_source != b.provider.usage_source {
+        mismatches.push(ComparisonMismatch {
+            scenario_id: "(report)".to_string(),
+            field: "usage_source".to_string(),
+            a: a.provider.usage_source.clone(),
+            b: b.provider.usage_source.clone(),
+        });
+    }
+    if a.pricing_provenance != b.pricing_provenance {
+        mismatches.push(ComparisonMismatch {
+            scenario_id: "(report)".to_string(),
+            field: "pricing_provenance".to_string(),
+            a: a.pricing_provenance.label().to_string(),
+            b: b.pricing_provenance.label().to_string(),
         });
     }
     if a.pricing != b.pricing {
@@ -334,14 +377,40 @@ fn compare_keys(
             b.comparison.provider_mode.clone(),
         ),
         (
+            "provider_id",
+            a.comparison.provider_id.clone(),
+            b.comparison.provider_id.clone(),
+        ),
+        (
             "model",
             a.comparison.model.clone(),
             b.comparison.model.clone(),
         ),
         (
+            "provider_base_url",
+            a.comparison
+                .provider_base_url
+                .clone()
+                .unwrap_or_else(|| "local/fake".to_string()),
+            b.comparison
+                .provider_base_url
+                .clone()
+                .unwrap_or_else(|| "local/fake".to_string()),
+        ),
+        (
             "pricing_fingerprint",
             a.comparison.pricing_fingerprint.clone(),
             b.comparison.pricing_fingerprint.clone(),
+        ),
+        (
+            "pricing_source",
+            a.comparison.pricing_source.clone(),
+            b.comparison.pricing_source.clone(),
+        ),
+        (
+            "pricing_provenance_fingerprint",
+            a.comparison.pricing_provenance_fingerprint.clone(),
+            b.comparison.pricing_provenance_fingerprint.clone(),
         ),
     ] {
         if a_value != b_value {
@@ -449,7 +518,7 @@ pub fn render_comparison(comparison: &ComparisonReport) -> String {
     }
     text.push('\n');
     text.push_str(&format!(
-        "Totals: A cost {} USD / B cost {} USD. Prices are caller-supplied. This comparison is not a universal ranking.\n",
+        "Totals: A cost {} USD / B cost {} USD. Prices follow each report's recorded provenance (caller, illustrative default, or partial override); this comparison is only billing-equivalent when that provenance and the values match. It is not a universal ranking.\n",
         format_usd(comparison.a_summary.total_cost_usd),
         format_usd(comparison.b_summary.total_cost_usd)
     ));
@@ -478,8 +547,13 @@ mod tests {
             fixture_fingerprint: "fixture".into(),
             acceptance_fingerprint: acceptance.into(),
             provider_mode: "fake".into(),
+            provider_id: "fake".into(),
             model: model.into(),
+            provider_base_url: None,
             pricing_fingerprint: Pricing::benchmark_default().fingerprint(),
+            pricing_source: "caller".into(),
+            pricing_provenance_fingerprint: crate::metrics::PricingProvenance::caller()
+                .fingerprint(),
         }
     }
 
@@ -549,6 +623,7 @@ mod tests {
             },
             provider: ProviderMetadata::fake("fake", model, "simulated", 0),
             pricing: Pricing::benchmark_default(),
+            pricing_provenance: crate::metrics::PricingProvenance::caller(),
             selection: BenchSelection {
                 scenario_ids: vec![scenario.scenario_id.clone()],
                 repetitions: scenario.repetitions,
@@ -615,6 +690,44 @@ mod tests {
                 .any(|mismatch| mismatch.field == "model")
         );
         assert!(refusal.to_string().contains("--allow-mismatch"));
+    }
+
+    #[test]
+    fn mismatched_provider_endpoint_and_pricing_source_are_refused() {
+        let mut a = report(
+            aggregate(1, 1, Some(1.0)),
+            summary(1, 1, Some(1.0)),
+            "bench",
+        );
+        a.provider.id = "provider-a".into();
+        a.provider.base_url = Some("https://a.example/v1".into());
+        a.scenarios[0].comparison.provider_id = "provider-a".into();
+        a.scenarios[0].comparison.provider_base_url = Some("https://a.example/v1".into());
+        let mut b = a.clone();
+        b.provider.id = "provider-b".into();
+        b.provider.base_url = Some("https://b.example/v1".into());
+        b.scenarios[0].comparison.provider_id = "provider-b".into();
+        b.scenarios[0].comparison.provider_base_url = Some("https://b.example/v1".into());
+        b.pricing_provenance =
+            crate::metrics::PricingProvenance::from_overrides(true, false, false, false);
+        b.scenarios[0].comparison.pricing_source = "partial_caller".into();
+        let refusal =
+            compare_reports(&a, &b, "a".into(), "b".into(), CompareOptions::default()).unwrap_err();
+        for field in [
+            "provider_id",
+            "provider_base_url",
+            "pricing_provenance",
+            "pricing_source",
+        ] {
+            assert!(
+                refusal
+                    .mismatches
+                    .iter()
+                    .any(|mismatch| mismatch.field == field),
+                "missing refusal for {field}: {:?}",
+                refusal.mismatches
+            );
+        }
     }
 
     #[test]

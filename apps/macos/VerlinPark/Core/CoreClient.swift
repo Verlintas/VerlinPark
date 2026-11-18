@@ -38,15 +38,59 @@ enum CoreError: LocalizedError, Sendable {
     }
 }
 
+/// Bounded RPC timeout classes. Reads stay short so a hung daemon is visible
+/// quickly; merge/land/PR/probe/replay operations legitimately take longer and
+/// get a larger bounded budget instead of a false 30s failure.
+enum RPCTimeouts {
+    static let short: Duration = .seconds(15)
+    static let standard: Duration = .seconds(30)
+    static let long: Duration = .seconds(120)
+    static let extended: Duration = .seconds(300)
+
+    static func timeout(for method: String) -> Duration {
+        switch method {
+        case "ping", "server.info", "agent.info", "project.list", "session.list",
+             "event.list", "approval.queue", "approval.list", "question.list":
+            short
+        case "session.land", "session.pr", "forge.preflight":
+            .seconds(180)
+        case "agent.probe", "mcp.server.probe", "acp.agent.probe", "mcp.call",
+             "remote.test.status", "remote.bootstrap.status",
+             "remote.integration.status", "remote.integration.cleanup",
+             "session.compact", "session.cache.warm", "session.transcript",
+             "session.usage_csv", "test_cache.impact", "program.tick":
+            long
+        case "session.replay", "orchestration.replay", "session.diagnosis",
+             "merge_queue.resolve", "merge_queue.retry",
+             "session.fork", "session.fork.merge", "session.checkpoint.restore",
+             "session.context.restore", "session.checkpoint",
+             "project.cleanup_worktrees", "memory.embeddings.rebuild",
+             "memory.embeddings.index.rebuild", "source.embedding.reindex",
+             "source.embedding.index_rebuild", "source.import", "source.reindex",
+             "artifact.archive.extract", "artifact.materialize", "media.transcode",
+             "update.download":
+            extended
+        case "agent.configure", "session.prompt", "session.steer", "session.defer",
+             "session.commit", "session.discard", "session.plan_resume":
+            .seconds(60)
+        default:
+            standard
+        }
+    }
+}
+
 actor CoreClient {
     private var urlSession: URLSession?
     private var socket: URLSessionWebSocketTask?
     private var pending: [String: CheckedContinuation<JSONValue, Error>] = [:]
     private var requestTimeouts: [String: Task<Void, Never>] = [:]
-    private var eventContinuation: AsyncStream<Event>.Continuation?
+    private var eventGate = EventStreamGate()
+    private var connectionEpoch = ConnectionEpoch()
     private var receiveTask: Task<Void, Never>?
     private var isConnected = false
+    private var consecutiveTimeouts = 0
     private var disconnectHandler: (@Sendable (Error) -> Void)?
+    private var eventGapHandler: (@Sendable (EventGap) -> Void)?
 
     func connect(to discovery: Discovery) async throws {
         disconnect()
@@ -62,30 +106,43 @@ actor CoreClient {
         urlSession = session
         self.socket = socket
         socket.resume()
+        let generation = connectionEpoch.advance()
         isConnected = true
         receiveTask = Task { [weak self] in
-            await self?.receiveLoop()
+            await self?.receiveLoop(generation: generation, socket: socket)
         }
 
-        let authResult = try await request(
-            method: "auth",
-            params: [
-                "token": .string(discovery.token),
-                "protocol": .number(1),
-            ]
-        )
-        guard try authResult.decode(AuthResult.self).ok else {
-            throw CoreError.rpc(
-                code: -32001,
-                message: "authentication failed",
-                data: nil
+        do {
+            let authResult = try await request(
+                method: "auth",
+                params: [
+                    "token": .string(discovery.token),
+                    "protocol": .number(1),
+                ]
             )
+            guard try authResult.decode(AuthResult.self).ok else {
+                throw CoreError.rpc(
+                    code: -32001,
+                    message: "authentication failed",
+                    data: nil
+                )
+            }
+            _ = try await request(method: "event.subscribe", params: [:])
+        } catch {
+            // A failed auth/subscribe must not leave the receive task and
+            // socket alive while reporting a failed connection.
+            disconnect()
+            throw error
         }
-        _ = try await request(method: "event.subscribe", params: [:])
     }
 
     func disconnect() {
+        // Advance before cancelling: the cancelled receive loop may still
+        // deliver a close/error, and that path must be stale rather than
+        // reporting a failure or scheduling a reconnect.
+        connectionEpoch.advance()
         isConnected = false
+        consecutiveTimeouts = 0
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
         urlSession?.invalidateAndCancel()
@@ -93,21 +150,31 @@ actor CoreClient {
         receiveTask?.cancel()
         receiveTask = nil
         failAll(CoreError.disconnected)
-        eventContinuation?.finish()
-        eventContinuation = nil
+        eventGate.finishCurrent()
     }
 
     func events() -> AsyncStream<Event> {
         AsyncStream { continuation in
-            self.eventContinuation = continuation
+            let installation = self.eventGate.install(continuation)
+            for event in installation.buffered {
+                continuation.yield(event)
+            }
             continuation.onTermination = { @Sendable _ in
-                Task { await self.clearEventContinuation() }
+                Task {
+                    await self.clearEventContinuation(generation: installation.generation)
+                }
             }
         }
     }
 
     func setDisconnectHandler(_ handler: @escaping @Sendable (Error) -> Void) {
         disconnectHandler = handler
+    }
+
+    /// Additive `event.gap` signal. Unknown/malformed gap payloads are dropped
+    /// before reaching this callback.
+    func setEventGapHandler(_ handler: @escaping @Sendable (EventGap) -> Void) {
+        eventGapHandler = handler
     }
 
     func ping() async throws -> JSONValue {
@@ -3554,18 +3621,20 @@ actor CoreClient {
         sessionID: String,
         body: String,
         agentID: String?,
-        taskID: String?
+        taskID: String?,
+        operationID: String? = nil
     ) async throws -> SessionSteerResult {
-        try await request(
-            method: "session.steer",
-            params: [
-                "session_id": .string(sessionID),
-                "body": .string(body),
-                "agent_id": agentID.map(JSONValue.string) ?? .null,
-                "task_id": taskID.map(JSONValue.string) ?? .null,
-            ]
-        )
-        .decode(SessionSteerResult.self)
+        var params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "body": .string(body),
+            "agent_id": agentID.map(JSONValue.string) ?? .null,
+            "task_id": taskID.map(JSONValue.string) ?? .null,
+        ]
+        if let operationID, !operationID.isEmpty {
+            params["operation_id"] = .string(operationID)
+        }
+        return try await request(method: "session.steer", params: params)
+            .decode(SessionSteerResult.self)
     }
 
     func sessionSteering(
@@ -3598,20 +3667,22 @@ actor CoreClient {
         watchTaskIDs: [String],
         watchMode: String,
         afterSecs: UInt64?,
-        deadlineAt: String?
+        deadlineAt: String?,
+        operationID: String? = nil
     ) async throws -> SessionDeferResult {
-        try await request(
-            method: "session.defer",
-            params: [
-                "session_id": .string(sessionID),
-                "body": .string(body),
-                "watch_task_ids": .array(watchTaskIDs.map(JSONValue.string)),
-                "watch_mode": .string(watchMode),
-                "after_secs": afterSecs.map { .number(Double($0)) } ?? .null,
-                "deadline_at": deadlineAt.map(JSONValue.string) ?? .null,
-            ]
-        )
-        .decode(SessionDeferResult.self)
+        var params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "body": .string(body),
+            "watch_task_ids": .array(watchTaskIDs.map(JSONValue.string)),
+            "watch_mode": .string(watchMode),
+            "after_secs": afterSecs.map { .number(Double($0)) } ?? .null,
+            "deadline_at": deadlineAt.map(JSONValue.string) ?? .null,
+        ]
+        if let operationID, !operationID.isEmpty {
+            params["operation_id"] = .string(operationID)
+        }
+        return try await request(method: "session.defer", params: params)
+            .decode(SessionDeferResult.self)
     }
 
     func sessionContinuations(
@@ -4240,11 +4311,14 @@ actor CoreClient {
             .decode(SessionDiff.self)
     }
 
-    func prompt(sessionID: String, content: String) async throws {
-        let params: [String: JSONValue] = [
+    func prompt(sessionID: String, content: String, operationID: String? = nil) async throws {
+        var params: [String: JSONValue] = [
             "session_id": .string(sessionID),
             "content": .string(content),
         ]
+        if let operationID, !operationID.isEmpty {
+            params["operation_id"] = .string(operationID)
+        }
         _ = try await request(method: "session.prompt", params: params)
     }
 
@@ -4607,7 +4681,8 @@ actor CoreClient {
 
     private func request(
         method: String,
-        params: [String: JSONValue]
+        params: [String: JSONValue],
+        timeout: Duration? = nil
     ) async throws -> JSONValue {
         guard isConnected, let socket else {
             throw CoreError.notConnected
@@ -4623,28 +4698,43 @@ actor CoreClient {
         guard let text = String(data: data, encoding: .utf8) else {
             throw CoreError.invalidURL
         }
+        let timeout = timeout ?? RPCTimeouts.timeout(for: method)
 
-        return try await withCheckedThrowingContinuation { continuation in
-            pending[id] = continuation
-            requestTimeouts[id] = Task { [weak self] in
-                try? await Task.sleep(for: .seconds(30))
-                await self?.timeoutRequest(id)
-            }
-            Task {
-                do {
-                    try await socket.send(.string(text))
-                } catch {
-                    self.failRequest(id, error)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                pending[id] = continuation
+                requestTimeouts[id] = Task { [weak self] in
+                    try? await Task.sleep(for: timeout)
+                    await self?.timeoutRequest(id)
                 }
+                Task {
+                    do {
+                        try await socket.send(.string(text))
+                    } catch {
+                        self.failRequest(id, error)
+                    }
+                }
+            }
+        } onCancel: {
+            // A caller that is cancelled (view/session change) should stop
+            // waiting promptly. The daemon request itself is not replayed; the
+            // operation id is what makes an explicit retry idempotent.
+            Task {
+                await self.cancelRequest(id)
             }
         }
     }
 
-    private func receiveLoop() async {
-        guard let socket else { return }
-        while isConnected {
+    private func receiveLoop(
+        generation: UInt64,
+        socket: URLSessionWebSocketTask
+    ) async {
+        while isConnected, isCurrentConnection(generation, socket: socket) {
             do {
                 let message = try await socket.receive()
+                // A reconnect may have happened while `receive` was suspended.
+                // Never apply a message from the superseded socket.
+                guard isCurrentConnection(generation, socket: socket) else { return }
                 switch message {
                 case let .string(text):
                     handle(text)
@@ -4656,13 +4746,48 @@ actor CoreClient {
                     break
                 }
             } catch {
-                isConnected = false
-                eventContinuation?.finish()
-                failAll(error)
-                disconnectHandler?(error)
-                break
+                handleReceiveFailure(
+                    error,
+                    generation: generation,
+                    socket: socket
+                )
+                return
             }
         }
+    }
+
+    private func isCurrentConnection(
+        _ generation: UInt64,
+        socket: URLSessionWebSocketTask
+    ) -> Bool {
+        connectionEpoch.isCurrent(
+            generation,
+            socketMatches: self.socket === socket
+        )
+    }
+
+    /// Reports a real server close exactly once for the current connection.
+    /// A failure from an intentionally cancelled or superseded loop is a no-op.
+    private func handleReceiveFailure(
+        _ error: Error,
+        generation: UInt64,
+        socket: URLSessionWebSocketTask
+    ) {
+        guard connectionEpoch.claimFailure(
+            candidate: generation,
+            socketMatches: self.socket === socket
+        ) else {
+            return
+        }
+        isConnected = false
+        consecutiveTimeouts = 0
+        self.socket = nil
+        urlSession?.invalidateAndCancel()
+        urlSession = nil
+        receiveTask = nil
+        eventGate.finishCurrent()
+        failAll(error)
+        disconnectHandler?(error)
     }
 
     private func handle(_ text: String) {
@@ -4677,6 +4802,7 @@ actor CoreClient {
            let id = idValue.stringValue,
            let continuation = pending.removeValue(forKey: id)
         {
+            consecutiveTimeouts = 0
             requestTimeouts.removeValue(forKey: id)?.cancel()
             if let error = envelope.error {
                 continuation.resume(
@@ -4692,11 +4818,21 @@ actor CoreClient {
             return
         }
 
+        if envelope.method == "event.gap" {
+            if let gap = EventGap.notification(
+                method: envelope.method,
+                params: envelope.params
+            ) {
+                eventGapHandler?(gap)
+            }
+            return
+        }
+
         if envelope.method == "event.appended",
            let params = envelope.params,
            let event = try? params.decode(Event.self)
         {
-            eventContinuation?.yield(event)
+            eventGate.enqueue(event)
         }
     }
 
@@ -4705,9 +4841,23 @@ actor CoreClient {
         pending.removeValue(forKey: id)?.resume(throwing: error)
     }
 
+    private func cancelRequest(_ id: String) {
+        requestTimeouts.removeValue(forKey: id)?.cancel()
+        pending.removeValue(forKey: id)?.resume(throwing: CancellationError())
+    }
+
     private func timeoutRequest(_ id: String) {
         requestTimeouts.removeValue(forKey: id)
-        pending.removeValue(forKey: id)?.resume(throwing: CoreError.timeout)
+        guard let continuation = pending.removeValue(forKey: id) else { return }
+        continuation.resume(throwing: CoreError.timeout)
+        consecutiveTimeouts += 1
+        // Two unanswered calls in a row mean the socket is alive but the
+        // daemon is not serving RPCs. Surface it so the app reconnects instead
+        // of displaying "connected" indefinitely. No request is replayed.
+        if consecutiveTimeouts >= 2 {
+            consecutiveTimeouts = 0
+            disconnectHandler?(CoreError.timeout)
+        }
     }
 
     private func failAll(_ error: Error) {
@@ -4717,12 +4867,13 @@ actor CoreClient {
             task.cancel()
         }
         requestTimeouts.removeAll()
+        consecutiveTimeouts = 0
         for continuation in continuations {
             continuation.resume(throwing: error)
         }
     }
 
-    private func clearEventContinuation() {
-        eventContinuation = nil
+    private func clearEventContinuation(generation: UInt64) {
+        eventGate.clear(generation: generation)
     }
 }

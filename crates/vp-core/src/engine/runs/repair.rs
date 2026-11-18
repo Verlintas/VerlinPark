@@ -36,13 +36,13 @@ impl Engine {
         });
         let replace_plan = plan_event.is_some() || data.plan.is_none();
         let plan = plan_event
-            .map(|event| {
-                let mut payload = event.payload.clone();
-                if let Some(object) = payload.as_object_mut() {
-                    object.remove("runtime_snapshot");
-                }
-                serde_json::to_string(&payload).map_err(anyhow::Error::from)
-            })
+            // A revision wraps the plan in `{plan, revision, ...}` while the
+            // session column stores the bare plan. Serialize the resolved plan
+            // value, not the event envelope, so repair never corrupts
+            // `sessions.team_plan`. A payload that cannot be resolved leaves
+            // the existing projection untouched rather than wiping it.
+            .and_then(crate::orchestration::plan::plan_from_event)
+            .map(|plan| serde_json::to_string(&plan).map_err(anyhow::Error::from))
             .transpose()?
             .or_else(|| data.plan.clone());
 
@@ -129,32 +129,8 @@ impl Engine {
         };
 
         let queue = {
-            let mut entries = HashMap::new();
-            let mut valid = true;
-            for event in data.events.iter().filter(|event| {
-                event.kind == "merge_queue.enqueued" || event.kind == "merge_queue.updated"
-            }) {
-                match serde_json::from_value::<MergeQueueEntry>(event.payload["entry"].clone()) {
-                    Ok(entry) => {
-                        entries.insert(entry.id.clone(), entry);
-                    }
-                    Err(_) => {
-                        valid = false;
-                        break;
-                    }
-                }
-            }
-            if valid && (!entries.is_empty() || data.queue.is_empty()) {
-                let mut entries = entries.into_values().collect::<Vec<_>>();
-                entries.sort_by(|left, right| {
-                    left.created_at
-                        .cmp(&right.created_at)
-                        .then_with(|| left.id.cmp(&right.id))
-                });
-                Some(entries)
-            } else {
-                None
-            }
+            let entries = Self::expected_merge_queue(data);
+            entries.filter(|entries| !entries.is_empty() || data.queue.is_empty())
         };
 
         let questions = {
@@ -348,24 +324,8 @@ impl Engine {
             {
                 None
             } else {
-                match crate::contract::contracts_from_events(&data.events) {
-                    Some(contracts) => Some(
-                        contracts
-                            .iter()
-                            .map(|contract| StoredContractRow {
-                                contract_id: contract.contract_id.clone(),
-                                project_id: contract.project_id.clone(),
-                                session_id: contract.session_id.clone(),
-                                task_id: contract.task_id.clone(),
-                                plan_revision: contract.plan_revision,
-                                role: contract.role.clone(),
-                                hash: contract.hash.clone(),
-                                source_hash: contract.source_hash.clone(),
-                                contract: serde_json::to_string(contract).unwrap_or_default(),
-                                created_at: contract.created_at.clone(),
-                            })
-                            .collect::<Vec<_>>(),
-                    ),
+                match Self::expected_contract_rows(data) {
+                    Some(rows) => Some(rows),
                     None if data.contracts.is_empty() => Some(Vec::new()),
                     None => None,
                 }
@@ -377,22 +337,8 @@ impl Engine {
             {
                 None
             } else {
-                match crate::contract::usage_from_events(&data.events) {
-                    Some(usage) => Some(
-                        usage
-                            .into_iter()
-                            .map(|(contract_id, usage)| ContractUsageRow {
-                                contract_id,
-                                project_id: data.session.project_id.clone(),
-                                session_id: data.session.id.clone(),
-                                task_id: None,
-                                writes: usage.writes,
-                                bytes: usage.bytes,
-                                commits: usage.commits,
-                                updated_at: vp_protocol::now_rfc3339(),
-                            })
-                            .collect::<Vec<_>>(),
-                    ),
+                match Self::expected_contract_usage_rows(data) {
+                    Some(rows) => Some(rows),
                     None if data.contract_usage.is_empty() => Some(Vec::new()),
                     None => None,
                 }

@@ -51,6 +51,41 @@ impl Engine {
         })
     }
 
+    /// Project-scoped source read for agent tools. A source from another
+    /// project is indistinguishable from a missing source so an agent cannot
+    /// probe or read another project's source namespace.
+    pub async fn get_source_in_project(
+        &self,
+        project_id: &str,
+        source_id: String,
+        offset: Option<u32>,
+        limit: Option<u32>,
+    ) -> Result<Option<SourceGetResult>> {
+        let store = self.store.clone();
+        let id = source_id.clone();
+        let source = tokio::task::spawn_blocking(move || store.get_source(&id)).await??;
+        let Some(source) = source else {
+            return Ok(None);
+        };
+        if source.project_id != project_id {
+            return Ok(None);
+        }
+        let store = self.store.clone();
+        let id = source_id.clone();
+        let chunks = tokio::task::spawn_blocking(move || {
+            store.source_chunks(&id, offset.unwrap_or(0), limit.unwrap_or(50))
+        })
+        .await??;
+        let store = self.store.clone();
+        let total =
+            tokio::task::spawn_blocking(move || store.source_chunk_count(&source_id)).await??;
+        Ok(Some(SourceGetResult {
+            source,
+            chunks,
+            total_chunks: total,
+        }))
+    }
+
     pub async fn search_sources(
         &self,
         project_id: String,

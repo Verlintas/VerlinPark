@@ -202,6 +202,7 @@ struct ApprovalCenterCard: View {
 
     private func approvalRow(_ approval: Approval) -> some View {
         let selected = model.approvalSelection.contains(approval.id)
+        let highlighted = model.highlightedApprovalID == approval.id
         return VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 6) {
                 Button {
@@ -289,9 +290,17 @@ struct ApprovalCenterCard: View {
         }
         .padding(9)
         .background(
-            selected ? VPTheme.accent.opacity(0.06) : .white.opacity(0.03),
+            highlighted
+                ? VPTheme.accent.opacity(0.14)
+                : (selected ? VPTheme.accent.opacity(0.06) : .white.opacity(0.03)),
             in: RoundedRectangle(cornerRadius: 9)
         )
+        .overlay {
+            if highlighted {
+                RoundedRectangle(cornerRadius: 9)
+                    .strokeBorder(VPTheme.accent.opacity(0.55), lineWidth: 1)
+            }
+        }
     }
 
     private func canCreateTemplate(_ approval: Approval) -> Bool {

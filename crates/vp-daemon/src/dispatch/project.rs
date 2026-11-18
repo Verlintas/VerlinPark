@@ -579,7 +579,7 @@ pub(super) async fn handle(
                 .await
             {
                 Ok(result) => RpcResponse::success(id, result),
-                Err(error) => internal_error(id, error),
+                Err(error) => validation_or_internal(id, error),
             },
             Err(response) => response_with_id(id, response),
         },

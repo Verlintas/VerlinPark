@@ -5,6 +5,7 @@ impl Store {
     /// the rows that changed so the caller can append audit events.
     pub fn interrupt_plan_tasks(&self) -> Result<Vec<ScheduledTask>> {
         let now = now_rfc3339();
+        let process_instance = self.process_owner_instance();
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         let interrupted = {
@@ -26,7 +27,18 @@ impl Store {
              WHERE status IN ('running', 'claimed', 'cancelling', 'pausing', 'paused')",
             params![now],
         )?;
-        tx.execute("DELETE FROM write_leases", [])?;
+        tx.execute(
+            "DELETE FROM write_leases
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM runtime_leases l
+                 WHERE l.lease_key = 'session:' || write_leases.session_id
+                   AND l.released_at IS NULL
+                   AND l.owner_instance <> ''
+                   AND l.owner_instance <> ?1
+                   AND julianday(l.expires_at) > julianday(?2)
+             )",
+            params![process_instance, now],
+        )?;
         tx.commit()?;
         Ok(interrupted)
     }

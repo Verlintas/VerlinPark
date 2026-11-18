@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::fixture::{AcceptanceSpec, FixtureFile, FixturePlan, validate_relative_path};
-use crate::metrics::Pricing;
+use crate::metrics::{Pricing, PricingProvenance};
 
 /// The repository/teardown shape used to exercise a runtime path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -196,6 +196,10 @@ pub struct PlanSpec {
 pub struct ScenarioConfig {
     pub model: String,
     pub pricing: Pricing,
+    /// Provenance for `pricing`; additive so older scenario JSON decodes with
+    /// an explicit `unknown` source instead of a guessed caller label.
+    #[serde(default)]
+    pub pricing_provenance: PricingProvenance,
     pub max_turns: u32,
     pub max_workers: usize,
     pub max_labour: usize,
@@ -231,6 +235,7 @@ impl ScenarioConfig {
         Self {
             model: "bench-fake-1".to_string(),
             pricing: Pricing::benchmark_default(),
+            pricing_provenance: PricingProvenance::illustrative_default(),
             max_turns: 8,
             max_workers: 4,
             max_labour: 8,
@@ -290,6 +295,10 @@ impl Scenario {
             .pricing
             .validate()
             .map_err(|error| format!("scenario pricing: {error}"))?;
+        self.config
+            .pricing_provenance
+            .validate()
+            .map_err(|error| format!("scenario pricing provenance: {error}"))?;
         if self.config.model.trim().is_empty() {
             return Err("scenario model cannot be empty".to_string());
         }

@@ -451,7 +451,13 @@ fn map_coordination_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentCoor
         project_id: row.get(1)?,
         seq: row.get::<_, i64>(2)?.max(0) as u64,
         kind: row.get(3)?,
-        payload: serde_json::from_str(&payload_json).unwrap_or(Value::Null),
+        payload: serde_json::from_str(&payload_json).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
         created_at: row.get(5)?,
     })
 }

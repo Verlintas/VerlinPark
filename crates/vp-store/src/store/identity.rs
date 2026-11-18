@@ -488,7 +488,11 @@ impl Store {
         limit: Option<u32>,
     ) -> Result<Vec<AgentIdentityEvent>> {
         let conn = self.lock()?;
-        let limit = limit.unwrap_or(100_000).clamp(1, 100_000) as i64;
+        // `None` means "the complete stream" for replay/rebuild callers. A
+        // silent 100k cap here would make the project manifest lossy.
+        let limit = limit
+            .map(|value| value.clamp(1, 100_000) as i64)
+            .unwrap_or(-1);
         let mut statement = conn.prepare(
             "SELECT project_id, identity_id, seq, kind, payload, created_at
              FROM agent_identity_events

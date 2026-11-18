@@ -12068,6 +12068,10 @@ fn context_checkpoint_bundle_validation_checks_session_and_project() {
         instructions: Vec::new(),
         prompt_prefix_observations: Vec::new(),
         effects: Vec::new(),
+        contracts: Vec::new(),
+        contract_usage: Vec::new(),
+        progress: Vec::new(),
+        remote_test_evidence: Vec::new(),
         agent_identities: Vec::new(),
         agent_identity_events: Vec::new(),
         session_agent_assignments: Vec::new(),
@@ -12346,6 +12350,10 @@ fn importing_a_projection_only_bundle_synthesizes_checkpoint_events() {
         instructions: Vec::new(),
         prompt_prefix_observations: Vec::new(),
         effects: Vec::new(),
+        contracts: Vec::new(),
+        contract_usage: Vec::new(),
+        progress: Vec::new(),
+        remote_test_evidence: Vec::new(),
         agent_identities: Vec::new(),
         agent_identity_events: Vec::new(),
         session_agent_assignments: Vec::new(),
@@ -14225,6 +14233,10 @@ fn bundle_import_preserves_supervised_process_lifecycle_rows() {
             created_at: now_rfc3339(),
             resolved_at: Some(now_rfc3339()),
         }],
+        contracts: Vec::new(),
+        contract_usage: Vec::new(),
+        progress: Vec::new(),
+        remote_test_evidence: Vec::new(),
         agent_identities: Vec::new(),
         agent_identity_events: Vec::new(),
         session_agent_assignments: Vec::new(),
@@ -14314,6 +14326,10 @@ fn supervised_process_bundle_validation_rejects_wrong_session() {
         instructions: Vec::new(),
         prompt_prefix_observations: Vec::new(),
         effects: Vec::new(),
+        contracts: Vec::new(),
+        contract_usage: Vec::new(),
+        progress: Vec::new(),
+        remote_test_evidence: Vec::new(),
         agent_identities: Vec::new(),
         agent_identity_events: Vec::new(),
         session_agent_assignments: Vec::new(),
@@ -16558,6 +16574,10 @@ fn bundle_import_preserves_instruction_state_and_rejects_missing_blobs() {
         }],
         prompt_prefix_observations: Vec::new(),
         effects: Vec::new(),
+        contracts: Vec::new(),
+        contract_usage: Vec::new(),
+        progress: Vec::new(),
+        remote_test_evidence: Vec::new(),
         agent_identities: Vec::new(),
         agent_identity_events: Vec::new(),
         session_agent_assignments: Vec::new(),
@@ -16646,6 +16666,10 @@ fn bundle_import_rejects_a_corrupt_instruction_blob() {
         instructions: Vec::new(),
         prompt_prefix_observations: Vec::new(),
         effects: Vec::new(),
+        contracts: Vec::new(),
+        contract_usage: Vec::new(),
+        progress: Vec::new(),
+        remote_test_evidence: Vec::new(),
         agent_identities: Vec::new(),
         agent_identity_events: Vec::new(),
         session_agent_assignments: Vec::new(),
@@ -17634,6 +17658,119 @@ fn run_step_intent_and_effect_commit_in_one_transaction() {
     );
     let row = store.get_effect(&settled.id).unwrap().unwrap();
     assert_eq!(row.state, EffectState::Done);
+}
+
+#[test]
+fn completed_tool_result_lookup_never_consumes_the_source_row() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("runs"))
+        .unwrap();
+    let session = store.create_session(&project.id, "replay").unwrap();
+    let now = now_rfc3339();
+    let first_run = SessionRun {
+        run_id: "run-lookup-a".to_string(),
+        session_id: session.id.clone(),
+        project_id: project.id.clone(),
+        agent_id: "agent".to_string(),
+        agent_name: "Leader".to_string(),
+        agent_role: "leader".to_string(),
+        task_id: None,
+        department: None,
+        objective: "write once".to_string(),
+        provider: "test".to_string(),
+        model: "test".to_string(),
+        status: "running".to_string(),
+        attempt: 1,
+        resumed_from_run_id: None,
+        resume_root_id: "run-lookup-a".to_string(),
+        top_level: true,
+        started_at: now.clone(),
+        updated_at: now.clone(),
+        ended_at: None,
+        budget: RunBudgetSnapshot::default(),
+        worktree_head: String::new(),
+        plan_revision: 1,
+        runtime_snapshot: None,
+        last_event_seq: 0,
+        failure: None,
+    };
+    store.start_session_run(&first_run).unwrap();
+    let step = RunStep {
+        step_id: "step-lookup-a".to_string(),
+        run_id: first_run.run_id.clone(),
+        session_id: session.id.clone(),
+        seq: 0,
+        turn: 1,
+        kind: "tool_call".to_string(),
+        status: "intent".to_string(),
+        input_hash: "fingerprint".to_string(),
+        output_hash: String::new(),
+        payload: serde_json::json!({"tool_name": "write_file"}),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    let tool = RunToolCall {
+        run_id: first_run.run_id.clone(),
+        session_id: session.id.clone(),
+        step_id: step.step_id.clone(),
+        tool_call_id: "call-lookup-a".to_string(),
+        tool_name: "write_file".to_string(),
+        input_fingerprint: "fingerprint".to_string(),
+        status: "intent".to_string(),
+        result: None,
+        error: None,
+        consumed_by_run_id: None,
+        consumed_at: None,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    store.record_run_step_intent(&step, Some(&tool)).unwrap();
+    let mut completed_step = step.clone();
+    completed_step.status = "completed".to_string();
+    completed_step.output_hash = "output".to_string();
+    completed_step.updated_at = now_rfc3339();
+    let mut completed_tool = tool.clone();
+    completed_tool.status = "completed".to_string();
+    completed_tool.result = Some(serde_json::json!({"content": "wrote once"}));
+    completed_tool.updated_at = completed_step.updated_at.clone();
+    store
+        .record_run_step_completed(&completed_step, Some(&completed_tool))
+        .unwrap();
+
+    let resumed = SessionRun {
+        run_id: "run-lookup-b".to_string(),
+        attempt: 2,
+        resumed_from_run_id: Some(first_run.run_id.clone()),
+        resume_root_id: first_run.resume_root_id.clone(),
+        started_at: now_rfc3339(),
+        updated_at: now_rfc3339(),
+        ..first_run.clone()
+    };
+    store.start_session_run(&resumed).unwrap();
+
+    let first = store
+        .find_completed_tool_result("run-lookup-b", "write_file", "fingerprint", "run-lookup-b")
+        .unwrap();
+    assert!(first.is_some());
+    let second = store
+        .find_completed_tool_result("run-lookup-b", "write_file", "fingerprint", "run-lookup-b")
+        .unwrap();
+    assert!(
+        second.is_some(),
+        "looking up a completed write must never consume it"
+    );
+    let row = store.list_run_tool_calls("run-lookup-a").unwrap().remove(0);
+    assert_eq!(row.consumed_by_run_id, None);
+
+    let missing = store
+        .find_completed_tool_result("run-lookup-b", "write_file", "other", "run-lookup-b")
+        .unwrap();
+    assert!(missing.is_none());
+    let current = store
+        .find_completed_tool_result("run-lookup-a", "write_file", "fingerprint", "run-lookup-a")
+        .unwrap();
+    assert!(current.is_none(), "an attempt cannot replay its own row");
 }
 
 #[test]
@@ -18923,4 +19060,671 @@ fn progress_rounds_are_ordered_bounded_and_event_backed() {
         store.latest_progress_revision(&session.id).unwrap(),
         Some(9)
     );
+}
+
+#[test]
+fn project_manifest_refuses_malformed_lines() {
+    let (data, store, repo) = test_store();
+    let _project = store
+        .add_project(repo.path().to_str().unwrap(), Some("manifest"))
+        .unwrap();
+    store.record_project_manifest().unwrap();
+    let path = data.path().join("projects.jsonl");
+    let mut raw = std::fs::read_to_string(&path).unwrap();
+    raw.push_str("{\"truncated\":");
+    std::fs::write(&path, raw).unwrap();
+    let error = read_project_manifest(data.path()).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("parsing project manifest") && message.contains("line 2"),
+        "{message}"
+    );
+}
+
+#[test]
+fn project_manifest_refuses_explicit_truncation() {
+    let (data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("truncated"))
+        .unwrap();
+    store.record_project_manifest().unwrap();
+    let path = data.path().join("projects.jsonl");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+    value["truncated"] = serde_json::json!(true);
+    std::fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string(&value).unwrap()),
+    )
+    .unwrap();
+    let error = read_project_manifest(data.path()).unwrap_err();
+    assert!(error.to_string().contains("marked truncated"), "{error}");
+    assert_eq!(value["project"]["id"], project.id);
+}
+
+#[test]
+fn project_manifest_reads_the_complete_identity_event_stream() {
+    let (data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("large manifest"))
+        .unwrap();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "WITH RECURSIVE n(x) AS (
+                 SELECT 1
+                 UNION ALL
+                 SELECT x + 1 FROM n WHERE x < 100001
+             )
+             INSERT INTO agent_identity_events
+                 (project_id, identity_id, seq, kind, payload, created_at)
+             SELECT ?1, 'identity-large', x, 'agent.identity.created', '{}',
+                    '2026-01-01T00:00:00Z'
+             FROM n",
+            params![project.id],
+        )
+        .unwrap();
+    }
+    store.record_project_manifest().unwrap();
+    let snapshots = read_project_manifest(data.path()).unwrap();
+    let snapshot = snapshots
+        .iter()
+        .find(|snapshot| snapshot.project.id == project.id)
+        .unwrap();
+    assert_eq!(snapshot.version, PROJECT_MANIFEST_VERSION);
+    assert!(!snapshot.truncated);
+    assert_eq!(snapshot.agent_identity_events.len(), 100_001);
+    assert!(
+        snapshot
+            .agent_identity_events
+            .iter()
+            .any(|event| event.seq == 100_001)
+    );
+}
+
+#[test]
+fn session_creation_commits_row_and_created_event_atomically() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("atomic session"))
+        .unwrap();
+    let (session, event) = store
+        .create_session_with_worktree_and_event(
+            "atomic-session",
+            &project.id,
+            "goal",
+            "/tmp/worktree",
+            "verlinpark/session",
+            None,
+            None,
+            None,
+            false,
+            "base123",
+            0,
+        )
+        .unwrap();
+    assert_eq!(event.kind, "session.created");
+    assert_eq!(event.seq, 1);
+    assert_eq!(event.payload["goal"], "goal");
+    assert_eq!(
+        store.get_session(&session.id).unwrap().unwrap().goal,
+        "goal"
+    );
+    assert_eq!(store.list_events(&session.id, 0, 10).unwrap().len(), 1);
+
+    // A failed insert rolls the whole transaction back: no second event and
+    // no overwritten row.
+    let duplicate = store.create_session_with_worktree_and_event(
+        "atomic-session",
+        &project.id,
+        "again",
+        "/tmp/worktree",
+        "verlinpark/session",
+        None,
+        None,
+        None,
+        false,
+        "base123",
+        0,
+    );
+    assert!(duplicate.is_err());
+    let events = store.list_events(&session.id, 0, 10).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, "session.created");
+    assert_eq!(
+        store.get_session(&session.id).unwrap().unwrap().goal,
+        "goal"
+    );
+}
+
+#[test]
+fn corrupt_orchestration_policy_fails_closed() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("orchestration"))
+        .unwrap();
+    // Missing row still uses the documented default.
+    assert_eq!(
+        store.get_orchestration_policy(&project.id).unwrap(),
+        OrchestrationPolicy::default()
+    );
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "INSERT INTO project_orchestration_policies (project_id, policy, updated_at)
+             VALUES (?1, '{', ?2)",
+            params![project.id, now_rfc3339()],
+        )
+        .unwrap();
+    }
+    let error = store.get_orchestration_policy(&project.id).unwrap_err();
+    assert!(
+        error.to_string().contains("orchestration policy"),
+        "{error}"
+    );
+
+    // An unknown enum value is also corruption, not a default.
+    let mut policy = serde_json::to_value(OrchestrationPolicy::default()).unwrap();
+    policy["stall_recovery"] = serde_json::json!("not-a-mode");
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE project_orchestration_policies SET policy = ?2 WHERE project_id = ?1",
+            params![project.id, serde_json::to_string(&policy).unwrap()],
+        )
+        .unwrap();
+    }
+    assert!(store.get_orchestration_policy(&project.id).is_err());
+}
+
+#[test]
+fn instruction_state_prefix_is_exact_and_case_sensitive() {
+    let (_data, store, _repo) = test_store();
+    let conn = store.lock().unwrap();
+    for (session_id, key) in [
+        ("abc", "leader"),
+        ("abc#task-1", "task"),
+        ("ABC#task-9", "task"),
+        ("ab%#task", "task"),
+        ("abc_x#task", "task"),
+    ] {
+        conn.execute(
+            "INSERT INTO session_instruction_state
+             (session_id, key, hash, ordinal, tail, updated_at)
+             VALUES (?1, ?2, 'hash', 1, 0, '2026-01-01T00:00:00Z')",
+            params![session_id, key],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let rows = store.list_instruction_states_for_session("abc").unwrap();
+    let ids = rows
+        .iter()
+        .map(|row| row.session_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["abc", "abc#task-1"]);
+
+    let rows = store.list_instruction_states_for_session("ab%").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].session_id, "ab%#task");
+
+    let mut conn = store.lock().unwrap();
+    let tx = conn.transaction().unwrap();
+    let deleted =
+        crate::store::cache::delete_instruction_states_for_session_tx(&tx, "abc").unwrap();
+    tx.commit().unwrap();
+    assert_eq!(deleted, 2);
+    let remaining: Vec<String> = conn
+        .prepare("SELECT session_id FROM session_instruction_state ORDER BY session_id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(remaining, vec!["ABC#task-9", "ab%#task", "abc_x#task"]);
+}
+
+#[test]
+fn merged_merge_queue_entries_are_terminal() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("merge terminal"))
+        .unwrap();
+    let session = store.create_session(&project.id, "merge").unwrap();
+    let entry = store
+        .enqueue_merge(
+            &session.id,
+            "agent_1",
+            "Worker 1",
+            Some("T1"),
+            "verlinpark/task",
+            "abc123",
+            "def456",
+            None,
+        )
+        .unwrap();
+    store.begin_merge_queue_entry(&entry.id, "def456").unwrap();
+    let merged = store
+        .update_merge_queue_entry_with_event(&entry.id, "merged", Some("ok"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(merged.0.status, "merged");
+
+    assert!(
+        store
+            .begin_merge_queue_entry(&entry.id, "ffff")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .update_merge_queue_entry_with_event(&entry.id, "failed", Some("late"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .update_merge_queue_entry(&entry.id, "merging", None)
+            .unwrap()
+            .is_none()
+    );
+    let current = store.get_merge_queue_entry(&entry.id).unwrap().unwrap();
+    assert_eq!(current.status, "merged");
+    assert_eq!(current.pre_merge_commit.as_deref(), Some("def456"));
+    assert_eq!(current.detail.as_deref(), Some("ok"));
+}
+
+#[test]
+fn completed_plan_tasks_are_terminal() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("plan terminal"))
+        .unwrap();
+    let session = store.create_session(&project.id, "plan").unwrap();
+    let submitted = store
+        .append_event(
+            &session.id,
+            "team_plan.submitted",
+            serde_json::json!({"goal": "plan"}),
+        )
+        .unwrap();
+    store
+        .sync_plan_tasks(&session.id, &project.id, submitted.seq, &scheduled_plan())
+        .unwrap();
+    store
+        .claim_plan_tasks(&session.id, submitted.seq, &["T1".into()])
+        .unwrap();
+    let completed = store
+        .finish_plan_task(&session.id, submitted.seq, "T1", "completed", None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.status, "completed");
+    assert!(
+        store
+            .finish_plan_task(&session.id, submitted.seq, "T1", "failed", Some("late"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .finish_plan_task(&session.id, submitted.seq, "T1", "cancelled", None)
+            .unwrap()
+            .is_none()
+    );
+    let task = store
+        .list_plan_tasks(Some(&project.id), None)
+        .unwrap()
+        .into_iter()
+        .find(|task| task.task_id == "T1")
+        .unwrap();
+    assert_eq!(task.status, "completed");
+    assert!(task.last_error.is_none());
+}
+
+#[test]
+fn recovery_preserves_live_foreign_write_and_computer_leases() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("foreign leases"))
+        .unwrap();
+    let session = store.create_session(&project.id, "foreign live").unwrap();
+    store.update_session_status(&session.id, "running").unwrap();
+    store
+        .acquire_runtime_lease(
+            &format!("session:{}", session.id),
+            "foreign-owner",
+            "foreign-instance:999",
+            "session",
+            Some(&session.id),
+            60,
+        )
+        .unwrap();
+    assert!(
+        store
+            .try_acquire_write_lease(
+                &project.id,
+                &session.id,
+                "agent-foreign",
+                &["src/**".to_string()]
+            )
+            .unwrap()
+    );
+    let lease = match store
+        .acquire_computer_lease(
+            "gui",
+            "foreign-owner",
+            &session.id,
+            "agent-foreign",
+            "Foreign Agent",
+            60,
+        )
+        .unwrap()
+    {
+        ComputerLeaseAttempt::Acquired { lease, .. } => lease,
+        ComputerLeaseAttempt::Busy { .. } => panic!("gui lease was unexpectedly busy"),
+    };
+
+    let (recovered, events) = store.recover_state().unwrap();
+    assert!(!recovered.contains(&session.id));
+    assert_eq!(
+        store.get_session(&session.id).unwrap().unwrap().status,
+        "running"
+    );
+    assert_eq!(
+        store
+            .list_write_leases(Some(&project.id), Some(&session.id))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(store.computer_lease(&lease.lease_id).unwrap().is_some());
+    assert!(!events.iter().any(|event| {
+        event.kind == "computer.lease.expired"
+            && event.payload["lease"]["lease_id"] == lease.lease_id
+    }));
+}
+
+fn empty_session_bundle(project: Project, session: Session) -> vp_protocol::types::SessionBundle {
+    vp_protocol::types::SessionBundle {
+        version: 1,
+        exported_at: now_rfc3339(),
+        project,
+        session,
+        events: Vec::new(),
+        agents: Vec::new(),
+        messages: Vec::new(),
+        team_plan: None,
+        todos: Vec::new(),
+        approvals: Vec::new(),
+        merge_queue: Vec::new(),
+        agent_messages: Vec::new(),
+        artifacts: Vec::new(),
+        usage: Vec::new(),
+        memories: Vec::new(),
+        memory_conflicts: Vec::new(),
+        questions: Vec::new(),
+        tasks: Vec::new(),
+        steering: Vec::new(),
+        continuations: Vec::new(),
+        gates: Vec::new(),
+        policy_snapshots: Vec::new(),
+        recoveries: Vec::new(),
+        programs: Vec::new(),
+        program_milestones: Vec::new(),
+        program_events: Vec::new(),
+        session_runs: Vec::new(),
+        run_steps: Vec::new(),
+        run_checkpoints: Vec::new(),
+        context_checkpoints: Vec::new(),
+        supervised_processes: Vec::new(),
+        test_results: Vec::new(),
+        instruction_blobs: Vec::new(),
+        instructions: Vec::new(),
+        prompt_prefix_observations: Vec::new(),
+        effects: Vec::new(),
+        contracts: Vec::new(),
+        contract_usage: Vec::new(),
+        progress: Vec::new(),
+        remote_test_evidence: Vec::new(),
+        agent_identities: Vec::new(),
+        agent_identity_events: Vec::new(),
+        session_agent_assignments: Vec::new(),
+        agent_inbox: Vec::new(),
+        agent_coordination_events: Vec::new(),
+        agent_workspaces: Vec::new(),
+        session_worker_workspaces: Vec::new(),
+        agent_workspace_events: Vec::new(),
+        agent_memories: Vec::new(),
+        agent_memory_events: Vec::new(),
+        agent_performance: Vec::new(),
+        agent_retirement_proposals: Vec::new(),
+        agent_employment_events: Vec::new(),
+        agent_hire_requests: Vec::new(),
+        team_templates: Vec::new(),
+        project_team_templates: Vec::new(),
+        team_template_events: Vec::new(),
+    }
+}
+
+#[test]
+fn bundle_import_rejects_out_of_range_sequences_and_oversized_payloads() {
+    let (data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("bundle limits"))
+        .unwrap();
+    let session = store.create_session(&project.id, "import").unwrap();
+    let imported = Store::open(data.path().join("bundle-import")).unwrap();
+
+    let mut invalid_seq = empty_session_bundle(project.clone(), session.clone());
+    invalid_seq.events = vec![Event {
+        session_id: session.id.clone(),
+        seq: i64::MAX as u64 + 1,
+        kind: "tool.finished".to_string(),
+        payload: serde_json::json!({}),
+        created_at: now_rfc3339(),
+    }];
+    let error = imported.import_session_bundle(&invalid_seq).unwrap_err();
+    assert!(error.to_string().contains("outside 1..="), "{error}");
+    assert!(imported.get_session(&session.id).unwrap().is_none());
+
+    let mut zero_seq = empty_session_bundle(project.clone(), session.clone());
+    zero_seq.events = vec![Event {
+        session_id: session.id.clone(),
+        seq: 0,
+        kind: "tool.finished".to_string(),
+        payload: serde_json::json!({}),
+        created_at: now_rfc3339(),
+    }];
+    assert!(imported.import_session_bundle(&zero_seq).is_err());
+
+    let mut oversized = empty_session_bundle(project, session.clone());
+    oversized.events = vec![Event {
+        session_id: session.id.clone(),
+        seq: 1,
+        kind: "tool.finished".to_string(),
+        payload: serde_json::json!({
+            "blob": "x".repeat(MAX_IMPORTED_EVENT_PAYLOAD_BYTES + 1)
+        }),
+        created_at: now_rfc3339(),
+    }];
+    let error = imported.import_session_bundle(&oversized).unwrap_err();
+    assert!(error.to_string().contains("payload is"), "{error}");
+    assert!(imported.get_session(&session.id).unwrap().is_none());
+}
+
+#[test]
+fn genuine_unknown_effects_cannot_be_settled_by_evidence_substrings() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("effects"))
+        .unwrap();
+    let session = store.create_session(&project.id, "effects").unwrap();
+    let intent = effect_fixture(&session.id, "genuine-unknown");
+    let (first, _, _) = store.begin_effect(&intent).unwrap();
+    let mut unknown = first.clone();
+    unknown.state = EffectState::Unknown;
+    unknown.evidence = EffectEvidence {
+        probe: "remote_stat".to_string(),
+        outcome: "unverifiable".to_string(),
+        note: Some("stale_intent_sweep".to_string()),
+        ..EffectEvidence::default()
+    };
+    store.settle_effect(&unknown).unwrap();
+    let mut late = first.clone();
+    late.state = EffectState::Done;
+    late.evidence = EffectEvidence::observed("workspace_sha256");
+    let error = store.settle_effect(&late).unwrap_err();
+    assert!(error.to_string().contains("cannot transition"), "{error}");
+
+    // Only the sweep-produced unknown may be replaced by a live completion.
+    let mut stale = effect_fixture(&session.id, "swept");
+    stale.created_at = (time::OffsetDateTime::now_utc() - time::Duration::hours(2))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let (swept_intent, _, _) = store.begin_effect(&stale).unwrap();
+    let now = time::OffsetDateTime::now_utc();
+    let events = store
+        .sweep_stale_effect_intents(&project.id, 60, 100, &now)
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    let mut settled = swept_intent.clone();
+    settled.state = EffectState::Done;
+    settled.evidence = EffectEvidence::observed("workspace_sha256");
+    let (done, events, changed) = store.settle_effect(&settled).unwrap();
+    assert!(changed);
+    assert_eq!(done.state, EffectState::Done);
+    assert_eq!(events.len(), 1);
+}
+
+#[test]
+fn memory_like_fallback_escapes_wildcards() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("memory like"))
+        .unwrap();
+    let session = store.create_session(&project.id, "memory").unwrap();
+    for (title, body) in [
+        ("percent", "50% done"),
+        ("plain", "5000 done"),
+        ("underscore", "foo_bar"),
+        ("plain-underscore", "fooXbar"),
+    ] {
+        store
+            .create_memory_with_event(
+                &session.id,
+                &project.id,
+                "agent",
+                "Agent",
+                "note",
+                title,
+                body,
+                &[],
+            )
+            .unwrap();
+    }
+    let percent = store
+        .list_memories(&project.id, Some("%"), None, 100)
+        .unwrap();
+    assert_eq!(percent.len(), 1);
+    assert_eq!(percent[0].title, "percent");
+    let underscore = store
+        .list_memories(&project.id, Some("_"), None, 100)
+        .unwrap();
+    assert_eq!(underscore.len(), 1);
+    assert_eq!(underscore[0].title, "underscore");
+}
+
+#[test]
+fn deferred_runs_are_terminal_and_cancellation_is_scoped_to_active_runs() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("deferred runs"))
+        .unwrap();
+    let session = store.create_session(&project.id, "gate wait").unwrap();
+    let run = |run_id: &str| SessionRun {
+        run_id: run_id.to_string(),
+        session_id: session.id.clone(),
+        project_id: project.id.clone(),
+        agent_id: "leader".to_string(),
+        agent_name: "Leader".to_string(),
+        agent_role: "leader".to_string(),
+        task_id: None,
+        department: None,
+        objective: "wait for a gate".to_string(),
+        provider: "test".to_string(),
+        model: "test".to_string(),
+        status: "running".to_string(),
+        attempt: 1,
+        resumed_from_run_id: None,
+        resume_root_id: run_id.to_string(),
+        top_level: true,
+        started_at: now_rfc3339(),
+        updated_at: now_rfc3339(),
+        ended_at: None,
+        budget: RunBudgetSnapshot::default(),
+        worktree_head: String::new(),
+        plan_revision: 0,
+        runtime_snapshot: None,
+        last_event_seq: 0,
+        failure: None,
+    };
+    let first = run("run-deferred");
+    store.start_session_run(&first).unwrap();
+    assert!(!store.session_run_cancel_requested(&session.id).unwrap());
+    store
+        .append_event(
+            &session.id,
+            "session.run.cancel_requested",
+            serde_json::json!({"run_id": first.run_id}),
+        )
+        .unwrap();
+    assert!(store.session_run_cancel_requested(&session.id).unwrap());
+
+    let failure = vp_protocol::types::RunFailure {
+        kind: "deferred".to_string(),
+        message: "waiting for gate gate-1".to_string(),
+    };
+    let (finished, event) = store
+        .finish_session_run(&first.run_id, "deferred", Some(&failure))
+        .unwrap();
+    assert_eq!(finished.status, "deferred");
+    assert_eq!(
+        finished.failure.as_ref().map(|f| f.kind.as_str()),
+        Some("deferred")
+    );
+    assert_eq!(event.kind, "session.run.deferred");
+    assert!(
+        store.list_resumable_session_runs(10).unwrap().is_empty(),
+        "a deferred run is not resumable"
+    );
+    assert!(
+        store.interrupt_running_session_runs().unwrap().0.is_empty(),
+        "restart recovery only rewrites running rows"
+    );
+
+    // A later attempt starts after the deferred terminal event, so the old
+    // cancel request is stale and does not block its merge boundary.
+    let second = run("run-second");
+    store.start_session_run(&second).unwrap();
+    assert!(!store.session_run_cancel_requested(&session.id).unwrap());
+    store
+        .append_event(
+            &session.id,
+            "session.run.cancel_requested",
+            serde_json::json!({"run_id": second.run_id}),
+        )
+        .unwrap();
+    assert!(store.session_run_cancel_requested(&session.id).unwrap());
+    store
+        .finish_session_run(
+            &second.run_id,
+            "interrupted",
+            Some(&vp_protocol::types::RunFailure {
+                kind: "cancelled".to_string(),
+                message: "operator cancelled".to_string(),
+            }),
+        )
+        .unwrap();
+    assert!(!store.session_run_cancel_requested(&session.id).unwrap());
 }

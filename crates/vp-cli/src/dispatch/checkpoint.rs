@@ -61,7 +61,15 @@ pub(super) async fn dispatch(
         Command::CheckpointRestore {
             session,
             checkpoint,
+            yes,
         } => {
+            let confirmed = yes
+                || confirm_cli_action(
+                    "Reset the session branch/worktree to this checkpoint commit?",
+                )?;
+            if !confirmed {
+                bail!("checkpoint restore requires explicit confirmation (pass --yes)");
+            }
             rpc(
                 &discovery,
                 "session.checkpoint.restore",

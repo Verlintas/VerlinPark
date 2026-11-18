@@ -246,6 +246,12 @@ pub fn count_agent_memories(
 /// Candidates for the bounded prompt brief. Only local, active, non-expired
 /// rows are returned. Scope filtering and deterministic ranking happen in
 /// `vp_core::identity_memory`.
+///
+/// The candidate window is partitioned per visible scope with reserved
+/// capacity. A plain `ORDER BY updated_at DESC LIMIT 128` lets a busy agent's
+/// private rows consume the entire window before the core ranker can consider
+/// department/project rows (including older pinned ones). Each scope is read
+/// separately with `pinned` first, so shared memory always reaches ranking.
 pub fn list_agent_memories_for_brief(
     store: &Store,
     project_id: &str,
@@ -256,6 +262,87 @@ pub fn list_agent_memories_for_brief(
     let limit = limit.unwrap_or(128).clamp(1, 256);
     let now = now_rfc3339();
     let conn = store.lock()?;
+    if viewer_identity_id.is_none() || limit < 4 {
+        // Trusted local operator view (no viewer) or a tiny explicit limit:
+        // keep the single bounded query.
+        let mut statement = conn.prepare(&format!(
+            "SELECT {AGENT_MEMORY_COLUMNS}
+             FROM agent_memories
+             WHERE project_id = ?1
+               AND status = 'active'
+               AND origin = 'local'
+               AND (expires_at IS NULL OR expires_at > ?2)
+               AND (
+                 ?3 IS NULL
+                 OR (scope = 'agent' AND identity_id = ?3)
+                 OR (scope = 'department' AND ?4 IS NOT NULL
+                     AND department = ?4 COLLATE NOCASE)
+                 OR scope = 'project'
+               )
+             ORDER BY pinned DESC, updated_at DESC, content_hash ASC, id ASC
+             LIMIT ?5"
+        ))?;
+        let rows = statement.query_map(
+            params![
+                project_id,
+                now,
+                viewer_identity_id,
+                viewer_department,
+                limit as i64
+            ],
+            map_memory,
+        )?;
+        return Ok(rows.collect::<Result<Vec<_>, _>>()?);
+    }
+    let department_quota = (limit / 4).max(1);
+    let project_quota = (limit / 4).max(1);
+    let agent_quota = limit
+        .saturating_sub(department_quota)
+        .saturating_sub(project_quota)
+        .max(1);
+    let mut candidates = Vec::new();
+    candidates.extend(brief_scope_rows(
+        &conn,
+        project_id,
+        &now,
+        "agent",
+        viewer_identity_id,
+        viewer_department,
+        agent_quota,
+    )?);
+    if viewer_department.is_some() {
+        candidates.extend(brief_scope_rows(
+            &conn,
+            project_id,
+            &now,
+            "department",
+            viewer_identity_id,
+            viewer_department,
+            department_quota,
+        )?);
+    }
+    candidates.extend(brief_scope_rows(
+        &conn,
+        project_id,
+        &now,
+        "project",
+        viewer_identity_id,
+        viewer_department,
+        project_quota,
+    )?);
+    Ok(candidates)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn brief_scope_rows(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+    now: &str,
+    scope: &str,
+    viewer_identity_id: Option<&str>,
+    viewer_department: Option<&str>,
+    limit: u32,
+) -> Result<Vec<AgentMemory>> {
     let mut statement = conn.prepare(&format!(
         "SELECT {AGENT_MEMORY_COLUMNS}
          FROM agent_memories
@@ -263,20 +350,21 @@ pub fn list_agent_memories_for_brief(
            AND status = 'active'
            AND origin = 'local'
            AND (expires_at IS NULL OR expires_at > ?2)
+           AND scope = ?3
            AND (
-             ?3 IS NULL
-             OR (scope = 'agent' AND identity_id = ?3)
-             OR (scope = 'department' AND ?4 IS NOT NULL
-                 AND department = ?4 COLLATE NOCASE)
-             OR scope = 'project'
+             (?3 = 'agent' AND identity_id = ?4)
+             OR (?3 = 'department' AND ?5 IS NOT NULL
+                 AND department = ?5 COLLATE NOCASE)
+             OR ?3 = 'project'
            )
-         ORDER BY updated_at DESC, content_hash ASC, id ASC
-         LIMIT ?5"
+         ORDER BY pinned DESC, updated_at DESC, content_hash ASC, id ASC
+         LIMIT ?6"
     ))?;
     let rows = statement.query_map(
         params![
             project_id,
             now,
+            scope,
             viewer_identity_id,
             viewer_department,
             limit as i64
@@ -294,4 +382,84 @@ pub fn list_agent_memories_for_replay(store: &Store, project_id: &str) -> Result
     ))?;
     let rows = statement.query_map(params![project_id], map_memory)?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use tempfile::TempDir;
+
+    fn memory(id: &str, scope: &str, updated_at: &str) -> AgentMemory {
+        let content = format!("content for {id}");
+        AgentMemory {
+            id: id.to_string(),
+            project_id: "project".to_string(),
+            identity_id: (scope == "agent").then(|| "agent-1".to_string()),
+            department: (scope == "department").then(|| "Platform".to_string()),
+            component: None,
+            scope: scope.to_string(),
+            content: content.clone(),
+            content_hash: format!("{:x}", Sha256::digest(content.as_bytes())),
+            evidence: Vec::new(),
+            source: "agent".to_string(),
+            status: "active".to_string(),
+            pinned: false,
+            created_at: updated_at.to_string(),
+            updated_at: updated_at.to_string(),
+            expires_at: None,
+            verified_at: None,
+            superseded_by: None,
+            stale_reason: None,
+            origin: "local".to_string(),
+            expired: false,
+        }
+    }
+
+    #[test]
+    fn brief_candidates_reserve_department_capacity_under_agent_pressure() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("brief"))
+            .unwrap();
+        // `agent_memories.identity_id` is a real foreign key. Create the
+        // owner identity before inserting agent-scoped rows so this test does
+        // not rely on a dangling projection id.
+        let leader = store
+            .create_agent_identity(&vp_protocol::types::CreateAgentIdentityParams {
+                project_id: project.id.clone(),
+                role: "leader".into(),
+                department: Some("Platform".into()),
+                title: Some("Leader".into()),
+                ..Default::default()
+            })
+            .unwrap()
+            .0;
+        for index in 0..200 {
+            let mut row = memory(
+                &format!("agent-{index:03}"),
+                "agent",
+                "2026-11-12T23:59:00Z",
+            );
+            row.project_id = project.id.clone();
+            row.identity_id = Some(leader.id.clone());
+            store.insert_agent_memory_snapshot(&row).unwrap();
+        }
+        let mut pinned = memory("dept-pinned", "department", "2026-01-01T00:00:00Z");
+        pinned.project_id = project.id.clone();
+        pinned.pinned = true;
+        store.insert_agent_memory_snapshot(&pinned).unwrap();
+        let candidates = list_agent_memories_for_brief(
+            &store,
+            &project.id,
+            Some(leader.id.as_str()),
+            Some("Platform"),
+            Some(128),
+        )
+        .unwrap();
+        assert!(candidates.iter().any(|row| row.id == "dept-pinned"));
+        assert!(candidates.len() <= 128);
+    }
 }

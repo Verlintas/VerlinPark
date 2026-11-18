@@ -285,9 +285,10 @@ impl Store {
                 tx.execute(
                     "INSERT INTO plan_tasks
                      (session_id, plan_seq, task_id, project_id, department, title, priority,
-                      status, deps, write_scope, attempts, last_error, enqueued_at, started_at,
-                      finished_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                      status, deps, write_scope, attempts, last_error, next_attempt_at,
+                      enqueued_at, started_at, finished_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                             ?14, ?15, ?16, ?17)",
                     params![
                         task.session_id,
                         task.plan_seq as i64,
@@ -301,6 +302,7 @@ impl Store {
                         serde_json::to_string(&task.write_scope)?,
                         i64::from(task.attempts),
                         task.last_error,
+                        task.next_attempt_at,
                         task.enqueued_at,
                         task.started_at,
                         task.finished_at,
@@ -442,11 +444,7 @@ impl Store {
             replace_prompt_prefix_observations_tx(&tx, &project_id, session_id, observations)?;
         }
         if let Some(instructions) = &repair.instructions {
-            tx.execute(
-                "DELETE FROM session_instruction_state
-                 WHERE session_id = ?1 OR session_id LIKE ?2",
-                params![session_id, format!("{session_id}#%")],
-            )?;
+            crate::store::cache::delete_instruction_states_for_session_tx(&tx, session_id)?;
             for row in instructions {
                 if row.session_id != session_id
                     && !row.session_id.starts_with(&format!("{session_id}#"))

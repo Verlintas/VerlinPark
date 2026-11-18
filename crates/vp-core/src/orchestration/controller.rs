@@ -119,7 +119,7 @@ pub fn plan_actions(input: ControllerInput<'_>) -> Vec<ControllerAction> {
         .collect::<HashMap<_, _>>();
     let completed = statuses
         .iter()
-        .filter(|(_, status)| matches!(status.as_str(), "completed" | "skipped"))
+        .filter(|(_, status)| super::plan::dependency_satisfied(Some(status.as_str())))
         .map(|(task_id, _)| task_id.as_str())
         .collect::<HashSet<_>>();
     let escalated = escalated_attempts(input.events);
@@ -138,6 +138,12 @@ pub fn plan_actions(input: ControllerInput<'_>) -> Vec<ControllerAction> {
             .map(String::as_str)
             .unwrap_or("pending");
         if status != "blocked" {
+            continue;
+        }
+        if rows
+            .get(task.id.as_str())
+            .is_some_and(|row| waiting_for_gate(row))
+        {
             continue;
         }
         if task.deps.iter().all(|dep| completed.contains(dep.as_str())) {
@@ -258,10 +264,16 @@ pub fn plan_actions(input: ControllerInput<'_>) -> Vec<ControllerAction> {
 
     // 4. Blocked rows with no failed dependency and no unmet dependency are
     //    stale and should be released (for example after a plan revision).
+    //    A task waiting on an external gate is not stale: it must stay blocked
+    //    until the gate continuation resumes it, otherwise the scheduler
+    //    re-executes the Worker on every controller tick.
     for row in input.scheduled {
         if row.status != "blocked" || actions.iter().any(|action| {
             matches!(action, ControllerAction::Unblock { task_id, .. } if task_id == &row.task_id)
         }) {
+            continue;
+        }
+        if waiting_for_gate(row) {
             continue;
         }
         let Some(task) = input.plan.tasks.iter().find(|task| task.id == row.task_id) else {
@@ -277,6 +289,12 @@ pub fn plan_actions(input: ControllerInput<'_>) -> Vec<ControllerAction> {
     }
 
     actions
+}
+
+fn waiting_for_gate(row: &ScheduledTask) -> bool {
+    row.last_error
+        .as_deref()
+        .is_some_and(|reason| reason.starts_with("waiting for external gate"))
 }
 
 fn direct_dependents(plan: &TeamPlan, task_id: &str) -> Vec<String> {

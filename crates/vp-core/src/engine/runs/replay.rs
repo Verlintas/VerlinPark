@@ -284,7 +284,8 @@ impl Engine {
         let expected_journal = crate::run_journal::projections_from_events(&data.events);
         let (runs_match, run_steps_match, run_checkpoints_match) = match &expected_journal {
             Some((runs, steps, checkpoints)) => (
-                crate::run_journal::runs_match(&data.runs, runs),
+                crate::run_journal::runs_match(&data.runs, runs)
+                    && Self::runs_runtime_pins_match(&data.runs, runs),
                 crate::run_journal::steps_match(&data.run_steps, steps),
                 crate::run_journal::checkpoints_match(&data.run_checkpoints, checkpoints),
             ),
@@ -696,17 +697,13 @@ impl Engine {
                     "team_plan.submitted" | "team_plan.revised"
                 )
             })
-            .map(|event| {
-                let mut payload = event.payload.clone();
-                if let Some(object) = payload.as_object_mut() {
-                    object.remove("runtime_snapshot");
-                }
-                payload
-            });
+            .and_then(crate::orchestration::plan::plan_from_event)
+            .and_then(|plan| serde_json::to_value(plan).ok());
         let projected_plan = data
             .plan
             .as_deref()
-            .and_then(|plan| serde_json::from_str::<serde_json::Value>(plan).ok());
+            .and_then(|plan| serde_json::from_str::<TeamPlan>(plan).ok())
+            .and_then(|plan| serde_json::to_value(plan).ok());
         let plan_matches = replay_plan == projected_plan;
         if !plan_matches {
             mismatches.push("team plan projection differs from event stream".to_string());
@@ -778,26 +775,20 @@ impl Engine {
             ));
         }
 
-        let replay_queue = data
-            .events
-            .iter()
-            .filter_map(|event| {
-                let entry = event.payload.get("entry")?;
-                Some((
-                    entry.get("id")?.as_str()?.to_string(),
-                    entry.get("status")?.as_str()?.to_string(),
-                ))
-            })
-            .fold(HashMap::new(), |mut map, (id, status)| {
-                map.insert(id, status);
-                map
-            });
-        let projected_queue = data
-            .queue
-            .iter()
-            .map(|entry| (entry.id.clone(), entry.status.clone()))
-            .collect::<HashMap<_, _>>();
-        let queue_matches = replay_queue == projected_queue;
+        let queue_matches = match Self::expected_merge_queue(data) {
+            Some(expected) => {
+                expected.len() == data.queue.len()
+                    && expected.iter().all(|expected| {
+                        data.queue
+                            .iter()
+                            .find(|entry| entry.id == expected.id)
+                            .is_some_and(|projected| {
+                                Self::same_merge_queue_entry(expected, projected)
+                            })
+                    })
+            }
+            None => false,
+        };
         if !queue_matches {
             mismatches.push("merge queue projection differs from event stream".to_string());
         }
@@ -900,6 +891,7 @@ impl Engine {
             && memories_matches
             && memory_conflicts_match
             && questions_matches
+            && progress_matches
             && task_queue_matches
             && plan_matches
             && todos_matches

@@ -26,13 +26,14 @@ pub mod scenario;
 pub use cache_bench::{
     CACHE_BENCH_SCHEMA, CacheBenchAcceptance, CacheBenchAggregate, CacheBenchCall,
     CacheBenchCommand, CacheBenchComparison, CacheBenchMatrix, CacheBenchMatrixArgs,
-    CacheBenchMode, CacheBenchPricing, CacheBenchRefusal, CacheBenchReport, CacheBenchRunArgs,
-    CacheBenchScenario, CacheBenchScenarioConfig, CacheBenchScenarioKind, CostEstimate,
-    LONG_PREFIX_HIT_TARGET, LONG_PREFIX_STRETCH_TARGET, LiveCacheBenchSettings, LiveRunOptions,
-    PrefixCacheSimulator, SIMULATOR_BLOCK_SIZE, ScenarioSizeCheck, compare_cache_bench_reports,
-    execute as execute_cache_bench, load_cache_bench_report, long_prefix_scenario,
-    run_live_benchmark, run_live_benchmark_with_options, run_live_benchmark_with_provider,
-    run_simulated_benchmark, write_cache_bench_artifacts,
+    CacheBenchMode, CacheBenchPriceFieldSources, CacheBenchPricing, CacheBenchRefusal,
+    CacheBenchReport, CacheBenchRunArgs, CacheBenchScenario, CacheBenchScenarioConfig,
+    CacheBenchScenarioKind, CostEstimate, LONG_PREFIX_HIT_TARGET, LONG_PREFIX_STRETCH_TARGET,
+    LiveCacheBenchSettings, LiveRunOptions, PrefixCacheSimulator, SIMULATOR_BLOCK_SIZE,
+    ScenarioSizeCheck, compare_cache_bench_reports, execute as execute_cache_bench,
+    load_cache_bench_report, long_prefix_scenario, run_live_benchmark,
+    run_live_benchmark_with_options, run_live_benchmark_with_provider, run_simulated_benchmark,
+    write_cache_bench_artifacts,
 };
 pub use compare::{
     CompareOptions, CompareRefusal, ComparisonMismatch, ComparisonReport, compare_reports,
@@ -41,7 +42,10 @@ pub use fixture::{
     AcceptanceHarness, AcceptanceSpec, BenchWorkspace, FixturePlan, materialize_repo,
     prepare_fixture,
 };
-pub use metrics::{Pricing, TokenUsage, cost_per_solved, priced_cost, tokens_per_solved};
+pub use metrics::{
+    PriceSource, Pricing, PricingProvenance, TokenUsage, cost_per_solved, priced_cost,
+    tokens_per_solved,
+};
 pub use provider::{BenchBehavior, FakeProvider, FakeUsageModel, RealProviderSettings};
 pub use reliability::{
     CoordinationUsage, LuckyPassSummary, LuckySignal, ReliabilityArtifacts, ReliabilityReport,

@@ -155,7 +155,10 @@ impl Engine {
             let branch = branch.clone();
             let base_commit = base_commit.clone();
             move || {
-                store.create_session_with_worktree(
+                // The session row and its `session.created` event commit in one
+                // transaction; `db-rebuild` therefore never skips the session
+                // while an orphan worktree remains on disk.
+                store.create_session_with_worktree_and_event(
                     &session_id,
                     &project_id,
                     &goal,
@@ -172,8 +175,8 @@ impl Engine {
         })
         .await;
 
-        let session = match session {
-            Ok(Ok(session)) => session,
+        let (session, event) = match session {
+            Ok(Ok(created)) => created,
             Ok(Err(error)) => {
                 worktree::remove(
                     &PathBuf::from(&project.root),
@@ -191,25 +194,10 @@ impl Engine {
                 return Err(error.into());
             }
         };
+        // The store committed the event with the row; subscribers still need
+        // the same broadcast that `append_event` used to provide.
+        self.broadcast_event(event);
 
-        let payload = serde_json::json!({
-            "goal": session.goal,
-            "project_id": session.project_id,
-            "worktree": session.worktree,
-            "branch": session.branch,
-            "priority": session.priority,
-            "token_budget": session.token_budget,
-            "cost_budget_usd": session.cost_budget_usd,
-            "time_budget_secs": session.time_budget_secs,
-            "unlimited": session.unlimited,
-            "budget_mode": if session.unlimited { "unlimited" } else { "limited" },
-            "base_commit": session.base_commit,
-            "prompt_layout": session.prompt_layout,
-            "created_at": session.created_at,
-        });
-        let _ = self
-            .append_event(&session.id, "session.created", payload)
-            .await?;
         Ok(session)
     }
 

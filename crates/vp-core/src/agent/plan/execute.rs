@@ -1,5 +1,116 @@
 use super::*;
 
+/// Statuses that already represent a real, settled outcome. A batch abort
+/// must not rewrite them: a completed/merged sibling stays completed, and a
+/// cancelled/failed/deferred sibling keeps the state its own result produced.
+fn preserved_terminal_status(status: &str) -> bool {
+    matches!(status, "completed" | "skipped" | "cancelled" | "failed")
+}
+
+fn task_dependency_satisfied(status: Option<&str>) -> bool {
+    crate::orchestration::dependency_satisfied(status)
+}
+
+async fn latest_merged_entry_id(
+    engine: &Engine,
+    session_id: &str,
+    task_id: &str,
+) -> Result<Option<String>> {
+    let store = engine.store().clone();
+    let session_id = session_id.to_string();
+    let task_id = task_id.to_string();
+    Ok(tokio::task::spawn_blocking(move || {
+        store.latest_merged_entry_for_task(&session_id, &task_id)
+    })
+    .await??
+    .map(|entry| entry.id))
+}
+
+/// Apply the guarded projection transition first, then emit the matching
+/// `plan_task.finished` event only when the store actually applied it. A
+/// completed/merged row is authoritative: a late abort/cancel must not emit a
+/// contradictory event that replay would project over the real result.
+#[allow(clippy::too_many_arguments)]
+async fn finish_task_and_emit(
+    engine: &Engine,
+    session_id: &str,
+    plan_seq: u64,
+    spec: &AgentSpec,
+    task_id: &str,
+    status: &str,
+    detail: Option<&str>,
+    payload: serde_json::Value,
+    statuses: &mut std::collections::HashMap<String, String>,
+) -> Result<Option<vp_protocol::types::ScheduledTask>> {
+    let Some(task) =
+        record_scheduled_task_finish(engine, session_id, plan_seq, task_id, status, detail).await?
+    else {
+        if let Some(current) = engine.plan_task_status(session_id, task_id).await? {
+            statuses.insert(task_id.to_string(), current);
+        }
+        return Ok(None);
+    };
+    statuses.insert(task_id.to_string(), task.status.clone());
+    emit(engine, session_id, spec, "plan_task.finished", payload).await?;
+    Ok(Some(task))
+}
+
+/// Settle a task that produced no actual result in this batch. The current
+/// projection is read first so an abort can never overwrite work another
+/// path already completed or cancelled.
+#[allow(clippy::too_many_arguments)]
+async fn settle_aborted_task(
+    engine: &Engine,
+    session_id: &str,
+    plan_seq: u64,
+    spec: &AgentSpec,
+    task_id: &str,
+    status: &str,
+    reason: &str,
+    statuses: &mut std::collections::HashMap<String, String>,
+    reports: &mut Vec<String>,
+) -> Result<()> {
+    if let Some(current) = engine.plan_task_status(session_id, task_id).await?
+        && preserved_terminal_status(&current)
+    {
+        statuses.insert(task_id.to_string(), current.clone());
+        reports.push(format!(
+            "{task_id} [{current}]: already settled; abort status {status} not applied"
+        ));
+        return Ok(());
+    }
+    let payload = serde_json::json!({
+        "task_id": task_id,
+        "task_status": status,
+        "reason": reason,
+    });
+    if finish_task_and_emit(
+        engine,
+        session_id,
+        plan_seq,
+        spec,
+        task_id,
+        status,
+        Some(reason),
+        payload,
+        statuses,
+    )
+    .await?
+    .is_some()
+    {
+        reports.push(format!("{task_id} [{status}]: {reason}"));
+    } else {
+        let current = statuses
+            .get(task_id)
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+        reports.push(format!(
+            "{task_id} [{current}]: guarded finish refused {status}; no event emitted"
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::agent) async fn execute_team_plan(
     engine: &Engine,
@@ -76,25 +187,16 @@ pub(in crate::agent) async fn execute_team_plan(
                 return Ok(PlanRunResult::Cancelled);
             }
             for task in &remaining {
-                statuses.insert(task.id.clone(), "cancelled".to_string());
-                emit(
-                    engine,
-                    &session.id,
-                    leader_spec,
-                    "plan_task.finished",
-                    serde_json::json!({
-                        "task_id": task.id,
-                        "task_status": "cancelled",
-                    }),
-                )
-                .await?;
-                record_scheduled_task_finish(
+                settle_aborted_task(
                     engine,
                     &session.id,
                     plan_seq,
+                    leader_spec,
                     &task.id,
                     "cancelled",
-                    None,
+                    "session cancelled",
+                    &mut statuses,
+                    &mut reports,
                 )
                 .await?;
             }
@@ -105,26 +207,16 @@ pub(in crate::agent) async fn execute_team_plan(
                 return Ok(PlanRunResult::BudgetExceeded(BudgetStop::session(budget)));
             }
             for task in &remaining {
-                statuses.insert(task.id.clone(), "blocked".to_string());
-                emit(
-                    engine,
-                    &session.id,
-                    leader_spec,
-                    "plan_task.finished",
-                    serde_json::json!({
-                        "task_id": task.id,
-                        "task_status": "blocked",
-                        "reason": "token budget exhausted",
-                    }),
-                )
-                .await?;
-                record_scheduled_task_finish(
+                settle_aborted_task(
                     engine,
                     &session.id,
                     plan_seq,
+                    leader_spec,
                     &task.id,
                     "blocked",
-                    Some("token budget exhausted"),
+                    "token budget exhausted",
+                    &mut statuses,
+                    &mut reports,
                 )
                 .await?;
             }
@@ -172,15 +264,11 @@ pub(in crate::agent) async fn execute_team_plan(
                 break;
             }
             for task in &remaining {
-                statuses.insert(task.id.clone(), "blocked".to_string());
                 let unmet = task
                     .deps
                     .iter()
                     .filter(|dep| {
-                        !matches!(
-                            statuses.get(*dep).map(String::as_str),
-                            Some("completed" | "skipped")
-                        )
+                        !task_dependency_satisfied(statuses.get(*dep).map(String::as_str))
                     })
                     .map(|dep| {
                         format!(
@@ -195,25 +283,16 @@ pub(in crate::agent) async fn execute_team_plan(
                 } else {
                     format!("waiting on {}", unmet.join(", "))
                 };
-                emit(
-                    engine,
-                    &session.id,
-                    leader_spec,
-                    "plan_task.finished",
-                    serde_json::json!({
-                        "task_id": task.id,
-                        "task_status": "blocked",
-                        "reason": reason,
-                    }),
-                )
-                .await?;
-                record_scheduled_task_finish(
+                settle_aborted_task(
                     engine,
                     &session.id,
                     plan_seq,
+                    leader_spec,
                     &task.id,
                     "blocked",
-                    Some(&reason),
+                    &reason,
+                    &mut statuses,
+                    &mut reports,
                 )
                 .await?;
             }
@@ -248,26 +327,16 @@ pub(in crate::agent) async fn execute_team_plan(
                 break;
             }
             for task in &remaining {
-                statuses.insert(task.id.clone(), "blocked".to_string());
-                emit(
-                    engine,
-                    &session.id,
-                    leader_spec,
-                    "plan_task.finished",
-                    serde_json::json!({
-                        "task_id": task.id,
-                        "task_status": "blocked",
-                        "reason": "Worker cap is fully occupied",
-                    }),
-                )
-                .await?;
-                record_scheduled_task_finish(
+                settle_aborted_task(
                     engine,
                     &session.id,
                     plan_seq,
+                    leader_spec,
                     &task.id,
                     "blocked",
-                    Some("Worker cap is fully occupied"),
+                    "Worker cap is fully occupied",
+                    &mut statuses,
+                    &mut reports,
                 )
                 .await?;
             }
@@ -296,209 +365,269 @@ pub(in crate::agent) async fn execute_team_plan(
 
         let mut prepared = Vec::new();
         let mut worker_slots = Vec::new();
-        let plan_results = latest_plan_results(engine, &session.id).await?;
-        for task in &batch {
-            let manager_spec = if let Some(spec) = manager_specs.get(&task.department) {
-                spec.clone()
-            } else {
-                let department = plan
-                    .departments
-                    .iter()
-                    .find(|department| department.name == task.department)
-                    .ok_or_else(|| anyhow!("missing department for task {}", task.department))?;
-                let spec =
-                    ensure_plan_manager(engine, config, session, budget, leader_spec, department)
-                        .await?;
-                manager_specs.insert(task.department.clone(), spec.clone());
-                spec
-            };
-            let profile = task_profile(task, manager_spec.profile);
-            let acceptance = task.acceptance.join("; ");
-            let write_scope = task
-                .write_scope
-                .iter()
-                .map(|scope| normalize_scope(scope))
-                .collect::<Vec<_>>();
-            let worker_name = format!("{} · {}", task.department, truncate_to(&task.title, 48));
-            let Some((_ordinal, slot)) = budget.reserve_slot(AgentRole::Worker) else {
-                return Err(anyhow!("the Worker cap for this session has been reached"));
-            };
-            worker_slots.push(slot);
-            let worker = engine
-                .create_agent(
-                    &session.id,
-                    AgentRole::Worker.as_str(),
-                    &worker_name,
-                    None,
-                    Some(manager_spec.id.clone()),
-                    &model_for(config, AgentRole::Worker),
-                )
-                .await?;
-            engine
-                .set_agent_profile(&worker.id, profile.as_str())
-                .await?;
-            engine
-                .set_agent_task(
-                    &worker.id,
-                    Some(task.id.clone()),
-                    Some(task.department.clone()),
-                )
-                .await?;
-            let workspace_binding = engine
-                .attach_worker_workspace_for_run(&session.id, None, Some(task.department.as_str()))
-                .await?;
-            let (worker_identity_id, worker_identity_generation) = match workspace_binding.as_ref()
-            {
-                Some(binding) => {
-                    let identity_id = binding.workspace.identity_id.clone();
-                    let generation = engine
-                        .get_agent_identity(&identity_id)
-                        .await
-                        .ok()
-                        .map(|result| result.identity.generation);
-                    (Some(identity_id), generation)
+        let claimed_ids = claimed
+            .iter()
+            .map(|task| task.task_id.clone())
+            .collect::<Vec<_>>();
+        let setup_snapshot = match batch_setup_snapshot(engine, session).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                // The snapshot is taken before any agent/worktree exists, so
+                // only the claims need settling.
+                let detail = format!("plan batch setup failed: {error:#}");
+                for task_id in &claimed_ids {
+                    if let Err(finish_error) = record_scheduled_task_finish(
+                        engine,
+                        &session.id,
+                        plan_seq,
+                        task_id,
+                        "failed",
+                        Some(&detail),
+                    )
+                    .await
+                    {
+                        tracing::warn!(%finish_error, task_id, "batch setup rollback could not settle claimed task");
+                    }
                 }
-                None => engine
-                    .prompt_identity_for_run(
+                return Err(error);
+            }
+        };
+        let setup_result: Result<()> = Box::pin(async {
+            let plan_results = latest_plan_results(engine, &session.id).await?;
+            for task in &batch {
+                let manager_spec = if let Some(spec) = manager_specs.get(&task.department) {
+                    spec.clone()
+                } else {
+                    let department = plan
+                        .departments
+                        .iter()
+                        .find(|department| department.name == task.department)
+                        .ok_or_else(|| {
+                            anyhow!("missing department for task {}", task.department)
+                        })?;
+                    let spec = ensure_plan_manager(
+                        engine,
+                        config,
+                        session,
+                        budget,
+                        leader_spec,
+                        department,
+                    )
+                    .await?;
+                    manager_specs.insert(task.department.clone(), spec.clone());
+                    spec
+                };
+                let profile = task_profile(task, manager_spec.profile);
+                let acceptance = task.acceptance.join("; ");
+                let write_scope = task
+                    .write_scope
+                    .iter()
+                    .map(|scope| normalize_scope(scope))
+                    .collect::<Vec<_>>();
+                let worker_name = format!("{} · {}", task.department, truncate_to(&task.title, 48));
+                let Some((_ordinal, slot)) = budget.reserve_slot(AgentRole::Worker) else {
+                    return Err(anyhow!("the Worker cap for this session has been reached"));
+                };
+                worker_slots.push(slot);
+                let worker = engine
+                    .create_agent(
                         &session.id,
                         AgentRole::Worker.as_str(),
+                        &worker_name,
+                        None,
+                        Some(manager_spec.id.clone()),
+                        &model_for(config, AgentRole::Worker),
+                    )
+                    .await?;
+                engine
+                    .set_agent_profile(&worker.id, profile.as_str())
+                    .await?;
+                engine
+                    .set_agent_task(
+                        &worker.id,
+                        Some(task.id.clone()),
+                        Some(task.department.clone()),
+                    )
+                    .await?;
+                let workspace_binding = engine
+                    .attach_worker_workspace_for_run(
+                        &session.id,
                         None,
                         Some(task.department.as_str()),
                     )
-                    .await?
-                    .map(|identity| (identity.id, identity.generation))
-                    .map(|(id, generation)| (Some(id), Some(generation)))
-                    .unwrap_or((None, None)),
-            };
-            let (info, workspace_id, session_workspace_id) = match workspace_binding {
-                Some(binding) => {
-                    let head_path = PathBuf::from(&binding.session.worktree_path);
-                    let head =
-                        tokio::task::spawn_blocking(move || worktree::head_commit(&head_path))
-                            .await??;
-                    (
-                        crate::worktree::WorktreeInfo {
-                            path: PathBuf::from(&binding.session.worktree_path),
-                            branch: binding.session.branch.clone(),
-                            base_commit: head,
-                        },
-                        Some(binding.workspace.id),
-                        Some(binding.session.id),
-                    )
-                }
-                None => (
-                    engine
-                        .create_task_worktree(
-                            &project.root,
-                            &project.id,
-                            &session.id,
-                            &task.id,
-                            &manager_spec.session_branch,
+                    .await?;
+                let (worker_identity_id, worker_identity_generation) =
+                    match workspace_binding.as_ref() {
+                        Some(binding) => {
+                            let identity_id = binding.workspace.identity_id.clone();
+                            let generation = engine
+                                .get_agent_identity(&identity_id)
+                                .await
+                                .ok()
+                                .map(|result| result.identity.generation);
+                            (Some(identity_id), generation)
+                        }
+                        None => engine
+                            .prompt_identity_for_run(
+                                &session.id,
+                                AgentRole::Worker.as_str(),
+                                None,
+                                Some(task.department.as_str()),
+                            )
+                            .await?
+                            .map(|identity| (identity.id, identity.generation))
+                            .map(|(id, generation)| (Some(id), Some(generation)))
+                            .unwrap_or((None, None)),
+                    };
+                let (info, workspace_id, session_workspace_id) = match workspace_binding {
+                    Some(binding) => {
+                        let head_path = PathBuf::from(&binding.session.worktree_path);
+                        let head =
+                            tokio::task::spawn_blocking(move || worktree::head_commit(&head_path))
+                                .await??;
+                        (
+                            crate::worktree::WorktreeInfo {
+                                path: PathBuf::from(&binding.session.worktree_path),
+                                branch: binding.session.branch.clone(),
+                                base_commit: head,
+                            },
+                            Some(binding.workspace.id),
+                            Some(binding.session.id),
                         )
-                        .await?,
-                    None,
-                    None,
-                ),
-            };
-            engine
-                .set_agent_worktree(&worker.id, &info.path.to_string_lossy(), &info.branch)
+                    }
+                    None => (
+                        engine
+                            .create_task_worktree(
+                                &project.root,
+                                &project.id,
+                                &session.id,
+                                &task.id,
+                                &manager_spec.session_branch,
+                            )
+                            .await?,
+                        None,
+                        None,
+                    ),
+                };
+                engine
+                    .set_agent_worktree(&worker.id, &info.path.to_string_lossy(), &info.branch)
+                    .await?;
+                engine
+                    .set_agent_workspace_binding(&worker.id, workspace_id.as_deref(), None)
+                    .await?;
+                let worker_spec = AgentSpec {
+                    id: worker.id.clone(),
+                    role: AgentRole::Worker,
+                    name: worker_name,
+                    depth: manager_spec.depth.saturating_add(1),
+                    parent_name: Some(manager_spec.name.clone()),
+                    title: None,
+                    task_id: Some(task.id.clone()),
+                    department: Some(task.department.clone()),
+                    identity_id: worker_identity_id,
+                    identity_generation: worker_identity_generation,
+                    profile,
+                    allow_delegation: true,
+                    // The plan task kind is the deterministic bundle selector for
+                    // this Worker. It is frozen for the run, including retries.
+                    task_kind: Some(task.kind.clone()),
+                    auto_approve: false,
+                    worktree: info.path,
+                    branch: info.branch,
+                    session_worktree: manager_spec.session_worktree.clone(),
+                    session_branch: manager_spec.session_branch.clone(),
+                    write_scope,
+                    base_commit: info.base_commit,
+                    workspace_id,
+                    session_workspace_id,
+                    parent_workspace_id: None,
+                };
+                emit(
+                    engine,
+                    &session.id,
+                    &worker_spec,
+                    "agent.spawned",
+                    serde_json::json!({
+                        "parent_id": manager_spec.id,
+                        "parent_name": manager_spec.name,
+                        "objective": task.title,
+                        "plan_task_id": task.id,
+                        "department": task.department,
+                    }),
+                )
                 .await?;
-            engine
-                .set_agent_workspace_binding(&worker.id, workspace_id.as_deref(), None)
+                statuses.insert(task.id.clone(), "running".to_string());
+                let dependency_brief = task_dependency_brief(task, &statuses, &plan_results);
+                let coordination = coordination_brief_for_agent(
+                    engine,
+                    &session.id,
+                    &worker_spec.id,
+                    Some(&task.id),
+                    6,
+                )
                 .await?;
-            let worker_spec = AgentSpec {
-                id: worker.id.clone(),
-                role: AgentRole::Worker,
-                name: worker_name,
-                depth: manager_spec.depth.saturating_add(1),
-                parent_name: Some(manager_spec.name.clone()),
-                title: None,
-                task_id: Some(task.id.clone()),
-                department: Some(task.department.clone()),
-                identity_id: worker_identity_id,
-                identity_generation: worker_identity_generation,
-                profile,
-                allow_delegation: true,
-                // The plan task kind is the deterministic bundle selector for
-                // this Worker. It is frozen for the run, including retries.
-                task_kind: Some(task.kind.clone()),
-                auto_approve: false,
-                worktree: info.path,
-                branch: info.branch,
-                session_worktree: manager_spec.session_worktree.clone(),
-                session_branch: manager_spec.session_branch.clone(),
-                write_scope,
-                base_commit: info.base_commit,
-                workspace_id,
-                session_workspace_id,
-                parent_workspace_id: None,
-            };
-            emit(
+                let mailbox = mailbox_brief(engine, &session.id, &worker_spec.id, 4).await?;
+                let memory_brief = project_memory_brief(
+                    engine,
+                    &session.id,
+                    Some(&task.id),
+                    Some(&task.department),
+                )
+                .await
+                .unwrap_or_default();
+                let memory_note = if memory_brief.is_empty() {
+                    String::new()
+                } else {
+                    format!("\nRelevant long-term memory:\n{memory_brief}")
+                };
+                let coordination_note = if coordination.is_empty() {
+                    String::new()
+                } else {
+                    format!("\nRecent coordination for this task:\n{coordination}")
+                };
+                let mailbox_note = if mailbox.is_empty() {
+                    String::new()
+                } else {
+                    format!("\nUnread mailbox:\n{mailbox}")
+                };
+                let objective = format!(
+                    "Execute plan task {}: {}. Department: {} ({}). Acceptance: {}. \
+                     Upstream handoffs:\n{}\n{}{}{}\
+                     Work only in your task worktree and return a concise summary.",
+                    task.id,
+                    task.title,
+                    task.department,
+                    manager_spec.title.as_deref().unwrap_or(&manager_spec.name),
+                    acceptance,
+                    dependency_brief,
+                    memory_note,
+                    coordination_note,
+                    mailbox_note
+                );
+                prepared.push((
+                    task.clone(),
+                    worker_spec,
+                    manager_spec,
+                    objective.clone(),
+                    acceptance,
+                    vec![ChatMessage::user(objective)],
+                ));
+            }
+            Ok(())
+        })
+        .await;
+        if let Err(error) = setup_result {
+            let detail = format!("plan batch setup failed: {error:#}");
+            rollback_batch_setup(
                 engine,
                 &session.id,
-                &worker_spec,
-                "agent.spawned",
-                serde_json::json!({
-                    "parent_id": manager_spec.id,
-                    "parent_name": manager_spec.name,
-                    "objective": task.title,
-                    "plan_task_id": task.id,
-                    "department": task.department,
-                }),
+                Some(plan_seq),
+                &claimed_ids,
+                &setup_snapshot,
+                &detail,
             )
-            .await?;
-            statuses.insert(task.id.clone(), "running".to_string());
-            let dependency_brief = task_dependency_brief(task, &statuses, &plan_results);
-            let coordination = coordination_brief_for_agent(
-                engine,
-                &session.id,
-                &worker_spec.id,
-                Some(&task.id),
-                6,
-            )
-            .await?;
-            let mailbox = mailbox_brief(engine, &session.id, &worker_spec.id, 4).await?;
-            let memory_brief =
-                project_memory_brief(engine, &session.id, Some(&task.id), Some(&task.department))
-                    .await
-                    .unwrap_or_default();
-            let memory_note = if memory_brief.is_empty() {
-                String::new()
-            } else {
-                format!("\nRelevant long-term memory:\n{memory_brief}")
-            };
-            let coordination_note = if coordination.is_empty() {
-                String::new()
-            } else {
-                format!("\nRecent coordination for this task:\n{coordination}")
-            };
-            let mailbox_note = if mailbox.is_empty() {
-                String::new()
-            } else {
-                format!("\nUnread mailbox:\n{mailbox}")
-            };
-            let objective = format!(
-                "Execute plan task {}: {}. Department: {} ({}). Acceptance: {}. \
-                 Upstream handoffs:\n{}\n{}{}{}\
-                 Work only in your task worktree and return a concise summary.",
-                task.id,
-                task.title,
-                task.department,
-                manager_spec.title.as_deref().unwrap_or(&manager_spec.name),
-                acceptance,
-                dependency_brief,
-                memory_note,
-                coordination_note,
-                mailbox_note
-            );
-            prepared.push((
-                task.clone(),
-                worker_spec,
-                manager_spec,
-                objective.clone(),
-                acceptance,
-                vec![ChatMessage::user(objective)],
-            ));
+            .await;
+            return Err(error);
         }
 
         let futures = prepared
@@ -536,41 +665,6 @@ pub(in crate::agent) async fn execute_team_plan(
         let mut abort: Option<PlanAbort> = None;
         for (index, result) in results.into_iter().enumerate() {
             let (task, worker_spec, manager_spec, objective, acceptance, _) = &prepared[index];
-            if let Some(abort) = &abort {
-                let status = abort.task_status();
-                let reason = abort.reason();
-                engine
-                    .update_agent_status(
-                        &worker_spec.id,
-                        if status == "cancelled" {
-                            "cancelled"
-                        } else {
-                            "failed"
-                        },
-                    )
-                    .await?;
-                statuses.insert(task.id.clone(), status.to_string());
-                emit_plan_task_finished(
-                    engine,
-                    &session.id,
-                    worker_spec,
-                    &task.id,
-                    status,
-                    Some(&reason),
-                )
-                .await?;
-                record_scheduled_task_finish(
-                    engine,
-                    &session.id,
-                    plan_seq,
-                    &task.id,
-                    status,
-                    Some(&reason),
-                )
-                .await?;
-                reports.push(format!("{} [{}]: {}", task.id, status, reason));
-                continue;
-            }
             match result {
                 Ok(LoopOutcome::Final(summary)) => {
                     let summary = if summary.trim().is_empty() {
@@ -578,37 +672,51 @@ pub(in crate::agent) async fn execute_team_plan(
                     } else {
                         summary
                     };
-                    if !control.is_cancelled()
-                        && engine
-                            .plan_task_cancel_requested(&session.id, &task.id)
-                            .await?
-                    {
-                        engine
-                            .update_agent_status(&worker_spec.id, "cancelled")
-                            .await?;
-                        statuses.insert(task.id.clone(), "cancelled".to_string());
-                        emit(
-                            engine,
-                            &session.id,
-                            worker_spec,
-                            "plan_task.finished",
-                            serde_json::json!({
-                                "task_id": task.id,
-                                "task_status": "cancelled",
-                                "reason": "cancel requested by user",
-                            }),
-                        )
+                    let session_cancelled = control.is_cancelled();
+                    let task_cancelled = engine
+                        .plan_task_cancel_requested(&session.id, &task.id)
                         .await?;
-                        record_scheduled_task_finish(
+                    if session_cancelled || task_cancelled {
+                        let reason = if session_cancelled {
+                            "session cancelled"
+                        } else {
+                            "cancel requested by user"
+                        };
+                        let payload = serde_json::json!({
+                            "task_id": task.id,
+                            "task_status": "cancelled",
+                            "reason": reason,
+                        });
+                        let applied = finish_task_and_emit(
                             engine,
                             &session.id,
                             plan_seq,
+                            worker_spec,
                             &task.id,
                             "cancelled",
-                            Some("cancel requested by user"),
+                            Some(reason),
+                            payload,
+                            &mut statuses,
                         )
                         .await?;
-                        reports.push(format!("{} [cancelled]: cancel requested", task.id));
+                        if applied.is_some() {
+                            engine
+                                .update_agent_status(&worker_spec.id, "cancelled")
+                                .await?;
+                            reports.push(format!("{} [cancelled]: {reason}", task.id));
+                        } else {
+                            reports.push(format!(
+                                "{} [{}]: guarded cancel refused; task event not emitted",
+                                task.id,
+                                statuses
+                                    .get(&task.id)
+                                    .map(String::as_str)
+                                    .unwrap_or("unknown")
+                            ));
+                        }
+                        if session_cancelled {
+                            abort = Some(PlanAbort::Cancelled);
+                        }
                         continue;
                     }
                     match finish_worker(
@@ -627,213 +735,364 @@ pub(in crate::agent) async fn execute_team_plan(
                     .await?
                     {
                         WorkerFinish::Done { report, success } => {
-                            let status = if success { "completed" } else { "failed" };
-                            statuses.insert(task.id.clone(), status.to_string());
-                            emit(
-                                engine,
-                                &session.id,
-                                worker_spec,
-                                "plan_task.finished",
-                                serde_json::json!({
-                                    "task_id": task.id,
-                                    "task_status": status,
-                                    "summary": truncate(&report),
-                                }),
-                            )
-                            .await?;
-                            record_scheduled_task_finish(
+                            let cancelled_after_finish = control.is_cancelled()
+                                || engine
+                                    .plan_task_cancel_requested(&session.id, &task.id)
+                                    .await?;
+                            let merged_before_cancel = if cancelled_after_finish {
+                                latest_merged_entry_id(engine, &session.id, &task.id).await?
+                            } else {
+                                None
+                            };
+                            let (status, detail, reason) = if cancelled_after_finish {
+                                if merged_before_cancel.is_some() {
+                                    // The commit already landed; report the
+                                    // actual merged result instead of
+                                    // rewriting history to cancelled.
+                                    (
+                                        "completed",
+                                        report.clone(),
+                                        Some("commit merged before the cancel was observed"),
+                                    )
+                                } else {
+                                    (
+                                        "cancelled",
+                                        "cancel requested before the commit merged; integration did not complete"
+                                            .to_string(),
+                                        Some("cancel requested by user"),
+                                    )
+                                }
+                            } else if success {
+                                ("completed", report.clone(), None)
+                            } else {
+                                ("failed", report.clone(), None)
+                            };
+                            let mut payload = serde_json::json!({
+                                "task_id": task.id,
+                                "task_status": status,
+                                "summary": truncate(&detail),
+                            });
+                            if cancelled_after_finish {
+                                payload["cancel_observed"] = serde_json::json!(true);
+                            }
+                            if merged_before_cancel.is_some() {
+                                payload["merged"] = serde_json::json!(true);
+                            }
+                            if let Some(reason) = reason {
+                                payload["reason"] = serde_json::json!(reason);
+                            }
+                            let applied = finish_task_and_emit(
                                 engine,
                                 &session.id,
                                 plan_seq,
+                                worker_spec,
                                 &task.id,
                                 status,
-                                Some(report.as_str()),
+                                Some(detail.as_str()),
+                                payload,
+                                &mut statuses,
                             )
                             .await?;
+                            if applied.is_none() {
+                                if control.is_cancelled() {
+                                    abort = Some(PlanAbort::Cancelled);
+                                }
+                                reports.push(format!(
+                                    "{} [{}]: guarded finish refused {status}; no event emitted",
+                                    task.id,
+                                    statuses
+                                        .get(&task.id)
+                                        .map(String::as_str)
+                                        .unwrap_or("unknown")
+                                ));
+                                continue;
+                            }
+                            if status == "cancelled" && control.is_cancelled() {
+                                abort = Some(PlanAbort::Cancelled);
+                            }
                             reports.push(format!(
                                 "{} [{}]: {}",
                                 task.id,
                                 status,
-                                truncate(&report)
+                                truncate(&detail)
                             ));
                         }
                         WorkerFinish::Cancelled => {
-                            statuses.insert(task.id.clone(), "cancelled".to_string());
-                            emit(
-                                engine,
-                                &session.id,
-                                worker_spec,
-                                "plan_task.finished",
-                                serde_json::json!({
-                                    "task_id": task.id,
-                                    "task_status": "cancelled",
-                                }),
-                            )
-                            .await?;
-                            record_scheduled_task_finish(
+                            let session_cancelled = control.is_cancelled();
+                            let task_cancelled = engine
+                                .plan_task_cancel_requested(&session.id, &task.id)
+                                .await?;
+                            let reason = if session_cancelled {
+                                "session cancelled"
+                            } else if task_cancelled {
+                                "cancel requested by user"
+                            } else {
+                                "verification cancelled"
+                            };
+                            let payload = serde_json::json!({
+                                "task_id": task.id,
+                                "task_status": "cancelled",
+                                "reason": reason,
+                            });
+                            let applied = finish_task_and_emit(
                                 engine,
                                 &session.id,
                                 plan_seq,
+                                worker_spec,
                                 &task.id,
                                 "cancelled",
-                                None,
+                                Some(reason),
+                                payload,
+                                &mut statuses,
                             )
                             .await?;
-                            abort = Some(PlanAbort::Cancelled);
+                            if applied.is_some() {
+                                reports.push(format!("{} [cancelled]: {reason}", task.id));
+                            } else {
+                                reports.push(format!(
+                                    "{} [{}]: guarded cancel refused; task event not emitted",
+                                    task.id,
+                                    statuses
+                                        .get(&task.id)
+                                        .map(String::as_str)
+                                        .unwrap_or("unknown")
+                                ));
+                            }
+                            if session_cancelled {
+                                abort = Some(PlanAbort::Cancelled);
+                            }
                         }
                         WorkerFinish::BudgetExceeded(stop) => {
-                            statuses.insert(task.id.clone(), "blocked".to_string());
-                            emit(
-                                engine,
-                                &session.id,
-                                worker_spec,
-                                "plan_task.finished",
-                                serde_json::json!({
-                                    "task_id": task.id,
-                                    "task_status": "blocked",
-                                    "reason": stop.summary(),
-                                }),
-                            )
-                            .await?;
-                            record_scheduled_task_finish(
+                            let payload = serde_json::json!({
+                                "task_id": task.id,
+                                "task_status": "blocked",
+                                "reason": stop.summary(),
+                            });
+                            let applied = finish_task_and_emit(
                                 engine,
                                 &session.id,
                                 plan_seq,
+                                worker_spec,
                                 &task.id,
                                 "blocked",
                                 Some(&stop.summary()),
+                                payload,
+                                &mut statuses,
                             )
                             .await?;
-                            abort = Some(PlanAbort::Budget(stop));
+                            if applied.is_some() {
+                                reports.push(format!("{} [blocked]: {}", task.id, stop.summary()));
+                                abort = Some(PlanAbort::Budget(stop));
+                            } else {
+                                reports.push(format!(
+                                    "{} [{}]: guarded budget stop refused; task event not emitted",
+                                    task.id,
+                                    statuses
+                                        .get(&task.id)
+                                        .map(String::as_str)
+                                        .unwrap_or("unknown")
+                                ));
+                            }
                         }
                     }
                 }
                 Ok(LoopOutcome::Deferred(wait)) => {
                     engine.update_agent_status(&worker_spec.id, "idle").await?;
-                    statuses.insert(task.id.clone(), "blocked".to_string());
-                    emit(
-                        engine,
-                        &session.id,
-                        worker_spec,
-                        "plan_task.finished",
-                        serde_json::json!({
-                            "task_id": task.id,
-                            "task_status": "blocked",
-                            "gate_id": wait.gate_id,
-                            "continuation_id": wait.continuation_id,
-                            "reason": "waiting for external gate",
-                        }),
-                    )
-                    .await?;
-                    record_scheduled_task_finish(
+                    let payload = serde_json::json!({
+                        "task_id": task.id,
+                        "task_status": "blocked",
+                        "gate_id": wait.gate_id,
+                        "continuation_id": wait.continuation_id,
+                        "reason": "waiting for external gate",
+                    });
+                    let applied = finish_task_and_emit(
                         engine,
                         &session.id,
                         plan_seq,
+                        worker_spec,
                         &task.id,
                         "blocked",
                         Some("waiting for external gate"),
+                        payload,
+                        &mut statuses,
                     )
                     .await?;
-                    reports.push(format!(
-                        "{} [blocked]: waiting for external gate {}",
-                        task.id, wait.gate_id
-                    ));
-                    abort = Some(PlanAbort::Deferred(wait));
+                    if applied.is_some() {
+                        reports.push(format!(
+                            "{} [blocked]: waiting for external gate {}",
+                            task.id, wait.gate_id
+                        ));
+                        abort = Some(PlanAbort::Deferred(wait));
+                    } else {
+                        reports.push(format!(
+                            "{} [{}]: guarded gate wait refused; task event not emitted",
+                            task.id,
+                            statuses
+                                .get(&task.id)
+                                .map(String::as_str)
+                                .unwrap_or("unknown")
+                        ));
+                    }
                 }
                 Ok(LoopOutcome::Cancelled) => {
                     let task_cancel = !control.is_cancelled()
                         && engine
                             .plan_task_cancel_requested(&session.id, &task.id)
                             .await?;
-                    engine
-                        .update_agent_status(&worker_spec.id, "cancelled")
-                        .await?;
-                    statuses.insert(task.id.clone(), "cancelled".to_string());
-                    emit(
-                        engine,
-                        &session.id,
-                        worker_spec,
-                        "plan_task.finished",
-                        serde_json::json!({
-                            "task_id": task.id,
-                            "task_status": "cancelled",
-                            "reason": if task_cancel { "cancel requested by user" } else { "session cancelled" },
-                        }),
-                    )
-                    .await?;
-                    record_scheduled_task_finish(
+                    let reason = if task_cancel {
+                        "cancel requested by user"
+                    } else {
+                        "session cancelled"
+                    };
+                    let payload = serde_json::json!({
+                        "task_id": task.id,
+                        "task_status": "cancelled",
+                        "reason": reason,
+                    });
+                    let applied = finish_task_and_emit(
                         engine,
                         &session.id,
                         plan_seq,
+                        worker_spec,
                         &task.id,
                         "cancelled",
-                        task_cancel.then_some("cancel requested by user"),
+                        task_cancel.then_some(reason),
+                        payload,
+                        &mut statuses,
                     )
                     .await?;
-                    if task_cancel {
-                        reports.push(format!("{} [cancelled]: cancel requested", task.id));
+                    if applied.is_some() {
+                        engine
+                            .update_agent_status(&worker_spec.id, "cancelled")
+                            .await?;
+                        reports.push(format!("{} [cancelled]: {reason}", task.id));
                     } else {
+                        reports.push(format!(
+                            "{} [{}]: guarded cancel refused; task event not emitted",
+                            task.id,
+                            statuses
+                                .get(&task.id)
+                                .map(String::as_str)
+                                .unwrap_or("unknown")
+                        ));
+                    }
+                    if !task_cancel {
                         abort = Some(PlanAbort::Cancelled);
                     }
                 }
                 Ok(LoopOutcome::BudgetExceeded(stop)) => {
-                    engine
-                        .update_agent_status(&worker_spec.id, "failed")
-                        .await?;
-                    statuses.insert(task.id.clone(), "blocked".to_string());
-                    emit(
-                        engine,
-                        &session.id,
-                        worker_spec,
-                        "plan_task.finished",
-                        serde_json::json!({
-                            "task_id": task.id,
-                            "task_status": "blocked",
-                            "reason": stop.summary(),
-                        }),
-                    )
-                    .await?;
-                    record_scheduled_task_finish(
+                    let payload = serde_json::json!({
+                        "task_id": task.id,
+                        "task_status": "blocked",
+                        "reason": stop.summary(),
+                    });
+                    let applied = finish_task_and_emit(
                         engine,
                         &session.id,
                         plan_seq,
+                        worker_spec,
                         &task.id,
                         "blocked",
                         Some(&stop.summary()),
+                        payload,
+                        &mut statuses,
                     )
                     .await?;
-                    if stop.is_abortive() {
-                        abort = Some(PlanAbort::Budget(stop));
+                    if applied.is_some() {
+                        engine
+                            .update_agent_status(&worker_spec.id, "failed")
+                            .await?;
+                        reports.push(format!("{} [blocked]: {}", task.id, stop.summary()));
+                        if stop.is_abortive() {
+                            abort = Some(PlanAbort::Budget(stop));
+                        }
+                    } else {
+                        reports.push(format!(
+                            "{} [{}]: guarded budget stop refused; task event not emitted",
+                            task.id,
+                            statuses
+                                .get(&task.id)
+                                .map(String::as_str)
+                                .unwrap_or("unknown")
+                        ));
                     }
                 }
-                Ok(LoopOutcome::Verdict(_)) => {}
-                Err(error) => {
-                    engine
-                        .update_agent_status(&worker_spec.id, "failed")
-                        .await?;
-                    statuses.insert(task.id.clone(), "failed".to_string());
-                    emit(
-                        engine,
-                        &session.id,
-                        worker_spec,
-                        "plan_task.finished",
-                        serde_json::json!({
-                            "task_id": task.id,
-                            "task_status": "failed",
-                            "summary": truncate(error.to_string().as_str()),
-                        }),
-                    )
-                    .await?;
-                    record_scheduled_task_finish(
+                Ok(LoopOutcome::Verdict(verdict)) => {
+                    // Role policy reserves `submit_verdict` for Verifiers. If a
+                    // Worker ever reaches this outcome, settle the task and its
+                    // agent as failed rather than leaving both projections
+                    // `running` with no terminal event.
+                    let summary = format!(
+                        "Worker returned an unsupported Verifier verdict: {}",
+                        truncate(&verdict.summary)
+                    );
+                    let payload = serde_json::json!({
+                        "task_id": task.id,
+                        "task_status": "failed",
+                        "summary": truncate(&summary),
+                        "unsupported_outcome": "verdict",
+                    });
+                    let applied = finish_task_and_emit(
                         engine,
                         &session.id,
                         plan_seq,
+                        worker_spec,
+                        &task.id,
+                        "failed",
+                        Some(&summary),
+                        payload,
+                        &mut statuses,
+                    )
+                    .await?;
+                    if applied.is_some() {
+                        engine
+                            .update_agent_status(&worker_spec.id, "failed")
+                            .await?;
+                        reports.push(format!("{} [failed]: {summary}", task.id));
+                    } else {
+                        reports.push(format!(
+                            "{} [{}]: guarded verdict finish refused; task event not emitted",
+                            task.id,
+                            statuses
+                                .get(&task.id)
+                                .map(String::as_str)
+                                .unwrap_or("unknown")
+                        ));
+                    }
+                }
+                Err(error) => {
+                    let payload = serde_json::json!({
+                        "task_id": task.id,
+                        "task_status": "failed",
+                        "summary": truncate(error.to_string().as_str()),
+                    });
+                    let applied = finish_task_and_emit(
+                        engine,
+                        &session.id,
+                        plan_seq,
+                        worker_spec,
                         &task.id,
                         "failed",
                         Some(&error.to_string()),
+                        payload,
+                        &mut statuses,
                     )
                     .await?;
-                    reports.push(format!("{} [failed]: {error}", task.id));
+                    if applied.is_some() {
+                        engine
+                            .update_agent_status(&worker_spec.id, "failed")
+                            .await?;
+                        reports.push(format!("{} [failed]: {error}", task.id));
+                    } else {
+                        reports.push(format!(
+                            "{} [{}]: guarded failure refused; task event not emitted",
+                            task.id,
+                            statuses
+                                .get(&task.id)
+                                .map(String::as_str)
+                                .unwrap_or("unknown")
+                        ));
+                    }
                 }
             }
         }
@@ -848,27 +1107,42 @@ pub(in crate::agent) async fn execute_team_plan(
             }
             let status = abort.task_status();
             let reason = abort.reason();
+            // Every batch future has a real result and was processed above.
+            // Only tasks with no result at all are synthesized here: the
+            // non-batch remainder plus any batch task whose result did not
+            // produce a terminal state. A completed/merged sibling is never
+            // rewritten by the abort.
             for task in remaining
                 .iter()
                 .filter(|task| !batch_ids.contains(&task.id))
             {
-                statuses.insert(task.id.clone(), status.to_string());
-                emit_plan_task_finished(
-                    engine,
-                    &session.id,
-                    leader_spec,
-                    &task.id,
-                    status,
-                    Some(&reason),
-                )
-                .await?;
-                record_scheduled_task_finish(
+                settle_aborted_task(
                     engine,
                     &session.id,
                     plan_seq,
+                    leader_spec,
                     &task.id,
                     status,
-                    Some(&reason),
+                    &reason,
+                    &mut statuses,
+                    &mut reports,
+                )
+                .await?;
+            }
+            for task in &batch {
+                if statuses.get(&task.id).map(String::as_str) != Some("running") {
+                    continue;
+                }
+                settle_aborted_task(
+                    engine,
+                    &session.id,
+                    plan_seq,
+                    leader_spec,
+                    &task.id,
+                    status,
+                    &reason,
+                    &mut statuses,
+                    &mut reports,
                 )
                 .await?;
             }

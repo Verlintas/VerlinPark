@@ -55,7 +55,8 @@ impl Pricing {
     /// The benchmark's illustrative default price profile.
     ///
     /// These numbers are not a claim about any vendor's current bill. Reports
-    /// label them as a caller-supplied profile and include the values.
+    /// label them as illustrative defaults (see [`PricingProvenance`]) and
+    /// include the values.
     pub fn benchmark_default() -> Self {
         Self::new(3.0, 15.0, 0.30, 3.75)
     }
@@ -90,6 +91,179 @@ impl Pricing {
         );
         sha256_hex(canonical.as_bytes())
     }
+}
+
+/// Where one price value came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PriceSource {
+    /// A report written before provenance was recorded. Never invent a source.
+    #[default]
+    Unknown,
+    /// Supplied explicitly by the operator for this invocation.
+    Caller,
+    /// The benchmark's illustrative default, not a vendor quote.
+    IllustrativeDefault,
+    /// Some fields were explicit and others kept the illustrative default.
+    PartialCaller,
+    /// Read from a named environment integration.
+    Environment,
+}
+
+impl PriceSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Caller => "caller",
+            Self::IllustrativeDefault => "illustrative_default",
+            Self::PartialCaller => "partial_caller",
+            Self::Environment => "environment",
+        }
+    }
+}
+
+/// Per-field pricing provenance recorded next to the numeric values.
+///
+/// A report must not call an illustrative default "caller-supplied". Keeping
+/// one source per field also makes a partial `--*-price` override visible
+/// instead of labelling all four values as caller-owned.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PricingProvenance {
+    pub source: PriceSource,
+    pub input: PriceSource,
+    pub output: PriceSource,
+    pub cache_read: PriceSource,
+    pub cache_write: PriceSource,
+}
+
+impl PricingProvenance {
+    pub fn illustrative_default() -> Self {
+        Self {
+            source: PriceSource::IllustrativeDefault,
+            input: PriceSource::IllustrativeDefault,
+            output: PriceSource::IllustrativeDefault,
+            cache_read: PriceSource::IllustrativeDefault,
+            cache_write: PriceSource::IllustrativeDefault,
+        }
+    }
+
+    pub fn caller() -> Self {
+        Self {
+            source: PriceSource::Caller,
+            input: PriceSource::Caller,
+            output: PriceSource::Caller,
+            cache_read: PriceSource::Caller,
+            cache_write: PriceSource::Caller,
+        }
+    }
+
+    /// Build per-field provenance from the four explicit-override flags.
+    pub fn from_overrides(input: bool, output: bool, cache_read: bool, cache_write: bool) -> Self {
+        let field = |explicit: bool| {
+            if explicit {
+                PriceSource::Caller
+            } else {
+                PriceSource::IllustrativeDefault
+            }
+        };
+        let count = [input, output, cache_read, cache_write]
+            .into_iter()
+            .filter(|explicit| *explicit)
+            .count();
+        let source = match count {
+            0 => PriceSource::IllustrativeDefault,
+            4 => PriceSource::Caller,
+            _ => PriceSource::PartialCaller,
+        };
+        Self {
+            source,
+            input: field(input),
+            output: field(output),
+            cache_read: field(cache_read),
+            cache_write: field(cache_write),
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        self.source.as_str()
+    }
+
+    pub fn all_caller(&self) -> bool {
+        self.source == PriceSource::Caller
+    }
+
+    /// Reject an internally contradictory provenance record.
+    pub fn validate(&self) -> Result<(), String> {
+        let fields = [self.input, self.output, self.cache_read, self.cache_write];
+        match self.source {
+            PriceSource::Caller => {
+                if fields.iter().any(|field| *field != PriceSource::Caller) {
+                    return Err(
+                        "pricing source 'caller' requires every field to be caller-supplied"
+                            .to_string(),
+                    );
+                }
+            }
+            PriceSource::IllustrativeDefault => {
+                if fields
+                    .iter()
+                    .any(|field| *field != PriceSource::IllustrativeDefault)
+                {
+                    return Err(
+                        "pricing source 'illustrative_default' requires every field to use the illustrative default"
+                            .to_string(),
+                    );
+                }
+            }
+            PriceSource::PartialCaller => {
+                let caller = fields
+                    .iter()
+                    .filter(|field| **field == PriceSource::Caller)
+                    .count();
+                if caller == 0 || caller == fields.len() {
+                    return Err(
+                        "pricing source 'partial_caller' requires a mix of caller and default fields"
+                            .to_string(),
+                    );
+                }
+            }
+            PriceSource::Environment | PriceSource::Unknown => {}
+        }
+        Ok(())
+    }
+
+    /// Stable fingerprint included in the comparison key.
+    pub fn fingerprint(&self) -> String {
+        sha256_hex(
+            format!(
+                "{}|{}|{}|{}|{}",
+                self.source.as_str(),
+                self.input.as_str(),
+                self.output.as_str(),
+                self.cache_read.as_str(),
+                self.cache_write.as_str()
+            )
+            .as_bytes(),
+        )
+    }
+}
+
+/// Remove URL userinfo, query, and fragment before an endpoint is persisted in
+/// a report. The path is kept because gateways are commonly distinguished by
+/// path, but credentials and signed query strings never belong in a benchmark
+/// artifact.
+pub fn redact_endpoint(value: &str) -> String {
+    let trimmed = value.trim();
+    let (prefix, rest) = match trimmed.split_once("://") {
+        Some((scheme, rest)) => (format!("{scheme}://"), rest),
+        None => (String::new(), trimmed),
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let tail = &rest[authority_end..];
+    let path_end = tail.find(['?', '#']).unwrap_or(tail.len());
+    format!("{prefix}{host}{}", &tail[..path_end])
 }
 
 /// Token counts accumulated for one run.
@@ -350,6 +524,48 @@ mod tests {
         assert_ne!(
             a.fingerprint(),
             Pricing::new(3.0, 15.0, 0.31, 3.75).fingerprint()
+        );
+    }
+
+    #[test]
+    fn pricing_provenance_records_partial_overrides_per_field() {
+        let defaults = PricingProvenance::from_overrides(false, false, false, false);
+        assert_eq!(defaults.source, PriceSource::IllustrativeDefault);
+        assert_eq!(defaults.input, PriceSource::IllustrativeDefault);
+        assert!(defaults.validate().is_ok());
+
+        let partial = PricingProvenance::from_overrides(true, false, false, false);
+        assert_eq!(partial.source, PriceSource::PartialCaller);
+        assert_eq!(partial.input, PriceSource::Caller);
+        assert_eq!(partial.output, PriceSource::IllustrativeDefault);
+        assert!(partial.validate().is_ok());
+
+        let caller = PricingProvenance::from_overrides(true, true, true, true);
+        assert_eq!(caller.source, PriceSource::Caller);
+        assert!(caller.all_caller());
+        assert!(caller.validate().is_ok());
+
+        let contradictory = PricingProvenance {
+            source: PriceSource::Caller,
+            ..partial
+        };
+        assert!(contradictory.validate().is_err());
+        assert_ne!(defaults.fingerprint(), partial.fingerprint());
+    }
+
+    #[test]
+    fn endpoint_redaction_keeps_the_host_and_path_but_not_credentials() {
+        assert_eq!(
+            redact_endpoint("https://user:secret@api.example.com/v1?token=abc#frag"),
+            "https://api.example.com/v1"
+        );
+        assert_eq!(
+            redact_endpoint("http://127.0.0.1:8080"),
+            "http://127.0.0.1:8080"
+        );
+        assert_eq!(
+            redact_endpoint("api.example.com/v1?q=1"),
+            "api.example.com/v1"
         );
     }
 

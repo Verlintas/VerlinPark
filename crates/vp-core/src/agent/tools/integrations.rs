@@ -23,6 +23,16 @@ pub(in crate::agent) async fn resolve_mcp_pin_trust(
         .unwrap_or(crate::contract::McpPinTrust::Unknown)
 }
 
+/// A foreign MCP task id is reported exactly like a missing one so a session
+/// cannot probe another session's task namespace.
+fn mcp_task_not_found(tool: &str, task_id: &str) -> ToolOutput {
+    ToolOutput::error_coded(
+        tool,
+        crate::tooling::errors::ToolErrorCode::NOT_FOUND,
+        format!("MCP task not found: {task_id}"),
+    )
+}
+
 #[allow(clippy::result_large_err)] // the typed failure carries the stable contract
 pub(in crate::agent) async fn run_mcp_tool(
     engine: &Engine,
@@ -215,7 +225,12 @@ pub(in crate::agent) async fn run_mcp_tool(
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| anyhow!("task_id is required for action={action}"))?;
             if action == "task_get" {
-                let task = engine.mcp_task_get(task_id, true).await?;
+                let Some(task) = engine
+                    .mcp_task_get_scoped(task_id, project_id, &session.id, true)
+                    .await?
+                else {
+                    return Ok(mcp_task_not_found("mcp", task_id));
+                };
                 Ok(ToolOutput::ok_structured(
                     format!(
                         "MCP task {} {}/{} [{}] poll={}ms",
@@ -228,12 +243,19 @@ pub(in crate::agent) async fn run_mcp_tool(
                     serde_json::json!(task),
                 ))
             } else {
-                let result = engine
-                    .mcp_task_result(vp_protocol::types::McpTaskResultParams {
-                        task_id: task_id.to_string(),
-                        refresh: input.get("refresh").and_then(serde_json::Value::as_bool),
-                    })
-                    .await?;
+                let Some(result) = engine
+                    .mcp_task_result_scoped(
+                        vp_protocol::types::McpTaskResultParams {
+                            task_id: task_id.to_string(),
+                            refresh: input.get("refresh").and_then(serde_json::Value::as_bool),
+                        },
+                        project_id,
+                        &session.id,
+                    )
+                    .await?
+                else {
+                    return Ok(mcp_task_not_found("mcp", task_id));
+                };
                 let mut text = format!(
                     "MCP task {} {}/{} [{}]",
                     result.task.id,
@@ -272,12 +294,17 @@ pub(in crate::agent) async fn run_mcp_tool(
                 .get("task_id")
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| anyhow!("task_id is required for action=task_cancel"))?;
-            let result = engine
-                .mcp_task_cancel(
+            let Some(result) = engine
+                .mcp_task_cancel_scoped(
                     task_id,
                     input.get("reason").and_then(serde_json::Value::as_str),
+                    project_id,
+                    &session.id,
                 )
-                .await?;
+                .await?
+            else {
+                return Ok(mcp_task_not_found("mcp", task_id));
+            };
             Ok(ToolOutput::ok_structured(
                 format!(
                     "MCP task {} [{}]: {}",
@@ -618,9 +645,21 @@ pub(in crate::agent) async fn run_source_tool(
                 .and_then(Value::as_u64)
                 .unwrap_or(6_000)
                 .clamp(300, 20_000) as usize;
-            let result = engine
-                .get_source(source_id.to_string(), Some(chunk_no - 1), Some(1))
-                .await?;
+            let Some(result) = engine
+                .get_source_in_project(
+                    &project.id,
+                    source_id.to_string(),
+                    Some(chunk_no - 1),
+                    Some(1),
+                )
+                .await?
+            else {
+                return Ok(ToolOutput::error_coded(
+                    "read_source",
+                    crate::tooling::errors::ToolErrorCode::NOT_FOUND,
+                    format!("source not found: {source_id}"),
+                ));
+            };
             let Some(chunk) = result.chunks.first() else {
                 return Ok(ToolOutput::error(format!(
                     "source {source_id} has no chunk {chunk_no}"
@@ -1171,12 +1210,25 @@ pub(in crate::agent) async fn run_mailbox_tool(
             let artifact = if let Some(artifact_id) =
                 input.get("artifact_id").and_then(serde_json::Value::as_str)
             {
+                // Updating a version appends an event to the artifact's own
+                // session. Resolve only session-owned artifacts so a foreign
+                // id can never inject a version event into another session.
+                let Some(existing) = session_artifact(engine, session, artifact_id).await? else {
+                    return Ok(artifact_not_found_output("publish_artifact", artifact_id));
+                };
                 let expected = input
                     .get("expected_version")
                     .and_then(serde_json::Value::as_u64)
                     .and_then(|value| u32::try_from(value).ok());
                 engine
-                    .publish_artifact_version(artifact_id, expected, name, kind, mime_type, content)
+                    .publish_artifact_version(
+                        &existing.id,
+                        expected,
+                        name,
+                        kind,
+                        mime_type,
+                        content,
+                    )
                     .await?
             } else if let Some(request_key) = requested_key {
                 engine
@@ -1242,13 +1294,12 @@ pub(in crate::agent) async fn run_mailbox_tool(
                 .get("artifact_id")
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| anyhow!("artifact_id is required"))?;
-            let artifact = engine
-                .get_artifact(id)
-                .await?
-                .ok_or_else(|| anyhow!("artifact not found: {id}"))?;
+            let Some(artifact) = session_artifact(engine, session, id).await? else {
+                return Ok(artifact_not_found_output("read_artifact", id));
+            };
             if artifact.storage == "file" {
                 let materialized = engine
-                    .materialize_artifact(id)
+                    .materialize_artifact(&artifact.id)
                     .await?
                     .ok_or_else(|| anyhow!("artifact {id} has no materialized file"))?;
                 Ok(ToolOutput::ok(format!(
@@ -1269,5 +1320,335 @@ pub(in crate::agent) async fn run_mailbox_tool(
             }
         }
         other => Err(anyhow!("unknown mailbox tool: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+    use vp_protocol::types::{McpTask, Source, SourceChunk};
+    use vp_store::Store;
+
+    struct Fixture {
+        _data: TempDir,
+        _repo_a: TempDir,
+        _repo_b: TempDir,
+        engine: Engine,
+        project_a: Project,
+        project_b: Project,
+        session_a1: Session,
+        session_a2: Session,
+        session_b: Session,
+    }
+
+    fn fixture() -> Fixture {
+        let data = TempDir::new().unwrap();
+        let repo_a = TempDir::new().unwrap();
+        let repo_b = TempDir::new().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        let project_a = store
+            .add_project(repo_a.path().to_str().unwrap(), Some("a"))
+            .unwrap();
+        let project_b = store
+            .add_project(repo_b.path().to_str().unwrap(), Some("b"))
+            .unwrap();
+        let session_a1 = store.create_session(&project_a.id, "session a1").unwrap();
+        let session_a2 = store.create_session(&project_a.id, "session a2").unwrap();
+        let session_b = store.create_session(&project_b.id, "session b").unwrap();
+        Fixture {
+            _data: data,
+            _repo_a: repo_a,
+            _repo_b: repo_b,
+            engine: Engine::new(store),
+            project_a,
+            project_b,
+            session_a1,
+            session_a2,
+            session_b,
+        }
+    }
+
+    fn spec(role: AgentRole, name: &str) -> AgentSpec {
+        AgentSpec {
+            id: format!("agent-{name}"),
+            role,
+            name: name.to_string(),
+            depth: 1,
+            parent_name: None,
+            title: None,
+            task_id: None,
+            department: None,
+            identity_id: None,
+            identity_generation: None,
+            profile: AgentProfile::Coding,
+            allow_delegation: false,
+            task_kind: None,
+            auto_approve: false,
+            worktree: PathBuf::from("/tmp/scope-worktree"),
+            branch: "scope".to_string(),
+            session_worktree: PathBuf::from("/tmp/scope-worktree"),
+            session_branch: "scope".to_string(),
+            write_scope: Vec::new(),
+            base_commit: "0".repeat(40),
+            workspace_id: None,
+            session_workspace_id: None,
+            parent_workspace_id: None,
+        }
+    }
+
+    fn failure_code(output: &ToolOutput) -> &'static str {
+        output
+            .failure
+            .as_ref()
+            .expect("typed tool failure")
+            .code
+            .as_str()
+    }
+
+    async fn event_count(engine: &Engine, session_id: &str) -> usize {
+        engine
+            .list_events(session_id.to_string(), 0, 1_000)
+            .await
+            .unwrap()
+            .len()
+    }
+
+    fn mcp_task_fixture(project_id: &str, session_id: &str) -> McpTask {
+        let now = vp_protocol::now_rfc3339();
+        McpTask {
+            id: "mcpt_foreign".to_string(),
+            project_id: project_id.to_string(),
+            session_id: session_id.to_string(),
+            agent_id: "worker-b".to_string(),
+            agent_name: "Worker B".to_string(),
+            task_id: None,
+            server_id: "server-b".to_string(),
+            server_name: "Server B".to_string(),
+            tool_name: "long_job".to_string(),
+            remote_task_id: "remote-1".to_string(),
+            status: "working".to_string(),
+            ttl_secs: 600,
+            poll_interval_ms: 1_000,
+            created_at: now.clone(),
+            updated_at: now,
+            expires_at: None,
+            result_available: false,
+            effect_receipt_id: None,
+            last_error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn artifact_tools_reject_foreign_session_ids_without_victim_events() {
+        let fixture = fixture();
+        let spec_a = spec(AgentRole::Worker, "Worker A");
+        let spec_b = spec(AgentRole::Worker, "Worker B");
+        let artifact = fixture
+            .engine
+            .publish_artifact(
+                &fixture.session_b.id,
+                &spec_b.id,
+                &spec_b.name,
+                None,
+                "notes.txt",
+                "note",
+                "text/plain",
+                "victim content",
+            )
+            .await
+            .unwrap();
+        let before_events = event_count(&fixture.engine, &fixture.session_b.id).await;
+
+        let read = run_mailbox_tool(
+            &fixture.engine,
+            &fixture.session_a1,
+            &spec_a,
+            "read_artifact",
+            serde_json::json!({"artifact_id": artifact.id}),
+        )
+        .await
+        .unwrap();
+        assert!(read.is_error);
+        assert_eq!(failure_code(&read), "NOT_FOUND");
+        assert!(!read.content.contains("victim content"));
+
+        let update = run_mailbox_tool(
+            &fixture.engine,
+            &fixture.session_a1,
+            &spec_a,
+            "publish_artifact",
+            serde_json::json!({
+                "artifact_id": artifact.id,
+                "name": "notes.txt",
+                "content": "tampered",
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(update.is_error);
+        assert_eq!(failure_code(&update), "NOT_FOUND");
+
+        let current = fixture
+            .engine
+            .get_artifact(&artifact.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.content, "victim content");
+        assert_eq!(current.version, 1);
+        assert_eq!(
+            event_count(&fixture.engine, &fixture.session_b.id).await,
+            before_events,
+            "a foreign artifact action must not append victim-session events"
+        );
+
+        // Positive control: the owning session still reads its artifact.
+        let owner_read = run_mailbox_tool(
+            &fixture.engine,
+            &fixture.session_b,
+            &spec_b,
+            "read_artifact",
+            serde_json::json!({"artifact_id": artifact.id}),
+        )
+        .await
+        .unwrap();
+        assert!(!owner_read.is_error, "{}", owner_read.content);
+        assert!(owner_read.content.contains("victim content"));
+    }
+
+    #[tokio::test]
+    async fn read_source_rejects_foreign_project_sources() {
+        let fixture = fixture();
+        let now = vp_protocol::now_rfc3339();
+        let source = Source {
+            id: "src_project_b".to_string(),
+            project_id: fixture.project_b.id.clone(),
+            kind: "file".to_string(),
+            collection: None,
+            title: "Project B secret".to_string(),
+            uri: None,
+            mime_type: None,
+            status: "indexed".to_string(),
+            size_bytes: 16,
+            sha256: "a".repeat(64),
+            revision: 1,
+            chunk_count: 1,
+            char_count: 16,
+            token_count: 4,
+            error: None,
+            labels: Vec::new(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            indexed_at: Some(now),
+        };
+        let chunk = SourceChunk {
+            id: "chunk_project_b".to_string(),
+            source_id: source.id.clone(),
+            chunk_no: 1,
+            heading: None,
+            content: "project b secret".to_string(),
+            start_offset: 0,
+            end_offset: 16,
+            token_count: 4,
+        };
+        fixture
+            .engine
+            .store()
+            .insert_source(&source, &[chunk])
+            .unwrap();
+
+        let mut citations = CitationRegistry::default();
+        let output = run_source_tool(
+            &fixture.engine,
+            &fixture.project_a,
+            "read_source",
+            serde_json::json!({"source_id": source.id}),
+            &mut citations,
+        )
+        .await
+        .unwrap();
+        assert!(output.is_error);
+        assert_eq!(failure_code(&output), "NOT_FOUND");
+        assert!(!output.content.contains("project b secret"));
+
+        // Positive control: the owning project still reads the source.
+        let mut citations = CitationRegistry::default();
+        let owned = run_source_tool(
+            &fixture.engine,
+            &fixture.project_b,
+            "read_source",
+            serde_json::json!({"source_id": source.id}),
+            &mut citations,
+        )
+        .await
+        .unwrap();
+        assert!(!owned.is_error, "{}", owned.content);
+        assert!(owned.content.contains("project b secret"));
+    }
+
+    #[tokio::test]
+    async fn mcp_task_tools_reject_foreign_session_ids_without_victim_events() {
+        let fixture = fixture();
+        let spec_a = spec(AgentRole::Worker, "Worker A");
+        let task = mcp_task_fixture(&fixture.project_b.id, &fixture.session_b.id);
+        fixture
+            .engine
+            .store()
+            .insert_mcp_task_with_event(&task)
+            .unwrap();
+        let before_events = event_count(&fixture.engine, &fixture.session_b.id).await;
+
+        for (action, extra) in [
+            ("task_get", serde_json::json!({})),
+            ("task_result", serde_json::json!({"refresh": false})),
+            (
+                "task_cancel",
+                serde_json::json!({"reason": "foreign cancel"}),
+            ),
+        ] {
+            let mut input = serde_json::json!({
+                "action": action,
+                "task_id": task.id,
+            });
+            if let Some(object) = input.as_object_mut() {
+                for (key, value) in extra.as_object().unwrap() {
+                    object.insert(key.clone(), value.clone());
+                }
+            }
+            let output = run_mcp_tool(&fixture.engine, &fixture.session_a1, &spec_a, input, None)
+                .await
+                .unwrap();
+            assert!(output.is_error, "{action} must fail: {}", output.content);
+            assert_eq!(failure_code(&output), "NOT_FOUND", "{action}");
+        }
+
+        assert_eq!(
+            event_count(&fixture.engine, &fixture.session_b.id).await,
+            before_events,
+            "foreign MCP task actions must not append victim-session events"
+        );
+        let stored = fixture
+            .engine
+            .store()
+            .get_mcp_task(&task.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "working", "foreign cancel must not mutate");
+        assert!(!stored.result_available);
+
+        // A same-project sibling session is still foreign.
+        let output = run_mcp_tool(
+            &fixture.engine,
+            &fixture.session_a2,
+            &spec_a,
+            serde_json::json!({"action": "task_get", "task_id": task.id}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(output.is_error);
+        assert_eq!(failure_code(&output), "NOT_FOUND");
     }
 }

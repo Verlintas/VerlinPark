@@ -164,14 +164,25 @@ impl ChatRequest {
 pub enum StreamEvent {
     TextDelta(String),
     ToolCall(ToolCall),
+    /// Provider-reported usage observed since the previous `Usage` event.
+    ///
+    /// Consumers add these counts across one stream; the accumulated totals
+    /// are the provider's totals for the turn. An adapter may emit a
+    /// prompt-side event when the provider reports it (so a stream that fails
+    /// before the final usage event still records the billed input) and a
+    /// later output-side event. A provider that reports one final cumulative
+    /// snapshot emits exactly one event.
     Usage {
-        /// Total provider input tokens. This is deliberately the provider's
-        /// total: uncached input + cache reads + cache writes.
+        /// Provider input tokens newly observed. Summed across the stream this
+        /// is deliberately the provider's total input: uncached input + cache
+        /// reads + cache writes.
         input_tokens: u32,
         output_tokens: u32,
-        /// Subset of `input_tokens` served from the provider prompt cache.
+        /// Part of the summed `input_tokens` served from the provider prompt
+        /// cache. Never an additional token count.
         cache_read_tokens: u32,
-        /// Subset of `input_tokens` written to the provider prompt cache.
+        /// Part of the summed `input_tokens` written to the provider prompt
+        /// cache. Never an additional token count.
         cache_write_tokens: u32,
     },
     Done,

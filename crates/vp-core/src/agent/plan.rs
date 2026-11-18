@@ -15,8 +15,8 @@ pub(super) use memory::record_task_memory;
 pub(crate) use memory::{record_integration_resolution_memory, record_verification_memory};
 pub(super) use roundtable::deliberate_team_plan;
 pub(super) use support::{
-    emit_plan_task_finished, ensure_plan_manager, latest_plan_results,
-    record_scheduled_task_finish, select_plan_batch, task_profile,
+    ensure_plan_manager, latest_plan_results, record_scheduled_task_finish, select_plan_batch,
+    task_profile,
 };
 pub(crate) use validate::validate_team_plan;
 pub(super) use worker::{finish_labour, finish_worker, parse_verdict};

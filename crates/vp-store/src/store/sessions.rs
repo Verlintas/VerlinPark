@@ -2,6 +2,72 @@
 
 use super::*;
 
+/// Maximum admitted session goal size. The goal is rendered inside the 64 KiB
+/// `session/context` instruction section together with fixed metadata; a goal
+/// at or above that section cap would make every run of the session fail
+/// closed with no edit surface. Reject it at creation instead.
+pub const MAX_SESSION_GOAL_BYTES: usize = 32 * 1024;
+/// Maximum admitted user prompt size. Prompts are persisted both as a message
+/// and in the `agent.queued` payload; an unbounded prompt grows the event log
+/// and can crowd out the conversation budget.
+pub const MAX_SESSION_PROMPT_BYTES: usize = 64 * 1024;
+
+/// Stable local validation failure for session input bounds. It carries a
+/// code so callers/tests can distinguish admission rejection from an
+/// infrastructure error without parsing prose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionValidationError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl SessionValidationError {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for SessionValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for SessionValidationError {}
+
+fn validate_goal_size(goal: &str) -> Result<()> {
+    if goal.len() > MAX_SESSION_GOAL_BYTES {
+        return Err(SessionValidationError::new(
+            "INVALID_ARGUMENT",
+            format!(
+                "session goal is {} bytes; the limit is {} bytes",
+                goal.len(),
+                MAX_SESSION_GOAL_BYTES
+            ),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_user_prompt_size(role: &str, content: &str) -> Result<()> {
+    if role == "user" && content.len() > MAX_SESSION_PROMPT_BYTES {
+        return Err(SessionValidationError::new(
+            "INVALID_ARGUMENT",
+            format!(
+                "session prompt is {} bytes; the limit is {} bytes",
+                content.len(),
+                MAX_SESSION_PROMPT_BYTES
+            ),
+        )
+        .into());
+    }
+    Ok(())
+}
+
 impl Store {
     pub fn create_session(&self, project_id: &str, goal: &str) -> Result<Session> {
         self.create_session_with_limits(project_id, goal, None, None, None)
@@ -79,8 +145,132 @@ impl Store {
         )
     }
 
+    /// Create a session row and its `session.created` event in one
+    /// transaction. This closes the crash window where a session exists but
+    /// `db-rebuild` (which reads the event mirror) skips it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_session_with_worktree_and_event(
+        &self,
+        id: &str,
+        project_id: &str,
+        goal: &str,
+        worktree: &str,
+        branch: &str,
+        token_budget: Option<u64>,
+        cost_budget_usd: Option<f64>,
+        time_budget_secs: Option<u64>,
+        unlimited: bool,
+        base_commit: &str,
+        priority: i32,
+    ) -> Result<(Session, Event)> {
+        self.create_session_with_worktree_and_event_payload(
+            id,
+            project_id,
+            goal,
+            worktree,
+            branch,
+            token_budget,
+            cost_budget_usd,
+            time_budget_secs,
+            unlimited,
+            base_commit,
+            priority,
+            None,
+        )
+    }
+
+    /// Same atomic session+`session.created` transaction, with optional extra
+    /// top-level event fields. Fork lineage (`forked_from_*`) belongs in the
+    /// event, so the session row and its replay authority commit together.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_session_with_worktree_and_event_payload(
+        &self,
+        id: &str,
+        project_id: &str,
+        goal: &str,
+        worktree: &str,
+        branch: &str,
+        token_budget: Option<u64>,
+        cost_budget_usd: Option<f64>,
+        time_budget_secs: Option<u64>,
+        unlimited: bool,
+        base_commit: &str,
+        priority: i32,
+        extra_payload: Option<serde_json::Value>,
+    ) -> Result<(Session, Event)> {
+        let session = self.build_session(
+            id.to_string(),
+            project_id,
+            goal,
+            Some(worktree.to_string()),
+            Some(branch.to_string()),
+            token_budget,
+            cost_budget_usd,
+            time_budget_secs,
+            unlimited,
+            Some(base_commit.to_string()),
+            priority,
+        )?;
+        let mut payload = session_created_payload(&session);
+        if let Some(extra) = extra_payload {
+            match (payload.as_object_mut(), extra) {
+                (Some(payload), serde_json::Value::Object(extra)) => {
+                    for (key, value) in extra {
+                        payload.insert(key, value);
+                    }
+                }
+                (Some(_), _) | (None, _) => {
+                    return Err(anyhow!("session.created payload must be an object"));
+                }
+            }
+        }
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        insert_session_row(&tx, &session)?;
+        let event = insert_event_tx(&tx, &session.id, "session.created", payload)?;
+        tx.commit()?;
+        drop(conn);
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok((session, event))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn insert_session(
+        &self,
+        id: String,
+        project_id: &str,
+        goal: &str,
+        worktree: Option<String>,
+        branch: Option<String>,
+        token_budget: Option<u64>,
+        cost_budget_usd: Option<f64>,
+        time_budget_secs: Option<u64>,
+        unlimited: bool,
+        base_commit: Option<String>,
+        priority: i32,
+    ) -> Result<Session> {
+        let session = self.build_session(
+            id,
+            project_id,
+            goal,
+            worktree,
+            branch,
+            token_budget,
+            cost_budget_usd,
+            time_budget_secs,
+            unlimited,
+            base_commit,
+            priority,
+        )?;
+        let conn = self.lock()?;
+        insert_session_row(&conn, &session)?;
+        Ok(session)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_session(
         &self,
         id: String,
         project_id: &str,
@@ -101,6 +291,7 @@ impl Store {
         if goal.is_empty() {
             return Err(anyhow!("session goal must not be empty"));
         }
+        validate_goal_size(goal)?;
         // New sessions inherit the project layout default. Existing rows keep
         // the `2` default added by the schema migration, so upgrading the
         // daemon never rewrites their prompt bytes.
@@ -108,7 +299,7 @@ impl Store {
             .get_cache_policy(project_id)
             .map(|policy| policy.session_prompt_layout())
             .unwrap_or(3);
-        let session = Session {
+        Ok(Session {
             id,
             project_id: project_id.to_string(),
             goal: goal.to_string(),
@@ -126,32 +317,7 @@ impl Store {
             tokens_out: 0,
             prompt_layout,
             created_at: now_rfc3339(),
-        };
-        let conn = self.lock()?;
-        conn.execute(
-            "INSERT INTO sessions
-             (id, project_id, goal, status, priority, worktree, branch, token_budget,
-              cost_budget_usd, time_budget_secs, unlimited, cost_spent_usd, base_commit,
-              tokens_in, tokens_out, prompt_layout, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12, 0, 0, ?13, ?14)",
-            params![
-                session.id,
-                session.project_id,
-                session.goal,
-                session.status,
-                session.priority,
-                session.worktree,
-                session.branch,
-                session.token_budget,
-                session.cost_budget_usd,
-                session.time_budget_secs,
-                if session.unlimited { 1 } else { 0 },
-                session.base_commit,
-                session.prompt_layout as i64,
-                session.created_at
-            ],
-        )?;
-        Ok(session)
+        })
     }
 
     /// Persist a session-scoped prompt-layout override. The caller emits the
@@ -540,6 +706,7 @@ impl Store {
         tool_calls: &serde_json::Value,
         tool_call_id: Option<&str>,
     ) -> Result<(StoredMessage, Event)> {
+        validate_user_prompt_size(role, content)?;
         let message = StoredMessage {
             id: Uuid::now_v7().to_string(),
             session_id: session_id.to_string(),
@@ -586,6 +753,7 @@ impl Store {
         tool_calls: &serde_json::Value,
         tool_call_id: Option<&str>,
     ) -> Result<StoredMessage> {
+        validate_user_prompt_size(role, content)?;
         let message = StoredMessage {
             id: Uuid::now_v7().to_string(),
             session_id: session_id.to_string(),
@@ -1387,5 +1555,103 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+}
+
+fn insert_session_row(conn: &Connection, session: &Session) -> Result<()> {
+    conn.execute(
+        "INSERT INTO sessions
+         (id, project_id, goal, status, priority, worktree, branch, token_budget,
+          cost_budget_usd, time_budget_secs, unlimited, cost_spent_usd, base_commit,
+          tokens_in, tokens_out, prompt_layout, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12, 0, 0, ?13, ?14)",
+        params![
+            session.id,
+            session.project_id,
+            session.goal,
+            session.status,
+            session.priority,
+            session.worktree,
+            session.branch,
+            session.token_budget,
+            session.cost_budget_usd,
+            session.time_budget_secs,
+            if session.unlimited { 1 } else { 0 },
+            session.base_commit,
+            session.prompt_layout as i64,
+            session.created_at
+        ],
+    )?;
+    Ok(())
+}
+
+fn session_created_payload(session: &Session) -> serde_json::Value {
+    serde_json::json!({
+        "goal": session.goal,
+        "project_id": session.project_id,
+        "worktree": session.worktree,
+        "branch": session.branch,
+        "priority": session.priority,
+        "token_budget": session.token_budget,
+        "cost_budget_usd": session.cost_budget_usd,
+        "time_budget_secs": session.time_budget_secs,
+        "unlimited": session.unlimited,
+        "budget_mode": if session.unlimited { "unlimited" } else { "limited" },
+        "base_commit": session.base_commit,
+        "prompt_layout": session.prompt_layout,
+        "created_at": session.created_at,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn fixture() -> (TempDir, TempDir, Store, Project) {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("sessions"))
+            .unwrap();
+        (data, repo, store, project)
+    }
+
+    #[test]
+    fn oversized_goal_is_rejected_before_a_session_is_created() {
+        let (_data, _repo, store, project) = fixture();
+        let exact = "g".repeat(MAX_SESSION_GOAL_BYTES);
+        store.create_session(&project.id, &exact).unwrap();
+        let oversized = "g".repeat(MAX_SESSION_GOAL_BYTES + 1);
+        let error = store.create_session(&project.id, &oversized).unwrap_err();
+        let typed = error.downcast_ref::<SessionValidationError>().unwrap();
+        assert_eq!(typed.code, "INVALID_ARGUMENT");
+        assert!(typed.message.contains("goal"));
+        assert_eq!(store.list_sessions(Some(&project.id)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn oversized_user_prompt_is_rejected_before_a_message_is_created() {
+        let (_data, _repo, store, project) = fixture();
+        let session = store.create_session(&project.id, "prompt bound").unwrap();
+        let exact = "p".repeat(MAX_SESSION_PROMPT_BYTES);
+        store
+            .append_message(&session.id, "user", &exact, &serde_json::json!([]), None)
+            .unwrap();
+        let oversized = "p".repeat(MAX_SESSION_PROMPT_BYTES + 1);
+        let error = store
+            .append_message(
+                &session.id,
+                "user",
+                &oversized,
+                &serde_json::json!([]),
+                None,
+            )
+            .unwrap_err();
+        let typed = error.downcast_ref::<SessionValidationError>().unwrap();
+        assert_eq!(typed.code, "INVALID_ARGUMENT");
+        assert!(typed.message.contains("prompt"));
+        assert_eq!(store.list_messages(&session.id).unwrap().len(), 1);
     }
 }

@@ -652,7 +652,9 @@ pub fn list_employment_events(
     project_id: &str,
     limit: Option<u32>,
 ) -> Result<Vec<AgentEmploymentEvent>> {
-    let limit = limit.unwrap_or(100_000).clamp(1, 100_000) as i64;
+    let limit = limit
+        .map(|value| value.clamp(1, 100_000) as i64)
+        .unwrap_or(-1);
     let conn = store.lock()?;
     let mut statement = conn.prepare(
         "SELECT id, project_id, seq, identity_id, kind, payload, created_at
@@ -667,7 +669,13 @@ pub fn list_employment_events(
             seq: row.get::<_, i64>(2)? as u64,
             identity_id: row.get(3)?,
             kind: row.get(4)?,
-            payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
+            payload: serde_json::from_str(&payload).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
             created_at: row.get(6)?,
         })
     })?;

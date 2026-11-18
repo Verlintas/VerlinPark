@@ -74,13 +74,22 @@ pub(super) async fn handle(
                             .clone()
                             .or(info.model)
                             .unwrap_or_else(|| "unconfigured".to_string());
-                        let _ = state.engine.create_leader_agent(&session.id, &model).await;
+                        // Do not report success for a session that has no
+                        // Leader roster row or whose run could not start. The
+                        // created session is kept and named in the error so
+                        // the caller can inspect it.
+                        if let Err(error) =
+                            state.engine.create_leader_agent(&session.id, &model).await
+                        {
+                            return session_start_error(id, &session, "leader agent", error);
+                        }
                         if let Err(error) = state.agent.start(&session.id, &params.goal).await {
                             tracing::warn!(%error, session_id = %session.id, "agent did not start");
+                            return session_start_error(id, &session, "agent.start", error);
                         }
                         RpcResponse::success(id, session)
                     }
-                    Err(error) => internal_error(id, error),
+                    Err(error) => validation_or_internal(id, error),
                 }
             }
             Err(response) => response_with_id(id, response),
@@ -159,29 +168,17 @@ pub(super) async fn handle(
                 .await
             {
                 Ok(result) => RpcResponse::success(id, result),
+                Err(error) => validation_or_internal(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.list" => match parse_params::<ListSessionsParams>(request.params) {
+            Ok(params) => match state.engine.list_sessions(params.project_id).await {
+                Ok(sessions) => RpcResponse::success(id, SessionListResult { sessions }),
                 Err(error) => internal_error(id, error),
             },
             Err(response) => response_with_id(id, response),
         },
-        "session.list" => {
-            let params: ListSessionsParams = if request.params.is_null() {
-                ListSessionsParams { project_id: None }
-            } else {
-                match serde_json::from_value(request.params) {
-                    Ok(params) => params,
-                    Err(error) => {
-                        return RpcResponse::error(
-                            id,
-                            RpcError::new(codes::INVALID_PARAMS, error.to_string()),
-                        );
-                    }
-                }
-            };
-            match state.engine.list_sessions(params.project_id).await {
-                Ok(sessions) => RpcResponse::success(id, SessionListResult { sessions }),
-                Err(error) => internal_error(id, error),
-            }
-        }
         "session.citation_audit" => {
             match parse_params::<SessionCitationAuditParams>(request.params) {
                 Ok(params) => match state
@@ -292,7 +289,7 @@ pub(super) async fn handle(
                 .await
             {
                 Ok(result) => RpcResponse::success(id, result),
-                Err(error) => internal_error(id, error),
+                Err(error) => operation_error(id, error),
             },
             Err(response) => response_with_id(id, response),
         },
@@ -335,7 +332,7 @@ pub(super) async fn handle(
                 .await
             {
                 Ok(result) => RpcResponse::success(id, result),
-                Err(error) => internal_error(id, error),
+                Err(error) => operation_error(id, error),
             },
             Err(response) => response_with_id(id, response),
         },
@@ -1110,7 +1107,7 @@ pub(super) async fn handle(
                 .await
             {
                 Ok(()) => RpcResponse::success(id, PromptResult { accepted: true }),
-                Err(error) => internal_error(id, error),
+                Err(error) => operation_error(id, error),
             },
             Err(response) => response_with_id(id, response),
         },

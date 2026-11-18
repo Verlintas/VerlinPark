@@ -77,8 +77,50 @@ pub(super) async fn execute_tool_calls(
         } else {
             call.id.clone()
         };
-        let input: serde_json::Value =
-            serde_json::from_str(&call.arguments).unwrap_or_else(|_| serde_json::json!({}));
+        let input: serde_json::Value = match parse_tool_arguments(&call.arguments) {
+            Ok(input) => input,
+            Err(reason) => {
+                // Never execute a tool with guessed input. The provider still
+                // receives a tool result so its call/result history stays
+                // valid, and the failure is typed and auditable.
+                let output = ToolOutput::error_coded(
+                    call.name.as_str(),
+                    crate::tooling::errors::ToolErrorCode::INVALID_ARGUMENT,
+                    reason,
+                )
+                .with_failure_evidence("invalid_tool_arguments");
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "tool.finished",
+                    tool_finished_payload(
+                        &call_id,
+                        &call.name,
+                        &output,
+                        0,
+                        None,
+                        config.approval_mode,
+                        None,
+                    ),
+                )
+                .await?;
+                if top_level {
+                    let stored = engine
+                        .append_message(
+                            &session.id,
+                            "tool",
+                            &output.content,
+                            serde_json::json!([]),
+                            Some(call_id.clone()),
+                        )
+                        .await?;
+                    conversation_ids.push(Some(stored.id));
+                }
+                conversation.push(ChatMessage::tool(call_id, output.content));
+                continue;
+            }
+        };
         // The probe needs the original arguments after dispatch consumes
         // `input`; cloning one bounded JSON value is cheaper than threading
         // it through every tool branch.
@@ -456,9 +498,28 @@ pub(super) async fn execute_tool_calls(
                         plan.departments.len(),
                         plan.tasks.len()
                     );
-                    engine.set_team_plan(&session.id, &plan).await?;
-                    *team_plan = Some(plan);
-                    ToolOutput::ok(summary)
+                    match engine.submit_team_plan(&session.id, &plan).await {
+                        Ok(()) => {
+                            *team_plan = Some(plan);
+                            ToolOutput::ok(summary)
+                        }
+                        Err(error) if error.to_string().starts_with("PLAN_REVISION_REQUIRED") => {
+                            // A second submission must never replace the
+                            // baseline plan: that would start a new plan_seq
+                            // and reset completed tasks/attempts. The model
+                            // gets a typed refusal; the run continues.
+                            ToolOutput::error_coded(
+                                "submit_team_plan",
+                                crate::tooling::errors::ToolErrorCode::CONFLICT,
+                                error.to_string(),
+                            )
+                            .with_failure_evidence("PLAN_REVISION_REQUIRED")
+                            .with_failure_hint(
+                                "The session already has a TeamPlan. Do not resubmit it; use plan_fanout for a bounded expansion or ask the operator for an explicit plan revision.",
+                            )
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 Err(error) => ToolOutput::error(error.to_string()),
             }
@@ -693,7 +754,7 @@ pub(super) async fn execute_tool_calls(
                 }),
             )
             .await?;
-            run_archive_tool(engine, &call.name, input.clone()).await
+            run_archive_tool(engine, session, &call.name, input.clone()).await
         } else if is_media_tool {
             emit(
                 engine,
@@ -707,7 +768,7 @@ pub(super) async fn execute_tool_calls(
                 }),
             )
             .await?;
-            run_media_tool(engine, spec, &call.name, input.clone()).await
+            run_media_tool(engine, session, spec, &call.name, input.clone()).await
         } else if is_browser {
             emit(
                 engine,
@@ -963,7 +1024,7 @@ pub(super) async fn execute_tool_calls(
                     journal
                         .question_completed(engine, &question_step, "answered")
                         .await?;
-                    engine.update_session_status(&session.id, "running").await?;
+                    resume_session_after_question(engine, &session.id).await?;
                     engine.update_agent_status(&spec.id, "running").await?;
                     ToolOutput::ok(format!("User answered: {answer}"))
                 }
@@ -980,7 +1041,7 @@ pub(super) async fn execute_tool_calls(
                     journal
                         .question_completed(engine, &question_step, "timed_out")
                         .await?;
-                    engine.update_session_status(&session.id, "running").await?;
+                    resume_session_after_question(engine, &session.id).await?;
                     engine.update_agent_status(&spec.id, "running").await?;
                     ToolOutput::error("User did not answer before the question timed out.")
                 }
@@ -1920,4 +1981,21 @@ pub(super) async fn execute_tool_calls(
     )
     .await?;
     Ok(None)
+}
+
+/// Return the session to `running` after an `ask_user` answer/timeout without
+/// overwriting a concurrent pause or cancellation. The store applies the
+/// transition only from `waiting_input`; the event is broadcast only when the
+/// row actually changed.
+async fn resume_session_after_question(engine: &Engine, session_id: &str) -> Result<()> {
+    let store = engine.store.clone();
+    let session_id = session_id.to_string();
+    let event = tokio::task::spawn_blocking(move || {
+        store.resume_session_after_question_with_event(&session_id)
+    })
+    .await??;
+    if let Some(event) = event {
+        let _ = engine.events.send(event);
+    }
+    Ok(())
 }

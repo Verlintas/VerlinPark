@@ -130,6 +130,41 @@ impl Store {
         Ok((claimed, events))
     }
 
+    /// End an `ask_user` wait by returning the session to `running`.
+    ///
+    /// The transition is conditional on the session still being in
+    /// `waiting_input`. If an operator paused or cancelled the session while
+    /// the question was pending, that state wins and no `session.updated`
+    /// event is appended; otherwise the answer would silently un-pause a
+    /// session whose run control is still paused.
+    pub fn resume_session_after_question_with_event(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<Event>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE sessions SET status = 'running'
+             WHERE id = ?1 AND status = 'waiting_input'",
+            params![session_id],
+        )?;
+        if changed == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let event = insert_event_tx(
+            &tx,
+            session_id,
+            "session.updated",
+            serde_json::json!({"status": "running"}),
+        )?;
+        tx.commit()?;
+        if let Err(error) = self.append_event_mirror(&event) {
+            tracing::warn!(%error, "failed to append event mirror");
+        }
+        Ok(Some(event))
+    }
+
     pub fn finish_plan_task(
         &self,
         session_id: &str,
@@ -141,13 +176,27 @@ impl Store {
         let now = now_rfc3339();
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
-        tx.execute(
+        // Terminal outcomes are final for a late/duplicate finish. Retrying
+        // them is an explicit operator action (`retry_plan_task_with_event`),
+        // never an implicit overwrite by an older writer. A task that is
+        // already `cancelling` may still record its real outcome: a concurrent
+        // completion can win the race (and the caller reports `merged`), while
+        // the merge boundary independently re-checks cancellation.
+        let changed = tx.execute(
             "UPDATE plan_tasks
              SET status = ?1, last_error = ?2, finished_at = ?3, next_attempt_at = NULL,
                  updated_at = ?3
-             WHERE session_id = ?4 AND plan_seq = ?5 AND task_id = ?6",
+             WHERE session_id = ?4 AND plan_seq = ?5 AND task_id = ?6
+               AND status NOT IN ('completed', 'skipped', 'cancelled')",
             params![status, detail, now, session_id, plan_seq as i64, task_id],
         )?;
+        if changed == 0 {
+            // Missing row, a terminal task, or a cancellation that must not be
+            // overwritten: the caller keeps the current projection and must
+            // not emit a `plan_task.finished` event for this write.
+            tx.commit()?;
+            return Ok(None);
+        }
         let task = tx
             .query_row(
                 "SELECT session_id, project_id, plan_seq, task_id, department, title, priority,
@@ -438,5 +487,181 @@ impl Store {
             tracing::warn!(%error, "failed to append event mirror");
         }
         Ok((task, event))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use vp_protocol::types::{PlanDepartment, PlanTask};
+
+    fn test_store() -> (TempDir, Store, TempDir) {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        (data, store, repo)
+    }
+
+    fn task(id: &str, deps: Vec<String>) -> PlanTask {
+        PlanTask {
+            id: id.into(),
+            department: "impl".into(),
+            title: id.into(),
+            kind: "coding".into(),
+            priority: 0,
+            profile: None,
+            deps,
+            write_scope: vec![format!("src/{id}")],
+            acceptance: vec!["done".into()],
+            token_budget: None,
+            cost_budget_usd: None,
+            parent_task_id: None,
+            fanout_key: None,
+            fanout_join_for: None,
+        }
+    }
+
+    fn plan() -> TeamPlan {
+        TeamPlan {
+            goal: "guarded transitions".into(),
+            departments: vec![PlanDepartment {
+                name: "impl".into(),
+                manager_title: "Implementation".into(),
+                profile: "coding".into(),
+                objective: "build".into(),
+                token_budget: None,
+                cost_budget_usd: None,
+            }],
+            tasks: vec![
+                task("T1", vec![]),
+                task("T2", vec![]),
+                task("T3", vec![]),
+                task("T4", vec![]),
+            ],
+        }
+    }
+
+    fn submitted(store: &Store, project: &Project, session: &Session) -> u64 {
+        let event = store
+            .append_event(
+                &session.id,
+                "team_plan.submitted",
+                serde_json::json!({"goal": "guarded transitions"}),
+            )
+            .unwrap();
+        let plan = plan();
+        store
+            .set_team_plan(&session.id, &serde_json::to_string(&plan).unwrap())
+            .unwrap();
+        store
+            .sync_plan_tasks(&session.id, &project.id, event.seq, &plan)
+            .unwrap();
+        event.seq
+    }
+
+    fn task_status(store: &Store, session: &Session, id: &str) -> ScheduledTask {
+        store
+            .list_plan_tasks(None, Some(&session.id))
+            .unwrap()
+            .into_iter()
+            .find(|task| task.task_id == id)
+            .unwrap()
+    }
+
+    #[test]
+    fn late_finish_cannot_overwrite_terminal_tasks() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("demo"))
+            .unwrap();
+        let session = store.create_session(&project.id, "guards").unwrap();
+        let plan_seq = submitted(&store, &project, &session);
+
+        store
+            .claim_plan_tasks(&session.id, plan_seq, &["T1".into(), "T4".into()])
+            .unwrap();
+        store
+            .finish_plan_task(&session.id, plan_seq, "T1", "completed", None)
+            .unwrap()
+            .unwrap();
+        let late = store
+            .finish_plan_task(&session.id, plan_seq, "T1", "failed", Some("late"))
+            .unwrap();
+        assert!(late.is_none());
+        let t1 = task_status(&store, &session, "T1");
+        assert_eq!(t1.status, "completed");
+        assert_eq!(t1.attempts, 1);
+
+        store.skip_plan_task_with_event(&session.id, "T2").unwrap();
+        let skipped = store
+            .finish_plan_task(&session.id, plan_seq, "T2", "failed", Some("late"))
+            .unwrap();
+        assert!(skipped.is_none());
+        assert_eq!(task_status(&store, &session, "T2").status, "skipped");
+
+        store
+            .cancel_plan_task_with_event(&session.id, plan_seq, "T3", "dependency failed", "T1")
+            .unwrap();
+        let cancelled = store
+            .finish_plan_task(&session.id, plan_seq, "T3", "completed", None)
+            .unwrap();
+        assert!(cancelled.is_none());
+        assert_eq!(task_status(&store, &session, "T3").status, "cancelled");
+
+        store
+            .request_plan_task_cancel_with_event(&session.id, "T4")
+            .unwrap();
+        // A real completion can win the cancel race. The merge boundary still
+        // re-checks cancellation before landing work; once the task is
+        // completed, a later late writer cannot overwrite it.
+        let completed = store
+            .finish_plan_task(&session.id, plan_seq, "T4", "completed", None)
+            .unwrap();
+        assert!(completed.is_some());
+        assert_eq!(task_status(&store, &session, "T4").status, "completed");
+        let late = store
+            .finish_plan_task(&session.id, plan_seq, "T4", "failed", Some("late"))
+            .unwrap();
+        assert!(late.is_none());
+        assert_eq!(task_status(&store, &session, "T4").status, "completed");
+    }
+
+    #[test]
+    fn ask_user_resume_does_not_overwrite_a_paused_session() {
+        let (_data, store, repo) = test_store();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("demo"))
+            .unwrap();
+        let session = store.create_session(&project.id, "ask").unwrap();
+        store
+            .update_session_status_with_event(&session.id, "waiting_input")
+            .unwrap();
+        store
+            .update_session_status_with_event(&session.id, "paused")
+            .unwrap();
+
+        let event = store
+            .resume_session_after_question_with_event(&session.id)
+            .unwrap();
+        assert!(event.is_none());
+        assert_eq!(
+            store.get_session(&session.id).unwrap().unwrap().status,
+            "paused"
+        );
+
+        store
+            .update_session_status_with_event(&session.id, "waiting_input")
+            .unwrap();
+        let event = store
+            .resume_session_after_question_with_event(&session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.kind, "session.updated");
+        assert_eq!(event.payload["status"], "running");
+        assert_eq!(
+            store.get_session(&session.id).unwrap().unwrap().status,
+            "running"
+        );
     }
 }

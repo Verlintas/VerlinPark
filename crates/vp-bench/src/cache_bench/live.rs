@@ -21,8 +21,8 @@ use vp_providers::{
 use super::simulator::aggregate_calls;
 use super::{
     CACHE_BENCH_SCHEMA, CacheBenchAcceptance, CacheBenchCall, CacheBenchMode, CacheBenchPricing,
-    CacheBenchReport, CostEstimate, LONG_PREFIX_HIT_TARGET, LONG_PREFIX_MIN_TOKENS, LiveGate,
-    ScenarioSizeCheck,
+    CacheBenchReport, CacheBenchScenarioKind, CostEstimate, LONG_PREFIX_HIT_TARGET,
+    LONG_PREFIX_MIN_TOKENS, LiveGate, ScenarioSizeCheck,
 };
 
 /// Optional extra environment gate. When set to `0`/`false`, live mode is
@@ -51,7 +51,7 @@ impl std::fmt::Debug for LiveCacheBenchSettings {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("LiveCacheBenchSettings")
-            .field("base_url", &self.base_url)
+            .field("base_url", &crate::metrics::redact_endpoint(&self.base_url))
             .field("model", &self.model)
             .field("turns", &self.turns)
             .field("allow_live", &self.allow_live)
@@ -86,14 +86,18 @@ impl LiveCacheBenchSettings {
         LiveGate {
             allow_live: self.allow_live,
             key_source: self.key_source.clone(),
-            base_url: self.base_url.clone(),
+            base_url: crate::metrics::redact_endpoint(&self.base_url),
             model: self.model.clone(),
             extra_env_gate: self.extra_env_gate.clone(),
         }
     }
 
     fn provider(&self) -> OpenAiCompatibleProvider {
-        OpenAiCompatibleProvider::new("deepseek", &self.base_url, Some(self.api_key.clone()))
+        OpenAiCompatibleProvider::new(
+            live_provider_label(&self.base_url),
+            &self.base_url,
+            Some(self.api_key.clone()),
+        )
     }
 }
 
@@ -163,6 +167,7 @@ struct LiveTurnUsage {
     output_tokens: u64,
     cache_read_tokens: u64,
     cache_write_tokens: u64,
+    /// True only when the provider reported both input and output counts.
     reported: bool,
     text: String,
     first_token_ms: Option<u64>,
@@ -224,6 +229,7 @@ pub async fn run_live_benchmark_with_provider(
     let mut previous_message_hash: Option<String> = None;
     let mut previous_message_count = 0u64;
     let mut spent_cost_usd = 0.0f64;
+    let mut partial_usage_calls = 0u64;
     for turn in 0..settings.turns {
         if let Some(limit) = options.max_cost_usd {
             let projected_input = previous_input.max(1).saturating_add(256);
@@ -276,6 +282,9 @@ pub async fn run_live_benchmark_with_provider(
         } else {
             estimate_text_tokens(&usage.text)
         };
+        if !usage.reported {
+            partial_usage_calls = partial_usage_calls.saturating_add(1);
+        }
         let current_hash = vp_core::prompt_cache::message_prefix_hash(&conversation);
         let current_count = conversation.len() as u64;
         let append_only = match previous_message_hash.as_deref() {
@@ -288,10 +297,18 @@ pub async fn run_live_benchmark_with_provider(
             }
             _ => false,
         };
-        let cache_read = usage.cache_read_tokens.min(input_tokens);
-        let cache_write = usage
-            .cache_write_tokens
-            .min(input_tokens.saturating_sub(cache_read));
+        let cache_read = if usage.reported {
+            usage.cache_read_tokens.min(input_tokens)
+        } else {
+            0
+        };
+        let cache_write = if usage.reported {
+            usage
+                .cache_write_tokens
+                .min(input_tokens.saturating_sub(cache_read))
+        } else {
+            0
+        };
         let miss_tokens = input_tokens.saturating_sub(cache_read);
         let theoretical =
             vp_core::prompt_cache::theoretical_max_hit_ratio(previous_input, input_tokens);
@@ -326,11 +343,16 @@ pub async fn run_live_benchmark_with_provider(
             estimated_usage: !usage.reported,
             cost,
         });
-        let reply = if usage.text.trim().is_empty() {
-            "OK".to_string()
-        } else {
-            usage.text
-        };
+        if usage.text.trim().is_empty() {
+            bail!(
+                "live cache-bench turn {} from provider `{}` (model `{}`, base `{}`) returned no assistant text; refusing to fabricate a reply or continue into later cache measurements",
+                turn + 1,
+                live_provider_label(&settings.base_url),
+                settings.model,
+                crate::metrics::redact_endpoint(&settings.base_url)
+            );
+        }
+        let reply = usage.text;
         conversation.push(ChatMessage::assistant(reply));
         previous_input = input_tokens;
         previous_message_hash = Some(current_hash);
@@ -353,16 +375,40 @@ pub async fn run_live_benchmark_with_provider(
         },
     };
     let generated_at = OffsetDateTime::now_utc().format(&Rfc3339).ok();
+    let provider = live_provider_label(&settings.base_url);
+    let scenario = if provider == "deepseek" {
+        "live_deepseek_controlled_session".to_string()
+    } else {
+        "live_openai_compatible_controlled_session".to_string()
+    };
+    let mut caveats = vec![
+        "Live mode uses the configured provider and credential; the key is never serialized or printed.".to_string(),
+        "Only provider-reported usage is labeled as reported; missing or partial usage is marked estimated_usage=true.".to_string(),
+        "The theoretical max is the previous prompt size divided by the current prompt size. It is not a provider TTL or block guarantee.".to_string(),
+        "The live scenario size is estimated from characters/4, not a vendor tokenizer; provider usage counts are still reported separately per call.".to_string(),
+        "The stable instruction prefix is intentionally small in the default smoke. Set the scenario/model if you need a long-context acceptance run; this module will not pad the prompt to chase a ratio.".to_string(),
+        format!(
+            "Long-prefix target is {:.2}%; a live smoke below that target is reported as a miss, not hidden.",
+            LONG_PREFIX_HIT_TARGET * 100.0
+        ),
+    ];
+    if partial_usage_calls > 0 {
+        caveats.push(format!(
+            "{partial_usage_calls} live call(s) omitted part of the provider usage object; those calls use estimated token counts and this report is not provider-reported evidence."
+        ));
+    }
     let mut report = CacheBenchReport {
         schema: CACHE_BENCH_SCHEMA.to_string(),
-        scenario: "live_deepseek_controlled_session".to_string(),
+        scenario,
+        scenario_kind: CacheBenchScenarioKind::WarmLongPrefix,
         mode: CacheBenchMode::Live,
-        provider: "deepseek".to_string(),
+        provider: provider.to_string(),
         model: settings.model.clone(),
         block_size: 64,
         turns: calls.len(),
         stable_prefix_tokens: estimated_prefix,
         initial_context_tokens: 0,
+        prefix_break_injected: false,
         cross_session_warm: false,
         warmup_included: false,
         deterministic: false,
@@ -373,19 +419,34 @@ pub async fn run_live_benchmark_with_provider(
         calls,
         aggregate,
         acceptance: CacheBenchAcceptance::default(),
-        caveats: vec![
-            "Live mode uses the configured provider and credential; the key is never serialized or printed.".to_string(),
-            "Only provider-reported usage is labeled as reported; missing usage is marked estimated_usage=true.".to_string(),
-            "The theoretical max is the previous prompt size divided by the current prompt size. It is not a provider TTL or block guarantee.".to_string(),
-            "The stable instruction prefix is intentionally small in the default smoke. Set the scenario/model if you need a long-context acceptance run; this module will not pad the prompt to chase a ratio.".to_string(),
-            format!(
-                "Long-prefix target is {:.2}%; a live smoke below that target is reported as a miss, not hidden.",
-                LONG_PREFIX_HIT_TARGET * 100.0
-            ),
-        ],
+        caveats,
     };
     report.acceptance = report.compute_acceptance();
+    report.validate()?;
     Ok(report)
+}
+
+fn live_provider_label(base_url: &str) -> &'static str {
+    let host = base_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(base_url)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default()
+        .split(':')
+        .next()
+        .unwrap_or_default();
+    if host.eq_ignore_ascii_case("api.deepseek.com")
+        || host.to_ascii_lowercase().ends_with(".api.deepseek.com")
+    {
+        "deepseek"
+    } else {
+        "openai-compatible"
+    }
 }
 
 async fn call_provider(provider: &dyn Provider, request: ChatRequest) -> Result<LiveTurnUsage> {
@@ -404,10 +465,11 @@ async fn call_provider(provider: &dyn Provider, request: ChatRequest) -> Result<
                 }
                 usage.text.push_str(&delta);
             }
-            StreamEvent::ToolCall(_) => {
-                // The live cache smoke intentionally exposes no tools. A
-                // provider tool call is not replayed or executed; it is simply
-                // ignored and the turn text remains whatever was streamed.
+            StreamEvent::ToolCall(call) => {
+                return Err(anyhow::anyhow!(
+                    "provider streamed tool call `{}` but the live cache benchmark advertises no tools",
+                    call.name
+                ));
             }
             StreamEvent::Usage {
                 input_tokens,
@@ -419,7 +481,7 @@ async fn call_provider(provider: &dyn Provider, request: ChatRequest) -> Result<
                 usage.output_tokens = u64::from(output_tokens);
                 usage.cache_read_tokens = u64::from(cache_read_tokens);
                 usage.cache_write_tokens = u64::from(cache_write_tokens);
-                usage.reported = true;
+                usage.reported = usage.input_tokens > 0 && usage.output_tokens > 0;
             }
             StreamEvent::Done => break,
         }
@@ -583,7 +645,7 @@ mod tests {
     #[tokio::test]
     async fn injected_provider_exercises_the_live_report_without_network() {
         let settings = LiveCacheBenchSettings::from_parts(
-            "http://127.0.0.1:1",
+            "https://api.deepseek.com",
             "fake-model",
             "not-a-real-key",
             3,
@@ -635,5 +697,220 @@ mod tests {
         .expect_err("zero cost guard must refuse the first call");
         assert!(error.to_string().contains("stopped before turn 1"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    type CapturedRequests = Arc<std::sync::Mutex<Vec<Vec<ChatMessage>>>>;
+
+    struct ScriptedLiveProvider {
+        calls: Arc<AtomicUsize>,
+        scripts: std::sync::Mutex<std::collections::VecDeque<Vec<StreamEvent>>>,
+        requests: CapturedRequests,
+    }
+
+    impl ScriptedLiveProvider {
+        fn new(scripts: Vec<Vec<StreamEvent>>) -> (Self, Arc<AtomicUsize>, CapturedRequests) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            (
+                Self {
+                    calls: calls.clone(),
+                    scripts: std::sync::Mutex::new(scripts.into_iter().collect()),
+                    requests: requests.clone(),
+                },
+                calls,
+                requests,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl Provider for ScriptedLiveProvider {
+        fn id(&self) -> &str {
+            "scripted-live"
+        }
+
+        async fn stream_chat(&self, request: ChatRequest) -> Result<EventStream, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.requests
+                .lock()
+                .expect("requests lock")
+                .push(request.messages);
+            let events = self
+                .scripts
+                .lock()
+                .expect("scripts lock")
+                .pop_front()
+                .unwrap_or_else(|| vec![StreamEvent::Done]);
+            Ok(Box::pin(stream::iter(events.into_iter().map(Ok))))
+        }
+    }
+
+    #[tokio::test]
+    async fn live_empty_text_turn_fails_instead_of_injecting_ok() {
+        let settings =
+            LiveCacheBenchSettings::from_parts("http://127.0.0.1:1", "fake-model", "key", 2);
+        let (provider, calls, requests) = ScriptedLiveProvider::new(vec![vec![
+            StreamEvent::Usage {
+                input_tokens: 1_000,
+                output_tokens: 8,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            StreamEvent::Done,
+        ]]);
+        let pricing = CacheBenchPricing::caller(crate::metrics::Pricing::new(1.0, 2.0, 0.1, 0.5));
+        let error = run_live_benchmark_with_provider(
+            &settings,
+            pricing,
+            &provider,
+            LiveRunOptions::default(),
+        )
+        .await
+        .expect_err("an empty live turn must fail");
+        let message = error.to_string();
+        assert!(message.contains("no assistant text"), "{message}");
+        assert!(message.contains("turn 1"), "{message}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(requests.lock().expect("requests").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn live_unexpected_tool_call_fails_the_run() {
+        let settings =
+            LiveCacheBenchSettings::from_parts("http://127.0.0.1:1", "fake-model", "key", 2);
+        let (provider, calls, _) = ScriptedLiveProvider::new(vec![vec![
+            StreamEvent::ToolCall(vp_providers::ToolCall {
+                id: "call-1".to_string(),
+                name: "write_file".to_string(),
+                arguments: "{}".to_string(),
+            }),
+            StreamEvent::Done,
+        ]]);
+        let pricing = CacheBenchPricing::caller(crate::metrics::Pricing::new(1.0, 2.0, 0.1, 0.5));
+        let error = run_live_benchmark_with_provider(
+            &settings,
+            pricing,
+            &provider,
+            LiveRunOptions::default(),
+        )
+        .await
+        .expect_err("a tool call must fail the no-tools live smoke");
+        assert!(error.to_string().contains("tool call"), "{error:#}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn live_partial_usage_is_not_provider_reported() {
+        let settings =
+            LiveCacheBenchSettings::from_parts("http://127.0.0.1:1", "fake-model", "key", 1);
+        let (provider, _, _) = ScriptedLiveProvider::new(vec![vec![
+            StreamEvent::TextDelta("partial usage reply".to_string()),
+            StreamEvent::Usage {
+                input_tokens: 1_000,
+                output_tokens: 0,
+                cache_read_tokens: 900,
+                cache_write_tokens: 0,
+            },
+            StreamEvent::Done,
+        ]]);
+        let pricing = CacheBenchPricing::caller(crate::metrics::Pricing::new(1.0, 2.0, 0.1, 0.5));
+        let report = run_live_benchmark_with_provider(
+            &settings,
+            pricing,
+            &provider,
+            LiveRunOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(report.calls[0].estimated_usage);
+        assert_eq!(report.calls[0].cache_read_tokens, 0);
+        assert_eq!(report.acceptance.measurement, "provider_estimated");
+        assert!(!report.acceptance.provider_reported);
+        assert!(!report.live_target_met());
+        assert!(
+            report
+                .caveats
+                .iter()
+                .any(|caveat| caveat.contains("omitted part of the provider usage"))
+        );
+    }
+
+    #[tokio::test]
+    async fn live_second_request_contains_only_provider_returned_text() {
+        let settings =
+            LiveCacheBenchSettings::from_parts("https://api.deepseek.com", "fake-model", "key", 2);
+        let (provider, _, requests) = ScriptedLiveProvider::new(vec![
+            vec![
+                StreamEvent::TextDelta("reply-one".to_string()),
+                StreamEvent::Usage {
+                    input_tokens: 1_000,
+                    output_tokens: 8,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("reply-two".to_string()),
+                StreamEvent::Usage {
+                    input_tokens: 1_100,
+                    output_tokens: 8,
+                    cache_read_tokens: 1_000,
+                    cache_write_tokens: 0,
+                },
+                StreamEvent::Done,
+            ],
+        ]);
+        let pricing = CacheBenchPricing::caller(crate::metrics::Pricing::new(1.0, 2.0, 0.1, 0.5));
+        let report = run_live_benchmark_with_provider(
+            &settings,
+            pricing,
+            &provider,
+            LiveRunOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.provider, "deepseek");
+        let requests = requests.lock().expect("requests");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].len(), 4);
+        assert_eq!(requests[1][2].role, "assistant");
+        assert_eq!(requests[1][2].content, "reply-one");
+        assert!(
+            requests[1]
+                .iter()
+                .all(|message| message.content.trim() != "OK")
+        );
+    }
+
+    #[tokio::test]
+    async fn live_custom_base_url_is_labeled_neutrally() {
+        let settings =
+            LiveCacheBenchSettings::from_parts("http://127.0.0.1:9/custom", "fake-model", "key", 1);
+        let (provider, _, _) = ScriptedLiveProvider::new(vec![vec![
+            StreamEvent::TextDelta("custom endpoint reply".to_string()),
+            StreamEvent::Usage {
+                input_tokens: 1_000,
+                output_tokens: 8,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            StreamEvent::Done,
+        ]]);
+        let pricing = CacheBenchPricing::caller(crate::metrics::Pricing::new(1.0, 2.0, 0.1, 0.5));
+        let report = run_live_benchmark_with_provider(
+            &settings,
+            pricing,
+            &provider,
+            LiveRunOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.provider, "openai-compatible");
+        assert_eq!(report.scenario, "live_openai_compatible_controlled_session");
+        assert_eq!(
+            report.live_gate.as_ref().map(|gate| gate.base_url.as_str()),
+            Some("http://127.0.0.1:9/custom")
+        );
     }
 }

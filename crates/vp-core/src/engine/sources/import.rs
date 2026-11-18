@@ -98,24 +98,28 @@ impl Engine {
         let project = self.project_for_sources(&params.project_id).await?;
         let labels = validate_source_labels(params.labels)?;
         let root = PathBuf::from(&project.root);
-        let existing = {
-            let store = self.store.clone();
-            let project_id = project.id.clone();
-            tokio::task::spawn_blocking(move || {
-                store.list_sources(&project_id, None, None, Some(1_000))
-            })
-            .await??
-        };
-        let existing_uris = existing
-            .iter()
-            .filter_map(|source| source.uri.clone())
-            .collect::<std::collections::HashSet<_>>();
         let relative = params.path.clone();
         let max_files = params.max_files.unwrap_or(100).clamp(1, 500) as usize;
         let scan = tokio::task::spawn_blocking(move || {
             collect_import_files(&root, relative.as_deref(), max_files)
         })
         .await??;
+        // The candidate file list is bounded, so check exactly those URIs.
+        // `list_sources` returns only the newest 1,000 rows and cannot prove
+        // that an older source with the same path does not already exist.
+        let candidate_uris = scan
+            .files
+            .iter()
+            .map(|file| file.relative.clone())
+            .collect::<Vec<_>>();
+        let project_id = project.id.clone();
+        let existing_uris = {
+            let store = self.store.clone();
+            tokio::task::spawn_blocking(move || {
+                store.existing_source_uris(&project_id, &candidate_uris)
+            })
+            .await??
+        };
         let mut imported = Vec::new();
         let mut skipped = scan.skipped;
         let mut errors = Vec::new();
@@ -664,3 +668,74 @@ fn source_title_from_url(url: &str) -> String {
 }
 
 const MAX_SOURCE_IMPORT_SCAN: usize = 20_000;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn source(project_id: &str, index: usize, uri: Option<String>) -> Source {
+        let now = now_rfc3339();
+        Source {
+            id: format!("existing-{index:04}"),
+            project_id: project_id.to_string(),
+            kind: "file".to_string(),
+            collection: None,
+            title: uri.clone().unwrap_or_else(|| format!("doc-{index:04}.md")),
+            uri,
+            mime_type: Some("text/markdown".to_string()),
+            status: "indexed".to_string(),
+            size_bytes: 1,
+            sha256: "a".repeat(64),
+            revision: 1,
+            chunk_count: 0,
+            char_count: 1,
+            token_count: 1,
+            error: None,
+            labels: Vec::new(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            indexed_at: Some(now),
+        }
+    }
+
+    #[tokio::test]
+    async fn import_skips_existing_files_beyond_the_first_thousand_sources() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("docs")).unwrap();
+        std::fs::write(repo.path().join("docs/existing.md"), "# Existing\n").unwrap();
+        let store = vp_store::Store::open(data.path()).unwrap();
+        let engine = Engine::new(store.clone());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("import".into()),
+            )
+            .await
+            .unwrap();
+        for index in 0..1_001 {
+            let uri = if index == 0 {
+                "docs/existing.md".to_string()
+            } else {
+                format!("docs/older-{index:04}.md")
+            };
+            let row = source(&project.id, index, Some(uri));
+            store.insert_source(&row, &[]).unwrap();
+        }
+        let result = engine
+            .import_sources(SourceImportParams {
+                project_id: project.id.clone(),
+                collection: None,
+                path: Some(".".into()),
+                max_files: Some(10),
+                labels: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert!(result.imported.is_empty(), "{:?}", result.imported);
+        assert!(result.skipped >= 1);
+        let stats = engine.source_stats(project.id).await.unwrap();
+        assert_eq!(stats.sources, 1_001);
+    }
+}

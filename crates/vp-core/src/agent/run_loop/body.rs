@@ -1,5 +1,22 @@
 use super::*;
 
+/// Stable provider-turn failure: the model returned neither text nor a tool
+/// call. This is a typed error rather than a successful empty answer so the run
+/// journal and session status record a failure.
+#[derive(Debug)]
+pub(in crate::agent) struct EmptyProviderTurnError;
+
+impl std::fmt::Display for EmptyProviderTurnError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "PROVIDER_EMPTY_TURN: the provider returned an assistant turn with no text and no tool calls"
+        )
+    }
+}
+
+impl std::error::Error for EmptyProviderTurnError {}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::agent) async fn run_loop_body(
     engine: &Engine,
@@ -1522,29 +1539,14 @@ pub(in crate::agent) async fn run_loop_body(
         let tool_calls = stream_turn.tool_calls;
 
         if text.is_empty() && tool_calls.is_empty() {
+            // An assistant turn with no text and no tool calls is not a valid
+            // completion. Failing closed here prevents a provider glitch from
+            // being persisted as a successful empty Final answer.
+            let error = anyhow::Error::new(EmptyProviderTurnError);
             journal
-                .model_completed(
-                    engine,
-                    &model_step,
-                    None,
-                    "",
-                    &[],
-                    input_tokens,
-                    output_tokens,
-                    cache_read_tokens,
-                    cache_write_tokens,
-                    estimated,
-                )
+                .model_failed(engine, &model_step, &format!("{error:#}"))
                 .await?;
-            emit(
-                engine,
-                &session.id,
-                spec,
-                "agent.turn_finished",
-                serde_json::json!({"turn": turn + 1, "empty": true}),
-            )
-            .await?;
-            return Ok(LoopOutcome::Final(String::new()));
+            return Err(error);
         }
 
         let assistant_tool_calls = if tool_calls.is_empty() {
@@ -1638,8 +1640,13 @@ pub(in crate::agent) async fn run_loop_body(
                 } else {
                     call.id.clone()
                 };
-                let input: serde_json::Value =
-                    serde_json::from_str(&call.arguments).unwrap_or_else(|_| serde_json::json!({}));
+                let Ok(input) = parse_tool_arguments(&call.arguments) else {
+                    // Invalid provider arguments are a typed tool failure on
+                    // the sequential path. Do not assess or execute a call
+                    // with guessed `{}` input.
+                    prepared.clear();
+                    break;
+                };
                 let assessment = crate::permissions::assess_tool_call_with_gui(
                     &call.name,
                     &input,
@@ -1667,10 +1674,30 @@ pub(in crate::agent) async fn run_loop_body(
                         break;
                     }
                 }
-                if !matches!(
-                    decide(config.approval_mode, &assessment, spec.auto_approve),
-                    ApprovalDecision::Allow { .. }
+                // Preview the persisted broker (templates, grants, audit) with
+                // a non-consuming rule evaluation. The fast path may only run
+                // when every candidate is a plain Allow; anything else falls
+                // back to the sequential dispatcher, which performs the one
+                // real evaluation and records the operator-visible decision.
+                let preview = match preview_tool_permission(
+                    engine,
+                    session,
+                    &assessment,
+                    &call.name,
+                    &input,
+                    config.approval_mode,
+                    spec.auto_approve,
                 ) {
+                    Ok(preview) => preview,
+                    Err(error) => {
+                        // Let the sequential broker surface the error with its
+                        // normal Deny path instead of adding a new failure mode.
+                        tracing::warn!(%error, tool = %call.name, "approval preview failed");
+                        prepared.clear();
+                        break;
+                    }
+                };
+                if !matches!(preview.decision, ApprovalDecision::Allow { .. }) {
                     prepared.clear();
                     break;
                 }
@@ -1689,6 +1716,62 @@ pub(in crate::agent) async fn run_loop_body(
                 ));
             }
             if !prepared.is_empty() {
+                // Every candidate passed the non-consuming preview. Record the
+                // real contract decision and the persisted broker decision
+                // exactly once now. A concurrent policy change that makes the
+                // real decision non-Allow fails closed before any tool runs;
+                // falling back here would consume a template use twice.
+                for (_, _, name, input, _, _) in &prepared {
+                    if let Some(contract) = &run_contract {
+                        let contract_spec = crate::contract::ContractCallSpec {
+                            tool: name,
+                            contract_tool: None,
+                            input,
+                            risk: crate::permissions::assess_tool_call_with_gui(
+                                name,
+                                input,
+                                &spec.worktree,
+                                &gui_policy,
+                            )
+                            .risk,
+                            worktree: &spec.worktree,
+                            usage: run_contract_usage,
+                            mcp_trust: None,
+                            patch_text: None,
+                        };
+                        let decision = crate::contract::authorize(
+                            &contract_spec,
+                            contract,
+                            &run_contract_policy,
+                        );
+                        engine
+                            .record_intent_decision(contract, &decision, &contract_spec)
+                            .await?;
+                    }
+                    let assessment = crate::permissions::assess_tool_call_with_gui(
+                        name,
+                        input,
+                        &spec.worktree,
+                        &gui_policy,
+                    );
+                    let evaluation = engine.evaluate_tool_permission(
+                        &session.id,
+                        &session.project_id,
+                        &assessment,
+                        name,
+                        input,
+                        config.approval_mode,
+                        spec.auto_approve,
+                    )?;
+                    if !matches!(
+                        evaluation.decision,
+                        crate::permissions::ApprovalDecision::Allow { .. }
+                    ) {
+                        return Err(anyhow!(
+                            "approval policy changed while preparing a parallel read batch for {name}; retry the turn"
+                        ));
+                    }
+                }
                 let mut journal_pairs = std::collections::HashMap::new();
                 for (_, call_id, name, input, _, _) in &prepared {
                     if let Err(error) = engine

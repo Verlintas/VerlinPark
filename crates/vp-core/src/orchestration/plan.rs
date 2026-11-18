@@ -264,15 +264,19 @@ pub fn status_map(
     statuses
 }
 
+/// A dependency is satisfied when its upstream task reached a terminal
+/// success state. `skipped` is an explicit operator decision that the task's
+/// work is not needed, so downstream tasks may proceed against whatever the
+/// plan expects from it. Every readiness check uses this one predicate so the
+/// scheduler, controller, plan runner, and snapshot cannot disagree.
+pub fn dependency_satisfied(status: Option<&str>) -> bool {
+    matches!(status, Some("completed" | "skipped"))
+}
+
 pub fn blocked_by(task: &PlanTask, statuses: &HashMap<String, String>) -> Vec<String> {
     task.deps
         .iter()
-        .filter(|dep| {
-            !matches!(
-                statuses.get(*dep).map(String::as_str),
-                Some("completed" | "skipped")
-            )
-        })
+        .filter(|dep| !dependency_satisfied(statuses.get(*dep).map(String::as_str)))
         .map(|dep| {
             format!(
                 "{} ({})",
@@ -298,12 +302,10 @@ pub fn ready_tasks<'a>(
             matches!(
                 status,
                 "pending" | "interrupted" | "failed" | "cancelled" | "retry_scheduled"
-            ) && task.deps.iter().all(|dep| {
-                matches!(
-                    statuses.get(dep).map(String::as_str),
-                    Some("completed" | "skipped")
-                )
-            })
+            ) && task
+                .deps
+                .iter()
+                .all(|dep| dependency_satisfied(statuses.get(dep).map(String::as_str)))
         })
         .take(limit.max(1))
         .collect()

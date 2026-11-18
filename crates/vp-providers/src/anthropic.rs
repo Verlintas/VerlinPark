@@ -3,7 +3,7 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cache::{
     CacheBreakpointPlan, CacheTtl, SystemSection, looks_like_cache_ttl_rejection,
@@ -46,7 +46,15 @@ impl AnthropicProvider {
     }
 }
 
-fn anthropic_system(system: String, stable_prefix: Option<&str>) -> Value {
+/// Anthropic's extended 1h prompt-cache TTL is a beta feature. The documented
+/// opt-in is the `anthropic-beta: extended-cache-ttl-2025-04-11` header. This
+/// is sent only when the operator explicitly selected the 1h pool; it is never
+/// inferred for the default 5m pool and never downgrades a requested 1h TTL.
+/// (ADR-0168 previously said no beta header was added implicitly; an explicit
+/// 1h selection is not implicit.)
+const EXTENDED_CACHE_TTL_BETA: &str = "extended-cache-ttl-2025-04-11";
+
+fn anthropic_system(system: String, stable_prefix: Option<&str>, ttl: CacheTtl) -> Value {
     let Some(prefix) = stable_prefix.filter(|prefix| {
         !prefix.is_empty() && system.starts_with(prefix) && prefix.len() <= system.len()
     }) else {
@@ -58,7 +66,7 @@ fn anthropic_system(system: String, stable_prefix: Option<&str>) -> Value {
     blocks.push(json!({
         "type": "text",
         "text": prefix,
-        "cache_control": {"type": "ephemeral"},
+        "cache_control": ttl.cache_control(),
     }));
     let remainder = &system[prefix.len()..];
     if !remainder.is_empty() {
@@ -212,6 +220,109 @@ fn mark_last_message_cache_control(messages: &mut [Value], ttl: CacheTtl) {
     }
 }
 
+/// Reconcile Anthropic's cumulative usage snapshots into additive
+/// `StreamEvent::Usage` deltas.
+///
+/// `message_start` reports the prompt side (input, cache read/write) and
+/// `message_delta` reports the cumulative output count (and may repeat the
+/// cache fields). Emitting the start snapshot immediately means a stream that
+/// fails between `message_start` and `message_delta` still reports the input
+/// the provider billed; emitting only newly observed counts means an additive
+/// consumer (the runtime usage ledger) never double-counts the two events.
+#[derive(Default)]
+struct UsageReconciler {
+    input_tokens: u32,
+    output_tokens: u32,
+    cache_read_tokens: u32,
+    cache_write_tokens: u32,
+    emitted_input: u32,
+    emitted_output: u32,
+    emitted_read: u32,
+    emitted_write: u32,
+}
+
+impl UsageReconciler {
+    /// Observe one provider usage object. Anthropic's `input_tokens` excludes
+    /// cache reads/writes; the public contract keeps `input_tokens` as the
+    /// total provider input. Counts are cumulative, so `max` protects against
+    /// a repeated or non-monotonic snapshot without ever losing a larger one.
+    fn observe(&mut self, usage: Option<&Value>) {
+        let Some(usage) = usage else {
+            return;
+        };
+        let field = |name: &str| {
+            usage
+                .get(name)
+                .and_then(Value::as_u64)
+                .map(|value| value.min(u64::from(u32::MAX)) as u32)
+        };
+        if let Some(value) = field("input_tokens") {
+            self.input_tokens = self.input_tokens.max(value);
+        }
+        if let Some(value) = field("output_tokens") {
+            self.output_tokens = self.output_tokens.max(value);
+        }
+        if let Some(value) = field("cache_read_input_tokens") {
+            self.cache_read_tokens = self.cache_read_tokens.max(value);
+        }
+        if let Some(value) = field("cache_creation_input_tokens") {
+            self.cache_write_tokens = self.cache_write_tokens.max(value);
+        }
+    }
+
+    /// The next additive usage delta, or `None` when nothing new was reported.
+    fn pending(&mut self) -> Option<StreamEvent> {
+        let total_input = self
+            .input_tokens
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_write_tokens);
+        let input_tokens = total_input.saturating_sub(self.emitted_input);
+        let output_tokens = self.output_tokens.saturating_sub(self.emitted_output);
+        let cache_read_tokens = self.cache_read_tokens.saturating_sub(self.emitted_read);
+        let cache_write_tokens = self.cache_write_tokens.saturating_sub(self.emitted_write);
+        if input_tokens == 0
+            && output_tokens == 0
+            && cache_read_tokens == 0
+            && cache_write_tokens == 0
+        {
+            return None;
+        }
+        self.emitted_input = self.emitted_input.saturating_add(input_tokens);
+        self.emitted_output = self.emitted_output.saturating_add(output_tokens);
+        self.emitted_read = self.emitted_read.saturating_add(cache_read_tokens);
+        self.emitted_write = self.emitted_write.saturating_add(cache_write_tokens);
+        Some(StreamEvent::Usage {
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+        })
+    }
+}
+
+/// Classify the terminal Anthropic `stop_reason`. `end_turn`, `stop_sequence`,
+/// and `tool_use` mean the message completed. `max_tokens`, `refusal`, and any
+/// unknown vendor reason are explicit provider failures: partial text or tool
+/// arguments from such a turn must not be treated as a successful completion.
+fn completion_failure(provider_id: &str, reason: &str) -> Option<String> {
+    let detail = match reason {
+        "end_turn" | "stop_sequence" | "tool_use" => return None,
+        "max_tokens" => "the message reached the provider max-token limit and is truncated",
+        "refusal" => "the provider refused to complete the request",
+        _ => {
+            return Some(format!(
+                "provider `{provider_id}` ended the stream with unrecognized stop_reason \
+                 `{reason}`; the completion state is unknown and the turn is not accepted"
+            ));
+        }
+    };
+    Some(format!(
+        "provider `{provider_id}` ended the stream with stop_reason `{reason}`: {detail}. \
+         Partial output is kept, but the turn is not a successful completion and buffered \
+         tool calls were discarded"
+    ))
+}
+
 #[async_trait]
 impl Provider for AnthropicProvider {
     fn id(&self) -> &str {
@@ -280,13 +391,19 @@ impl AnthropicProvider {
                 // while caching is enabled; a disabled policy must emit no
                 // markers even for a legacy request.
                 body["system"] = if plan.enabled {
-                    anthropic_system(system, stable_prefix.as_deref())
+                    anthropic_system(system, stable_prefix.as_deref(), plan.ttl)
                 } else {
                     json!(system)
                 };
             }
         } else if let Some(system) = system {
-            body["system"] = anthropic_system(system, stable_prefix.as_deref());
+            // No cache policy was supplied: preserve the historical 5m
+            // compatibility marker for a stable prefix.
+            body["system"] = anthropic_system(
+                system,
+                stable_prefix.as_deref(),
+                cache_ttl.unwrap_or_default(),
+            );
         }
         if let Some(plan) = plan.as_ref() {
             if plan.enabled && plan.automatic {
@@ -309,14 +426,22 @@ impl AnthropicProvider {
             body["tools"] = anthropic_tools_with_plan(&request.tools, plan.as_ref());
         }
 
+        // Extended cache TTL is a beta feature and must be requested on the
+        // wire; the default 5m pool never sends this header.
+        let extended_cache_ttl =
+            cache_ttl == Some(CacheTtl::OneHour) && plan.as_ref().is_some_and(|plan| plan.enabled);
         let response = match crate::send_with_retry_preemptible(
             || {
-                self.client
+                let mut builder = self
+                    .client
                     .post(self.endpoint())
                     .header("x-api-key", api_key)
                     .header("anthropic-version", "2023-06-01")
-                    .header("content-type", "application/json")
-                    .json(&body)
+                    .header("content-type", "application/json");
+                if extended_cache_ttl {
+                    builder = builder.header("anthropic-beta", EXTENDED_CACHE_TTL_BETA);
+                }
+                builder.json(&body)
             },
             preempt.as_ref(),
         )
@@ -348,19 +473,29 @@ impl AnthropicProvider {
         }
         let stream = Box::pin(response.bytes_stream().eventsource());
         let preempt = preempt.clone();
+        let provider_id = self.id.clone();
         let mapped = async_stream::stream! {
-            let mut input_tokens = 0u32;
-            let mut output_tokens = 0u32;
-            let mut cache_read_tokens = 0u32;
-            let mut cache_write_tokens = 0u32;
+            let mut usage = UsageReconciler::default();
+            // Tool calls are buffered until the terminal stop_reason is known.
+            // Anthropic emits `content_block_stop` before `message_delta`, so
+            // emitting a call there would execute a tool call from a
+            // `max_tokens`/refusal-truncated message.
             let mut tool_calls: BTreeMap<u64, ToolCall> = BTreeMap::new();
-            let mut saw_done = false;
+            // A tool call is only executable after its `content_block_stop`.
+            // An allowed `tool_use` stop_reason with an unclosed block still
+            // means the arguments may be incomplete.
+            let mut closed_tool_calls: BTreeSet<u64> = BTreeSet::new();
+            let mut stop_reason: Option<String> = None;
+            // A terminal provider error ends the stream after the error event;
+            // it is never followed by a second end-of-stream error (PR-15).
+            let mut terminated = false;
             let mut stream = stream;
             loop {
                 let next = match &preempt {
                     Some(token) => tokio::select! {
                         _ = token.cancelled() => {
                             yield Err(ProviderError::preempted(token));
+                            terminated = true;
                             break;
                         }
                         item = stream.next() => item,
@@ -373,6 +508,7 @@ impl AnthropicProvider {
                 match item {
                     Err(error) => {
                         yield Err(provider_error_from_stream(error));
+                        terminated = true;
                         break;
                     }
                     Ok(event) => {
@@ -380,7 +516,8 @@ impl AnthropicProvider {
                             Ok(value) => value,
                             Err(error) => {
                                 yield Err(ProviderError::Parse(error.to_string()));
-                                continue;
+                                terminated = true;
+                                break;
                             }
                         };
                         match event.event.as_str() {
@@ -428,78 +565,107 @@ impl AnthropicProvider {
                                 }
                             }
                             "content_block_stop" => {
-                                if let Some(index) = value.get("index").and_then(Value::as_u64)
-                                    && let Some(mut call) = tool_calls.remove(&index)
-                                    && !call.name.is_empty()
+                                if let Some(index) = value.get("index").and_then(Value::as_u64) {
+                                    let nameless = tool_calls
+                                        .get(&index)
+                                        .is_some_and(|call| call.name.is_empty());
+                                    if nameless {
+                                        // Never execute a nameless call.
+                                        tool_calls.remove(&index);
+                                    } else if tool_calls.contains_key(&index) {
+                                        if let Some(call) = tool_calls.get_mut(&index)
+                                            && call.id.is_empty()
+                                        {
+                                            call.id = crate::fallback_tool_call_id(index as usize);
+                                        }
+                                        closed_tool_calls.insert(index);
+                                    }
+                                }
+                            }
+                            "message_start" => {
+                                // Emit the prompt-side usage immediately. If
+                                // the stream fails before `message_delta`, the
+                                // runtime still records the provider-reported
+                                // input instead of an estimate (PR-6).
+                                usage.observe(value.pointer("/message/usage"));
+                                if let Some(event) = usage.pending() {
+                                    yield Ok(event);
+                                }
+                            }
+                            "message_delta" => {
+                                if let Some(reason) = value
+                                    .pointer("/delta/stop_reason")
+                                    .and_then(Value::as_str)
+                                    .or_else(|| {
+                                        value.get("stop_reason").and_then(Value::as_str)
+                                    })
+                                    .map(str::trim)
+                                    .filter(|reason| !reason.is_empty())
                                 {
+                                    stop_reason = Some(reason.to_string());
+                                }
+                                // `message_delta.usage` is cumulative; emit
+                                // only the newly observed counts so an
+                                // additive usage ledger cannot double-count
+                                // the `message_start` snapshot.
+                                usage.observe(value.get("usage"));
+                                if let Some(event) = usage.pending() {
+                                    yield Ok(event);
+                                }
+                                if let Some(reason) = stop_reason.as_deref()
+                                    && let Some(message) =
+                                        completion_failure(&provider_id, reason)
+                                {
+                                    // Fails closed before any buffered tool
+                                    // call is emitted and without `Done`.
+                                    yield Err(ProviderError::Stream(message));
+                                    terminated = true;
+                                    break;
+                                }
+                            }
+                            "message_stop" => {
+                                // Some compatible gateways put the terminal
+                                // reason on `message_stop` instead of (or in
+                                // addition to) `message_delta`.
+                                if let Some(reason) = value
+                                    .get("stop_reason")
+                                    .and_then(Value::as_str)
+                                    .map(str::trim)
+                                    .filter(|reason| !reason.is_empty())
+                                {
+                                    stop_reason = Some(reason.to_string());
+                                }
+                                if let Some(reason) = stop_reason.as_deref()
+                                    && let Some(message) =
+                                        completion_failure(&provider_id, reason)
+                                {
+                                    yield Err(ProviderError::Stream(message));
+                                    terminated = true;
+                                    break;
+                                }
+                                if let Some(event) = usage.pending() {
+                                    yield Ok(event);
+                                }
+                                for (index, mut call) in std::mem::take(&mut tool_calls) {
+                                    if call.name.is_empty()
+                                        || !closed_tool_calls.contains(&index)
+                                    {
+                                        continue;
+                                    }
                                     if call.id.is_empty() {
                                         call.id = crate::fallback_tool_call_id(index as usize);
                                     }
                                     yield Ok(StreamEvent::ToolCall(call));
                                 }
-                            }
-                            "message_start" => {
-                                let usage = value.pointer("/message/usage");
-                                if let Some(input) = usage
-                                    .and_then(|usage| usage.get("input_tokens"))
-                                    .and_then(Value::as_u64)
-                                {
-                                    input_tokens = input as u32;
-                                }
-                                if let Some(read) = usage
-                                    .and_then(|usage| usage.get("cache_read_input_tokens"))
-                                    .and_then(Value::as_u64)
-                                {
-                                    cache_read_tokens = read as u32;
-                                }
-                                if let Some(write) = usage
-                                    .and_then(|usage| usage.get("cache_creation_input_tokens"))
-                                    .and_then(Value::as_u64)
-                                {
-                                    cache_write_tokens = write as u32;
-                                }
-                            }
-                            "message_delta" => {
-                                let usage = value.get("usage");
-                                if let Some(output) =
-                                    usage.and_then(|usage| usage.get("output_tokens")).and_then(Value::as_u64)
-                                {
-                                    output_tokens = output as u32;
-                                }
-                                if let Some(read) = usage
-                                    .and_then(|usage| usage.get("cache_read_input_tokens"))
-                                    .and_then(Value::as_u64)
-                                {
-                                    cache_read_tokens = read as u32;
-                                }
-                                if let Some(write) = usage
-                                    .and_then(|usage| usage.get("cache_creation_input_tokens"))
-                                    .and_then(Value::as_u64)
-                                {
-                                    cache_write_tokens = write as u32;
-                                }
-                                // Anthropic's `input_tokens` excludes cache
-                                // reads and writes. Our public contract keeps
-                                // `input_tokens` as the total provider input.
-                                let total_input = input_tokens
-                                    .saturating_add(cache_read_tokens)
-                                    .saturating_add(cache_write_tokens);
-                                yield Ok(StreamEvent::Usage {
-                                    input_tokens: total_input,
-                                    output_tokens,
-                                    cache_read_tokens,
-                                    cache_write_tokens,
-                                });
-                            }
-                            "message_stop" => {
-                                saw_done = true;
                                 yield Ok(StreamEvent::Done);
+                                return;
                             }
                             "error" => {
                                 yield Err(ProviderError::Api {
                                     status: 200,
                                     body: crate::redact_provider_body(&value.to_string()),
                                 });
+                                terminated = true;
                                 break;
                             }
                             _ => {}
@@ -507,11 +673,17 @@ impl AnthropicProvider {
                     }
                 }
             }
-            if !saw_done {
-                yield Err(ProviderError::Stream(
-                    "provider stream ended before message_stop".into(),
-                ));
+            if terminated {
+                return;
             }
+            if let Some(event) = usage.pending() {
+                yield Ok(event);
+            }
+            // `message_stop` is the only clean terminal event and returns
+            // above, so reaching here always means an incomplete stream.
+            yield Err(ProviderError::Stream(
+                "provider stream ended before message_stop".into(),
+            ));
         };
 
         Ok(Box::pin(mapped))
@@ -525,6 +697,91 @@ mod tests {
     use futures_util::StreamExt;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn anthropic_sse_server(body: &str) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn test_provider(server: &MockServer) -> AnthropicProvider {
+        AnthropicProvider::with_base_url(
+            "test",
+            format!("{}/v1", server.uri()),
+            Some("test-key".to_string()),
+        )
+    }
+
+    async fn drain_anthropic(
+        provider: &AnthropicProvider,
+        request: ChatRequest,
+    ) -> Vec<std::result::Result<StreamEvent, ProviderError>> {
+        let mut stream = provider.stream_chat(request).await.unwrap();
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            events.push(item);
+        }
+        events
+    }
+
+    fn usage_events(
+        events: &[std::result::Result<StreamEvent, ProviderError>],
+    ) -> Vec<(u32, u32, u32, u32)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Ok(StreamEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                }) => Some((
+                    *input_tokens,
+                    *output_tokens,
+                    *cache_read_tokens,
+                    *cache_write_tokens,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn summed_usage(
+        events: &[std::result::Result<StreamEvent, ProviderError>],
+    ) -> (u32, u32, u32, u32) {
+        usage_events(events).into_iter().fold(
+            (0, 0, 0, 0),
+            |(input, output, read, write), (i, o, r, w)| {
+                (
+                    input.saturating_add(i),
+                    output.saturating_add(o),
+                    read.saturating_add(r),
+                    write.saturating_add(w),
+                )
+            },
+        )
+    }
+
+    fn has_done(events: &[std::result::Result<StreamEvent, ProviderError>]) -> bool {
+        events
+            .iter()
+            .any(|event| matches!(event, Ok(StreamEvent::Done)))
+    }
+
+    fn stream_error_message(events: &[std::result::Result<StreamEvent, ProviderError>]) -> &str {
+        match events.iter().find_map(|event| event.as_ref().err()) {
+            Some(ProviderError::Stream(message)) => message.as_str(),
+            other => panic!("expected a provider stream error, got {other:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn parses_anthropic_sse_stream() {
@@ -566,24 +823,31 @@ mod tests {
             .unwrap();
         let mut events = Vec::new();
         while let Some(item) = stream.next().await {
-            events.push(item.unwrap());
+            events.push(item);
         }
-        assert!(events.contains(&StreamEvent::TextDelta("Hi".to_string())));
-        assert!(events.contains(&StreamEvent::TextDelta(" there".to_string())));
-        assert!(events.contains(&StreamEvent::Usage {
-            input_tokens: 12,
-            output_tokens: 3,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
+        assert!(
+            events
+                .iter()
+                .any(|event| { matches!(event, Ok(StreamEvent::TextDelta(text)) if text == "Hi") })
+        );
+        assert!(events.iter().any(|event| {
+            matches!(event, Ok(StreamEvent::TextDelta(text)) if text == " there")
         }));
-        assert_eq!(events.last(), Some(&StreamEvent::Done));
+        // Usage is additive across the stream: the prompt-side snapshot is
+        // emitted at message_start and the output-side delta at message_delta.
+        assert_eq!(summed_usage(&events), (12, 3, 0, 0));
+        assert!(events.iter().all(std::result::Result::is_ok));
+        assert!(matches!(events.last(), Some(Ok(StreamEvent::Done))));
     }
 
     #[test]
     fn anthropic_system_keeps_the_string_shape_without_a_marker() {
-        assert_eq!(anthropic_system("hello".to_string(), None), json!("hello"));
         assert_eq!(
-            anthropic_system("hello".to_string(), Some("not-a-prefix")),
+            anthropic_system("hello".to_string(), None, CacheTtl::FiveMinutes),
+            json!("hello")
+        );
+        assert_eq!(
+            anthropic_system("hello".to_string(), Some("not-a-prefix"), CacheTtl::OneHour),
             json!("hello")
         );
     }
@@ -611,36 +875,229 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = AnthropicProvider::with_base_url(
-            "test",
-            format!("{}/v1", server.uri()),
-            Some("test-key".to_string()),
+        let provider = test_provider(&server);
+        let events = drain_anthropic(
+            &provider,
+            ChatRequest::new("claude-test", vec![ChatMessage::user("hi")]),
+        )
+        .await;
+        // 12 raw input + 100 cache-read + 20 cache-write, reported once at
+        // message_start; the output delta follows at message_delta.
+        assert_eq!(summed_usage(&events), (132, 4, 100, 20));
+        assert!(events.iter().all(std::result::Result::is_ok));
+    }
+
+    #[tokio::test]
+    async fn anthropic_usage_is_reconciled_across_message_events() {
+        let server = anthropic_sse_server(concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":4,\"cache_creation_input_tokens\":2}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7,\"cache_read_input_tokens\":6,\"cache_creation_input_tokens\":3}}\n\n",
+            // A gateway may repeat the cumulative snapshot; it must not add
+            // tokens a second time.
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7,\"cache_read_input_tokens\":6,\"cache_creation_input_tokens\":3}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        ))
+        .await;
+        let events = drain_anthropic(
+            &test_provider(&server),
+            ChatRequest::new("claude-test", vec![ChatMessage::user("hi")]),
+        )
+        .await;
+        assert!(events.iter().all(std::result::Result::is_ok));
+        // 10 raw input + 6 cache-read + 3 cache-write = 19 total input.
+        assert_eq!(summed_usage(&events), (19, 7, 6, 3));
+        // One prompt-side snapshot and one output-side delta; the repeated
+        // cumulative snapshot produces no third event.
+        assert_eq!(usage_events(&events).len(), 2);
+        assert!(matches!(events.last(), Some(Ok(StreamEvent::Done))));
+    }
+
+    #[tokio::test]
+    async fn anthropic_usage_survives_a_stream_failure_before_message_delta() {
+        let server = anthropic_sse_server(concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12,\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":20}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+        ))
+        .await;
+        let events = drain_anthropic(
+            &test_provider(&server),
+            ChatRequest::new("claude-test", vec![ChatMessage::user("hi")]),
+        )
+        .await;
+        // The prompt was already billed; the prompt-side usage must not be
+        // discarded just because the stream failed later.
+        assert_eq!(summed_usage(&events), (132, 0, 100, 20));
+        assert!(!has_done(&events));
+        assert!(stream_error_message(&events).contains("message_stop"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_max_tokens_stop_reason_is_not_success() {
+        let server = anthropic_sse_server(concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":3}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        ))
+        .await;
+        let events = drain_anthropic(
+            &test_provider(&server),
+            ChatRequest::new("claude-test", vec![ChatMessage::user("hi")]),
+        )
+        .await;
+        assert!(
+            events.iter().any(
+                |event| matches!(event, Ok(StreamEvent::TextDelta(text)) if text == "partial")
+            )
         );
-        let mut stream = provider
-            .stream_chat(ChatRequest::new(
-                "claude-test",
-                vec![ChatMessage::user("hi")],
-            ))
-            .await
-            .unwrap();
-        let mut usage = None;
-        while let Some(item) = stream.next().await {
-            if let StreamEvent::Usage {
-                input_tokens,
-                output_tokens,
-                cache_read_tokens,
-                cache_write_tokens,
-            } = item.unwrap()
-            {
-                usage = Some((
-                    input_tokens,
-                    output_tokens,
-                    cache_read_tokens,
-                    cache_write_tokens,
-                ));
-            }
-        }
-        assert_eq!(usage, Some((132, 4, 100, 20)));
+        assert!(!has_done(&events), "max_tokens must not report Done");
+        let message = stream_error_message(&events);
+        assert!(message.contains("max_tokens"), "{message}");
+        assert!(message.contains("truncated"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn anthropic_refusal_stop_reason_is_not_success() {
+        let server = anthropic_sse_server(concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usage\":{\"output_tokens\":0}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        ))
+        .await;
+        let events = drain_anthropic(
+            &test_provider(&server),
+            ChatRequest::new("claude-test", vec![ChatMessage::user("hi")]),
+        )
+        .await;
+        assert!(!has_done(&events));
+        let message = stream_error_message(&events);
+        assert!(message.contains("refusal"), "{message}");
+        assert!(message.contains("refused"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn anthropic_stop_sequence_stop_reason_completes() {
+        let server = anthropic_sse_server(concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"done\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"stop_sequence\"},\"usage\":{\"output_tokens\":2}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        ))
+        .await;
+        let events = drain_anthropic(
+            &test_provider(&server),
+            ChatRequest::new("claude-test", vec![ChatMessage::user("hi")]),
+        )
+        .await;
+        assert!(events.iter().all(std::result::Result::is_ok));
+        assert_eq!(summed_usage(&events), (7, 2, 0, 0));
+        assert!(matches!(events.last(), Some(Ok(StreamEvent::Done))));
+    }
+
+    fn tool_use_sse(stop_reason: &str) -> String {
+        format!(
+            concat!(
+                "event: message_start\n",
+                "data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":9}}}}}}\n\n",
+                "event: content_block_start\n",
+                "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"read_file\",\"input\":{{}}}}}}\n\n",
+                "event: content_block_delta\n",
+                "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\\\"path\\\":\\\"README.md\\\"}}\"}}}}\n\n",
+                "event: content_block_stop\n",
+                "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n",
+                "event: message_delta\n",
+                "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{stop_reason}\"}},\"usage\":{{\"output_tokens\":5}}}}\n\n",
+                "event: message_stop\n",
+                "data: {{\"type\":\"message_stop\"}}\n\n",
+            ),
+            stop_reason = stop_reason
+        )
+    }
+
+    #[tokio::test]
+    async fn anthropic_tool_use_stop_reason_emits_the_buffered_tool_call() {
+        let server = anthropic_sse_server(&tool_use_sse("tool_use")).await;
+        let events = drain_anthropic(
+            &test_provider(&server),
+            ChatRequest::new("claude-test", vec![ChatMessage::user("hi")]),
+        )
+        .await;
+        assert!(events.iter().all(std::result::Result::is_ok));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Ok(StreamEvent::ToolCall(call))
+                if call.id == "toolu_1"
+                    && call.name == "read_file"
+                    && call.arguments == "{\"path\":\"README.md\"}"
+        )));
+        assert!(matches!(events.last(), Some(Ok(StreamEvent::Done))));
+    }
+
+    #[tokio::test]
+    async fn anthropic_max_tokens_discards_partial_tool_call() {
+        let server = anthropic_sse_server(&tool_use_sse("max_tokens")).await;
+        let events = drain_anthropic(
+            &test_provider(&server),
+            ChatRequest::new("claude-test", vec![ChatMessage::user("hi")]),
+        )
+        .await;
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Ok(StreamEvent::ToolCall(_)))),
+            "a tool call from a truncated message must never be executable"
+        );
+        assert!(!has_done(&events));
+        assert!(stream_error_message(&events).contains("max_tokens"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_error_event_is_terminal() {
+        let server = anthropic_sse_server(concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\n",
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"try later\"}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        ))
+        .await;
+        let events = drain_anthropic(
+            &test_provider(&server),
+            ChatRequest::new("claude-test", vec![ChatMessage::user("hi")]),
+        )
+        .await;
+        assert!(!has_done(&events));
+        assert_eq!(
+            events.iter().filter(|event| event.is_err()).count(),
+            1,
+            "a terminal error must not be repeated"
+        );
+        assert!(matches!(
+            events.iter().find_map(|event| event.as_ref().err()),
+            Some(ProviderError::Api { status: 200, .. })
+        ));
+        // Usage reported before the error is still preserved.
+        assert_eq!(summed_usage(&events), (5, 0, 0, 0));
     }
 
     #[tokio::test]
@@ -815,6 +1272,133 @@ mod tests {
         assert_eq!(body["system"][1]["cache_control"]["ttl"], json!("1h"));
         assert_eq!(body["tools"][1]["cache_control"]["ttl"], json!("1h"));
         assert_eq!(count_cache_controls(&body), 4);
+    }
+
+    #[tokio::test]
+    async fn one_hour_sends_the_extended_cache_ttl_beta_header() {
+        let mut request = cache_request();
+        request.cache = Some(crate::PromptCacheConfig::new(true, CacheTtl::OneHour, true));
+        let (server, body) = capture_body(request).await;
+        let requests = server.received_requests().await.unwrap();
+        let header = requests[0]
+            .headers
+            .get("anthropic-beta")
+            .and_then(|value| value.to_str().ok());
+        assert_eq!(header, Some(EXTENDED_CACHE_TTL_BETA));
+        assert_eq!(body["cache_control"]["ttl"], json!("1h"));
+        assert_eq!(body["system"][0]["cache_control"]["ttl"], json!("1h"));
+        assert_eq!(body["tools"][1]["cache_control"]["ttl"], json!("1h"));
+    }
+
+    #[tokio::test]
+    async fn five_minutes_omits_the_extended_cache_ttl_beta_header() {
+        let mut request = cache_request();
+        request.cache = Some(crate::PromptCacheConfig::new(
+            true,
+            CacheTtl::FiveMinutes,
+            true,
+        ));
+        let (server, body) = capture_body(request).await;
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests[0].headers.get("anthropic-beta").is_none(),
+            "the default 5m pool must not ask for the 1h beta"
+        );
+        assert!(body["cache_control"].get("ttl").is_none());
+    }
+
+    #[tokio::test]
+    async fn one_hour_legacy_system_marker_uses_1h_and_the_beta_header() {
+        let mut request = ChatRequest::new("claude-test", vec![ChatMessage::user("inspect")]);
+        request.system = Some("STABLE CHARTER\n\nVOLATILE RUN CONTEXT".to_string());
+        request.system_stable_prefix = Some("STABLE CHARTER".to_string());
+        request.tools = vec![crate::ToolSchema {
+            name: "read_file".to_string(),
+            description: "Read a file".to_string(),
+            parameters: json!({"type": "object"}),
+        }];
+        request.cache = Some(crate::PromptCacheConfig::new(true, CacheTtl::OneHour, true));
+        let (server, body) = capture_body(request).await;
+        // The legacy stable-prefix path must honor the configured TTL instead
+        // of silently emitting the 5m marker.
+        assert_eq!(body["system"][0]["text"], json!("STABLE CHARTER"));
+        assert_eq!(body["system"][0]["cache_control"]["ttl"], json!("1h"));
+        assert!(body["system"][1].get("cache_control").is_none());
+        assert_eq!(body["tools"][0]["cache_control"]["ttl"], json!("1h"));
+        assert_eq!(body["cache_control"]["ttl"], json!("1h"));
+        let requests = server.received_requests().await.unwrap();
+        let header = requests[0]
+            .headers
+            .get("anthropic-beta")
+            .and_then(|value| value.to_str().ok());
+        assert_eq!(header, Some(EXTENDED_CACHE_TTL_BETA));
+    }
+
+    #[tokio::test]
+    async fn five_minute_legacy_system_marker_omits_the_ttl_field() {
+        let mut request = ChatRequest::new("claude-test", vec![ChatMessage::user("inspect")]);
+        request.system = Some("STABLE CHARTER\n\nVOLATILE RUN CONTEXT".to_string());
+        request.system_stable_prefix = Some("STABLE CHARTER".to_string());
+        request.cache = Some(crate::PromptCacheConfig::new(
+            true,
+            CacheTtl::FiveMinutes,
+            true,
+        ));
+        let (server, body) = capture_body(request).await;
+        assert_eq!(
+            body["system"][0]["cache_control"]["type"],
+            json!("ephemeral")
+        );
+        assert!(body["system"][0]["cache_control"].get("ttl").is_none());
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests[0].headers.get("anthropic-beta").is_none());
+    }
+
+    #[tokio::test]
+    async fn parallel_tool_results_are_one_user_message_in_tool_use_order() {
+        let mut request = ChatRequest::new(
+            "claude-test",
+            vec![
+                ChatMessage::user("read both"),
+                ChatMessage::assistant_tool_calls(
+                    "",
+                    vec![
+                        ToolCall {
+                            id: "toolu_1".to_string(),
+                            name: "read_file".to_string(),
+                            arguments: "{}".to_string(),
+                        },
+                        ToolCall {
+                            id: "toolu_2".to_string(),
+                            name: "read_file".to_string(),
+                            arguments: "{}".to_string(),
+                        },
+                    ],
+                ),
+                // Completion order differs from tool_use order.
+                ChatMessage::tool("toolu_2", "two"),
+                ChatMessage::tool("toolu_1", "one"),
+                ChatMessage::assistant_tool_calls("both read", vec![]),
+            ],
+        );
+        request.tools = vec![crate::ToolSchema {
+            name: "read_file".to_string(),
+            description: "Read a file".to_string(),
+            parameters: json!({"type": "object"}),
+        }];
+        let (_server, body) = capture_body(request).await;
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 4, "{messages:#?}");
+        assert_eq!(messages[2]["role"], json!("user"));
+        let blocks = messages[2]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], json!("tool_result"));
+        assert_eq!(blocks[0]["tool_use_id"], json!("toolu_1"));
+        assert_eq!(blocks[0]["content"], json!("one"));
+        assert_eq!(blocks[1]["tool_use_id"], json!("toolu_2"));
+        assert_eq!(blocks[1]["content"], json!("two"));
+        // The next assistant turn is a separate message, not merged.
+        assert_eq!(messages[3]["role"], json!("assistant"));
     }
 
     #[tokio::test]

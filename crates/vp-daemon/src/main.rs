@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::Router;
 use axum::routing::{get, post};
 use clap::Parser;
@@ -25,6 +25,7 @@ mod server;
 mod sweepers;
 #[cfg(test)]
 mod tests;
+mod ws;
 
 use crate::http::{gate_resolve_http, health, metrics_http, rpc_http, ws_handler};
 use crate::server::{
@@ -35,9 +36,9 @@ use crate::sweepers::{
     spawn_computer_sweeper, spawn_coordination_sweeper, spawn_effect_sweeper, spawn_gate_sweeper,
     spawn_gui_grace_sweeper, spawn_gui_timeline_retention_sweeper, spawn_memory_conflict_scanner,
     spawn_memory_embedding_reconciler, spawn_memory_stale_sweeper, spawn_memory_sweeper,
-    spawn_orchestration_controller, spawn_process_sweeper, spawn_source_embedding_reconciler,
-    spawn_stall_recovery_reconciler, spawn_task_stall_sweeper, spawn_terminal_sweeper,
-    spawn_tool_output_sweeper, spawn_worktree_sweeper,
+    spawn_orchestration_controller, spawn_process_sweeper, spawn_runtime_lease_sweeper,
+    spawn_source_embedding_reconciler, spawn_stall_recovery_reconciler, spawn_task_stall_sweeper,
+    spawn_terminal_sweeper, spawn_tool_output_sweeper, spawn_worktree_sweeper,
 };
 
 #[derive(Debug, Parser)]
@@ -87,6 +88,14 @@ async fn run() -> Result<()> {
 
     let args = Args::parse();
     let data_dir = args.data_dir.clone().unwrap_or_else(paths::data_dir);
+    run_daemon(data_dir, args.port).await
+}
+
+/// Start the daemon. Background work (queue re-enqueue, auto-resume,
+/// schedulers, sweepers) starts only after the listener binds and discovery is
+/// written, so a bind or discovery failure cannot spend tokens or mutate
+/// durable session state.
+async fn run_daemon(data_dir: PathBuf, port: Option<u16>) -> Result<()> {
     paths::ensure_private_dir(&data_dir)?;
     let _lock_file = acquire_instance_lock(&data_dir)?;
 
@@ -144,16 +153,6 @@ async fn run() -> Result<()> {
         tracing::warn!(%error, "failed to write project manifest");
     }
     let agent = AgentService::from_env(engine.clone());
-    match agent.resume_queued_sessions().await {
-        Ok(0) => {}
-        Ok(started) => tracing::info!(started, "re-enqueued persisted queued sessions"),
-        Err(error) => tracing::warn!(%error, "failed to re-enqueue queued sessions"),
-    }
-    match agent.auto_resume_interrupted_runs().await {
-        Ok(0) => {}
-        Ok(started) => tracing::info!(started, "auto-resumed interrupted durable runs"),
-        Err(error) => tracing::warn!(%error, "failed to auto-resume interrupted durable runs"),
-    }
     let token = generate_token();
     let started_at = now_rfc3339();
     let state = AppState {
@@ -165,32 +164,19 @@ async fn run() -> Result<()> {
         started: Instant::now(),
         pid: std::process::id(),
     };
-    state.agent.start_auto_resolver();
-    state.agent.start_task_scheduler();
-    state.agent.start_scaling_controller();
-    spawn_worktree_sweeper(state.engine.clone());
-    spawn_checkpoint_sweeper(state.engine.clone());
-    spawn_tool_output_sweeper(state.engine.clone());
-    spawn_memory_sweeper(state.engine.clone());
-    spawn_memory_stale_sweeper(state.engine.clone());
-    spawn_memory_conflict_scanner(state.engine.clone());
-    spawn_memory_embedding_reconciler(state.engine.clone());
-    spawn_source_embedding_reconciler(state.engine.clone());
-    spawn_terminal_sweeper(state.engine.clone());
-    spawn_browser_sweeper(state.engine.clone());
-    spawn_computer_sweeper(state.engine.clone());
-    spawn_gui_grace_sweeper(state.engine.clone());
-    spawn_gui_timeline_retention_sweeper(state.engine.clone());
-    spawn_task_stall_sweeper(state.engine.clone());
-    spawn_effect_sweeper(state.engine.clone());
-    spawn_gate_sweeper(state.engine.clone());
-    spawn_coordination_sweeper(state.engine.clone());
-    spawn_stall_recovery_reconciler(state.agent.clone());
-    spawn_process_sweeper(state.engine.clone());
-    spawn_approval_sweeper(state.engine.clone());
-    spawn_orchestration_controller(state.engine.clone());
 
-    let listener = TcpListener::bind(("127.0.0.1", args.port.unwrap_or(0))).await?;
+    // Bind (and publish discovery) before any schedulers, sweepers, or
+    // auto-resume can start durable work. A port bind failure must not spend
+    // tokens or mutate session state.
+    let listener = match TcpListener::bind(("127.0.0.1", port.unwrap_or(0))).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            // A stale discovery file from a crashed daemon must not keep
+            // pointing clients at a port this process does not serve.
+            remove_discovery(&data_dir);
+            return Err(error).with_context(|| format!("binding 127.0.0.1:{}", port.unwrap_or(0)));
+        }
+    };
     let addr = listener.local_addr()?;
     let discovery = Discovery {
         pid: state.pid,
@@ -200,7 +186,12 @@ async fn run() -> Result<()> {
         version: APP_VERSION.to_string(),
         started_at: started_at.clone(),
     };
-    write_discovery(&data_dir, &discovery)?;
+    if let Err(error) = write_discovery(&data_dir, &discovery) {
+        remove_discovery(&data_dir);
+        return Err(error);
+    }
+
+    start_background_work(&state).await;
 
     let app = Router::new()
         .route("/health", get(health))
@@ -228,4 +219,44 @@ async fn run() -> Result<()> {
     remove_discovery(&data_dir);
     result?;
     Ok(())
+}
+
+/// Durable background work. It runs only after the listener is bound and
+/// discovery is published, so a startup failure cannot start scheduler work.
+async fn start_background_work(state: &AppState) {
+    match state.agent.resume_queued_sessions().await {
+        Ok(0) => {}
+        Ok(started) => tracing::info!(started, "re-enqueued persisted queued sessions"),
+        Err(error) => tracing::warn!(%error, "failed to re-enqueue queued sessions"),
+    }
+    match state.agent.auto_resume_interrupted_runs().await {
+        Ok(0) => {}
+        Ok(started) => tracing::info!(started, "auto-resumed interrupted durable runs"),
+        Err(error) => tracing::warn!(%error, "failed to auto-resume interrupted durable runs"),
+    }
+    state.agent.start_auto_resolver();
+    state.agent.start_task_scheduler();
+    state.agent.start_scaling_controller();
+    spawn_worktree_sweeper(state.engine.clone());
+    spawn_checkpoint_sweeper(state.engine.clone());
+    spawn_tool_output_sweeper(state.engine.clone());
+    spawn_memory_sweeper(state.engine.clone());
+    spawn_memory_stale_sweeper(state.engine.clone());
+    spawn_memory_conflict_scanner(state.engine.clone());
+    spawn_memory_embedding_reconciler(state.engine.clone());
+    spawn_source_embedding_reconciler(state.engine.clone());
+    spawn_terminal_sweeper(state.engine.clone());
+    spawn_browser_sweeper(state.engine.clone());
+    spawn_computer_sweeper(state.engine.clone());
+    spawn_gui_grace_sweeper(state.engine.clone());
+    spawn_gui_timeline_retention_sweeper(state.engine.clone());
+    spawn_task_stall_sweeper(state.engine.clone());
+    spawn_effect_sweeper(state.engine.clone());
+    spawn_gate_sweeper(state.engine.clone());
+    spawn_coordination_sweeper(state.engine.clone());
+    spawn_stall_recovery_reconciler(state.agent.clone());
+    spawn_process_sweeper(state.engine.clone());
+    spawn_approval_sweeper(state.engine.clone());
+    spawn_runtime_lease_sweeper(state.engine.clone());
+    spawn_orchestration_controller(state.engine.clone());
 }

@@ -137,6 +137,44 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Exact existing project source URIs for a bounded candidate list.
+    /// `list_sources` is newest-first and capped at 1,000 rows, so using it to
+    /// build an import dedupe set silently misses older sources. This lookup
+    /// checks only the URIs about to be imported and cannot miss a match due to
+    /// a recency window. The caller's list is already bounded (import scans at
+    /// most 500 files); batches keep the SQL parameter count well below
+    /// SQLite's variable limit.
+    pub fn existing_source_uris(
+        &self,
+        project_id: &str,
+        uris: &[String],
+    ) -> Result<std::collections::HashSet<String>> {
+        let mut found = std::collections::HashSet::new();
+        if uris.is_empty() {
+            return Ok(found);
+        }
+        let conn = self.lock()?;
+        for batch in uris.chunks(400) {
+            let placeholders = vec!["?"; batch.len()].join(", ");
+            let mut statement = conn.prepare(&format!(
+                "SELECT DISTINCT uri FROM sources
+                 WHERE project_id = ?1 AND uri IN ({placeholders})"
+            ))?;
+            let mut values = Vec::with_capacity(batch.len() + 1);
+            values.push(project_id.to_string());
+            values.extend(batch.iter().cloned());
+            let rows = statement.query_map(rusqlite::params_from_iter(values), |row| {
+                row.get::<_, Option<String>>(0)
+            })?;
+            for row in rows {
+                if let Some(uri) = row? {
+                    found.insert(uri);
+                }
+            }
+        }
+        Ok(found)
+    }
+
     pub fn source_chunks(
         &self,
         source_id: &str,
@@ -338,5 +376,64 @@ impl Store {
         drop(conn);
         self.get_source(&source.id)?
             .ok_or_else(|| anyhow!("source disappeared after metadata update"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn source(project_id: &str, index: usize) -> Source {
+        let now = now_rfc3339();
+        Source {
+            id: format!("source-{index:04}"),
+            project_id: project_id.to_string(),
+            kind: "file".to_string(),
+            collection: None,
+            title: format!("doc-{index:04}.md"),
+            uri: Some(format!("docs/doc-{index:04}.md")),
+            mime_type: Some("text/markdown".to_string()),
+            status: "indexed".to_string(),
+            size_bytes: 1,
+            sha256: "a".repeat(64),
+            revision: 1,
+            chunk_count: 0,
+            char_count: 1,
+            token_count: 1,
+            error: None,
+            labels: Vec::new(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            indexed_at: Some(now),
+        }
+    }
+
+    #[test]
+    fn existing_source_uri_lookup_cannot_miss_older_rows() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("sources"))
+            .unwrap();
+        for index in 0..1_001 {
+            store
+                .insert_source(&source(&project.id, index), &[])
+                .unwrap();
+        }
+        let found = store
+            .existing_source_uris(
+                &project.id,
+                &[
+                    "docs/doc-0000.md".to_string(),
+                    "docs/doc-1000.md".to_string(),
+                    "docs/missing.md".to_string(),
+                ],
+            )
+            .unwrap();
+        assert!(found.contains("docs/doc-0000.md"));
+        assert!(found.contains("docs/doc-1000.md"));
+        assert!(!found.contains("docs/missing.md"));
     }
 }

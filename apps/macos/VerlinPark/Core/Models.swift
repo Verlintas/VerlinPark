@@ -7587,6 +7587,9 @@ struct AppNotice: Codable, Identifiable, Hashable, Sendable {
     let detail: String
     let createdAt: String
     var isRead: Bool
+    /// Approval risk captured at notice creation. Missing means the notice
+    /// predates risk-aware notifications and requires in-app review.
+    var approvalRisk: String? = nil
 }
 
 struct SessionDirectoryEntry: Hashable, Sendable {

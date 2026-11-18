@@ -970,8 +970,13 @@ impl Engine {
             let cost_budget = source.cost_budget_usd;
             let time_budget = source.time_budget_secs;
             let priority = source.priority;
+            let fork_payload = serde_json::json!({
+                "forked_from_session_id": source.id,
+                "forked_from_checkpoint_id": checkpoint.id,
+                "forked_from_commit": checkpoint.commit,
+            });
             tokio::task::spawn_blocking(move || {
-                store.create_session_with_worktree(
+                store.create_session_with_worktree_and_event_payload(
                     &session_id,
                     &project_id,
                     &goal,
@@ -983,38 +988,20 @@ impl Engine {
                     source.unlimited,
                     &base_commit,
                     priority,
+                    Some(fork_payload),
                 )
             })
             .await?
         };
-        let new_session = match new_session {
+        let (new_session, created_event) = match new_session {
             Ok(session) => session,
             Err(error) => {
                 worktree::remove(&PathBuf::from(&project.root), &worktree.path, &branch);
                 return Err(error);
             }
         };
+        let _ = self.events.send(created_event);
 
-        let created = serde_json::json!({
-            "goal": new_session.goal,
-            "project_id": new_session.project_id,
-            "worktree": new_session.worktree,
-            "branch": new_session.branch,
-            "priority": new_session.priority,
-            "token_budget": new_session.token_budget,
-            "cost_budget_usd": new_session.cost_budget_usd,
-            "time_budget_secs": new_session.time_budget_secs,
-            "unlimited": new_session.unlimited,
-            "budget_mode": if new_session.unlimited { "unlimited" } else { "limited" },
-            "base_commit": new_session.base_commit,
-            "prompt_layout": new_session.prompt_layout,
-            "created_at": new_session.created_at,
-            "forked_from_session_id": source.id,
-            "forked_from_checkpoint_id": checkpoint.id,
-            "forked_from_commit": checkpoint.commit,
-        });
-        self.append_event(&new_session.id, "session.created", created)
-            .await?;
         let source_leader = self
             .list_agents(source_session_id)
             .await?

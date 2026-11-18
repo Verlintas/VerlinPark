@@ -70,6 +70,8 @@ struct ContextCheckpointSection: View {
 
     @Environment(AppModel.self) private var model
     let style: Style
+    @State private var pruneSessionID: String?
+    @State private var showingPrune = false
 
     private var sessionStatus: String {
         model.selectedSession?.status ?? "draft"
@@ -105,6 +107,26 @@ struct ContextCheckpointSection: View {
                     .lineLimit(2)
             }
         }
+        .confirmationDialog(
+            "Prune context checkpoints?",
+            isPresented: $showingPrune
+        ) {
+            Button("Prune older checkpoints", role: .destructive) {
+                let target = pruneSessionID
+                pruneSessionID = nil
+                guard let target else { return }
+                Task {
+                    await model.pruneContextCheckpoints(sessionID: target, keepLatest: 1)
+                }
+            }
+            Button("Cancel", role: .cancel) {
+                pruneSessionID = nil
+            }
+        } message: {
+            Text(
+                "Keeps the latest active context checkpoint and removes the older ones for this session. This cannot be undone."
+            )
+        }
     }
 
     private var header: some View {
@@ -129,11 +151,14 @@ struct ContextCheckpointSection: View {
             .help("Capture the active summary boundary without running a prompt")
             if style == .dashboard, sorted.count > 1 {
                 Button("Prune") {
-                    Task { await model.pruneContextCheckpoints(keepLatest: 1) }
+                    guard let sessionID = model.selectedSessionID else { return }
+                    // Capture the intended session before the confirmation.
+                    pruneSessionID = sessionID
+                    showingPrune = true
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .disabled(model.contextCheckpointBusy)
+                .disabled(model.contextCheckpointBusy || model.selectedSessionID == nil)
                 .help("Prune older checkpoints; the latest active checkpoint is protected")
             }
         }

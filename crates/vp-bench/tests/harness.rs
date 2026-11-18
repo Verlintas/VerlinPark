@@ -313,6 +313,13 @@ async fn cli_run_report_and_compare_are_consistent() {
     let mut changed: serde_json::Value =
         serde_json::from_slice(&fs::read(&json_path).unwrap()).unwrap();
     changed["provider"]["model"] = serde_json::json!("different-model");
+    for run in changed["runs"].as_array_mut().unwrap() {
+        run["provider"]["model"] = serde_json::json!("different-model");
+        run["comparison"]["model"] = serde_json::json!("different-model");
+    }
+    for scenario in changed["scenarios"].as_array_mut().unwrap() {
+        scenario["comparison"]["model"] = serde_json::json!("different-model");
+    }
     let changed_path = dir.path().join("changed.json");
     fs::write(&changed_path, serde_json::to_vec_pretty(&changed).unwrap()).unwrap();
     let refused = execute(

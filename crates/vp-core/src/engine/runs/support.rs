@@ -107,19 +107,36 @@ impl Engine {
     }
 
     /// Reconstruct task-DAG rows from the active plan event and the plan
-    /// lifecycle events after it. Timestamps are derived from event times;
-    /// `same_expected_task` deliberately compares only durable scheduling state
-    /// so a live claim/finish timestamp cannot create false drift.
+    /// lifecycle events after it. The active plan is the latest submitted or
+    /// revised plan; the task-event window keeps the latest **submitted**
+    /// sequence, matching `Store::sync_plan_tasks` (a revision replaces the
+    /// plan body but does not move `plan_seq`). Timestamps are derived from
+    /// event times; `same_expected_task` deliberately compares only durable
+    /// scheduling state so a live claim/finish timestamp cannot create false
+    /// drift.
     pub(super) fn expected_tasks(data: &ReplayData) -> Option<Vec<ScheduledTask>> {
-        let plan_event = data
+        let plan_event = data.events.iter().rev().find(|event| {
+            matches!(
+                event.kind.as_str(),
+                "team_plan.submitted" | "team_plan.revised"
+            )
+        });
+        let submitted_event = data
             .events
             .iter()
             .rev()
             .find(|event| event.kind == "team_plan.submitted");
         let (plan_seq, plan, enqueued_at) = match plan_event {
             Some(event) => {
-                let plan = serde_json::from_value::<TeamPlan>(event.payload.clone()).ok()?;
-                (event.seq, plan, event.created_at.clone())
+                // Revisions wrap the plan in `{plan, revision, ...}`; submitted
+                // events carry the plan fields at the top level. Both resolve
+                // through the same helper so replay/repair never compare the
+                // revision envelope to the stored bare plan.
+                let plan = crate::orchestration::plan::plan_from_event(event)?;
+                let (plan_seq, enqueued_at) = submitted_event
+                    .map(|event| (event.seq, event.created_at.clone()))
+                    .unwrap_or_else(|| (0, data.session.created_at.clone()));
+                (plan_seq, plan, enqueued_at)
             }
             None => {
                 let Some(plan) = data
@@ -200,6 +217,7 @@ impl Engine {
                     }
                     task.attempts = task.attempts.saturating_add(1);
                     task.started_at = Some(event.created_at.clone());
+                    task.next_attempt_at = None;
                 }
                 "plan_task.finished" => {
                     let status = event.payload["task_status"]
@@ -246,6 +264,7 @@ impl Engine {
                     task.status = "blocked".to_string();
                     task.finished_at = None;
                     task.last_error = event.payload["reason"].as_str().map(str::to_string);
+                    task.next_attempt_at = None;
                 }
                 "plan_task.unblocked" => {
                     task.status = "pending".to_string();
@@ -257,6 +276,7 @@ impl Engine {
                     task.status = "cancelled".to_string();
                     task.finished_at = Some(event.created_at.clone());
                     task.last_error = event.payload["reason"].as_str().map(str::to_string);
+                    task.next_attempt_at = None;
                 }
                 "plan_task.cancelling" => {
                     task.status = "cancelling".to_string();
@@ -299,6 +319,139 @@ impl Engine {
             && left.write_scope == right.write_scope
             && left.attempts == right.attempts
             && left.enqueued_at == right.enqueued_at
+            && left.next_attempt_at == right.next_attempt_at
+    }
+
+    /// Reconstruct the merge-queue projection from its own mutation events.
+    /// Only `merge_queue.enqueued` / `merge_queue.updated` carry queue rows;
+    /// unrelated payloads with an `entry` object (for example
+    /// `test_cache.stored`) must never be folded into this projection.
+    pub(super) fn expected_merge_queue(data: &ReplayData) -> Option<Vec<MergeQueueEntry>> {
+        let mut entries = HashMap::<String, MergeQueueEntry>::new();
+        for event in data.events.iter().filter(|event| {
+            matches!(
+                event.kind.as_str(),
+                "merge_queue.enqueued" | "merge_queue.updated"
+            )
+        }) {
+            let entry =
+                serde_json::from_value::<MergeQueueEntry>(event.payload.get("entry")?.clone())
+                    .ok()?;
+            entries.insert(entry.id.clone(), entry);
+        }
+        let mut entries = entries.into_values().collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Some(entries)
+    }
+
+    /// Compare the durable merge-queue fields that determine what the
+    /// Integrator merges and whether verification was recorded.
+    /// `pre_merge_commit` is an operational rollback target and is deliberately
+    /// not reconstructed by repair, so it is excluded.
+    pub(super) fn same_merge_queue_entry(left: &MergeQueueEntry, right: &MergeQueueEntry) -> bool {
+        left.id == right.id
+            && left.session_id == right.session_id
+            && left.agent_id == right.agent_id
+            && left.agent_name == right.agent_name
+            && left.task_id == right.task_id
+            && left.branch == right.branch
+            && left.commit == right.commit
+            && left.base_commit == right.base_commit
+            && left.status == right.status
+            && left.attempt == right.attempt
+            && left.detail == right.detail
+            && left.source == right.source
+            && left.remote_host == right.remote_host
+            && left.remote_branch == right.remote_branch
+            && left.bundle_sha256 == right.bundle_sha256
+            && left.imported_ref == right.imported_ref
+            && left.verifier_approved == right.verifier_approved
+            && left.verifier_summary == right.verifier_summary
+            && left.environment_caveat == right.environment_caveat
+            && left.remote_test_evidence_id == right.remote_test_evidence_id
+            && left.remote_test_digest == right.remote_test_digest
+            && left.remote_test_status == right.remote_test_status
+            && left.created_at == right.created_at
+            && left.updated_at == right.updated_at
+    }
+
+    /// Event-derived contract rows. `contract.derived` payloads carry the
+    /// hashed contract; a malformed payload returns `None` so repair fails
+    /// closed instead of inventing a row.
+    pub(super) fn expected_contract_rows(data: &ReplayData) -> Option<Vec<StoredContractRow>> {
+        Self::contract_rows_from_events(&data.events)
+    }
+
+    pub(super) fn contract_rows_from_events(events: &[Event]) -> Option<Vec<StoredContractRow>> {
+        let contracts = crate::contract::contracts_from_events(events)?;
+        Some(
+            contracts
+                .iter()
+                .map(|contract| StoredContractRow {
+                    contract_id: contract.contract_id.clone(),
+                    project_id: contract.project_id.clone(),
+                    session_id: contract.session_id.clone(),
+                    task_id: contract.task_id.clone(),
+                    plan_revision: contract.plan_revision,
+                    role: contract.role.clone(),
+                    hash: contract.hash.clone(),
+                    source_hash: contract.source_hash.clone(),
+                    contract: serde_json::to_string(contract).unwrap_or_default(),
+                    created_at: contract.created_at.clone(),
+                })
+                .collect(),
+        )
+    }
+
+    /// Event-derived mutation usage rows. The ledger only tracks counts; the
+    /// projection timestamp is repair-local and never compared by replay.
+    pub(super) fn expected_contract_usage_rows(data: &ReplayData) -> Option<Vec<ContractUsageRow>> {
+        Self::contract_usage_rows_from_events(
+            &data.events,
+            &data.session.project_id,
+            &data.session.id,
+        )
+    }
+
+    pub(super) fn contract_usage_rows_from_events(
+        events: &[Event],
+        project_id: &str,
+        session_id: &str,
+    ) -> Option<Vec<ContractUsageRow>> {
+        let usage = crate::contract::usage_from_events(events)?;
+        Some(
+            usage
+                .into_iter()
+                .map(|(contract_id, usage)| ContractUsageRow {
+                    contract_id,
+                    project_id: project_id.to_string(),
+                    session_id: session_id.to_string(),
+                    task_id: None,
+                    writes: usage.writes,
+                    bytes: usage.bytes,
+                    commits: usage.commits,
+                    updated_at: vp_protocol::now_rfc3339(),
+                })
+                .collect(),
+        )
+    }
+
+    /// A lost C4 runtime pin is projection drift even though `runs_match`
+    /// (owned by the run journal) compares the rest of the durable run row.
+    pub(super) fn runs_runtime_pins_match(
+        projected: &[vp_protocol::types::SessionRun],
+        expected: &[vp_protocol::types::SessionRun],
+    ) -> bool {
+        expected.iter().all(|expected| {
+            projected
+                .iter()
+                .find(|run| run.run_id == expected.run_id)
+                .is_some_and(|run| run.runtime_snapshot == expected.runtime_snapshot)
+        })
     }
 
     pub(super) fn expected_approvals(data: &ReplayData) -> Vec<Approval> {
@@ -694,9 +847,14 @@ impl Engine {
     pub(super) fn expected_remote_test_evidence(
         data: &ReplayData,
     ) -> Option<Vec<RemoteTestEvidence>> {
+        Self::remote_test_evidence_from_events(&data.events)
+    }
+
+    pub(super) fn remote_test_evidence_from_events(
+        events: &[Event],
+    ) -> Option<Vec<RemoteTestEvidence>> {
         let mut rows = Vec::new();
-        for event in data
-            .events
+        for event in events
             .iter()
             .filter(|event| event.kind == "remote_test.completed")
         {
@@ -716,12 +874,12 @@ impl Engine {
     }
 
     pub(super) fn expected_progress(data: &ReplayData) -> Option<Vec<(u64, ProgressRound)>> {
+        Self::progress_from_events(&data.events)
+    }
+
+    pub(super) fn progress_from_events(events: &[Event]) -> Option<Vec<(u64, ProgressRound)>> {
         let mut items: Vec<(u64, ProgressRound)> = Vec::new();
-        for event in data
-            .events
-            .iter()
-            .filter(|event| event.kind == "progress.round")
-        {
+        for event in events.iter().filter(|event| event.kind == "progress.round") {
             let plan_revision = event
                 .payload
                 .get("plan_revision")

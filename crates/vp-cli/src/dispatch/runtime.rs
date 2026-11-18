@@ -172,21 +172,38 @@ pub(super) async fn dispatch(
             project,
             network,
             read_deny,
+            replace_read_deny,
+            clear_read_deny,
             restrict_home,
+            no_restrict_home,
             read_jail,
+            no_read_jail,
         } => {
+            let current = rpc(
+                &discovery,
+                "project.shell_policy.get",
+                json!({"project_id": project}),
+            )
+            .await?;
+            let current_policy = current
+                .get("policy")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("shell policy get returned no policy"))?;
+            let policy = merge_shell_policy(
+                current_policy,
+                network,
+                read_deny,
+                replace_read_deny,
+                clear_read_deny,
+                restrict_home,
+                no_restrict_home,
+                read_jail,
+                no_read_jail,
+            )?;
             rpc(
                 &discovery,
                 "project.shell_policy.set",
-                json!({
-                    "project_id": project,
-                    "policy": {
-                        "network": network,
-                        "read_deny": read_deny,
-                        "restrict_home": restrict_home,
-                        "read_jail": read_jail,
-                    }
-                }),
+                json!({"project_id": project, "policy": policy}),
             )
             .await?
         }
@@ -351,7 +368,15 @@ pub(super) async fn dispatch(
             process,
             signal,
             grace_secs,
+            yes,
         } => {
+            let confirmed = yes
+                || confirm_cli_action(&format!(
+                    "Stop supervised process {process} ({signal}, {grace_secs}s grace)?"
+                ))?;
+            if !confirmed {
+                bail!("process stop requires explicit confirmation (pass --yes)");
+            }
             rpc(
                 &discovery,
                 "session.process.stop",
@@ -364,7 +389,18 @@ pub(super) async fn dispatch(
             )
             .await?
         }
-        Command::Preempt { session, reason } => {
+        Command::Preempt {
+            session,
+            reason,
+            yes,
+        } => {
+            let confirmed = yes
+                || confirm_cli_action(&format!(
+                    "Hard-preempt the running agent for session {session}?"
+                ))?;
+            if !confirmed {
+                bail!("preempt requires explicit confirmation (pass --yes)");
+            }
             rpc(
                 &discovery,
                 "session.preempt",
@@ -398,6 +434,7 @@ pub(super) async fn dispatch(
         }
         Command::PreemptionPolicySet {
             project,
+            enabled,
             disabled,
             provider_grace_ms,
             tool_grace_ms,
@@ -406,17 +443,23 @@ pub(super) async fn dispatch(
             clear_tool_deadline,
             no_checkpoint,
         } => {
+            let enabled = resolve_optional_switch(enabled, disabled, "--enabled", "--disabled")?;
             let current = rpc(
                 &discovery,
                 "project.preemption_policy.get",
                 json!({"project_id": project}),
             )
             .await?;
-            let mut policy = current.get("policy").cloned().unwrap_or_else(|| json!({}));
+            let mut policy = current
+                .get("policy")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("preemption policy get returned no policy"))?;
             let object = policy
                 .as_object_mut()
                 .ok_or_else(|| anyhow::anyhow!("preemption policy result is not an object"))?;
-            object.insert("enabled".into(), json!(!disabled));
+            if let Some(enabled) = enabled {
+                object.insert("enabled".into(), json!(enabled));
+            }
             if let Some(value) = provider_grace_ms {
                 object.insert("provider_grace_ms".into(), json!(value));
             }

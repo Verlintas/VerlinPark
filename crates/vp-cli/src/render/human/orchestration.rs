@@ -359,13 +359,6 @@ pub(super) fn print(value: &Value) -> bool {
         }
         return true;
     }
-    if value.get("removed").is_some() {
-        println!(
-            "Removed {} expired runtime lease(s).",
-            value["removed"].as_u64().unwrap_or(0)
-        );
-        return true;
-    }
     if let Some(hits) = value.get("hits").and_then(Value::as_array)
         && value.get("query").is_some()
     {

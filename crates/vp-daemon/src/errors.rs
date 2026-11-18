@@ -1,8 +1,239 @@
 use serde_json::{Value, json};
 use vp_protocol::rpc::{RpcError, RpcResponse, codes};
+use vp_protocol::types::Session;
 
 pub(crate) fn internal_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
     RpcResponse::error(id, RpcError::new(codes::INTERNAL_ERROR, error.to_string()))
+}
+
+fn bounded_message(message: String) -> String {
+    const MAX_ERROR_CHARS: usize = 2_000;
+    if message.chars().count() <= MAX_ERROR_CHARS {
+        return message;
+    }
+    let mut bounded = message.chars().take(MAX_ERROR_CHARS).collect::<String>();
+    bounded.push('…');
+    bounded
+}
+
+fn typed_client_error(
+    id: Option<Value>,
+    rpc_code: i32,
+    code: &str,
+    message: String,
+    retryable: bool,
+    hint: &str,
+) -> RpcResponse {
+    RpcResponse::error(
+        id,
+        RpcError::with_data(
+            rpc_code,
+            bounded_message(message),
+            json!({
+                "code": code,
+                "retryable": retryable,
+                "hint": hint,
+            }),
+        ),
+    )
+}
+
+/// Session operation receipts (`session.prompt`, `session.steer`,
+/// `session.defer`, `session.run.resume`) distinguish four outcomes that a
+/// retry policy must be able to tell apart.
+///
+/// `vp-core::operation` currently returns plain `anyhow` messages for them and
+/// does not expose the marker type, so this mapper recognizes the four exact,
+/// stable sentences. Nothing else is classified here: an unrelated store or IO
+/// failure still maps to `INTERNAL_ERROR`.
+pub(crate) fn operation_receipt_error(
+    id: Option<Value>,
+    error: &anyhow::Error,
+) -> Option<RpcResponse> {
+    let message = format!("{error:#}");
+    let lowered = message.to_ascii_lowercase();
+    if lowered.contains("is already in progress for session") {
+        return Some(typed_client_error(
+            id,
+            codes::CONFLICT,
+            "OPERATION_IN_PROGRESS",
+            message,
+            true,
+            "the same operation_id is still running; wait for it to finish instead of retrying",
+        ));
+    }
+    if lowered.contains("was already used for session") {
+        return Some(typed_client_error(
+            id,
+            codes::CONFLICT,
+            "OPERATION_CONFLICT",
+            message,
+            false,
+            "the operation_id is already bound to a different method or payload; use a new id",
+        ));
+    }
+    if lowered.contains("has an unknown outcome after a daemon restart") {
+        return Some(typed_client_error(
+            id,
+            codes::CONFLICT,
+            "OPERATION_UNKNOWN",
+            message,
+            false,
+            "the previous attempt may have run; inspect the session transcript before retrying",
+        ));
+    }
+    if lowered.contains("operation_id must be 1-")
+        || lowered.contains("operation_id must not contain control characters")
+    {
+        return Some(typed_client_error(
+            id,
+            codes::INVALID_PARAMS,
+            "INVALID_OPERATION_ID",
+            message,
+            false,
+            "operation_id must be 1-200 non-blank characters without control characters",
+        ));
+    }
+    None
+}
+
+/// Engine setters still report client-shaped validation failures as plain
+/// messages. This maps only the bounded, stable sentences that the engine uses
+/// for input that the caller can fix; everything else stays an internal error.
+pub(crate) fn validation_error(id: Option<Value>, error: &anyhow::Error) -> Option<RpcResponse> {
+    let message = format!("{error:#}");
+    let lowered = message.to_ascii_lowercase();
+    let (rpc_code, code, retryable, hint) = if lowered.contains("project not found") {
+        (
+            codes::NOT_FOUND,
+            "PROJECT_NOT_FOUND",
+            false,
+            "create or select an existing project before retrying",
+        )
+    } else if lowered.contains("session priority must be between -100 and 100") {
+        (
+            codes::INVALID_PARAMS,
+            "SESSION_PRIORITY_INVALID",
+            false,
+            "priority must be between -100 and 100",
+        )
+    } else if lowered.contains("an unlimited session cannot also declare") {
+        (
+            codes::INVALID_PARAMS,
+            "SESSION_UNLIMITED_CONFLICT",
+            false,
+            "an unlimited session cannot also declare token, cost, or time budgets",
+        )
+    } else if lowered.contains("project token budget must be greater than zero") {
+        (
+            codes::INVALID_PARAMS,
+            "PROJECT_TOKEN_BUDGET_INVALID",
+            false,
+            "token_budget must be greater than zero; omit it to clear the project budget",
+        )
+    } else if lowered.contains("project cost budget must be a positive finite number") {
+        (
+            codes::INVALID_PARAMS,
+            "PROJECT_COST_BUDGET_INVALID",
+            false,
+            "cost_budget_usd must be a positive finite number",
+        )
+    } else if lowered.contains("token budget must be greater than zero") {
+        (
+            codes::INVALID_PARAMS,
+            "SESSION_TOKEN_BUDGET_INVALID",
+            false,
+            "token_budget must be greater than zero; omit it for the project default",
+        )
+    } else if lowered.contains("cost budget must be a positive finite number") {
+        (
+            codes::INVALID_PARAMS,
+            "SESSION_COST_BUDGET_INVALID",
+            false,
+            "cost_budget_usd must be a positive finite number",
+        )
+    } else if lowered.contains("time budget must be greater than zero") {
+        (
+            codes::INVALID_PARAMS,
+            "SESSION_TIME_BUDGET_INVALID",
+            false,
+            "time_budget_secs must be greater than zero",
+        )
+    } else if lowered.contains("invalid critical-path policy") {
+        (
+            codes::INVALID_PARAMS,
+            "POLICY_INVALID",
+            false,
+            "fix the policy ranges reported in the message and retry",
+        )
+    } else if lowered.starts_with("gui ") || lowered.contains(": gui ") {
+        (
+            codes::INVALID_PARAMS,
+            "GUI_POLICY_INVALID",
+            false,
+            "fix the GUI policy ranges reported in the message and retry",
+        )
+    } else {
+        return None;
+    };
+    Some(typed_client_error(
+        id, rpc_code, code, message, retryable, hint,
+    ))
+}
+
+/// Idempotent-operation errors first, then bounded validation failures, then
+/// the ordinary internal error. Used by RPC arms that accept an
+/// `operation_id`.
+pub(crate) fn operation_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
+    if let Some(response) = operation_receipt_error(id.clone(), &error) {
+        return response;
+    }
+    if let Some(response) = validation_error(id.clone(), &error) {
+        return response;
+    }
+    internal_error(id, error)
+}
+
+/// A typed `INVALID_PARAMS` for a bounded engine validation failure; every
+/// other error keeps the ordinary `INTERNAL_ERROR` with no invented code.
+pub(crate) fn validation_or_internal(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
+    match validation_error(id.clone(), &error) {
+        Some(response) => response,
+        None => internal_error(id, error),
+    }
+}
+
+/// `session.create` is deliberately not transactional: the session row exists
+/// before the Leader agent is created and the first run starts. Returning a
+/// bare success would hide a failed start, so the RPC fails with a typed
+/// `SESSION_START_FAILED` payload that names the session that was created.
+pub(crate) fn session_start_error(
+    id: Option<Value>,
+    session: &Session,
+    phase: &str,
+    error: anyhow::Error,
+) -> RpcResponse {
+    let message = bounded_message(format!(
+        "session {} was created but {phase} failed: {error:#}",
+        session.id
+    ));
+    RpcResponse::error(
+        id,
+        RpcError::with_data(
+            codes::INTERNAL_ERROR,
+            message,
+            json!({
+                "code": "SESSION_START_FAILED",
+                "phase": phase,
+                "session_id": session.id,
+                "project_id": session.project_id,
+                "status": session.status,
+                "session_created": true,
+                "retryable": true,
+                "hint": "the session exists; do not create a duplicate — fix the provider/agent configuration, then retry session.prompt",
+            }),
+        ),
+    )
 }
 
 /// Map the stable identity error taxonomy to a bounded RPC failure. Message
@@ -202,7 +433,7 @@ pub(crate) fn runtime_pin_error(id: Option<Value>, error: anyhow::Error) -> RpcR
             RpcError::with_data(codes::INTERNAL_ERROR, pin.to_string(), pin.data()),
         );
     }
-    internal_error(id, error)
+    operation_error(id, error)
 }
 
 /// Diagnosis failures use the Q3 `{code,message,retryable,hint}` shape. They

@@ -272,6 +272,10 @@ struct PreviewPanelView: View {
     @State private var showingPR = false
     @State private var commitMessage = ""
     @State private var selectedDiffPath: String?
+    /// Captured when a confirmation is presented so a selection change can
+    /// never retarget discard/commit/land/PR at a different session.
+    @State private var pendingDialogSessionID: String?
+    @State private var pendingDialogGoal = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -358,26 +362,35 @@ struct PreviewPanelView: View {
             TextField("Message", text: $commitMessage)
             Button("Commit") {
                 let message = commitMessage
+                let target = pendingDialogSessionID
                 commitMessage = ""
-                Task { await model.commitSession(message: message) }
+                pendingDialogSessionID = nil
+                guard let target else { return }
+                Task { await model.commitSession(message: message, sessionID: target) }
             }
             Button("Cancel", role: .cancel) {
                 commitMessage = ""
+                pendingDialogSessionID = nil
             }
         } message: {
-            Text("Stages all changes in this session worktree and commits them on its branch.")
+            Text(
+                "Stages all changes in “\(pendingDialogGoal)” and commits them on its branch."
+            )
         }
         .confirmationDialog(
             "Discard uncommitted changes?",
             isPresented: $showingDiscard
         ) {
             Button("Discard changes", role: .destructive) {
-                Task { await model.discardChanges() }
+                let target = pendingDialogSessionID
+                pendingDialogSessionID = nil
+                guard let target else { return }
+                Task { await model.discardChanges(sessionID: target) }
             }
-            Button("Cancel", role: .cancel) {}
+            Button("Cancel", role: .cancel) { pendingDialogSessionID = nil }
         } message: {
             Text(
-                "This resets tracked files and removes untracked files in the session worktree. Commits are kept."
+                "This resets tracked files and removes untracked files in “\(pendingDialogGoal)”. Commits are kept."
             )
         }
         .confirmationDialog(
@@ -385,12 +398,15 @@ struct PreviewPanelView: View {
             isPresented: $showingPR
         ) {
             Button("Push branch & open PR") {
-                Task { await model.openPullRequest() }
+                let target = pendingDialogSessionID
+                pendingDialogSessionID = nil
+                guard let target else { return }
+                Task { await model.openPullRequest(sessionID: target) }
             }
-            Button("Cancel", role: .cancel) {}
+            Button("Cancel", role: .cancel) { pendingDialogSessionID = nil }
         } message: {
             Text(
-                "Pushes the session branch to origin and asks the configured forge provider to open a PR/MR. GitHub uses gh, GitLab uses glab, Gitea/Forgejo use tea, and Bitbucket Cloud uses its REST API with environment credentials. Preflight runs before the push; no merge is performed locally."
+                "Pushes “\(pendingDialogGoal)” to origin and asks the configured forge provider to open a PR/MR. GitHub uses gh, GitLab uses glab, Gitea/Forgejo use tea, and Bitbucket Cloud uses its REST API with environment credentials. Preflight runs before the push; no merge is performed locally."
             )
         }
         .confirmationDialog(
@@ -398,14 +414,22 @@ struct PreviewPanelView: View {
             isPresented: $showingLand
         ) {
             Button("Land into \(model.selectedProject?.defaultBranch ?? "the default branch")") {
-                Task { await model.landSession() }
+                let target = pendingDialogSessionID
+                pendingDialogSessionID = nil
+                guard let target else { return }
+                Task { await model.landSession(sessionID: target) }
             }
-            Button("Cancel", role: .cancel) {}
+            Button("Cancel", role: .cancel) { pendingDialogSessionID = nil }
         } message: {
             Text(
-                "The project checkout must be clean and checked out on its default branch. The session branch is merged with --no-ff; no push or PR is performed."
+                "Merges “\(pendingDialogGoal)” into the project default branch with --no-ff. The project checkout must be clean and checked out on its default branch; no push or PR is performed."
             )
         }
+    }
+
+    private func captureDialogTarget(_ session: Session) {
+        pendingDialogSessionID = session.id
+        pendingDialogGoal = session.goal
     }
 
     private var canCommit: Bool {
@@ -433,6 +457,7 @@ struct PreviewPanelView: View {
                 Spacer()
                 if mode == .changes, canCommit {
                     Button {
+                        captureDialogTarget(session)
                         showingDiscard = true
                     } label: {
                         Image(systemName: "trash")
@@ -443,6 +468,7 @@ struct PreviewPanelView: View {
                     .disabled(model.commitBusy)
                     Button("Commit") {
                         commitMessage = session.goal
+                        captureDialogTarget(session)
                         showingCommit = true
                     }
                     .buttonStyle(.borderedProminent)
@@ -450,12 +476,14 @@ struct PreviewPanelView: View {
                     .disabled(model.commitBusy)
                 } else if mode == .changes, canLand(session) {
                     Button("Open PR / MR") {
+                        captureDialogTarget(session)
                         showingPR = true
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     .disabled(model.pullRequestBusy)
                     Button("Land") {
+                        captureDialogTarget(session)
                         showingLand = true
                     }
                     .buttonStyle(.borderedProminent)

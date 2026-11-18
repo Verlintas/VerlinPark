@@ -183,16 +183,18 @@ impl TaskScheduler {
                 .iter()
                 .map(|row| (row.task_id.clone(), row.status.clone()))
                 .collect::<HashMap<_, _>>();
-            let completed = statuses
+            let satisfied = statuses
                 .iter()
-                .filter(|(_, status)| status.as_str() == "completed")
+                .filter(|(_, status)| {
+                    crate::orchestration::dependency_satisfied(Some(status.as_str()))
+                })
                 .map(|(task_id, _)| task_id.clone())
                 .collect::<HashSet<_>>();
             let now = OffsetDateTime::now_utc();
             let mut ready = rows
                 .into_iter()
                 .filter(|row| is_retryable_status(&row.status))
-                .filter(|row| row.deps.iter().all(|dep| completed.contains(dep)))
+                .filter(|row| row.deps.iter().all(|dep| satisfied.contains(dep)))
                 .filter(|row| {
                     row.next_attempt_at
                         .as_deref()
@@ -1048,6 +1050,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(queue.tasks[0].last_error.as_deref(), Some("tests failed"));
+    }
+
+    #[tokio::test]
+    async fn skipped_dependency_releases_downstream_task() {
+        let (_dir, store, _project, session) = store();
+        let scheduler = TaskScheduler::new_with_aging(store, Duration::ZERO);
+        let plan = plan(vec![task("a", 0, vec![]), task("b", 0, vec!["a"])]);
+        let (seq, _) = scheduler.sync_plan(&session, &plan).await.unwrap();
+        scheduler
+            .claim(&session.id, seq, &["a".into()])
+            .await
+            .unwrap();
+        scheduler
+            .finish(&session.id, seq, "a", "skipped", Some("not needed"))
+            .await
+            .unwrap();
+        let ready = scheduler
+            .ready_tasks(&session, seq, &plan, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            ready
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b"]
+        );
+        let (claimed, _) = scheduler
+            .claim(&session.id, seq, &["b".into()])
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].status, "running");
     }
 }
 

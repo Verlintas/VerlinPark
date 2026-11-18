@@ -271,20 +271,25 @@ pub(super) async fn handle(
             Err(response) => response_with_id(id, response),
         },
         "gui.policy.set" => match parse_params::<SetGuiPolicyParams>(request.params) {
-            Ok(params) => match state
-                .engine
-                .set_gui_policy(&params.project_id, params.policy)
-                .await
-            {
-                Ok(policy) => RpcResponse::success(
-                    id,
-                    GuiPolicyResult {
-                        project_id: params.project_id,
-                        policy,
-                    },
-                ),
-                Err(error) => internal_error(id, error),
-            },
+            Ok(params) => {
+                if let Err(message) = params.policy.validate() {
+                    return validation_or_internal(id, anyhow::anyhow!("{message}"));
+                }
+                match state
+                    .engine
+                    .set_gui_policy(&params.project_id, params.policy)
+                    .await
+                {
+                    Ok(policy) => RpcResponse::success(
+                        id,
+                        GuiPolicyResult {
+                            project_id: params.project_id,
+                            policy,
+                        },
+                    ),
+                    Err(error) => validation_or_internal(id, error),
+                }
+            }
             Err(response) => response_with_id(id, response),
         },
         _ => RpcResponse::error(

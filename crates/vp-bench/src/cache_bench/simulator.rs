@@ -34,7 +34,8 @@ pub const SIMULATOR_BLOCK_SIZE: u64 = 64;
 pub const OUTPUT_TOKENS_PER_TURN: u64 = 48;
 
 /// Positive long-prefix scenario plus two negative controls.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CacheBenchScenarioKind {
     /// Previous session primed the stable prefix; measured turns are append-only.
     #[default]
@@ -220,6 +221,13 @@ impl BlockHasher {
 /// The shape is synthetic but deterministic; it is not a claim about a vendor
 /// tokenizer.
 pub fn long_prefix_scenario(config: CacheBenchScenarioConfig) -> Result<CacheBenchScenario> {
+    if config.kind == CacheBenchScenarioKind::PrefixBreakControl
+        && config.initial_context_tokens == 0
+    {
+        bail!(
+            "prefix-break control needs a non-zero --initial-context-tokens value: with no early conversation tokens there is nothing to mutate and the control would report a false pass"
+        );
+    }
     let stable_tokens = synthetic_tokens(config.stable_prefix_tokens, 0xA11CE);
     let initial_tokens = synthetic_tokens(config.initial_context_tokens, 0xB0B);
     let mut turn_tokens = Vec::with_capacity(config.turns);
@@ -442,7 +450,17 @@ pub fn run_simulated_benchmark(
         previous_len = prompt.len();
         previous_hash = Some(token_prefix_hash(&prompt));
     }
+    if scenario.kind == CacheBenchScenarioKind::PrefixBreakControl && !prefix_break_injected {
+        bail!(
+            "prefix-break control did not inject a prefix break; refusing to record a control that proves nothing"
+        );
+    }
     let aggregate = aggregate_calls(&calls);
+    if scenario.kind == CacheBenchScenarioKind::PrefixBreakControl && aggregate.prefix_breaks == 0 {
+        bail!(
+            "prefix-break control did not produce an observed prefix break; refusing to record a false pass"
+        );
+    }
     let mut caveats = vec![
         "Simulator tokens are deterministic synthetic word tokens, not a vendor tokenizer; use live mode for provider-reported usage.".to_string(),
         "The stable prefix is primed once as a previous session with the same epoch. The warmup is excluded from measured calls and is reported as warmup_included=false.".to_string(),
@@ -477,6 +495,7 @@ pub fn run_simulated_benchmark(
     let mut report = CacheBenchReport {
         schema: CACHE_BENCH_SCHEMA.to_string(),
         scenario: scenario.name.to_string(),
+        scenario_kind: scenario.kind,
         mode: CacheBenchMode::Simulated,
         provider: "simulator".to_string(),
         model: "deepseek-prefix-sim".to_string(),
@@ -484,6 +503,7 @@ pub fn run_simulated_benchmark(
         turns: calls.len(),
         stable_prefix_tokens: scenario.stable_tokens.len() as u64,
         initial_context_tokens: scenario.initial_tokens.len() as u64,
+        prefix_break_injected,
         cross_session_warm,
         warmup_included: false,
         deterministic: true,
@@ -504,6 +524,7 @@ pub fn run_simulated_benchmark(
         },
     };
     report.acceptance = report.compute_acceptance();
+    report.validate()?;
     Ok(report)
 }
 

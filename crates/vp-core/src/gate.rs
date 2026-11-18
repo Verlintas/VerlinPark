@@ -325,6 +325,23 @@ impl Engine {
                 "the gate token does not authorize resolution",
             ));
         }
+        // Expiry is deadline-bound, not sweep-bound. A resolve that arrives
+        // after `expires_at` but before the periodic sweep must fail closed and
+        // move the gate to its terminal expired state (waking any waiter).
+        if existing.gate.is_open() && gate_is_expired(&existing.gate, OffsetDateTime::now_utc()) {
+            let store = self.store().clone();
+            let gate_id_owned = gate_id.to_string();
+            if let Ok(transition) = run_gate_store(move || store.expire_gate(&gate_id_owned)).await
+            {
+                for event in &transition.events {
+                    let _ = self.events.send(event.clone());
+                }
+            }
+            return Err(gate_error(
+                codes::GATE_EXPIRED,
+                format!("gate {gate_id} expired; resolve is closed"),
+            ));
+        }
         let note = normalize_note(note)?;
         let actor = normalize_actor(resolved_by)?;
         let expected_hash = token.hash();
@@ -537,7 +554,11 @@ impl Engine {
             let Some(session) = session else {
                 continue;
             };
-            if matches!(session.status.as_str(), "imported" | "landed") {
+            // Expiry is terminal and does not mutate session state, so a
+            // landed session's open gates must still expire. Imported archives
+            // are read-only and excluded; their frozen rows are archive
+            // evidence, not live waits.
+            if session.status == "imported" {
                 continue;
             }
             let store = self.store().clone();
@@ -685,6 +706,22 @@ fn map_store_gate_error(error: anyhow::Error) -> anyhow::Error {
         }
     }
     error
+}
+
+/// A gate whose RFC3339 deadline is at or before `now`. A malformed stored
+/// deadline fails closed (treated as expired) rather than becoming an immortal
+/// open gate.
+fn gate_is_expired(gate: &ExternalGate, now: OffsetDateTime) -> bool {
+    let Some(expires_at) = gate.expires_at.as_deref() else {
+        return false;
+    };
+    match OffsetDateTime::parse(
+        expires_at.trim(),
+        &time::format_description::well_known::Rfc3339,
+    ) {
+        Ok(deadline) => deadline <= now,
+        Err(_) => true,
+    }
 }
 
 fn resolve_gate_deadline(
@@ -1193,6 +1230,82 @@ mod engine_tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_after_deadline_expires_before_the_sweep() {
+        let fixture = fixture().await;
+        let token = "vpg_expired_gate";
+        let record = GateRecord {
+            gate: ExternalGate {
+                id: "g-expired".into(),
+                session_id: fixture.session_id.clone(),
+                kind: GateKind::Ci,
+                label: "late ci".into(),
+                state: GateState::Open,
+                expires_at: Some("2020-01-01T00:00:00Z".into()),
+                ..ExternalGate::default()
+            },
+            token_hash: hash_gate_token(token),
+        };
+        fixture
+            .engine
+            .store()
+            .create_gate_with_event(&record)
+            .unwrap();
+        let error = fixture
+            .engine
+            .resolve_gate(&record.gate.id, token, None, None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(code(&error), codes::GATE_EXPIRED);
+        let stored = fixture
+            .engine
+            .store()
+            .get_gate(&record.gate.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.gate.state,
+            GateState::Expired,
+            "a failed late resolve must still close the gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_expires_open_gates_on_landed_sessions() {
+        let fixture = fixture().await;
+        let record = GateRecord {
+            gate: ExternalGate {
+                id: "g-landed".into(),
+                session_id: fixture.session_id.clone(),
+                kind: GateKind::Deploy,
+                label: "landed deploy".into(),
+                state: GateState::Open,
+                expires_at: Some("2020-01-01T00:00:00Z".into()),
+                ..ExternalGate::default()
+            },
+            token_hash: "c".repeat(64),
+        };
+        fixture
+            .engine
+            .store()
+            .create_gate_with_event(&record)
+            .unwrap();
+        fixture
+            .engine
+            .store()
+            .update_session_status(&fixture.session_id, "landed")
+            .unwrap();
+        let changed = fixture.engine.sweep_expired_gates(10).await.unwrap();
+        assert_eq!(changed, 1);
+        let stored = fixture
+            .engine
+            .store()
+            .get_gate(&record.gate.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.gate.state, GateState::Expired);
     }
 
     #[tokio::test]

@@ -794,8 +794,8 @@ pub fn list_team_template_events_for_project(
     limit: Option<usize>,
 ) -> Result<Vec<TeamTemplateEvent>> {
     let limit = limit
-        .unwrap_or(TEAM_TEMPLATE_MAX_EVENTS)
-        .min(TEAM_TEMPLATE_MAX_EVENTS) as i64;
+        .map(|value| value.min(TEAM_TEMPLATE_MAX_EVENTS) as i64)
+        .unwrap_or(-1);
     let conn = store.lock()?;
     let mut statement = conn.prepare(
         "SELECT id, project_id, seq, kind, template_id, name, version, content_hash, payload,

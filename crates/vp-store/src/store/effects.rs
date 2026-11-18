@@ -161,17 +161,17 @@ impl Store {
         stored.resolved_at = Some(now.clone());
         // A live completion may replace the sweep's synthetic `unknown` with
         // the real probe result. Genuine unknown receipts stay terminal and
-        // still require explicit reconciliation.
+        // still require explicit reconciliation. The sweep marker is a
+        // dedicated column, never a substring of free-form evidence.
         let changed = tx.execute(
             "UPDATE effect_receipts
              SET state = ?2, provider_key = COALESCE(?3, provider_key),
                  external_id = COALESCE(?4, external_id),
                  response_hash = COALESCE(?5, response_hash),
-                 evidence_json = ?6, resolved_at = ?7
+                 evidence_json = ?6, resolved_at = ?7, settled_by_sweep = 0
              WHERE id = ?1
                AND (state = 'intent'
-                    OR (state = 'unknown'
-                        AND instr(evidence_json, 'stale_intent_sweep') > 0))",
+                    OR (state = 'unknown' AND settled_by_sweep = 1))",
             params![
                 stored.id,
                 stored.state.as_str(),
@@ -442,7 +442,8 @@ impl Store {
             };
             tx.execute(
                 "UPDATE effect_receipts
-                 SET state = 'unknown', evidence_json = ?2, resolved_at = ?3
+                 SET state = 'unknown', evidence_json = ?2, resolved_at = ?3,
+                     settled_by_sweep = 1
                  WHERE id = ?1 AND state = 'intent'",
                 params![
                     stored.id,

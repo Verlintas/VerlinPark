@@ -13,6 +13,12 @@ pub(crate) struct Cli {
     /// Override the daemon data directory (must match the daemon's data dir).
     #[arg(long, global = true)]
     pub(crate) data_dir: Option<PathBuf>,
+    /// Bound every daemon RPC request (1-3600 seconds).
+    #[arg(long, global = true, value_name = "SECS", default_value_t = 300)]
+    pub(crate) rpc_timeout_secs: u64,
+    /// Bound the TCP/TLS connection phase of every daemon RPC (1-3600 seconds).
+    #[arg(long, global = true, value_name = "SECS", default_value_t = 10)]
+    pub(crate) rpc_connect_timeout_secs: u64,
     #[command(subcommand)]
     pub(crate) command: Command,
 }
@@ -1477,6 +1483,7 @@ pub(crate) enum Command {
     /// Edit one plan task through a validated plan revision.
     TaskEdit {
         session: String,
+        /// JSON task object file (or stdin with `-`; stdin is also the default).
         #[arg(long)]
         file: Option<PathBuf>,
         #[arg(long)]
@@ -1512,11 +1519,12 @@ pub(crate) enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Revise a stored TeamPlan from a JSON file (or stdin).
+    /// Revise a stored TeamPlan from a JSON file (or stdin with `-`).
     TeamPlanRevise {
         session: String,
         #[arg(long)]
         reason: String,
+        /// JSON plan file (or stdin with `-`; stdin is also the default).
         #[arg(long)]
         file: Option<PathBuf>,
         #[arg(long)]
@@ -1622,21 +1630,34 @@ pub(crate) enum Command {
     },
     /// Show the project's shell permission policy.
     ShellPolicy { project: String },
-    /// Update the project's shell network/read-deny policy.
+    /// Update the project's shell network/read-deny policy. Only explicitly
+    /// supplied flags are changed; omitted settings keep their stored values.
     ShellPolicySet {
         project: String,
         /// Network access for shell commands: allow or deny.
-        #[arg(long, default_value = "allow")]
-        network: String,
-        /// Additional absolute (or ~/...) path to deny for reads.
+        #[arg(long)]
+        network: Option<String>,
+        /// Additional absolute (or ~/...) path to deny for reads. Additive.
         #[arg(long = "read-deny")]
         read_deny: Vec<String>,
+        /// Replace the stored read-deny list with the supplied paths.
+        #[arg(long)]
+        replace_read_deny: bool,
+        /// Clear the stored read-deny list.
+        #[arg(long)]
+        clear_read_deny: bool,
         /// Deny reads under HOME except worktree/scratch/Git metadata/toolchains.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "no_restrict_home")]
         restrict_home: bool,
-        /// Deny sibling user homes and /Volumes outside the worktree/toolchains.
+        /// Explicitly clear the HOME read restriction.
         #[arg(long)]
+        no_restrict_home: bool,
+        /// Deny sibling user homes and /Volumes outside the worktree/toolchains.
+        #[arg(long, conflicts_with = "no_read_jail")]
         read_jail: bool,
+        /// Explicitly clear the user/volume read jail.
+        #[arg(long)]
+        no_read_jail: bool,
     },
     /// Show the cross-project Manage Dash snapshot and alerts.
     Dashboard {
@@ -1661,23 +1682,32 @@ pub(crate) enum Command {
         #[arg(long, default_value = "")]
         notes: String,
     },
-    /// Update a model preset.
+    /// Update a model preset. Only supplied fields change.
     ModelPresetUpdate {
         id: String,
         #[arg(long)]
-        name: String,
-        #[arg(long, default_value = "openai-compatible")]
-        provider: String,
+        name: Option<String>,
         #[arg(long)]
-        model: String,
+        provider: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
         #[arg(long)]
         context_window: Option<u64>,
+        /// Clear the stored context window.
+        #[arg(long)]
+        clear_context_window: bool,
         #[arg(long)]
         input_price: Option<f64>,
+        /// Clear the stored input price.
+        #[arg(long)]
+        clear_input_price: bool,
         #[arg(long)]
         output_price: Option<f64>,
-        #[arg(long, default_value = "")]
-        notes: String,
+        /// Clear the stored output price.
+        #[arg(long)]
+        clear_output_price: bool,
+        #[arg(long)]
+        notes: Option<String>,
     },
     /// Delete a model preset.
     ModelPresetDelete { id: String },
@@ -2188,6 +2218,9 @@ pub(crate) enum Command {
         signal: String,
         #[arg(long, default_value_t = 5)]
         grace_secs: u32,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
     },
     /// List files in a session worktree.
     Files { session: String },
@@ -2254,6 +2287,9 @@ pub(crate) enum Command {
         session: String,
         #[arg(long)]
         reason: Option<String>,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
     },
     /// Show hard-preemption history and the project policy for a session.
     Preemption {
@@ -2272,6 +2308,9 @@ pub(crate) enum Command {
     /// Update a project's hard-preemption policy; unspecified values are kept.
     PreemptionPolicySet {
         project: String,
+        /// Explicitly enable hard preemption.
+        #[arg(long, conflicts_with = "disabled")]
+        enabled: bool,
         #[arg(long)]
         disabled: bool,
         #[arg(long)]
@@ -2362,7 +2401,7 @@ pub(crate) enum Command {
     A2aCard,
     /// Update the stored A2A policy while the facade is stopped.
     A2aPolicySet {
-        #[arg(long)]
+        #[arg(long, conflicts_with = "disable")]
         enable: bool,
         #[arg(long)]
         disable: bool,
@@ -2417,7 +2456,13 @@ pub(crate) enum Command {
     /// Show approximate checkpoint storage stats for a session.
     CheckpointStats { session: String },
     /// Restore a session worktree branch to a checkpoint commit.
-    CheckpointRestore { session: String, checkpoint: String },
+    CheckpointRestore {
+        session: String,
+        checkpoint: String,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Delete one checkpoint and its snapshot ref.
     CheckpointDelete { session: String, checkpoint: String },
     /// Prune checkpoints older than --older-than-days while keeping the latest N.
@@ -3006,7 +3051,8 @@ pub(crate) enum Command {
         /// operator, agent, task_result, verifier, or integration.
         #[arg(long)]
         source: Option<String>,
-        /// Bounded pointer as kind:reference[:note]; repeatable.
+        /// Bounded pointer as kind:reference[:note] or a JSON object;
+        /// repeatable. URL references keep their colons.
         #[arg(long = "evidence")]
         evidence: Vec<String>,
         #[arg(long = "expires-at")]
@@ -3587,9 +3633,13 @@ pub(crate) enum Command {
     },
     /// Show the project memory retention policy.
     MemoryPolicy { project: String },
-    /// Update the opt-in project memory retention policy.
+    /// Update the opt-in project memory retention policy. Only explicitly
+    /// supplied flags are changed; embedding-only updates keep retention.
     MemoryPolicySet {
         project: String,
+        /// Explicitly enable automatic memory pruning.
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
         /// Disable automatic memory pruning.
         #[arg(long)]
         disable: bool,
@@ -3942,9 +3992,19 @@ pub(crate) enum Command {
     /// Compare the JSONL event mirror with the database.
     LogStatus { session: String },
     /// Restore the event table from the JSONL mirror and rebuild projections.
-    RestoreLog { session: String },
+    RestoreLog {
+        session: String,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Discard uncommitted changes in the session worktree.
-    Discard { session: String },
+    Discard {
+        session: String,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Commit the session worktree.
     Commit {
         session: String,
@@ -4000,7 +4060,10 @@ pub(crate) enum Command {
         expires_at: Option<String>,
         #[arg(long = "max-uses")]
         max_uses: Option<u32>,
-        /// Disable the template (update only).
+        /// Enable the template (create default; update preserves unless set).
+        #[arg(long, conflicts_with = "disabled")]
+        enabled: bool,
+        /// Disable the template (update preserves unless set; create honors).
         #[arg(long)]
         disabled: bool,
     },

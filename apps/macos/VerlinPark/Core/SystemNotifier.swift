@@ -14,7 +14,12 @@ final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
 
     var onOpenSession: ((String) -> Void)?
     var onResolveApproval: ((String, Bool) -> Void)?
+    /// High-risk approvals must be reviewed in the app, where risk, tool, and
+    /// target are visible. This callback selects the Inbox instead of
+    /// resolving the request from a notification action.
+    var onReviewApproval: ((String) -> Void)?
     private var requestedAuthorization = false
+    nonisolated static let pendingApprovalReviewKey = "verlinpark.pendingApprovalReview"
 
     nonisolated static func approvalID(from noticeID: String) -> String? {
         guard noticeID.hasPrefix("approval-") else { return nil }
@@ -35,10 +40,22 @@ final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
             title: "Deny",
             options: [.destructive]
         )
+        let review = UNNotificationAction(
+            identifier: "verlinpark.review",
+            title: "Review in VerlinPark",
+            options: [.foreground]
+        )
         center.setNotificationCategories([
             UNNotificationCategory(
-                identifier: "verlinpark.approval",
+                identifier: NotificationApprovalPolicy.inlineCategory,
                 actions: [approve, deny],
+                intentIdentifiers: [],
+                options: []
+            ),
+            // No Approve/Deny action here: the request only opens the app.
+            UNNotificationCategory(
+                identifier: NotificationApprovalPolicy.reviewCategory,
+                actions: [review],
                 intentIdentifiers: [],
                 options: []
             ),
@@ -63,8 +80,10 @@ final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
         content.sound = .default
         content.userInfo = ["session_id": notice.sessionId]
         if let approvalID = Self.approvalID(from: notice.id) {
-            content.categoryIdentifier = "verlinpark.approval"
+            let risk = notice.approvalRisk
+            content.categoryIdentifier = NotificationApprovalPolicy.categoryIdentifier(risk: risk)
             content.userInfo["approval_id"] = approvalID
+            content.userInfo["approval_risk"] = risk ?? ""
         }
         let request = UNNotificationRequest(
             identifier: "verlinpark-\(notice.id)",
@@ -87,21 +106,51 @@ final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
         didReceive response: UNNotificationResponse,
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
-        let sessionID = response.notification.request.content.userInfo["session_id"] as? String
-        let approvalID = response.notification.request.content.userInfo["approval_id"] as? String
+        let userInfo = response.notification.request.content.userInfo
+        let sessionID = userInfo["session_id"] as? String
+        let approvalID = userInfo["approval_id"] as? String
+        let risk = userInfo["approval_risk"] as? String
         let action = response.actionIdentifier
         Task { @MainActor in
             if action == "verlinpark.approve" || action == "verlinpark.deny",
                let approvalID
             {
+                // Re-check at action time so a stale or misregistered category
+                // can never approve a high-risk request blindly.
+                guard NotificationApprovalPolicy.allowsInlineResolution(risk: risk) else {
+                    NSApp.activate(ignoringOtherApps: true)
+                    self.routeToReview(approvalID)
+                    return
+                }
                 self.onResolveApproval?(approvalID, action == "verlinpark.approve")
                 return
             }
             NSApp.activate(ignoringOtherApps: true)
+            if action == "verlinpark.review", let approvalID {
+                self.routeToReview(approvalID)
+                return
+            }
+            if let approvalID,
+               !NotificationApprovalPolicy.allowsInlineResolution(risk: risk)
+            {
+                self.routeToReview(approvalID)
+                return
+            }
             if let sessionID {
                 self.onOpenSession?(sessionID)
             }
         }
         completionHandler()
+    }
+
+    /// A notification action can arrive before `AppModel.start` wires the
+    /// callback (for example when the action launches the app). Persist the
+    /// request so the first connected app session opens the Inbox.
+    private func routeToReview(_ approvalID: String) {
+        if let onReviewApproval {
+            onReviewApproval(approvalID)
+        } else {
+            UserDefaults.standard.set(approvalID, forKey: Self.pendingApprovalReviewKey)
+        }
     }
 }

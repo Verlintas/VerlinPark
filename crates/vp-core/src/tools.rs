@@ -1716,6 +1716,13 @@ pub(crate) async fn sandboxed_command(context: &ToolContext) -> Result<Command> 
             "(deny file-read* (subpath (param \"SECRET{index}\")))\n"
         ));
     }
+    // The daemon data-directory denies above include the `worktrees` and
+    // `sandbox` roots. Re-allow only this agent's own worktree, runtime
+    // scratch, and Git metadata after the denies so sibling worktrees and
+    // scratch stay unreadable without breaking normal shell use.
+    profile.push_str(
+        "(allow file-read* (subpath (param \"WORKTREE\")) (subpath (param \"SCRATCH\")) (subpath (param \"GIT_DIR\")) (subpath (param \"COMMON_DIR\")))\n",
+    );
     let mut process = Command::new(SANDBOX_EXEC);
     process.env_clear();
     for key in SHELL_ENV_PASSTHROUGH {

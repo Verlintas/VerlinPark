@@ -1381,10 +1381,18 @@ struct ProvidersSettingsView: View {
                     }
                     if model.providerHasStoredKey {
                         Button(L10n.t("Remove stored key")) {
-                            model.clearStoredProviderKey()
+                            Task { await model.clearStoredProviderKey() }
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
+                        .disabled(model.providerBusy)
+                    } else if model.providerNeedsDaemonKeyClear {
+                        Button(L10n.t("Retry daemon key clear")) {
+                            Task { await model.clearStoredProviderKey() }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(model.providerBusy)
                     }
                 }
 

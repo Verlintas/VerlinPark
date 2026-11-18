@@ -149,7 +149,8 @@ impl Store {
                 response_hash TEXT,
                 evidence_json TEXT NOT NULL,
                 created_at    TEXT NOT NULL,
-                resolved_at   TEXT
+                resolved_at   TEXT,
+                settled_by_sweep INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE INDEX IF NOT EXISTS idx_effect_receipts_session
@@ -2870,6 +2871,12 @@ impl Store {
             "TEXT",
         )?;
         ensure_column(&conn, "plan_tasks", "next_attempt_at", "TEXT")?;
+        ensure_column(
+            &conn,
+            "effect_receipts",
+            "settled_by_sweep",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         ensure_column(&conn, "scaling_decisions", "replay_inputs_json", "TEXT")?;
         ensure_column(&conn, "session_runs", "runtime_snapshot_json", "TEXT")?;
         ensure_column(&conn, "approvals", "approval_risk", "TEXT")?;

@@ -115,13 +115,6 @@ pub(super) fn print(value: &Value) -> bool {
         }
         return true;
     }
-    if value.get("removed").is_some() && value.get("bytes_freed").is_none() {
-        println!(
-            "mailbox GC removed {} message(s)",
-            value["removed"].as_u64().unwrap_or(0)
-        );
-        return true;
-    }
     if value.get("removed").is_some() && value.get("bytes_freed").is_some() {
         println!(
             "artifact GC removed {} artifact(s), freed {} bytes",

@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(test)]
 pub(in crate::agent) struct RoleSystemPrompt {
     /// `core` section: role charter, security/output contract, and stable
     /// project conventions. It is identical across agents with the same role,
@@ -9,15 +10,6 @@ pub(in crate::agent) struct RoleSystemPrompt {
     /// section and is intentionally last so it cannot invalidate `core` or
     /// `project`.
     pub(in crate::agent) run_context: String,
-}
-
-impl RoleSystemPrompt {
-    /// Legacy combined core+run-context string. The run loop builds the full
-    /// three-section prompt separately; manual compaction and context preflight
-    /// still use this compatibility renderer.
-    pub(in crate::agent) fn render(&self) -> String {
-        format!("{}\n\n{}", self.core, self.run_context)
-    }
 }
 
 pub(in crate::agent) struct RolePromptParts {
@@ -242,6 +234,7 @@ pub(in crate::agent) fn role_prompt_parts(
     }
 }
 
+#[cfg(test)]
 pub(in crate::agent) fn role_system_prompt(
     role: AgentRole,
     project: &Project,
@@ -254,6 +247,105 @@ pub(in crate::agent) fn role_system_prompt(
         core: parts.core,
         run_context: parts.run_context,
     }
+}
+
+/// The exact layout-aware prompt preamble for one session Leader, plus the
+/// estimate inputs the run loop uses for hard-limit and compaction decisions.
+///
+/// Manual compaction and context checkpoints must not assemble a second,
+/// legacy prompt: that would omit identity/source/skill/contract sections and
+/// include the volatile objective, so the checkpoint hash and token estimate
+/// would describe a request the provider never receives. This helper uses the
+/// same `build_prompt_sections` path as the run loop, including pinned stored
+/// bytes, the derived task contract, and the frozen tool bundle.
+pub(in crate::agent) struct SessionPromptContext {
+    pub(in crate::agent) spec: AgentSpec,
+    pub(in crate::agent) model: String,
+    pub(in crate::agent) system_tokens: u64,
+    pub(in crate::agent) tool_tokens: u64,
+    pub(in crate::agent) base_tokens: u64,
+    pub(in crate::agent) prefix_hash: String,
+}
+
+pub(in crate::agent) async fn build_session_prompt_context(
+    engine: &Engine,
+    config: &AgentConfig,
+    session: &Session,
+    project: &Project,
+    mode: InstructionBuildMode,
+) -> Result<SessionPromptContext> {
+    let agents = engine.list_agents(&session.id).await?;
+    let leader = agents.into_iter().find(|agent| agent.role == "leader");
+    let profile = leader
+        .as_ref()
+        .and_then(|agent| agent.profile.as_deref())
+        .and_then(AgentProfile::parse)
+        .unwrap_or(AgentProfile::Generic);
+    let worktree = PathBuf::from(session.worktree.clone().unwrap_or_default());
+    let branch = session.branch.clone().unwrap_or_default();
+    let spec = AgentSpec {
+        id: leader
+            .as_ref()
+            .map(|agent| agent.id.clone())
+            .unwrap_or_else(|| "leader".to_string()),
+        role: AgentRole::Leader,
+        name: leader
+            .as_ref()
+            .map(|agent| agent.name.clone())
+            .unwrap_or_else(|| "Leader".to_string()),
+        depth: 0,
+        parent_name: None,
+        title: leader.as_ref().and_then(|agent| agent.title.clone()),
+        task_id: None,
+        department: None,
+        identity_id: leader.as_ref().and_then(|agent| agent.identity_id.clone()),
+        identity_generation: None,
+        profile,
+        allow_delegation: true,
+        task_kind: None,
+        auto_approve: false,
+        worktree: worktree.clone(),
+        branch: branch.clone(),
+        session_worktree: worktree,
+        session_branch: branch,
+        write_scope: Vec::new(),
+        base_commit: session.base_commit.clone().unwrap_or_default(),
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
+    };
+    let contract = derive_contract_for_run(engine, project, session, &spec).await?;
+    let sections = build_prompt_sections(
+        engine,
+        project,
+        session,
+        &spec,
+        contract.as_ref(),
+        &session.goal,
+        true,
+        mode,
+        None,
+    )
+    .await?;
+    let dynamic_mcp =
+        collect_dynamic_mcp_tools(engine, spec.role, &session.project_id, Some(&session.id)).await;
+    let frozen_bundle = frozen_tool_bundle(config, &spec, &dynamic_mcp);
+    let tools = frozen_bundle.tools.clone();
+    let model = model_for(config, spec.role);
+    let hashes = sections.hashes(&model, &tools);
+    let system_tokens = estimate_context_tokens(&sections.render());
+    let tool_tokens = serde_json::to_string(&tools)
+        .map(|schema| estimate_context_tokens(&schema))
+        .unwrap_or(0);
+    let prefix_hash = hashes.prefix_hash.clone();
+    Ok(SessionPromptContext {
+        spec,
+        model,
+        system_tokens,
+        tool_tokens,
+        base_tokens: system_tokens.saturating_add(tool_tokens),
+        prefix_hash,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

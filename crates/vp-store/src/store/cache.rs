@@ -145,8 +145,9 @@ impl Store {
     }
 
     /// List the Leader state and every task-scoped state for one session.
-    /// Scope ids are `<session_id>#<agent_id>`; matching is parameterized and
-    /// bounded by the caller's session key space.
+    /// Scope ids are `<session_id>#<agent_id>`; matching uses an exact,
+    /// case-sensitive `substr` prefix so `%`/`_` and case-variant ids cannot
+    /// cross session boundaries.
     pub fn list_instruction_states_for_session(
         &self,
         session_id: &str,
@@ -155,11 +156,11 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT session_id, key, hash, ordinal, tail, updated_at
              FROM session_instruction_state
-             WHERE session_id = ?1 OR session_id LIKE ?2
+             WHERE session_id = ?1
+                OR substr(session_id, 1, length(?1) + 1) = ?1 || '#'
              ORDER BY session_id ASC, ordinal ASC, key ASC",
         )?;
-        let prefix = format!("{session_id}#%");
-        let rows = stmt.query_map(params![session_id, prefix], map_session_instruction)?;
+        let rows = stmt.query_map(params![session_id], map_session_instruction)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -288,6 +289,12 @@ impl Store {
             let mut conn = self.lock()?;
             let tx = conn.transaction()?;
             let record = record_prompt_prefix_call_tx(&tx, call, &now)?;
+            // A same-session explicit warm is not proof of reuse from another
+            // session. The provider may serve this call from the prefix this
+            // session just warmed, so `prior_sessions` alone is not enough to
+            // attribute the read to another session.
+            let same_session_warm =
+                prompt_prefix_was_warmed_tx(&tx, session_id, &call.cache_epoch)?;
             if let Some(object) = payload.as_object_mut() {
                 object.insert(
                     "cache_epoch".into(),
@@ -310,8 +317,15 @@ impl Store {
                     serde_json::json!(record.first_session_call),
                 );
                 object.insert(
+                    "same_session_warm".into(),
+                    serde_json::json!(same_session_warm),
+                );
+                object.insert(
                     "cross_session_cache_read_tokens".into(),
-                    serde_json::json!(if record.first_session_call && record.prior_sessions > 0 {
+                    serde_json::json!(if record.first_session_call
+                        && record.prior_sessions > 0
+                        && !same_session_warm
+                    {
                         call.cache_read_tokens.min(call.input_tokens)
                     } else {
                         0
@@ -737,5 +751,126 @@ impl Store {
             }
         }
         Ok(inconsistent)
+    }
+}
+
+/// True when this session already recorded an explicit warm for the same
+/// finalized cache epoch. Warm events intentionally do not create
+/// `prompt_prefix_observations` rows (they are not ordinary conversation
+/// calls), so the event stream is the only durable evidence. A matching warm
+/// makes cross-session attribution unprovable; the caller reports zero rather
+/// than overriding it with an upper bound.
+fn prompt_prefix_was_warmed_tx(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    cache_epoch: &str,
+) -> Result<bool> {
+    let warmed: i64 = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM events
+             WHERE session_id = ?1
+               AND type = 'context.cache'
+               AND json_extract(payload, '$.warm') = 1
+               AND json_extract(payload, '$.cache_epoch') = ?2
+         )",
+        params![session_id, cache_epoch],
+        |row| row.get(0),
+    )?;
+    Ok(warmed != 0)
+}
+
+/// Delete the Leader and task-scoped instruction rows owned by one session.
+/// `session_instruction_state.session_id` is either the session id itself or
+/// `<session_id>#<scope>`. SQLite `LIKE` is case-insensitive and treats `%`/`_`
+/// as wildcards, so use an exact, case-sensitive `substr` prefix instead.
+pub(crate) fn delete_instruction_states_for_session_tx(
+    tx: &Transaction<'_>,
+    session_id: &str,
+) -> Result<usize> {
+    Ok(tx.execute(
+        "DELETE FROM session_instruction_state
+         WHERE session_id = ?1
+            OR substr(session_id, 1, length(?1) + 1) = ?1 || '#'",
+        params![session_id],
+    )?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn fixture() -> (TempDir, TempDir, Store, Project, Session, Session) {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("cache"))
+            .unwrap();
+        let first = store.create_session(&project.id, "first").unwrap();
+        let second = store.create_session(&project.id, "second").unwrap();
+        (data, repo, store, project, first, second)
+    }
+
+    fn call(project: &Project, session: &Session, epoch: &str) -> PromptPrefixCall {
+        PromptPrefixCall {
+            project_id: project.id.clone(),
+            cache_epoch: epoch.to_string(),
+            session_id: session.id.clone(),
+            model: "test-model".to_string(),
+            tool_bundle: "leader".to_string(),
+            tool_bundle_hash: "b".repeat(64),
+            core_hash: "c".repeat(64),
+            project_hash: "d".repeat(64),
+            core_sections: Vec::new(),
+            project_sections: Vec::new(),
+            input_tokens: 1_000,
+            cache_read_tokens: 800,
+        }
+    }
+
+    #[test]
+    fn same_session_warm_is_not_counted_as_cross_session_reuse() {
+        let (_data, _repo, store, project, first, second) = fixture();
+        let epoch = "a".repeat(64);
+        store
+            .record_prompt_prefix_call(&call(&project, &first, &epoch))
+            .unwrap();
+        store
+            .append_event(
+                &second.id,
+                "context.cache",
+                serde_json::json!({"warm": true, "cache_epoch": epoch}),
+            )
+            .unwrap();
+        let (event, record) = store
+            .append_cache_call_event(
+                &second.id,
+                "context.cache",
+                serde_json::json!({"input_tokens": 1_000, "cache_read_tokens": 800}),
+                &call(&project, &second, &epoch),
+            )
+            .unwrap();
+        assert!(record.first_session_call);
+        assert_eq!(record.prior_sessions, 1);
+        assert_eq!(event.payload["same_session_warm"], true);
+        assert_eq!(event.payload["cross_session_cache_read_tokens"], 0);
+
+        // Without a warm event the same first call is still attributable to the
+        // other session; the warm is the only condition that suppresses it.
+        let other_epoch = "e".repeat(64);
+        store
+            .record_prompt_prefix_call(&call(&project, &first, &other_epoch))
+            .unwrap();
+        let (event, _) = store
+            .append_cache_call_event(
+                &second.id,
+                "context.cache",
+                serde_json::json!({"input_tokens": 1_000, "cache_read_tokens": 800}),
+                &call(&project, &second, &other_epoch),
+            )
+            .unwrap();
+        assert_eq!(event.payload["same_session_warm"], false);
+        assert_eq!(event.payload["cross_session_cache_read_tokens"], 800);
     }
 }

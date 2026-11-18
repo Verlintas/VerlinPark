@@ -130,6 +130,9 @@ pub(super) async fn dispatch(
             max_tasks,
             task_ttl_secs,
         } => {
+            if enable && disable {
+                bail!("--enable and --disable are mutually exclusive");
+            }
             let mut policy = vp_protocol::a2a::A2aPolicy {
                 enabled: enable && !disable,
                 allow_inbound,

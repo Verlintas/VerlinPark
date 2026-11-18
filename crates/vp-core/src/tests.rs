@@ -4442,6 +4442,25 @@ async fn checkpoints_and_forks_preserve_committed_branch_and_active_conversation
         .list_events(fork.session.id.clone(), 0, 200)
         .await
         .unwrap();
+    let created_events = fork_events
+        .iter()
+        .filter(|event| event.kind == "session.created")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        created_events.len(),
+        1,
+        "fork session row and session.created must commit together"
+    );
+    assert_eq!(created_events[0].seq, 1);
+    assert_eq!(
+        created_events[0].payload["forked_from_session_id"],
+        session.id
+    );
+    assert_eq!(
+        created_events[0].payload["forked_from_checkpoint_id"],
+        checkpoint.id
+    );
+    assert_eq!(created_events[0].payload["forked_from_commit"], commit);
     assert!(
         fork_events
             .iter()
@@ -15983,4 +16002,700 @@ async fn diagnosis_records_one_advisory_event_without_mutating_runtime_state() {
         replay.mismatches, before_replay.mismatches,
         "an advisory record must not create a new projection drift"
     );
+}
+
+#[cfg(test)]
+mod replay_integrity_tests {
+    use super::*;
+    use vp_protocol::progress::ProgressRound;
+    use vp_protocol::remote::RemoteTestEvidence;
+    use vp_protocol::runtime::RuntimeSnapshot;
+    use vp_protocol::test_cache::TestCacheEntry;
+    use vp_protocol::types::{MergeQueueSource, PlanTask, SessionRun, TeamPlan};
+
+    async fn replay_fixture(label: &str) -> (Engine, Project, Session, TempDir, TempDir) {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some(label.into()),
+            )
+            .await
+            .unwrap();
+        let session = engine
+            .create_session(project.id.clone(), format!("{label} session"), None)
+            .await
+            .unwrap();
+        (engine, project, session, data, repo)
+    }
+
+    fn added_task_plan(mut plan: TeamPlan) -> TeamPlan {
+        plan.tasks.push(PlanTask {
+            id: "T3".into(),
+            department: "impl".into(),
+            title: "Revision verification".into(),
+            kind: "verify".into(),
+            priority: 5,
+            profile: None,
+            deps: vec!["T2".into()],
+            write_scope: vec![],
+            acceptance: vec!["tests pass".into()],
+            token_budget: None,
+            cost_budget_usd: None,
+            parent_task_id: None,
+            fanout_key: None,
+            fanout_join_for: None,
+        });
+        plan
+    }
+
+    fn plan_event_payload(events: &[vp_protocol::types::Event], kind: &str) -> serde_json::Value {
+        events
+            .iter()
+            .find(|event| event.kind == kind)
+            .map(|event| event.payload.clone())
+            .unwrap_or_else(|| panic!("missing {kind} event"))
+    }
+
+    #[tokio::test]
+    async fn revised_plan_replays_and_survives_repair_and_rebuild() {
+        let (engine, _project, session, _data, _repo) = replay_fixture("revised plan").await;
+        let plan = orchestration_test_plan();
+        engine.set_team_plan(&session.id, &plan).await.unwrap();
+        let revised = added_task_plan(plan);
+        let revision = engine
+            .revise_team_plan(
+                &session.id,
+                revised.clone(),
+                "add verification",
+                "leader",
+                Some(1),
+                5,
+            )
+            .await
+            .unwrap();
+        assert_eq!(revision.revision.revision, 2);
+        let plan_seq = engine
+            .task_queue(None, Some(session.id.clone()))
+            .await
+            .unwrap()
+            .tasks[0]
+            .plan_seq;
+        engine
+            .store()
+            .finish_plan_task(&session.id, plan_seq, "T1", "completed", Some("landed"))
+            .unwrap();
+        engine
+            .append_event(
+                &session.id,
+                "plan_task.finished",
+                serde_json::json!({
+                    "task_id": "T1",
+                    "task_status": "completed",
+                    "summary": "landed",
+                }),
+            )
+            .await
+            .unwrap();
+
+        let before = engine.replay_session(&session.id).await.unwrap();
+        assert!(before.plan_matches, "{:?}", before.mismatches);
+        assert!(before.task_queue_matches, "{:?}", before.mismatches);
+
+        // Simulate a session written by the old repair path: the revision
+        // envelope instead of the bare plan.
+        let events = engine
+            .list_events(session.id.clone(), 0, 200)
+            .await
+            .unwrap();
+        let wrapper = plan_event_payload(&events, "team_plan.revised");
+        engine
+            .store()
+            .set_team_plan(&session.id, &serde_json::to_string(&wrapper).unwrap())
+            .unwrap();
+        let drift = engine.replay_session(&session.id).await.unwrap();
+        assert!(!drift.plan_matches);
+
+        let repaired = engine.repair_session(&session.id).await.unwrap();
+        assert!(repaired.plan_matches, "{:?}", repaired.mismatches);
+        let stored = engine.get_team_plan(&session.id).await.unwrap().unwrap();
+        assert_eq!(stored, revised);
+        assert!(stored.tasks.iter().any(|task| task.id == "T3"));
+
+        // Plan edit and revision restore still work after repair.
+        let mut edited_task = stored
+            .tasks
+            .iter()
+            .find(|task| task.id == "T2")
+            .cloned()
+            .unwrap();
+        edited_task.title = "Edited after repair".into();
+        let edited = engine
+            .edit_plan_task(&session.id, edited_task, "post-repair edit", Some(2), 5)
+            .await
+            .unwrap();
+        assert_eq!(edited.revision.revision, 3);
+        let restored = engine
+            .restore_team_plan_revision(&session.id, 2, "restore revision", Some(3), 5)
+            .await
+            .unwrap();
+        assert_eq!(restored.revision.revision, 4);
+        assert_eq!(
+            restored
+                .plan
+                .tasks
+                .iter()
+                .find(|task| task.id == "T2")
+                .map(|task| task.title.as_str()),
+            Some("Follow-up")
+        );
+
+        let rebuilt = engine.rebuild_session(&session.id).await.unwrap();
+        assert!(rebuilt.plan_matches, "{:?}", rebuilt.mismatches);
+        let after_rebuild = engine.get_team_plan(&session.id).await.unwrap().unwrap();
+        assert!(after_rebuild.tasks.iter().any(|task| task.id == "T3"));
+        // Repair/rebuild must not rewrite the archived revision event.
+        let after_events = engine
+            .list_events(session.id.clone(), 0, 400)
+            .await
+            .unwrap();
+        assert!(
+            after_events
+                .iter()
+                .any(|event| event.kind == "team_plan.revised" && event.payload == wrapper)
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_revision_added_task_survives_replay_and_repair() {
+        let (engine, _project, session, _data, _repo) = replay_fixture("revised tasks").await;
+        let plan = orchestration_test_plan();
+        engine.set_team_plan(&session.id, &plan).await.unwrap();
+        let revised = added_task_plan(plan.clone());
+        engine
+            .revise_team_plan(
+                &session.id,
+                revised,
+                "add verification",
+                "leader",
+                Some(1),
+                5,
+            )
+            .await
+            .unwrap();
+
+        let report = engine.replay_session(&session.id).await.unwrap();
+        assert!(report.task_queue_matches, "{:?}", report.mismatches);
+
+        let plan_seq = engine
+            .task_queue(None, Some(session.id.clone()))
+            .await
+            .unwrap()
+            .tasks[0]
+            .plan_seq;
+        engine
+            .store()
+            .finish_plan_task(&session.id, plan_seq, "T3", "completed", Some("done"))
+            .unwrap();
+        engine
+            .append_event(
+                &session.id,
+                "plan_task.finished",
+                serde_json::json!({
+                    "task_id": "T3",
+                    "task_status": "completed",
+                    "summary": "done",
+                }),
+            )
+            .await
+            .unwrap();
+        // A resync against the pre-revision plan deletes T3, exactly like a
+        // stale live projection. Replay must not accept the truncated DAG.
+        engine.scheduler().sync_plan(&session, &plan).await.unwrap();
+        let drift = engine.replay_session(&session.id).await.unwrap();
+        assert!(!drift.task_queue_matches, "{:?}", drift.mismatches);
+
+        engine.repair_session(&session.id).await.unwrap();
+        let repaired_queue = engine
+            .task_queue(None, Some(session.id.clone()))
+            .await
+            .unwrap()
+            .tasks;
+        let t3 = repaired_queue
+            .iter()
+            .find(|task| task.task_id == "T3")
+            .expect("revision-added task must survive repair");
+        assert_eq!(t3.status, "completed");
+        let repaired = engine.replay_session(&session.id).await.unwrap();
+        assert!(repaired.task_queue_matches, "{:?}", repaired.mismatches);
+
+        let rebuilt = engine.rebuild_session(&session.id).await.unwrap();
+        assert!(rebuilt.task_queue_matches, "{:?}", rebuilt.mismatches);
+        assert!(
+            engine
+                .task_queue(None, Some(session.id.clone()))
+                .await
+                .unwrap()
+                .tasks
+                .iter()
+                .any(|task| task.task_id == "T3" && task.status == "completed")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_entries_do_not_create_merge_queue_drift_and_content_drift_is_detected() {
+        let (engine, project, session, data, _repo) = replay_fixture("merge queue").await;
+        let now = vp_protocol::now_rfc3339();
+        let test_entry = TestCacheEntry {
+            id: Uuid::now_v7().to_string(),
+            project_id: project.id.clone(),
+            session_id: session.id.clone(),
+            kind: "test".into(),
+            command: "cargo test".into(),
+            command_source: "profile".into(),
+            key_version: 1,
+            cache_key: "cache-key-1".into(),
+            inputs_hash: "a".repeat(64),
+            impact_generation: "impact-1".into(),
+            status: "passed".into(),
+            exit_code: 0,
+            duration_ms: 12,
+            output_ref: None,
+            output_bytes: 0,
+            covered_paths: vec!["src/lib.rs".into()],
+            warnings: vec![],
+            warning_count: 0,
+            failure_count: 0,
+            created_at: now.clone(),
+            expires_at: "2999-01-01T00:00:00Z".into(),
+            hit_count: 0,
+            last_hit_at: None,
+        };
+        engine
+            .store()
+            .record_test_result_with_events(&test_entry, "{}", 100)
+            .unwrap();
+        let (entry, _event) = engine
+            .store()
+            .enqueue_merge_with_event_source(
+                &session.id,
+                "agent-1",
+                "Worker",
+                Some("T1"),
+                "verlinpark/session--worker",
+                &"b".repeat(40),
+                &"c".repeat(40),
+                Some("verified"),
+                &MergeQueueSource::local(),
+            )
+            .unwrap();
+        let report = engine.replay_session(&session.id).await.unwrap();
+        assert!(report.queue_matches, "{:?}", report.mismatches);
+        assert!(report.consistent, "{:?}", report.mismatches);
+
+        let conn = rusqlite::Connection::open(data.path().join("verlinpark.db")).unwrap();
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        conn.execute(
+            "UPDATE merge_queue SET commit_hash = 'corrupted' WHERE id = ?1",
+            rusqlite::params![entry.id],
+        )
+        .unwrap();
+        let drift = engine.replay_session(&session.id).await.unwrap();
+        assert!(!drift.queue_matches, "{:?}", drift.mismatches);
+        assert!(!drift.consistent);
+
+        engine.repair_session(&session.id).await.unwrap();
+        let repaired = engine.replay_session(&session.id).await.unwrap();
+        assert!(repaired.queue_matches, "{:?}", repaired.mismatches);
+        let restored = engine
+            .list_merge_queue(&session.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == entry.id)
+            .unwrap();
+        assert_eq!(restored.commit, entry.commit);
+
+        // Status is unchanged here; a changed Verifier verdict must still be
+        // detected through the full entry comparison.
+        conn.execute(
+            "UPDATE merge_queue SET verifier_approved = 1, verifier_summary = 'tampered' WHERE id = ?1",
+            rusqlite::params![entry.id],
+        )
+        .unwrap();
+        let verdict_drift = engine.replay_session(&session.id).await.unwrap();
+        assert!(
+            !verdict_drift.queue_matches,
+            "{:?}",
+            verdict_drift.mismatches
+        );
+        engine.repair_session(&session.id).await.unwrap();
+        let cleared = engine
+            .list_merge_queue(&session.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == entry.id)
+            .unwrap();
+        assert_eq!(cleared.verifier_approved, None);
+        assert_eq!(cleared.verifier_summary, None);
+    }
+
+    #[tokio::test]
+    async fn progress_only_drift_is_inconsistent_and_repair_rebuilds_it() {
+        let (engine, _project, session, _data, _repo) = replay_fixture("progress drift").await;
+        engine
+            .record_progress_round(
+                &session.id,
+                ProgressRound {
+                    round_id: "r1".into(),
+                    agent_id: Some("manager".into()),
+                    agent_name: Some("Manager".into()),
+                    satisfied: vec!["landed".into()],
+                    progressing: vec!["verify".into()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        engine
+            .store()
+            .replace_progress_rounds(&session.id, &[])
+            .unwrap();
+        let drift = engine.replay_session(&session.id).await.unwrap();
+        assert!(!drift.consistent);
+        assert!(
+            drift
+                .mismatches
+                .iter()
+                .any(|mismatch| mismatch.starts_with("progress:")),
+            "{:?}",
+            drift.mismatches
+        );
+        let repaired = engine.repair_session(&session.id).await.unwrap();
+        assert!(repaired.consistent, "{:?}", repaired.mismatches);
+        assert_eq!(
+            engine
+                .store()
+                .list_progress_rows(&session.id)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_retry_backoff_survives_session_repair() {
+        let (engine, _project, session, _data, _repo) = replay_fixture("retry backoff").await;
+        let plan = orchestration_test_plan();
+        engine.set_team_plan(&session.id, &plan).await.unwrap();
+        let plan_seq = engine
+            .task_queue(None, Some(session.id.clone()))
+            .await
+            .unwrap()
+            .tasks[0]
+            .plan_seq;
+        engine
+            .scheduler()
+            .claim(&session.id, plan_seq, &["T1".into()])
+            .await
+            .unwrap();
+        engine
+            .scheduler()
+            .finish(&session.id, plan_seq, "T1", "failed", Some("compile error"))
+            .await
+            .unwrap();
+        engine.advance_orchestration(&session.id).await.unwrap();
+        let scheduled = engine
+            .task_queue(None, Some(session.id.clone()))
+            .await
+            .unwrap()
+            .tasks
+            .into_iter()
+            .find(|task| task.task_id == "T1")
+            .unwrap();
+        let next_attempt_at = scheduled
+            .next_attempt_at
+            .clone()
+            .expect("retry backoff scheduled");
+        let report = engine.replay_session(&session.id).await.unwrap();
+        assert!(report.task_queue_matches, "{:?}", report.mismatches);
+
+        // Force a repair through an unrelated plan drift; the task INSERT must
+        // preserve the persisted retry deadline. Write the projection only:
+        // a new `team_plan.submitted` event would make the drifted plan the
+        // expected state and hide the repair path under test.
+        let drifted = added_task_plan(plan.clone());
+        engine
+            .store()
+            .set_team_plan(&session.id, &serde_json::to_string(&drifted).unwrap())
+            .unwrap();
+        assert!(
+            !engine
+                .replay_session(&session.id)
+                .await
+                .unwrap()
+                .plan_matches
+        );
+        engine.repair_session(&session.id).await.unwrap();
+        let repaired = engine
+            .task_queue(None, Some(session.id.clone()))
+            .await
+            .unwrap()
+            .tasks
+            .into_iter()
+            .find(|task| task.task_id == "T1")
+            .unwrap();
+        assert_eq!(
+            repaired.next_attempt_at.as_deref(),
+            Some(next_attempt_at.as_str())
+        );
+        let after = engine.replay_session(&session.id).await.unwrap();
+        assert!(after.task_queue_matches, "{:?}", after.mismatches);
+    }
+
+    #[tokio::test]
+    async fn planned_archive_round_trip_replays_with_contracts_progress_and_remote_evidence() {
+        let (engine, project, session, _data, _repo) = replay_fixture("archive round trip").await;
+        let contract = crate::contract::derive_contract(crate::contract::ContractDerivation {
+            project_id: project.id.clone(),
+            session_id: session.id.clone(),
+            task_id: Some("T1".into()),
+            plan_revision: 1,
+            role: "worker".into(),
+            profile: "coding".into(),
+            goal: "round trip".into(),
+            task_kind: Some("coding".into()),
+            write_scope: vec!["src".into()],
+            acceptance: vec!["tests pass".into()],
+            allowed_tools: vec!["read_file".into(), "write_file".into()],
+            policy: vp_protocol::types::ContractPolicy::default(),
+            shell_network: "allow".into(),
+        })
+        .unwrap();
+        engine
+            .store()
+            .insert_contract(&StoredContractRow {
+                contract_id: contract.contract_id.clone(),
+                project_id: contract.project_id.clone(),
+                session_id: contract.session_id.clone(),
+                task_id: contract.task_id.clone(),
+                plan_revision: contract.plan_revision,
+                role: contract.role.clone(),
+                hash: contract.hash.clone(),
+                source_hash: contract.source_hash.clone(),
+                contract: serde_json::to_string(&contract).unwrap(),
+                created_at: contract.created_at.clone(),
+            })
+            .unwrap();
+        engine
+            .append_event(
+                &session.id,
+                "contract.derived",
+                serde_json::json!({
+                    "contract": contract.clone(),
+                    "created_at": contract.created_at.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+        engine
+            .append_event(
+                &session.id,
+                "intent.mutation",
+                serde_json::json!({
+                    "contract_id": contract.contract_id.clone(),
+                    "reads": 1,
+                    "writes": 2,
+                    "bytes": 128,
+                    "commits": 1,
+                    "outcome": "allowed",
+                }),
+            )
+            .await
+            .unwrap();
+        engine
+            .store()
+            .add_contract_usage(
+                &contract.contract_id,
+                &project.id,
+                &session.id,
+                None,
+                2,
+                128,
+                1,
+            )
+            .unwrap();
+        engine
+            .record_progress_round(
+                &session.id,
+                ProgressRound {
+                    round_id: "r1".into(),
+                    agent_id: Some("manager".into()),
+                    agent_name: Some("Manager".into()),
+                    satisfied: vec!["implemented".into()],
+                    next_task: Some("verify".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let evidence = RemoteTestEvidence {
+            id: Uuid::now_v7().to_string(),
+            project_id: project.id.clone(),
+            session_id: session.id.clone(),
+            entry_id: None,
+            profile: "coding".into(),
+            kind: "test".into(),
+            host: "build.example.com".into(),
+            commit: "d".repeat(40),
+            command: "cargo test".into(),
+            cwd: None,
+            status: "passed".into(),
+            exit_code: Some(0),
+            duration_ms: 42,
+            output_ref: None,
+            output_sha256: None,
+            output_bytes: 0,
+            output_truncated: false,
+            timed_out: false,
+            detail: None,
+            digest: "e".repeat(64),
+            environment_caveat: "remote host environment".into(),
+            created_at: vp_protocol::now_rfc3339(),
+        };
+        engine
+            .store()
+            .insert_remote_test_evidence_with_event(&evidence)
+            .unwrap();
+
+        let live = engine.replay_session(&session.id).await.unwrap();
+        assert!(live.consistent, "{:?}", live.mismatches);
+        let bundle = engine.export_session(&session.id).await.unwrap();
+        assert_eq!(bundle.contracts.len(), 1);
+        assert_eq!(bundle.contract_usage.len(), 1);
+        assert_eq!(bundle.progress.len(), 1);
+        assert_eq!(bundle.remote_test_evidence.len(), 1);
+        // Go through the same JSON wire shape `vp export`/`vp import` use.
+        let bundle: SessionBundle =
+            serde_json::from_str(&serde_json::to_string(&bundle).unwrap()).unwrap();
+        assert_eq!(bundle.contracts.len(), 1);
+        assert_eq!(bundle.progress.len(), 1);
+        assert_eq!(bundle.remote_test_evidence.len(), 1);
+
+        let imported_data = TempDir::new().unwrap();
+        let imported = Engine::new(Store::open(imported_data.path()).unwrap());
+        imported.import_session(bundle).await.unwrap();
+        let replayed = imported.replay_session(&session.id).await.unwrap();
+        assert!(replayed.consistent, "{:?}", replayed.mismatches);
+        assert_eq!(
+            imported
+                .store()
+                .list_contracts_for_session(&session.id)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            imported
+                .store()
+                .list_contract_usage_for_session(&session.id)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            imported
+                .store()
+                .list_progress_rows(&session.id)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            imported
+                .store()
+                .list_remote_test_evidence_for_session(&session.id)
+                .unwrap()
+                .len(),
+            1
+        );
+        let archive = imported.store().get_session(&session.id).unwrap().unwrap();
+        assert_eq!(archive.status, "imported");
+    }
+
+    #[tokio::test]
+    async fn replay_detects_a_lost_run_runtime_snapshot_and_repair_restores_it() {
+        let (engine, project, session, data, _repo) = replay_fixture("run pin").await;
+        let run_id = Uuid::now_v7().to_string();
+        let now = vp_protocol::now_rfc3339();
+        let snapshot = RuntimeSnapshot {
+            schema_version: 1,
+            runtime_version: "test-runtime".into(),
+            runtime_build: "test-build".into(),
+            policy_hash: "f".repeat(64),
+            tool_bundle_hash: "1".repeat(64),
+            prompt_layout_version: 3,
+            plan_revision: 2,
+            contract_hash: "2".repeat(64),
+            created_at: now.clone(),
+        };
+        engine
+            .store()
+            .start_session_run(&SessionRun {
+                run_id: run_id.clone(),
+                session_id: session.id.clone(),
+                project_id: project.id.clone(),
+                agent_id: "agent-1".into(),
+                agent_name: "Leader".into(),
+                agent_role: "leader".into(),
+                task_id: None,
+                department: None,
+                objective: "pin replay".into(),
+                provider: "test".into(),
+                model: "test-model".into(),
+                status: "running".into(),
+                attempt: 1,
+                resumed_from_run_id: None,
+                resume_root_id: run_id.clone(),
+                top_level: true,
+                started_at: now.clone(),
+                updated_at: now.clone(),
+                ended_at: None,
+                budget: Default::default(),
+                worktree_head: String::new(),
+                plan_revision: 0,
+                runtime_snapshot: Some(snapshot.clone()),
+                last_event_seq: 0,
+                failure: None,
+            })
+            .unwrap();
+        engine
+            .store()
+            .finish_session_run(&run_id, "completed", None)
+            .unwrap();
+        let report = engine.replay_session(&session.id).await.unwrap();
+        assert!(report.runs_match, "{:?}", report.mismatches);
+
+        let conn = rusqlite::Connection::open(data.path().join("verlinpark.db")).unwrap();
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        conn.execute(
+            "UPDATE session_runs SET runtime_snapshot_json = NULL WHERE run_id = ?1",
+            rusqlite::params![run_id],
+        )
+        .unwrap();
+        let drift = engine.replay_session(&session.id).await.unwrap();
+        assert!(!drift.runs_match, "{:?}", drift.mismatches);
+
+        engine.repair_session(&session.id).await.unwrap();
+        let repaired = engine.replay_session(&session.id).await.unwrap();
+        assert!(repaired.runs_match, "{:?}", repaired.mismatches);
+        let runs = engine.session_runs(&session.id, 10).await.unwrap().runs;
+        assert_eq!(runs[0].runtime_snapshot.as_ref(), Some(&snapshot));
+    }
 }

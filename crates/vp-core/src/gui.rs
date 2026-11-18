@@ -236,6 +236,71 @@ struct GuiHolder {
     last_action_at: OffsetDateTime,
     last_action: Instant,
     grace: Duration,
+    /// Ticket of the action currently in flight, if any. While this is set and
+    /// recent, the grace sweeper and a different session's acquisition must
+    /// not reclaim the lease: the action may legitimately outlive the
+    /// configured grace (a browser ticket covers helper startup plus a 75s
+    /// action, and grace is user-configurable down to 0). It is cleared by
+    /// `finish` when the finishing ticket matches.
+    active_ticket: Option<String>,
+    /// Start of the current in-flight action. A ticket that is never finished
+    /// (the run was cancelled or killed) stops suppressing grace after the
+    /// existing GUI lease TTL, which is also the SQLite row's own bound. This
+    /// intentionally reuses the lease TTL rather than defining a second
+    /// action-window constant.
+    active_since: Option<Instant>,
+}
+
+impl GuiHolder {
+    /// True while an action is in flight and still inside the lease TTL. An
+    /// abandoned ticket past the TTL no longer blocks grace release; the
+    /// SQLite row is then the only remaining authority.
+    fn action_in_flight(&self) -> bool {
+        active_action_in_flight(
+            self.active_ticket.as_deref(),
+            self.active_since,
+            Instant::now(),
+        )
+    }
+
+    /// Clear a ticket that was never finished within the lease TTL. This only
+    /// drops the in-memory marker; the lease itself is still governed by the
+    /// configured grace and the SQLite row.
+    fn clear_abandoned_action(&mut self) -> bool {
+        if self.active_ticket.is_some() && !self.action_in_flight() {
+            self.active_ticket = None;
+            self.active_since = None;
+            return true;
+        }
+        false
+    }
+
+    fn mark_action_started(&mut self, ticket_id: &str) {
+        self.active_ticket = Some(ticket_id.to_string());
+        self.active_since = Some(Instant::now());
+    }
+}
+
+/// Pure in-flight predicate so tests can exercise the TTL bound without
+/// sleeping for it. `active_since = None` with a ticket is treated as
+/// in-flight (safe default); a missing ticket is never in flight.
+fn active_action_in_flight(
+    active_ticket: Option<&str>,
+    active_since: Option<Instant>,
+    now: Instant,
+) -> bool {
+    let Some(ticket) = active_ticket else {
+        return false;
+    };
+    if ticket.is_empty() {
+        return false;
+    }
+    match active_since {
+        Some(since) => {
+            now.saturating_duration_since(since) < Duration::from_secs(GUI_LEASE_TTL_SECS)
+        }
+        None => true,
+    }
 }
 
 struct GuiWaiter {
@@ -299,12 +364,17 @@ impl GuiCoordinator {
 
         loop {
             // Reclaim an expired holder before evaluating our own request.
+            // A different session never reclaims through grace while an
+            // action is in flight: the action can outlive the configured
+            // grace. The `vanished` check below still applies when the
+            // SQLite row itself is gone.
             let expired = {
                 let mut state = self.state.lock().await;
                 if state.releasing {
                     None
                 } else if let Some(holder) = state.holder.as_ref() {
                     if holder.session_id != session_id
+                        && !holder.action_in_flight()
                         && holder.last_action.elapsed() >= holder.grace
                     {
                         state.holder.take()
@@ -390,6 +460,7 @@ impl GuiCoordinator {
                         holder.agent_name = agent_name.to_string();
                         holder.last_action = Instant::now();
                         holder.last_action_at = OffsetDateTime::now_utc();
+                        holder.mark_action_started(&ticket_id);
                         self.remove_waiter_locked(&mut state, &ticket_id);
                         return Ok(GuiAcquire::Acquired(GuiActionTicket {
                             ticket_id,
@@ -449,7 +520,7 @@ impl GuiCoordinator {
                             let generation = guard.lease.generation;
                             state.generation = state.generation.max(generation);
                             let now = OffsetDateTime::now_utc();
-                            let holder = GuiHolder {
+                            let mut holder = GuiHolder {
                                 lease_id: guard.lease_id().to_string(),
                                 guard: Some(guard),
                                 session_id: session_id.to_string(),
@@ -461,7 +532,10 @@ impl GuiCoordinator {
                                 last_action_at: now,
                                 last_action: Instant::now(),
                                 grace,
+                                active_ticket: None,
+                                active_since: None,
                             };
+                            holder.mark_action_started(&ticket_id);
                             let lease_id = holder.lease_id.clone();
                             self.remove_waiter_locked(&mut state, &ticket_id);
                             state.holder = Some(holder);
@@ -655,6 +729,10 @@ impl GuiCoordinator {
                 && holder.lease_id == ticket.lease_id
                 && holder.session_id == ticket.session_id
             {
+                if holder.active_ticket.as_deref() == Some(ticket.ticket_id.as_str()) {
+                    holder.active_ticket = None;
+                    holder.active_since = None;
+                }
                 holder.last_action = Instant::now();
                 holder.last_action_at = OffsetDateTime::now_utc();
             }
@@ -705,19 +783,29 @@ impl GuiCoordinator {
     }
 
     /// Release holders whose grace elapsed. Called by the daemon's short GUI
-    /// sweeper and opportunistically before every acquisition.
+    /// sweeper and opportunistically before every acquisition. An action in
+    /// flight keeps the holder regardless of grace; once `finish` clears the
+    /// ticket, the configured grace (including 0) applies to the last action.
     pub async fn sweep(&self) -> usize {
         let expired = {
             let mut state = self.state.lock().await;
             if state.releasing {
                 Vec::new()
             } else {
-                match state.holder.as_ref() {
-                    Some(holder) if holder.last_action.elapsed() >= holder.grace => {
-                        state.holder.take().into_iter().collect::<Vec<_>>()
+                let mut expired = None;
+                if let Some(holder) = state.holder.as_mut() {
+                    if holder.clear_abandoned_action() {
+                        tracing::warn!(
+                            lease_id = %holder.lease_id,
+                            session_id = %holder.session_id,
+                            "cleared a GUI action ticket that outlived the lease TTL"
+                        );
                     }
-                    _ => Vec::new(),
+                    if !holder.action_in_flight() && holder.last_action.elapsed() >= holder.grace {
+                        expired = state.holder.take();
+                    }
                 }
+                expired.into_iter().collect::<Vec<_>>()
             }
         };
         let mut released = 0usize;
@@ -1403,6 +1491,77 @@ mod coordinator_tests {
     }
 
     #[tokio::test]
+    async fn in_flight_action_blocks_grace_release_until_it_finishes() {
+        let (_data, _repo, engine, first, second, _project, mut policy) =
+            fixture("gui in flight", 0, 0).await;
+        policy.grace_secs = 0;
+        policy.wait_ms = 0;
+        // The ticket is held for the whole simulated action; `finish` is not
+        // called yet, which is what a long browser/computer action looks like.
+        let ticket = match engine
+            .gui_begin_action_with_policy(&policy, GuiSurface::Browser, &first, "agent-a", "A")
+            .await
+            .unwrap()
+        {
+            GuiAcquire::Acquired(ticket) => ticket,
+            GuiAcquire::Busy(busy) => panic!("first session was busy: {busy}"),
+        };
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        // Zero grace has elapsed, but the in-flight ticket must survive both
+        // the sweeper and another session's grace reclaim.
+        assert_eq!(engine.sweep_gui_grace().await, 0);
+        let (holder, _) = engine.gui.status().await;
+        assert_eq!(
+            holder.expect("in-flight holder was released").session_id,
+            first
+        );
+        let busy = engine
+            .gui_begin_action_with_policy(&policy, GuiSurface::Computer, &second, "agent-b", "B")
+            .await
+            .unwrap();
+        match busy {
+            GuiAcquire::Busy(busy) => {
+                assert_eq!(busy.code, "GUI_BUSY");
+                assert_eq!(busy.holder_session_id.as_deref(), Some(first.as_str()));
+            }
+            GuiAcquire::Acquired(_) => panic!("a second session drove the GUI during an action"),
+        }
+
+        // Finishing the matching ticket clears the in-flight marker; zero
+        // grace then lets the other session acquire with a new generation.
+        engine
+            .gui_finish_action(&ticket, GuiActionOutcome::new("snapshot"))
+            .await
+            .unwrap();
+        let next = match engine
+            .gui_begin_action_with_policy(&policy, GuiSurface::Computer, &second, "agent-b", "B")
+            .await
+            .unwrap()
+        {
+            GuiAcquire::Acquired(ticket) => ticket,
+            GuiAcquire::Busy(busy) => panic!("zero grace did not release after finish: {busy}"),
+        };
+        assert_eq!(next.session_id, second);
+        assert!(next.lease_generation > ticket.lease_generation);
+        engine.gui_end_session(&second, "cleanup").await;
+    }
+
+    #[test]
+    fn abandoned_action_ticket_is_bounded_by_the_lease_ttl() {
+        let now = Instant::now();
+        assert!(active_action_in_flight(Some("ticket"), Some(now), now));
+        assert!(!active_action_in_flight(Some(""), Some(now), now));
+        assert!(!active_action_in_flight(None, None, now));
+        // A ticket that never finished stops blocking after the existing
+        // lease TTL; no second action-window constant is involved.
+        let expired = now
+            .checked_sub(Duration::from_secs(GUI_LEASE_TTL_SECS + 1))
+            .expect("instant underflow");
+        assert!(!active_action_in_flight(Some("ticket"), Some(expired), now));
+    }
+
+    #[tokio::test]
     async fn legacy_rows_block_gui_until_retired() {
         let (_data, _repo, engine, first, _second, _project, policy) =
             fixture("gui legacy", 30, 50).await;
@@ -1505,7 +1664,12 @@ mod coordinator_tests {
         outcome.latency_ms = 2;
         engine.gui_finish_action(&ticket, outcome).await.unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
-        assert_eq!(engine.sweep_gui_grace().await, 1);
+        // The waiter may reclaim the zero-grace lease through its own
+        // acquisition path before this tick, so the sweep can legitimately
+        // release zero or one holder. The property under test is that the
+        // waiter wakes without an explicit release.
+        let released = engine.sweep_gui_grace().await;
+        assert!(released <= 1);
         let waiter = tokio::time::timeout(Duration::from_secs(2), waiter)
             .await
             .unwrap()

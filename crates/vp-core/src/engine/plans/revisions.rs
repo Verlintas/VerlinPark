@@ -2,7 +2,10 @@ use super::*;
 
 impl Engine {
     pub async fn plan_revisions(&self, session_id: &str) -> Result<Vec<PlanRevisionInfo>> {
-        let events = self.recent_events(session_id, 5_000).await?;
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let events =
+            tokio::task::spawn_blocking(move || store.plan_lifecycle_events(&session_id)).await??;
         Ok(crate::orchestration::revisions_from_events(&events))
     }
 
@@ -50,12 +53,14 @@ impl Engine {
         })
         .await??;
         let events = self.recent_events(&session_id, 5_000).await?;
-        let current_revision = crate::orchestration::plan_revision(&events);
+        // The store count is authoritative; the recent-event window is only a
+        // bounded status fallback and must never number revisions.
+        let current_revision = self.current_plan_revision(&session_id).await?;
         if let Some(expected) = expected_revision
             && expected != current_revision
         {
             anyhow::bail!(
-                "plan revision conflict: expected {expected}, current {current_revision}"
+                "PLAN_REVISION_CONFLICT: plan revision conflict: expected {expected}, current {current_revision}"
             );
         }
         crate::agent::validate_team_plan(&plan, max_managers)?;
@@ -77,6 +82,7 @@ impl Engine {
             "runtime_snapshot": snapshot,
         });
         let plan_json = serde_json::to_string(&plan)?;
+        let expected_at_write = current_revision;
         let event = tokio::task::spawn_blocking({
             let store = store.clone();
             let session_id = session_id.clone();
@@ -84,16 +90,22 @@ impl Engine {
             let payload = payload.clone();
             let snapshot_json = snapshot_json.clone();
             move || {
-                store.set_team_plan_revision_with_runtime_snapshot_and_event(
+                store.compare_and_set_team_plan_revision_with_runtime_snapshot_and_event(
                     &session_id,
                     &plan_json,
                     "team_plan.revised",
                     payload,
                     Some(&snapshot_json),
+                    expected_at_write,
                 )
             }
         })
-        .await??;
+        .await??
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "PLAN_REVISION_CONFLICT: plan revision conflict: revision {current_revision} was written concurrently"
+            )
+        })?;
         let _ = self.events.send(event.clone());
         self.scheduler.sync_plan(&session, &plan).await?;
         Ok(ReviseTeamPlanResult {
@@ -118,7 +130,11 @@ impl Engine {
         session_id: &str,
         revision: u32,
     ) -> Result<PlanRevisionDetailResult> {
-        let events = self.all_events(session_id).await?;
+        let store = self.store.clone();
+        let session_id_owned = session_id.to_string();
+        let events =
+            tokio::task::spawn_blocking(move || store.plan_lifecycle_events(&session_id_owned))
+                .await??;
         let revisions = crate::orchestration::revisions_from_events(&events);
         let info = revisions
             .iter()
@@ -206,7 +222,32 @@ impl Engine {
         .await
     }
 
+    /// Operator/internal plan write. It intentionally replaces the stored
+    /// plan; the Leader tool surface uses [`Engine::submit_team_plan`] and the
+    /// explicit revision path instead.
     pub async fn set_team_plan(&self, session_id: &str, plan: &TeamPlan) -> Result<()> {
+        self.persist_team_plan(session_id, plan, false).await
+    }
+
+    /// First Leader submission for a session. A session has exactly one
+    /// baseline `team_plan.submitted`; a second submission is rejected with a
+    /// typed error so the task projection (attempts/completed rows) cannot be
+    /// silently reset. Changing a plan requires the explicit revision path.
+    pub async fn submit_team_plan(&self, session_id: &str, plan: &TeamPlan) -> Result<()> {
+        self.persist_team_plan(session_id, plan, true).await
+    }
+
+    async fn persist_team_plan(
+        &self,
+        session_id: &str,
+        plan: &TeamPlan,
+        require_absent: bool,
+    ) -> Result<()> {
+        if require_absent && self.get_team_plan(session_id).await?.is_some() {
+            anyhow::bail!(
+                "PLAN_REVISION_REQUIRED: session {session_id} already has a TeamPlan; submit_team_plan cannot replace it without an explicit revision"
+            );
+        }
         let store = self.store.clone();
         let id = session_id.to_string();
         let json = serde_json::to_string(plan)?;
@@ -216,16 +257,45 @@ impl Engine {
             tokio::task::spawn_blocking(move || store.get_session(&id)).await??
         }
         .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+        if loaded.status == "imported" {
+            anyhow::bail!("imported sessions are read-only archives");
+        }
         let revision = self
             .current_plan_revision(session_id)
             .await?
             .saturating_add(1);
         let snapshot = self.pin_plan_snapshot(&loaded, plan, revision).await?;
         let snapshot_json = serde_json::to_string(&snapshot)?;
-        let event = tokio::task::spawn_blocking(move || {
-            store.set_team_plan_with_runtime_snapshot_and_event(&id, &json, Some(&snapshot_json))
-        })
-        .await??;
+        let event = if require_absent {
+            tokio::task::spawn_blocking({
+                let store = store.clone();
+                let id = id.clone();
+                let json = json.clone();
+                let snapshot_json = snapshot_json.clone();
+                move || {
+                    store.set_team_plan_if_absent_with_runtime_snapshot_and_event(
+                        &id,
+                        &json,
+                        Some(&snapshot_json),
+                    )
+                }
+            })
+            .await??
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "PLAN_REVISION_REQUIRED: session {session_id} already has a TeamPlan; submit_team_plan cannot replace it without an explicit revision"
+                )
+            })?
+        } else {
+            tokio::task::spawn_blocking(move || {
+                store.set_team_plan_with_runtime_snapshot_and_event(
+                    &id,
+                    &json,
+                    Some(&snapshot_json),
+                )
+            })
+            .await??
+        };
         let _ = self.events.send(event);
         let store = self.store.clone();
         let id = session_id.to_string();
@@ -241,5 +311,136 @@ impl Engine {
         let id = session_id.to_string();
         let raw = tokio::task::spawn_blocking(move || store.get_team_plan(&id)).await??;
         Ok(raw.and_then(|json| serde_json::from_str(&json).ok()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use vp_protocol::types::{PlanDepartment, PlanTask};
+
+    fn task(id: &str, deps: Vec<String>) -> PlanTask {
+        PlanTask {
+            id: id.into(),
+            department: "impl".into(),
+            title: id.into(),
+            kind: "coding".into(),
+            priority: 0,
+            profile: None,
+            deps,
+            write_scope: vec![format!("src/{id}")],
+            acceptance: vec!["done".into()],
+            token_budget: None,
+            cost_budget_usd: None,
+            parent_task_id: None,
+            fanout_key: None,
+            fanout_join_for: None,
+        }
+    }
+
+    fn plan() -> TeamPlan {
+        TeamPlan {
+            goal: "plan revision".into(),
+            departments: vec![PlanDepartment {
+                name: "impl".into(),
+                manager_title: "Implementation".into(),
+                profile: "coding".into(),
+                objective: "build".into(),
+                token_budget: None,
+                cost_budget_usd: None,
+            }],
+            tasks: vec![task("T1", vec![])],
+        }
+    }
+
+    #[tokio::test]
+    async fn resubmission_requires_revision_and_revision_preserves_completed_tasks() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("plans"))
+            .unwrap();
+        let session = store.create_session(&project.id, "resubmit").unwrap();
+        let engine = Engine::new(store.clone());
+
+        let original = plan();
+        engine
+            .submit_team_plan(&session.id, &original)
+            .await
+            .unwrap();
+        let plan_seq = store
+            .latest_event_seq(&session.id, "team_plan.submitted")
+            .unwrap();
+        store
+            .claim_plan_tasks_with_events(&session.id, plan_seq, &["T1".into()])
+            .unwrap();
+        store
+            .finish_plan_task(&session.id, plan_seq, "T1", "completed", None)
+            .unwrap()
+            .unwrap();
+        store
+            .append_event(
+                &session.id,
+                "plan_task.finished",
+                serde_json::json!({
+                    "task_id": "T1",
+                    "task_status": "completed",
+                    "summary": "done",
+                }),
+            )
+            .unwrap();
+        let lifecycle_before = store.plan_lifecycle_events(&session.id).unwrap().len();
+        assert_eq!(lifecycle_before, 1);
+
+        let error = engine
+            .submit_team_plan(&session.id, &original)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().starts_with("PLAN_REVISION_REQUIRED"),
+            "{error}"
+        );
+        assert_eq!(
+            store.plan_lifecycle_events(&session.id).unwrap().len(),
+            lifecycle_before,
+            "a rejected submission must not append team_plan.submitted"
+        );
+        let t1 = store
+            .list_plan_tasks(None, Some(&session.id))
+            .unwrap()
+            .into_iter()
+            .find(|task| task.task_id == "T1")
+            .unwrap();
+        assert_eq!(t1.status, "completed");
+        assert_eq!(t1.attempts, 1);
+
+        let mut revised = original.clone();
+        revised.goal = "plan revision with follow-up".into();
+        revised.tasks.push(task("T2", vec!["T1".into()]));
+        let result = engine
+            .revise_team_plan(&session.id, revised, "add a follow-up", "user", Some(1), 4)
+            .await
+            .unwrap();
+        assert_eq!(result.revision.revision, 2);
+        assert_eq!(engine.plan_revisions(&session.id).await.unwrap().len(), 2);
+
+        let tasks = store.list_plan_tasks(None, Some(&session.id)).unwrap();
+        let t1 = tasks.iter().find(|task| task.task_id == "T1").unwrap();
+        assert_eq!(t1.status, "completed");
+        assert_eq!(t1.attempts, 1);
+        let t2 = tasks.iter().find(|task| task.task_id == "T2").unwrap();
+        assert_eq!(t2.status, "pending");
+
+        let error = engine
+            .submit_team_plan(&session.id, &original)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().starts_with("PLAN_REVISION_REQUIRED"),
+            "{error}"
+        );
+        assert_eq!(store.plan_lifecycle_events(&session.id).unwrap().len(), 2);
     }
 }

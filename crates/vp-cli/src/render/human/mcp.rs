@@ -148,10 +148,6 @@ pub(super) fn print(value: &Value) -> bool {
         );
         return true;
     }
-    if let Some(removed) = value.get("removed").and_then(Value::as_bool) {
-        println!("MCP server removed={removed}");
-        return true;
-    }
     if let Some(questions) = value.get("questions").and_then(Value::as_array) {
         for question in questions {
             println!(

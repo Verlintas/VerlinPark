@@ -2318,6 +2318,22 @@ pub(crate) fn shell_secret_roots(data_dir: &std::path::Path) -> Vec<PathBuf> {
         data_dir.join("sessions"),
         data_dir.join("logs"),
         data_dir.join("artifacts"),
+        // Daemon-owned runtime state that backs session-scoped APIs. Shell
+        // must not read another session's spilled tool outputs, process logs,
+        // verification clones, scratch, or derived archive/media scratch.
+        data_dir.join("tool-outputs"),
+        data_dir.join("processes"),
+        data_dir.join("verify"),
+        data_dir.join("sandbox"),
+        data_dir.join("archive-extracts"),
+        data_dir.join("media-transcode"),
+        // Sibling session/task worktrees and daemon temp/import scratch. The
+        // current agent's own worktree, scratch, and Git metadata are
+        // re-allowed after the denies in `tools::sandboxed_command`.
+        data_dir.join("worktrees"),
+        data_dir.join("tmp"),
+        // Backup signing keyring; it is 0600 for the daemon, not for a shell.
+        data_dir.join("backup-keys"),
         data_dir.join("projects.jsonl"),
         data_dir.join("projects.jsonl.tmp"),
     ];

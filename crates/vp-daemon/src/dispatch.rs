@@ -163,8 +163,9 @@ use crate::backup_status::backup_status;
 use crate::errors::{
     approval_error, archive_media_error, coordination_error, diagnosis_error, effect_error,
     fanout_error, forge_error, gate_error, identity_error, internal_error, memory_error,
-    otel_error, remote_bootstrap_error, remote_integration_error, remote_test_error,
-    retrieval_policy_error, runtime_pin_error, source_index_error, workspace_error,
+    operation_error, otel_error, remote_bootstrap_error, remote_integration_error,
+    remote_test_error, retrieval_policy_error, runtime_pin_error, session_start_error,
+    source_index_error, validation_or_internal, workspace_error,
 };
 use crate::http::collect_daemon_metrics;
 use crate::metrics;

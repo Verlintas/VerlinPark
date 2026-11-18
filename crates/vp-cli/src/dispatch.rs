@@ -46,6 +46,9 @@ mod task;
 mod team;
 mod testing;
 
+#[cfg(test)]
+pub(crate) use preview::streamed_exit_error;
+
 pub(crate) async fn run_command(
     command: Command,
     discovery: Discovery,

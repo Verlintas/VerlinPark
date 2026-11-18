@@ -1173,6 +1173,77 @@ pub(crate) fn anthropic_history_message(message: &ChatMessage) -> Option<Value> 
     ])))
 }
 
+fn anthropic_tool_result_block(message: &ChatMessage) -> Value {
+    let tool_use_id = message.tool_call_id.clone().unwrap_or_default();
+    Value::Object(Map::from_iter([
+        ("type".to_string(), Value::String("tool_result".to_string())),
+        ("tool_use_id".to_string(), Value::String(tool_use_id)),
+        (
+            "content".to_string(),
+            Value::String(message.content.clone()),
+        ),
+    ]))
+}
+
+/// Project an Anthropic history. Consecutive `tool` messages answer one
+/// assistant turn, so they become a single `user` message containing all
+/// `tool_result` blocks. Anthropic associates tool results with the preceding
+/// assistant message and accepts one user message per assistant turn; one user
+/// message per result is rejected by strict gateways and diverges from the
+/// canonical hash. Blocks follow the assistant's `tool_use` order; an unmatched
+/// result keeps its relative position after the matched ones.
+fn anthropic_history_messages(messages: &[ChatMessage]) -> Vec<Value> {
+    let mut values = Vec::with_capacity(messages.len());
+    let mut index = 0;
+    while index < messages.len() {
+        if messages[index].role == "tool" {
+            let start = index;
+            while index < messages.len() && messages[index].role == "tool" {
+                index += 1;
+            }
+            let mut blocks = messages[start..index]
+                .iter()
+                .enumerate()
+                .map(|(offset, message)| {
+                    let tool_use_id = message.tool_call_id.as_deref().unwrap_or_default();
+                    let rank = tool_use_order(values.last(), tool_use_id);
+                    (rank, offset, anthropic_tool_result_block(message))
+                })
+                .collect::<Vec<_>>();
+            blocks.sort_by_key(|entry| (entry.0, entry.1));
+            values.push(Value::Object(Map::from_iter([
+                ("role".to_string(), Value::String("user".to_string())),
+                (
+                    "content".to_string(),
+                    Value::Array(blocks.into_iter().map(|(_, _, block)| block).collect()),
+                ),
+            ])));
+            continue;
+        }
+        if let Some(value) = anthropic_history_message(&messages[index]) {
+            values.push(value);
+        }
+        index += 1;
+    }
+    values
+}
+
+/// Position of `tool_use_id` in the previous assistant message's tool_use
+/// blocks. `usize::MAX` marks a result with no matching call so it sorts after
+/// the matched results without being dropped.
+fn tool_use_order(previous: Option<&Value>, tool_use_id: &str) -> usize {
+    previous
+        .and_then(|value| value.get("content"))
+        .and_then(Value::as_array)
+        .and_then(|blocks| {
+            blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+                .position(|block| block.get("id").and_then(Value::as_str) == Some(tool_use_id))
+        })
+        .unwrap_or(usize::MAX)
+}
+
 fn project_history(request: &ChatRequest, capabilities: ProviderCacheCapabilities) -> Vec<Value> {
     match capabilities.wire {
         ProviderWire::OpenAiCompatible => request
@@ -1181,10 +1252,8 @@ fn project_history(request: &ChatRequest, capabilities: ProviderCacheCapabilitie
             .map(|message| openai_history_message(message, capabilities))
             .map(|value| strip_volatile_fields(&value))
             .collect(),
-        ProviderWire::Anthropic => request
-            .messages
-            .iter()
-            .filter_map(anthropic_history_message)
+        ProviderWire::Anthropic => anthropic_history_messages(&request.messages)
+            .into_iter()
             .map(|value| strip_volatile_fields(&value))
             .collect(),
     }
@@ -1965,6 +2034,66 @@ mod tests {
         assert_eq!(last["content"][0]["type"], json!("tool_result"));
         assert_eq!(last["content"][0]["tool_use_id"], json!("toolu_1"));
         assert_eq!(last["content"][0]["content"], json!("file contents"));
+    }
+
+    #[test]
+    fn anthropic_parallel_tool_results_are_one_user_message_in_tool_use_order() {
+        let request = request(vec![
+            ChatMessage::user("read both"),
+            ChatMessage::assistant_tool_calls(
+                "",
+                vec![
+                    ToolCall {
+                        id: "toolu_1".into(),
+                        name: "read_file".into(),
+                        arguments: "{}".into(),
+                    },
+                    ToolCall {
+                        id: "toolu_2".into(),
+                        name: "read_file".into(),
+                        arguments: "{}".into(),
+                    },
+                ],
+            ),
+            // Results arrive in completion order, not tool_use order.
+            ChatMessage::tool("toolu_2", "two"),
+            ChatMessage::tool("toolu_1", "one"),
+            ChatMessage::assistant_tool_calls("both read", vec![]),
+        ]);
+        let canonical = canonical_request(&request, anthropic_capabilities(), "tools");
+        assert_eq!(canonical.history_messages.len(), 4);
+        let results = &canonical.history_messages[2];
+        assert_eq!(results["role"], json!("user"));
+        let blocks = results["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], json!("tool_result"));
+        assert_eq!(blocks[0]["tool_use_id"], json!("toolu_1"));
+        assert_eq!(blocks[0]["content"], json!("one"));
+        assert_eq!(blocks[1]["tool_use_id"], json!("toolu_2"));
+        assert_eq!(blocks[1]["content"], json!("two"));
+        // The assistant turn that follows is not merged into the tool results.
+        assert_eq!(canonical.history_messages[3]["role"], json!("assistant"));
+    }
+
+    #[test]
+    fn anthropic_tool_results_stop_grouping_at_a_non_tool_message() {
+        let request = request(vec![
+            ChatMessage::user("start"),
+            ChatMessage::tool("toolu_1", "one"),
+            ChatMessage::user("next"),
+            ChatMessage::tool("toolu_2", "two"),
+        ]);
+        let canonical = canonical_request(&request, anthropic_capabilities(), "tools");
+        assert_eq!(canonical.history_messages.len(), 4);
+        assert_eq!(
+            canonical.history_messages[1]["content"][0]["tool_use_id"],
+            json!("toolu_1")
+        );
+        assert_eq!(canonical.history_messages[2]["content"], json!("next"));
+        assert_eq!(
+            canonical.history_messages[3]["content"][0]["tool_use_id"],
+            json!("toolu_2")
+        );
     }
 
     #[test]

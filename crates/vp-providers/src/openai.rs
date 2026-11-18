@@ -172,16 +172,31 @@ impl OpenAiCompatibleProvider {
         }
         let stream = Box::pin(response.bytes_stream().eventsource());
         let preempt = preempt.clone();
+        let provider_id = self.id.clone();
         let mapped = async_stream::stream! {
             let mut tool_calls: BTreeMap<usize, ToolCall> = BTreeMap::new();
             let mut saw_done = false;
-            let mut stream_failed = false;
+            // A terminal provider error ends the stream after the error event;
+            // it must never be followed by ToolCall/Done events (PR-15).
+            let mut terminated = false;
+            // The provider's cumulative usage is buffered and emitted once, so
+            // a provider that repeats the same cumulative object cannot be
+            // counted twice by additive consumers.
+            let mut pending_usage: Option<StreamEvent> = None;
+            // The terminal choice state. `[DONE]` alone is not proof of a
+            // complete answer: max-token truncation, content filtering, and
+            // refusals all end the SSE stream normally.
+            let mut finish_reason: Option<String> = None;
             let mut stream = stream;
             loop {
                 let next = match &preempt {
                     Some(token) => tokio::select! {
                         _ = token.cancelled() => {
+                            if let Some(usage) = pending_usage.take() {
+                                yield Ok(usage);
+                            }
                             yield Err(ProviderError::preempted(token));
+                            terminated = true;
                             break;
                         }
                         item = stream.next() => item,
@@ -193,7 +208,11 @@ impl OpenAiCompatibleProvider {
                 };
                 match item {
                     Err(error) => {
+                        if let Some(usage) = pending_usage.take() {
+                            yield Ok(usage);
+                        }
                         yield Err(provider_error_from_stream(error));
+                        terminated = true;
                         break;
                     }
                     Ok(event) => {
@@ -205,16 +224,30 @@ impl OpenAiCompatibleProvider {
                             Ok(value) => value,
                             Err(error) => {
                                 yield Err(ProviderError::Parse(error.to_string()));
-                                continue;
+                                terminated = true;
+                                break;
                             }
                         };
                         if let Some(error) = value.get("error") {
-                            stream_failed = true;
+                            // Accounting for an already-billed attempt stays
+                            // honest; the error is still terminal.
+                            if let Some(usage) = pending_usage.take() {
+                                yield Ok(usage);
+                            }
                             yield Err(ProviderError::Api {
                                 status: 200,
                                 body: crate::redact_provider_body(&error.to_string()),
                             });
+                            terminated = true;
                             break;
+                        }
+                        if let Some(reason) = value
+                            .pointer("/choices/0/finish_reason")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|reason| !reason.is_empty())
+                        {
+                            finish_reason = Some(reason.to_string());
                         }
                         if let Some(text) = value
                             .pointer("/choices/0/delta/content")
@@ -256,12 +289,30 @@ impl OpenAiCompatibleProvider {
                             }
                         }
                         if let Some(usage) = openai_usage(&value) {
-                            yield Ok(usage);
+                            // Cumulative usage: keep only the newest snapshot.
+                            pending_usage = Some(usage);
                         }
                     }
                 }
             }
-            if !saw_done && !stream_failed {
+            if terminated {
+                return;
+            }
+            if let Some(reason) = finish_reason.as_deref()
+                && let Some(message) = completion_failure(&provider_id, reason)
+            {
+                // The provider reported usage for a turn that is not usable.
+                // Record it, but never emit the buffered tool calls or `Done`.
+                if let Some(usage) = pending_usage.take() {
+                    yield Ok(usage);
+                }
+                yield Err(ProviderError::Stream(message));
+                return;
+            }
+            if let Some(usage) = pending_usage.take() {
+                yield Ok(usage);
+            }
+            if !saw_done {
                 yield Err(ProviderError::Stream(
                     "provider stream ended before [DONE]".into(),
                 ));
@@ -324,6 +375,31 @@ fn openai_body(
         body["tool_choice"] = json!("auto");
     }
     body
+}
+
+/// Classify the terminal OpenAI `finish_reason`. Only values that mean "the
+/// model finished the answer" are accepted. Truncation, filtering, refusals,
+/// and unknown vendor reasons are explicit provider failures: partial text or
+/// tool arguments from such a turn must not be treated as a successful
+/// completion.
+fn completion_failure(provider_id: &str, reason: &str) -> Option<String> {
+    let detail = match reason {
+        "stop" | "tool_calls" | "function_call" => return None,
+        "length" => "the response reached the provider max-token limit and is truncated",
+        "content_filter" => "the provider filtered the response content",
+        "refusal" => "the provider refused to complete the request",
+        _ => {
+            return Some(format!(
+                "provider `{provider_id}` ended the stream with unrecognized finish_reason \
+                 `{reason}`; the completion state is unknown and the turn is not accepted"
+            ));
+        }
+    };
+    Some(format!(
+        "provider `{provider_id}` ended the stream with finish_reason `{reason}`: {detail}. \
+         Partial output is kept, but the turn is not a successful completion and buffered \
+         tool calls were discarded"
+    ))
 }
 
 /// A deterministic in-memory provider used by tests and dry runs.
@@ -520,6 +596,209 @@ mod tests {
             arguments: "{\"path\":\"README.md\"}".to_string(),
         })));
         assert_eq!(events.last(), Some(&StreamEvent::Done));
+    }
+
+    async fn openai_sse_server(body: &str) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn drain_openai(
+        server: &MockServer,
+    ) -> Vec<std::result::Result<StreamEvent, ProviderError>> {
+        let provider = OpenAiCompatibleProvider::local("test", format!("{}/v1", server.uri()));
+        let mut stream = provider
+            .stream_chat(ChatRequest::new(
+                "test-model",
+                vec![ChatMessage::user("hi")],
+            ))
+            .await
+            .unwrap();
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            events.push(item);
+        }
+        events
+    }
+
+    fn stream_error_message(events: &[std::result::Result<StreamEvent, ProviderError>]) -> &str {
+        match events.iter().find_map(|event| event.as_ref().err()) {
+            Some(ProviderError::Stream(message)) => message.as_str(),
+            other => panic!("expected a provider stream error, got {other:?}"),
+        }
+    }
+
+    fn has_done(events: &[std::result::Result<StreamEvent, ProviderError>]) -> bool {
+        events
+            .iter()
+            .any(|event| matches!(event, Ok(StreamEvent::Done)))
+    }
+
+    #[tokio::test]
+    async fn openai_length_finish_reason_is_not_success() {
+        let server = openai_sse_server(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3}}\n\n",
+            "data: [DONE]\n\n"
+        ))
+        .await;
+        let events = drain_openai(&server).await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Ok(StreamEvent::TextDelta(text)) if text == "partial"
+        )));
+        assert!(!has_done(&events), "length must not report Done");
+        let message = stream_error_message(&events);
+        assert!(message.contains("length"), "{message}");
+        assert!(message.contains("truncated"), "{message}");
+        // The provider-billed usage is preserved even though the turn failed.
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Ok(StreamEvent::Usage {
+                input_tokens: 12,
+                output_tokens: 3,
+                ..
+            })
+        )));
+    }
+
+    #[tokio::test]
+    async fn openai_content_filter_finish_reason_is_not_success() {
+        let server = openai_sse_server(concat!(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":0}}\n\n",
+            "data: [DONE]\n\n"
+        ))
+        .await;
+        let events = drain_openai(&server).await;
+        assert!(!has_done(&events), "content_filter must not report Done");
+        let message = stream_error_message(&events);
+        assert!(message.contains("content_filter"), "{message}");
+        assert!(message.contains("filtered"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn openai_stop_finish_reason_completes() {
+        let server = openai_sse_server(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        ))
+        .await;
+        let events = drain_openai(&server).await;
+        assert!(events.iter().all(std::result::Result::is_ok));
+        assert!(matches!(events.last(), Some(Ok(StreamEvent::Done))));
+    }
+
+    #[tokio::test]
+    async fn openai_tool_calls_finish_reason_is_accepted() {
+        let server = openai_sse_server(concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        ))
+        .await;
+        let events = drain_openai(&server).await;
+        assert!(events.iter().all(std::result::Result::is_ok));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Ok(StreamEvent::ToolCall(call)) if call.id == "call_1"
+        )));
+        assert!(matches!(events.last(), Some(Ok(StreamEvent::Done))));
+    }
+
+    #[tokio::test]
+    async fn openai_truncated_tool_arguments_are_not_emitted() {
+        let server = openai_sse_server(concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: [DONE]\n\n"
+        ))
+        .await;
+        let events = drain_openai(&server).await;
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Ok(StreamEvent::ToolCall(_)))),
+            "a truncated tool call must never be executable"
+        );
+        assert!(!has_done(&events));
+        assert!(stream_error_message(&events).contains("length"));
+    }
+
+    #[tokio::test]
+    async fn openai_unknown_finish_reason_is_not_success() {
+        let server = openai_sse_server(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"mystery\"}]}\n\n",
+            "data: [DONE]\n\n"
+        ))
+        .await;
+        let events = drain_openai(&server).await;
+        assert!(!has_done(&events));
+        let message = stream_error_message(&events);
+        assert!(message.contains("mystery"), "{message}");
+        assert!(message.contains("unrecognized"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn openai_repeated_usage_is_not_double_counted() {
+        let server = openai_sse_server(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4}}\n\n",
+            "data: [DONE]\n\n"
+        ))
+        .await;
+        let events = drain_openai(&server).await;
+        let usage = events
+            .iter()
+            .filter_map(|event| match event {
+                Ok(StreamEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                }) => Some((
+                    *input_tokens,
+                    *output_tokens,
+                    *cache_read_tokens,
+                    *cache_write_tokens,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(usage, vec![(10, 4, 0, 0)]);
+        assert!(matches!(events.last(), Some(Ok(StreamEvent::Done))));
+    }
+
+    #[tokio::test]
+    async fn openai_in_stream_error_is_terminal() {
+        let server = openai_sse_server(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            "data: {\"error\":{\"message\":\"backend unavailable\"}}\n\n",
+            "data: [DONE]\n\n"
+        ))
+        .await;
+        let events = drain_openai(&server).await;
+        assert!(!has_done(&events));
+        assert!(matches!(
+            events.iter().find_map(|event| event.as_ref().err()),
+            Some(ProviderError::Api { status: 200, .. })
+        ));
+        assert_eq!(
+            events.iter().filter(|event| event.is_err()).count(),
+            1,
+            "a terminal error must not be repeated"
+        );
     }
 
     #[tokio::test]

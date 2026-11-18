@@ -1,23 +1,5 @@
 use super::*;
 
-pub(in crate::agent) async fn emit_plan_task_finished(
-    engine: &Engine,
-    session_id: &str,
-    spec: &AgentSpec,
-    task_id: &str,
-    status: &str,
-    reason: Option<&str>,
-) -> Result<()> {
-    let mut payload = serde_json::json!({
-        "task_id": task_id,
-        "task_status": status,
-    });
-    if let Some(reason) = reason {
-        payload["reason"] = serde_json::json!(reason);
-    }
-    emit(engine, session_id, spec, "plan_task.finished", payload).await
-}
-
 pub(in crate::agent) async fn latest_plan_results(
     engine: &Engine,
     session_id: &str,
@@ -63,6 +45,9 @@ pub(in crate::agent) async fn latest_plan_results(
     Ok(results)
 }
 
+/// Apply one guarded task transition. `None` means the store refused the
+/// write because the row is already completed/terminal; callers must not emit
+/// a `plan_task.finished` event in that case.
 pub(in crate::agent) async fn record_scheduled_task_finish(
     engine: &Engine,
     session_id: &str,

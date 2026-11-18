@@ -318,9 +318,20 @@ async fn run_one(
     }
     let solved = reasons.is_empty();
     metrics.recompute_cost(&pricing, solved);
+    let mut provider_metadata = built.metadata.clone();
+    if provider_metadata.mode == "real" {
+        provider_metadata.usage_source = if metrics.usage_calls == 0 {
+            "none_recorded".to_string()
+        } else if metrics.estimated_usage {
+            "provider_estimated".to_string()
+        } else {
+            "provider".to_string()
+        };
+    }
     let trial_evidence = crate::reliability::analyze_events(&events);
     let coordination = CoordinationUsage::from_entries(&ledger.entries);
-    let comparison = comparison_key(scenario, &built.metadata, &pricing);
+    let pricing_provenance = scenario.config.pricing_provenance;
+    let comparison = comparison_key(scenario, &provider_metadata, &pricing, &pricing_provenance);
     let mut record = RunRecord {
         run_id: format!(
             "{}-r{}-{}",
@@ -347,7 +358,8 @@ async fn run_one(
         coordination,
         comparison,
         pricing,
-        provider: built.metadata.clone(),
+        pricing_provenance,
+        provider: provider_metadata,
         target_paths: scenario.target_paths(),
         retained_workspace: None,
     };
@@ -443,7 +455,8 @@ fn build_provider(scenario: &Scenario, options: &BenchRunOptions) -> Result<Buil
                 );
             }
             let metadata =
-                ProviderMetadata::real(settings.provider_id.clone(), settings.model.clone());
+                ProviderMetadata::real(settings.provider_id.clone(), settings.model.clone())
+                    .with_base_url(settings.base_url.clone());
             let metering = Arc::new(MeteringProvider::new(settings.clone().into_provider()));
             let provider: Arc<dyn Provider> = metering.clone();
             Ok(BuiltProvider {

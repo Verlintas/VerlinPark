@@ -123,14 +123,15 @@ impl Store {
             let (team_templates, project_team_templates, team_template_events) =
                 crate::store::team_template::manifest_records(self, &project.id)?;
             let snapshot = ProjectManifestSnapshot {
-                version: 1,
+                version: PROJECT_MANIFEST_VERSION,
+                truncated: false,
                 recorded_at: now_rfc3339(),
                 shell_policy: self.get_shell_policy(&project.id)?,
                 contract_policy: self.get_contract_policy(&project.id)?,
                 agent_identity_policy: self.get_agent_identity_policy(&project.id)?,
                 agent_identities: self.list_agent_identities(&project.id, None, None)?,
                 agent_identity_events: self
-                    .list_agent_identity_events_for_project(&project.id, Some(100_000))?,
+                    .list_agent_identity_events_for_project(&project.id, None)?,
                 session_agent_assignments: self.list_agent_assignments_for_replay(&project.id)?,
                 agent_inbox: self.list_agent_inbox_for_replay(&project.id)?,
                 agent_coordination_events: self
@@ -158,7 +159,7 @@ impl Store {
                 agent_employment_events: crate::store::employment::list_employment_events(
                     self,
                     &project.id,
-                    Some(100_000),
+                    None,
                 )?,
                 agent_performance: crate::store::employment::list_agent_performance(
                     self,
@@ -209,21 +210,15 @@ impl Store {
                 intake_tasks: self.list_intake_tasks(Some(&project.id), None, None)?,
                 programs: self.list_programs(Some(&project.id), None, None)?,
                 program_milestones: self.list_program_milestones_for_project(&project.id)?,
-                program_events: self.list_program_events_for_project(&project.id, Some(100_000))?,
+                program_events: self.list_program_events_for_project(&project.id, None)?,
                 skills: self.list_skills(Some(&project.id), true)?,
                 project,
             };
             serde_json::to_writer(&mut line_buffer, &snapshot)?;
             line_buffer.push(b'\n');
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("opening project manifest {}", path.display()))?;
-        file.write_all(&line_buffer)?;
-        file.flush()?;
-        paths::ensure_private_file(&path)?;
+        write_project_manifest_atomic(&self.data_dir, &line_buffer)
+            .with_context(|| format!("writing project manifest {}", path.display()))?;
         Ok(())
     }
 
@@ -471,4 +466,39 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+/// Write the complete manifest through a private temp file and an atomic
+/// rename. A crash can leave the previous complete manifest or the new one,
+/// never a half-written line. The previous snapshot is preserved as
+/// `projects.jsonl.prev` for manual recovery.
+fn write_project_manifest_atomic(data_dir: &Path, contents: &[u8]) -> Result<()> {
+    let path = data_dir.join("projects.jsonl");
+    let previous = data_dir.join("projects.jsonl.prev");
+    let temp = data_dir.join(format!(".projects.jsonl.{}.tmp", Uuid::now_v7()));
+    let write = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        paths::ensure_private_file(&temp)?;
+        if path.is_file()
+            && let Err(error) = std::fs::copy(&path, &previous)
+        {
+            tracing::warn!(%error, "could not preserve the previous project manifest");
+        }
+        std::fs::rename(&temp, &path)?;
+        // Best-effort directory sync so the rename survives a power loss.
+        if let Ok(directory) = std::fs::File::open(data_dir) {
+            let _ = directory.sync_all();
+        }
+        Ok(())
+    })();
+    if write.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    write
 }

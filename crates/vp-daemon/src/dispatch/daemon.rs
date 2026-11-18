@@ -100,7 +100,24 @@ pub(super) async fn handle(
             },
             Err(response) => response_with_id(id, response),
         },
-        "event.subscribe" => RpcResponse::success(id, json!({"subscribed": true})),
+        // Live events are delivered on the `/ws` transport after `auth` and
+        // `event.subscribe`. Answering success here would promise a stream the
+        // HTTP transport cannot provide, so this is an explicit unsupported
+        // transport error with a hint.
+        "event.subscribe" => RpcResponse::error(
+            id,
+            RpcError::with_data(
+                codes::METHOD_NOT_FOUND,
+                "event.subscribe requires the WebSocket transport",
+                json!({
+                    "code": "UNSUPPORTED_TRANSPORT",
+                    "transport": "http",
+                    "required_transport": "ws",
+                    "retryable": false,
+                    "hint": "connect to /ws, send auth, then event.subscribe; use event.list for one-shot reads",
+                }),
+            ),
+        ),
         "auth" => RpcResponse::success(id, json!({"ok": true})),
         _ => RpcResponse::error(
             id,

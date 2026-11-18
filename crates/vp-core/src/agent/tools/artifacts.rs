@@ -1,5 +1,31 @@
 use super::*;
 
+/// Resolve an artifact only when it belongs to the calling session. A foreign
+/// artifact id is indistinguishable from a missing one, so a session cannot
+/// probe another session's artifact namespace or publish derived versions into
+/// it.
+pub(in crate::agent) async fn session_artifact(
+    engine: &Engine,
+    session: &Session,
+    artifact_id: &str,
+) -> Result<Option<vp_protocol::types::Artifact>> {
+    let Some(artifact) = engine.get_artifact(artifact_id).await? else {
+        return Ok(None);
+    };
+    if artifact.session_id != session.id {
+        return Ok(None);
+    }
+    Ok(Some(artifact))
+}
+
+pub(in crate::agent) fn artifact_not_found_output(tool: &str, artifact_id: &str) -> ToolOutput {
+    ToolOutput::error_coded(
+        tool,
+        crate::tooling::errors::ToolErrorCode::NOT_FOUND,
+        format!("artifact not found: {artifact_id}"),
+    )
+}
+
 pub(in crate::agent) async fn run_publish_artifact_file(
     engine: &Engine,
     session: &Session,
@@ -71,6 +97,7 @@ pub(in crate::agent) fn archive_media_failure(tool: &str, error: &anyhow::Error)
 
 pub(in crate::agent) async fn run_archive_tool(
     engine: &Engine,
+    session: &Session,
     name: &str,
     input: Value,
 ) -> ToolOutput {
@@ -89,6 +116,11 @@ pub(in crate::agent) async fn run_archive_tool(
             );
         }
     };
+    match session_artifact(engine, session, &artifact_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return artifact_not_found_output(name, &artifact_id),
+        Err(error) => return ToolOutput::from_tool_error(name, &error),
+    }
     match name {
         "archive_list" => {
             let max_entries = input
@@ -220,6 +252,7 @@ pub(in crate::agent) async fn run_archive_tool(
 
 pub(in crate::agent) async fn run_media_tool(
     engine: &Engine,
+    session: &Session,
     spec: &AgentSpec,
     name: &str,
     input: Value,
@@ -232,6 +265,11 @@ pub(in crate::agent) async fn run_media_tool(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
             {
+                match session_artifact(engine, session, artifact_id).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return artifact_not_found_output(name, artifact_id),
+                    Err(error) => return ToolOutput::from_tool_error(name, &error),
+                }
                 let params = vp_protocol::types::MediaInfoParams {
                     artifact_id: artifact_id.to_string(),
                 };
@@ -312,6 +350,11 @@ pub(in crate::agent) async fn run_media_tool(
                     "artifact_id is required",
                 );
             };
+            match session_artifact(engine, session, artifact_id).await {
+                Ok(Some(_)) => {}
+                Ok(None) => return artifact_not_found_output(name, artifact_id),
+                Err(error) => return ToolOutput::from_tool_error(name, &error),
+            }
             let Some(format) = input.get("format").and_then(Value::as_str) else {
                 return ToolOutput::error_coded(
                     "media_transcode",
@@ -396,4 +439,195 @@ pub(in crate::agent) fn media_info_summary(
         text.push_str(&format!("\nwarning: {warning}"));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+    use vp_store::Store;
+
+    struct Fixture {
+        _data: TempDir,
+        _repo: TempDir,
+        engine: Engine,
+        session_a: Session,
+        session_b: Session,
+    }
+
+    fn fixture() -> Fixture {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("scope"))
+            .unwrap();
+        let session_a = store.create_session(&project.id, "session a").unwrap();
+        let session_b = store.create_session(&project.id, "session b").unwrap();
+        Fixture {
+            _data: data,
+            _repo: repo,
+            engine: Engine::new(store),
+            session_a,
+            session_b,
+        }
+    }
+
+    fn spec(name: &str) -> AgentSpec {
+        AgentSpec {
+            id: format!("agent-{name}"),
+            role: AgentRole::Worker,
+            name: name.to_string(),
+            depth: 1,
+            parent_name: None,
+            title: None,
+            task_id: None,
+            department: None,
+            identity_id: None,
+            identity_generation: None,
+            profile: AgentProfile::Coding,
+            allow_delegation: false,
+            task_kind: None,
+            auto_approve: false,
+            worktree: PathBuf::from("/tmp/scope-worktree"),
+            branch: "scope".to_string(),
+            session_worktree: PathBuf::from("/tmp/scope-worktree"),
+            session_branch: "scope".to_string(),
+            write_scope: Vec::new(),
+            base_commit: "0".repeat(40),
+            workspace_id: None,
+            session_workspace_id: None,
+            parent_workspace_id: None,
+        }
+    }
+
+    fn zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buffer = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut buffer);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            for (name, data) in entries {
+                writer.start_file(*name, options).unwrap();
+                writer.write_all(data).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        buffer.into_inner()
+    }
+
+    fn failure_code(output: &ToolOutput) -> &'static str {
+        output
+            .failure
+            .as_ref()
+            .expect("typed tool failure")
+            .code
+            .as_str()
+    }
+
+    async fn event_count(engine: &Engine, session_id: &str) -> usize {
+        engine
+            .list_events(session_id.to_string(), 0, 1_000)
+            .await
+            .unwrap()
+            .len()
+    }
+
+    #[tokio::test]
+    async fn archive_and_media_tools_reject_foreign_artifacts_before_publish() {
+        let fixture = fixture();
+        let spec_a = spec("Worker A");
+        let archive = fixture
+            .engine
+            .publish_artifact_binary(
+                &fixture.session_b.id,
+                "worker-b",
+                "Worker B",
+                None,
+                "bundle.zip",
+                "archive",
+                "application/zip",
+                &zip_bytes(&[("a.txt", b"alpha")]),
+            )
+            .await
+            .unwrap();
+        let media = fixture
+            .engine
+            .publish_artifact_binary(
+                &fixture.session_b.id,
+                "worker-b",
+                "Worker B",
+                None,
+                "clip.mp4",
+                "video",
+                "video/mp4",
+                b"fake media bytes",
+            )
+            .await
+            .unwrap();
+        let before_artifacts = fixture
+            .engine
+            .list_artifacts(&fixture.session_b.id)
+            .await
+            .unwrap()
+            .len();
+        let before_events = event_count(&fixture.engine, &fixture.session_b.id).await;
+
+        for (name, input) in [
+            (
+                "archive_list",
+                serde_json::json!({"artifact_id": archive.id}),
+            ),
+            (
+                "archive_extract",
+                serde_json::json!({"artifact_id": archive.id, "all": true}),
+            ),
+        ] {
+            let output = run_archive_tool(&fixture.engine, &fixture.session_a, name, input).await;
+            assert!(output.is_error, "{name} must fail: {}", output.content);
+            assert_eq!(failure_code(&output), "NOT_FOUND", "{name}");
+        }
+
+        for (name, input) in [
+            ("media_info", serde_json::json!({"artifact_id": media.id})),
+            (
+                "media_transcode",
+                serde_json::json!({"artifact_id": media.id, "format": "mp4"}),
+            ),
+        ] {
+            let output =
+                run_media_tool(&fixture.engine, &fixture.session_a, &spec_a, name, input).await;
+            assert!(output.is_error, "{name} must fail: {}", output.content);
+            assert_eq!(failure_code(&output), "NOT_FOUND", "{name}");
+        }
+
+        assert_eq!(
+            fixture
+                .engine
+                .list_artifacts(&fixture.session_b.id)
+                .await
+                .unwrap()
+                .len(),
+            before_artifacts,
+            "foreign archive/media calls must not publish derived artifacts"
+        );
+        assert_eq!(
+            event_count(&fixture.engine, &fixture.session_b.id).await,
+            before_events,
+            "foreign archive/media calls must not append victim-session events"
+        );
+
+        // Positive control: the owner can list its archive without a worktree.
+        let owned = run_archive_tool(
+            &fixture.engine,
+            &fixture.session_b,
+            "archive_list",
+            serde_json::json!({"artifact_id": archive.id}),
+        )
+        .await;
+        assert!(!owned.is_error, "{}", owned.content);
+        assert!(owned.content.contains("a.txt"));
+    }
 }

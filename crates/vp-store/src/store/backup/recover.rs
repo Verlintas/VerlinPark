@@ -314,7 +314,21 @@ impl Store {
                ))",
             params![now, process_instance],
         )?;
-        tx.execute("DELETE FROM write_leases", [])?;
+        // Clear cross-session write scopes only for sessions this recovery is
+        // interrupting. A session held by another live instance keeps its
+        // write leases; deleting them would allow overlapping writes.
+        tx.execute(
+            "DELETE FROM write_leases
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM runtime_leases l
+                 WHERE l.lease_key = 'session:' || write_leases.session_id
+                   AND l.released_at IS NULL
+                   AND l.owner_instance <> ''
+                   AND l.owner_instance <> ?1
+                   AND julianday(l.expires_at) > julianday(?2)
+             )",
+            params![process_instance, now],
+        )?;
         // Only this process's leases (and pre-fencing legacy rows) are
         // cleared. Another daemon sharing the data directory keeps its live
         // ownership; its expired rows are swept later by the normal sweep.
@@ -350,14 +364,29 @@ impl Store {
         )?;
         let interrupted_computer_leases = {
             let mut stmt = tx.prepare(
-                "SELECT lease_id, surface, owner_id, session_id, agent_id, agent_name,
-                        acquired_at, heartbeat_at, expires_at, generation
-                 FROM computer_leases ORDER BY acquired_at ASC, lease_id ASC",
+                "SELECT c.lease_id, c.surface, c.owner_id, c.session_id, c.agent_id,
+                        c.agent_name, c.acquired_at, c.heartbeat_at, c.expires_at, c.generation
+                 FROM computer_leases c
+                 WHERE julianday(c.expires_at) <= julianday(?1)
+                    OR NOT EXISTS (
+                        SELECT 1 FROM runtime_leases l
+                        WHERE l.lease_key = 'session:' || c.session_id
+                          AND l.released_at IS NULL
+                          AND l.owner_instance <> ''
+                          AND l.owner_instance <> ?2
+                          AND julianday(l.expires_at) > julianday(?1)
+                    )
+                 ORDER BY c.acquired_at ASC, c.lease_id ASC",
             )?;
-            let rows = stmt.query_map([], map_computer_lease)?;
+            let rows = stmt.query_map(params![now, process_instance], map_computer_lease)?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
-        tx.execute("DELETE FROM computer_leases", [])?;
+        for lease in &interrupted_computer_leases {
+            tx.execute(
+                "DELETE FROM computer_leases WHERE lease_id = ?1",
+                params![&lease.lease_id],
+            )?;
+        }
 
         let mut events = Vec::new();
         for lease in &interrupted_computer_leases {

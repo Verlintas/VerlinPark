@@ -233,6 +233,7 @@
 | [0227](adr/0227-daemon-entrypoint-split.md) | `vp-daemon` entrypoint split: dispatch/http/sweepers/errors/server/tests modules without changing RPC, auth, routes, or behavior | Accepted | Maintainability |
 | [0228](adr/0228-dispatch-module-splits.md) | CLI render/dispatch and daemon dispatch split by output/command/route family; behavior and protocol unchanged | Accepted | Maintainability |
 | [0229](adr/0229-live-provider-and-budget-estimation.md) | Live provider compatibility: omit empty `tool_calls`, context-aware budget preflight with 25% headroom, validate DeepSeek streaming and full agent flow | Accepted | Providers/Reliability |
+| [0230](adr/0230-reliability-hardening-round.md) | Reliability hardening: persisted approval preview, cross-session ownership, non-consuming journal replay, plan/replay guards, manifest v2, provider finish reasons, CLI policy patches, GUI in-flight lease, Swift reconnect/gap handling | Accepted | Reliability/Security |
 
 ---
 

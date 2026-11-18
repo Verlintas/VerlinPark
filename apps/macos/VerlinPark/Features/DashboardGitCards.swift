@@ -5,6 +5,9 @@ struct CheckpointsCard: View {
     @State private var deleting: SessionCheckpoint?
     @State private var restoring: SessionCheckpoint?
     @State private var previewing: SessionCheckpoint?
+    @State private var pruneSessionID: String?
+    @State private var pruneSessionGoal = ""
+    @State private var showingPrune = false
 
     var body: some View {
         @Bindable var model = model
@@ -27,7 +30,11 @@ struct CheckpointsCard: View {
                 .controlSize(.small)
                 .disabled(model.selectedSession == nil || model.checkpointStatsBusy)
                 Button("Prune >30d, keep 5") {
-                    Task { await model.pruneCheckpoints() }
+                    guard let session = model.selectedSession else { return }
+                    // Capture the intended session at presentation time.
+                    pruneSessionID = session.id
+                    pruneSessionGoal = session.goal
+                    showingPrune = true
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
@@ -157,6 +164,24 @@ struct CheckpointsCard: View {
         }
         .vpHoverLift(scale: 1.003, lift: 1)
         .vpAppear(index: 0)
+        .confirmationDialog(
+            "Prune checkpoints?",
+            isPresented: $showingPrune
+        ) {
+            Button("Prune >30d, keep 5", role: .destructive) {
+                let target = pruneSessionID
+                pruneSessionID = nil
+                guard let target else { return }
+                Task { await model.pruneCheckpoints(sessionID: target) }
+            }
+            Button("Cancel", role: .cancel) {
+                pruneSessionID = nil
+            }
+        } message: {
+            Text(
+                "Removes checkpoints older than 30 days beyond the latest 5 for “\(pruneSessionGoal)”. This cannot be undone and existing fork branches are unaffected."
+            )
+        }
         .confirmationDialog(
             "Delete checkpoint?",
             isPresented: Binding(

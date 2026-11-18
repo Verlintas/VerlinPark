@@ -63,6 +63,7 @@ pub(super) async fn dispatch(
             action,
             expires_at,
             max_uses,
+            enabled,
             disabled,
         } => {
             let project = resolve_project(&discovery, project.as_deref()).await?;
@@ -83,6 +84,11 @@ pub(super) async fn dispatch(
                     })
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("approval template not found: {id}"))?;
+                let enabled = resolve_template_enabled(
+                    enabled,
+                    disabled,
+                    existing.get("enabled").and_then(Value::as_bool),
+                )?;
                 let name = name.unwrap_or_else(|| {
                     existing
                         .get("name")
@@ -140,7 +146,7 @@ pub(super) async fn dispatch(
                     json!({
                         "id": id,
                         "name": name,
-                        "enabled": !disabled,
+                        "enabled": enabled,
                         "tool_pattern": tool_pattern,
                         "risk_levels": risk,
                         "path_globs": path_glob,
@@ -159,7 +165,7 @@ pub(super) async fn dispatch(
                 let tool_pattern =
                     tool_pattern.ok_or_else(|| anyhow::anyhow!("--tool-pattern is required"))?;
                 let action = action.ok_or_else(|| anyhow::anyhow!("--action is required"))?;
-                rpc(
+                let created = rpc(
                     &discovery,
                     "approval.template.create",
                     json!({
@@ -173,7 +179,56 @@ pub(super) async fn dispatch(
                         "max_uses": max_uses,
                     }),
                 )
-                .await?
+                .await?;
+                let want_enabled = resolve_template_enabled(enabled, disabled, None)?;
+                if want_enabled {
+                    created
+                } else {
+                    // The create RPC has no enabled field and always creates an
+                    // enabled template. Immediately disable it, and remove the
+                    // new template if that second step fails so a requested
+                    // disable never silently becomes an auto-approval grant.
+                    let template = created.get("template").cloned().ok_or_else(|| {
+                        anyhow::anyhow!("approval.template.create returned no template")
+                    })?;
+                    let id = template
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("approval.template.create returned no template id")
+                        })?
+                        .to_string();
+                    let disabled = rpc(
+                        &discovery,
+                        "approval.template.update",
+                        json!({
+                            "id": id,
+                            "name": template.get("name").cloned().unwrap_or(Value::Null),
+                            "enabled": false,
+                            "tool_pattern": template.get("tool_pattern").cloned().unwrap_or(Value::Null),
+                            "risk_levels": template.get("risk_levels").cloned().unwrap_or_else(|| json!([])),
+                            "path_globs": template.get("path_globs").cloned().unwrap_or_else(|| json!([])),
+                            "action": template.get("action").cloned().unwrap_or_else(|| json!("allow")),
+                            "expires_at": template.get("expires_at").cloned().unwrap_or(Value::Null),
+                            "max_uses": template.get("max_uses").cloned().unwrap_or(Value::Null),
+                        }),
+                    )
+                    .await;
+                    match disabled {
+                        Ok(value) => value,
+                        Err(error) => {
+                            let cleanup =
+                                rpc(&discovery, "approval.template.delete", json!({"id": id}))
+                                    .await;
+                            return Err(error.context(match cleanup {
+                                Ok(_) => "disabling the new approval template failed; the template was deleted".to_string(),
+                                Err(cleanup) => format!(
+                                    "disabling the new approval template failed and cleanup also failed: {cleanup:#}"
+                                ),
+                            }));
+                        }
+                    }
+                }
             }
         }
         Command::ApprovalTemplateDelete { id } => {

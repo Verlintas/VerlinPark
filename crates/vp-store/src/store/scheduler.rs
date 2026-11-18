@@ -114,9 +114,13 @@ impl Store {
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
-        Ok(stored
-            .and_then(|raw| serde_json::from_str::<OrchestrationPolicy>(&raw).ok())
-            .unwrap_or_default())
+        match stored {
+            // A corrupt row must fail closed. `OrchestrationPolicy::default()`
+            // is active (auto retry/escalate), so silently decoding to it would
+            // enable automation the operator never configured.
+            Some(raw) => serde_json::from_str(&raw).context("parsing stored orchestration policy"),
+            None => Ok(OrchestrationPolicy::default()),
+        }
     }
 
     pub fn set_orchestration_policy(

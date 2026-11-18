@@ -213,8 +213,46 @@ fn compare_memories(
         .then_with(|| left.id.cmp(&right.id))
 }
 
+const BRIEF_SCOPE_ORDER: [&str; 3] = ["agent", "department", "project"];
+
+fn scope_candidate_quota(scope: &str) -> usize {
+    match scope {
+        "agent" => MAX_BRIEF_CANDIDATES / 2,
+        "department" => MAX_BRIEF_CANDIDATES / 4,
+        "project" => MAX_BRIEF_CANDIDATES / 4,
+        _ => 0,
+    }
+}
+
+fn scope_item_quota(scope: &str) -> usize {
+    match scope {
+        "agent" => MAX_BRIEF_ITEMS / 2,
+        "department" => MAX_BRIEF_ITEMS / 4,
+        "project" => MAX_BRIEF_ITEMS / 4,
+        _ => 0,
+    }
+}
+
+fn append_brief_item(text: &mut String, item: &str, budget: usize) -> bool {
+    let separator = usize::from(!text.is_empty());
+    let needed = separator.saturating_add(item.len());
+    if text.len().saturating_add(needed) > budget {
+        return false;
+    }
+    if separator == 1 {
+        text.push('\n');
+    }
+    text.push_str(item);
+    true
+}
+
 /// Deterministic display order of all provided rows. Filtering is the caller's
 /// responsibility; this helper does not mutate or persist anything.
+///
+/// Candidate selection reserves capacity per scope (agent > department >
+/// project) before the global `MAX_BRIEF_CANDIDATES` cut, so a large agent
+/// history cannot erase shared or pinned department/project memory. Unused
+/// scope quota is filled from the remaining global rank.
 pub fn rank_memories(memories: &[AgentMemory], now: OffsetDateTime) -> Vec<AgentMemory> {
     let mut rows = memories
         .iter()
@@ -222,8 +260,33 @@ pub fn rank_memories(memories: &[AgentMemory], now: OffsetDateTime) -> Vec<Agent
         .cloned()
         .collect::<Vec<_>>();
     rows.sort_by(|left, right| compare_memories(left, right, now));
-    rows.truncate(MAX_BRIEF_CANDIDATES);
-    rows
+    let mut selected = Vec::with_capacity(MAX_BRIEF_CANDIDATES.min(rows.len()));
+    let mut selected_ids = BTreeSet::new();
+    for scope in BRIEF_SCOPE_ORDER {
+        let quota = scope_candidate_quota(scope);
+        for memory in rows
+            .iter()
+            .filter(|memory| memory.scope == scope)
+            .take(quota)
+        {
+            if selected.len() >= MAX_BRIEF_CANDIDATES {
+                break;
+            }
+            if selected_ids.insert(memory.id.clone()) {
+                selected.push(memory.clone());
+            }
+        }
+    }
+    for memory in &rows {
+        if selected.len() >= MAX_BRIEF_CANDIDATES {
+            break;
+        }
+        if selected_ids.insert(memory.id.clone()) {
+            selected.push(memory.clone());
+        }
+    }
+    selected.sort_by(|left, right| compare_memories(left, right, now));
+    selected
 }
 
 fn collapse_whitespace(value: &str) -> String {
@@ -308,23 +371,50 @@ pub fn select_identity_memory_brief(
     let total_candidates = ranked.len();
     let mut text = String::new();
     let mut selected = Vec::new();
+    let mut selected_ids = BTreeSet::new();
+    // Reserve item capacity per scope (agent > department > project) so shared
+    // memory survives even when newer agent-scope rows would fill the item and
+    // byte budgets first. Items are still whole: a non-fitting scope is left
+    // for the fill pass rather than split.
+    for scope in BRIEF_SCOPE_ORDER {
+        let quota = scope_item_quota(scope);
+        let mut count = 0;
+        for memory in ranked.iter().filter(|memory| memory.scope == scope) {
+            if count >= quota || selected.len() >= MAX_BRIEF_ITEMS {
+                break;
+            }
+            if selected_ids.contains(&memory.id) {
+                continue;
+            }
+            let item = render_item(memory);
+            if item.trim().is_empty() {
+                continue;
+            }
+            if !append_brief_item(&mut text, &item, budget) {
+                break;
+            }
+            selected_ids.insert(memory.id.clone());
+            selected.push(memory.clone());
+            count += 1;
+        }
+    }
+    // Fill any unused capacity from the global rank. This preserves the old
+    // behavior when only one scope has content.
     for memory in ranked {
         if selected.len() >= MAX_BRIEF_ITEMS {
             break;
+        }
+        if selected_ids.contains(&memory.id) {
+            continue;
         }
         let item = render_item(&memory);
         if item.trim().is_empty() {
             continue;
         }
-        let separator = usize::from(!text.is_empty());
-        let needed = separator + item.len();
-        if text.len().saturating_add(needed) > budget {
+        if !append_brief_item(&mut text, &item, budget) {
             break;
         }
-        if separator == 1 {
-            text.push('\n');
-        }
-        text.push_str(&item);
+        selected_ids.insert(memory.id.clone());
         selected.push(memory);
     }
     let mut scope_counts = BTreeMap::new();
@@ -786,6 +876,33 @@ mod tests {
         let ranked = rank_memories(&[right, left], now());
         assert_eq!(ranked[0].id, "m-z");
         assert_eq!(ranked[1].id, "m-a");
+    }
+
+    #[test]
+    fn brief_keeps_older_pinned_shared_memory_under_agent_pressure() {
+        let mut memories = (0..129)
+            .map(|index| {
+                memory(
+                    &format!("m-agent-{index:03}"),
+                    "agent",
+                    "2026-11-12T23:59:00Z",
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut department = memory("m-dept-pinned", "department", "2026-01-01T00:00:00Z");
+        department.pinned = true;
+        memories.push(department);
+        let brief = select_identity_memory_brief(&memories, DEFAULT_BRIEF_BYTES, now());
+        assert!(
+            brief.memory_ids.iter().any(|id| id == "m-dept-pinned"),
+            "the older pinned department memory must survive agent pressure"
+        );
+        assert!(brief.total_candidates <= MAX_BRIEF_CANDIDATES);
+        assert!(brief.brief_bytes <= DEFAULT_BRIEF_BYTES);
+        assert_eq!(brief.scope_counts.get("department"), Some(&1));
+        let ranked = rank_memories(&memories, now());
+        assert!(ranked.iter().any(|memory| memory.id == "m-dept-pinned"));
+        assert!(ranked.len() <= MAX_BRIEF_CANDIDATES);
     }
 
     #[test]

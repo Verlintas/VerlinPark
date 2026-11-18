@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::metrics::Pricing;
+use simulator::aggregate_calls;
 
 pub use live::{
     LIVE_GATE_ENV, LiveCacheBenchSettings, LiveRunOptions, live_settings_from_env,
@@ -76,8 +77,12 @@ pub struct CacheBenchPricing {
     pub output_usd_per_million: f64,
     pub cache_read_usd_per_million: f64,
     pub cache_write_usd_per_million: f64,
-    /// `caller`, `illustrative_default`, or `environment`.
+    /// `caller`, `illustrative_default`, `partial_caller`, or `environment`.
     pub source: PricingSource,
+    /// Per-field provenance. Older reports omit it; `None` means the overall
+    /// `source` applies to every field.
+    #[serde(default)]
+    pub field_sources: Option<CacheBenchPriceFieldSources>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,7 +90,39 @@ pub struct CacheBenchPricing {
 pub enum PricingSource {
     Caller,
     IllustrativeDefault,
+    PartialCaller,
     Environment,
+}
+
+impl PricingSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Caller => "caller",
+            Self::IllustrativeDefault => "illustrative_default",
+            Self::PartialCaller => "partial_caller",
+            Self::Environment => "environment",
+        }
+    }
+}
+
+/// Per-field provenance for a cache-bench price profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheBenchPriceFieldSources {
+    pub input: PricingSource,
+    pub output: PricingSource,
+    pub cache_read: PricingSource,
+    pub cache_write: PricingSource,
+}
+
+impl Default for CacheBenchPriceFieldSources {
+    fn default() -> Self {
+        Self {
+            input: PricingSource::IllustrativeDefault,
+            output: PricingSource::IllustrativeDefault,
+            cache_read: PricingSource::IllustrativeDefault,
+            cache_write: PricingSource::IllustrativeDefault,
+        }
+    }
 }
 
 impl CacheBenchPricing {
@@ -96,6 +133,12 @@ impl CacheBenchPricing {
             cache_read_usd_per_million: pricing.cache_read_usd_per_million,
             cache_write_usd_per_million: pricing.cache_write_usd_per_million,
             source: PricingSource::Caller,
+            field_sources: Some(CacheBenchPriceFieldSources {
+                input: PricingSource::Caller,
+                output: PricingSource::Caller,
+                cache_read: PricingSource::Caller,
+                cache_write: PricingSource::Caller,
+            }),
         }
     }
 
@@ -108,6 +151,7 @@ impl CacheBenchPricing {
             cache_read_usd_per_million: 0.028,
             cache_write_usd_per_million: 0.28,
             source: PricingSource::IllustrativeDefault,
+            field_sources: Some(CacheBenchPriceFieldSources::default()),
         }
     }
 
@@ -122,16 +166,73 @@ impl CacheBenchPricing {
                 bail!("cache-bench price '{name}' must be finite and non-negative");
             }
         }
+        if self.source == PricingSource::PartialCaller && self.field_sources.is_none() {
+            bail!("cache-bench pricing source 'partial_caller' requires per-field provenance");
+        }
+        if let Some(fields) = self.field_sources {
+            let values = [
+                fields.input,
+                fields.output,
+                fields.cache_read,
+                fields.cache_write,
+            ];
+            match self.source {
+                PricingSource::Caller => {
+                    if values.iter().any(|field| *field != PricingSource::Caller) {
+                        bail!(
+                            "cache-bench pricing source 'caller' requires every field to be caller-supplied"
+                        );
+                    }
+                }
+                PricingSource::IllustrativeDefault => {
+                    if values
+                        .iter()
+                        .any(|field| *field != PricingSource::IllustrativeDefault)
+                    {
+                        bail!(
+                            "cache-bench pricing source 'illustrative_default' requires every field to use the illustrative default"
+                        );
+                    }
+                }
+                PricingSource::PartialCaller => {
+                    let caller = values
+                        .iter()
+                        .filter(|field| **field == PricingSource::Caller)
+                        .count();
+                    if caller == 0 || caller == values.len() {
+                        bail!(
+                            "cache-bench pricing source 'partial_caller' requires a mix of caller and default fields"
+                        );
+                    }
+                }
+                PricingSource::Environment => {}
+            }
+        }
         Ok(())
     }
 
+    pub fn effective_field_sources(&self) -> CacheBenchPriceFieldSources {
+        self.field_sources.unwrap_or(CacheBenchPriceFieldSources {
+            input: self.source,
+            output: self.source,
+            cache_read: self.source,
+            cache_write: self.source,
+        })
+    }
+
     pub fn fingerprint(&self) -> String {
+        let fields = self.effective_field_sources();
         format!(
-            "{:.9}|{:.9}|{:.9}|{:.9}",
+            "{:.9}|{:.9}|{:.9}|{:.9}|{}|{}|{}|{}|{}",
             self.input_usd_per_million,
             self.output_usd_per_million,
             self.cache_read_usd_per_million,
-            self.cache_write_usd_per_million
+            self.cache_write_usd_per_million,
+            self.source.as_str(),
+            fields.input.as_str(),
+            fields.output.as_str(),
+            fields.cache_read.as_str(),
+            fields.cache_write.as_str()
         )
     }
 
@@ -261,8 +362,12 @@ pub struct CacheBenchAcceptance {
     pub short_session_target: f64,
     pub floor_met: bool,
     pub stretch_met: bool,
+    /// A negative control (cold-start or prefix-break) is not a positive
+    /// long-prefix acceptance result, even when its raw ratio is high.
+    #[serde(default)]
+    pub control: bool,
     /// `stretch`, `pass`, `below_floor`, `unrealistic`, `cold_start_control`,
-    /// or `prefix_break_control`.
+    /// `prefix_break_control`, or `prefix_break_control_invalid`.
     pub verdict: String,
     pub notes: Vec<String>,
 }
@@ -281,6 +386,7 @@ impl Default for CacheBenchAcceptance {
             short_session_target: 0.95,
             floor_met: false,
             stretch_met: false,
+            control: false,
             verdict: "unknown".to_string(),
             notes: Vec::new(),
         }
@@ -291,6 +397,10 @@ impl Default for CacheBenchAcceptance {
 pub struct CacheBenchReport {
     pub schema: String,
     pub scenario: String,
+    /// Scenario kind. Older reports decode as `warm_long_prefix`, but the
+    /// scenario name and observed breaks are still used as control evidence.
+    #[serde(default)]
+    pub scenario_kind: CacheBenchScenarioKind,
     pub mode: CacheBenchMode,
     pub provider: String,
     pub model: String,
@@ -298,6 +408,9 @@ pub struct CacheBenchReport {
     pub turns: usize,
     pub stable_prefix_tokens: u64,
     pub initial_context_tokens: u64,
+    /// Whether the prefix-break control actually mutated an early token.
+    #[serde(default)]
+    pub prefix_break_injected: bool,
     /// True when the stable prefix was primed by a previous session. That
     /// warmup is never counted as a measured call.
     #[serde(default)]
@@ -362,6 +475,7 @@ impl CacheBenchReport {
         let canonical = json!({
             "schema": self.schema,
             "scenario": self.scenario,
+            "scenario_kind": self.scenario_kind,
             "mode": self.mode,
             "provider": self.provider,
             "model": self.model,
@@ -371,6 +485,7 @@ impl CacheBenchReport {
             "initial_context_tokens": self.initial_context_tokens,
             "warmup_included": self.warmup_included,
             "pricing": self.pricing.fingerprint(),
+            "live_base_url": self.live_gate.as_ref().map(|gate| gate.base_url.clone()),
         });
         sha256_hex(canonical.to_string().as_bytes())
     }
@@ -386,20 +501,34 @@ impl CacheBenchReport {
             self.model
         ));
         out.push_str(&format!(
-            "- Turns: {} measured · prefix {} tokens · initial context {} tokens\n",
-            self.turns, self.stable_prefix_tokens, self.initial_context_tokens
+            "- Turns: {} measured · prefix {} tokens · initial context {} tokens · kind `{}` · break injected {}\n",
+            self.turns,
+            self.stable_prefix_tokens,
+            self.initial_context_tokens,
+            self.scenario_kind.as_str(),
+            self.prefix_break_injected
         ));
+        match self.mode {
+            CacheBenchMode::Simulated => out.push_str(&format!(
+                "- Simulator: {} · block size {} · deterministic {}\n",
+                SIMULATOR_VERSION, self.block_size, self.deterministic
+            )),
+            CacheBenchMode::Live => out.push_str(&format!(
+                "- Measurement: live provider · block size n/a · deterministic {}\n",
+                self.deterministic
+            )),
+        }
         out.push_str(&format!(
-            "- Simulator: {} · block size {} · deterministic {}\n",
-            SIMULATOR_VERSION, self.block_size, self.deterministic
-        ));
-        out.push_str(&format!(
-            "- Prices: input ${:.4}/M · output ${:.4}/M · cache read ${:.4}/M · cache write ${:.4}/M ({:?})\n",
+            "- Prices: input ${:.4}/M · output ${:.4}/M · cache read ${:.4}/M · cache write ${:.4}/M (`{}`; fields in/out/read/write: `{}`/`{}`/`{}`/`{}`)\n",
             self.pricing.input_usd_per_million,
             self.pricing.output_usd_per_million,
             self.pricing.cache_read_usd_per_million,
             self.pricing.cache_write_usd_per_million,
-            self.pricing.source
+            self.pricing.source.as_str(),
+            self.pricing.effective_field_sources().input.as_str(),
+            self.pricing.effective_field_sources().output.as_str(),
+            self.pricing.effective_field_sources().cache_read.as_str(),
+            self.pricing.effective_field_sources().cache_write.as_str()
         ));
         out.push_str("\n## Aggregate\n\n");
         out.push_str("| metric | value |\n|---|---:|\n");
@@ -511,19 +640,55 @@ impl CacheBenchReport {
         out
     }
 
+    /// Strict acceptance target. This is not a ratio-only check: an
+    /// unrealistic scenario, a negative control, or a live report whose usage
+    /// was estimated cannot claim the long-prefix target. A simulated report
+    /// remains eligible as an explicitly labelled simulator result.
     pub fn live_target_met(&self) -> bool {
-        self.aggregate.cache_hit_ratio >= LONG_PREFIX_HIT_TARGET
+        let acceptance = self.compute_acceptance();
+        if !acceptance.scenario_shape_valid || acceptance.control {
+            return false;
+        }
+        if !matches!(acceptance.verdict.as_str(), "pass" | "stretch") {
+            return false;
+        }
+        match self.mode {
+            CacheBenchMode::Simulated => true,
+            CacheBenchMode::Live => acceptance.provider_reported,
+        }
     }
 
     /// Structural validation for a loaded or embedded report. It rejects
     /// internally inconsistent token math instead of letting a dashboard show
-    /// a ratio that the call rows do not support.
+    /// a ratio that the call rows do not support, and it recomputes acceptance
+    /// from the evidence instead of trusting stored metadata.
     pub fn validate(&self) -> Result<()> {
         if self.schema != CACHE_BENCH_SCHEMA {
             bail!(
                 "cache-bench schema is '{}', expected '{CACHE_BENCH_SCHEMA}'",
                 self.schema
             );
+        }
+        self.pricing.validate()?;
+        match self.mode {
+            CacheBenchMode::Simulated => {
+                if self.live_gate.is_some() {
+                    bail!("simulated cache-bench report cannot carry a live gate");
+                }
+                if self.provider != "simulator" || !self.deterministic {
+                    bail!(
+                        "simulated cache-bench report must be labeled as the deterministic simulator"
+                    );
+                }
+            }
+            CacheBenchMode::Live => {
+                if self.live_gate.is_none() {
+                    bail!("live cache-bench report must carry the live gate/provenance");
+                }
+                if self.provider == "simulator" || self.deterministic {
+                    bail!("live cache-bench report cannot claim simulator provenance");
+                }
+            }
         }
         if self.block_size == 0 {
             bail!("cache-bench block_size must be positive");
@@ -537,6 +702,49 @@ impl CacheBenchReport {
                 self.turns,
                 self.calls.len()
             );
+        }
+        if self.scenario_size.turns != self.turns {
+            bail!("cache-bench scenario size turn count disagrees with the calls");
+        }
+        let expected_prefix = self
+            .stable_prefix_tokens
+            .saturating_add(self.initial_context_tokens);
+        if self.scenario_size.total_prefix_tokens != expected_prefix {
+            bail!("cache-bench scenario size prefix total disagrees with the report");
+        }
+        let expected_mean_delta = match self.mode {
+            CacheBenchMode::Simulated => self
+                .calls
+                .last()
+                .map(|call| call.input_tokens.saturating_sub(expected_prefix) / self.turns as u64)
+                .unwrap_or(0),
+            CacheBenchMode::Live => {
+                if self.calls.len() < 2 {
+                    0
+                } else {
+                    self.calls
+                        .windows(2)
+                        .map(|pair| pair[1].input_tokens.saturating_sub(pair[0].input_tokens))
+                        .sum::<u64>()
+                        / (self.calls.len() - 1) as u64
+                }
+            }
+        };
+        if self.scenario_size.mean_turn_delta_tokens != expected_mean_delta {
+            bail!("cache-bench scenario size mean delta disagrees with the call rows");
+        }
+        let expected_shape = match self.mode {
+            CacheBenchMode::Simulated => {
+                expected_prefix >= LONG_PREFIX_MIN_TOKENS
+                    && self.turns >= MIN_LONG_PREFIX_TURNS
+                    && self.scenario_size.mean_turn_delta_tokens <= MAX_MEAN_TURN_DELTA
+                    && self.initial_context_tokens <= self.stable_prefix_tokens / 2
+                    && self.stable_prefix_tokens <= LONG_PREFIX_MIN_TOKENS * 2
+            }
+            CacheBenchMode::Live => expected_prefix >= LONG_PREFIX_MIN_TOKENS,
+        };
+        if self.scenario_size.passed != expected_shape {
+            bail!("cache-bench scenario size verdict does not match the recorded shape");
         }
         let mut input = 0u64;
         let mut output = 0u64;
@@ -589,6 +797,18 @@ impl CacheBenchReport {
                     call.turn
                 );
             }
+            let expected_cost = self.pricing.estimate(
+                call.input_tokens,
+                call.cache_read_tokens,
+                call.cache_write_tokens,
+                call.output_tokens,
+            );
+            if (call.cost.total_cost_usd - expected_cost.total_cost_usd).abs() > 1e-5 {
+                bail!(
+                    "cache-bench call {} cost does not match its tokens and recorded prices",
+                    call.turn
+                );
+            }
             for (name, value) in [
                 ("input_cost_usd", call.cost.input_cost_usd),
                 ("cache_read_cost_usd", call.cost.cache_read_cost_usd),
@@ -627,13 +847,36 @@ impl CacheBenchReport {
         if (aggregate.cost.total_cost_usd - total_cost).abs() > 1e-5 {
             bail!("cache-bench aggregate cost does not match its call rows");
         }
+        let recomputed = aggregate_calls(&self.calls);
+        if *aggregate != recomputed {
+            bail!(
+                "cache-bench aggregate derived metrics (percentiles, prefix breaks, or cost components) do not match its call rows"
+            );
+        }
         if self.calls[0].append_only {
             bail!("cache-bench first measured call cannot be append-only");
         }
-        if self.acceptance.hit_ratio != aggregate.cache_hit_ratio {
-            bail!("cache-bench acceptance ratio disagrees with the aggregate");
+        let expected_acceptance = self.compute_acceptance();
+        let mut comparable = expected_acceptance.clone();
+        // `control` was added after the first report schema. Older reports
+        // decode it as false even when the scenario name/breaks identify a
+        // control. Gates recompute control independently, so the additive field
+        // itself is not trusted or required for equality.
+        comparable.control = self.acceptance.control;
+        if self.acceptance != comparable {
+            bail!(
+                "cache-bench acceptance metadata does not match recomputed scenario shape, control, and usage provenance"
+            );
         }
         Ok(())
+    }
+
+    /// True when stored acceptance metadata matches the evidence, ignoring the
+    /// additive `control` flag for legacy-report compatibility.
+    pub fn acceptance_metadata_matches(&self, acceptance: &CacheBenchAcceptance) -> bool {
+        let mut expected = self.compute_acceptance();
+        expected.control = acceptance.control;
+        *acceptance == expected
     }
 
     /// Derive the honest acceptance verdict. The 99.84% stretch and 99.5%
@@ -643,7 +886,10 @@ impl CacheBenchReport {
     pub fn compute_acceptance(&self) -> CacheBenchAcceptance {
         let provider_reported = self.mode == CacheBenchMode::Live
             && !self.calls.is_empty()
-            && self.calls.iter().all(|call| !call.estimated_usage);
+            && self
+                .calls
+                .iter()
+                .all(|call| !call.estimated_usage && call.output_tokens > 0);
         let measurement = match self.mode {
             CacheBenchMode::Simulated => "simulator",
             CacheBenchMode::Live if provider_reported => "provider_reported",
@@ -653,17 +899,30 @@ impl CacheBenchReport {
         let ratio = self.aggregate.cache_hit_ratio;
         let floor_met = ratio >= LONG_PREFIX_HIT_TARGET;
         let stretch_met = ratio >= LONG_PREFIX_STRETCH_TARGET;
-        let prefix_break_control = self.aggregate.prefix_breaks > 0;
+        let prefix_break_control = self.scenario_kind == CacheBenchScenarioKind::PrefixBreakControl
+            || self.scenario.starts_with("prefix_break")
+            || self.aggregate.prefix_breaks > 0;
+        let prefix_break_injected = self.prefix_break_injected || self.aggregate.prefix_breaks > 0;
         let cold_start_control = !self.cross_session_warm
             && self.mode == CacheBenchMode::Simulated
-            && self.scenario.starts_with("cold_start");
+            && (self.scenario_kind == CacheBenchScenarioKind::ColdLongPrefix
+                || self.scenario.starts_with("cold_start"));
+        let control = prefix_break_control || cold_start_control;
         let mut notes = Vec::new();
         let verdict = if prefix_break_control {
-            notes.push(
-                "Prefix-break control: the raw ratio is not an acceptance result. The control exists to prove break detection and lost-cache accounting."
-                    .to_string(),
-            );
-            "prefix_break_control"
+            if !prefix_break_injected {
+                notes.push(
+                    "Invalid prefix-break control: no early token was changed, so the report does not provide negative-control evidence and cannot claim a pass."
+                        .to_string(),
+                );
+                "prefix_break_control_invalid"
+            } else {
+                notes.push(
+                    "Prefix-break control: the raw ratio is not an acceptance result. The control exists to prove break detection and lost-cache accounting."
+                        .to_string(),
+                );
+                "prefix_break_control"
+            }
         } else if cold_start_control {
             notes.push(
                 "Cold-start control: no prior-session prefix. The first call pays the whole stable prefix, so the long-prefix target does not apply."
@@ -705,7 +964,7 @@ impl CacheBenchReport {
         } else {
             "below_floor"
         };
-        if self.aggregate.cache_miss_tokens > 0 && prefix_break_control {
+        if self.aggregate.cache_miss_tokens > 0 && prefix_break_control && prefix_break_injected {
             notes.push(format!(
                 "Observed {} uncached token(s) across {} calls; the expected tail plus the injected break explain the miss.",
                 self.aggregate.cache_miss_tokens, self.aggregate.calls
@@ -723,6 +982,7 @@ impl CacheBenchReport {
             short_session_target: 0.95,
             floor_met,
             stretch_met,
+            control,
             verdict: verdict.to_string(),
             notes,
         }
@@ -806,6 +1066,38 @@ pub fn compare_cache_bench_reports(
         "initial_context_tokens",
         left.initial_context_tokens.to_string(),
         right.initial_context_tokens.to_string(),
+    );
+    check(
+        "scenario_kind",
+        format!("{:?}", left.scenario_kind),
+        format!("{:?}", right.scenario_kind),
+    );
+    check(
+        "measurement",
+        left.compute_acceptance().measurement,
+        right.compute_acceptance().measurement,
+    );
+    check(
+        "acceptance_verdict",
+        left.compute_acceptance().verdict,
+        right.compute_acceptance().verdict,
+    );
+    check(
+        "pricing_source",
+        left.pricing.source.as_str().to_string(),
+        right.pricing.source.as_str().to_string(),
+    );
+    check(
+        "live_base_url",
+        left.live_gate
+            .as_ref()
+            .map(|gate| gate.base_url.clone())
+            .unwrap_or_default(),
+        right
+            .live_gate
+            .as_ref()
+            .map(|gate| gate.base_url.clone())
+            .unwrap_or_default(),
     );
     check(
         "pricing",
@@ -1023,22 +1315,49 @@ pub struct CacheBenchRunArgs {
     pub prefix_break: bool,
 }
 
+fn source_for_override(explicit: bool) -> PricingSource {
+    if explicit {
+        PricingSource::Caller
+    } else {
+        PricingSource::IllustrativeDefault
+    }
+}
+
 impl CacheBenchRunArgs {
     pub fn pricing(&self) -> Result<CacheBenchPricing> {
         let explicit = self.input_price.is_some()
             || self.output_price.is_some()
             || self.cache_read_price.is_some()
             || self.cache_write_price.is_some();
-        let base = if explicit {
-            CacheBenchPricing {
-                input_usd_per_million: self.input_price.unwrap_or(0.28),
-                output_usd_per_million: self.output_price.unwrap_or(0.42),
-                cache_read_usd_per_million: self.cache_read_price.unwrap_or(0.028),
-                cache_write_usd_per_million: self.cache_write_price.unwrap_or(0.28),
-                source: PricingSource::Caller,
-            }
+        let field_sources = CacheBenchPriceFieldSources {
+            input: source_for_override(self.input_price.is_some()),
+            output: source_for_override(self.output_price.is_some()),
+            cache_read: source_for_override(self.cache_read_price.is_some()),
+            cache_write: source_for_override(self.cache_write_price.is_some()),
+        };
+        let explicit_count = [
+            self.input_price.is_some(),
+            self.output_price.is_some(),
+            self.cache_read_price.is_some(),
+            self.cache_write_price.is_some(),
+        ]
+        .into_iter()
+        .filter(|value| *value)
+        .count();
+        let source = if !explicit {
+            PricingSource::IllustrativeDefault
+        } else if explicit_count == 4 {
+            PricingSource::Caller
         } else {
-            CacheBenchPricing::illustrative_default()
+            PricingSource::PartialCaller
+        };
+        let base = CacheBenchPricing {
+            input_usd_per_million: self.input_price.unwrap_or(0.28),
+            output_usd_per_million: self.output_price.unwrap_or(0.42),
+            cache_read_usd_per_million: self.cache_read_price.unwrap_or(0.028),
+            cache_write_usd_per_million: self.cache_write_price.unwrap_or(0.28),
+            source,
+            field_sources: Some(field_sources),
         };
         base.validate()?;
         Ok(base)
@@ -1110,10 +1429,14 @@ pub async fn execute(command: CacheBenchCommand, json: bool) -> Result<i32> {
                 print!("{}", report.markdown());
             }
             if args.require_target && !report.live_target_met() {
+                let acceptance = report.compute_acceptance();
                 eprintln!(
-                    "cache-bench target missed: {:.4}% < {:.4}%",
+                    "cache-bench target not claimable: ratio {:.4}% · verdict `{}` · shape valid {} · control {} · measurement `{}`",
                     report.aggregate.cache_hit_ratio * 100.0,
-                    LONG_PREFIX_HIT_TARGET * 100.0
+                    acceptance.verdict,
+                    acceptance.scenario_shape_valid,
+                    acceptance.control,
+                    acceptance.measurement
                 );
                 return Ok(1);
             }
@@ -1229,10 +1552,20 @@ pub async fn execute(command: CacheBenchCommand, json: bool) -> Result<i32> {
                 bail!("--min-hit-ratio must be finite and between 0 and 1");
             }
             let report = load_cache_bench_report(&file)?;
-            let control = report.acceptance.verdict.contains("control");
+            let acceptance = report.compute_acceptance();
+            if !report.acceptance_metadata_matches(&report.acceptance) {
+                bail!(
+                    "cache-bench report acceptance metadata does not match recomputed evidence; refusing to verify a tampered or mislabeled report"
+                );
+            }
+            let control = acceptance.control;
+            let control_valid = acceptance.verdict != "prefix_break_control_invalid";
             let floor_met = report.aggregate.cache_hit_ratio >= min_hit_ratio;
-            let provider_ok = !require_provider_reported || report.acceptance.provider_reported;
-            let control_ok = !control || allow_control;
+            let provider_ok = !require_provider_reported
+                || (report.mode == CacheBenchMode::Live
+                    && acceptance.provider_reported
+                    && report.calls.iter().all(|call| !call.estimated_usage));
+            let control_ok = !control || (allow_control && control_valid);
             let passed = floor_met && provider_ok && control_ok;
             if json {
                 println!(
@@ -1244,11 +1577,15 @@ pub async fn execute(command: CacheBenchCommand, json: bool) -> Result<i32> {
                         "hit_ratio": report.aggregate.cache_hit_ratio,
                         "min_hit_ratio": min_hit_ratio,
                         "floor_met": floor_met,
-                        "provider_reported": report.acceptance.provider_reported,
+                        "measurement": acceptance.measurement,
+                        "scenario_shape_valid": acceptance.scenario_shape_valid,
+                        "pricing_source": report.pricing.source.as_str(),
+                        "provider_reported": acceptance.provider_reported,
                         "provider_required": require_provider_reported,
                         "provider_ok": provider_ok,
-                        "verdict": report.acceptance.verdict,
+                        "verdict": acceptance.verdict,
                         "control": control,
+                        "control_valid": control_valid,
                         "allow_control": allow_control,
                         "control_ok": control_ok
                     }))?
@@ -1262,19 +1599,22 @@ pub async fn execute(command: CacheBenchCommand, json: bool) -> Result<i32> {
                     if floor_met { "pass" } else { "FAIL" }
                 );
                 println!(
-                    "  measurement      {} · provider reported {} · {}",
-                    report.acceptance.measurement,
-                    report.acceptance.provider_reported,
+                    "  measurement      {} · shape {} · provider reported {} · {}",
+                    acceptance.measurement,
+                    acceptance.scenario_shape_valid,
+                    acceptance.provider_reported,
                     if provider_ok { "pass" } else { "FAIL" }
                 );
                 println!(
-                    "  verdict          {} · control {} · {}",
-                    report.acceptance.verdict,
+                    "  verdict          {} · control {} (valid {}) · {}",
+                    acceptance.verdict,
                     control,
+                    control_valid,
                     if control_ok { "pass" } else { "FAIL" }
                 );
                 println!(
-                    "  result           {}",
+                    "  pricing          {} · result {}",
+                    report.pricing.source.as_str(),
                     if passed { "PASS" } else { "FAIL" }
                 );
             }

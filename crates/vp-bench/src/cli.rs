@@ -20,7 +20,7 @@ use time::format_description::well_known::Rfc3339;
 use vp_store::paths;
 
 use crate::compare::{CompareOptions, compare_reports};
-use crate::metrics::{Pricing, format_optional, format_percent, format_usd};
+use crate::metrics::{Pricing, PricingProvenance, format_optional, format_percent, format_usd};
 use crate::provider::RealProviderSettings;
 use crate::reliability::{
     MAX_RELIABILITY_SCENARIOS, MAX_RELIABILITY_TRIALS, ReliabilityArtifacts, ReliabilityReport,
@@ -113,7 +113,7 @@ pub struct RunArgs {
     /// Model override for real-provider mode (also needs the environment gate).
     #[arg(long)]
     pub model: Option<String>,
-    /// USD per million input tokens. Defaults to the scenario profile.
+    /// USD per million input tokens. Defaults to the illustrative scenario profile.
     #[arg(long)]
     pub input_price: Option<f64>,
     /// USD per million output tokens. Defaults to the scenario profile.
@@ -163,7 +163,7 @@ pub struct ReliabilityArgs {
     /// Model override for real-provider mode (also needs the environment gate).
     #[arg(long)]
     pub model: Option<String>,
-    /// USD per million input tokens. Defaults to the scenario profile.
+    /// USD per million input tokens. Defaults to the illustrative scenario profile.
     #[arg(long)]
     pub input_price: Option<f64>,
     /// USD per million output tokens. Defaults to the scenario profile.
@@ -379,12 +379,17 @@ fn select_scenarios(ids: &[String]) -> Result<Vec<Scenario>> {
 
 fn apply_pricing(scenarios: &mut [Scenario], overrides: &PricingOverrides) -> Result<()> {
     for scenario in scenarios {
-        scenario.config.pricing = pricing_from_options(scenario.config.pricing, overrides)?;
+        let (pricing, provenance) = pricing_from_options(scenario.config.pricing, overrides)?;
+        scenario.config.pricing = pricing;
+        scenario.config.pricing_provenance = provenance;
     }
     Ok(())
 }
 
-fn pricing_from_options(base: Pricing, overrides: &PricingOverrides) -> Result<Pricing> {
+fn pricing_from_options(
+    base: Pricing,
+    overrides: &PricingOverrides,
+) -> Result<(Pricing, PricingProvenance)> {
     let pricing = Pricing {
         input_usd_per_million: overrides.input.unwrap_or(base.input_usd_per_million),
         output_usd_per_million: overrides.output.unwrap_or(base.output_usd_per_million),
@@ -396,7 +401,13 @@ fn pricing_from_options(base: Pricing, overrides: &PricingOverrides) -> Result<P
             .unwrap_or(base.cache_write_usd_per_million),
     };
     pricing.validate().map_err(anyhow::Error::msg)?;
-    Ok(pricing)
+    let provenance = PricingProvenance::from_overrides(
+        overrides.input.is_some(),
+        overrides.output.is_some(),
+        overrides.cache_read.is_some(),
+        overrides.cache_write.is_some(),
+    );
+    Ok((pricing, provenance))
 }
 
 fn provider_selection(
@@ -604,7 +615,7 @@ fn benchmark_exit_code(all_solved: bool, harness_faults: usize) -> i32 {
 
 #[cfg(test)]
 fn pricing_with_overrides(args: &RunArgs, base: Pricing) -> Result<Pricing> {
-    pricing_from_options(
+    Ok(pricing_from_options(
         base,
         &PricingOverrides {
             input: args.input_price,
@@ -612,7 +623,8 @@ fn pricing_with_overrides(args: &RunArgs, base: Pricing) -> Result<Pricing> {
             cache_read: args.cache_read_price,
             cache_write: args.cache_write_price,
         },
-    )
+    )?
+    .0)
 }
 
 fn render_run_summary(report: &BenchReport, artifacts: &ReportArtifacts, exit_code: i32) -> String {
@@ -648,13 +660,14 @@ fn render_run_summary(report: &BenchReport, artifacts: &ReportArtifacts, exit_co
     ));
     human.push_str(&format!("csv: {}\n", artifacts.csv_path.display()));
     human.push_str(&format!(
-        "provider: {} · model: {} · prices USD/M: in {} out {} cache-read {} cache-write {}\n",
+        "provider: {} · model: {} · prices USD/M: in {} out {} cache-read {} cache-write {} · provenance {}\n",
         report.provider.mode,
         report.provider.model,
         format_usd(report.pricing.input_usd_per_million),
         format_usd(report.pricing.output_usd_per_million),
         format_usd(report.pricing.cache_read_usd_per_million),
-        format_usd(report.pricing.cache_write_usd_per_million)
+        format_usd(report.pricing.cache_write_usd_per_million),
+        report.pricing_provenance.label()
     ));
     human.push_str(&format!("exit: {exit_code}\n"));
     human.push_str(&format!("caveat: {REPORT_CAVEAT}\n"));

@@ -1143,7 +1143,9 @@ impl Store {
         limit: Option<u32>,
     ) -> Result<Vec<ProgramEvent>> {
         let conn = self.lock()?;
-        let limit = limit.unwrap_or(10_000).clamp(1, 100_000) as i64;
+        let limit = limit
+            .map(|value| value.clamp(1, 100_000) as i64)
+            .unwrap_or(-1);
         let mut stmt = conn.prepare(
             "SELECT program_id, project_id, seq, kind, payload, created_at
              FROM program_events

@@ -382,25 +382,38 @@ pub(super) async fn dispatch(
             provider,
             model,
             context_window,
+            clear_context_window,
             input_price,
+            clear_input_price,
             output_price,
+            clear_output_price,
             notes,
         } => {
-            rpc(
-                &discovery,
-                "model.preset.update",
-                json!({
-                    "id": id,
-                    "name": name,
-                    "provider": provider,
-                    "model": model,
-                    "context_window": context_window,
-                    "input_usd_per_million": input_price,
-                    "output_usd_per_million": output_price,
-                    "notes": notes
-                }),
-            )
-            .await?
+            let current = rpc(&discovery, "model.preset.list", json!({})).await?;
+            let existing = current
+                .get("presets")
+                .and_then(Value::as_array)
+                .and_then(|presets| {
+                    presets.iter().find(|preset| {
+                        preset.get("id").and_then(Value::as_str) == Some(id.as_str())
+                    })
+                })
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("model preset not found: {id}"))?;
+            let params = merge_model_preset(
+                existing,
+                name,
+                provider,
+                model,
+                context_window,
+                clear_context_window,
+                input_price,
+                clear_input_price,
+                output_price,
+                clear_output_price,
+                notes,
+            )?;
+            rpc(&discovery, "model.preset.update", params).await?
         }
         Command::ModelPresetDelete { id } => {
             rpc(&discovery, "model.preset.delete", json!({"id": id})).await?

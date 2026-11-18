@@ -1,5 +1,38 @@
 use super::*;
 
+/// Memory retrieval is a bounded lexical query, not a document-search API. A
+/// session goal (or a task acceptance block) is joined into this query, so an
+/// unbounded prompt could otherwise build a huge FTS `MATCH` expression and a
+/// huge LIKE fallback pattern before the instruction budget rejects the run.
+pub(crate) const MAX_MEMORY_QUERY_TERMS: usize = 32;
+pub(crate) const MAX_MEMORY_QUERY_BYTES: usize = 512;
+
+/// Keep the first deterministic whitespace-delimited terms within both the
+/// term and byte budgets. Whole terms are retained; a term that would cross
+/// the byte cap stops the query instead of being split.
+pub(crate) fn bounded_memory_query(input: &str) -> String {
+    let mut bounded = String::new();
+    for (terms, term) in input.split_whitespace().enumerate() {
+        if terms >= MAX_MEMORY_QUERY_TERMS {
+            break;
+        }
+        let separator = usize::from(!bounded.is_empty());
+        if bounded
+            .len()
+            .saturating_add(separator)
+            .saturating_add(term.len())
+            > MAX_MEMORY_QUERY_BYTES
+        {
+            break;
+        }
+        if separator == 1 {
+            bounded.push(' ');
+        }
+        bounded.push_str(term);
+    }
+    bounded
+}
+
 impl Store {
     /// Compatibility shim for callers that predate evidence-backed memory.
     /// Delegates with source `agent`, no evidence, and dedupe enabled. When the
@@ -158,7 +191,8 @@ impl Store {
         include_stale: bool,
         limit: u32,
     ) -> Result<Vec<MemoryItem>> {
-        if let Some(query) = query
+        let query = query.map(bounded_memory_query);
+        if let Some(query) = query.as_deref()
             && let Some(query) = fts_query(query)
         {
             match self.list_memories_fts(project_id, &query, kind, status, include_stale, limit) {
@@ -170,14 +204,19 @@ impl Store {
             }
         }
         let conn = self.lock()?;
-        let pattern = query.map(|query| format!("%{query}%"));
+        let pattern = query
+            .as_deref()
+            .map(|query| format!("%{}%", escape_like(query.trim())));
         let mut stmt = conn.prepare(
             "SELECT id, session_id, project_id, agent_id, agent_name, kind, title, body,
                     tags, created_at, status, source, evidence, supersedes, superseded_by,
                     pinned, use_count, last_used_at, last_verified_at, verify_after, stale_reason
              FROM memories m
              WHERE m.project_id = ?1
-               AND (?2 IS NULL OR m.title LIKE ?2 OR m.body LIKE ?2 OR m.tags LIKE ?2)
+               AND (?2 IS NULL
+                    OR m.title LIKE ?2 ESCAPE '\\'
+                    OR m.body LIKE ?2 ESCAPE '\\'
+                    OR m.tags LIKE ?2 ESCAPE '\\')
                AND (?3 IS NULL OR m.kind = ?3)
                AND (
                    (?4 IS NOT NULL AND m.status = ?4)
@@ -254,8 +293,9 @@ impl Store {
         include_stale: bool,
         limit: u32,
     ) -> Result<Vec<MemoryCandidate>> {
+        let query = bounded_memory_query(query);
         let mut candidates = Vec::new();
-        if let Some(fts) = fts_query(query) {
+        if let Some(fts) = fts_query(&query) {
             match self.memory_candidates_fts(project_id, &fts, kind, include_stale, limit) {
                 Ok(found) if !found.is_empty() => candidates = found,
                 Ok(_) => {}
@@ -266,7 +306,7 @@ impl Store {
         }
         if candidates.is_empty() {
             candidates =
-                self.memory_candidates_like(project_id, query, kind, include_stale, limit)?;
+                self.memory_candidates_like(project_id, &query, kind, include_stale, limit)?;
         }
         if !kinds.is_empty() {
             candidates.retain(|candidate| kinds.iter().any(|kind| kind == &candidate.memory.kind));
@@ -334,22 +374,28 @@ impl Store {
         limit: u32,
     ) -> Result<Vec<MemoryCandidate>> {
         let conn = self.lock()?;
-        let pattern = format!("%{}%", query.trim());
+        let trimmed = query.trim();
+        let has_filter = if trimmed.is_empty() { 0 } else { 1 };
+        let pattern = format!("%{}%", escape_like(trimmed));
         let mut stmt = conn.prepare(
             "SELECT id, session_id, project_id, agent_id, agent_name, kind, title, body,
                     tags, created_at, status, source, evidence, supersedes, superseded_by,
                     pinned, use_count, last_used_at, last_verified_at, verify_after, stale_reason
              FROM memories m
              WHERE m.project_id = ?1
-               AND (?2 = '%%' OR m.title LIKE ?2 OR m.body LIKE ?2 OR m.tags LIKE ?2)
-               AND (?3 IS NULL OR m.kind = ?3)
-               AND (m.status = 'active' OR (?4 = 1 AND m.status = 'stale'))
+               AND (?2 = 0
+                    OR m.title LIKE ?3 ESCAPE '\\'
+                    OR m.body LIKE ?3 ESCAPE '\\'
+                    OR m.tags LIKE ?3 ESCAPE '\\')
+               AND (?4 IS NULL OR m.kind = ?4)
+               AND (m.status = 'active' OR (?5 = 1 AND m.status = 'stale'))
              ORDER BY m.created_at DESC, m.id ASC
-             LIMIT ?5",
+             LIMIT ?6",
         )?;
         let rows = stmt.query_map(
             params![
                 project_id,
+                has_filter,
                 pattern,
                 kind,
                 if include_stale { 1 } else { 0 },
@@ -526,7 +572,32 @@ impl Store {
         };
         let previous_status = memory.status.clone();
         if let Some(status) = status {
+            if status == "active"
+                && previous_status != "active"
+                && let Some(active) =
+                    active_memory_for_key_tx(&tx, &memory.project_id, &memory.kind, &memory.title)?
+                && active.id != memory.id
+            {
+                // The one-active-row key invariant cannot be repaired by
+                // clearing an audit edge: another row with the same normalized
+                // kind/title is still live. Refuse the reactivation rather
+                // than silently creating two active claims.
+                return Err(vp_protocol::types::AgentMemoryError::new(
+                    vp_protocol::types::agent_memory_codes::MEMORY_CONFLICT,
+                    format!(
+                        "memory {} cannot be reactivated while {} is active for the same kind/title",
+                        memory.id, active.id
+                    ),
+                )
+                .into());
+            }
             memory.status = status.to_string();
+            if status == "active" {
+                // Reactivating a superseded row must not keep a replacement
+                // edge: the row is live again and the old link describes the
+                // superseded lifecycle. History remains in the events.
+                memory.superseded_by = None;
+            }
             if status == "stale" {
                 if memory.stale_reason.is_none() {
                     memory.stale_reason = Some("operator marked stale".to_string());
@@ -704,5 +775,118 @@ impl Store {
             by_source: memory_count_group(&conn, project_id, "source")?,
             by_kind: memory_count_group(&conn, project_id, "kind")?,
         })
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn fixture() -> (TempDir, TempDir, Store, Project, Session) {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("memory"))
+            .unwrap();
+        let session = store
+            .create_session(&project.id, "memory lifecycle")
+            .unwrap();
+        (data, repo, store, project, session)
+    }
+
+    fn create<'a>(
+        store: &Store,
+        project: &'a Project,
+        session: &'a Session,
+        body: &'a str,
+    ) -> MemoryItem {
+        store
+            .create_memory_with_metadata_event(NewMemory {
+                session_id: &session.id,
+                project_id: &project.id,
+                agent_id: "agent-1",
+                agent_name: "Agent",
+                kind: "convention",
+                title: "One active row",
+                body,
+                tags: &[],
+                source: "agent",
+                evidence: &[],
+                pinned: false,
+                verify_after: None,
+                dedupe: true,
+                auto_supersede: true,
+            })
+            .unwrap()
+            .memory
+    }
+
+    #[test]
+    fn reactivation_refuses_a_live_replacement_and_clears_a_stale_edge() {
+        let (_data, _repo, store, project, session) = fixture();
+        let first = create(&store, &project, &session, "first claim");
+        let replacement = create(&store, &project, &session, "replacement claim");
+        let superseded = store.get_memory(&first.id).unwrap().unwrap();
+        assert_eq!(superseded.status, "superseded");
+        assert_eq!(
+            superseded.superseded_by.as_deref(),
+            Some(replacement.id.as_str())
+        );
+
+        let error = store
+            .update_memory_with_event(&first.id, Some("active"), None, None)
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<vp_protocol::types::AgentMemoryError>()
+                .map(|error| error.code),
+            Some(vp_protocol::types::agent_memory_codes::MEMORY_CONFLICT)
+        );
+        assert_eq!(
+            store.get_memory(&first.id).unwrap().unwrap().status,
+            "superseded"
+        );
+
+        store
+            .delete_memories_with_events(std::slice::from_ref(&replacement.id))
+            .unwrap();
+        let (reactivated, _) = store
+            .update_memory_with_event(&first.id, Some("active"), None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reactivated.status, "active");
+        assert!(reactivated.superseded_by.is_none());
+        assert_eq!(
+            store.get_memory(&first.id).unwrap().unwrap().superseded_by,
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod query_bound_tests {
+    use super::*;
+
+    #[test]
+    fn memory_query_terms_and_bytes_are_bounded_deterministically() {
+        let input = (0..200)
+            .map(|index| format!("term{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let bounded = bounded_memory_query(&input);
+        assert_eq!(bounded.split_whitespace().count(), MAX_MEMORY_QUERY_TERMS);
+        assert!(bounded.len() <= MAX_MEMORY_QUERY_BYTES);
+        assert!(bounded.starts_with("term0 term1"));
+        assert_eq!(bounded, bounded_memory_query(&input));
+
+        let long_terms = (0..40)
+            .map(|index| format!("{index}{}", "x".repeat(40)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let bounded = bounded_memory_query(&long_terms);
+        assert!(bounded.len() <= MAX_MEMORY_QUERY_BYTES);
+        assert!(bounded.split_whitespace().count() < MAX_MEMORY_QUERY_TERMS);
     }
 }

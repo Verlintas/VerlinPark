@@ -1,5 +1,20 @@
 use super::*;
 
+async fn worker_cancel_requested(
+    engine: &Engine,
+    session_id: &str,
+    control: &RunControl,
+    task_id: Option<&str>,
+) -> Result<bool> {
+    if control.is_cancelled() {
+        return Ok(true);
+    }
+    match task_id {
+        Some(task_id) => engine.plan_task_cancel_requested(session_id, task_id).await,
+        None => Ok(false),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::agent) async fn finish_worker(
     engine: &Engine,
@@ -85,6 +100,37 @@ pub(in crate::agent) async fn finish_worker(
     .await?;
     match verification {
         VerificationOutcome::Approved(verdict) => {
+            // A cancel can arrive while the Verifier's final turn is running.
+            // Re-check after verification and before enqueueing the commit so
+            // an operator cancel is not lost to the integration path.
+            if worker_cancel_requested(engine, &session.id, control, worker_spec.task_id.as_deref())
+                .await?
+            {
+                engine
+                    .update_agent_status(&worker_spec.id, "cancelled")
+                    .await?;
+                emit(
+                    engine,
+                    &session.id,
+                    worker_spec,
+                    "agent.finished",
+                    serde_json::json!({
+                        "status": "cancelled",
+                        "summary": truncate(summary),
+                        "commit": commit,
+                        "changed_paths": changed_paths,
+                        "merged": false,
+                        "verified": true,
+                        "approved": true,
+                        "verdict": truncate(&verdict.summary),
+                        "reason": "cancel observed before integration",
+                        "worktree": worker_spec.worktree,
+                        "branch": worker_spec.branch,
+                    }),
+                )
+                .await?;
+                return Ok(WorkerFinish::Cancelled);
+            }
             match integrate_worker(
                 engine,
                 session,

@@ -5054,6 +5054,12 @@ pub struct SearchResult {
 pub struct SubscribeParams {
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Last event seq the client already has. When paired with `session_id`,
+    /// the daemon replays `seq > since_seq` from the event store before
+    /// streaming live events. A cross-session backfill cursor is not
+    /// supported and is rejected with a typed error instead of being ignored.
+    #[serde(default)]
+    pub since_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -11278,6 +11284,64 @@ pub struct ReplaySessionParams {
     pub rebuild: bool,
 }
 
+/// One C1 task-contract projection row in an archive. The `contract` field is
+/// the canonical serialized `TaskContract`; the event stream remains
+/// authoritative when it carries `contract.derived` events.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BundleContractRow {
+    #[serde(default)]
+    pub contract_id: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub plan_revision: u64,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub hash: String,
+    #[serde(default)]
+    pub source_hash: String,
+    #[serde(default)]
+    pub contract: String,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+/// One C1 mutation-usage projection row in an archive. Counts only; the
+/// timestamp is projection-local and not replay-authoritative.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BundleContractUsageRow {
+    #[serde(default)]
+    pub contract_id: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub writes: u64,
+    #[serde(default)]
+    pub bytes: u64,
+    #[serde(default)]
+    pub commits: u64,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+/// One C12 advisory progress row in an archive. Progress is evidence only and
+/// never grants scheduler, merge, or budget authority.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BundleProgressRound {
+    #[serde(default)]
+    pub plan_revision: u64,
+    pub round: crate::progress::ProgressRound,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionBundle {
     pub version: u32,
@@ -11378,6 +11442,23 @@ pub struct SessionBundle {
     /// rebuilds the rows.
     #[serde(default)]
     pub effects: Vec<EffectReceipt>,
+    /// Event-backed task-contract rows. Older bundles decode as an empty list;
+    /// `contract.derived` events remain authoritative on import.
+    #[serde(default)]
+    pub contracts: Vec<BundleContractRow>,
+    /// Event-backed contract mutation usage rows. Older bundles decode as an
+    /// empty list; `intent.mutation` events remain authoritative on import.
+    #[serde(default)]
+    pub contract_usage: Vec<BundleContractUsageRow>,
+    /// Event-derived advisory progress rounds. Older bundles decode as an
+    /// empty list; `progress.round` events remain authoritative on import.
+    #[serde(default)]
+    pub progress: Vec<BundleProgressRound>,
+    /// Supplemental remote-test evidence metadata. Output bodies are
+    /// operational state and never part of a bundle; imported rows can be
+    /// inspected but their `output_ref` cannot resolve a local body.
+    #[serde(default)]
+    pub remote_test_evidence: Vec<crate::remote::RemoteTestEvidence>,
     /// Project-scoped identities for this archive's project. Older bundles
     /// decode as an empty list. Imported identities are read-only until an
     /// explicit rehome; their project ids are never silently remapped.
@@ -20733,6 +20814,10 @@ mod context_checkpoint_bundle_tests {
                 evidence: EffectEvidence::observed("workspace_sha256"),
                 ..Default::default()
             }],
+            contracts: Vec::new(),
+            contract_usage: Vec::new(),
+            progress: Vec::new(),
+            remote_test_evidence: Vec::new(),
             agent_identities: Vec::new(),
             agent_identity_events: Vec::new(),
             session_agent_assignments: Vec::new(),

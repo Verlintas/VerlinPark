@@ -28,7 +28,7 @@ use cli::{Cli, Command, DaemonAgentAction};
 use render::{
     filtered_tool_codes, print_backup_anchor, print_backup_key_events, print_backup_key_generation,
     print_backup_key_revocation, print_backup_key_rotation, print_backup_keyring, print_human,
-    print_json, print_portable_anchor_export, print_portable_anchor_import,
+    print_human_for, print_json, print_portable_anchor_export, print_portable_anchor_import,
     print_portable_anchor_verify, print_repository_backup, print_repository_list,
     print_repository_prune, print_repository_rekey, print_repository_restore,
     print_repository_verify, tool_activity_csv,
@@ -38,14 +38,53 @@ use rpc::{confirm_cli_action, read_discovery};
 /// Accept both `vp cache warm <session>` and `vp cache-warm <session>`.
 /// The status command keeps its historical `vp cache <session>` shape, so the
 /// two-word warm spelling is normalized before clap parses positional args.
+/// Global options may appear before the subcommand, so this scans positional
+/// tokens instead of relying on fixed indices.
 pub(crate) fn normalize_cache_warm_args(mut args: Vec<String>) -> Vec<String> {
-    if args.get(1).map(String::as_str) == Some("cache")
-        && args.get(2).map(String::as_str) == Some("warm")
-    {
-        args.remove(2);
-        args[1] = "cache-warm".to_string();
+    let mut positional = Vec::new();
+    let mut index = 1;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if arg == "--" {
+            index += 1;
+            while index < args.len() {
+                positional.push(index);
+                if positional.len() == 2 {
+                    break;
+                }
+                index += 1;
+            }
+            break;
+        }
+        if let Some(flag) = arg.strip_prefix("--")
+            && !flag.contains('=')
+            && global_option_takes_value(flag)
+        {
+            index += 2;
+            continue;
+        }
+        if arg.starts_with('-') && arg != "-" {
+            index += 1;
+            continue;
+        }
+        positional.push(index);
+        if positional.len() == 2 {
+            break;
+        }
+        index += 1;
+    }
+    if positional.len() == 2 && args[positional[0]] == "cache" && args[positional[1]] == "warm" {
+        args.remove(positional[1]);
+        args[positional[0]] = "cache-warm".to_string();
     }
     args
+}
+
+fn global_option_takes_value(flag: &str) -> bool {
+    matches!(
+        flag,
+        "data-dir" | "rpc-timeout-secs" | "rpc-connect-timeout-secs"
+    )
 }
 
 /// The generated clap parser and the command dispatch future have both grown
@@ -53,25 +92,68 @@ pub(crate) fn normalize_cache_warm_args(mut args: Vec<String>) -> Vec<String> {
 /// platform's default main-thread stack; the tokio workers get the same budget.
 const CLI_STACK_BYTES: usize = 32 * 1024 * 1024;
 
-fn main() -> Result<()> {
-    let worker = std::thread::Builder::new()
+fn main() -> std::process::ExitCode {
+    let worker = match std::thread::Builder::new()
         .name("vp-cli".into())
         .stack_size(CLI_STACK_BYTES)
         .spawn(|| -> Result<()> {
-            let cli = Cli::parse_from(normalize_cache_warm_args(std::env::args().collect()));
-            tokio::runtime::Builder::new_multi_thread()
+            let args = std::env::args_os()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            let cli = Cli::parse_from(normalize_cache_warm_args(args));
+            let json = cli.json;
+            let outcome = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .thread_stack_size(CLI_STACK_BYTES)
                 .build()?
-                .block_on(run(cli))
-        })?;
+                .block_on(run(cli));
+            if let Err(error) = &outcome {
+                print_cli_error(error, json);
+            }
+            outcome
+        }) {
+        Ok(worker) => worker,
+        Err(error) => {
+            eprintln!("Error: spawning the vp CLI worker: {error}");
+            return std::process::ExitCode::from(1);
+        }
+    };
     match worker.join() {
-        Ok(result) => result,
-        Err(_) => anyhow::bail!("vp CLI thread panicked"),
+        Ok(Ok(())) => std::process::ExitCode::SUCCESS,
+        Ok(Err(_)) => std::process::ExitCode::from(1),
+        Err(_) => {
+            eprintln!("Error: vp CLI thread panicked");
+            std::process::ExitCode::from(1)
+        }
     }
 }
 
+/// Render a failed CLI invocation. `--json` always yields one structured
+/// object on stderr; the stable RPC code and typed `data.code` are preserved
+/// instead of being flattened into English text.
+fn print_cli_error(error: &anyhow::Error, json: bool) {
+    if json {
+        let value = match error.downcast_ref::<rpc::CliRpcError>() {
+            Some(rpc_error) => rpc_error.to_json(),
+            None => json!({
+                "error": {
+                    "kind": "cli",
+                    "code": Value::Null,
+                    "message": format!("{error:#}"),
+                }
+            }),
+        };
+        eprintln!(
+            "{}",
+            serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
+        );
+        return;
+    }
+    eprintln!("Error: {error:#}");
+}
+
 async fn run(cli: Cli) -> Result<()> {
+    rpc::configure_timeouts(cli.rpc_timeout_secs, cli.rpc_connect_timeout_secs)?;
     if let Command::Bench { command } = &cli.command {
         match vp_bench::cli::execute(command.clone(), cli.json).await {
             Ok(outcome) => {
@@ -834,6 +916,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         return Ok(());
     }
+    let human_hint = render::human_hint(&cli.command);
     let discovery = read_discovery(cli.data_dir.as_deref())?;
     let want_tool_activity_csv = matches!(&cli.command, Command::ToolActivity { csv: true, .. });
     let value = dispatch::run_command(cli.command, discovery, cli.json).await?;
@@ -845,7 +928,7 @@ async fn run(cli: Cli) -> Result<()> {
         if cli.json {
             print_json(&value)?;
         } else {
-            print_human(&value);
+            print_human_for(human_hint, &value);
         }
     }
     Ok(())
@@ -866,17 +949,59 @@ pub(crate) fn parse_agent_identity_policy_json(value: Option<&str>) -> Result<Op
     Ok(Some(parsed))
 }
 
-/// `kind:reference[:note]`. The reference is opaque and bounded by the daemon;
-/// the CLI only splits on the first two colons.
+/// Parse a memory evidence pointer. Accepts `kind:reference[:note]` and, for
+/// opaque references that contain colons (for example URLs), a JSON object
+/// `{"kind":..,"reference":..,"note":..}`. A bare `kind:https://host/path`
+/// keeps the whole URL as the reference instead of treating `//host/path` as a
+/// note.
 pub(crate) fn parse_memory_evidence(value: &str) -> Result<Value> {
-    let mut parts = value.splitn(3, ':');
-    let kind = parts.next().unwrap_or_default().trim();
-    let reference = parts.next().unwrap_or_default().trim();
-    if kind.is_empty() || reference.is_empty() {
+    let trimmed = value.trim();
+    if trimmed.starts_with('{') {
+        let parsed: Value =
+            serde_json::from_str(trimmed).context("--evidence JSON must be an object")?;
+        let kind = parsed.get("kind").and_then(Value::as_str).map(str::trim);
+        let reference = parsed
+            .get("reference")
+            .and_then(Value::as_str)
+            .map(str::trim);
+        let (Some(kind), Some(reference)) = (kind, reference) else {
+            bail!("--evidence JSON requires non-empty \"kind\" and \"reference\" strings");
+        };
+        if kind.is_empty() || reference.is_empty() {
+            bail!("--evidence JSON requires non-empty \"kind\" and \"reference\" strings");
+        }
+        let mut evidence = json!({"kind": kind, "reference": reference});
+        if let Some(note) = parsed
+            .get("note")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|note| !note.is_empty())
+        {
+            evidence["note"] = json!(note);
+        }
+        return Ok(evidence);
+    }
+    let (kind, rest) = trimmed
+        .split_once(':')
+        .context("--evidence must be kind:reference[:note]")?;
+    let kind = kind.trim();
+    let rest = rest.trim();
+    if kind.is_empty() || rest.is_empty() {
+        bail!("--evidence must be kind:reference[:note]");
+    }
+    let (reference, note) = if rest.contains("://") {
+        (rest, None)
+    } else {
+        match rest.split_once(':') {
+            Some((reference, note)) => (reference.trim(), Some(note.trim())),
+            None => (rest, None),
+        }
+    };
+    if reference.is_empty() {
         bail!("--evidence must be kind:reference[:note]");
     }
     let mut evidence = json!({"kind": kind, "reference": reference});
-    if let Some(note) = parts.next().map(str::trim).filter(|note| !note.is_empty()) {
+    if let Some(note) = note.filter(|note| !note.is_empty()) {
         evidence["note"] = json!(note);
     }
     Ok(evidence)
@@ -1051,13 +1176,26 @@ pub(crate) fn parse_pairs(
 }
 
 pub(crate) fn read_json_input(file: Option<&std::path::Path>) -> Result<String> {
+    let stdin = std::io::stdin();
+    let mut stdin = stdin.lock();
+    read_json_input_from(file, &mut stdin)
+}
+
+/// `--file -` means stdin for every JSON file option. A literal file named
+/// `-` is never opened; pass `./-` if such a file is really intended.
+pub(crate) fn read_json_input_from<R: std::io::Read>(
+    file: Option<&std::path::Path>,
+    stdin: &mut R,
+) -> Result<String> {
     match file {
-        Some(path) => {
+        Some(path) if path != std::path::Path::new("-") => {
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
         }
-        None => {
+        _ => {
             let mut buffer = String::new();
-            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer)?;
+            stdin
+                .read_to_string(&mut buffer)
+                .context("reading JSON input from stdin")?;
             Ok(buffer)
         }
     }
@@ -1157,4 +1295,274 @@ pub(crate) fn parse_governor_mode(value: Option<&str>) -> anyhow::Result<Option<
             .map(|mode| Some(mode.as_str()))
             .ok_or_else(|| anyhow::anyhow!("invalid --mode {value:?}; use `single` or `multi`")),
     }
+}
+
+/// Resolve an explicit on/off pair without inventing a default. `None` means
+/// the caller must preserve the stored value.
+pub(crate) fn resolve_optional_switch(
+    enabled: bool,
+    disabled: bool,
+    on_flag: &str,
+    off_flag: &str,
+) -> anyhow::Result<Option<bool>> {
+    if enabled && disabled {
+        anyhow::bail!("{on_flag} and {off_flag} cannot be combined");
+    }
+    Ok(match (enabled, disabled) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        _ => None,
+    })
+}
+
+/// Approval-template create defaults to enabled; update preserves the stored
+/// state unless `--enabled`/`--disabled` is explicit.
+pub(crate) fn resolve_template_enabled(
+    enabled: bool,
+    disabled: bool,
+    existing: Option<bool>,
+) -> anyhow::Result<bool> {
+    Ok(
+        resolve_optional_switch(enabled, disabled, "--enabled", "--disabled")?
+            .or(existing)
+            .unwrap_or(true),
+    )
+}
+
+/// Preserve stored model-preset fields unless the operator supplied a
+/// replacement or an explicit clear flag.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn merge_model_preset(
+    current: Value,
+    name: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    context_window: Option<u64>,
+    clear_context_window: bool,
+    input_price: Option<f64>,
+    clear_input_price: bool,
+    output_price: Option<f64>,
+    clear_output_price: bool,
+    notes: Option<String>,
+) -> anyhow::Result<Value> {
+    let Some(current) = current.as_object() else {
+        anyhow::bail!("model preset list returned a non-object preset");
+    };
+    if clear_context_window && context_window.is_some() {
+        anyhow::bail!("--context-window and --clear-context-window cannot be combined");
+    }
+    if clear_input_price && input_price.is_some() {
+        anyhow::bail!("--input-price and --clear-input-price cannot be combined");
+    }
+    if clear_output_price && output_price.is_some() {
+        anyhow::bail!("--output-price and --clear-output-price cannot be combined");
+    }
+    let id = current
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("model preset list returned a preset without an id"))?;
+    let name = name.or_else(|| {
+        current
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
+    let provider = provider.or_else(|| {
+        current
+            .get("provider")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
+    let model = model.or_else(|| {
+        current
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
+    let (Some(name), Some(provider), Some(model)) = (name, provider, model) else {
+        anyhow::bail!("model preset is missing name, provider, or model");
+    };
+    let context_window = if clear_context_window {
+        None
+    } else {
+        context_window.or_else(|| current.get("context_window").and_then(Value::as_u64))
+    };
+    let input_price = if clear_input_price {
+        None
+    } else {
+        input_price.or_else(|| current.get("input_usd_per_million").and_then(Value::as_f64))
+    };
+    let output_price = if clear_output_price {
+        None
+    } else {
+        output_price.or_else(|| {
+            current
+                .get("output_usd_per_million")
+                .and_then(Value::as_f64)
+        })
+    };
+    let notes = notes.unwrap_or_else(|| {
+        current
+            .get("notes")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    });
+    Ok(json!({
+        "id": id,
+        "name": name,
+        "provider": provider,
+        "model": model,
+        "context_window": context_window,
+        "input_usd_per_million": input_price,
+        "output_usd_per_million": output_price,
+        "notes": notes,
+    }))
+}
+
+/// Patch only explicitly supplied shell-policy fields. `--read-deny` is
+/// additive so an operator cannot drop stored denies by accident; replacement
+/// and clearing require their own flags.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn merge_shell_policy(
+    current: Value,
+    network: Option<String>,
+    read_deny: Vec<String>,
+    replace_read_deny: bool,
+    clear_read_deny: bool,
+    restrict_home: bool,
+    no_restrict_home: bool,
+    read_jail: bool,
+    no_read_jail: bool,
+) -> anyhow::Result<Value> {
+    let Some(current) = current.as_object() else {
+        anyhow::bail!("shell policy get returned a non-object policy");
+    };
+    if clear_read_deny && (replace_read_deny || !read_deny.is_empty()) {
+        anyhow::bail!(
+            "--clear-read-deny cannot be combined with --read-deny or --replace-read-deny"
+        );
+    }
+    if replace_read_deny && read_deny.is_empty() {
+        anyhow::bail!("--replace-read-deny requires at least one --read-deny path");
+    }
+    if restrict_home && no_restrict_home {
+        anyhow::bail!("--restrict-home and --no-restrict-home cannot be combined");
+    }
+    if read_jail && no_read_jail {
+        anyhow::bail!("--read-jail and --no-read-jail cannot be combined");
+    }
+    if network.is_none()
+        && read_deny.is_empty()
+        && !replace_read_deny
+        && !clear_read_deny
+        && !restrict_home
+        && !no_restrict_home
+        && !read_jail
+        && !no_read_jail
+    {
+        anyhow::bail!("no shell policy fields supplied; pass at least one update flag");
+    }
+
+    let mut policy = current.clone();
+    if let Some(network) = network {
+        let network = network.trim().to_ascii_lowercase();
+        if network != "allow" && network != "deny" {
+            anyhow::bail!("--network must be allow or deny");
+        }
+        policy.insert("network".into(), json!(network));
+    } else if !policy.contains_key("network") {
+        policy.insert("network".into(), json!("allow"));
+    }
+    let mut denies = if clear_read_deny || replace_read_deny {
+        Vec::new()
+    } else {
+        policy
+            .get("read_deny")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    for path in read_deny {
+        let path = path.trim();
+        if !path.is_empty() && !denies.iter().any(|existing| existing == path) {
+            denies.push(path.to_string());
+        }
+    }
+    policy.insert("read_deny".into(), json!(denies));
+    let restrict_home = match (restrict_home, no_restrict_home) {
+        (true, false) => true,
+        (false, true) => false,
+        (false, false) => policy
+            .get("restrict_home")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        (true, true) => unreachable!("validated above"),
+    };
+    policy.insert("restrict_home".into(), json!(restrict_home));
+    let read_jail = match (read_jail, no_read_jail) {
+        (true, false) => true,
+        (false, true) => false,
+        (false, false) => policy
+            .get("read_jail")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        (true, true) => unreachable!("validated above"),
+    };
+    policy.insert("read_jail".into(), json!(read_jail));
+    Ok(Value::Object(policy))
+}
+
+/// Preserve stored retention unless a lifecycle flag was explicitly supplied.
+pub(crate) fn resolve_memory_retention(
+    current: &Value,
+    enable: bool,
+    disable: bool,
+    clear: bool,
+    max_items: Option<u32>,
+    max_age_days: Option<u32>,
+) -> anyhow::Result<(bool, Option<u32>, Option<u32>)> {
+    if enable && disable {
+        anyhow::bail!("--enable and --disable cannot be combined");
+    }
+    if clear && (enable || disable || max_items.is_some() || max_age_days.is_some()) {
+        anyhow::bail!("--clear cannot be combined with other retention flags");
+    }
+    let enabled = if clear || disable {
+        false
+    } else if enable {
+        true
+    } else {
+        current
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    };
+    let max_items = if clear {
+        None
+    } else {
+        max_items.or_else(|| {
+            current
+                .get("max_items")
+                .and_then(Value::as_u64)
+                .map(|value| value as u32)
+        })
+    };
+    let max_age_days = if clear {
+        None
+    } else {
+        max_age_days.or_else(|| {
+            current
+                .get("max_age_days")
+                .and_then(Value::as_u64)
+                .map(|value| value as u32)
+        })
+    };
+    Ok((enabled, max_items, max_age_days))
 }

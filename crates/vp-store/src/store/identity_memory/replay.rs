@@ -19,15 +19,15 @@ pub fn list_agent_memory_events_for_project(
     limit: Option<u32>,
 ) -> Result<Vec<AgentMemoryEvent>> {
     let limit = limit
-        .unwrap_or(AGENT_MEMORY_EVENT_LIMIT)
-        .clamp(1, AGENT_MEMORY_EVENT_LIMIT);
+        .map(|value| value.clamp(1, AGENT_MEMORY_EVENT_LIMIT) as i64)
+        .unwrap_or(-1);
     let conn = store.lock()?;
     let mut statement = conn.prepare(
         "SELECT id, project_id, seq, kind, payload, created_at
          FROM agent_memory_events WHERE project_id = ?1
          ORDER BY seq ASC LIMIT ?2",
     )?;
-    let rows = statement.query_map(params![project_id, limit as i64], |row| {
+    let rows = statement.query_map(params![project_id, limit], |row| {
         let payload: String = row.get(4)?;
         Ok(AgentMemoryEvent {
             id: row.get(0)?,

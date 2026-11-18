@@ -266,6 +266,47 @@ impl Engine {
             instructions: data.instructions,
             prompt_prefix_observations: data.prompt_prefix_observations,
             effects: data.effects,
+            contracts: data
+                .contracts
+                .iter()
+                .map(|row| vp_protocol::types::BundleContractRow {
+                    contract_id: row.contract_id.clone(),
+                    project_id: row.project_id.clone(),
+                    session_id: row.session_id.clone(),
+                    task_id: row.task_id.clone(),
+                    plan_revision: row.plan_revision,
+                    role: row.role.clone(),
+                    hash: row.hash.clone(),
+                    source_hash: row.source_hash.clone(),
+                    contract: row.contract.clone(),
+                    created_at: row.created_at.clone(),
+                })
+                .collect(),
+            contract_usage: data
+                .contract_usage
+                .iter()
+                .map(|row| vp_protocol::types::BundleContractUsageRow {
+                    contract_id: row.contract_id.clone(),
+                    project_id: row.project_id.clone(),
+                    session_id: row.session_id.clone(),
+                    task_id: row.task_id.clone(),
+                    writes: row.writes,
+                    bytes: row.bytes,
+                    commits: row.commits,
+                    updated_at: row.updated_at.clone(),
+                })
+                .collect(),
+            progress: data
+                .progress
+                .iter()
+                .map(
+                    |(plan_revision, round)| vp_protocol::types::BundleProgressRound {
+                        plan_revision: *plan_revision,
+                        round: round.clone(),
+                    },
+                )
+                .collect(),
+            remote_test_evidence: data.remote_test_evidence,
             agent_identities,
             agent_identity_events,
             session_agent_assignments,

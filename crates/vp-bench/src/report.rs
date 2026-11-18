@@ -20,18 +20,21 @@ use uuid::Uuid;
 
 use crate::fixture::AcceptanceExecution;
 use crate::metrics::{
-    Pricing, TokenUsage, cost_per_solved, format_optional, format_percent, format_usd,
-    percent_change, priced_cost, ratio_or_none, round_usd, tokens_per_solved,
+    Pricing, PricingProvenance, TokenUsage, cost_per_solved, format_optional, format_percent,
+    format_usd, percent_change, priced_cost, ratio_or_none, redact_endpoint, round_usd,
+    tokens_per_solved,
 };
 use crate::scenario::Scenario;
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const MAX_REPORT_BYTES: usize = 8 * 1024 * 1024;
 pub const REPORT_CAVEAT: &str = "These results are local measurements for the recorded \
-fixture, provider mode, model, pricing profile, host, and commit. Fake-provider runs measure \
-harness/runtime mechanics, not model quality. Caller-supplied prices may not match provider \
-billing. One host and one model are not a universal ranking, and this report does not claim \
-that any configuration is generally faster, cheaper, or better.";
+fixture, provider mode, model, pricing profile and its recorded provenance, host, and commit. \
+Fake-provider runs measure harness/runtime mechanics, not model quality. Prices come from the \
+recorded `pricing_provenance` (caller, illustrative benchmark default, partial override, or \
+environment) and may not match provider billing. One host and one model are not a universal \
+ranking, and this report does not claim that any configuration is generally faster, cheaper, or \
+better.";
 
 /// Host and build metadata recorded once per report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,9 +92,13 @@ pub struct ProviderMetadata {
     pub mode: String,
     pub id: String,
     pub model: String,
-    /// `fixed`, `simulated`, or `provider`.
+    /// `fixed`, `simulated`, or `provider`/`provider_estimated`.
     pub usage_source: String,
     pub simulated_latency_ms: u64,
+    /// Endpoint identity when the provider is remote. It is part of comparison
+    /// identity so two gateways with the same model string are not conflated.
+    #[serde(default)]
+    pub base_url: Option<String>,
 }
 
 impl ProviderMetadata {
@@ -107,6 +114,7 @@ impl ProviderMetadata {
             model: model.into(),
             usage_source: usage_source.into(),
             simulated_latency_ms,
+            base_url: None,
         }
     }
 
@@ -117,7 +125,14 @@ impl ProviderMetadata {
             model: model.into(),
             usage_source: "provider".to_string(),
             simulated_latency_ms: 0,
+            base_url: None,
         }
+    }
+
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        let base_url = base_url.into();
+        self.base_url = Some(redact_endpoint(&base_url));
+        self
     }
 }
 
@@ -128,8 +143,16 @@ pub struct ComparisonKey {
     pub fixture_fingerprint: String,
     pub acceptance_fingerprint: String,
     pub provider_mode: String,
+    #[serde(default)]
+    pub provider_id: String,
     pub model: String,
+    #[serde(default)]
+    pub provider_base_url: Option<String>,
     pub pricing_fingerprint: String,
+    #[serde(default)]
+    pub pricing_source: String,
+    #[serde(default)]
+    pub pricing_provenance_fingerprint: String,
 }
 
 /// A structured reason a run is unsolved.
@@ -347,6 +370,9 @@ pub struct RunRecord {
     pub coordination: crate::reliability::CoordinationUsage,
     pub comparison: ComparisonKey,
     pub pricing: Pricing,
+    /// Provenance of `pricing`; older reports decode as `unknown`.
+    #[serde(default)]
+    pub pricing_provenance: PricingProvenance,
     pub provider: ProviderMetadata,
     pub target_paths: Vec<String>,
     /// Populated only when `--keep-worktrees` retained the disposable fixture.
@@ -439,6 +465,9 @@ pub struct BenchReport {
     pub host: HostMetadata,
     pub provider: ProviderMetadata,
     pub pricing: Pricing,
+    /// Additive provenance for `pricing`; older reports decode as `unknown`.
+    #[serde(default)]
+    pub pricing_provenance: PricingProvenance,
     pub selection: BenchSelection,
     pub summary: BenchSummary,
     pub scenarios: Vec<ScenarioAggregate>,
@@ -468,21 +497,35 @@ impl BenchReport {
         }
         let mut provider = runs[0].provider.clone();
         let pricing = runs[0].pricing;
+        let pricing_provenance = runs[0].pricing_provenance;
+        let mut usage_sources = HashSet::new();
         for run in &runs {
+            usage_sources.insert(run.provider.usage_source.clone());
             if run.provider.mode != provider.mode
                 || run.provider.id != provider.id
                 || run.provider.model != provider.model
-                || run.provider.usage_source != provider.usage_source
+                || run.provider.base_url != provider.base_url
             {
                 bail!("all runs in one report must use the same provider identity");
             }
             if run.pricing != pricing {
                 bail!("all runs in one report must use the same pricing profile");
             }
+            if run.pricing_provenance != pricing_provenance {
+                bail!("all runs in one report must use the same pricing provenance");
+            }
             provider.simulated_latency_ms = provider
                 .simulated_latency_ms
                 .max(run.provider.simulated_latency_ms);
         }
+        provider.usage_source = if usage_sources.len() == 1 {
+            usage_sources
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| provider.usage_source.clone())
+        } else {
+            "mixed".to_string()
+        };
         let mut by_scenario: BTreeMap<&str, Vec<&RunRecord>> = BTreeMap::new();
         for run in &runs {
             by_scenario
@@ -531,6 +574,7 @@ impl BenchReport {
             host,
             provider,
             pricing,
+            pricing_provenance,
             selection,
             summary,
             scenarios,
@@ -567,6 +611,31 @@ impl BenchReport {
         }
         if self.pricing.validate().is_err() {
             bail!("report contains an invalid pricing profile");
+        }
+        self.pricing_provenance
+            .validate()
+            .map_err(|error| anyhow::anyhow!("report pricing provenance: {error}"))?;
+        if !self.runs.is_empty() {
+            for run in &self.runs {
+                if run.pricing != self.pricing {
+                    bail!("report run pricing does not match the report pricing profile");
+                }
+                if run.pricing_provenance != self.pricing_provenance {
+                    bail!("report run pricing provenance does not match the report");
+                }
+                if run.provider.mode != self.provider.mode
+                    || run.provider.id != self.provider.id
+                    || run.provider.model != self.provider.model
+                    || run.provider.base_url != self.provider.base_url
+                {
+                    bail!("report run provider identity does not match the report provider");
+                }
+                let expected_cost =
+                    round_usd(priced_cost(&run.metrics.token_usage(), &self.pricing));
+                if (expected_cost - run.metrics.cost_usd).abs() > 1e-5 {
+                    bail!("report run cost does not match its token usage and recorded pricing");
+                }
+            }
         }
         Ok(())
     }
@@ -928,18 +997,27 @@ pub fn render_markdown(report: &BenchReport) -> String {
             .unwrap_or_default()
     ));
     text.push_str(&format!(
-        "- Provider: `{}` (`{}`) · model `{}` · usage `{}`\n",
+        "- Provider: `{}` (`{}`) · model `{}` · usage `{}` · endpoint {}\n",
         report.provider.id,
         report.provider.mode,
         report.provider.model,
-        report.provider.usage_source
+        report.provider.usage_source,
+        report.provider.base_url.as_deref().unwrap_or("local/fake")
     ));
     text.push_str(&format!(
-        "- Prices (USD per million): input {} · output {} · cache read {} · cache write {}\n",
+        "- Prices (USD per million): input {} · output {} · cache read {} · cache write {} · provenance `{}`\n",
         format_usd(report.pricing.input_usd_per_million),
         format_usd(report.pricing.output_usd_per_million),
         format_usd(report.pricing.cache_read_usd_per_million),
-        format_usd(report.pricing.cache_write_usd_per_million)
+        format_usd(report.pricing.cache_write_usd_per_million),
+        report.pricing_provenance.label()
+    ));
+    text.push_str(&format!(
+        "- Price field sources: input `{}` · output `{}` · cache read `{}` · cache write `{}`\n",
+        report.pricing_provenance.input.as_str(),
+        report.pricing_provenance.output.as_str(),
+        report.pricing_provenance.cache_read.as_str(),
+        report.pricing_provenance.cache_write.as_str()
     ));
     text.push_str(&format!(
         "- Selection: {} scenario(s) × {} repetition(s)\n\n",
@@ -1194,14 +1272,19 @@ pub fn comparison_key(
     scenario: &Scenario,
     provider: &ProviderMetadata,
     pricing: &Pricing,
+    provenance: &PricingProvenance,
 ) -> ComparisonKey {
     ComparisonKey {
         fixture_kind: scenario.fixture.as_str().to_string(),
         fixture_fingerprint: scenario.fixture_plan().fingerprint(),
         acceptance_fingerprint: scenario.fixture_plan().acceptance_fingerprint(),
         provider_mode: provider.mode.clone(),
+        provider_id: provider.id.clone(),
         model: provider.model.clone(),
+        provider_base_url: provider.base_url.clone(),
         pricing_fingerprint: pricing.fingerprint(),
+        pricing_source: provenance.label().to_string(),
+        pricing_provenance_fingerprint: provenance.fingerprint(),
     }
 }
 
@@ -1213,6 +1296,7 @@ pub(crate) fn run_record_fixture(run_id: &str, repetition: usize, solved: bool) 
     let scenario = Scenario::find("baseline-single-session").unwrap();
     let pricing = Pricing::new(3.0, 15.0, 0.3, 3.75);
     let provider = ProviderMetadata::fake("vp-bench-fake", "bench-fake-1", "simulated", 0);
+    let provenance = PricingProvenance::caller();
     let usage = TokenUsage {
         input_tokens: 1_900,
         output_tokens: 100,
@@ -1287,8 +1371,9 @@ pub(crate) fn run_record_fixture(run_id: &str, repetition: usize, solved: bool) 
         harness_fault: None,
         trial_evidence: crate::reliability::TrialEvidence::default(),
         coordination: crate::reliability::CoordinationUsage::default(),
-        comparison: comparison_key(&scenario, &provider, &pricing),
+        comparison: comparison_key(&scenario, &provider, &pricing, &provenance),
         pricing,
+        pricing_provenance: provenance,
         provider,
         target_paths: scenario.target_paths(),
         retained_workspace: None,
@@ -1316,6 +1401,7 @@ mod tests {
 
     fn run(solved: bool, tokens: u64, wall: u64) -> RunRecord {
         let scenario = scenario();
+        let provenance = PricingProvenance::caller();
         let usage = TokenUsage {
             input_tokens: tokens.saturating_sub(100),
             output_tokens: 100,
@@ -1390,8 +1476,9 @@ mod tests {
             harness_fault: None,
             trial_evidence: crate::reliability::TrialEvidence::default(),
             coordination: crate::reliability::CoordinationUsage::default(),
-            comparison: comparison_key(&scenario, &provider(), &pricing()),
+            comparison: comparison_key(&scenario, &provider(), &pricing(), &provenance),
             pricing: pricing(),
+            pricing_provenance: provenance,
             provider: provider(),
             target_paths: scenario.target_paths(),
             retained_workspace: None,
@@ -1457,6 +1544,84 @@ mod tests {
     }
 
     #[test]
+    fn report_records_pricing_provenance_and_refuses_mixed_sources() {
+        let scenario = scenario();
+        let first = run(true, 1_000, 10);
+        let mut second = run(true, 1_000, 20);
+        second.pricing_provenance = PricingProvenance::illustrative_default();
+        second.comparison.pricing_source = "illustrative_default".into();
+        second.comparison.pricing_provenance_fingerprint =
+            PricingProvenance::illustrative_default().fingerprint();
+        let error = BenchReport::build(
+            vec![first, second],
+            std::slice::from_ref(&scenario),
+            2,
+            "2026-11-11T00:00:00Z",
+            None,
+            None,
+            HostMetadata::detect(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("pricing provenance"), "{error}");
+
+        let report = report();
+        assert_eq!(report.pricing_provenance.label(), "caller");
+        assert_eq!(report.runs[0].pricing_provenance, report.pricing_provenance);
+        assert!(report.to_markdown().contains("provenance `caller`"));
+    }
+
+    #[test]
+    fn provider_endpoint_metadata_redacts_credentials() {
+        let provider = ProviderMetadata::real("openai-compatible", "m")
+            .with_base_url("https://user:secret@example.com/v1?token=abc");
+        assert_eq!(provider.base_url.as_deref(), Some("https://example.com/v1"));
+        assert!(
+            !provider
+                .base_url
+                .as_deref()
+                .unwrap_or_default()
+                .contains("secret")
+        );
+    }
+
+    #[test]
+    fn report_rejects_a_tampered_run_cost() {
+        let mut report = report();
+        report.runs[0].metrics.cost_usd += 1.0;
+        let error = report.validate().unwrap_err();
+        assert!(error.to_string().contains("cost"), "{error}");
+    }
+
+    #[test]
+    fn report_rejects_a_tampered_provider_identity() {
+        let mut report = report();
+        report.provider.base_url = Some("https://example.invalid/v1".into());
+        let error = report.validate().unwrap_err();
+        assert!(error.to_string().contains("provider identity"), "{error}");
+    }
+
+    #[test]
+    fn mixed_usage_sources_are_labeled_instead_of_claiming_one() {
+        let scenario = scenario();
+        let mut first = run(true, 1_000, 10);
+        first.provider.usage_source = "provider".to_string();
+        let mut second = run(true, 1_000, 20);
+        second.provider.usage_source = "provider_estimated".to_string();
+        let report = BenchReport::build(
+            vec![first, second],
+            std::slice::from_ref(&scenario),
+            2,
+            "2026-11-11T00:00:00Z",
+            None,
+            None,
+            HostMetadata::detect(),
+        )
+        .unwrap();
+        assert_eq!(report.provider.usage_source, "mixed");
+        assert!(report.to_markdown().contains("usage `mixed`"));
+    }
+
+    #[test]
     fn mixed_simulated_latency_keeps_one_provider_identity() {
         let scenario = scenario();
         let mut first = run(true, 1_000, 10);
@@ -1498,10 +1663,17 @@ mod tests {
     fn legacy_reports_decode_without_reliability_fields() {
         let report = report();
         let mut value = serde_json::to_value(&report).unwrap();
+        value.as_object_mut().unwrap().remove("pricing_provenance");
+        value["provider"]
+            .as_object_mut()
+            .unwrap()
+            .remove("base_url");
         for run in value["runs"].as_array_mut().unwrap() {
             let object = run.as_object_mut().unwrap();
             object.remove("trial_evidence");
             object.remove("coordination");
+            object.remove("pricing_provenance");
+            run["provider"].as_object_mut().unwrap().remove("base_url");
         }
         for scenario in value["scenarios"].as_array_mut().unwrap() {
             scenario.as_object_mut().unwrap().remove("reliability");
@@ -1511,6 +1683,8 @@ mod tests {
         assert_eq!(decoded.runs[0].coordination.ratio, None);
         assert_eq!(decoded.scenarios[0].reliability.scenario_id, "");
         assert_eq!(decoded.scenarios[0].reliability.trials, 0);
+        assert_eq!(decoded.pricing_provenance.label(), "unknown");
+        assert_eq!(decoded.provider.base_url, None);
     }
 
     #[test]
@@ -1604,19 +1778,24 @@ mod tests {
     #[test]
     fn comparison_key_changes_with_acceptance_and_model() {
         let scenario = scenario();
-        let baseline = comparison_key(&scenario, &provider(), &pricing());
+        let provenance = PricingProvenance::caller();
+        let baseline = comparison_key(&scenario, &provider(), &pricing(), &provenance);
         let mut changed = scenario.clone();
         changed.acceptance.expected_files[0]
             .content
             .push_str("changed");
-        let changed = comparison_key(&changed, &provider(), &pricing());
+        let changed = comparison_key(&changed, &provider(), &pricing(), &provenance);
         assert_ne!(
             baseline.acceptance_fingerprint,
             changed.acceptance_fingerprint
         );
         let other_model = ProviderMetadata::fake("vp-bench-fake", "other", "simulated", 0);
-        let other = comparison_key(&scenario, &other_model, &pricing());
+        let other = comparison_key(&scenario, &other_model, &pricing(), &provenance);
         assert_ne!(baseline.model, other.model);
+
+        let partial = PricingProvenance::from_overrides(true, false, false, false);
+        let partial_key = comparison_key(&scenario, &provider(), &pricing(), &partial);
+        assert_ne!(baseline.pricing_source, partial_key.pricing_source);
     }
 
     #[test]

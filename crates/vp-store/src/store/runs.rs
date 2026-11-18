@@ -420,16 +420,17 @@ impl Store {
         Ok((step.clone(), stored_tool, events))
     }
 
-    /// Finish a run. `completed`, `failed`, and `interrupted` are the only
-    /// terminal statuses; cancellation is recorded as `interrupted` with a
-    /// `cancelled` failure kind so it cannot be resumed implicitly.
+    /// Finish a run. `completed`, `failed`, `interrupted`, and `deferred` are
+    /// the terminal statuses; cancellation is recorded as `interrupted` with a
+    /// `cancelled` failure kind so it cannot be resumed implicitly. `deferred`
+    /// is a clean external-gate handoff and is never treated as resumable.
     pub fn finish_session_run(
         &self,
         run_id: &str,
         status: &str,
         failure: Option<&vp_protocol::types::RunFailure>,
     ) -> Result<(SessionRun, Event)> {
-        validate_run_status(status, &["completed", "failed", "interrupted"])?;
+        validate_run_status(status, &["completed", "failed", "interrupted", "deferred"])?;
         let now = now_rfc3339();
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
@@ -480,6 +481,10 @@ impl Store {
             ),
             "failed" => (
                 "session.run.failed",
+                serde_json::json!({"run": serde_json::to_value(&run)?}),
+            ),
+            "deferred" => (
+                "session.run.deferred",
                 serde_json::json!({"run": serde_json::to_value(&run)?}),
             ),
             _ => (
@@ -834,6 +839,45 @@ impl Store {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// True when a recorded `session.run.cancel_requested` is newer than every
+    /// terminal run event in the session and at least one run is still active.
+    /// A cancel for an already-terminal run is stale and does not block a later
+    /// integration. This is the persisted, cross-process view of the in-memory
+    /// run control used by the deterministic Integrator.
+    pub fn session_run_cancel_requested(&self, session_id: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        let cancel_seq: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM events
+             WHERE session_id = ?1 AND type = 'session.run.cancel_requested'",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        if cancel_seq == 0 {
+            return Ok(false);
+        }
+        let terminal_seq: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM events
+             WHERE session_id = ?1
+               AND type IN (
+                   'session.run.completed',
+                   'session.run.failed',
+                   'session.run.interrupted',
+                   'session.run.deferred'
+               )",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        if terminal_seq >= cancel_seq {
+            return Ok(false);
+        }
+        let running: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM session_runs WHERE session_id = ?1 AND status = 'running'",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        Ok(running > 0)
+    }
+
     pub fn get_session_run(&self, run_id: &str) -> Result<Option<SessionRun>> {
         let conn = self.lock()?;
         conn.query_row(
@@ -944,10 +988,47 @@ impl Store {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Consume one completed journaled tool result for a resumed attempt.
-    /// The compare-and-set on `consumed_by_run_id IS NULL` makes this
-    /// consume-once across concurrent/duplicate calls: a second identical call
-    /// in the same attempt will not short-circuit on the same row again.
+    /// Find one completed journaled tool result in the resume lineage without
+    /// consuming it. A replay is journaled as its own completed row in the
+    /// current attempt, so an attempt that fails after the replay can find the
+    /// original (or successor) row again instead of re-executing the write.
+    /// `current_run_id` is excluded so one attempt cannot replay its own rows.
+    pub fn find_completed_tool_result(
+        &self,
+        run_id: &str,
+        tool_name: &str,
+        input_fingerprint: &str,
+        current_run_id: &str,
+    ) -> Result<Option<RunToolCall>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT tc.run_id, tc.session_id, tc.step_id, tc.tool_call_id, tc.tool_name,
+                    tc.input_fingerprint, tc.status, tc.result_json, tc.error,
+                    tc.consumed_by_run_id, tc.consumed_at, tc.created_at, tc.updated_at
+             FROM run_tool_calls tc
+             JOIN session_runs r ON r.run_id = tc.run_id
+             WHERE COALESCE(NULLIF(r.resume_root_id, ''), r.run_id) = (
+                 SELECT COALESCE(NULLIF(resume_root_id, ''), run_id)
+                 FROM session_runs WHERE run_id = ?1
+             )
+               AND tc.run_id <> ?4
+               AND tc.status = 'completed'
+               AND tc.tool_name = ?2
+               AND tc.input_fingerprint = ?3
+             ORDER BY tc.created_at ASC, tc.rowid ASC
+             LIMIT 1",
+            params![run_id, tool_name, input_fingerprint, current_run_id],
+            map_run_tool_call,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Legacy consume-once claim. New journal replays use
+    /// [`Store::find_completed_tool_result`] and record a successor completed
+    /// row instead of consuming the source row, so a post-replay failure can
+    /// replay again rather than re-executing the write. The claim path remains
+    /// for older daemon data and focused tests.
     pub fn claim_completed_tool_result(
         &self,
         run_id: &str,

@@ -30,59 +30,19 @@ impl AgentService {
         // not pausable.
         let control = self.begin_manual_operation(session_id)?;
         let result = async {
-            let agents = self.engine.list_agents(session_id).await?;
-            let leader = agents.into_iter().find(|agent| agent.role == "leader");
-            let profile = leader
-                .as_ref()
-                .and_then(|agent| agent.profile.as_deref())
-                .and_then(AgentProfile::parse)
-                .unwrap_or(AgentProfile::Generic);
-            let worktree = PathBuf::from(session.worktree.clone().unwrap_or_default());
-            let branch = session.branch.clone().unwrap_or_default();
-            let spec = AgentSpec {
-                id: leader
-                    .as_ref()
-                    .map(|agent| agent.id.clone())
-                    .unwrap_or_else(|| "leader".to_string()),
-                role: AgentRole::Leader,
-                name: leader
-                    .as_ref()
-                    .map(|agent| agent.name.clone())
-                    .unwrap_or_else(|| "Leader".to_string()),
-                depth: 0,
-                parent_name: None,
-                title: leader.as_ref().and_then(|agent| agent.title.clone()),
-                task_id: None,
-                department: None,
-                identity_id: None,
-                identity_generation: None,
-                profile,
-                allow_delegation: true,
-                task_kind: None,
-                auto_approve: false,
-                worktree: worktree.clone(),
-                branch: branch.clone(),
-                session_worktree: worktree,
-                session_branch: branch,
-                write_scope: Vec::new(),
-                base_commit: session.base_commit.clone().unwrap_or_default(),
-
-                workspace_id: None,
-                session_workspace_id: None,
-                parent_workspace_id: None,
-            };
-            let system =
-                role_system_prompt(spec.role, &project, &session, &spec, &session.goal).render();
-            let dynamic_mcp =
-                collect_dynamic_mcp_tools(&self.engine, spec.role, &session.project_id, None).await;
-            let frozen_bundle = frozen_tool_bundle(&config, &spec, &dynamic_mcp);
-            let tools = frozen_bundle.tools.clone();
-            let model_name = model_for(&config, spec.role);
+            let prompt = build_session_prompt_context(
+                &self.engine,
+                &config,
+                &session,
+                &project,
+                InstructionBuildMode::Materialize,
+            )
+            .await?;
+            let spec = prompt.spec.clone();
+            let model_name = prompt.model.clone();
             let calibration = load_context_calibration(&self.engine, session_id, &model_name).await;
-            let system_tokens = estimate_context_tokens(&system);
-            let tool_tokens = serde_json::to_string(&tools)
-                .map(|schema| estimate_context_tokens(&schema))
-                .unwrap_or(0);
+            let system_tokens = prompt.system_tokens;
+            let tool_tokens = prompt.tool_tokens;
             let compaction_policy = context_compaction_policy(&config, spec.role);
             let (threshold, hard_limit) =
                 (compaction_policy.threshold, compaction_policy.hard_limit);
@@ -118,13 +78,7 @@ impl AgentService {
             if budget.exhausted() {
                 anyhow::bail!("session budget is exhausted; compaction needs provider tokens");
             }
-            let prefix_hash = crate::sha256_hex(
-                format!(
-                    "{system}\n{}",
-                    serde_json::to_string(&tools).unwrap_or_default()
-                )
-                .as_bytes(),
-            );
+            let prefix_hash = prompt.prefix_hash.clone();
             let mut compaction_runtime = CompactionRuntime::default();
             let changed = compact_context_if_needed(
                 &self.engine,

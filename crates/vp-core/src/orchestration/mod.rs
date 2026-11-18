@@ -15,8 +15,8 @@ pub use controller::{
     ControllerAction, ControllerInput, plan_actions, session_has_actionable_work,
 };
 pub use plan::{
-    PlanDiff, blocked_by, diff_plan, ensure_revision_safe, latest_result_summary, plan_revision,
-    ready_tasks, revisions_from_events, status_map,
+    PlanDiff, blocked_by, dependency_satisfied, diff_plan, ensure_revision_safe,
+    latest_result_summary, plan_revision, ready_tasks, revisions_from_events, status_map,
 };
 pub use policy::{OrchestrationPolicyError, retry_delay, should_auto_retry, validate_policy};
 pub use recovery::{StallRecoveryDecision, decide_stall_recovery, recoveries_from_events};

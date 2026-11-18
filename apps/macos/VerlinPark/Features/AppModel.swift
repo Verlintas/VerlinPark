@@ -36,6 +36,11 @@ struct WorkspaceDirectoryState: Equatable {
 @Observable
 final class AppModel {
     private let noticesKey = "verlinpark.notices"
+    /// One retention policy for history loads and live appends. The daemon
+    /// event API pages forward only, so the loader walks to the tail but keeps
+    /// only this newest window instead of merging up to 100k events on the
+    /// main actor.
+    private static let eventRetentionLimit = 8000
 
     enum ConnectionState: Equatable {
         case idle
@@ -736,12 +741,53 @@ final class AppModel {
 
     private let core = CoreClient()
     private let daemon = DaemonController()
+    private let secretStore: any SecretStore
+    private let secretAccount: String
     private var eventTask: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
+    private var resyncHeartbeatTask: Task<Void, Never>?
     private var reconnectAttempt = 0
     private var started = false
     private var selectionGeneration = 0
     private var searchGeneration = 0
+    private var lastEventSequences: [String: UInt64] = [:]
+    private var lastGlobalResyncAt = Date.distantPast
+    private struct PendingPromptOperation {
+        let id: String
+        let text: String
+    }
+
+    private struct PendingGapResume {
+        let sessionID: String
+        let since: UInt64
+    }
+
+    private var gapBackfillTask: Task<Void, Never>?
+    private var gapResyncTask: Task<Void, Never>?
+    private var gapResyncQueued = false
+    private var pendingGapResume: PendingGapResume?
+    private var selectionLoadTask: Task<Void, Never>?
+    /// An unchanged prompt that failed or timed out reuses its operation id on
+    /// an explicit retry, so an accepted-but-unacknowledged prompt is not
+    /// started twice.
+    private var pendingPromptOperations: [String: PendingPromptOperation] = [:]
+    /// Persisted across restarts so a key removed while the daemon is offline
+    /// is still cleared on the next successful connection.
+    private var providerDaemonClearPending =
+        UserDefaults.standard.bool(forKey: "provider.daemonClearPending")
+    /// Set by a notification that requires in-app review rather than inline
+    /// approval; RootView presents the dashboard Inbox when it changes.
+    var approvalAttentionRequestID: UUID?
+    var requestedDashboardSection: DashboardSection?
+    var highlightedApprovalID: String?
+
+    init(
+        secretStore: any SecretStore = KeychainSecretStore(),
+        secretAccount: String = "provider.apiKey"
+    ) {
+        self.secretStore = secretStore
+        self.secretAccount = secretAccount
+    }
 
     var unreadNoticeCount: Int {
         notices.count(where: { !$0.isRead })
@@ -927,6 +973,25 @@ final class AppModel {
                 }
             }
         }
+        SystemNotifier.shared.onReviewApproval = { [weak self] approvalID in
+            guard let self else { return }
+            Task { @MainActor in
+                self.requestApprovalReview(approvalID)
+            }
+        }
+        if let pending = UserDefaults.standard.string(
+            forKey: SystemNotifier.pendingApprovalReviewKey
+        ), !pending.isEmpty {
+            UserDefaults.standard.removeObject(
+                forKey: SystemNotifier.pendingApprovalReviewKey
+            )
+            requestApprovalReview(pending)
+        }
+        await core.setEventGapHandler { [weak self] gap in
+            Task { @MainActor in
+                self?.handleEventGap(gap)
+            }
+        }
         await connectIfNeeded()
         if connection != .connected {
             scheduleReconnect()
@@ -949,19 +1014,39 @@ final class AppModel {
             }
             connection = .connected
             reconnectAttempt = 0
-            await configureStoredProvider()
+            // Install the consumer before provider configuration. The client
+            // also buffers events that arrive between `event.subscribe` and
+            // this call, so a slow provider configure cannot drop approvals.
+            consumeEvents()
             agentInfo = try? await core.agentInfo()
             if let info = agentInfo {
                 roleModels = info.roleModels
                 adoptApprovalMode(from: info)
             }
-            consumeEvents()
+            await clearDaemonProviderKeyIfPending()
+            await configureStoredProvider()
             await refresh()
+            // A reconnect is a resync boundary: reload global projections and
+            // fetch the selected session's event tail by sequence. Live
+            // `event.gap` notifications are handled separately; because there
+            // is no global sequence, other sessions are reconciled through
+            // their projections.
+            await resyncAfterReconnect()
+            startResyncHeartbeat()
         } catch {
             reconnectAttempt += 1
             connection = .failed(error.localizedDescription)
             lastError = error.localizedDescription
         }
+    }
+
+    /// Routes a notification that is not safe to resolve inline into the
+    /// in-app approval center so risk, tool, and target stay visible.
+    func requestApprovalReview(_ approvalID: String) {
+        highlightedApprovalID = approvalID
+        requestedDashboardSection = .inbox
+        approvalAttentionRequestID = UUID()
+        Task { await loadPendingApprovals() }
     }
 
     private func scheduleReconnect() {
@@ -1012,6 +1097,7 @@ final class AppModel {
     }
 
     func selectProject(_ id: String?) {
+        selectionLoadTask?.cancel()
         guard let id else {
             selectionGeneration &+= 1
             selectedProjectID = nil
@@ -1328,7 +1414,20 @@ final class AppModel {
         lastCommit = nil
         lastLanding = nil
         lastPullRequest = nil
-        Task {
+        commitBusy = false
+        landingBusy = false
+        pullRequestBusy = false
+        diffLoading = false
+        checkpointBusy = false
+        contextCheckpointBusy = false
+        processesBusy = false
+        processesError = nil
+        supervisedProcesses = []
+        processSummary = []
+        selectedProcessID = nil
+        processLogs = ""
+        selectionLoadTask?.cancel()
+        selectionLoadTask = Task {
             await loadEvents()
             await loadEfficiency()
             await loadCheckpoints()
@@ -1623,22 +1722,78 @@ final class AppModel {
             showToast("Session created", detail: session.goal, kind: .success)
             return true
         } catch {
+            // D10: the daemon may create the row/worktree and then fail to
+            // start the Leader. The typed error names the created session, so
+            // open it and warn instead of inviting a duplicate create. Never
+            // retry session.create automatically.
+            if let partial = SessionCreateErrorMapper.partialSuccess(from: error) {
+                await adoptPartiallyStartedSession(
+                    partial,
+                    fallbackProjectID: projectID
+                )
+                return true
+            }
             handle(error)
             return false
         }
     }
 
-    func sendMessage(_ text: String) async {
+    private func adoptPartiallyStartedSession(
+        _ failure: SessionStartFailure,
+        fallbackProjectID: String
+    ) async {
+        let reportedProjectID = failure.projectID?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let projectID = reportedProjectID.isEmpty
+            ? fallbackProjectID
+            : reportedProjectID
+        await openSession(sessionID: failure.sessionID, projectID: projectID)
+        let goal = sessions.first(where: { $0.id == failure.sessionID })?.goal
+        let detail = goal.map { "\(failure.warningDetail) · \($0)" }
+            ?? failure.warningDetail
+        showToast(
+            "Session created; Leader failed to start",
+            detail: detail,
+            kind: .warning,
+            duration: 8
+        )
+    }
+
+    @discardableResult
+    func sendMessage(_ text: String) async -> Bool {
         guard let sessionID = selectedSessionID else {
             lastError = "Choose or create a session first."
-            return
+            return false
+        }
+        guard connection == .connected else {
+            lastError = "The daemon is not connected. Your prompt was kept in the composer."
+            return false
         }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty else { return false }
+        // The daemon deduplicates prompt/defer/steer by operation id. The app
+        // still never auto-retries; a user-initiated retry of the same
+        // unchanged prompt reuses this id instead of starting duplicate work.
+        let operationID = pendingPromptOperations[sessionID]
+            .flatMap { $0.text == trimmed ? $0.id : nil }
+            ?? UUID().uuidString
+        pendingPromptOperations[sessionID] = PendingPromptOperation(
+            id: operationID,
+            text: trimmed
+        )
         do {
-            try await core.prompt(sessionID: sessionID, content: trimmed)
+            try await core.prompt(
+                sessionID: sessionID,
+                content: trimmed,
+                operationID: operationID
+            )
+            if pendingPromptOperations[sessionID]?.id == operationID {
+                pendingPromptOperations.removeValue(forKey: sessionID)
+            }
+            return true
         } catch {
             handle(error)
+            return false
         }
     }
 
@@ -3410,10 +3565,16 @@ final class AppModel {
             processLogs = ""
             return
         }
+        let generation = selectionGeneration
         processesBusy = true
-        defer { processesBusy = false }
+        defer {
+            if generation == selectionGeneration {
+                processesBusy = false
+            }
+        }
         do {
             let result = try await core.listProcesses(sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
             supervisedProcesses = result.processes
             if let selectedProcessID,
                !result.processes.contains(where: { $0.id == selectedProcessID })
@@ -3429,6 +3590,7 @@ final class AppModel {
                 await loadProcessLogs(processID: selectedProcessID)
             }
         } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
             processesError = error.localizedDescription
             handle(error)
         }
@@ -3436,6 +3598,7 @@ final class AppModel {
 
     func loadProcessLogs(processID: String) async {
         guard let sessionID = selectedSessionID else { return }
+        let generation = selectionGeneration
         do {
             let result = try await core.processLogs(
                 sessionID: sessionID,
@@ -3443,6 +3606,7 @@ final class AppModel {
                 maxBytes: 65536,
                 fromEnd: true
             )
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
             var text = result.content
             if result.rotated {
                 text = "[older output was dropped by bounded rotation]\n" + text
@@ -3452,7 +3616,9 @@ final class AppModel {
             }
             processLogs = text
         } catch {
-            processesError = error.localizedDescription
+            if isCurrent(sessionID: sessionID, generation: generation) {
+                processesError = error.localizedDescription
+            }
         }
     }
 
@@ -3461,17 +3627,21 @@ final class AppModel {
             processSummary = []
             return
         }
+        let generation = selectionGeneration
         do {
             let result = try await core.listProcesses(
                 sessionID: sessionID,
                 includeFinished: false,
                 limit: 8
             )
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
             processSummary = result.processes
         } catch {
             // A transient summary failure must not replace the Stage with an
             // error banner; the Preview card owns detailed diagnostics.
-            processSummary = []
+            if isCurrent(sessionID: sessionID, generation: generation) {
+                processSummary = []
+            }
         }
     }
 
@@ -5077,22 +5247,38 @@ final class AppModel {
         }
         providerBusy = true
         defer { providerBusy = false }
+
+        let typedKey = providerAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let apiKey: String
+        if !typedKey.isEmpty {
+            // Persist first. If the Keychain write fails we must not hand the
+            // daemon a key that a later reconnect cannot recover.
+            do {
+                try secretStore.save(typedKey, account: secretAccount)
+            } catch {
+                providerStatus = "Could not save the API key: \(error.localizedDescription)"
+                return
+            }
+            providerHasStoredKey = true
+            UserDefaults.standard.set(true, forKey: "provider.hasAPIKey")
+            providerAPIKey = ""
+            apiKey = typedKey
+            setProviderDaemonClearPending(false)
+        } else {
+            switch resolveProviderCredential() {
+            case let .key(stored):
+                apiKey = stored
+            case .notRequired, .notConfigured:
+                apiKey = ""
+            case .missingStoredKey:
+                providerStatus =
+                    "The stored API key could not be read from Keychain. Re-enter it before saving; the daemon provider was left unchanged."
+                return
+            }
+        }
+
         do {
-            let caps = orgCaps
-            let apiKey = resolvedProviderAPIKey()
-            let info = try await core.configureAgent(
-                kind: providerKind,
-                baseURL: baseURL,
-                model: model,
-                roleModels: roleModels,
-                apiKey: apiKey,
-                maxManagers: caps.managers,
-                maxWorkers: caps.workers,
-                maxLabour: caps.labour,
-                autoExpandWorkers: autoExpandWorkers,
-                contextWindow: parsedContextWindow,
-                approvalMode: approvalMode.rawValue
-            )
+            let info = try await applyProviderConfiguration(apiKey: apiKey)
             agentInfo = info
             roleModels = info.roleModels
             let defaults = UserDefaults.standard
@@ -5106,12 +5292,6 @@ final class AppModel {
             UserDefaults.standard.set(providerContextWindowText, forKey: "provider.contextWindow")
             if let data = try? JSONEncoder().encode(roleModels) {
                 UserDefaults.standard.set(data, forKey: "provider.roleModels")
-            }
-            if !providerAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                try Keychain.save(providerAPIKey, account: "provider.apiKey")
-                providerHasStoredKey = true
-                UserDefaults.standard.set(true, forKey: "provider.hasAPIKey")
-                providerAPIKey = ""
             }
             providerStatus = "Connected · \(model)"
             showToast("Provider connected", detail: model, kind: .success)
@@ -5128,84 +5308,187 @@ final class AppModel {
             || lower.contains("0.0.0.0"))
     }
 
-    private func resolvedProviderAPIKey() -> String {
-        let typed = providerAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !typed.isEmpty {
-            return typed
-        }
-        guard providerHasStoredKey, providerNeedsAPIKey else { return "" }
-        return Keychain.read(account: "provider.apiKey") ?? ""
+    private func resolveProviderCredential() -> ProviderCredential {
+        ProviderCredentialResolver.resolve(
+            typedKey: providerAPIKey,
+            hasStoredKeyFlag: providerHasStoredKey,
+            endpointRequiresKey: providerNeedsAPIKey,
+            store: secretStore,
+            account: secretAccount
+        )
     }
 
-    func clearStoredProviderKey() {
-        Keychain.delete(account: "provider.apiKey")
+    /// Removes the local secret and clears the daemon provider credentials
+    /// through `agent.configure` with no key. If the daemon is offline the
+    /// intent is persisted and retried on the next connection; a missing
+    /// Keychain item is never treated as permission to clear a live daemon.
+    func clearStoredProviderKey() async {
+        providerBusy = true
+        defer { providerBusy = false }
+        secretStore.delete(account: secretAccount)
         providerAPIKey = ""
         providerHasStoredKey = false
         UserDefaults.standard.set(false, forKey: "provider.hasAPIKey")
-        providerStatus = "Stored API key removed."
+        setProviderDaemonClearPending(true)
+        await clearDaemonProviderKeyIfPending()
     }
 
-    private func configureStoredProvider() async {
+    /// True when the Keychain key is gone but the daemon has not acknowledged
+    /// clearing its in-memory provider credentials yet.
+    var providerNeedsDaemonKeyClear: Bool {
+        providerDaemonClearPending
+    }
+
+    private func setProviderDaemonClearPending(_ value: Bool) {
+        providerDaemonClearPending = value
+        UserDefaults.standard.set(value, forKey: "provider.daemonClearPending")
+    }
+
+    private func clearDaemonProviderKeyIfPending() async {
+        guard providerDaemonClearPending else { return }
         let baseURL = providerBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         let model = providerModel.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !baseURL.isEmpty, !model.isEmpty else { return }
+        guard !baseURL.isEmpty, !model.isEmpty else {
+            setProviderDaemonClearPending(false)
+            providerStatus = "Stored API key removed. No local provider configuration to clear."
+            return
+        }
+        guard connection == .connected else {
+            providerStatus =
+                "Stored API key removed from Keychain. The daemon provider will be cleared on the next connection."
+            return
+        }
+        if let info = agentInfo, !info.configured {
+            setProviderDaemonClearPending(false)
+            providerStatus = "Stored API key removed. The daemon has no active provider configuration."
+            return
+        }
         do {
-            let caps = orgCaps
-            _ = try await core.configureAgent(
-                kind: providerKind,
-                baseURL: baseURL,
-                model: model,
-                roleModels: roleModels,
-                apiKey: resolvedProviderAPIKey(),
-                maxManagers: caps.managers,
-                maxWorkers: caps.workers,
-                maxLabour: caps.labour,
-                autoExpandWorkers: autoExpandWorkers,
-                contextWindow: parsedContextWindow,
-                approvalMode: approvalMode.rawValue
-            )
+            let info = try await applyProviderConfiguration(apiKey: "")
+            agentInfo = info
+            roleModels = info.roleModels
+            setProviderDaemonClearPending(false)
+            providerStatus = "Stored API key removed; the daemon provider was reconfigured without credentials."
         } catch {
-            providerStatus = error.localizedDescription
+            providerStatus =
+                "Stored API key removed from Keychain, but clearing the daemon provider failed: \(error.localizedDescription)"
         }
     }
 
+    @discardableResult
+    private func configureStoredProvider() async -> Bool {
+        let baseURL = providerBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let model = providerModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !baseURL.isEmpty, !model.isEmpty else { return false }
+        let apiKey: String
+        switch resolveProviderCredential() {
+        case let .key(key):
+            apiKey = key
+        case .notRequired:
+            apiKey = ""
+        case .missingStoredKey:
+            // Never replace a live daemon provider with an unauthorized one
+            // just because the Keychain read failed.
+            providerStatus =
+                "The stored API key could not be read from Keychain. The daemon provider was left unchanged; re-enter the key in Settings."
+            return false
+        case .notConfigured:
+            if agentInfo?.configured != true {
+                providerStatus = "Enter an API key and save the provider to connect it."
+            } else if providerStatus?.isEmpty != false {
+                providerStatus =
+                    "No stored API key; the daemon provider configuration was left unchanged."
+            }
+            return false
+        }
+        do {
+            let info = try await applyProviderConfiguration(apiKey: apiKey)
+            agentInfo = info
+            roleModels = info.roleModels
+            providerStatus = "Connected · \(info.model ?? model)"
+            return true
+        } catch {
+            providerStatus = error.localizedDescription
+            return false
+        }
+    }
+
+    private func applyProviderConfiguration(apiKey: String) async throws -> AgentInfo {
+        let caps = orgCaps
+        return try await core.configureAgent(
+            kind: providerKind,
+            baseURL: providerBaseURL.trimmingCharacters(in: .whitespacesAndNewlines),
+            model: providerModel.trimmingCharacters(in: .whitespacesAndNewlines),
+            roleModels: roleModels,
+            apiKey: apiKey,
+            maxManagers: caps.managers,
+            maxWorkers: caps.workers,
+            maxLabour: caps.labour,
+            autoExpandWorkers: autoExpandWorkers,
+            contextWindow: parsedContextWindow,
+            approvalMode: approvalMode.rawValue
+        )
+    }
+
     func applyOrgSettings() async {
-        await configureStoredProvider()
+        let applied = await configureStoredProvider()
+        showToast(
+            applied ? "Team capacity applied" : "Team capacity saved",
+            detail: applied
+                ? "Leader, Manager, Worker, and Labour caps updated."
+                : (providerStatus ?? "Enter the API key to apply provider settings."),
+            kind: applied ? .success : .warning
+        )
     }
 
     func applyApprovalMode() async {
         approvalMode.store()
-        await configureStoredProvider()
+        let applied = await configureStoredProvider()
         showToast(
-            "Permission policy updated",
-            detail: approvalMode.title,
-            kind: .success
+            applied ? "Permission policy updated" : "Permission policy saved",
+            detail: applied
+                ? approvalMode.title
+                : (providerStatus ?? "Enter the API key to apply it to the daemon."),
+            kind: applied ? .success : .warning
         )
     }
 
-    func commitSession(message: String) async {
-        guard let sessionID = selectedSessionID else { return }
+    func commitSession(message: String, sessionID: String? = nil) async {
+        guard let sessionID = sessionID ?? selectedSessionID else { return }
+        let generation = selectionGeneration
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             lastError = "Enter a commit message."
             return
         }
         commitBusy = true
-        defer { commitBusy = false }
+        defer {
+            if generation == selectionGeneration {
+                commitBusy = false
+            }
+        }
         do {
-            lastCommit = try await core.commitSession(sessionID: sessionID, message: trimmed)
+            let commit = try await core.commitSession(sessionID: sessionID, message: trimmed)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            lastCommit = commit
             await loadDiff()
         } catch {
             handle(error)
         }
     }
 
-    func discardChanges() async {
-        guard let sessionID = selectedSessionID else { return }
+    func discardChanges(sessionID: String? = nil) async {
+        guard let sessionID = sessionID ?? selectedSessionID else { return }
+        let generation = selectionGeneration
         commitBusy = true
-        defer { commitBusy = false }
+        defer {
+            if generation == selectionGeneration {
+                commitBusy = false
+            }
+        }
         do {
             try await core.discardSession(sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
             lastCommit = nil
             await loadDiff()
         } catch {
@@ -9210,12 +9493,21 @@ final class AppModel {
         }
     }
 
-    func landSession() async {
-        guard let sessionID = selectedSessionID else { return }
+    func landSession(sessionID: String? = nil) async {
+        guard let sessionID = sessionID ?? selectedSessionID else { return }
+        let generation = selectionGeneration
         landingBusy = true
-        defer { landingBusy = false }
+        defer {
+            if generation == selectionGeneration {
+                landingBusy = false
+            }
+        }
         do {
             let landing = try await core.landSession(sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else {
+                await loadAllSessions()
+                return
+            }
             lastLanding = landing
             await loadSessions()
             await loadDiff()
@@ -9230,12 +9522,21 @@ final class AppModel {
         }
     }
 
-    func openPullRequest() async {
-        guard let sessionID = selectedSessionID else { return }
+    func openPullRequest(sessionID: String? = nil) async {
+        guard let sessionID = sessionID ?? selectedSessionID else { return }
+        let generation = selectionGeneration
         pullRequestBusy = true
-        defer { pullRequestBusy = false }
+        defer {
+            if generation == selectionGeneration {
+                pullRequestBusy = false
+            }
+        }
         do {
             let pullRequest = try await core.openPullRequest(sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else {
+                await loadAllSessions()
+                return
+            }
             lastPullRequest = pullRequest
             await loadSessions()
             let provider = pullRequest.provider.map { "\($0) · " } ?? ""
@@ -9452,11 +9753,20 @@ final class AppModel {
         }
     }
 
-    func pruneContextCheckpoints(keepLatest: Int = 1) async {
-        guard let sessionID = selectedSessionID else { return }
-        contextCheckpointBusy = true
-        contextCheckpointNotice = nil
-        defer { contextCheckpointBusy = false }
+    /// `sessionID` is captured when the confirmation is presented so a
+    /// selection change cannot retarget a destructive prune.
+    func pruneContextCheckpoints(sessionID: String, keepLatest: Int = 1) async {
+        let generation = selectionGeneration
+        let targetIsCurrent = sessionID == selectedSessionID
+        if targetIsCurrent {
+            contextCheckpointBusy = true
+            contextCheckpointNotice = nil
+        }
+        defer {
+            if targetIsCurrent, generation == selectionGeneration {
+                contextCheckpointBusy = false
+            }
+        }
         do {
             let result = try await core.pruneContextCheckpoints(
                 sessionID: sessionID,
@@ -9464,11 +9774,11 @@ final class AppModel {
                 keepLatest: keepLatest,
                 dryRun: false
             )
-            guard sessionID == selectedSessionID else { return }
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
             contextCheckpointNotice = "Pruned \(result.removed) of \(result.candidates)"
             await loadContextStatus()
         } catch {
-            if sessionID == selectedSessionID {
+            if isCurrent(sessionID: sessionID, generation: generation) {
                 contextCheckpointNotice = "Prune failed: \(error.localizedDescription)"
             }
             handle(error)
@@ -9603,11 +9913,21 @@ final class AppModel {
         }
     }
 
-    func pruneCheckpoints() async {
-        guard let sessionID = selectedSessionID else { return }
-        checkpointBusy = true
-        checkpointNotice = nil
-        defer { checkpointBusy = false }
+    /// `sessionID` is captured when the confirmation is presented. The prune
+    /// itself always targets that session, even if the selection changes while
+    /// the dialog is open.
+    func pruneCheckpoints(sessionID: String) async {
+        let generation = selectionGeneration
+        let targetIsCurrent = sessionID == selectedSessionID
+        if targetIsCurrent {
+            checkpointBusy = true
+            checkpointNotice = nil
+        }
+        defer {
+            if targetIsCurrent, generation == selectionGeneration {
+                checkpointBusy = false
+            }
+        }
         do {
             let result = try await core.pruneCheckpoints(
                 sessionID: sessionID,
@@ -9615,6 +9935,7 @@ final class AppModel {
                 keepLatest: 5,
                 dryRun: false
             )
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
             await loadCheckpoints()
             checkpointNotice = "Removed \(result.removed) of \(result.candidates) candidates"
         } catch {
@@ -9885,6 +10206,7 @@ final class AppModel {
         do {
             var loaded: [Event] = []
             var since: UInt64 = 0
+            var pages = 0
             while true {
                 if Task.isCancelled || !isCurrent(sessionID: sessionID, generation: generation) {
                     return
@@ -9894,12 +10216,19 @@ final class AppModel {
                     since: since,
                     limit: 500
                 )
+                pages += 1
                 loaded.append(contentsOf: page)
+                // Keep the newest window. This mirrors the live retention
+                // policy, so the first live event no longer collapses a large
+                // loaded transcript, and the main-actor merge stays bounded.
+                if loaded.count > Self.eventRetentionLimit {
+                    loaded.removeFirst(loaded.count - Self.eventRetentionLimit)
+                }
                 guard page.count == 500, let last = page.last else { break }
                 let next = last.seq &+ 1
                 guard next > since else { break }
                 since = next
-                if loaded.count > 100_000 {
+                if pages >= 2000 {
                     break
                 }
             }
@@ -9907,7 +10236,17 @@ final class AppModel {
             // Keep events that arrived while the history was loading; dedupe by
             // sequence and restore the canonical order.
             let live = events.filter { $0.sessionId == sessionID }
-            events = mergeEvents(loaded, live)
+            var merged = mergeEvents(loaded, live)
+            if merged.count > Self.eventRetentionLimit {
+                merged.removeFirst(merged.count - Self.eventRetentionLimit)
+            }
+            events = merged
+            if let maxSeq = events.filter({ $0.sessionId == sessionID }).map(\.seq).max() {
+                lastEventSequences[sessionID] = max(
+                    lastEventSequences[sessionID] ?? 0,
+                    maxSeq
+                )
+            }
             refreshPlanTaskStatuses()
         } catch {
             if isCurrent(sessionID: sessionID, generation: generation) {
@@ -9967,21 +10306,230 @@ final class AppModel {
             for await event in stream {
                 apply(event)
             }
+            guard !Task.isCancelled else { return }
+            // Only the current consumer reaches this point; a superseded one
+            // was cancelled above. If the stream ended while the socket still
+            // claims to be connected, live updates stopped silently.
+            if connection == .connected {
+                connection = .failed("Live updates stopped.")
+                scheduleReconnect()
+            }
+        }
+    }
+
+    /// `event.gap` is the primary lag signal. This sequence check remains a
+    /// fallback for older daemons and for a dropped notification. Events carry
+    /// a per-session sequence; there is no global sequence.
+    private func trackEventSequence(_ event: Event) {
+        let previous = lastEventSequences[event.sessionId] ?? 0
+        if previous > 0, event.seq > previous + 1,
+           pendingGapResume == nil
+        {
+            scheduleGapBackfill(sessionID: event.sessionId, since: previous + 1)
+        }
+        lastEventSequences[event.sessionId] = max(previous, event.seq)
+    }
+
+    private func scheduleGapBackfill(sessionID: String, since _: UInt64) {
+        guard sessionID == selectedSessionID else {
+            // A non-selected session's transcript is not loaded, but its
+            // approval or question may have been missed. Reload the global
+            // projections.
+            Task { [weak self] in
+                await self?.resyncGlobalProjections()
+            }
+            return
+        }
+        // Coalesce a burst of gap detections. A full bounded reload is simpler
+        // and safer than juggling an earlier `since` cursor while the window
+        // advances; the retained window is capped at `eventRetentionLimit`.
+        gapBackfillTask?.cancel()
+        gapBackfillTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(100))
+            guard let self, !Task.isCancelled else { return }
+            await loadEvents()
+            if !Task.isCancelled {
+                gapBackfillTask = nil
+            }
+        }
+    }
+
+    /// Handles the daemon's additive `event.gap` lag signal. Global
+    /// projections are always reconciled; a gap that names the selected
+    /// session also re-fetches that session from `resume_from_seq`/`last_seq`.
+    /// No event is fabricated and no unbounded cross-session replay is done.
+    private func handleEventGap(_ gap: EventGap) {
+        guard connection == .connected else { return }
+        if let target = gap.targetSessionID,
+           target == selectedSessionID,
+           let resume = gap.effectiveResumeFromSeq
+        {
+            queueGapResume(sessionID: target, since: resume)
+        }
+        // This app subscribes globally, so one gap can span sessions while the
+        // payload names only the last delivered session. Also tail-fetch the
+        // selected session from the last seq we actually saw.
+        if gap.sessionID == nil,
+           let selected = selectedSessionID,
+           let last = lastEventSequences[selected],
+           last > 0, last < UInt64.max
+        {
+            queueGapResume(sessionID: selected, since: last + 1)
+        }
+        scheduleGapResync()
+    }
+
+    private func queueGapResume(sessionID: String, since: UInt64) {
+        guard since > 0 else { return }
+        if let pending = pendingGapResume, pending.sessionID == sessionID {
+            pendingGapResume = PendingGapResume(
+                sessionID: sessionID,
+                since: min(pending.since, since)
+            )
+        } else {
+            pendingGapResume = PendingGapResume(
+                sessionID: sessionID,
+                since: since
+            )
+        }
+    }
+
+    private func scheduleGapResync() {
+        if gapResyncTask != nil {
+            gapResyncQueued = true
+            return
+        }
+        gapResyncTask = Task { [weak self] in
+            guard let self else { return }
+            repeat {
+                gapResyncQueued = false
+                let pending = pendingGapResume
+                pendingGapResume = nil
+                await resyncGlobalProjections(force: true)
+                if let pending, pending.sessionID == selectedSessionID {
+                    await backfillSelectedSessionEvents(since: pending.since)
+                }
+                if !gapResyncQueued { break }
+                // Coalesce a burst of gap frames without delaying the first
+                // global reconciliation.
+                try? await Task.sleep(for: .milliseconds(50))
+            } while !Task.isCancelled
+            gapResyncTask = nil
+        }
+    }
+
+    private func resyncAfterReconnect() async {
+        await loadAllSessions()
+        await resyncGlobalProjections(force: true)
+        guard let sessionID = selectedSessionID else { return }
+        if lastEventSequences[sessionID, default: 0] > 0 {
+            await backfillSelectedSessionEvents(since: nil)
+        } else {
+            await loadEvents()
+        }
+    }
+
+    private func resyncGlobalProjections(force: Bool = false) async {
+        guard connection == .connected else { return }
+        let now = Date()
+        if !force, now.timeIntervalSince(lastGlobalResyncAt) < 5 {
+            return
+        }
+        lastGlobalResyncAt = now
+        await loadPendingApprovals()
+        await loadPendingQuestions()
+        await refreshSessionDirectory()
+    }
+
+    /// Bounded selected-session tail fetch using `event.list since_seq`.
+    /// This is a session-scoped backfill, not a global event replay contract.
+    private func backfillSelectedSessionEvents(since explicitSince: UInt64?) async {
+        guard let sessionID = selectedSessionID else { return }
+        let generation = selectionGeneration
+        let since = explicitSince
+            ?? ((events.filter { $0.sessionId == sessionID }.map(\.seq).max()).map { $0 + 1 } ?? 0)
+        guard since > 0 else {
+            await loadEvents()
+            return
+        }
+        var cursor = since
+        var fetched: [Event] = []
+        do {
+            while true {
+                if Task.isCancelled || !isCurrent(sessionID: sessionID, generation: generation) {
+                    return
+                }
+                let page = try await core.listEvents(
+                    sessionID: sessionID,
+                    since: cursor,
+                    limit: 500
+                )
+                fetched.append(contentsOf: page)
+                guard page.count == 500, let last = page.last else { break }
+                let next = last.seq &+ 1
+                guard next > cursor else { break }
+                cursor = next
+                // A tail reconciliation is bounded; a long disconnected gap
+                // is handled by the next full load rather than an unbounded
+                // main-actor merge.
+                if fetched.count >= 10000 {
+                    break
+                }
+            }
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            if let maxSeq = fetched.map(\.seq).max() {
+                lastEventSequences[sessionID] = max(
+                    lastEventSequences[sessionID] ?? 0,
+                    maxSeq
+                )
+            }
+            guard !fetched.isEmpty else { return }
+            var merged = mergeEvents(events, fetched)
+            if merged.count > Self.eventRetentionLimit {
+                merged.removeFirst(merged.count - Self.eventRetentionLimit)
+            }
+            events = merged
+            refreshPlanTaskStatuses()
+        } catch {
+            // `event.gap`, the heartbeat, and the next reconnect retry the
+            // reconciliation.
+        }
+    }
+
+    /// Slow safety net in addition to `event.gap`; the gap is handled
+    /// immediately, this catches a missed notification.
+    private func startResyncHeartbeat() {
+        resyncHeartbeatTask?.cancel()
+        resyncHeartbeatTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(60))
+                guard let self, !Task.isCancelled else { return }
+                guard connection == .connected else { continue }
+                await resyncGlobalProjections()
+                if let sessionID = selectedSessionID {
+                    await backfillSelectedSessionEvents(
+                        since: (lastEventSequences[sessionID] ?? 0) > 0
+                            ? (lastEventSequences[sessionID] ?? 0) + 1
+                            : nil
+                    )
+                }
+            }
         }
     }
 
     private func apply(_ event: Event) {
+        trackEventSequence(event)
         let transientDelta = event.type == "agent.message_delta" || event.type == "agent.thought_delta"
         if event.sessionId == selectedSessionID,
            !transientDelta,
            !events.contains(where: { $0.id == event.id })
         {
             events.append(event)
-            // Context diagnostics can add one event per provider call; keep a
-            // deeper window so a long tool-heavy session does not push the
-            // visible conversation out of the in-memory event buffer.
-            if events.count > 4000 {
-                events.removeFirst(events.count - 4000)
+            // Context diagnostics can add one event per provider call; use the
+            // same bounded window as the history loader so a live event does
+            // not suddenly shrink an already-loaded transcript.
+            if events.count > Self.eventRetentionLimit {
+                events.removeFirst(events.count - Self.eventRetentionLimit)
             }
         }
 
@@ -10325,8 +10873,14 @@ final class AppModel {
                 projectId: directory?.projectId ?? fallbackProject,
                 kind: "approval",
                 title: "Approval needed · \(goal)",
-                detail: "\(approval.tool) · \(approval.agentName ?? approval.agentRole ?? "agent")",
-                createdAt: event.createdAt
+                detail: Self.approvalNoticeDetail(
+                    tool: approval.tool,
+                    agent: approval.agentName ?? approval.agentRole ?? "agent",
+                    risk: approval.approvalRisk,
+                    input: approval.input
+                ),
+                createdAt: event.createdAt,
+                approvalRisk: approval.approvalRisk
             )
         case "plan_task.finished":
             let status = event.payload.objectValue?["task_status"]?.stringValue ?? ""
@@ -10370,6 +10924,32 @@ final class AppModel {
         }
     }
 
+    /// Bounded notification summary: risk plus the path/URL/command target.
+    /// Full tool input can contain credentials, so only the target-shaped
+    /// fields are copied and the result is capped.
+    static func approvalNoticeDetail(
+        tool: String,
+        agent: String,
+        risk: String?,
+        input: JSONValue
+    ) -> String {
+        let object = input.objectValue
+        let target = object?["command"]?.stringValue
+            ?? object?["path"]?.stringValue
+            ?? object?["url"]?.stringValue
+            ?? object?["query"]?.stringValue
+        let riskLabel = NotificationApprovalPolicy.riskLabel(risk: risk)
+        var parts = [tool, agent, riskLabel]
+        if let target, !target.isEmpty {
+            let singleLine = target
+                .split(whereSeparator: \.isNewline)
+                .first?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? target
+            parts.append(String(singleLine.prefix(160)))
+        }
+        return parts.joined(separator: " · ")
+    }
+
     private func addNotice(
         id: String,
         event: Event,
@@ -10377,7 +10957,8 @@ final class AppModel {
         kind: String,
         title: String,
         detail: String,
-        createdAt: String
+        createdAt: String,
+        approvalRisk: String? = nil
     ) {
         guard !notices.contains(where: { $0.id == id }) else { return }
         let notice = AppNotice(
@@ -10388,7 +10969,8 @@ final class AppModel {
             title: title,
             detail: detail,
             createdAt: createdAt,
-            isRead: false
+            isRead: false,
+            approvalRisk: approvalRisk
         )
         notices.insert(notice, at: 0)
         if notices.count > 100 {
