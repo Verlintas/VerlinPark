@@ -282,6 +282,17 @@ C5 已实现并合入 `782cb19`，ADR-0197。Rust **3,571 passed / 0 failed / 6 
 
 ---
 
+## 2026-11-18 M3.6 dispatch and render split
+
+ADR-0228 完成 **M3.6 dispatch/render 拆分**，不改变 CLI/RPC 行为。Rust **4,234 passed / 0 failed / 6 ignored**，Swift 未修改（535 passed），fmt/clippy 通过。
+
+- `vp-cli/render.rs` 7,999 → **33 行 parent + 18 个输出域 modules**（repository/support/activity/runtime/forges/instructions/effects/identity + `human/` 的 10 个 chunk）。`print_human` 保持 first-match 顺序与 pretty-JSON fallback。
+- `vp-cli/dispatch.rs` 6,918 → **482 行 parent + 23 个命令族 modules**；parent 穷举 425 个 `Command` variants，各 family 保留原 arm 内容与 `Ok(None)` 提前输出语义。
+- `vp-daemon/dispatch.rs` 5,442 → **339 行 parent + 11 个路由族 modules**；469 个 arms 保留，`task.stalls → session` alias 与 unknown-method fallback 不变。
+- 机械校验：dispatch arms 425/425 与 daemon arms 469 均存在，字符串字面量 multiset 不变；CLI smoke 的只读命令 exit 0。
+- 测试：`vp-cli` 156 passed（145 unit + 10 backup integration + 1 governance）；`vp-daemon` 23 unit + 1 governance。
+- 风险：dispatch 路由表的 variant/prefix 需要随新增命令维护；`render/human.rs` chunk 顺序不能随意调整；父级多一层 async 调用，无行为变化。
+
 ## 2026-11-18 M3.5 store, core tail, and daemon split
 
 ADR-0226/0227 与 ADR-0224 的尾部工作完成 **M3.5 结构治理**，不改变行为/API。Rust **4,234 passed / 0 failed / 6 ignored**，Swift 未修改（535 passed），fmt/clippy 通过。

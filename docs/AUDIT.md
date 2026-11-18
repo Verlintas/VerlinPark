@@ -441,6 +441,25 @@ store tests pass. This is structural relocation, not new behavior.
 
 Verification: 4,227 Rust passed / 0 failed / 6 ignored; 535 Swift passed (403 app + 132 helper); `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `swiftformat --lint`, and `xcodebuild test` passed.
 
+## 0.29 2026-11-18 M3.6 dispatch and render split
+
+ADR-0228 splits the remaining large application matches without behavior
+changes. `vp-cli/render.rs` (7,999) is a 33-line surface plus 18 output-domain
+modules, with `print_human` retaining the original first-match order and JSON
+fallback. `vp-cli/dispatch.rs` (6,918) is a 482-line exhaustive router plus 23
+command-family modules covering all 425 `Command` variants with verbatim arms
+and early-output `Ok(None)` behavior. `vp-daemon/dispatch.rs` (5,442) is a
+339-line method-prefix router plus 11 route-family modules covering all 469
+arms, including the `task.stalls → session` alias and unknown-method fallback.
+Mechanical checks found identical string-literal multisets; CLI smoke read-only
+commands exit 0. Risks: routing tables and render chunk order must be maintained.
+Also fixed a store test fixture that truncated UUIDv7 to its timestamp prefix,
+which could collide within one millisecond and intermittently fail the stale
+effect-intent sweep test; full UUIDs remove the flake. Verification: CLI 156
+passed (145 unit + 10 integration + 1 governance); daemon 23 unit + 1
+governance; full workspace 4,234 Rust / 6 ignored; fmt/clippy passed; Swift
+unchanged at 535.
+
 ## 0.28 2026-11-18 M3.5 store, core tail, and daemon split
 
 ADR-0226 splits the eight `vp-store` modules above 2k lines (employment,

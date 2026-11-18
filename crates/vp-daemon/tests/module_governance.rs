@@ -19,7 +19,7 @@ fn line_count(file: &str) -> usize {
 fn daemon_entrypoint_modules_stay_bounded() {
     for (file, max) in [
         ("main.rs", 2_000),
-        ("dispatch.rs", 6_000),
+        ("dispatch.rs", 2_000),
         ("http.rs", 1_000),
         ("sweepers.rs", 1_000),
         ("errors.rs", 1_000),
@@ -33,5 +33,17 @@ fn daemon_entrypoint_modules_stay_bounded() {
             lines <= max,
             "src/{file} has {lines} lines; split below {max}"
         );
+    }
+    let root = manifest_dir().join("src").join("dispatch");
+    for entry in fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|extension| extension == "rs") {
+            let lines = fs::read_to_string(&path).unwrap().lines().count();
+            assert!(
+                lines <= 1_500,
+                "{} has {lines} lines; split below 1500",
+                path.display()
+            );
+        }
     }
 }

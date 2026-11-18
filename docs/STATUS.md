@@ -1,7 +1,7 @@
 # VerlinPark Status
 
 > 最后更新：2026-11-18
-> 当前主线：C1–C12 代码落地（C11 为 loopback + card-only，尚无 inbound 执行桥）；M3.1–M3.5 结构治理完成（store/core/CLI/daemon 入口与领域模块）；下一阶段为生产化与分布式边界。
+> 当前主线：C1–C12 代码落地（C11 为 loopback + card-only，尚无 inbound 执行桥）；M3.1–M3.6 结构治理完成（store/core/CLI/daemon 入口、领域模块与 dispatch 路由）；下一阶段为生产化与分布式边界。
 
 ## 1. 一句话
 
@@ -12,7 +12,7 @@ VerlinPark 已经是一个可运行的 macOS 原生多 Agent 开发区：Rust da
 | 项 | 当前值 |
 |---|---:|
 | Rust crates | 10（新增 `vp-a2a`） |
-| ADR | 222 |
+| ADR | 223 |
 | 最近全量 Rust 测试 | 4,234 passed / 0 failed / 6 ignored |
 | Swift | 535 passed（403 app + 132 helper），`xcodebuild test` 通过 |
 | 当前分支 | `m3-round`（本轮审查前不合并） |
@@ -31,8 +31,16 @@ VerlinPark 已经是一个可运行的 macOS 原生多 Agent 开发区：Rust da
 - M3.3：`run_loop`/`service`/`service_run`/`runs`/`plans`/`sources` 完成二级拆分；parent 最高 138 行，所有模块 < 3k；module-governance 改为递归扫描。
 - M3.4：`vp-cli/src/main.rs` 27,823 行 → 1,160 行 parent + `cli`/`dispatch`/`render`/`rpc`/`tests` modules；CLI 行为不变。
 - M3.5：`vp-store` 8 个大模块、`vp-core` plan/memory/service-merge、`vp-daemon/main.rs` 完成二级拆分；新增 store/CLI/daemon module-governance 测试。
+- M3.6：`vp-cli/render.rs`、`vp-cli/dispatch.rs`、`vp-daemon/dispatch.rs` 按输出域/命令族/路由族拆分；行为与协议不变。
 
 ## 4. 本轮新增
+
+### M3.6 dispatch and render split
+
+- `vp-cli/render.rs` 7,999 → 33 行 parent + 18 个输出域 modules；`print_human` 保持原 first-match 顺序。
+- `vp-cli/dispatch.rs` 6,918 → 482 行 parent + 23 个命令族 modules；425 个 `Command` variants 穷举路由，arm 内容保持。
+- `vp-daemon/dispatch.rs` 5,442 → 339 行 parent + 11 个路由族 modules；469 个 top-level match arms 保持，`task.stalls → session` alias 保留。
+- 新增 ADR-0228；CLI/daemon 行为、RPC method/params、输出、认证、路由不变。
 
 ### M3.5 store, core tail, and daemon split
 
@@ -101,7 +109,7 @@ VerlinPark 已经是一个可运行的 macOS 原生多 Agent 开发区：Rust da
 
 ## 6. 推荐下一阶段
 
-1. **M3.6 结构治理**：拆 `vp-cli/render.rs`/`dispatch.rs`、`vp-daemon/dispatch.rs`、`agent/run_loop/body.rs`/`tool_calls.rs`、`engine/checkpoints.rs`。
+1. **M3.7 结构治理**：拆 `agent/run_loop/body.rs`/`tool_calls.rs`、`engine/checkpoints.rs`/`usage.rs`/`agents.rs`，并评估 `vp-cli/tests.rs` 与 Swift `AppModel` 的模块化。
 2. **发布生产化**：Developer ID、notarization、Sparkle/自动更新、干净 Mac smoke。
 3. **C11 partner gated**：只有有真实 partner 时接 inbound execution/gate bridge。
 4. **分布式 runtime**：跨主机 lease/fencing、merge ownership、远程环境复现。
@@ -143,8 +151,8 @@ VerlinPark 已经是一个可运行的 macOS 原生多 Agent 开发区：Rust da
 ## 9. Architecture debt
 
 1. `vp-core` 的 `lib.rs`/`agent.rs` 与主要领域模块已完成 M3.2/M3.3/M3.5 拆分；parent 最高 138 行。
-2. `vp-cli` 入口已完成 M3.4 拆分；`render.rs`（7,999）与 `dispatch.rs`（6,918）仍是下一批拆分目标。
-3. `vp-daemon/main.rs` 已完成 M3.5 拆分；`dispatch.rs`（5,442）仍是最大的 route match，可按域拆分。
+2. `vp-cli` 入口、render、dispatch 已完成 M3.4/M3.6 拆分；剩余最大 CLI 文件是 `cli.rs` 4,049（clap model）与 `tests.rs` 7,594（测试）。
+3. `vp-daemon/main.rs` 与 dispatch 已完成 M3.5/M3.6 拆分；最大 route family 为 `dispatch/session.rs` 1,122。
 4. 当前最大 core modules：`agent/run_loop/body.rs`（1,954）、`agent/run_loop/tool_calls.rs`（1,923）、`engine/checkpoints.rs`（1,558）、`engine/usage.rs`（1,319）、`engine/agents.rs`（1,249）。下一轮可拆 `body`/`tool_calls`/`checkpoints`/`usage`。
 5. `store` 已完成 8 个大模块二级拆分；`schema.rs` 2,931 仍是单一有序单元，`team_template`/`programs` 等仍 >1.5k。
 6. 事件投影覆盖仍以关键 session 状态为主；plan_task_progress、A2A task list 等是操作状态。

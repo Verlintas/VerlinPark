@@ -17302,7 +17302,10 @@ fn effect_fixture(session_id: &str, target: &str) -> EffectReceipt {
 }
 
 fn uuid_like(prefix: &str) -> String {
-    format!("{prefix}-{}", &Uuid::now_v7().simple().to_string()[..12])
+    // UUIDv7's first 48 bits are the millisecond timestamp; truncating the
+    // *front* made two fixtures created in the same millisecond collide on the
+    // primary key. Use the full UUID so the id is genuinely unique.
+    format!("{prefix}-{}", Uuid::now_v7())
 }
 
 #[test]

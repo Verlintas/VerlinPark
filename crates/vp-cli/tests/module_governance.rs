@@ -15,13 +15,35 @@ fn line_count(file: &str) -> usize {
         .count()
 }
 
+fn module_files(directory: &str) -> Vec<std::path::PathBuf> {
+    let root = manifest_dir().join("src").join(directory);
+    let mut files = Vec::new();
+    let mut pending = vec![root];
+    while let Some(current) = pending.pop() {
+        for entry in fs::read_dir(&current)
+            .unwrap_or_else(|error| panic!("read {}: {error}", current.display()))
+        {
+            let path = entry.expect("directory entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|extension| extension == "rs")
+                && path.file_name().is_some_and(|name| name != "tests.rs")
+            {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
 #[test]
 fn cli_entrypoint_modules_stay_bounded() {
     for (file, max) in [
         ("main.rs", 2_000),
         ("cli.rs", 5_000),
-        ("dispatch.rs", 8_000),
-        ("render.rs", 9_000),
+        ("dispatch.rs", 2_000),
+        ("render.rs", 2_000),
         ("rpc.rs", 1_000),
         ("tests.rs", 9_000),
     ] {
@@ -30,5 +52,15 @@ fn cli_entrypoint_modules_stay_bounded() {
             lines <= max,
             "src/{file} has {lines} lines; split below {max}"
         );
+    }
+    for directory in ["dispatch", "render"] {
+        for file in module_files(directory) {
+            let lines = fs::read_to_string(&file).unwrap().lines().count();
+            assert!(
+                lines <= 1_500,
+                "{} has {lines} lines; split below 1500",
+                file.display()
+            );
+        }
     }
 }
