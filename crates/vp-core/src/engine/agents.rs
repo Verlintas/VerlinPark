@@ -1,5 +1,16 @@
 use super::*;
 
+use vp_protocol::types::{
+    AgentContextView, AgentInboxCounts, AgentInboxView, AgentInspectParams, AgentInspectResult,
+    AgentTaskView, AgentTimelineEntry, AgentUsageTotals, TeamPlan,
+};
+
+const AGENT_INSPECT_DEFAULT_TIMELINE: u32 = 80;
+const AGENT_INSPECT_MAX_TIMELINE: u32 = 200;
+const AGENT_INSPECT_TEXT_CHARS: usize = 1_200;
+const AGENT_INSPECT_INBOX_LIMIT: u32 = 50;
+const AGENT_INSPECT_STEERING_LIMIT: usize = 50;
+
 impl Engine {
     #[allow(clippy::too_many_arguments)]
     pub async fn create_agent(
@@ -326,6 +337,220 @@ impl Engine {
         let store = self.store.clone();
         let id = session_id.to_string();
         tokio::task::spawn_blocking(move || store.list_agents(&id)).await?
+    }
+
+    // ---------------------------------------------------------------------
+    // V1 Collab Agent Inspector
+    // ---------------------------------------------------------------------
+
+    /// Bounded, read-only Agent inspection for the Collab inspector.
+    ///
+    /// The result is event-derived and deliberately excludes raw prompts, tool
+    /// input/output, unbounded compaction summaries, and raw inbox payloads.
+    /// It never appends an event, changes agent status, or approves anything.
+    pub async fn inspect_agent(&self, params: AgentInspectParams) -> Result<AgentInspectResult> {
+        let session_id = params.session_id.trim().to_string();
+        let agent_id = params.agent_id.trim().to_string();
+        if session_id.is_empty() || agent_id.is_empty() {
+            return Err(operator_error(
+                vp_protocol::types::agent_operator_codes::AGENT_TARGET_INVALID,
+                "session_id and agent_id are required",
+            ));
+        }
+
+        let store = self.store.clone();
+        let lookup_session = session_id.clone();
+        let lookup_agent = agent_id.clone();
+        let (session, agent, agents) = tokio::task::spawn_blocking(move || {
+            let session = store.get_session(&lookup_session)?.ok_or_else(|| {
+                operator_error(
+                    vp_protocol::types::agent_operator_codes::AGENT_NOT_FOUND,
+                    "session not found",
+                )
+            })?;
+            let agents = store.list_agents(&lookup_session)?;
+            let agent = agents
+                .iter()
+                .find(|agent| agent.id == lookup_agent)
+                .cloned()
+                .ok_or_else(|| {
+                    operator_error(
+                        vp_protocol::types::agent_operator_codes::AGENT_NOT_FOUND,
+                        "agent is not a member of this session",
+                    )
+                })?;
+            Ok::<_, anyhow::Error>((session, agent, agents))
+        })
+        .await??;
+
+        let timeline_limit = params
+            .timeline_limit
+            .unwrap_or(AGENT_INSPECT_DEFAULT_TIMELINE)
+            .clamp(1, AGENT_INSPECT_MAX_TIMELINE);
+
+        let store = self.store.clone();
+        let timeline_session = session_id.clone();
+        let timeline_agent = agent_id.clone();
+        let (mut events, truncated) = tokio::task::spawn_blocking(move || {
+            // For the common case read one extra row so `truncated` is proven
+            // rather than guessed. At the hard ceiling the store clamps the
+            // probe, so an indexed count supplies the same answer.
+            if timeline_limit < AGENT_INSPECT_MAX_TIMELINE {
+                let events = store.list_agent_events(
+                    &timeline_session,
+                    &timeline_agent,
+                    timeline_limit + 1,
+                )?;
+                let truncated = events.len() > timeline_limit as usize;
+                Ok::<_, anyhow::Error>((events, truncated))
+            } else {
+                let events =
+                    store.list_agent_events(&timeline_session, &timeline_agent, timeline_limit)?;
+                let truncated = store.agent_event_count(&timeline_session, &timeline_agent)?
+                    > u64::from(timeline_limit);
+                Ok::<_, anyhow::Error>((events, truncated))
+            }
+        })
+        .await??;
+        if events.len() > timeline_limit as usize {
+            let excess = events.len() - timeline_limit as usize;
+            events.drain(0..excess);
+        }
+        let timeline = events.iter().map(timeline_entry).collect::<Vec<_>>();
+
+        let task = if let Some(task_id) = agent.task_id.clone() {
+            let store = self.store.clone();
+            let task_session = session_id.clone();
+            let task_id_for_read = task_id.clone();
+            let agents_for_verifier = agents.clone();
+            let (plan, scheduled, status, verifier_status) =
+                tokio::task::spawn_blocking(move || {
+                    let plan = store
+                        .get_team_plan(&task_session)?
+                        .and_then(|raw| serde_json::from_str::<TeamPlan>(&raw).ok());
+                    let scheduled = store
+                        .list_plan_tasks(None, Some(&task_session))?
+                        .into_iter()
+                        .find(|task| task.task_id == task_id_for_read);
+                    let status = store.plan_task_status(&task_session, &task_id_for_read)?;
+                    let verifier_status = latest_verifier_status(
+                        &store,
+                        &task_session,
+                        &agents_for_verifier,
+                        &task_id_for_read,
+                    )?;
+                    Ok::<_, anyhow::Error>((plan, scheduled, status, verifier_status))
+                })
+                .await??;
+            let max_attempts = self
+                .orchestration_policy(&session.project_id)
+                .await?
+                .max_attempts;
+            let plan_task = plan
+                .as_ref()
+                .and_then(|plan| plan.tasks.iter().find(|task| task.id == task_id));
+            Some(AgentTaskView {
+                task_id: task_id.clone(),
+                title: plan_task.map(|task| task.title.clone()).unwrap_or_default(),
+                department: plan_task
+                    .map(|task| task.department.clone())
+                    .or_else(|| agent.department.clone())
+                    .unwrap_or_default(),
+                kind: plan_task.map(|task| task.kind.clone()).unwrap_or_default(),
+                status,
+                acceptance: plan_task
+                    .map(|task| task.acceptance.clone())
+                    .unwrap_or_default(),
+                write_scope: plan_task
+                    .map(|task| task.write_scope.clone())
+                    .unwrap_or_default(),
+                deps: plan_task.map(|task| task.deps.clone()).unwrap_or_default(),
+                attempts: scheduled.as_ref().map(|task| task.attempts).unwrap_or(0),
+                max_attempts,
+                verifier_status,
+            })
+        } else {
+            None
+        };
+
+        let store = self.store.clone();
+        let context_session = session_id.clone();
+        let context_agent = agent_id.clone();
+        let (started, prompt_prefix, usage_event, compacted, totals) =
+            tokio::task::spawn_blocking(move || {
+                let started = store.latest_agent_event_of_kind(
+                    &context_session,
+                    &context_agent,
+                    "agent.started",
+                )?;
+                let prompt_prefix = store.latest_agent_event_of_kind(
+                    &context_session,
+                    &context_agent,
+                    "context.prompt_prefix",
+                )?;
+                let usage_event = store.latest_agent_event_of_kind(
+                    &context_session,
+                    &context_agent,
+                    "context.usage",
+                )?;
+                let compacted = store.latest_agent_event_of_kind(
+                    &context_session,
+                    &context_agent,
+                    "context.compacted",
+                )?;
+                let totals = store.agent_usage_totals(&context_session, &context_agent)?;
+                Ok::<_, anyhow::Error>((started, prompt_prefix, usage_event, compacted, totals))
+            })
+            .await??;
+        let context = build_agent_context(
+            &agent,
+            started.as_ref(),
+            prompt_prefix.as_ref(),
+            usage_event.as_ref(),
+            compacted.as_ref(),
+            &totals,
+        );
+
+        let steering = self
+            .session_steering(&session_id, None, Some(2_000))
+            .await?
+            .steering
+            .into_iter()
+            .filter(|steering| steering.agent_id == agent.id)
+            .collect::<Vec<_>>();
+        let steering = tail_bounded(steering, AGENT_INSPECT_STEERING_LIMIT);
+
+        let (inbox, inbox_counts) = match agent.identity_id.clone() {
+            Some(identity_id) => {
+                let store = self.store.clone();
+                let project_id = session.project_id.clone();
+                let inbox_session = session_id.clone();
+                let (messages, counts) = tokio::task::spawn_blocking(move || {
+                    store.list_agent_inbox_messages(
+                        Some(&project_id),
+                        Some(&identity_id),
+                        Some(&inbox_session),
+                        None,
+                        false,
+                        Some(AGENT_INSPECT_INBOX_LIMIT),
+                    )
+                })
+                .await??;
+                (messages.into_iter().map(agent_inbox_view).collect(), counts)
+            }
+            None => (Vec::new(), AgentInboxCounts::default()),
+        };
+
+        Ok(AgentInspectResult {
+            agent,
+            task,
+            context,
+            timeline,
+            steering,
+            inbox,
+            inbox_counts,
+            truncated,
+        })
     }
 
     // ---------------------------------------------------------------------
@@ -1245,5 +1470,968 @@ impl Engine {
         .await??;
         let _ = self.events.send(event);
         Ok(agent.id)
+    }
+}
+
+fn operator_error(code: &'static str, message: impl Into<String>) -> anyhow::Error {
+    vp_protocol::types::AgentIdentityError::new(code, message).into()
+}
+
+/// Bound one display string and remove common credential shapes. The inspector
+/// is a read surface, not a secret store: callers pass only allowlisted fields,
+/// and this is the final defense-in-depth filter.
+fn inspect_text(value: &str, max_chars: usize) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let redacted = crate::tooling::errors::redact_secrets_for_display(trimmed);
+    truncate_chars(&redacted, max_chars)
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut output = text
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    output.push('…');
+    output
+}
+
+fn tail_bounded<T>(items: Vec<T>, limit: usize) -> Vec<T> {
+    if items.len() <= limit {
+        return items;
+    }
+    let skip = items.len() - limit;
+    items.into_iter().skip(skip).collect()
+}
+
+fn payload_string(payload: &serde_json::Value, key: &str) -> Option<String> {
+    payload
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn payload_u32(payload: &serde_json::Value, key: &str) -> Option<u32> {
+    payload
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| value.min(u64::from(u32::MAX)) as u32)
+}
+
+fn payload_u64(payload: &serde_json::Value, key: &str) -> Option<u64> {
+    payload.get(key).and_then(serde_json::Value::as_u64)
+}
+
+fn payload_status(payload: &serde_json::Value) -> Option<String> {
+    for key in ["status", "task_status", "agent_status"] {
+        if let Some(value) = payload_string(payload, key) {
+            return Some(inspect_text(&value, 80));
+        }
+    }
+    None
+}
+
+fn latest_verifier_status(
+    store: &Store,
+    session_id: &str,
+    agents: &[AgentRecord],
+    task_id: &str,
+) -> Result<Option<String>> {
+    let mut latest: Option<(u64, String)> = None;
+    for verifier in agents
+        .iter()
+        .filter(|agent| agent.role == "verifier" && agent.task_id.as_deref() == Some(task_id))
+    {
+        let Some(event) =
+            store.latest_agent_event_of_kind(session_id, &verifier.id, "agent.finished")?
+        else {
+            continue;
+        };
+        let status = match event
+            .payload
+            .get("approved")
+            .and_then(serde_json::Value::as_bool)
+        {
+            Some(true) => "approved".to_string(),
+            Some(false) => "rejected".to_string(),
+            None => payload_status(&event.payload).unwrap_or_else(|| "finished".to_string()),
+        };
+        if latest.as_ref().is_none_or(|(seq, _)| event.seq > *seq) {
+            latest = Some((event.seq, status));
+        }
+    }
+    Ok(latest.map(|(_, status)| status))
+}
+
+fn build_agent_context(
+    agent: &AgentRecord,
+    started: Option<&Event>,
+    prompt_prefix: Option<&Event>,
+    usage_event: Option<&Event>,
+    compacted: Option<&Event>,
+    totals: &AgentUsageTotals,
+) -> AgentContextView {
+    let mut context = AgentContextView {
+        model: agent.model.clone(),
+        profile: agent.profile.clone(),
+        input_tokens: totals.input_tokens,
+        output_tokens: totals.output_tokens,
+        cache_read_tokens: totals.cache_read_tokens,
+        cache_write_tokens: totals.cache_write_tokens,
+        cost_usd: totals.cost_usd,
+        generated_at: vp_protocol::now_rfc3339(),
+        ..AgentContextView::default()
+    };
+
+    if let Some(event) = started {
+        context.objective = payload_string(&event.payload, "goal")
+            .or_else(|| payload_string(&event.payload, "objective"))
+            .map(|goal| inspect_text(&goal, AGENT_INSPECT_TEXT_CHARS));
+    }
+
+    if let Some(event) = prompt_prefix {
+        let payload = &event.payload;
+        if let Some(model) = payload_string(payload, "model") {
+            context.model = inspect_text(&model, 200);
+        }
+        if let Some(profile) = payload_string(payload, "agent_profile") {
+            context.profile = Some(inspect_text(&profile, 80));
+        }
+        context.tool_count = payload_u32(payload, "tool_bundle_total_tool_count")
+            .or_else(|| payload_u32(payload, "tool_count"));
+        context.tool_bundle =
+            payload_string(payload, "tool_bundle").map(|bundle| inspect_text(&bundle, 80));
+        context.prefix_hash =
+            payload_string(payload, "prefix_hash").map(|hash| inspect_text(&hash, 128));
+        if let Some(memory) = payload
+            .get("identity_memory")
+            .filter(|value| value.is_object())
+        {
+            context.memory_brief_chars = payload_u32(memory, "brief_chars");
+            context.memory_brief_hash =
+                payload_string(memory, "brief_hash").map(|hash| inspect_text(&hash, 128));
+        }
+    }
+
+    if let Some(event) = usage_event {
+        let payload = &event.payload;
+        context.estimated_tokens = payload_u64(payload, "estimated_tokens");
+        context.context_window = payload_u64(payload, "context_window");
+        context.threshold_tokens = payload_u64(payload, "threshold_tokens");
+        context.hard_limit_tokens = payload_u64(payload, "hard_limit_tokens");
+    }
+
+    if let Some(event) = compacted {
+        let mode = payload_string(&event.payload, "mode").unwrap_or_else(|| "compacted".into());
+        let label = match payload_u64(&event.payload, "compaction_count") {
+            Some(count) => format!("{mode} #{count}"),
+            None => mode,
+        };
+        context.last_compaction = Some(inspect_text(&label, 120));
+    }
+
+    context
+}
+
+fn timeline_category(kind: &str) -> &'static str {
+    match kind {
+        "agent.message" | "agent.message_delta" | "agent.thought_delta" => "message",
+        value if value.starts_with("tool.") => "tool",
+        value if value.starts_with("approval.") => "approval",
+        "agent.finished"
+        | "agent.budget_exceeded"
+        | "plan_task.finished"
+        | "task_result.stored"
+        | "verification.recorded"
+        | "verification.failed" => "result",
+        value if value.starts_with("context.") => "context",
+        "coordination.note" | "steering.created" | "steering.delivered" | "steering.cancelled" => {
+            "coordination"
+        }
+        value if value.starts_with("merge_queue.") || value.starts_with("integration.") => "merge",
+        value if value.starts_with("question.") => "question",
+        _ => "other",
+    }
+}
+
+fn timeline_event_text(event: &Event) -> String {
+    let payload = &event.payload;
+    let raw = match event.kind.as_str() {
+        "agent.message" => payload_string(payload, "text").unwrap_or_default(),
+        "agent.message_delta" | "agent.thought_delta" => {
+            payload_string(payload, "delta").unwrap_or_default()
+        }
+        "tool.started" => format!(
+            "{} started",
+            payload_string(payload, "name")
+                .or_else(|| payload_string(payload, "tool"))
+                .unwrap_or_else(|| "tool".to_string())
+        ),
+        "tool.finished" => {
+            let name = payload_string(payload, "name")
+                .or_else(|| payload_string(payload, "tool"))
+                .unwrap_or_else(|| "tool".to_string());
+            let failed = payload
+                .get("is_error")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            match payload_string(payload, "error_code") {
+                Some(code) => format!(
+                    "{name} {} ({code})",
+                    if failed { "failed" } else { "finished" }
+                ),
+                None => format!("{name} {}", if failed { "failed" } else { "finished" }),
+            }
+        }
+        "approval.created" | "approval.requested" => format!(
+            "approval requested for {}",
+            payload_string(payload, "tool").unwrap_or_else(|| "a tool".to_string())
+        ),
+        "approval.resolved" => {
+            let approved = payload
+                .get("approved")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            format!(
+                "approval {} for {}",
+                if approved { "approved" } else { "denied" },
+                payload_string(payload, "tool").unwrap_or_else(|| "a tool".to_string())
+            )
+        }
+        "agent.started" => format!(
+            "agent started ({})",
+            payload_string(payload, "model").unwrap_or_else(|| "model unknown".to_string())
+        ),
+        "agent.finished" => {
+            let status = payload_status(payload).unwrap_or_else(|| "finished".to_string());
+            match payload_string(payload, "summary") {
+                Some(summary) => format!("agent {status}: {summary}"),
+                None => format!("agent {status}"),
+            }
+        }
+        "agent.usage" => format!(
+            "usage: {} input / {} output",
+            payload_u64(payload, "input_tokens").unwrap_or(0),
+            payload_u64(payload, "output_tokens").unwrap_or(0)
+        ),
+        "agent.cost" => format!(
+            "cost: ${:.4}",
+            payload
+                .get("amount_usd")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0)
+        ),
+        "context.prompt_prefix" => format!(
+            "prompt prefix {} (model {}, {} tools)",
+            payload_string(payload, "prefix_hash").unwrap_or_else(|| "unknown".to_string()),
+            payload_string(payload, "model").unwrap_or_else(|| "unknown".to_string()),
+            payload_u64(payload, "tool_bundle_total_tool_count")
+                .or_else(|| payload_u64(payload, "tool_count"))
+                .unwrap_or(0)
+        ),
+        "context.usage" => format!(
+            "context: {} / {} tokens (threshold {})",
+            payload_u64(payload, "estimated_tokens").unwrap_or(0),
+            payload_u64(payload, "context_window").unwrap_or(0),
+            payload_u64(payload, "threshold_tokens").unwrap_or(0)
+        ),
+        "context.compacted" | "context.compaction" | "context.compaction.cache_reset" => {
+            let mode = payload_string(payload, "mode").unwrap_or_else(|| "compacted".to_string());
+            match payload_u64(payload, "compaction_count") {
+                Some(count) => format!("context compacted ({mode} #{count})"),
+                None => format!("context compacted ({mode})"),
+            }
+        }
+        "question.requested" => payload_string(payload, "question")
+            .map(|question| format!("question: {question}"))
+            .unwrap_or_else(|| "question requested".to_string()),
+        "question.answered" => payload_string(payload, "answer")
+            .map(|answer| format!("answer: {answer}"))
+            .unwrap_or_else(|| "question answered".to_string()),
+        "coordination.note" => payload_string(payload, "message")
+            .map(|message| format!("coordination: {message}"))
+            .unwrap_or_else(|| "coordination note".to_string()),
+        "steering.created" => payload_string(payload, "body")
+            .map(|body| format!("steering queued: {body}"))
+            .unwrap_or_else(|| "steering queued".to_string()),
+        "steering.delivered" => "steering delivered".to_string(),
+        "steering.cancelled" => "steering cancelled".to_string(),
+        _ => payload_string(payload, "summary")
+            .or_else(|| payload_status(payload))
+            .unwrap_or_else(|| event.kind.clone()),
+    };
+    inspect_text(&raw, AGENT_INSPECT_TEXT_CHARS)
+}
+
+fn timeline_entry(event: &Event) -> AgentTimelineEntry {
+    let payload = &event.payload;
+    let status = payload_status(payload);
+    let is_error = payload
+        .get("is_error")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || payload.get("error").is_some_and(|value| !value.is_null())
+        || payload.get("approved").and_then(serde_json::Value::as_bool) == Some(false)
+        || status.as_deref().is_some_and(|status| {
+            matches!(
+                status,
+                "failed" | "error" | "denied" | "rejected" | "cancelled" | "timed_out"
+            )
+        });
+    AgentTimelineEntry {
+        seq: event.seq,
+        kind: event.kind.clone(),
+        category: timeline_category(&event.kind).to_string(),
+        created_at: event.created_at.clone(),
+        text: timeline_event_text(event),
+        tool: payload_string(payload, "name").or_else(|| payload_string(payload, "tool")),
+        tool_call_id: payload_string(payload, "tool_call_id"),
+        status,
+        is_error,
+    }
+}
+
+fn agent_inbox_view(message: vp_protocol::types::AgentInboxMessage) -> AgentInboxView {
+    AgentInboxView {
+        id: message.id,
+        from_label: inspect_text(&message.from_label, 200),
+        kind: inspect_text(&message.kind, 80),
+        status: inspect_text(&message.status, 40),
+        body: inbox_body(&message.payload),
+        created_at: message.created_at,
+        read_at: message.read_at,
+        expires_at: message.expires_at,
+    }
+}
+
+fn inbox_body(payload: &serde_json::Value) -> String {
+    for key in ["body", "message", "summary", "detail"] {
+        if let Some(value) = payload_string(payload, key) {
+            return inspect_text(&value, AGENT_INSPECT_TEXT_CHARS);
+        }
+    }
+    if payload.is_null() || payload.as_object().is_some_and(|object| object.is_empty()) {
+        return String::new();
+    }
+    let summary = serde_json::to_string(payload).unwrap_or_default();
+    inspect_text(&summary, 600)
+}
+
+#[cfg(test)]
+mod inspector_tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::TempDir;
+    use vp_protocol::types::{
+        AgentInboxSendParams, CreateAgentIdentityParams, PlanDepartment, PlanTask,
+    };
+
+    fn setup() -> (TempDir, TempDir, Engine, Project, Session) {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("inspect"))
+            .unwrap();
+        let session = store
+            .create_session(&project.id, "inspect an agent")
+            .unwrap();
+        let engine = Engine::new(store);
+        (data, repo, engine, project, session)
+    }
+
+    fn inspect_plan() -> TeamPlan {
+        TeamPlan {
+            goal: "inspect the widget".into(),
+            departments: vec![PlanDepartment {
+                name: "impl".into(),
+                manager_title: "Implementation".into(),
+                profile: "coding".into(),
+                objective: "build the widget".into(),
+                token_budget: None,
+                cost_budget_usd: None,
+            }],
+            tasks: vec![PlanTask {
+                id: "T1".into(),
+                department: "impl".into(),
+                title: "Build the widget".into(),
+                kind: "coding".into(),
+                priority: 5,
+                profile: Some("coding".into()),
+                deps: vec!["T0".into()],
+                write_scope: vec!["src/widget".into()],
+                acceptance: vec!["tests pass".into()],
+                token_budget: None,
+                cost_budget_usd: None,
+                parent_task_id: None,
+                fanout_key: None,
+                fanout_join_for: None,
+            }],
+        }
+    }
+
+    async fn worker_fixture(engine: &Engine, session: &Session) -> AgentRecord {
+        let leader = engine
+            .create_leader_agent(&session.id, "leader-model")
+            .await
+            .unwrap();
+        engine
+            .create_agent(
+                &session.id,
+                "worker",
+                "Worker",
+                Some("Implementation".into()),
+                Some(leader),
+                "worker-model",
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn inspect_agent_reports_task_context_timeline_and_redaction() {
+        let (_data, _repo, engine, project, session) = setup();
+        let worker = worker_fixture(&engine, &session).await;
+        engine
+            .submit_team_plan(&session.id, &inspect_plan())
+            .await
+            .unwrap();
+        engine
+            .set_agent_task(&worker.id, Some("T1".into()), Some("impl".into()))
+            .await
+            .unwrap();
+
+        engine
+            .append_event(
+                &session.id,
+                "agent.started",
+                json!({
+                    "agent_id": worker.id,
+                    "agent_role": "worker",
+                    "goal": "Inspect widgets safely",
+                    "prompt": "PROMPT SECRET DO NOT SHOW",
+                    "model": "worker-model",
+                }),
+            )
+            .await
+            .unwrap();
+        engine
+            .append_event(
+                &session.id,
+                "context.prompt_prefix",
+                json!({
+                    "agent_id": worker.id,
+                    "model": "worker-model",
+                    "agent_profile": "coding",
+                    "tool_bundle": "coding",
+                    "tool_bundle_total_tool_count": 17,
+                    "prefix_hash": "prefix-abc",
+                    "prompt": "SYSTEM PROMPT SECRET",
+                    "identity_memory": {
+                        "brief_chars": 345,
+                        "brief_hash": "memory-hash",
+                        "memory_count": 3,
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+        engine
+            .append_event(
+                &session.id,
+                "context.usage",
+                json!({
+                    "agent_id": worker.id,
+                    "estimated_tokens": 12_000,
+                    "context_window": 128_000,
+                    "threshold_tokens": 96_000,
+                    "hard_limit_tokens": 128_000,
+                }),
+            )
+            .await
+            .unwrap();
+        engine
+            .append_event(
+                &session.id,
+                "context.compacted",
+                json!({
+                    "agent_id": worker.id,
+                    "mode": "summary",
+                    "compaction_count": 2,
+                    "summary": "COMPACTION SECRET DO NOT SHOW",
+                }),
+            )
+            .await
+            .unwrap();
+        engine
+            .append_event(
+                &session.id,
+                "agent.message",
+                json!({
+                    "agent_id": worker.id,
+                    "text": "working with token=supersecret123 and bearer abc",
+                }),
+            )
+            .await
+            .unwrap();
+        engine
+            .append_event(
+                &session.id,
+                "tool.started",
+                json!({
+                    "agent_id": worker.id,
+                    "tool_call_id": "call-1",
+                    "name": "shell",
+                    "input": {"command": "cat TOOL INPUT SECRET"},
+                }),
+            )
+            .await
+            .unwrap();
+        engine
+            .append_event(
+                &session.id,
+                "tool.finished",
+                json!({
+                    "agent_id": worker.id,
+                    "tool_call_id": "call-1",
+                    "name": "shell",
+                    "is_error": false,
+                    "output": "TOOL OUTPUT SECRET DO NOT SHOW",
+                }),
+            )
+            .await
+            .unwrap();
+        engine
+            .append_event(
+                &session.id,
+                "approval.requested",
+                json!({
+                    "agent_id": worker.id,
+                    "tool": "shell",
+                    "status": "pending",
+                    "input": {"command": "APPROVAL INPUT SECRET"},
+                }),
+            )
+            .await
+            .unwrap();
+        engine
+            .append_event(
+                &session.id,
+                "agent.finished",
+                json!({
+                    "agent_id": worker.id,
+                    "status": "completed",
+                    "summary": "finished safely",
+                }),
+            )
+            .await
+            .unwrap();
+        engine
+            .append_event(
+                &session.id,
+                "coordination.note",
+                json!({
+                    "agent_id": worker.id,
+                    "message": "handoff to verifier",
+                }),
+            )
+            .await
+            .unwrap();
+        engine
+            .append_event(
+                &session.id,
+                "merge_queue.enqueued",
+                json!({
+                    "agent_id": worker.id,
+                    "status": "queued",
+                }),
+            )
+            .await
+            .unwrap();
+        engine
+            .append_event(
+                &session.id,
+                "question.requested",
+                json!({
+                    "agent_id": worker.id,
+                    "question": "Should the widget be blue?",
+                    "status": "pending",
+                }),
+            )
+            .await
+            .unwrap();
+        engine
+            .store()
+            .add_usage_entry_with_events(
+                &session.id,
+                &worker.id,
+                "Worker",
+                "worker",
+                Some("T1"),
+                Some("impl"),
+                "worker-model",
+                100,
+                20,
+                40,
+                5,
+                false,
+                0.25,
+            )
+            .unwrap();
+        engine
+            .store()
+            .add_usage_entry_with_events(
+                &session.id,
+                &worker.id,
+                "Worker",
+                "worker",
+                Some("T1"),
+                Some("impl"),
+                "worker-model",
+                200,
+                30,
+                60,
+                7,
+                true,
+                0.5,
+            )
+            .unwrap();
+
+        let result = engine
+            .inspect_agent(AgentInspectParams {
+                session_id: session.id.clone(),
+                agent_id: worker.id.clone(),
+                timeline_limit: Some(80),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.agent.id, worker.id);
+        let task = result.task.expect("task view");
+        assert_eq!(task.task_id, "T1");
+        assert_eq!(task.title, "Build the widget");
+        assert_eq!(task.department, "impl");
+        assert_eq!(task.kind, "coding");
+        assert_eq!(task.status.as_deref(), Some("pending"));
+        assert_eq!(task.acceptance, vec!["tests pass"]);
+        assert_eq!(task.write_scope, vec!["src/widget"]);
+        assert_eq!(task.deps, vec!["T0"]);
+        assert_eq!(task.attempts, 0);
+        assert_eq!(task.max_attempts, 2);
+        assert!(task.verifier_status.is_none());
+
+        assert_eq!(
+            result.context.objective.as_deref(),
+            Some("Inspect widgets safely")
+        );
+        assert_eq!(result.context.model, "worker-model");
+        assert_eq!(result.context.profile.as_deref(), Some("coding"));
+        assert_eq!(result.context.estimated_tokens, Some(12_000));
+        assert_eq!(result.context.context_window, Some(128_000));
+        assert_eq!(result.context.threshold_tokens, Some(96_000));
+        assert_eq!(result.context.hard_limit_tokens, Some(128_000));
+        assert_eq!(result.context.input_tokens, 300);
+        assert_eq!(result.context.output_tokens, 50);
+        assert_eq!(result.context.cache_read_tokens, 100);
+        assert_eq!(result.context.cache_write_tokens, 12);
+        assert!((result.context.cost_usd - 0.75).abs() < 1e-9);
+        assert_eq!(result.context.tool_count, Some(17));
+        assert_eq!(result.context.tool_bundle.as_deref(), Some("coding"));
+        assert_eq!(result.context.prefix_hash.as_deref(), Some("prefix-abc"));
+        assert_eq!(
+            result.context.last_compaction.as_deref(),
+            Some("summary #2")
+        );
+        assert_eq!(result.context.memory_brief_chars, Some(345));
+        assert_eq!(
+            result.context.memory_brief_hash.as_deref(),
+            Some("memory-hash")
+        );
+        assert!(!result.context.generated_at.is_empty());
+        assert!(!result.truncated);
+
+        let categories = result
+            .timeline
+            .iter()
+            .map(|entry| entry.category.as_str())
+            .collect::<Vec<_>>();
+        for expected in [
+            "message",
+            "tool",
+            "approval",
+            "result",
+            "context",
+            "coordination",
+            "merge",
+            "question",
+        ] {
+            assert!(
+                categories.contains(&expected),
+                "missing timeline category {expected}: {categories:?}"
+            );
+        }
+        let combined = result
+            .timeline
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for secret in [
+            "PROMPT SECRET",
+            "SYSTEM PROMPT SECRET",
+            "COMPACTION SECRET",
+            "TOOL INPUT SECRET",
+            "TOOL OUTPUT SECRET",
+            "APPROVAL INPUT SECRET",
+            "supersecret123",
+        ] {
+            assert!(!combined.contains(secret), "timeline leaked {secret}");
+        }
+        assert!(combined.contains("[redacted]"), "{combined}");
+        assert!(result.steering.is_empty());
+        assert!(result.inbox.is_empty());
+        assert_eq!(project.id, session.project_id);
+    }
+
+    #[tokio::test]
+    async fn inspect_agent_rejects_missing_and_cross_session_agents() {
+        let (_data, _repo, engine, _project, session) = setup();
+        let leader = engine
+            .create_leader_agent(&session.id, "leader-model")
+            .await
+            .unwrap();
+        let other_session = engine
+            .store()
+            .create_session(&session.project_id, "another session")
+            .unwrap();
+        let other_agent = engine
+            .create_leader_agent(&other_session.id, "leader-model")
+            .await
+            .unwrap();
+
+        let missing = engine
+            .inspect_agent(AgentInspectParams {
+                session_id: session.id.clone(),
+                agent_id: "missing-agent".into(),
+                timeline_limit: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{missing}").contains("AGENT_NOT_FOUND"),
+            "{missing}"
+        );
+
+        let cross_session = engine
+            .inspect_agent(AgentInspectParams {
+                session_id: session.id.clone(),
+                agent_id: other_agent,
+                timeline_limit: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{cross_session}").contains("AGENT_NOT_FOUND"),
+            "{cross_session}"
+        );
+
+        let invalid = engine
+            .inspect_agent(AgentInspectParams {
+                session_id: session.id.clone(),
+                agent_id: "   ".into(),
+                timeline_limit: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{invalid}").contains("AGENT_TARGET_INVALID"),
+            "{invalid}"
+        );
+
+        let minimal = engine
+            .inspect_agent(AgentInspectParams {
+                session_id: session.id,
+                agent_id: leader,
+                timeline_limit: None,
+            })
+            .await
+            .unwrap();
+        assert!(minimal.task.is_none());
+        assert!(minimal.timeline.is_empty());
+        assert_eq!(minimal.context.model, "leader-model");
+        assert!(minimal.inbox.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inspect_timeline_is_bounded_and_reports_truncation() {
+        let (_data, _repo, engine, _project, session) = setup();
+        let leader = engine
+            .create_leader_agent(&session.id, "leader-model")
+            .await
+            .unwrap();
+        let mut seqs = Vec::new();
+        for index in 0..5 {
+            let event = engine
+                .append_event(
+                    &session.id,
+                    "agent.message",
+                    json!({
+                        "agent_id": leader,
+                        "text": format!("message {index}"),
+                    }),
+                )
+                .await
+                .unwrap();
+            seqs.push(event.seq);
+        }
+        engine
+            .append_event(
+                &session.id,
+                "agent.message",
+                json!({"agent_id": "another-agent", "text": "not mine"}),
+            )
+            .await
+            .unwrap();
+
+        let bounded = engine
+            .inspect_agent(AgentInspectParams {
+                session_id: session.id.clone(),
+                agent_id: leader.clone(),
+                timeline_limit: Some(2),
+            })
+            .await
+            .unwrap();
+        assert_eq!(bounded.timeline.len(), 2);
+        assert!(bounded.truncated);
+        assert_eq!(bounded.timeline[0].seq, seqs[3]);
+        assert_eq!(bounded.timeline[1].seq, seqs[4]);
+
+        let exact = engine
+            .inspect_agent(AgentInspectParams {
+                session_id: session.id.clone(),
+                agent_id: leader.clone(),
+                timeline_limit: Some(5),
+            })
+            .await
+            .unwrap();
+        assert_eq!(exact.timeline.len(), 5);
+        assert!(!exact.truncated);
+
+        let clamped = engine
+            .inspect_agent(AgentInspectParams {
+                session_id: session.id.clone(),
+                agent_id: leader.clone(),
+                timeline_limit: Some(0),
+            })
+            .await
+            .unwrap();
+        assert_eq!(clamped.timeline.len(), 1);
+        assert!(clamped.truncated);
+
+        let oversized = engine
+            .inspect_agent(AgentInspectParams {
+                session_id: session.id,
+                agent_id: leader,
+                timeline_limit: Some(10_000),
+            })
+            .await
+            .unwrap();
+        assert_eq!(oversized.timeline.len(), 5);
+        assert!(!oversized.truncated);
+    }
+
+    #[tokio::test]
+    async fn inspect_agent_includes_steering_and_identity_inbox() {
+        let (_data, _repo, engine, project, session) = setup();
+        let worker = worker_fixture(&engine, &session).await;
+        engine
+            .submit_team_plan(&session.id, &inspect_plan())
+            .await
+            .unwrap();
+        engine
+            .set_agent_task(&worker.id, Some("T1".into()), Some("impl".into()))
+            .await
+            .unwrap();
+        let identity = engine
+            .create_agent_identity(CreateAgentIdentityParams {
+                project_id: project.id.clone(),
+                role: "worker".into(),
+                department: Some("impl".into()),
+                title: Some("Implementation".into()),
+                profile: Some("coding".into()),
+                ..CreateAgentIdentityParams::default()
+            })
+            .await
+            .unwrap()
+            .identity;
+        engine
+            .set_agent_identity_binding(&worker.id, Some(&identity.id))
+            .await
+            .unwrap();
+        engine
+            .steer_session(
+                &session.id,
+                "operator steering note",
+                Some(&worker.id),
+                Some("T1"),
+                None,
+            )
+            .await
+            .unwrap();
+        engine
+            .send_agent_inbox(AgentInboxSendParams {
+                project_id: Some(project.id.clone()),
+                identity_id: identity.id.clone(),
+                session_id: Some(session.id.clone()),
+                kind: "message".into(),
+                body: Some("inbox token=inboxsecret123".into()),
+                ..AgentInboxSendParams::default()
+            })
+            .await
+            .unwrap();
+        engine
+            .append_event(
+                &session.id,
+                "agent.message",
+                json!({"agent_id": worker.id, "text": "worker visible"}),
+            )
+            .await
+            .unwrap();
+
+        let result = engine
+            .inspect_agent(AgentInspectParams {
+                session_id: session.id,
+                agent_id: worker.id.clone(),
+                timeline_limit: Some(10),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.steering.len(), 1);
+        assert_eq!(result.steering[0].agent_id, worker.id);
+        assert_eq!(result.steering[0].body, "operator steering note");
+        assert_eq!(result.inbox.len(), 1);
+        assert!(!result.inbox[0].id.is_empty());
+        assert_eq!(result.inbox[0].status, "unread");
+        assert_eq!(result.inbox_counts.unread, 1);
+        assert_eq!(result.inbox_counts.read, 0);
+        assert!(!result.inbox[0].body.contains("inboxsecret123"));
+        assert!(result.inbox[0].body.contains("[redacted]"));
+        assert!(
+            result
+                .timeline
+                .iter()
+                .any(|entry| entry.category == "coordination")
+        );
     }
 }

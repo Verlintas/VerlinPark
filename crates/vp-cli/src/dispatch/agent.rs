@@ -72,6 +72,44 @@ pub(super) async fn dispatch(
             )
             .await?
         }
+        Command::AgentInspect {
+            session,
+            agent,
+            timeline_limit,
+        } => {
+            rpc(
+                &discovery,
+                "agent.inspect",
+                json!({
+                    "session_id": session,
+                    "agent_id": agent,
+                    "timeline_limit": timeline_limit,
+                }),
+            )
+            .await?
+        }
+        Command::AgentMessage {
+            session,
+            agent,
+            text,
+            task,
+            wake,
+            operation_id,
+        } => {
+            rpc(
+                &discovery,
+                "agent.message.send",
+                json!({
+                    "session_id": session,
+                    "agent_id": agent,
+                    "body": text,
+                    "task_id": task,
+                    "operation_id": operation_id,
+                    "wake_session": wake,
+                }),
+            )
+            .await?
+        }
         Command::TeamExport {
             project,
             name,

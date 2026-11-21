@@ -12616,6 +12616,238 @@ pub struct AgentListResult {
 }
 
 // ---------------------------------------------------------------------------
+// V1 Collab Agent Inspector and direct operator channel
+// ---------------------------------------------------------------------------
+
+/// Stable wire codes for Agent inspection and direct messaging. They are
+/// identifiers, not free-form error text; callers classify on the code only.
+pub mod agent_operator_codes {
+    pub const AGENT_NOT_FOUND: &str = "AGENT_NOT_FOUND";
+    pub const AGENT_NOT_ACTIVE: &str = "AGENT_NOT_ACTIVE";
+    pub const AGENT_TARGET_INVALID: &str = "AGENT_TARGET_INVALID";
+    pub const AGENT_MESSAGE_INVALID: &str = "AGENT_MESSAGE_INVALID";
+}
+
+/// Bounded, read-only inspector request. `timeline_limit` defaults to 80 and
+/// is clamped to 1..=200 by the engine.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentInspectParams {
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub agent_id: String,
+    #[serde(default)]
+    pub timeline_limit: Option<u32>,
+}
+
+/// One agent's inspectable task metadata. Fields are derived from the stored
+/// TeamPlan and task projection; missing values are empty/default rather than
+/// inferred from prose.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTaskView {
+    #[serde(default)]
+    pub task_id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub department: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub acceptance: Vec<String>,
+    #[serde(default)]
+    pub write_scope: Vec<String>,
+    #[serde(default)]
+    pub deps: Vec<String>,
+    #[serde(default)]
+    pub attempts: u32,
+    #[serde(default)]
+    pub max_attempts: u32,
+    #[serde(default)]
+    pub verifier_status: Option<String>,
+}
+
+/// Bounded context/usage metadata for the Context tab. Prompt text, tool input,
+/// tool output, and unbounded compaction summaries are deliberately absent.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentContextView {
+    #[serde(default)]
+    pub objective: Option<String>,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub estimated_tokens: Option<u64>,
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    #[serde(default)]
+    pub threshold_tokens: Option<u64>,
+    #[serde(default)]
+    pub hard_limit_tokens: Option<u64>,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    #[serde(default)]
+    pub cost_usd: f64,
+    #[serde(default)]
+    pub tool_count: Option<u32>,
+    #[serde(default)]
+    pub tool_bundle: Option<String>,
+    #[serde(default)]
+    pub prefix_hash: Option<String>,
+    #[serde(default)]
+    pub last_compaction: Option<String>,
+    #[serde(default)]
+    pub memory_brief_chars: Option<u32>,
+    #[serde(default)]
+    pub memory_brief_hash: Option<String>,
+    #[serde(default)]
+    pub generated_at: String,
+}
+
+/// One bounded, display-oriented timeline row. `kind` is the persisted event
+/// type; `category` is the inspector's stable grouping. `text` is already
+/// bounded and secret-redacted by the engine.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTimelineEntry {
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub tool: Option<String>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub is_error: bool,
+}
+
+/// One project inbox row rendered for the Messages tab. `body` is a bounded,
+/// redacted display string, never the raw JSON payload.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentInboxView {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub from_label: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub read_at: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+/// Aggregated usage for one agent row, computed by SQL rather than by loading
+/// the full session ledger.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentUsageTotals {
+    #[serde(default)]
+    pub calls: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    #[serde(default)]
+    pub cost_usd: f64,
+}
+
+/// Read-only aggregate returned by `agent.inspect`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentInspectResult {
+    pub agent: AgentRecord,
+    #[serde(default)]
+    pub task: Option<AgentTaskView>,
+    pub context: AgentContextView,
+    #[serde(default)]
+    pub timeline: Vec<AgentTimelineEntry>,
+    #[serde(default)]
+    pub steering: Vec<SteeringMessage>,
+    #[serde(default)]
+    pub inbox: Vec<AgentInboxView>,
+    #[serde(default)]
+    pub inbox_counts: AgentInboxCounts,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// Direct operator-to-Agent message request. Routing is owned by the daemon:
+/// running Agents use steering, idle identity Agents use the inbox, and
+/// ephemeral idle runs fail closed with `AGENT_NOT_ACTIVE`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentMessageSendParams {
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub agent_id: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub operation_id: Option<String>,
+    #[serde(default)]
+    pub wake_session: bool,
+}
+
+/// Truthful delivery outcome for a direct operator message.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentMessageDelivery {
+    /// `steering`, `inbox`, or `rejected`.
+    #[serde(default)]
+    pub kind: String,
+    /// `pending`, `delivered`, `cancelled`, `queued`, `unread`, `read`, or
+    /// `rejected`.
+    #[serde(default)]
+    pub status: String,
+    /// Bounded operator-facing explanation. It never claims provider delivery.
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub agent_id: String,
+    #[serde(default)]
+    pub identity_id: Option<String>,
+    #[serde(default)]
+    pub steering: Option<SteeringMessage>,
+    #[serde(default)]
+    pub inbox: Option<AgentInboxView>,
+    #[serde(default)]
+    pub wake: Option<AgentCoordinationWake>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentMessageSendResult {
+    #[serde(default)]
+    pub delivery: AgentMessageDelivery,
+}
+
+// ---------------------------------------------------------------------------
 // Project-scoped agent identities (S1)
 // ---------------------------------------------------------------------------
 
@@ -26521,5 +26753,186 @@ mod auto_budget_type_tests {
         assert_eq!(params.mode, Some(BudgetMode::Auto));
         assert_eq!(params.hard_token_cap, Some(5_000));
         assert!(params.policy.unwrap().enabled);
+    }
+}
+
+#[cfg(test)]
+mod agent_inspector_protocol_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn agent_record() -> AgentRecord {
+        AgentRecord {
+            id: "agent-1".into(),
+            session_id: "ses-1".into(),
+            role: "worker".into(),
+            name: "Worker".into(),
+            title: Some("Implementation".into()),
+            identity_id: Some("identity-1".into()),
+            workspace_id: None,
+            parent_workspace_id: None,
+            parent_id: Some("manager-1".into()),
+            task_id: Some("T1".into()),
+            department: Some("impl".into()),
+            profile: Some("coding".into()),
+            worktree: Some("/tmp/worktree".into()),
+            branch: Some("verlinpark/task/T1".into()),
+            status: "running".into(),
+            model: "test-model".into(),
+            created_at: "2026-11-22T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn agent_inspect_params_accept_minimal_wire_payload() {
+        let params: AgentInspectParams =
+            serde_json::from_value(json!({"session_id": "ses-1", "agent_id": "agent-1"})).unwrap();
+        assert_eq!(params.session_id, "ses-1");
+        assert_eq!(params.agent_id, "agent-1");
+        assert_eq!(params.timeline_limit, None);
+    }
+
+    #[test]
+    fn agent_message_send_decodes_body_task_and_operation() {
+        let params: AgentMessageSendParams = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "agent_id": "agent-1",
+            "body": "check the parser",
+            "task_id": "T1",
+            "operation_id": "op-1",
+            "wake_session": true
+        }))
+        .unwrap();
+        assert_eq!(params.body, "check the parser");
+        assert_eq!(params.task_id.as_deref(), Some("T1"));
+        assert_eq!(params.operation_id.as_deref(), Some("op-1"));
+        assert!(params.wake_session);
+    }
+
+    #[test]
+    fn agent_inspect_result_round_trips_bounded_fields() {
+        let result = AgentInspectResult {
+            agent: agent_record(),
+            task: Some(AgentTaskView {
+                task_id: "T1".into(),
+                title: "Build it".into(),
+                department: "impl".into(),
+                kind: "coding".into(),
+                status: Some("running".into()),
+                acceptance: vec!["tests pass".into()],
+                write_scope: vec!["src/impl".into()],
+                deps: vec!["T0".into()],
+                attempts: 1,
+                max_attempts: 3,
+                verifier_status: Some("pending".into()),
+            }),
+            context: AgentContextView {
+                objective: Some("build the widget".into()),
+                model: "test-model".into(),
+                profile: Some("coding".into()),
+                estimated_tokens: Some(1200),
+                context_window: Some(128000),
+                threshold_tokens: Some(96000),
+                hard_limit_tokens: Some(120000),
+                input_tokens: 100,
+                output_tokens: 20,
+                cache_read_tokens: 80,
+                cache_write_tokens: 0,
+                cost_usd: 0.01,
+                tool_count: Some(39),
+                tool_bundle: Some("coding".into()),
+                prefix_hash: Some("abc".into()),
+                last_compaction: Some("summary #1".into()),
+                memory_brief_chars: Some(42),
+                memory_brief_hash: Some("def".into()),
+                generated_at: "2026-11-22T00:00:00Z".into(),
+            },
+            timeline: vec![AgentTimelineEntry {
+                seq: 7,
+                kind: "tool.finished".into(),
+                category: "tool".into(),
+                created_at: "2026-11-22T00:00:01Z".into(),
+                text: "write_file finished".into(),
+                tool: Some("write_file".into()),
+                tool_call_id: Some("call-1".into()),
+                status: Some("ok".into()),
+                is_error: false,
+            }],
+            steering: vec![SteeringMessage {
+                id: "steer-1".into(),
+                session_id: "ses-1".into(),
+                agent_id: "agent-1".into(),
+                task_id: Some("T1".into()),
+                body: "check it".into(),
+                status: "pending".into(),
+                created_at: "2026-11-22T00:00:02Z".into(),
+                delivered_at: None,
+            }],
+            inbox: vec![AgentInboxView {
+                id: "inbox-1".into(),
+                from_label: "operator".into(),
+                kind: "message".into(),
+                status: "unread".into(),
+                body: "hello".into(),
+                created_at: "2026-11-22T00:00:03Z".into(),
+                read_at: None,
+                expires_at: None,
+            }],
+            inbox_counts: AgentInboxCounts {
+                unread: 1,
+                ..AgentInboxCounts::default()
+            },
+            truncated: true,
+        };
+        let encoded = serde_json::to_value(&result).unwrap();
+        assert_eq!(encoded["agent"]["id"], "agent-1");
+        assert_eq!(encoded["context"]["tool_count"], 39);
+        assert_eq!(encoded["timeline"][0]["category"], "tool");
+        assert_eq!(encoded["inbox_counts"]["unread"], 1);
+        let decoded: AgentInspectResult = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, result);
+    }
+
+    #[test]
+    fn agent_message_delivery_keeps_truthful_state_and_optional_evidence() {
+        let result = AgentMessageSendResult {
+            delivery: AgentMessageDelivery {
+                kind: "inbox".into(),
+                status: "unread".into(),
+                message: "Stored in the project inbox; not instant delivery.".into(),
+                agent_id: "agent-1".into(),
+                identity_id: Some("identity-1".into()),
+                steering: None,
+                inbox: None,
+                wake: Some(AgentCoordinationWake {
+                    requested: true,
+                    created: false,
+                    continuation_id: None,
+                    reason: "no_active_session".into(),
+                }),
+            },
+        };
+        let encoded = serde_json::to_value(&result).unwrap();
+        assert_eq!(encoded["delivery"]["kind"], "inbox");
+        assert_eq!(encoded["delivery"]["status"], "unread");
+        assert_eq!(encoded["delivery"]["wake"]["reason"], "no_active_session");
+        assert_eq!(
+            serde_json::from_value::<AgentMessageSendResult>(encoded).unwrap(),
+            result
+        );
+    }
+
+    #[test]
+    fn agent_operator_codes_are_stable_wire_values() {
+        assert_eq!(agent_operator_codes::AGENT_NOT_FOUND, "AGENT_NOT_FOUND");
+        assert_eq!(agent_operator_codes::AGENT_NOT_ACTIVE, "AGENT_NOT_ACTIVE");
+        assert_eq!(
+            agent_operator_codes::AGENT_TARGET_INVALID,
+            "AGENT_TARGET_INVALID"
+        );
+        assert_eq!(
+            agent_operator_codes::AGENT_MESSAGE_INVALID,
+            "AGENT_MESSAGE_INVALID"
+        );
     }
 }

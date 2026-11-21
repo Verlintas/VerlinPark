@@ -19,6 +19,7 @@ pub(crate) mod integrations;
 pub(crate) mod leases;
 pub(crate) mod memory;
 pub(crate) mod merge;
+pub(crate) mod operator;
 pub(crate) mod plans;
 pub(crate) mod programs;
 pub(crate) mod projects;

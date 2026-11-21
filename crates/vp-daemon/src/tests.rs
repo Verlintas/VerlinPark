@@ -1923,3 +1923,6 @@ mod protocol_transport_tests {
         );
     }
 }
+
+#[path = "agent_operator_tests.rs"]
+mod agent_operator_rpc_tests;

@@ -312,6 +312,38 @@ impl Store {
         Ok(tokens)
     }
 
+    /// Aggregate one agent's usage directly in SQL. The inspector must not
+    /// load a long session's whole ledger just to show one Agent's totals.
+    pub fn agent_usage_totals(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+    ) -> Result<vp_protocol::types::AgentUsageTotals> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(cache_read_tokens), 0),
+                    COALESCE(SUM(cache_write_tokens), 0),
+                    COALESCE(SUM(cost_usd), 0)
+             FROM usage_ledger
+             WHERE session_id = ?1 AND agent_id = ?2",
+            params![session_id, agent_id],
+            |row| {
+                Ok(vp_protocol::types::AgentUsageTotals {
+                    calls: row.get::<_, i64>(0)?.max(0) as u64,
+                    input_tokens: row.get::<_, i64>(1)?.max(0) as u64,
+                    output_tokens: row.get::<_, i64>(2)?.max(0) as u64,
+                    cache_read_tokens: row.get::<_, i64>(3)?.max(0) as u64,
+                    cache_write_tokens: row.get::<_, i64>(4)?.max(0) as u64,
+                    cost_usd: row.get::<_, f64>(5)?.max(0.0),
+                })
+            },
+        )
+        .map_err(Into::into)
+    }
+
     pub fn list_usage_entries(&self, session_id: &str) -> Result<Vec<UsageEntry>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(

@@ -6727,6 +6727,7 @@ fn search_snippet(text: &str, query: &str) -> String {
 }
 
 mod acp;
+mod agent_events;
 mod agents;
 mod approvals;
 mod artifacts;

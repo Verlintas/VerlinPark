@@ -51,7 +51,7 @@ impl Engine {
         result
     }
 
-    async fn steer_session_inner(
+    pub(crate) async fn steer_session_inner(
         &self,
         session_id: &str,
         body: &str,

@@ -114,6 +114,20 @@ pub(super) async fn handle(
             },
             Err(response) => response_with_id(id, response),
         },
+        "agent.inspect" => match parse_params::<AgentInspectParams>(request.params) {
+            Ok(params) => match state.engine.inspect_agent(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => agent_operator_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "agent.message.send" => match parse_params::<AgentMessageSendParams>(request.params) {
+            Ok(params) => match state.engine.send_agent_operator_message(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => agent_operator_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
         "agent.identities.list" => match parse_params::<AgentIdentityListParams>(request.params) {
             Ok(params) => match state
                 .engine

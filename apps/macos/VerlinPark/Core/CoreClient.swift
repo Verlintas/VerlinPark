@@ -52,6 +52,8 @@ enum RPCTimeouts {
         case "ping", "server.info", "agent.info", "project.list", "session.list",
              "event.list", "approval.queue", "approval.list", "question.list":
             short
+        case "agent.inspect":
+            standard
         case "session.land", "session.pr", "forge.preflight":
             .seconds(180)
         case "agent.probe", "mcp.server.probe", "acp.agent.probe", "mcp.call",
@@ -70,8 +72,8 @@ enum RPCTimeouts {
              "artifact.archive.extract", "artifact.materialize", "media.transcode",
              "update.download":
             extended
-        case "agent.configure", "session.prompt", "session.steer", "session.defer",
-             "session.commit", "session.discard", "session.plan_resume":
+        case "agent.configure", "agent.message.send", "session.prompt", "session.steer",
+             "session.defer", "session.commit", "session.discard", "session.plan_resume":
             .seconds(60)
         default:
             standard
@@ -1971,6 +1973,49 @@ actor CoreClient {
         return try await request(method: "agent.list", params: params)
             .decode(AgentListResult.self)
             .agents
+    }
+
+    /// Bounded read-only Collab Agent Inspector projection. No run, request,
+    /// wake, retry, or approval is triggered by reading this snapshot.
+    func agentInspect(
+        sessionID: String,
+        agentID: String,
+        timelineLimit: Int? = nil
+    ) async throws -> AgentInspectResult {
+        var params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "agent_id": .string(agentID),
+        ]
+        if let timelineLimit {
+            params["timeline_limit"] = .number(Double(timelineLimit))
+        }
+        return try await request(method: "agent.inspect", params: params)
+            .decode(AgentInspectResult.self)
+    }
+
+    /// Direct operator-to-agent delivery. The daemon chooses steering for a
+    /// live run or the agent inbox for an idle identity, and fails closed with
+    /// `AGENT_NOT_ACTIVE` for an idle ephemeral agent.
+    func sendAgentMessage(
+        sessionID: String,
+        agentID: String,
+        body: String,
+        taskID: String? = nil,
+        wakeSession: Bool = false,
+        operationID: String? = nil
+    ) async throws -> AgentMessageSendResult {
+        var params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "agent_id": .string(agentID),
+            "body": .string(body),
+            "task_id": taskID.map(JSONValue.string) ?? .null,
+            "wake_session": .bool(wakeSession),
+        ]
+        if let operationID, !operationID.isEmpty {
+            params["operation_id"] = .string(operationID)
+        }
+        return try await request(method: "agent.message.send", params: params)
+            .decode(AgentMessageSendResult.self)
     }
 
     /// Read-only project identity roster. S1 deliberately has no hire/assign
@@ -4937,3 +4982,5 @@ actor CoreClient {
         eventGate.clear(generation: generation)
     }
 }
+
+extension CoreClient: CollabAgentRPC {}

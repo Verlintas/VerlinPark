@@ -1,6 +1,7 @@
 # VerlinPark V1 最终计划
 
-- Status: Final plan; implementation has not started
+- Status: Final plan; implementation in progress. Collab Agent
+  Inspector/Direct Channel implemented and verified (2026-11-22).
 - Date: 2026-11-22
 - Owner: Verlintas
 - Scope: **single-project coding ADE**
@@ -148,8 +149,9 @@ Delivery semantics must be truthful:
    with an explicit wake request. UI shows `queued`, `unread`, or `read`; it
    never claims instant delivery.
 3. **Idle Agent without a project identity** (Labour/Verifier/Scout and similar
-   ephemeral runs): store a bounded pending operator note and deliver it when
-   that Agent next starts. Do not spawn a new run solely to simulate a chat.
+   ephemeral runs): reject the message with a typed `AGENT_NOT_ACTIVE` and tell
+   the operator to start/retry the task. Do not store a note that can never be
+   delivered, and do not spawn a new run solely to simulate a chat.
 4. Operator messages are audit events. They must not approve approvals, bypass
    sandbox/contracts/write scope, change budgets, or enter the merge queue.
 5. The target Agent must belong to the current session/project; cross-session
@@ -157,14 +159,17 @@ Delivery semantics must be truthful:
 
 Backend requirements:
 
-- A bounded read model/RPC, proposed as `agent.inspect` / `agent.context`, that
-  aggregates event-derived metadata, context telemetry, recent visible
-  conversation/tool evidence, budget, and unread state by `session_id` and
-  `agent_id`.
+- A bounded read model/RPC, implemented as `agent.inspect`, that aggregates
+  event-derived metadata, context telemetry, recent visible conversation/tool
+  evidence, budget, and unread state by `session_id` and `agent_id`. The
+  `agent.context` name is not a separate RPC; context is a section of the
+  snapshot.
 - An index/projection for agent-scoped event reads; the current event table is
   ordered by session/seq and JSON `agent_id` is not indexed.
-- A message route that dispatches to steering, agent inbox, or pending note
-  according to the target's state, with typed errors and delivery status.
+- A message route, implemented as `agent.message.send`, that dispatches to
+  steering or agent inbox according to the target's state, rejects idle
+  ephemeral Agents with typed `AGENT_NOT_ACTIVE`, and reports honest delivery
+  status.
 - Redaction and bounds for the Context/Conversation tabs. Raw hidden system
   prompts, secrets, credential material, and unbounded tool output must not be
   returned. Show hashes/metadata or bounded previews where necessary.
@@ -175,7 +180,8 @@ Acceptance:
   Messages without reading the whole session transcript.
 - Message a running Worker; see `pending` then `delivered` at the next boundary.
 - Message an idle identity Agent; see queued/unread and an explicit wake result.
-- Message an ephemeral idle Agent; see a pending note, not a fake reply.
+- Message an ephemeral idle Agent; see a typed `AGENT_NOT_ACTIVE` failure, not a
+  fake reply or an undeliverable note.
 - Invalid/cross-session targets fail closed.
 - Context view is bounded, redacted, and does not leak secrets.
 - A direct message cannot approve an approval or bypass a gate.
@@ -416,8 +422,8 @@ On the real target repository:
 - diagnosis from events
 - Collab Agent Inspector: per-Agent context, conversation, activity, and
   message tabs
-- direct operator channel: active steering, idle identity inbox, ephemeral
-  pending note, truthful delivery states
+- direct operator channel: active steering, idle identity inbox, typed
+  ephemeral not-active, truthful delivery states
 - agent-scoped event read model/index; bounded and redacted context views
 
 Exit: acceptance scenarios 1–8 pass; no unknown S0/S1; performance within

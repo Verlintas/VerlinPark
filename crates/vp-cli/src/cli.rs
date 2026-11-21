@@ -2848,6 +2848,37 @@ pub(crate) enum Command {
         #[arg(long, default_value_t = 50)]
         assignment_limit: u32,
     },
+    /// Inspect one Agent's bounded context, recent timeline, steering, and
+    /// project-inbox state. Read-only; never returns raw prompts or tool bytes.
+    #[command(name = "agent-inspect")]
+    AgentInspect {
+        session: String,
+        agent: String,
+        /// Newest bounded timeline rows to request (1-200, default 80).
+        #[arg(long, default_value_t = 80)]
+        timeline_limit: u32,
+    },
+    /// Send a direct operator message to one Agent. Running/waiting Agents use
+    /// cooperative steering; idle identity Agents use the durable project inbox;
+    /// idle ephemeral runs fail with AGENT_NOT_ACTIVE. This never approves an
+    /// approval, resolves a gate, or changes budgets/routing.
+    #[command(name = "agent-message")]
+    AgentMessage {
+        session: String,
+        agent: String,
+        /// Operator message text (1-4000 characters).
+        text: String,
+        /// Require the target Agent to be working on this plan task.
+        #[arg(long)]
+        task: Option<String>,
+        /// Request the existing deferred wake when the target uses the inbox.
+        #[arg(long)]
+        wake: bool,
+        /// Idempotency key; retrying with the same key and payload replays the
+        /// first delivery result.
+        #[arg(long)]
+        operation_id: Option<String>,
+    },
     /// Export a portable, content-addressed team charter. Writes team.json and
     /// TEAM.md into the output directory; never includes context, memory,
     /// inbox, worktree, performance, MCP, path, URL, or secret content.

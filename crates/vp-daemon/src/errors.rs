@@ -301,6 +301,110 @@ pub(crate) fn operation_error(id: Option<Value>, error: anyhow::Error) -> RpcRes
     internal_error(id, error)
 }
 
+/// `agent.inspect` and `agent.message.send` use the operator taxonomy. The
+/// engine carries it through [`vp_protocol::types::AgentIdentityError`] because
+/// it is the existing typed wrapper; the message text is never used for
+/// classification when a code is present. The steering fallback below covers
+/// only a race where the target stopped being active between the route check
+/// and the inner steering write.
+pub(crate) fn agent_operator_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
+    if let Some(typed) = error.downcast_ref::<vp_protocol::types::AgentIdentityError>() {
+        let (rpc_code, retryable, hint) = match typed.code {
+            vp_protocol::types::agent_operator_codes::AGENT_NOT_FOUND => (
+                codes::NOT_FOUND,
+                false,
+                "select an Agent that belongs to this session",
+            ),
+            vp_protocol::types::agent_operator_codes::AGENT_NOT_ACTIVE => (
+                codes::CONFLICT,
+                true,
+                "the Agent has no durable project identity; start or retry its task, then message it while it is running",
+            ),
+            vp_protocol::types::agent_operator_codes::AGENT_TARGET_INVALID => (
+                codes::INVALID_PARAMS,
+                false,
+                "session_id and agent_id must identify an Agent row in this session",
+            ),
+            "AGENT_TASK_INVALID" => (
+                codes::INVALID_PARAMS,
+                false,
+                "the supplied task_id must match the Agent's current task and a task in the stored TeamPlan",
+            ),
+            vp_protocol::types::agent_operator_codes::AGENT_MESSAGE_INVALID => (
+                codes::INVALID_PARAMS,
+                false,
+                "body must be 1-4000 characters and operation_id must be valid and unused for a different payload",
+            ),
+            "SESSION_IMPORTED_READONLY" => (
+                codes::CONFLICT,
+                false,
+                "imported sessions are read-only archives; message a live session instead",
+            ),
+            _ => return identity_error(id, error),
+        };
+        return typed_client_error(
+            id,
+            rpc_code,
+            typed.code,
+            typed.message.clone(),
+            retryable,
+            hint,
+        );
+    }
+    if error
+        .downcast_ref::<vp_protocol::types::AgentCoordinationError>()
+        .is_some()
+    {
+        return coordination_error(id, error);
+    }
+
+    let message = format!("{error:#}");
+    let lowered = message.to_ascii_lowercase();
+    let (rpc_code, code, retryable, hint) = if lowered
+        .contains("target agent is not in this session")
+    {
+        (
+            codes::NOT_FOUND,
+            vp_protocol::types::agent_operator_codes::AGENT_NOT_FOUND,
+            false,
+            "select an Agent that belongs to this session",
+        )
+    } else if lowered.contains("steering requires a running or waiting agent") {
+        (
+            codes::CONFLICT,
+            vp_protocol::types::agent_operator_codes::AGENT_NOT_ACTIVE,
+            true,
+            "the Agent stopped running before the message was routed; start or retry its task, then send again",
+        )
+    } else if lowered.contains("is not working on task")
+        || lowered.contains("is not in the stored teamplan")
+    {
+        (
+            codes::INVALID_PARAMS,
+            "AGENT_TASK_INVALID",
+            false,
+            "the supplied task_id must match the Agent's current task and a task in the stored TeamPlan",
+        )
+    } else if lowered.contains("imported sessions are read-only archives") {
+        (
+            codes::CONFLICT,
+            "SESSION_IMPORTED_READONLY",
+            false,
+            "imported sessions are read-only archives; message a live session instead",
+        )
+    } else if lowered.contains("steering body must be 1-4000 chars") {
+        (
+            codes::INVALID_PARAMS,
+            vp_protocol::types::agent_operator_codes::AGENT_MESSAGE_INVALID,
+            false,
+            "body must be 1-4000 characters",
+        )
+    } else {
+        return internal_error(id, error);
+    };
+    typed_client_error(id, rpc_code, code, message, retryable, hint)
+}
+
 /// A typed `INVALID_PARAMS` for a bounded engine validation failure; every
 /// other error keeps the ordinary `INTERNAL_ERROR` with no invented code.
 pub(crate) fn validation_or_internal(id: Option<Value>, error: anyhow::Error) -> RpcResponse {

@@ -13,6 +13,7 @@ struct CollabGraphView: View {
     @State private var selectedID: String?
     @State private var showFullGraph = false
     @State private var surface: CollabSurface = .graph
+    @State private var inspectLoadTask: Task<Void, Never>?
 
     private var layout: CollabGraphLayout {
         CollabGraphBuilder.build(
@@ -32,6 +33,17 @@ struct CollabGraphView: View {
     private var selectedNode: CollabGraphNode? {
         guard let selectedID else { return nil }
         return layout.nodes.first { $0.id == selectedID }
+    }
+
+    /// Pending steering is the only per-agent delivery signal the app already
+    /// holds for every node. Unread inbox counts are loaded only for the
+    /// selected Agent and stay inside the inspector.
+    private var pendingSteeringByAgent: [String: Int] {
+        var counts: [String: Int] = [:]
+        for message in model.steeringMessages where message.isPending {
+            counts[message.agentId, default: 0] += 1
+        }
+        return counts
     }
 
     var body: some View {
@@ -55,42 +67,42 @@ struct CollabGraphView: View {
                                 goal: model.selectedSession?.goal ?? L10n.t("Waiting for a session")
                             )
                         } else {
-                            ZStack(alignment: .topTrailing) {
+                            ZStack(alignment: .topLeading) {
                                 graphScroll(layout: layout)
                                 zoomControls(layout: layout, available: proxy.size)
                                     .padding(12)
                             }
-                            .overlay(alignment: .bottom) {
+                            .overlay(alignment: .trailing) {
                                 if let selectedNode {
-                                    CollabNodeInspector(
-                                        node: selectedNode,
-                                        task: task(for: selectedNode),
-                                        blockers: blockers(for: selectedNode),
-                                        busy: model.collabTaskActionBusyID != nil,
-                                        onAction: { command in
-                                            guard let task = task(for: selectedNode) else { return }
-                                            Task { await model.collabTaskAction(task, action: command) }
-                                        },
-                                        onClose: { selectedID = nil }
+                                    inspectorPanel(
+                                        for: selectedNode,
+                                        width: compactInspectorWidth(available: proxy.size)
                                     )
-                                    .padding(.horizontal, 10)
-                                    .padding(.bottom, 10)
-                                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                                    .padding(.vertical, 8)
+                                    .padding(.trailing, 8)
+                                    .transition(.vpInspector)
                                 }
                             }
+                            .animation(
+                                VPMotion.resolved(VPMotion.snap, reduceMotion: reduceMotion),
+                                value: selectedID
+                            )
                         }
                     }
                     .onAppear {
                         fit(layout: layout, available: proxy.size, minimum: 0.55)
                     }
                     .onChange(of: model.selectedSessionID) { _, _ in
+                        inspectLoadTask?.cancel()
+                        inspectLoadTask = nil
+                        model.clearCollabAgentInspect()
                         selectedID = nil
                         autoFit = true
                         fit(layout: layout, available: proxy.size, minimum: 0.55)
                     }
                     .onChange(of: layout.nodes.map(\.id)) { _, _ in
                         if let selectedID, !layout.nodes.contains(where: { $0.id == selectedID }) {
-                            self.selectedID = nil
+                            closeInspector()
                         }
                         if autoFit {
                             fit(layout: layout, available: proxy.size, minimum: 0.55)
@@ -104,9 +116,75 @@ struct CollabGraphView: View {
             }
         }
         .background(VPTheme.canvas)
-        .sheet(isPresented: $showFullGraph) {
+        .sheet(isPresented: $showFullGraph, onDismiss: {
+            restoreCompactInspector()
+        }) {
             CollabExpandedGraphView()
                 .environment(model)
+        }
+    }
+
+    private func compactInspectorWidth(available: CGSize) -> CGFloat {
+        min(370, max(240, available.width - 20))
+    }
+
+    private func inspectorPanel(for node: CollabGraphNode, width: CGFloat) -> some View {
+        CollabAgentInspectorPanel(
+            node: node,
+            task: task(for: node),
+            blockers: blockers(for: node),
+            busy: model.collabTaskActionBusyID != nil,
+            onAction: { command in
+                guard let task = task(for: node) else { return }
+                Task { await model.collabTaskAction(task, action: command) }
+            },
+            onClose: closeInspector
+        )
+        .frame(width: width)
+    }
+
+    private func selectAgent(_ id: String) {
+        if selectedID == id,
+           model.collabAgentInspectAgentID == id,
+           model.collabAgentInspect != nil
+        {
+            return
+        }
+        inspectLoadTask?.cancel()
+        withAnimation(VPMotion.resolved(VPMotion.snap, reduceMotion: reduceMotion)) {
+            selectedID = id
+        }
+        model.clearCollabAgentInspect()
+        guard isInspectableAgent(id) else { return }
+        inspectLoadTask = Task {
+            await model.loadCollabAgentInspect(agentID: id)
+        }
+    }
+
+    private func isInspectableAgent(_ id: String) -> Bool {
+        guard let node = layout.nodes.first(where: { $0.id == id }) else { return false }
+        return !node.isPlaceholder
+    }
+
+    private func closeInspector() {
+        inspectLoadTask?.cancel()
+        inspectLoadTask = nil
+        model.clearCollabAgentInspect()
+        withAnimation(VPMotion.resolved(VPMotion.snap, reduceMotion: reduceMotion)) {
+            selectedID = nil
+        }
+    }
+
+    private func restoreCompactInspector() {
+        guard let selectedID, isInspectableAgent(selectedID) else {
+            model.clearCollabAgentInspect()
+            return
+        }
+        if model.collabAgentInspectAgentID != selectedID || model.collabAgentInspect == nil {
+            inspectLoadTask?.cancel()
+            inspectLoadTask = Task {
+                await model.loadCollabAgentInspect(agentID: selectedID)
+            }
         }
     }
 
@@ -129,11 +207,10 @@ struct CollabGraphView: View {
             CollabGraphContent(
                 layout: layout,
                 selectedID: selectedID,
-                reduceMotion: reduceMotion
+                reduceMotion: reduceMotion,
+                pendingSteering: pendingSteeringByAgent
             ) { id in
-                withAnimation(VPMotion.resolved(VPMotion.snap, reduceMotion: reduceMotion)) {
-                    selectedID = id
-                }
+                selectAgent(id)
             }
             .scaleEffect(zoom, anchor: .topLeading)
             .frame(width: scaled.width, height: scaled.height, alignment: .topLeading)
@@ -243,7 +320,22 @@ struct CollabGraphContent: View {
     let layout: CollabGraphLayout
     let selectedID: String?
     let reduceMotion: Bool
+    var pendingSteering: [String: Int] = [:]
     let onSelect: (String) -> Void
+
+    init(
+        layout: CollabGraphLayout,
+        selectedID: String?,
+        reduceMotion: Bool,
+        pendingSteering: [String: Int] = [:],
+        onSelect: @escaping (String) -> Void
+    ) {
+        self.layout = layout
+        self.selectedID = selectedID
+        self.reduceMotion = reduceMotion
+        self.pendingSteering = pendingSteering
+        self.onSelect = onSelect
+    }
 
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -254,7 +346,8 @@ struct CollabGraphContent: View {
                 CollabNodeCard(
                     node: node,
                     selected: node.id == selectedID,
-                    reduceMotion: reduceMotion
+                    reduceMotion: reduceMotion,
+                    pendingSteering: pendingSteering[node.id] ?? 0
                 )
                 .frame(width: node.size.width, height: node.size.height)
                 .position(node.position)
@@ -281,6 +374,15 @@ struct CollabExpandedGraphView: View {
     @State private var selectedID: String?
     @State private var showPlanned = true
     @State private var showOps = true
+    @State private var inspectLoadTask: Task<Void, Never>?
+
+    private var pendingSteeringByAgent: [String: Int] {
+        var counts: [String: Int] = [:]
+        for message in model.steeringMessages where message.isPending {
+            counts[message.agentId, default: 0] += 1
+        }
+        return counts
+    }
 
     private var layout: CollabGraphLayout {
         CollabGraphBuilder.build(
@@ -346,16 +448,15 @@ struct CollabExpandedGraphView: View {
 
             HStack(spacing: 0) {
                 GeometryReader { proxy in
-                    ZStack(alignment: .topTrailing) {
+                    ZStack(alignment: .topLeading) {
                         ScrollView([.horizontal, .vertical]) {
                             CollabGraphContent(
                                 layout: layout,
                                 selectedID: selectedID,
-                                reduceMotion: reduceMotion
+                                reduceMotion: reduceMotion,
+                                pendingSteering: pendingSteeringByAgent
                             ) { id in
-                                withAnimation(VPMotion.resolved(VPMotion.snap, reduceMotion: reduceMotion)) {
-                                    selectedID = id
-                                }
+                                selectAgent(id)
                             }
                             .scaleEffect(zoom, anchor: .topLeading)
                             .frame(
@@ -406,52 +507,96 @@ struct CollabExpandedGraphView: View {
                         }
                         .padding(12)
                     }
-                    .overlay(alignment: .bottom) {
-                        if let selectedID,
-                           let node = layout.nodes.first(where: { $0.id == selectedID })
-                        {
-                            let task = node.taskID.flatMap { id in
-                                model.orchestrationSnapshot?.task(id)
-                            }
-                            let blockers = node.taskID.flatMap { id in
-                                model.orchestrationSnapshot?.blockers(for: id)
-                            } ?? []
-                            CollabNodeInspector(
-                                node: node,
-                                task: task,
-                                blockers: blockers,
-                                busy: model.collabTaskActionBusyID != nil,
-                                onAction: { command in
-                                    guard let task else { return }
-                                    Task { await model.collabTaskAction(task, action: command) }
-                                },
-                                onClose: { self.selectedID = nil }
-                            )
-                            .padding(.horizontal, 12)
-                            .padding(.bottom, 12)
-                            .transition(.move(edge: .bottom).combined(with: .opacity))
-                        }
-                    }
                     .onAppear {
                         fit(layout: layout, available: proxy.size)
                     }
                     .onChange(of: layout.nodes.map(\.id)) { _, _ in
                         if let selectedID, !layout.nodes.contains(where: { $0.id == selectedID }) {
-                            self.selectedID = nil
+                            closeInspector()
                         }
+                    }
+                    .onChange(of: model.selectedSessionID) { _, _ in
+                        closeInspector()
                     }
                 }
 
-                if showOps {
+                if let node = selectedNode(in: layout) {
+                    VPHairline(vertical: true)
+                    CollabAgentInspectorPanel(
+                        node: node,
+                        task: task(for: node),
+                        blockers: blockers(for: node),
+                        busy: model.collabTaskActionBusyID != nil,
+                        onAction: { command in
+                            guard let task = task(for: node) else { return }
+                            Task { await model.collabTaskAction(task, action: command) }
+                        },
+                        onClose: closeInspector
+                    )
+                    .frame(width: 408)
+                    .padding(10)
+                    .transition(.vpInspector)
+                } else if showOps {
                     Divider()
                     CollabOpsPanel()
                         .frame(width: 360)
                         .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
             }
+            .animation(
+                VPMotion.resolved(VPMotion.snap, reduceMotion: reduceMotion),
+                value: selectedID
+            )
         }
         .frame(minWidth: 1060, minHeight: 620)
         .background(VPTheme.canvas)
+    }
+
+    private func selectedNode(in layout: CollabGraphLayout) -> CollabGraphNode? {
+        guard let selectedID else { return nil }
+        return layout.nodes.first { $0.id == selectedID }
+    }
+
+    private func task(for node: CollabGraphNode) -> OrchestrationTask? {
+        guard let taskID = node.taskID else { return nil }
+        return model.orchestrationSnapshot?.task(taskID)
+    }
+
+    private func blockers(for node: CollabGraphNode) -> [OrchestrationBlocker] {
+        guard let taskID = node.taskID else { return [] }
+        return model.orchestrationSnapshot?.blockers(for: taskID) ?? []
+    }
+
+    private func selectAgent(_ id: String) {
+        if selectedID == id,
+           model.collabAgentInspectAgentID == id,
+           model.collabAgentInspect != nil
+        {
+            return
+        }
+        inspectLoadTask?.cancel()
+        withAnimation(VPMotion.resolved(VPMotion.snap, reduceMotion: reduceMotion)) {
+            selectedID = id
+        }
+        model.clearCollabAgentInspect()
+        guard isInspectableAgent(id) else { return }
+        inspectLoadTask = Task {
+            await model.loadCollabAgentInspect(agentID: id)
+        }
+    }
+
+    private func isInspectableAgent(_ id: String) -> Bool {
+        guard let node = layout.nodes.first(where: { $0.id == id }) else { return false }
+        return !node.isPlaceholder
+    }
+
+    private func closeInspector() {
+        inspectLoadTask?.cancel()
+        inspectLoadTask = nil
+        model.clearCollabAgentInspect()
+        withAnimation(VPMotion.resolved(VPMotion.snap, reduceMotion: reduceMotion)) {
+            selectedID = nil
+        }
     }
 
     private func steppedZoom(_ value: CGFloat) -> CGFloat {
@@ -840,6 +985,7 @@ private struct CollabNodeCard: View {
     let node: CollabGraphNode
     let selected: Bool
     let reduceMotion: Bool
+    var pendingSteering = 0
 
     private var tint: Color {
         switch node.kind {
@@ -928,6 +1074,9 @@ private struct CollabNodeCard: View {
             if node.isPlaceholder {
                 plannedBadge
             }
+            if pendingSteering > 0 {
+                pendingSteeringBadge
+            }
             Spacer(minLength: 2)
             VPStatusDot(
                 color: statusColor,
@@ -950,6 +1099,23 @@ private struct CollabNodeCard: View {
                     style: StrokeStyle(lineWidth: 0.8, dash: [2, 1.5])
                 )
             }
+    }
+
+    private var pendingSteeringBadge: some View {
+        HStack(spacing: 1.5) {
+            Image(systemName: "text.bubble.fill")
+                .font(.system(size: 5, weight: .semibold))
+            Text("\(pendingSteering)")
+                .font(VPTheme.mono(5.4, weight: .semibold))
+        }
+        .foregroundStyle(VPTheme.warning)
+        .padding(.horizontal, 3)
+        .padding(.vertical, 1)
+        .background(VPTheme.warning.opacity(0.12), in: Capsule())
+        .overlay {
+            Capsule().strokeBorder(VPTheme.warning.opacity(0.22), lineWidth: 0.6)
+        }
+        .help(L10n.format("%@ pending steering message(s)", "\(pendingSteering)"))
     }
 
     @ViewBuilder
@@ -1224,6 +1390,9 @@ private struct CollabNodeCard: View {
         if let taskLine = node.taskLine {
             parts.append(taskLine)
         }
+        if pendingSteering > 0 {
+            parts.append(L10n.format("%@ pending steering", "\(pendingSteering)"))
+        }
         if node.ready {
             parts.append(L10n.t("Ready to dispatch"))
         }
@@ -1299,163 +1468,9 @@ private struct CollabTaskStatusChip: View {
     }
 }
 
-// MARK: - Inspector
+// MARK: - Inspector actions
 
-private struct CollabNodeInspector: View {
-    let node: CollabGraphNode
-    let task: OrchestrationTask?
-    let blockers: [OrchestrationBlocker]
-    let busy: Bool
-    let onAction: (CollabTaskCommand) -> Void
-    let onClose: () -> Void
-
-    private var tint: Color {
-        switch node.kind {
-        case .leader: VPTheme.accent
-        case .manager: VPTheme.plan
-        case .worker: VPTheme.info
-        case .scout: VPTheme.accentDeep
-        case .verifier: VPTheme.success
-        case .labour: VPTheme.warning
-        case .group, .plannedTask: VPTheme.textSecondary
-        }
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(tint.opacity(0.9))
-                    .frame(width: 5, height: 5)
-                Text(node.name)
-                    .font(VPTheme.font(11, weight: .semibold))
-                    .foregroundStyle(VPTheme.textPrimary)
-                    .lineLimit(1)
-                if let title = node.displayTitle {
-                    Text(title)
-                        .font(VPTheme.mono(7))
-                        .foregroundStyle(VPTheme.textTertiary)
-                        .lineLimit(1)
-                }
-                Spacer()
-                Text(node.kind.rawValue.uppercased())
-                    .font(VPTheme.mono(6.5, weight: .semibold))
-                    .tracking(0.5)
-                    .foregroundStyle(tint)
-                StatusPill(status: node.statusColorKey)
-                VPCloseButton(
-                    size: 24,
-                    help: L10n.t("Close inspector")
-                ) {
-                    onClose()
-                }
-            }
-
-            if let task {
-                CollabInspectorActions(task: task, busy: busy, onAction: onAction)
-            }
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: 4) {
-                    if let taskLine = node.taskLine {
-                        CollabDetailRow(label: "Task", value: taskLine, tint: tint)
-                    }
-                    if let taskStatus = node.taskStatus {
-                        CollabDetailRow(
-                            label: "Task status",
-                            value: taskStatus,
-                            tint: VPTheme.statusColor(taskStatus)
-                        )
-                    }
-                    if let task {
-                        CollabDetailRow(
-                            label: "Attempts",
-                            value: "\(task.attempts)/\(task.maxAttempts)",
-                            tint: task.attempts >= task.maxAttempts ? VPTheme.danger : VPTheme.textSecondary
-                        )
-                        if let verifier = task.verifierStatus {
-                            CollabDetailRow(
-                                label: "Verifier",
-                                value: verifier,
-                                tint: VPTheme.statusColor(verifier)
-                            )
-                        }
-                        if let next = task.nextAttemptAt {
-                            CollabDetailRow(
-                                label: "Next retry",
-                                value: VPTheme.relativeTime(next),
-                                tint: VPTheme.warning
-                            )
-                        }
-                        if !task.blockedBy.isEmpty {
-                            CollabDetailRow(
-                                label: "Blocked by",
-                                value: task.blockedBy.joined(separator: ", "),
-                                tint: VPTheme.warning
-                            )
-                        }
-                    }
-                    ForEach(blockers.prefix(2)) { blocker in
-                        CollabDetailRow(
-                            label: blocker.kind.replacingOccurrences(of: "_", with: " "),
-                            value: blocker.message,
-                            tint: VPTheme.danger
-                        )
-                    }
-                    if let objective = node.objective, !objective.isEmpty {
-                        CollabDetailRow(label: "Objective", value: objective, tint: VPTheme.textSecondary)
-                    }
-                    if let activity = node.activity, !activity.isEmpty {
-                        CollabDetailRow(label: "Activity", value: activity, tint: VPTheme.textSecondary)
-                    }
-                    if !node.deps.isEmpty {
-                        CollabDetailRow(
-                            label: "Depends on",
-                            value: node.deps.joined(separator: ", "),
-                            tint: VPTheme.warning
-                        )
-                    }
-                    if !node.writeScope.isEmpty {
-                        CollabDetailRow(
-                            label: "Scope",
-                            value: node.writeScope.joined(separator: ", "),
-                            tint: VPTheme.textSecondary
-                        )
-                    }
-                    if !node.acceptance.isEmpty {
-                        CollabDetailRow(
-                            label: "Acceptance",
-                            value: node.acceptance.joined(separator: " · "),
-                            tint: VPTheme.textSecondary
-                        )
-                    }
-                    if let branch = node.branch, !branch.isEmpty {
-                        CollabDetailRow(label: "Branch", value: branch, tint: VPTheme.textTertiary)
-                    }
-                    if !node.model.isEmpty {
-                        CollabDetailRow(label: "Model", value: node.model, tint: VPTheme.textTertiary)
-                    }
-                    if let error = node.lastError, !error.isEmpty {
-                        CollabDetailRow(label: "Last error", value: error, tint: VPTheme.danger)
-                    }
-                }
-            }
-            .frame(maxHeight: 116)
-        }
-        .padding(9)
-        .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(VPTheme.surfaceRaised.opacity(0.97))
-        )
-        .overlay {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(VPTheme.edgeGradient, lineWidth: 1)
-        }
-        .shadow(color: .black.opacity(0.30), radius: 18, y: 8)
-    }
-}
-
-private struct CollabInspectorActions: View {
+struct CollabInspectorActions: View {
     let task: OrchestrationTask
     let busy: Bool
     let onAction: (CollabTaskCommand) -> Void
@@ -1515,7 +1530,7 @@ private struct CollabInspectorActions: View {
     }
 }
 
-private struct CollabDetailRow: View {
+struct CollabDetailRow: View {
     let label: String
     let value: String
     let tint: Color

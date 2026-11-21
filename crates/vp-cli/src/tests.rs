@@ -6613,6 +6613,220 @@ mod coordination_cli_tests {
     }
 
     #[test]
+    fn agent_inspect_and_message_commands_parse_without_resetting_other_fields() {
+        let cli = Cli::try_parse_from([
+            "vp",
+            "agent-inspect",
+            "ses-1",
+            "agt-1",
+            "--timeline-limit",
+            "40",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::AgentInspect {
+                session,
+                agent,
+                timeline_limit,
+            } => {
+                assert_eq!(session, "ses-1");
+                assert_eq!(agent, "agt-1");
+                assert_eq!(timeline_limit, 40);
+            }
+            other => panic!("expected agent-inspect, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["vp", "agent-inspect", "ses-1", "agt-1"]).unwrap();
+        match cli.command {
+            Command::AgentInspect { timeline_limit, .. } => assert_eq!(timeline_limit, 80),
+            other => panic!("expected agent-inspect default, got {other:?}"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["vp", "agent-message", "ses-1", "agt-1", "check this"]).unwrap();
+        match cli.command {
+            Command::AgentMessage {
+                session,
+                agent,
+                text,
+                task,
+                wake,
+                operation_id,
+            } => {
+                assert_eq!(session, "ses-1");
+                assert_eq!(agent, "agt-1");
+                assert_eq!(text, "check this");
+                assert!(task.is_none());
+                assert!(!wake);
+                assert!(operation_id.is_none());
+            }
+            other => panic!("expected agent-message defaults, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "agent-message",
+            "ses-1",
+            "agt-1",
+            "check this",
+            "--task",
+            "T1",
+            "--wake",
+            "--operation-id",
+            "op-msg-1",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::AgentMessage {
+                task,
+                wake,
+                operation_id,
+                ..
+            } => {
+                assert_eq!(task.as_deref(), Some("T1"));
+                assert!(wake);
+                assert_eq!(operation_id.as_deref(), Some("op-msg-1"));
+            }
+            other => panic!("expected agent-message flags, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_inspect_and_message_human_lines_are_bounded_and_truthful() {
+        let inspect = json!({
+            "agent": {
+                "id": "agt-1",
+                "session_id": "ses-1",
+                "role": "worker",
+                "name": "Worker",
+                "title": "Implementation",
+                "status": "running",
+                "department": "impl",
+                "profile": "coding",
+                "model": "worker-model",
+                "parent_id": "agt-leader",
+                "identity_id": "idn-1",
+                "worktree": "/tmp/worktree",
+                "branch": "verlinpark/task/T1"
+            },
+            "task": {
+                "task_id": "T1",
+                "title": "Build it",
+                "department": "impl",
+                "kind": "coding",
+                "status": "running",
+                "attempts": 1,
+                "max_attempts": 2,
+                "acceptance": ["tests pass"],
+                "write_scope": ["src/impl"],
+                "verifier_status": "pending"
+            },
+            "context": {
+                "objective": "build the widget",
+                "model": "worker-model",
+                "estimated_tokens": 1200,
+                "context_window": 128000,
+                "threshold_tokens": 96000,
+                "hard_limit_tokens": 128000,
+                "input_tokens": 3000,
+                "output_tokens": 400,
+                "cache_read_tokens": 2400,
+                "cache_write_tokens": 100,
+                "cost_usd": 0.0123,
+                "tool_count": 17,
+                "tool_bundle": "coding",
+                "prefix_hash": "abcdef0123456789",
+                "last_compaction": "summary@2",
+                "memory_brief_chars": 345,
+                "memory_brief_hash": "9876543210abcdef"
+            },
+            "timeline": [{
+                "seq": 12,
+                "kind": "tool.finished",
+                "category": "tool",
+                "created_at": "2026-11-22T00:00:00Z",
+                "text": "cargo test passed",
+                "tool": "run_project_task",
+                "status": "ok",
+                "is_error": false
+            }],
+            "steering": [{
+                "id": "str-1",
+                "status": "pending",
+                "task_id": "T1",
+                "body": "focus on the parser",
+                "created_at": "2026-11-22T00:00:01Z"
+            }],
+            "inbox": [],
+            "inbox_counts": {"unread": 0, "read": 0, "done": 0, "expired": 0},
+            "truncated": true
+        });
+        let rendered = agent_inspect_lines(&inspect)
+            .expect("inspect lines")
+            .join("\n");
+        assert!(rendered.contains("Worker · worker · running"));
+        assert!(rendered.contains("task T1 · Build it"));
+        assert!(rendered.contains("timeline 1 row(s) [truncated]"));
+        assert!(rendered.contains("steering 1 (1 pending)"));
+        assert!(rendered.contains("cargo test passed"));
+        assert!(rendered.contains("prefix abcdef012345"));
+
+        let steering = json!({
+            "delivery": {
+                "kind": "steering",
+                "status": "pending",
+                "message": "Queued as steering; delivered at the next provider boundary.",
+                "agent_id": "agt-1",
+                "identity_id": "idn-1",
+                "steering": {
+                    "id": "str-1",
+                    "task_id": "T1",
+                    "status": "pending",
+                    "created_at": "2026-11-22T00:00:01Z"
+                }
+            }
+        });
+        let rendered = agent_message_lines(&steering)
+            .expect("steering message lines")
+            .join("\n");
+        assert!(rendered.contains("steering · pending · agent agt-1"));
+        assert!(rendered.contains("next provider boundary"));
+        assert!(rendered.contains("steering str-1 · task T1"));
+
+        let inbox = json!({
+            "delivery": {
+                "kind": "inbox",
+                "status": "unread",
+                "message": "Stored in the project inbox.",
+                "agent_id": "agt-1",
+                "identity_id": "idn-1",
+                "inbox": {
+                    "id": "msg-1",
+                    "status": "unread",
+                    "from_label": "operator",
+                    "body": "pick this up when you return",
+                    "created_at": "2026-11-22T00:00:02Z",
+                    "expires_at": "2026-11-23T00:00:02Z"
+                },
+                "wake": {
+                    "requested": true,
+                    "created": true,
+                    "continuation_id": "con-1",
+                    "reason": "deferred_continuation"
+                }
+            }
+        });
+        let rendered = agent_message_lines(&inbox)
+            .expect("inbox message lines")
+            .join("\n");
+        assert!(rendered.contains("inbox · unread · agent agt-1"));
+        assert!(rendered.contains("inbox msg-1 · unread · from operator"));
+        assert!(rendered.contains("pick this up when you return"));
+        assert!(rendered.contains("wake requested=true created=true"));
+        assert!(rendered.contains("continuation con-1"));
+    }
+
+    #[test]
     fn coordination_human_lines_show_lease_inbox_and_wake_without_secrets() {
         let assignments = json!({
             "assignments": [{

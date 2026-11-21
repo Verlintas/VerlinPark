@@ -4,12 +4,16 @@ mod briefs;
 mod maintenance;
 mod mcp;
 mod memory;
+mod operator;
 mod orchestration;
 mod programs;
 mod projects;
 mod sessions;
 mod sources;
 mod status;
+
+#[allow(unused_imports)]
+pub(crate) use operator::{agent_inspect_lines, agent_message_lines};
 
 use super::*;
 use crate::cli::Command;
@@ -115,6 +119,9 @@ pub(crate) fn print_human_for(hint: Option<&str>, value: &Value) {
         return;
     }
     if orchestration::print(value) {
+        return;
+    }
+    if operator::print(value) {
         return;
     }
     if sources::print(value) {

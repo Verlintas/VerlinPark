@@ -473,14 +473,26 @@ impl Store {
                 PRIMARY KEY (session_id, seq)
             );
 
-            CREATE INDEX IF NOT EXISTS idx_events_session_seq
-                ON events(session_id, seq);
-            CREATE INDEX IF NOT EXISTS idx_events_session_type_seq
-                ON events(session_id, type, seq);
-            CREATE INDEX IF NOT EXISTS idx_events_type_created
-                ON events(type, created_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_sessions_project
-                ON sessions(project_id);
+            CREATE INDEX IF NOT EXISTS idx_events_session_seq ON events(session_id, seq);
+            CREATE INDEX IF NOT EXISTS idx_events_session_type_seq ON events(session_id, type, seq);
+            CREATE INDEX IF NOT EXISTS idx_events_type_created ON events(type, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id);
+
+            -- Derived agent-scoped event index for the V1 Collab Agent Inspector.
+            CREATE TABLE IF NOT EXISTS agent_event_index (
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                agent_id TEXT NOT NULL, seq INTEGER NOT NULL, kind TEXT NOT NULL,
+                created_at TEXT NOT NULL, PRIMARY KEY (session_id, agent_id, seq)
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_event_index_agent ON agent_event_index(session_id, agent_id, seq);
+            CREATE TRIGGER IF NOT EXISTS trg_agent_event_index_insert AFTER INSERT ON events
+            WHEN json_valid(NEW.payload) AND json_type(NEW.payload, '$.agent_id') = 'text'
+            BEGIN
+                INSERT OR IGNORE INTO agent_event_index (session_id, agent_id, seq, kind, created_at)
+                VALUES (NEW.session_id, json_extract(NEW.payload, '$.agent_id'), NEW.seq, NEW.type, NEW.created_at);
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_agent_event_index_delete AFTER DELETE ON events
+            BEGIN DELETE FROM agent_event_index WHERE session_id = OLD.session_id AND seq = OLD.seq; END;
 
             CREATE TABLE IF NOT EXISTS agents (
                 id         TEXT PRIMARY KEY,
@@ -2969,6 +2981,9 @@ impl Store {
             "headers",
             "TEXT NOT NULL DEFAULT '{}'",
         )?;
+        // One-time backfill for the agent event index. It is a derived
+        // projection; events remain authoritative.
+        super::agent_events::backfill_agent_event_index(&conn)?;
         let daemon_identity = crate::store::lease::load_or_create_daemon_identity(&conn)?;
 
         Ok(Self {

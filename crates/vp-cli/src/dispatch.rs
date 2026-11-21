@@ -381,6 +381,8 @@ pub(crate) async fn run_command(
         Command::Agents { .. }
         | Command::AgentOrg { .. }
         | Command::AgentDetail { .. }
+        | Command::AgentInspect { .. }
+        | Command::AgentMessage { .. }
         | Command::TeamExport { .. }
         | Command::TeamImport { .. }
         | Command::TeamTemplates { .. }

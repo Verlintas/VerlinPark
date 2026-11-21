@@ -476,6 +476,16 @@ final class AppModel {
     var orchestrationOverviewBusy = false
     var orchestrationOverviewStatus: String?
     var steeringMessages: [SteeringMessage] = []
+    // Collab Agent Inspector and direct operator channel. The inspector is a
+    // bounded daemon projection; sends are explicit and never auto-retried.
+    var collabAgentInspect: AgentInspectResult?
+    var collabAgentInspectAgentID: String?
+    var collabAgentInspectBusy = false
+    var collabAgentInspectError: String?
+    var collabAgentMessageBusy = false
+    var collabAgentMessageError: String?
+    var collabAgentMessageNotice: String?
+    var collabAgentMessageDelivery: AgentMessageDelivery?
     var continuations: [SessionContinuation] = []
     var recoveries: [OrchestrationRecovery] = []
     var taskProgress: [PlanTaskProgress] = []
@@ -753,6 +763,8 @@ final class AppModel {
 
     private let core: CoreClient
     private let budgetRPC: any BudgetRPC
+    private let collabAgentRPC: any CollabAgentRPC
+    private var collabAgentInspectRequestGeneration = 0
     private let daemon = DaemonController()
     private let secretStore: any SecretStore
     private let secretAccount: String
@@ -797,7 +809,8 @@ final class AppModel {
     init(
         secretStore: any SecretStore = KeychainSecretStore(),
         secretAccount: String = "provider.apiKey",
-        budgetRPC: (any BudgetRPC)? = nil
+        budgetRPC: (any BudgetRPC)? = nil,
+        collabAgentRPC: (any CollabAgentRPC)? = nil
     ) {
         let core = CoreClient()
         self.core = core
@@ -806,6 +819,7 @@ final class AppModel {
         } else {
             self.budgetRPC = core
         }
+        self.collabAgentRPC = collabAgentRPC ?? core
         self.secretStore = secretStore
         self.secretAccount = secretAccount
     }
@@ -955,6 +969,18 @@ final class AppModel {
         steeringCancelBusyID = nil
         continuationSubmitBusy = false
         continuationActionBusyID = nil
+    }
+
+    private func resetCollabAgentInspectState() {
+        collabAgentInspectRequestGeneration &+= 1
+        collabAgentInspect = nil
+        collabAgentInspectAgentID = nil
+        collabAgentInspectBusy = false
+        collabAgentInspectError = nil
+        collabAgentMessageBusy = false
+        collabAgentMessageError = nil
+        collabAgentMessageNotice = nil
+        collabAgentMessageDelivery = nil
     }
 
     private func resetEfficiencyState() {
@@ -1139,6 +1165,7 @@ final class AppModel {
             selectionGeneration &+= 1
             selectedProjectID = nil
             selectedSessionID = nil
+            resetCollabAgentInspectState()
             events = []
             contextStatus = nil
             compactNotice = nil
@@ -1232,6 +1259,7 @@ final class AppModel {
         selectionGeneration &+= 1
         selectedProjectID = id
         selectedSessionID = nil
+        resetCollabAgentInspectState()
         events = []
         contextStatus = nil
         compactNotice = nil
@@ -1389,6 +1417,7 @@ final class AppModel {
 
     func selectResident() {
         selectionGeneration &+= 1
+        resetCollabAgentInspectState()
         mode = .resident
     }
 
@@ -1400,6 +1429,7 @@ final class AppModel {
         selectionGeneration &+= 1
         mode = .project
         selectedSessionID = id
+        resetCollabAgentInspectState()
         Task {
             await closeTerminal()
             await closeConsole()
@@ -5939,7 +5969,7 @@ final class AppModel {
 
     private func loadSteering(sessionID: String, generation: Int) async {
         do {
-            let result = try await core.sessionSteering(
+            let result = try await collabAgentRPC.sessionSteering(
                 sessionID: sessionID,
                 status: nil,
                 limit: 50
@@ -6177,6 +6207,133 @@ final class AppModel {
                 longTaskStatus = message
             }
             return message
+        }
+    }
+
+    // MARK: - Collab Agent Inspector and direct channel
+
+    /// Loads the bounded inspector projection for one agent in the selected
+    /// session. There is no polling: the caller decides when to refresh.
+    func loadCollabAgentInspect(agentID: String) async {
+        // A late response from a previous Agent selection must not replace the
+        // currently selected Agent's inspector. `clearCollabAgentInspect`
+        // resets this target before the next selection.
+        if let current = collabAgentInspectAgentID, !current.isEmpty, current != agentID {
+            return
+        }
+        guard let sessionID = selectedSessionID else {
+            collabAgentInspectRequestGeneration &+= 1
+            collabAgentInspect = nil
+            collabAgentInspectAgentID = nil
+            collabAgentInspectBusy = false
+            collabAgentInspectError = L10n.t("Select a session first.")
+            return
+        }
+        let generation = selectionGeneration
+        collabAgentInspectRequestGeneration &+= 1
+        let requestGeneration = collabAgentInspectRequestGeneration
+        if collabAgentInspectAgentID != agentID {
+            collabAgentInspect = nil
+        }
+        collabAgentInspectAgentID = agentID
+        collabAgentInspectBusy = true
+        collabAgentInspectError = nil
+        defer {
+            if isCurrent(sessionID: sessionID, generation: generation),
+               requestGeneration == collabAgentInspectRequestGeneration
+            {
+                collabAgentInspectBusy = false
+            }
+        }
+        do {
+            let result = try await collabAgentRPC.agentInspect(
+                sessionID: sessionID,
+                agentID: agentID,
+                timelineLimit: AgentInspectRules.defaultTimelineLimit
+            )
+            guard isCurrent(sessionID: sessionID, generation: generation),
+                  requestGeneration == collabAgentInspectRequestGeneration
+            else { return }
+            collabAgentInspect = result
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation),
+                  requestGeneration == collabAgentInspectRequestGeneration
+            else { return }
+            collabAgentInspectError = AgentInspectRules.errorText(error)
+        }
+    }
+
+    /// Clears inspector/channel state when the operator closes the panel or
+    /// changes sessions. It does not cancel any daemon-side delivery.
+    func clearCollabAgentInspect() {
+        resetCollabAgentInspectState()
+    }
+
+    /// Sends one explicit operator message to the selected agent. A live run is
+    /// steered; an idle identity agent is queued in its inbox; an idle
+    /// ephemeral agent fails closed with `AGENT_NOT_ACTIVE`. The method never
+    /// synthesizes a successful delivery from a failed RPC.
+    func sendCollabAgentMessage(
+        agentID: String,
+        body: String,
+        taskID: String?,
+        wakeSession: Bool
+    ) async {
+        guard let sessionID = selectedSessionID else {
+            collabAgentMessageError = L10n.t("Select a session first.")
+            collabAgentMessageNotice = nil
+            collabAgentMessageDelivery = nil
+            return
+        }
+        let trimmed: String
+        switch LongTaskRules.validateSteeringBody(body) {
+        case let .success(value):
+            trimmed = value
+        case let .failure(error):
+            collabAgentMessageError = error.message
+            collabAgentMessageNotice = nil
+            collabAgentMessageDelivery = nil
+            return
+        }
+        guard !collabAgentMessageBusy else { return }
+        let generation = selectionGeneration
+        let normalizedTaskID: String?
+        if let taskID {
+            let trimmedTaskID = taskID.trimmingCharacters(in: .whitespacesAndNewlines)
+            normalizedTaskID = trimmedTaskID.isEmpty ? nil : trimmedTaskID
+        } else {
+            normalizedTaskID = nil
+        }
+        collabAgentMessageBusy = true
+        collabAgentMessageError = nil
+        collabAgentMessageNotice = nil
+        collabAgentMessageDelivery = nil
+        defer {
+            if isCurrent(sessionID: sessionID, generation: generation) {
+                collabAgentMessageBusy = false
+            }
+        }
+        do {
+            let result = try await collabAgentRPC.sendAgentMessage(
+                sessionID: sessionID,
+                agentID: agentID,
+                body: trimmed,
+                taskID: normalizedTaskID,
+                wakeSession: wakeSession,
+                operationID: nil
+            )
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            collabAgentMessageDelivery = result.delivery
+            collabAgentMessageNotice = AgentInspectRules.deliveryNotice(result.delivery)
+            await loadSteering(sessionID: sessionID, generation: generation)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            // `loadCollabAgentInspect` rejects a late response for a different
+            // currently selected Agent; the extra request generation check
+            // below drops a response that arrives after a newer selection.
+            await loadCollabAgentInspect(agentID: agentID)
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            collabAgentMessageError = AgentInspectRules.errorText(error)
         }
     }
 

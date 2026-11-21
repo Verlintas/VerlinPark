@@ -1,10 +1,71 @@
 # VerlinPark 进度
 
-> 最后更新：2026-11-21
+> 最后更新：2026-11-22
 > 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark + task contracts/intent authorization/MCP schema pins + effect receipts/postconditions + external gates/durable waits + runtime pinning/controller replay + reliability/OTel + project-scoped identities S1–S8 + failure attribution/cascade + production hardening rounds 1–3 (ADR-0213/0214/0215) + C7 bounded fan-out (ADR-0216) + C8 tool search v2 (ADR-0217) + C9 MCP async tasks (ADR-0218) + C10 Code Mode (ADR-0219) + C11 loopback A2A (ADR-0221) + C12 advisory progress ledger (ADR-0220) + M3.1 store split 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
+
+---
+
+## 2026-11-22 Collab Agent Inspector and Direct Channel
+
+The V1 round adds the per-Agent inspection and operator channel (ADR-0232):
+
+- `agent.inspect` one bounded read-only snapshot: `agent`, plan `task`, agent
+  `context`, `timeline`, `steering`, session-scoped identity `inbox` plus
+  counts, and a proven `truncated` flag. Timeline defaults to 80 rows
+  server-side (the macOS client also requests 80) / hard cap 200, each display row
+  is capped at 1,200 redacted characters, and steering / inbox lists are capped
+  at 50 rows.
+- `agent_event_index` derived projection with SQLite insert/delete triggers on
+  `events`, a one-time `agent_event_index_v1` backfill, and empty-index repair
+  on store reopen. Reads join the index back to the authoritative event rows;
+  the index is not bundle evidence and is rebuilt from events.
+- `agent.message.send` truthful routing: `running`/`waiting_input` uses
+  `session.steer` (`pending` → `delivered` at the next provider boundary, or
+  `cancelled`); an idle Agent with a persisted identity uses
+  `agent.inbox.send` (`queued`/`unread`, then `read`/`done`/`expired`, optional
+  deferred wake); an idle ephemeral Agent fails with typed `AGENT_NOT_ACTIVE`
+  and stores no undeliverable note. Unknown/foreign targets and invalid bodies
+  use typed `AGENT_NOT_FOUND` / `AGENT_TARGET_INVALID` / `AGENT_MESSAGE_INVALID`.
+- Collab gets an Agent Inspector with Overview, Context, Conversation, Messages,
+  and Activity views, existing status/activity plus pending-steering and
+  blocked/completion signals, and an in-place composer. Unread inbox state is
+  shown for the selected Agent in Messages; a per-node unread badge is not
+  claimed in this round. The client renders daemon data only; there is no new
+  Agent tool, no Agent-to-Agent chat, and no spawn-to-chat.
+- Context/Conversation are bounded operator views: no
+  `agent.started.prompt`/composed system prompt, raw tool input, raw approval
+  input, raw/unbounded inbox payload, unbounded tool output, or
+  secret/credential material.
+  The read model returns counts, hashes, tool-bundle identity, and bounded
+  redacted display rows.
+- Successful sends remain audited through existing `steering.*` and
+  `agent.inbox.*` events. The route cannot approve approvals, resolve gates,
+  submit verdicts, merge, change budgets/capacity/plans, or bypass the
+  Verifier/Integrator.
+- RPC/CLI parity: `agent.inspect` / `agent.message.send`;
+  `vp agent-inspect <session> <agent> [--timeline-limit N]` and
+  `vp agent-message <session> <agent> <text> [--task T] [--wake]
+  [--operation-id ID]` use the same typed routes.
+
+Limits: delivery is cooperative and cannot interrupt a provider stream or tool
+call; idle ephemeral runs have no channel; the project inbox is pull-based and
+without a wake V1 does not inject it into a run, so it can stay unread;
+ACP-backed runs have
+no native steering drain in V1; the inspector timeline/steering/inbox are
+bounded recent windows, not complete archives; the Context tab has no
+per-agent checkpoint summary in this round (checkpoint detail stays in the
+existing Stage surfaces); redaction is deterministic/best-effort; the index is
+same-host SQLite derived state; imported archives are inspectable but read-only.
+
+Verification: `cargo test --workspace` **4,534 passed / 0 failed / 6 ignored**;
+`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+and `swiftformat --lint` passed; `xcodebuild test` passed **474 app + 132
+helper** tests. Targeted suites: store agent-event index 4, core inspector 4,
+core operator 5, daemon operator RPC 1, CLI inspect/message 2, Swift
+AgentInspect 17. The manual macOS GUI smoke remains a release-gate item.
 
 ---
 

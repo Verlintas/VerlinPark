@@ -1,6 +1,6 @@
 # VerlinPark Status
 
-> 最后更新：2026-11-18
+> 最后更新：2026-11-22
 > 当前主线：C1–C12 代码落地（C11 为 loopback + card-only，尚无 inbound 执行桥）；M3.1–M3.6 结构治理完成（store/core/CLI/daemon 入口、领域模块与 dispatch 路由）；下一阶段为生产化与分布式边界。
 
 ## 1. 一句话
@@ -12,9 +12,9 @@ VerlinPark 已经是一个可运行的 macOS 原生多 Agent 开发区：Rust da
 | 项 | 当前值 |
 |---|---:|
 | Rust crates | 10（新增 `vp-a2a`） |
-| ADR | 224 |
-| 最近全量 Rust 测试 | 4,236 passed / 0 failed / 6 ignored |
-| Swift | 535 passed（403 app + 132 helper），`xcodebuild test` 通过 |
+| ADR | 226 |
+| 最近全量 Rust 测试 | 4,534 passed / 0 failed / 6 ignored |
+| Swift | 474 app + 132 helper passed，`xcodebuild test` 通过 |
 | Live provider | DeepSeek `deepseek-flash` 流式/provider-test/完整 Leader 写文件通过；小前缀 cache 97.1–97.4% |
 | 当前分支 | `m3-round`（本轮审查前不合并） |
 
@@ -35,6 +35,14 @@ VerlinPark 已经是一个可运行的 macOS 原生多 Agent 开发区：Rust da
 - M3.6：`vp-cli/render.rs`、`vp-cli/dispatch.rs`、`vp-daemon/dispatch.rs` 按输出域/命令族/路由族拆分；行为与协议不变。
 
 ## 4. 本轮新增
+
+### Collab Agent Inspector and Direct Channel (2026-11-22)
+
+- Clicking a live Agent node opens a bounded inspector with Overview/Context/Conversation/Messages/Activity.
+- `agent.inspect` exposes agent-scoped task/context/usage/timeline/steering/inbox data without raw prompts, tool payloads, or secrets.
+- `agent_event_index` is a derived SQLite index rebuilt from events.
+- `agent.message.send` routes running/waiting Agents to steering, idle identity Agents to the project inbox, and idle ephemeral Agents to typed `AGENT_NOT_ACTIVE`; it never fabricates instant delivery or approval.
+- Rust 4,534 / 0 failed / 6 ignored; Swift 474 app + 132 helper; fmt/clippy/swiftformat/xcodebuild pass.
 
 ### Live DeepSeek validation
 
