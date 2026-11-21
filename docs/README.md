@@ -9,6 +9,7 @@
 |---|---|---|
 | **Current** | [PROGRESS.md](PROGRESS.md) | 当前真实可用的能力、限制、测试结果；状态以这里为准 |
 | **Current** | [STATUS.md](STATUS.md) | 当前项目状态、路线完成度、已知边界与下一阶段建议（2026-11-16） |
+| **Current** | [V1_FINAL_PLAN.md](V1_FINAL_PLAN.md) | V1 单项目 coding 最终计划：范围、Collab Agent Inspector/Direct Channel、零遗留缺陷门禁、验收场景、阶段与 fork 点（2026-11-22） |
 | **Current** | [AUDIT.md](AUDIT.md) | 最近一次项目重审：P0/P1/P2 问题、证据、建议顺序 |
 | **Current** | [audit/2026-11-09-findings.md](audit/2026-11-09-findings.md) | 2026-11-09 全量审查完整台账（[CSV](audit/2026-11-09-findings.csv)）；116 个原始 finding 合并为 65 条并保留全部来源 ID |
 | **Design** | [ARCHITECTURE.md](ARCHITECTURE.md) | 目标架构、协议、数据模型、状态机；实现状态见 PROGRESS/AUDIT |
