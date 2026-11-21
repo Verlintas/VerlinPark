@@ -262,6 +262,7 @@
 
 - GUI lease：`GuiCoordinator` 跟踪 in-flight ticket；动作执行中 sweep/其他 session 不能按 grace 回收；移除 daemon 105s 硬编码 grace floor；用户 grace 0–600 原样保存。
 - Context/cache：manual compaction/checkpoint 使用真实 layout-aware prefix；warm 跨 session 归属修正；identity memory preview 按 scope 保留配额；goal 32 KiB / prompt 64 KiB 上限；source 导入精确 URI 去重；memory LIKE 转义；instruction blob 不重复写。
+- Tool surface：advertised schema 与 role policy 对齐；Manager/Verifier 不再看到 `archive_extract`/`media_transcode`，Scout 重新获得只读的 `archive_list`/`media_info`；Leader policy surface 不再包含 `delegate_many`/`submit_verdict`，Worker policy surface 不再包含 `delegate_acp`，Verifier policy surface 不再包含 `ask_user`/`coordinate`/`remember`。
 - Store：orchestration policy 损坏 fail closed；instruction prefix 精确大小写；merge/plan 终态 guard；foreign live lease 保留；bundle seq/payload 边界；effect sweep 结构化标记；memory LIKE 转义。
 - Bench：空 live turn 不再伪造 `"OK"`；prefix-break 负控制真实注入；`--require-target`/verify 重算 acceptance 和 provider-reported provenance；pricing/scenario 比较拒绝不匹配。
 - Security：shell read roots 扩展；跨会话对象所有权；notification 风险门控；invalid approval mode 仍为既有 gap（未在本轮改变默认 smart 行为）。
@@ -271,7 +272,7 @@
 - `cargo fmt --all -- --check`：通过。
 - `cargo check --workspace --all-targets`：通过。
 - `cargo clippy --workspace --all-targets -- -D warnings`：通过。
-- `cargo test -p vp-core --lib`：**2,479 passed / 0 failed / 2 ignored**。
+- `cargo test -p vp-core --lib`：**2,480 passed / 0 failed / 2 ignored**。
 - `cargo test -p vp-store --lib`：**418 passed / 0 failed**。
 - `cargo test -p vp-cli`：**162 unit + 10 backup integration + 1 governance passed**。
 - `cargo test -p vp-daemon`：**42 unit + 1 governance passed**。

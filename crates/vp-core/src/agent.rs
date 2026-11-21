@@ -1380,8 +1380,6 @@ pub(crate) fn role_tool_surface(role: AgentRole, profile: AgentProfile) -> Vec<S
             "read_artifact",
             "archive_list",
             "media_info",
-            "ask_user",
-            "coordinate",
             "team_status",
             "use_skill",
             "tool_help",
@@ -1389,13 +1387,20 @@ pub(crate) fn role_tool_surface(role: AgentRole, profile: AgentProfile) -> Vec<S
             "task_detail",
             "budget_status",
             "read_tool_output",
-            "remember",
             "recall",
             "search_sources",
             "read_source",
             "list_sources",
+            // Manager and Verifier use the same MCP bridge with a reduced
+            // action set (inspect/read only, no call/cancel).
+            "mcp",
         ] {
             names.push(name.to_string());
+        }
+        if role != AgentRole::Verifier {
+            for name in ["ask_user", "coordinate", "remember"] {
+                names.push(name.to_string());
+            }
         }
     } else {
         for name in [
@@ -1408,6 +1413,13 @@ pub(crate) fn role_tool_surface(role: AgentRole, profile: AgentProfile) -> Vec<S
         ] {
             names.push(name.to_string());
         }
+    }
+    // The catalog is filtered by `allows_tool`, and Leader intentionally
+    // allows every registry tool. Remove the two role-specific catalog entries
+    // that the Leader schema does not advertise: delegation batches belong to
+    // Managers, and verdicts belong to Verifiers.
+    if role == AgentRole::Leader {
+        names.retain(|name| name != "delegate_many" && name != "submit_verdict");
     }
     match role {
         AgentRole::Verifier => names.push("submit_verdict".to_string()),
@@ -1437,7 +1449,6 @@ pub(crate) fn role_tool_surface(role: AgentRole, profile: AgentProfile) -> Vec<S
         }
         AgentRole::Worker => {
             names.push("delegate".to_string());
-            names.push("delegate_acp".to_string());
         }
         _ => {}
     }

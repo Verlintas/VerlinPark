@@ -109,6 +109,19 @@ no hidden model or provider routing was added.
   `SESSION_START_FAILED` as a created session, and limits notification approval
   actions to routine workspace writes.
 
+### Tool schema and policy alignment
+
+- Archive/media schemas are filtered by the same role policy as executable
+  tools: Managers and Verifiers no longer see `archive_extract` or
+  `media_transcode`, while Scout receives only the read-only `archive_list` and
+  `media_info` views.
+- The policy surface no longer advertises `delegate_many` or `submit_verdict`
+  to the Leader, `delegate_acp` to Workers, or `ask_user`/`coordinate`/`remember`
+  to Verifiers. Manager/Verifier MCP inspect/read access is included in the
+  surface explicitly.
+- A regression test asserts the advertised schema and policy surface do not
+  drift for these role-specific tools.
+
 ## Consequences
 
 - The approval, ownership, journal, plan, replay, and truncation paths now fail
@@ -153,7 +166,7 @@ no hidden model or provider routing was added.
 
 - `cargo fmt --all -- --check`, `cargo check --workspace --all-targets`, and
   `cargo clippy --workspace --all-targets -- -D warnings` pass.
-- `cargo test -p vp-core --lib`: 2,479 passed / 0 failed / 2 ignored.
+- `cargo test -p vp-core --lib`: 2,480 passed / 0 failed / 2 ignored.
 - `cargo test -p vp-store --lib`: 418 passed / 0 failed.
 - `cargo test -p vp-cli`: 162 unit + 10 backup integration + 1 governance.
 - `cargo test -p vp-daemon`: 42 unit + 1 governance.

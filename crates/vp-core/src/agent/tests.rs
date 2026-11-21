@@ -3006,6 +3006,8 @@ async fn scout_tool_schema_is_read_only() {
         "read_source",
         "recall",
         "team_status",
+        "archive_list",
+        "media_info",
     ] {
         assert!(scout.contains(required), "Scout is missing {required}");
     }
@@ -22778,9 +22780,9 @@ async fn tool_bundle_matrix_covers_standard_combinations_without_session_state()
     assert_eq!(labour.builtin_count, 37);
     let scout = find("scout", "research", None);
     assert_eq!(scout.bundle, "research");
-    assert_eq!(scout.builtin_count, 20);
+    assert_eq!(scout.builtin_count, 22);
     assert_eq!(scout.requested_count, 33);
-    assert_eq!(scout.omitted_count, 13);
+    assert_eq!(scout.omitted_count, 11);
     assert!(scout.omitted_count > 0, "Scout has role-only omissions");
     for row in &matrix.rows {
         assert_eq!(row.bundle_hash.len(), 64);
@@ -26964,4 +26966,63 @@ async fn run_script_inner_contract_denial_fails_closed_without_approval() {
         !std::path::Path::new(worktree).join("docs/out.txt").exists(),
         "contract-denied inner write created a file"
     );
+}
+
+#[tokio::test]
+async fn advertised_tool_schemas_match_the_role_policy_surface() {
+    let dir = TempDir::new().unwrap();
+    let (_engine, service, _project) = test_service(&dir);
+    let config = service
+        .config
+        .read()
+        .unwrap()
+        .as_ref()
+        .expect("test service configured")
+        .clone();
+    let advertised = |role: AgentRole, profile: AgentProfile| {
+        tool_schemas(&config, role, profile, true)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<std::collections::HashSet<_>>()
+    };
+    let surface = |role: AgentRole, profile: AgentProfile| {
+        role_tool_surface(role, profile)
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>()
+    };
+
+    let manager = advertised(AgentRole::Manager, AgentProfile::Coding);
+    assert!(manager.contains("archive_list"));
+    assert!(manager.contains("media_info"));
+    assert!(!manager.contains("archive_extract"));
+    assert!(!manager.contains("media_transcode"));
+    assert!(manager.contains("delegate_many"));
+    assert!(manager.contains("mcp"));
+
+    let verifier = advertised(AgentRole::Verifier, AgentProfile::Verification);
+    assert!(verifier.contains("archive_list"));
+    assert!(verifier.contains("media_info"));
+    assert!(!verifier.contains("archive_extract"));
+    assert!(!verifier.contains("media_transcode"));
+    assert!(verifier.contains("submit_verdict"));
+    assert!(!verifier.contains("ask_user"));
+    assert!(!verifier.contains("coordinate"));
+    assert!(!verifier.contains("remember"));
+
+    let scout = advertised(AgentRole::Scout, AgentProfile::Research);
+    assert!(scout.contains("archive_list"));
+    assert!(scout.contains("media_info"));
+    assert!(!scout.contains("archive_extract"));
+    assert!(!scout.contains("media_transcode"));
+
+    let leader_surface = surface(AgentRole::Leader, AgentProfile::Coding);
+    assert!(!leader_surface.contains("delegate_many"));
+    assert!(!leader_surface.contains("submit_verdict"));
+    let worker_surface = surface(AgentRole::Worker, AgentProfile::Coding);
+    assert!(!worker_surface.contains("delegate_acp"));
+    let verifier_surface = surface(AgentRole::Verifier, AgentProfile::Verification);
+    assert!(verifier_surface.contains("mcp"));
+    assert!(!verifier_surface.contains("ask_user"));
+    assert!(!verifier_surface.contains("coordinate"));
+    assert!(!verifier_surface.contains("remember"));
 }

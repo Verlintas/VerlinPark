@@ -64,6 +64,70 @@ pub(super) fn source_tool_schemas() -> Vec<ToolSchema> {
     ]
 }
 
+pub(super) fn archive_list_tool_schema() -> ToolSchema {
+    ToolSchema {
+        name: "archive_list".to_string(),
+        description: "List a zip, tar, or tar.gz artifact with hard entry/size/ratio caps. Entry bytes are never extracted and the workspace is not touched.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "artifact_id": {"type": "string"},
+                "max_entries": {"type": "integer", "minimum": 1, "maximum": 2000}
+            },
+            "required": ["artifact_id"]
+        }),
+    }
+}
+
+pub(super) fn archive_extract_tool_schema() -> ToolSchema {
+    ToolSchema {
+        name: "archive_extract".to_string(),
+        description: "Extract selected safe entries from a zip/tar/tar.gz artifact into daemon-owned scratch, then publish bounded content-addressed artifacts with source provenance. Unsafe entries are rejected; nothing is written into the worktree.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "artifact_id": {"type": "string"},
+                "entries": {"type": "array", "items": {"type": "string"}, "maxItems": 2000},
+                "all": {"type": "boolean"},
+                "max_entries": {"type": "integer", "minimum": 1, "maximum": 2000},
+                "include_previews": {"type": "boolean"}
+            },
+            "required": ["artifact_id"]
+        }),
+    }
+}
+
+pub(super) fn media_info_tool_schema() -> ToolSchema {
+    ToolSchema {
+        name: "media_info".to_string(),
+        description: "Probe a media artifact or worktree file with ffprobe. Missing ffprobe returns MEDIA_TOOL_UNAVAILABLE; still images may fall back to explicitly labeled image metadata. No metadata is fabricated and no network is used.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "artifact_id": {"type": "string"},
+                "path": {"type": "string", "description": "Worktree-relative media path when artifact_id is absent"}
+            }
+        }),
+    }
+}
+
+pub(super) fn media_transcode_tool_schema() -> ToolSchema {
+    ToolSchema {
+        name: "media_transcode".to_string(),
+        description: "Explicitly transcode a file-backed media artifact with ffmpeg into a bounded, duration/byte-capped content-addressed artifact. Requires the approval broker and ffmpeg; never writes a workspace file.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "artifact_id": {"type": "string"},
+                "format": {"type": "string", "enum": ["mp4", "webm", "mp3", "wav", "png", "jpeg"]},
+                "max_duration_secs": {"type": "integer", "minimum": 1, "maximum": 600},
+                "max_bytes": {"type": "integer", "minimum": 1048576, "maximum": 268435456}
+            },
+            "required": ["artifact_id", "format"]
+        }),
+    }
+}
+
 pub(super) fn recall_tool_schema() -> ToolSchema {
     ToolSchema {
         name: "recall".to_string(),
@@ -132,6 +196,14 @@ pub(super) fn tool_schemas(
         tools.push(recall_tool_schema());
         tools.push(read_tool_output_tool_schema());
         tools.push(team_status_tool_schema());
+        // Scout's policy allows metadata inspection but never extraction or
+        // transcoding. Keep those two read-only schemas aligned with policy.
+        if role.allows_tool(profile, "archive_list") {
+            tools.push(archive_list_tool_schema());
+        }
+        if role.allows_tool(profile, "media_info") {
+            tools.push(media_info_tool_schema());
+        }
         return tools;
     }
     tools.push(ToolSchema {
@@ -191,58 +263,18 @@ pub(super) fn tool_schemas(
             "required": ["artifact_id"]
         }),
     });
-    tools.push(ToolSchema {
-        name: "archive_list".to_string(),
-        description: "List a zip, tar, or tar.gz artifact with hard entry/size/ratio caps. Entry bytes are never extracted and the workspace is not touched.".to_string(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "artifact_id": {"type": "string"},
-                "max_entries": {"type": "integer", "minimum": 1, "maximum": 2000}
-            },
-            "required": ["artifact_id"]
-        }),
-    });
-    tools.push(ToolSchema {
-        name: "archive_extract".to_string(),
-        description: "Extract selected safe entries from a zip/tar/tar.gz artifact into daemon-owned scratch, then publish bounded content-addressed artifacts with source provenance. Unsafe entries are rejected; nothing is written into the worktree.".to_string(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "artifact_id": {"type": "string"},
-                "entries": {"type": "array", "items": {"type": "string"}, "maxItems": 2000},
-                "all": {"type": "boolean"},
-                "max_entries": {"type": "integer", "minimum": 1, "maximum": 2000},
-                "include_previews": {"type": "boolean"}
-            },
-            "required": ["artifact_id"]
-        }),
-    });
-    tools.push(ToolSchema {
-        name: "media_info".to_string(),
-        description: "Probe a media artifact or worktree file with ffprobe. Missing ffprobe returns MEDIA_TOOL_UNAVAILABLE; still images may fall back to explicitly labeled image metadata. No metadata is fabricated and no network is used.".to_string(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "artifact_id": {"type": "string"},
-                "path": {"type": "string", "description": "Worktree-relative media path when artifact_id is absent"}
-            }
-        }),
-    });
-    tools.push(ToolSchema {
-        name: "media_transcode".to_string(),
-        description: "Explicitly transcode a file-backed media artifact with ffmpeg into a bounded, duration/byte-capped content-addressed artifact. Requires the approval broker and ffmpeg; never writes a workspace file.".to_string(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "artifact_id": {"type": "string"},
-                "format": {"type": "string", "enum": ["mp4", "webm", "mp3", "wav", "png", "jpeg"]},
-                "max_duration_secs": {"type": "integer", "minimum": 1, "maximum": 600},
-                "max_bytes": {"type": "integer", "minimum": 1048576, "maximum": 268435456}
-            },
-            "required": ["artifact_id", "format"]
-        }),
-    });
+    if role.allows_tool(profile, "archive_list") {
+        tools.push(archive_list_tool_schema());
+    }
+    if role.allows_tool(profile, "archive_extract") {
+        tools.push(archive_extract_tool_schema());
+    }
+    if role.allows_tool(profile, "media_info") {
+        tools.push(media_info_tool_schema());
+    }
+    if role.allows_tool(profile, "media_transcode") {
+        tools.push(media_transcode_tool_schema());
+    }
     tools.extend(source_tool_schemas());
     tools.push(ToolSchema {
         name: "use_skill".to_string(),
