@@ -344,6 +344,49 @@ impl Store {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Bounded forecast read. Returns the newest `limit` calls in oldest-first
+    /// order so callers cannot accidentally load a long session's full ledger.
+    /// The hard ceiling matches the auto-budget policy bound.
+    pub fn list_recent_usage_entries(
+        &self,
+        session_id: &str,
+        limit: u32,
+    ) -> Result<Vec<UsageEntry>> {
+        let limit = limit.clamp(1, 1_000);
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, agent_id, agent_name, role, task_id, department,
+                    model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                    estimated, cost_usd, created_at
+             FROM usage_ledger
+             WHERE session_id = ?1
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![session_id, limit as i64], |row| {
+            Ok(UsageEntry {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                agent_id: row.get(2)?,
+                agent_name: row.get(3)?,
+                role: row.get(4)?,
+                task_id: row.get(5)?,
+                department: row.get(6)?,
+                model: row.get(7)?,
+                input_tokens: row.get::<_, i64>(8)? as u64,
+                output_tokens: row.get::<_, i64>(9)? as u64,
+                cache_read_tokens: row.get::<_, i64>(10)? as u64,
+                cache_write_tokens: row.get::<_, i64>(11)? as u64,
+                estimated: row.get::<_, i64>(12)? != 0,
+                cost_usd: row.get(13)?,
+                created_at: row.get(14)?,
+            })
+        })?;
+        let mut entries = rows.collect::<Result<Vec<_>, _>>()?;
+        entries.reverse();
+        Ok(entries)
+    }
+
     pub fn replace_usage_ledger(&self, session_id: &str, entries: &[UsageEntry]) -> Result<()> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;

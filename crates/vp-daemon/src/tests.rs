@@ -1641,4 +1641,285 @@ mod protocol_transport_tests {
         let store = Store::open(data.path()).unwrap();
         assert!(store.list_projects().unwrap().is_empty());
     }
+
+    async fn budget_call(
+        state: &AppState,
+        method: &str,
+        params: Value,
+    ) -> vp_protocol::rpc::RpcResponse {
+        dispatch(state, RpcRequest::new(json!(1), method, params)).await
+    }
+
+    #[tokio::test]
+    async fn session_budget_rpcs_round_trip_and_preserve_partial_updates() {
+        let (_data, _repo, state) = project_state().await;
+        let project = first_project_id(&state).await;
+        let session = state
+            .engine
+            .create_session(project.clone(), "budget rpc".into(), Some(1_000))
+            .await
+            .unwrap();
+
+        let response = budget_call(
+            &state,
+            "session.budget.get",
+            json!({"session_id": session.id}),
+        )
+        .await;
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let status = response.result.unwrap();
+        assert_eq!(status["mode"], "fixed");
+        assert_eq!(status["effective_token_budget"], 1_000);
+        assert_eq!(status["spent_tokens"], 0);
+        assert_eq!(status["forecast"]["source"], "unavailable");
+
+        // A synthetic forecast preview is read-only and bounded.
+        let response = budget_call(
+            &state,
+            "session.budget.forecast",
+            json!({"session_id": session.id}),
+        )
+        .await;
+        let forecast = response.result.unwrap();
+        assert_eq!(forecast["session_id"], session.id);
+        assert_eq!(forecast["forecast"]["sample_calls"], 0);
+
+        // Only the hard cap is supplied; the effective token budget must stay.
+        let response = budget_call(
+            &state,
+            "session.budget.set",
+            json!({"session_id": session.id, "hard_token_cap": 5_000}),
+        )
+        .await;
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let budget = response.result.unwrap()["budget"].clone();
+        assert_eq!(budget["mode"], "fixed");
+        assert_eq!(budget["effective_token_budget"], 1_000);
+        assert_eq!(budget["hard_token_cap"], 5_000);
+
+        // Switching to auto keeps the existing hard cap and effective budget.
+        let response = budget_call(
+            &state,
+            "session.budget.set",
+            json!({"session_id": session.id, "mode": "auto"}),
+        )
+        .await;
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let budget = response.result.unwrap()["budget"].clone();
+        assert_eq!(budget["mode"], "auto");
+        assert_eq!(budget["hard_token_cap"], 5_000);
+        assert_eq!(budget["effective_token_budget"], 1_000);
+
+        // A later effective-budget update must not clear the auto cap or mode.
+        let response = budget_call(
+            &state,
+            "session.budget.set",
+            json!({"session_id": session.id, "token_budget": 2_000}),
+        )
+        .await;
+        let budget = response.result.unwrap()["budget"].clone();
+        assert_eq!(budget["mode"], "auto");
+        assert_eq!(budget["hard_token_cap"], 5_000);
+        assert_eq!(budget["effective_token_budget"], 2_000);
+
+        let response = budget_call(
+            &state,
+            "project.auto_budget.get",
+            json!({"project_id": project}),
+        )
+        .await;
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let policy = response.result.unwrap();
+        assert_eq!(policy["policy"]["enabled"], false);
+        assert!(policy["updated_at"].is_null());
+
+        let response = budget_call(
+            &state,
+            "project.auto_budget.set",
+            json!({
+                "project_id": project,
+                "policy": {"enabled": true, "extend_ratio": 2.0},
+            }),
+        )
+        .await;
+        let error = response.error.expect("invalid ratio must fail");
+        assert_eq!(error.code, codes::INVALID_PARAMS);
+        let data = error.data.expect("typed policy code");
+        assert_eq!(data["code"], "INVALID_AUTO_BUDGET_POLICY");
+
+        let response = budget_call(
+            &state,
+            "project.auto_budget.set",
+            json!({
+                "project_id": project,
+                "policy": {"enabled": true, "hard_cost_cap_usd": 5.0, "min_runway_turns": 2},
+            }),
+        )
+        .await;
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let policy = response.result.unwrap();
+        assert_eq!(policy["policy"]["enabled"], true);
+        assert_eq!(policy["policy"]["hard_cost_cap_usd"], 5.0);
+        assert_eq!(policy["policy"]["min_runway_turns"], 2);
+        assert!(policy["updated_at"].is_string());
+    }
+
+    #[tokio::test]
+    async fn session_budget_set_keeps_legacy_unlimited_requests_working() {
+        let (_data, _repo, state) = project_state().await;
+        let project = first_project_id(&state).await;
+        let session = state
+            .engine
+            .create_session(project, "legacy unlimited".into(), Some(1_000))
+            .await
+            .unwrap();
+
+        let response = budget_call(
+            &state,
+            "session.budget.set",
+            json!({"session_id": session.id, "unlimited": true}),
+        )
+        .await;
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let budget = response.result.unwrap()["budget"].clone();
+        assert_eq!(budget["mode"], "unlimited");
+        assert_eq!(budget["unlimited"], true);
+        // Effective limits stay recorded for a later restore.
+        assert_eq!(budget["effective_token_budget"], 1_000);
+
+        let response = budget_call(
+            &state,
+            "session.budget.set",
+            json!({"session_id": session.id, "unlimited": false}),
+        )
+        .await;
+        let budget = response.result.unwrap()["budget"].clone();
+        assert_eq!(budget["mode"], "fixed");
+        assert_eq!(budget["unlimited"], false);
+    }
+
+    #[tokio::test]
+    async fn auto_budget_set_without_a_cap_fails_with_a_typed_error() {
+        let (_data, _repo, state) = project_state().await;
+        let project = first_project_id(&state).await;
+        let session = state
+            .engine
+            .create_session(project, "auto no cap".into(), Some(1_000))
+            .await
+            .unwrap();
+
+        let response = budget_call(
+            &state,
+            "session.budget.set",
+            json!({"session_id": session.id, "mode": "auto"}),
+        )
+        .await;
+        let error = response.error.expect("auto without a cap must fail");
+        assert_eq!(error.code, codes::INVALID_PARAMS);
+        let data = error.data.expect("typed auto-budget code");
+        assert_eq!(data["code"], "AUTO_BUDGET_CAP_REQUIRED");
+        assert_eq!(data["retryable"], false);
+    }
+
+    #[tokio::test]
+    async fn session_create_auto_without_a_cap_fails_before_any_session_exists() {
+        let (_data, _repo, state) = project_state().await;
+        let project = first_project_id(&state).await;
+        let response = budget_call(
+            &state,
+            "session.create",
+            json!({
+                "project_id": project,
+                "goal": "auto without a cap",
+                "budget_mode": "auto",
+            }),
+        )
+        .await;
+        let error = response.error.expect("auto creation must fail closed");
+        assert_eq!(error.code, codes::INVALID_PARAMS);
+        let data = error.data.expect("typed auto-budget code");
+        assert_eq!(data["code"], "AUTO_BUDGET_POLICY_REQUIRED");
+        assert!(
+            state
+                .engine
+                .list_sessions(Some(project))
+                .await
+                .unwrap()
+                .is_empty(),
+            "a rejected auto creation must not leave a session or worktree"
+        );
+    }
+
+    #[tokio::test]
+    async fn imported_sessions_and_missing_projects_keep_typed_budget_errors() {
+        let (_data, _repo, app) = project_state().await;
+        let project = first_project_id(&app).await;
+        let session = app
+            .engine
+            .create_session(project, "imported budget".into(), Some(1_000))
+            .await
+            .unwrap();
+        let bundle = app.engine.export_session(&session.id).await.unwrap();
+        let imported_data = TempDir::new().unwrap();
+        let imported_engine = Engine::new(Store::open(imported_data.path()).unwrap());
+        imported_engine.import_session(bundle).await.unwrap();
+        let imported_state = state(
+            &imported_data,
+            imported_engine.clone(),
+            AgentService::unconfigured(imported_engine.clone()),
+        );
+        let response = budget_call(
+            &imported_state,
+            "session.budget.set",
+            json!({"session_id": session.id, "mode": "fixed"}),
+        )
+        .await;
+        let error = response.error.expect("imported session must be read-only");
+        assert_eq!(error.code, codes::CONFLICT);
+        assert_eq!(
+            error.data.expect("typed read-only code")["code"],
+            "SESSION_IMPORTED_READONLY"
+        );
+
+        let response = budget_call(
+            &app,
+            "project.auto_budget.get",
+            json!({"project_id": "prj-missing"}),
+        )
+        .await;
+        let error = response.error.expect("missing project must fail");
+        assert_eq!(error.code, codes::NOT_FOUND);
+        assert_eq!(
+            error.data.expect("typed project code")["code"],
+            "PROJECT_NOT_FOUND"
+        );
+    }
+
+    #[test]
+    fn budget_validation_errors_map_to_typed_invalid_params() {
+        let error: anyhow::Error = vp_protocol::types::BudgetValidationError::new(
+            vp_protocol::types::auto_budget_codes::BUDGET_BELOW_SPENT,
+            "token budget 10 is below tokens already spent (20)",
+        )
+        .into();
+        let response = crate::errors::budget_error(Some(json!(1)), error);
+        let error = response.error.expect("typed budget error");
+        assert_eq!(error.code, codes::INVALID_PARAMS);
+        let data = error.data.expect("typed data");
+        assert_eq!(data["code"], "BUDGET_BELOW_SPENT");
+        assert_eq!(data["retryable"], false);
+
+        // A store path that stringifies a policy validation keeps the stable
+        // policy code instead of degrading to INTERNAL_ERROR.
+        let response = crate::errors::budget_error(
+            Some(json!(2)),
+            anyhow::anyhow!("invalid auto-budget policy: extend_ratio must be in (0, 1]"),
+        );
+        let error = response.error.expect("typed policy error");
+        assert_eq!(error.code, codes::INVALID_PARAMS);
+        assert_eq!(
+            error.data.expect("typed data")["code"],
+            "INVALID_AUTO_BUDGET_POLICY"
+        );
+    }
 }

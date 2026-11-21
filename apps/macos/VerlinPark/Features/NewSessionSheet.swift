@@ -4,11 +4,10 @@ struct NewSessionSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @State private var goal = ""
-    @State private var budget = 200_000
     @State private var priority = 0
-    @State private var costBudget = ""
-    @State private var timeBudget = ""
-    @State private var unlimited = false
+    @State private var budgetDraft = SessionBudgetPresetDraft()
+    @State private var budgetTouched = false
+    @State private var budgetError: BudgetValidationIssue?
     @FocusState private var goalFocused: Bool
 
     var body: some View {
@@ -34,9 +33,20 @@ struct NewSessionSheet: View {
         .background { VPCrystalBackdrop() }
         .tint(VPTheme.accent)
         .onAppear {
-            budget = model.defaultTokenBudget
-            unlimited = model.defaultUnlimitedBudget
+            budgetDraft = SessionBudgetPresetDraft(
+                projectPolicy: model.projectAutoBudgetPolicy,
+                defaultTokenBudget: model.defaultTokenBudget
+            )
             goalFocused = true
+        }
+        .task {
+            await model.loadProjectAutoBudgetPolicy()
+            if !budgetTouched {
+                budgetDraft.applyProjectDefaults(model.projectAutoBudgetPolicy)
+            }
+        }
+        .onChange(of: budgetDraft) { _, _ in
+            budgetError = nil
         }
     }
 
@@ -142,74 +152,235 @@ struct NewSessionSheet: View {
 
     // MARK: Budgets
 
-    private var budgetSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                sectionLabel(
-                    "Run budgets",
-                    detail: "Checked at turn and tool boundaries."
-                )
-                Spacer()
-                Toggle(L10n.t("Unlimited budget"), isOn: $unlimited)
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-            }
-            HStack(alignment: .top, spacing: 10) {
-                budgetCard(
-                    icon: "number",
-                    title: "Tokens",
-                    hint: "Input + output ceiling."
-                ) {
-                    TextField("200000", value: $budget, format: .number)
-                        .textFieldStyle(.plain)
-                        .font(VPTheme.mono(11))
-                        .disabled(unlimited)
-                }
-                budgetCard(
-                    icon: "dollarsign.circle",
-                    title: "USD",
-                    hint: "Needs role prices."
-                ) {
-                    TextField("optional", text: $costBudget)
-                        .textFieldStyle(.plain)
-                        .font(VPTheme.mono(11))
-                        .disabled(unlimited)
-                }
-                budgetCard(
-                    icon: "clock",
-                    title: "Wall clock",
-                    hint: "Seconds per run."
-                ) {
-                    TextField("optional", text: $timeBudget)
-                        .textFieldStyle(.plain)
-                        .font(VPTheme.mono(11))
-                        .disabled(unlimited)
-                }
-            }
-            .opacity(unlimited ? 0.45 : 1)
+    private var budgetValidation: BudgetValidationIssue? {
+        budgetDraft.validation(basePolicy: model.projectAutoBudgetPolicy)
+    }
 
-            if unlimited {
+    private var budgetSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            sectionLabel(
+                "Budget preset",
+                detail: "One decision. Auto is recommended for long tasks."
+            )
+
+            VPSegmentedControl(
+                segments: [
+                    VPSegment(.auto, title: "Auto (recommended)", icon: "wand.and.stars"),
+                    VPSegment(.fixed, title: "Fixed", icon: "slider.horizontal.3"),
+                    VPSegment(.unlimited, title: "Unlimited", icon: "infinity"),
+                ],
+                selection: Binding(
+                    get: { budgetDraft.preset },
+                    set: { value in
+                        budgetDraft.preset = value
+                        budgetTouched = true
+                    }
+                )
+            )
+
+            switch budgetDraft.preset {
+            case .auto:
+                autoBudgetFields
+            case .fixed:
+                fixedBudgetFields
+            case .unlimited:
+                unlimitedBudgetNote
+            default:
+                unknownBudgetNote
+            }
+
+            if let issue = budgetValidation ?? budgetError {
                 HStack(alignment: .top, spacing: 7) {
-                    Image(systemName: "infinity.circle.fill")
-                        .foregroundStyle(VPTheme.accent)
-                    Text(
-                        L10n.t(
-                            "Unlimited ignores session, plan-task, department, and project budget gates. Capacity, approvals, verification, context compaction, and turn limits still apply."
-                        )
-                    )
-                    .font(VPTheme.mono(8))
-                    .foregroundStyle(VPTheme.textSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(VPTheme.warning)
+                    Text(issue.displayText)
+                        .font(VPTheme.mono(8))
+                        .foregroundStyle(VPTheme.warning)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 .padding(9)
-                .background(VPTheme.accent.opacity(0.07), in: RoundedRectangle(cornerRadius: 9))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(VPTheme.warning.opacity(0.08), in: RoundedRectangle(cornerRadius: 9))
                 .overlay {
                     RoundedRectangle(cornerRadius: 9)
-                        .strokeBorder(VPTheme.accent.opacity(0.18), lineWidth: 1)
+                        .strokeBorder(VPTheme.warning.opacity(0.22), lineWidth: 1)
                 }
             }
         }
         .vpAppear(index: 2)
+    }
+
+    private var autoBudgetFields: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(alignment: .top, spacing: 10) {
+                budgetCard(
+                    icon: budgetDraft.capKind == .usd ? "dollarsign.circle" : "number",
+                    title: budgetDraft.capKind == .usd ? "Maximum USD" : "Maximum tokens",
+                    hint: "The runtime may extend only up to this cap."
+                ) {
+                    TextField(
+                        budgetDraft.capKind == .usd ? "e.g. 25" : "e.g. 500000",
+                        text: Binding(
+                            get: { budgetDraft.autoCapText },
+                            set: { value in
+                                budgetDraft.autoCapText = value
+                                budgetTouched = true
+                            }
+                        )
+                    )
+                    .textFieldStyle(.plain)
+                    .font(VPTheme.mono(11))
+                }
+                budgetCard(
+                    icon: "clock",
+                    title: "Max wall clock",
+                    hint: "Optional. Blank keeps the project default."
+                ) {
+                    TextField(
+                        "optional seconds",
+                        text: Binding(
+                            get: { budgetDraft.autoWallClockText },
+                            set: { value in
+                                budgetDraft.autoWallClockText = value
+                                budgetTouched = true
+                            }
+                        )
+                    )
+                    .textFieldStyle(.plain)
+                    .font(VPTheme.mono(11))
+                }
+            }
+
+            VPSegmentedControl(
+                segments: [
+                    VPSegment(BudgetAutoCapKind.usd, title: "Cap in USD", icon: "dollarsign"),
+                    VPSegment(
+                        BudgetAutoCapKind.tokens,
+                        title: "Cap in tokens",
+                        icon: "number"
+                    ),
+                ],
+                selection: Binding(
+                    get: { budgetDraft.capKind },
+                    set: { value in
+                        if value != budgetDraft.capKind {
+                            budgetDraft.autoCapText = ""
+                        }
+                        budgetDraft.capKind = value
+                        budgetTouched = true
+                    }
+                ),
+                compact: true
+            )
+
+            Text("USD caps require configured role prices; token caps always apply.")
+                .font(VPTheme.mono(7.5))
+                .foregroundStyle(VPTheme.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Text(
+                "Auto starts within the project's initial budget and extends deterministically up to this hard cap. It never changes the model/provider, approvals, sandbox, Verifier, or merge policy."
+            )
+            .font(VPTheme.mono(8))
+            .foregroundStyle(VPTheme.textSecondary)
+            .fixedSize(horizontal: false, vertical: true)
+
+            if let projectCap = inheritedAutoCapNote {
+                Text(projectCap)
+                    .font(VPTheme.mono(7.5))
+                    .foregroundStyle(VPTheme.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if !model.projectAutoBudgetPolicy.enabled {
+                Text(
+                    "Project Auto Budget defaults are off. This session can still use Auto with the explicit cap above."
+                )
+                .font(VPTheme.mono(7.5))
+                .foregroundStyle(VPTheme.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var fixedBudgetFields: some View {
+        HStack(alignment: .top, spacing: 10) {
+            budgetCard(
+                icon: "number",
+                title: "Tokens",
+                hint: "Input + output ceiling."
+            ) {
+                TextField("200000", text: $budgetDraft.fixedTokenText)
+                    .textFieldStyle(.plain)
+                    .font(VPTheme.mono(11))
+            }
+            budgetCard(
+                icon: "dollarsign.circle",
+                title: "USD",
+                hint: "Needs role prices."
+            ) {
+                TextField("optional", text: $budgetDraft.fixedCostText)
+                    .textFieldStyle(.plain)
+                    .font(VPTheme.mono(11))
+            }
+            budgetCard(
+                icon: "clock",
+                title: "Wall clock",
+                hint: "Seconds per run."
+            ) {
+                TextField("optional", text: $budgetDraft.fixedTimeText)
+                    .textFieldStyle(.plain)
+                    .font(VPTheme.mono(11))
+            }
+        }
+    }
+
+    private var unlimitedBudgetNote: some View {
+        HStack(alignment: .top, spacing: 7) {
+            Image(systemName: "infinity.circle.fill")
+                .foregroundStyle(VPTheme.accent)
+            Text(
+                L10n.t(
+                    "Unlimited ignores session, plan-task, department, and project budget gates. Capacity, approvals, verification, context compaction, and turn limits still apply. It is only used when you select it here."
+                )
+            )
+            .font(VPTheme.mono(8))
+            .foregroundStyle(VPTheme.textSecondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(9)
+        .background(VPTheme.accent.opacity(0.07), in: RoundedRectangle(cornerRadius: 9))
+        .overlay {
+            RoundedRectangle(cornerRadius: 9)
+                .strokeBorder(VPTheme.accent.opacity(0.18), lineWidth: 1)
+        }
+    }
+
+    private var unknownBudgetNote: some View {
+        HStack(alignment: .top, spacing: 7) {
+            Image(systemName: "questionmark.circle")
+                .foregroundStyle(VPTheme.warning)
+            Text(
+                "This daemon reported an unknown budget mode. Choose Auto, Fixed, or Unlimited explicitly."
+            )
+            .font(VPTheme.mono(8))
+            .foregroundStyle(VPTheme.textSecondary)
+        }
+        .padding(9)
+        .background(VPTheme.warning.opacity(0.08), in: RoundedRectangle(cornerRadius: 9))
+    }
+
+    private var inheritedAutoCapNote: String? {
+        let policy = model.projectAutoBudgetPolicy
+        var parts: [String] = []
+        if budgetDraft.capKind != .usd, let cap = policy.hardCostCapUSD {
+            parts.append("USD \(BudgetFormatting.money(cap))")
+        }
+        if budgetDraft.capKind != .tokens, let cap = policy.hardTokenCap {
+            parts.append("\(BudgetFormatting.tokens(cap)) tokens")
+        }
+        if parts.isEmpty { return nil }
+        return "Other project hard caps still apply: " + parts.joined(separator: " · ") + "."
     }
 
     private func budgetCard(
@@ -268,13 +439,24 @@ struct NewSessionSheet: View {
 
             Button {
                 Task {
+                    let arguments: SessionCreateBudgetArguments
+                    do {
+                        arguments = try budgetDraft.arguments(
+                            basePolicy: model.projectAutoBudgetPolicy
+                        )
+                    } catch {
+                        budgetError = BudgetValidationIssue.from(error)
+                        return
+                    }
                     let created = await model.createSession(
                         goal: goal,
-                        tokenBudget: unlimited ? nil : budget,
-                        costBudgetUSD: unlimited ? nil : Double(costBudget),
-                        timeBudgetSecs: unlimited ? nil : Int(timeBudget),
+                        tokenBudget: arguments.tokenBudget.flatMap { Int(exactly: $0) },
+                        costBudgetUSD: arguments.costBudgetUSD,
+                        timeBudgetSecs: arguments.timeBudgetSecs.flatMap { Int(exactly: $0) },
                         priority: priority,
-                        unlimited: unlimited
+                        unlimited: arguments.unlimited,
+                        budgetMode: arguments.mode,
+                        autoBudget: arguments.autoPolicy
                     )
                     if created {
                         dismiss()
@@ -307,6 +489,7 @@ struct NewSessionSheet: View {
     private var isCreateDisabled: Bool {
         model.isBusy ||
             goal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
-            model.selectedProject == nil
+            model.selectedProject == nil ||
+            budgetValidation != nil
     }
 }

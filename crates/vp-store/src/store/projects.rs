@@ -194,6 +194,9 @@ impl Store {
                 context_checkpoint_policy: self.get_context_checkpoint_policy(&project.id)?,
                 process_policy: self.get_process_policy(&project.id)?,
                 preemption_policy: self.get_preemption_policy(&project.id)?,
+                auto_budget_policy: self.get_project_auto_budget_policy(&project.id)?,
+                project_auto_budget_events: self
+                    .list_project_auto_budget_events(&project.id, None)?,
                 budget: self.get_project_budget(&project.id)?,
                 task_scheduler_policy: self.get_task_scheduler_policy(&project.id)?,
                 scaling_policy: self.get_scaling_policy(&project.id)?,

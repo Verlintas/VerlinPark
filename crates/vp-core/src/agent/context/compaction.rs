@@ -231,11 +231,11 @@ pub(in crate::agent) async fn run_compaction_summary(
         tools: Vec::new(),
     };
     let reservation = budget
-        .limit
+        .token_limit()
         .is_some()
         .then(|| budget.reserve_tokens(estimate_request_tokens(&request).saturating_add(1024)))
         .flatten();
-    if !(budget.is_unlimited() || budget.limit.is_none() || reservation.is_some()) {
+    if !(budget.is_unlimited() || budget.token_limit().is_none() || reservation.is_some()) {
         return Ok(None);
     }
     let outcome = collect_compaction_completion(

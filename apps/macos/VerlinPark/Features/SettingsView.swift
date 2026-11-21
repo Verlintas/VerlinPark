@@ -330,6 +330,11 @@ struct GeneralSettingsView: View {
                 }
 
                 VStack(alignment: .leading, spacing: 9) {
+                    SectionLabel(title: L10n.t("Automation"))
+                    AutoBudgetSettingsCard()
+                }
+
+                VStack(alignment: .leading, spacing: 9) {
                     SectionLabel(title: L10n.t("Appearance"))
                     HStack(spacing: 10) {
                         ZStack {
@@ -563,6 +568,7 @@ struct GeneralSettingsView: View {
         .task {
             await model.loadApprovalGrants()
             await model.loadForgeStatus()
+            await model.loadProjectAutoBudgetPolicy()
         }
         .sheet(isPresented: $showSetupWizard) {
             SetupWizardView {
@@ -1080,7 +1086,6 @@ struct ResidentSettingsView: View {
 struct ProvidersSettingsView: View {
     @Environment(AppModel.self) private var model
     @AppStorage("verlinpark.session.tokenBudget") private var tokenBudget = 200_000
-    @AppStorage("verlinpark.session.unlimitedBudget") private var unlimitedBudget = false
     @State private var showingModelPresets = false
     @State private var selectedPreset = "auto"
     @State private var showAdvanced = false
@@ -1475,16 +1480,11 @@ struct ProvidersSettingsView: View {
                 }
 
                 Section("Session defaults") {
-                    Toggle(L10n.t("Unlimited budget for new sessions"), isOn: $unlimitedBudget)
-                    TextField("Token budget", value: $tokenBudget, format: .number)
+                    TextField("Fixed preset token budget", value: $tokenBudget, format: .number)
                         .textFieldStyle(.plain).vpFrostedField()
                         .frame(width: 160)
-                        .disabled(unlimitedBudget)
-                        .opacity(unlimitedBudget ? 0.45 : 1)
                     Text(
-                        unlimitedBudget
-                            ? "New sessions bypass session, plan-task, department, and project economic budget gates. Capacity, approvals, verification, context, and turn limits still apply. You can toggle the mode per session from the Stage menu."
-                            : "Input + output token budget for new sessions. Existing sessions keep their own budget. Provider calls reserve before they start and settle from reported usage, so the cap holds across concurrent batches."
+                        "New sessions open with the Auto preset and need one explicit hard cap. The Fixed preset uses this token budget. Unlimited is never selected automatically; choose it explicitly in the New Session sheet or Stage menu."
                     )
                     .font(.caption)
                     .foregroundStyle(.secondary)

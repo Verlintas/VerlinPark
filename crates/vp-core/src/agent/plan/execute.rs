@@ -223,7 +223,7 @@ pub(in crate::agent) async fn execute_team_plan(
             return Ok(PlanRunResult::BudgetExceeded(BudgetStop::session(budget)));
         }
         let governor_budget = GovernorBudgetView::new(
-            budget.limit,
+            budget.token_limit(),
             budget.spent(),
             engine.budget_registry().reserved_for_session(&session.id),
         );

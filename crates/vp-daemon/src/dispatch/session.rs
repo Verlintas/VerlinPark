@@ -54,12 +54,14 @@ pub(super) async fn handle(
             Ok(params) => {
                 let created = state
                     .engine
-                    .create_session_with_options_and_unlimited(
+                    .create_session_with_budget_options(
                         params.project_id,
                         params.goal.clone(),
                         params.token_budget,
                         params.cost_budget_usd,
                         params.time_budget_secs,
+                        params.budget_mode,
+                        params.auto_budget,
                         params.priority.unwrap_or(0),
                         params.unlimited,
                     )
@@ -89,9 +91,36 @@ pub(super) async fn handle(
                         }
                         RpcResponse::success(id, session)
                     }
-                    Err(error) => validation_or_internal(id, error),
+                    Err(error) => budget_error(id, error),
                 }
             }
+            Err(response) => response_with_id(id, response),
+        },
+        "session.budget.get" => match parse_params::<SessionBudgetParams>(request.params) {
+            Ok(params) => match state.engine.session_budget(&params.session_id).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => budget_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "session.budget.forecast" => {
+            match parse_params::<SessionBudgetForecastParams>(request.params) {
+                Ok(params) => match state
+                    .engine
+                    .session_budget_forecast(&params.session_id)
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => budget_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "session.budget.set" => match parse_params::<SetSessionBudgetParams>(request.params) {
+            Ok(params) => match state.engine.set_session_budget(params).await {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => budget_error(id, error),
+            },
             Err(response) => response_with_id(id, response),
         },
         "session.processes" => match parse_params::<ProcessListParams>(request.params) {
@@ -143,17 +172,6 @@ pub(super) async fn handle(
             Ok(params) => match state
                 .engine
                 .session_process_restart(&params.session_id, &params.process_id, params.confirm)
-                .await
-            {
-                Ok(result) => RpcResponse::success(id, result),
-                Err(error) => internal_error(id, error),
-            },
-            Err(response) => response_with_id(id, response),
-        },
-        "session.budget.set" => match parse_params::<SetSessionUnlimitedParams>(request.params) {
-            Ok(params) => match state
-                .engine
-                .set_session_unlimited(&params.session_id, params.unlimited)
                 .await
             {
                 Ok(result) => RpcResponse::success(id, result),

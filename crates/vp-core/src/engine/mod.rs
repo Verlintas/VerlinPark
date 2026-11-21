@@ -9,6 +9,7 @@ use super::*;
 pub(crate) mod agents;
 pub(crate) mod approvals;
 pub(crate) mod artifacts;
+pub(crate) mod auto_budget;
 pub(crate) mod checkpoints;
 pub(crate) mod collaboration;
 pub(crate) mod effects;

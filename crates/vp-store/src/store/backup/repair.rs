@@ -30,6 +30,27 @@ impl Store {
         if changed == 0 {
             return Err(anyhow!("session not found: {session_id}"));
         }
+        if let Some(token_budget) = repair.token_budget {
+            tx.execute(
+                "UPDATE sessions SET token_budget = ?1 WHERE id = ?2",
+                params![token_budget, session_id],
+            )?;
+        }
+        if let Some(cost_budget_usd) = repair.cost_budget_usd {
+            tx.execute(
+                "UPDATE sessions SET cost_budget_usd = ?1 WHERE id = ?2",
+                params![cost_budget_usd, session_id],
+            )?;
+        }
+        if let Some(time_budget_secs) = repair.time_budget_secs {
+            tx.execute(
+                "UPDATE sessions SET time_budget_secs = ?1 WHERE id = ?2",
+                params![time_budget_secs, session_id],
+            )?;
+        }
+        if let Some(auto_budget) = &repair.auto_budget {
+            crate::store::auto_budget::insert_session_auto_budget_tx(&tx, auto_budget)?;
+        }
         if repair.replace_plan {
             tx.execute(
                 "UPDATE sessions SET team_plan = ?1 WHERE id = ?2",

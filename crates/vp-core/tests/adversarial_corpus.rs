@@ -40,12 +40,13 @@ use vp_core::script::{
     ScriptResult, WRITE_TOOLS, bindings, classify_error, spawn, validate_source,
 };
 use vp_core::tool_bundle::{
-    BUNDLE_TOOL_CATALOG, CODING_TOOL_LIMIT, LEADER_TOOL_LIMIT, LEADER_TOOLS, MAX_BUNDLE_MCP_TOOLS,
+    BUNDLE_TOOL_CATALOG, CODING_TOOL_LIMIT, LEADER_ORCHESTRATOR_TOOL_LIMIT,
+    LEADER_ORCHESTRATOR_TOOLS, LEADER_TOOL_LIMIT, LEADER_TOOLS, MAX_BUNDLE_MCP_TOOLS,
     MINIMAL_TOOL_LIMIT, MINIMAL_TOOLS, ROLE_LEADER, ROLE_MANAGER, ROLE_SCOUT, ROLE_VERIFIER,
     ROLE_WORKER, ToolBundleKind, bundle_contract_hash, bundle_hash, bundle_tool_names,
     bundle_tool_specs, canonical_tool_json, canonical_tools_hash, canonical_tools_json,
-    catalog_entries, catalog_entry, definition, freeze, select_bundle, task_kind_bundle,
-    tool_schema_hash,
+    catalog_entries, catalog_entry, definition, freeze, select_bundle, select_bundle_with_mode,
+    task_kind_bundle, tool_schema_hash,
 };
 use vp_core::tooling::errors::{
     MAX_FAILURE_ACTION_CHARS, MAX_FAILURE_EVIDENCE_CHARS, MAX_FAILURE_HINT_CHARS,
@@ -2393,24 +2394,40 @@ fn bundle_selection_role_matrix() {
             "worker",
             "coding",
             Some("mystery"),
-            ToolBundleKind::Full,
-            "task_kind_unknown_full",
+            ToolBundleKind::Coding,
+            "task_kind_unknown_role_default",
+            true,
+        ),
+        (
+            "worker",
+            "research",
+            Some("mystery"),
+            ToolBundleKind::Research,
+            "task_kind_unknown_role_default",
+            true,
+        ),
+        (
+            "worker",
+            "generic",
+            Some("mystery"),
+            ToolBundleKind::Minimal,
+            "task_kind_unknown_role_default",
             true,
         ),
         (
             "worker",
             "coding",
             None,
-            ToolBundleKind::Full,
-            "no_task_kind_full",
+            ToolBundleKind::Coding,
+            "no_task_kind_role_default",
             true,
         ),
         (
             "worker",
             "coding",
             Some("   "),
-            ToolBundleKind::Full,
-            "no_task_kind_full",
+            ToolBundleKind::Coding,
+            "no_task_kind_role_default",
             true,
         ),
         (
@@ -2473,6 +2490,8 @@ fn task_kind_mapping_table() {
 fn bundle_name_matrix_prunes_read_only_roles() {
     let cases = [
         (ToolBundleKind::Leader, ROLE_LEADER, "generic"),
+        (ToolBundleKind::LeaderOrchestrator, ROLE_LEADER, "generic"),
+        (ToolBundleKind::LeaderOrchestrator, ROLE_MANAGER, "coding"),
         (ToolBundleKind::Leader, ROLE_MANAGER, "coding"),
         (ToolBundleKind::Coding, ROLE_WORKER, "coding"),
         (ToolBundleKind::Coding, "labour", "coding"),
@@ -2776,12 +2795,16 @@ fn freeze_full_bundle_warns_for_read_only_roles() {
 #[test]
 fn bundle_catalog_entries_and_hashes_are_stable() {
     let entries = catalog_entries();
-    assert_eq!(entries.len(), 6);
+    assert_eq!(entries.len(), 7);
     let by_kind = entries
         .iter()
         .map(|entry| (entry.kind, entry.requested_count))
         .collect::<BTreeMap<_, _>>();
     assert_eq!(by_kind[&ToolBundleKind::Leader], LEADER_TOOLS.len());
+    assert_eq!(
+        by_kind[&ToolBundleKind::LeaderOrchestrator],
+        LEADER_ORCHESTRATOR_TOOLS.len()
+    );
     assert_eq!(by_kind[&ToolBundleKind::Coding], 39);
     assert_eq!(by_kind[&ToolBundleKind::Research], 34);
     assert_eq!(by_kind[&ToolBundleKind::Verification], 38);
@@ -2795,6 +2818,10 @@ fn bundle_catalog_entries_and_hashes_are_stable() {
     }
     assert_eq!(definition(ToolBundleKind::Full).kind, ToolBundleKind::Full);
     assert_eq!(definition(ToolBundleKind::Leader).target_limit, Some(51));
+    assert_eq!(
+        definition(ToolBundleKind::LeaderOrchestrator).target_limit,
+        Some(LEADER_ORCHESTRATOR_TOOL_LIMIT)
+    );
     assert_eq!(definition(ToolBundleKind::Coding).target_limit, Some(40));
     assert_eq!(definition(ToolBundleKind::Minimal).target_limit, Some(12));
     assert_eq!(definition(ToolBundleKind::Research).target_limit, None);
@@ -2812,6 +2839,17 @@ fn bundle_catalog_entries_and_hashes_are_stable() {
         bundle_contract_hash(&manager)
     );
     assert_ne!(bundle_hash(&leader, &[]), bundle_hash(&manager, &[]));
+    let orchestrator = select_bundle_with_mode(
+        ROLE_LEADER,
+        "generic",
+        None,
+        vp_core::tool_bundle::ToolBundleMode::LeaderOrchestrator,
+    );
+    assert_ne!(
+        bundle_contract_hash(&leader),
+        bundle_contract_hash(&orchestrator),
+        "orchestrator mode must have a distinct runtime pin identity"
+    );
     let coding = select_bundle(ROLE_WORKER, "coding", Some("implementation"));
     assert_ne!(bundle_contract_hash(&leader), bundle_contract_hash(&coding));
     assert!(BUNDLE_TOOL_CATALOG.len() >= 60);

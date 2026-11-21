@@ -30,6 +30,7 @@ pub(super) async fn execute_tool_calls(
     tool_context: &ToolContext,
     plan_budget: &PlanBudgetScope,
     frozen_bundle: &crate::tool_bundle::FrozenToolBundle,
+    surface: ToolSurface,
     tools: &[ToolSchema],
 ) -> Result<Option<LoopOutcome>> {
     // Capture every serial call id before the iterator consumes the list.
@@ -387,6 +388,7 @@ pub(super) async fn execute_tool_calls(
                 journal,
                 &input,
                 tools,
+                surface,
                 &call_id,
                 turn + 1,
                 run_contract.as_ref(),
@@ -699,6 +701,7 @@ pub(super) async fn execute_tool_calls(
                 spec,
                 &session.project_id,
                 frozen_bundle,
+                surface,
                 input.clone(),
             )
             .await

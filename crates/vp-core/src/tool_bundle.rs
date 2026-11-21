@@ -12,6 +12,23 @@
 //! role policy can be recovered through `tool_search` and executed manually.
 //! That keeps the reduction safe while preventing per-turn schema churn.
 //!
+//! Two additional controls are opt-in and never change the historical default:
+//!
+//! - [`ToolCapabilities`] gates conditional surfaces (`mcp`, `remote_*`,
+//!   archive/media, GUI helpers, web search, LSP, file-backed artifact
+//!   publishing). The runtime passes the probed flags to
+//!   `agent::schemas::tool_schemas_with_capabilities`; the legacy
+//!   `tool_schemas` builder uses the permissive default so unrelated callers
+//!   keep identical bytes.
+//! - [`ToolBundleMode::LeaderOrchestrator`] selects the read-only Leader
+//!   orchestration partition ([`LEADER_ORCHESTRATOR_TOOLS`]). The default
+//!   [`select_bundle`] path still returns the existing `Leader` partition
+//!   until the runtime opts in through [`select_bundle_with_mode`].
+//!
+//! Capability flags and the orchestrator mode affect **advertisement only**.
+//! They never widen role policy, approvals, sandboxing, write scope, Verifier
+//! or merge rules, and they never route a model.
+//!
 //! Canonicalization rules:
 //!
 //! - tools are sorted by name;
@@ -37,6 +54,10 @@ pub const TOOL_BUNDLE_VERSION: u32 = 1;
 
 /// Default Leader cap, down from the previous role-wide list (72 tools).
 pub const LEADER_TOOL_LIMIT: usize = 51;
+/// Target cap for the opt-in read-only Leader orchestration surface. It is
+/// intentionally below [`LEADER_TOOL_LIMIT`]: an orchestrator plans, inspects,
+/// delegates, reviews, and coordinates, but never writes the workspace.
+pub const LEADER_ORCHESTRATOR_TOOL_LIMIT: usize = 44;
 /// Default coding Worker/Labour cap, down from the previous list (64 tools).
 pub const CODING_TOOL_LIMIT: usize = 40;
 /// Minimal cap for a trivial one-file task.
@@ -60,12 +81,294 @@ pub const PROFILE_RESEARCH: &str = "research";
 pub const PROFILE_VERIFICATION: &str = "verification";
 pub const PROFILE_GENERIC: &str = "generic";
 
-/// A named tool partition. `Full` is the backward-compatible fallback and is
-/// not intended for the default path.
+/// One optional runtime capability that gates a conditional tool surface.
+///
+/// Capabilities describe whether the daemon can *usefully* service a tool, not
+/// whether the calling role is authorized. Role policy, approvals, sandbox,
+/// write scope, and effect gates remain authoritative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCapability {
+    /// At least one MCP server is enabled for the project.
+    Mcp,
+    /// A remote execution host is configured for the project.
+    RemoteHost,
+    /// The archive/media surface is available (archive readers enabled and
+    /// `ffprobe`/`ffmpeg` present for the media tools).
+    ArchiveMedia,
+    /// The packaged WKWebView browser helper is installed.
+    BrowserHelper,
+    /// The packaged Accessibility/CGEvent computer helper is installed.
+    ComputerHelper,
+    /// A `web_search` provider is configured.
+    WebSearch,
+    /// The content-addressed session artifact store accepts file-backed
+    /// publishes. Inline text artifacts are a core surface and are not gated.
+    Artifacts,
+    /// At least one LSP server is configured or discoverable.
+    Lsp,
+}
+
+impl ToolCapability {
+    pub const ALL: &'static [ToolCapability] = &[
+        Self::Mcp,
+        Self::RemoteHost,
+        Self::ArchiveMedia,
+        Self::BrowserHelper,
+        Self::ComputerHelper,
+        Self::WebSearch,
+        Self::Artifacts,
+        Self::Lsp,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mcp => "mcp",
+            Self::RemoteHost => "remote_host",
+            Self::ArchiveMedia => "archive_media",
+            Self::BrowserHelper => "browser_helper",
+            Self::ComputerHelper => "computer_helper",
+            Self::WebSearch => "web_search",
+            Self::Artifacts => "artifacts",
+            Self::Lsp => "lsp",
+        }
+    }
+}
+
+/// Static gate for one conditional tool. A tool is advertised only when every
+/// listed capability is available. Tools without an entry are unconditional.
+#[derive(Debug, Clone, Copy)]
+pub struct ToolCapabilityGate {
+    pub tool: &'static str,
+    pub requires: &'static [ToolCapability],
+}
+
+/// Complete gate table, sorted by tool name. This is a bounded allowlist: a
+/// tool that is not listed here is never gated by capability state.
+pub const TOOL_CAPABILITY_GATES: &[ToolCapabilityGate] = &[
+    ToolCapabilityGate {
+        tool: "archive_extract",
+        requires: &[ToolCapability::ArchiveMedia, ToolCapability::Artifacts],
+    },
+    ToolCapabilityGate {
+        tool: "archive_list",
+        requires: &[ToolCapability::ArchiveMedia],
+    },
+    ToolCapabilityGate {
+        tool: "browser",
+        requires: &[ToolCapability::BrowserHelper],
+    },
+    ToolCapabilityGate {
+        tool: "computer",
+        requires: &[ToolCapability::ComputerHelper],
+    },
+    ToolCapabilityGate {
+        tool: "lsp_query",
+        requires: &[ToolCapability::Lsp],
+    },
+    ToolCapabilityGate {
+        tool: "mcp",
+        requires: &[ToolCapability::Mcp],
+    },
+    ToolCapabilityGate {
+        tool: "media_info",
+        requires: &[ToolCapability::ArchiveMedia],
+    },
+    ToolCapabilityGate {
+        tool: "media_transcode",
+        requires: &[ToolCapability::ArchiveMedia],
+    },
+    ToolCapabilityGate {
+        tool: "publish_artifact_file",
+        requires: &[ToolCapability::Artifacts],
+    },
+    ToolCapabilityGate {
+        tool: "remote_exec",
+        requires: &[ToolCapability::RemoteHost],
+    },
+    ToolCapabilityGate {
+        tool: "remote_git",
+        requires: &[ToolCapability::RemoteHost],
+    },
+    ToolCapabilityGate {
+        tool: "remote_list",
+        requires: &[ToolCapability::RemoteHost],
+    },
+    ToolCapabilityGate {
+        tool: "remote_read",
+        requires: &[ToolCapability::RemoteHost],
+    },
+    ToolCapabilityGate {
+        tool: "remote_worktree",
+        requires: &[ToolCapability::RemoteHost],
+    },
+    ToolCapabilityGate {
+        tool: "remote_write",
+        requires: &[ToolCapability::RemoteHost],
+    },
+    ToolCapabilityGate {
+        tool: "web_search",
+        requires: &[ToolCapability::WebSearch],
+    },
+];
+
+/// Look up the capability gate for a tool, if it is conditional.
+pub fn capability_gate(tool: &str) -> Option<&'static ToolCapabilityGate> {
+    TOOL_CAPABILITY_GATES.iter().find(|gate| gate.tool == tool)
+}
+
+/// Probed runtime capabilities for conditional tool advertisement.
+///
+/// These flags are **advertisement hints only**. They never grant authority:
+/// a missing capability hides a schema, while a present capability still goes
+/// through role policy, approvals, the write sandbox, contracts, and effect
+/// receipts. A hidden tool stays in the role's policy surface, so `tool_search`
+/// can still describe it; the runtime would have to advertise it again before
+/// it is executable.
+///
+/// [`Default`] is deliberately **permissive** (every capability present). The
+/// legacy `tool_schemas` builder delegates with this default so existing
+/// callers and tests keep their exact schema bytes. A runtime that probed the
+/// environment should start from [`ToolCapabilities::none`] and set flags
+/// explicitly; otherwise an unconfigured MCP server or a missing GUI helper
+/// keeps paying schema tokens on every call.
+///
+/// Serde uses the same semantics: missing fields read as present (permissive),
+/// so an older event or config blob never accidentally strips a surface.
+///
+/// `read_pdf`, `read_image`, and `read_document` are intentionally **not**
+/// gated. They are pure-Rust parsers that still return useful labeled metadata
+/// when optional helpers (tesseract OCR) are absent, so hiding them would lose
+/// function rather than save tokens. `read_image` reports OCR as skipped
+/// instead of failing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+pub struct ToolCapabilities {
+    pub mcp_configured: bool,
+    pub remote_host_configured: bool,
+    pub archive_media_available: bool,
+    pub browser_helper_available: bool,
+    pub computer_helper_available: bool,
+    pub web_search_configured: bool,
+    pub artifacts_enabled: bool,
+    pub lsp_available: bool,
+}
+
+impl Default for ToolCapabilities {
+    fn default() -> Self {
+        Self::all()
+    }
+}
+
+impl ToolCapabilities {
+    /// Every capability present. This is the permissive compatibility default.
+    pub const fn all() -> Self {
+        Self {
+            mcp_configured: true,
+            remote_host_configured: true,
+            archive_media_available: true,
+            browser_helper_available: true,
+            computer_helper_available: true,
+            web_search_configured: true,
+            artifacts_enabled: true,
+            lsp_available: true,
+        }
+    }
+
+    /// No optional capability. Recommended starting point for a runtime that
+    /// then sets probed flags.
+    pub const fn none() -> Self {
+        Self {
+            mcp_configured: false,
+            remote_host_configured: false,
+            archive_media_available: false,
+            browser_helper_available: false,
+            computer_helper_available: false,
+            web_search_configured: false,
+            artifacts_enabled: false,
+            lsp_available: false,
+        }
+    }
+
+    /// Builder-style flag set, so a detector can chain probes:
+    /// `ToolCapabilities::none().with(ToolCapability::Mcp, mcp.is_some())`.
+    pub fn with(mut self, capability: ToolCapability, available: bool) -> Self {
+        self.set(capability, available);
+        self
+    }
+
+    pub fn set(&mut self, capability: ToolCapability, available: bool) {
+        match capability {
+            ToolCapability::Mcp => self.mcp_configured = available,
+            ToolCapability::RemoteHost => self.remote_host_configured = available,
+            ToolCapability::ArchiveMedia => self.archive_media_available = available,
+            ToolCapability::BrowserHelper => self.browser_helper_available = available,
+            ToolCapability::ComputerHelper => self.computer_helper_available = available,
+            ToolCapability::WebSearch => self.web_search_configured = available,
+            ToolCapability::Artifacts => self.artifacts_enabled = available,
+            ToolCapability::Lsp => self.lsp_available = available,
+        }
+    }
+
+    pub fn is_available(self, capability: ToolCapability) -> bool {
+        match capability {
+            ToolCapability::Mcp => self.mcp_configured,
+            ToolCapability::RemoteHost => self.remote_host_configured,
+            ToolCapability::ArchiveMedia => self.archive_media_available,
+            ToolCapability::BrowserHelper => self.browser_helper_available,
+            ToolCapability::ComputerHelper => self.computer_helper_available,
+            ToolCapability::WebSearch => self.web_search_configured,
+            ToolCapability::Artifacts => self.artifacts_enabled,
+            ToolCapability::Lsp => self.lsp_available,
+        }
+    }
+
+    /// Whether a tool may be advertised. Unconditional tools always pass; a
+    /// conditional tool passes only when every required capability is present.
+    pub fn allows_tool(self, tool: &str) -> bool {
+        capability_gate(tool).is_none_or(|gate| {
+            gate.requires
+                .iter()
+                .all(|capability| self.is_available(*capability))
+        })
+    }
+
+    /// Deterministically ordered names of unavailable capabilities. Useful for
+    /// prompt telemetry and for a bounded "why is this tool missing?" answer.
+    pub fn gated_off(self) -> Vec<&'static str> {
+        ToolCapability::ALL
+            .iter()
+            .filter(|capability| !self.is_available(**capability))
+            .map(|capability| capability.as_str())
+            .collect()
+    }
+
+    pub fn payload(self) -> Value {
+        serde_json::json!({
+            "mcp_configured": self.mcp_configured,
+            "remote_host_configured": self.remote_host_configured,
+            "archive_media_available": self.archive_media_available,
+            "browser_helper_available": self.browser_helper_available,
+            "computer_helper_available": self.computer_helper_available,
+            "web_search_configured": self.web_search_configured,
+            "artifacts_enabled": self.artifacts_enabled,
+            "lsp_available": self.lsp_available,
+            "gated_off": self.gated_off(),
+        })
+    }
+}
+
+/// A named tool partition. `Full` is the last-resort fallback for an unknown
+/// role or an explicit preview and is not used for a known role's missing or
+/// unknown task kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolBundleKind {
     Leader,
+    /// Opt-in read-only Leader/Manager orchestration surface: inspect, plan,
+    /// delegate, review, and coordinate without shell, writes, GUI, or remote
+    /// write/exec.
+    LeaderOrchestrator,
     Coding,
     Research,
     Verification,
@@ -77,6 +380,7 @@ impl ToolBundleKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Leader => "leader",
+            Self::LeaderOrchestrator => "leader_orchestrator",
             Self::Coding => "coding",
             Self::Research => "research",
             Self::Verification => "verification",
@@ -88,6 +392,7 @@ impl ToolBundleKind {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "leader" => Some(Self::Leader),
+            "leader_orchestrator" | "orchestrator" => Some(Self::LeaderOrchestrator),
             "coding" => Some(Self::Coding),
             "research" => Some(Self::Research),
             "verification" => Some(Self::Verification),
@@ -102,6 +407,7 @@ impl ToolBundleKind {
     pub fn target_limit(self) -> Option<usize> {
         match self {
             Self::Leader => Some(LEADER_TOOL_LIMIT),
+            Self::LeaderOrchestrator => Some(LEADER_ORCHESTRATOR_TOOL_LIMIT),
             Self::Coding => Some(CODING_TOOL_LIMIT),
             Self::Minimal => Some(MINIMAL_TOOL_LIMIT),
             Self::Research | Self::Verification | Self::Full => None,
@@ -309,6 +615,7 @@ pub const BUNDLE_TOOL_CATALOG: &[BundleToolSpec] = &[
     BundleToolSpec::new("budget_status", ToolCategory::Utility, false, false),
     BundleToolSpec::new("task_detail", ToolCategory::Task, false, false),
     BundleToolSpec::new("task_control", ToolCategory::Task, false, false),
+    BundleToolSpec::new("report_progress", ToolCategory::Orchestration, false, false),
     BundleToolSpec::new("wait_for_gate", ToolCategory::Orchestration, false, false),
     BundleToolSpec::new("read_tool_output", ToolCategory::Utility, false, false),
     BundleToolSpec::new("tool_help", ToolCategory::Utility, false, false),
@@ -396,6 +703,80 @@ pub const LEADER_TOOLS: &[&str] = &[
     "tool_help",
     "tool_search",
     "run_script",
+];
+
+/// Opt-in read-only Leader orchestration bundle.
+///
+/// It keeps the inspection, planning, delegation, review, coordination,
+/// memory/source, and artifact surfaces an orchestrator needs, and drops every
+/// workspace/shell/process/GUI/remote-write surface:
+///
+/// - no `write_file`, `edit_file`, `apply_patch`, `file_manage`, `run_script`;
+/// - no `shell`, `process`, `wait_for`, `run_project_task`, `project_profile`;
+/// - no `browser`, `computer`, `local_http`;
+/// - no `remote_write`, `remote_exec`, `remote_worktree`;
+/// - no `mcp` bridge: the Leader action set can execute and cancel MCP tasks,
+///   so it is not a read-only surface.
+///
+/// Delegation (`delegate`, `delegate_acp`, plan tools, `scout`) stays because
+/// it is authority, not a workspace write: the child runs under its own task
+/// worktree, Verifier, and merge gates. `task_control`, `report_progress`,
+/// `budget_status`, and `wait_for_gate` stay because they are the operator
+/// coordination surface. Managers additionally receive `delegate_many` through
+/// [`bundle_tool_names`].
+///
+/// This list is opt-in through [`ToolBundleMode::LeaderOrchestrator`]; the
+/// default Leader selection is unchanged.
+pub const LEADER_ORCHESTRATOR_TOOLS: &[&str] = &[
+    // Read-only workspace and code intelligence.
+    "read_file",
+    "list_dir",
+    "grep",
+    "find_files",
+    "file_info",
+    "read_files",
+    "git",
+    "repo_map",
+    "find_symbol",
+    "find_references",
+    "dependency_graph",
+    // External read-only retrieval.
+    "fetch_url",
+    "web_search",
+    // Memory and project sources.
+    "recall",
+    "remember",
+    "list_sources",
+    "search_sources",
+    "read_source",
+    // Mailbox, inline artifacts, and skills.
+    "send_message",
+    "read_mailbox",
+    "publish_artifact",
+    "list_artifacts",
+    "read_artifact",
+    "ask_user",
+    "coordinate",
+    "team_status",
+    "use_skill",
+    "todo_write",
+    // Delegation and plan authority.
+    "delegate",
+    "delegate_acp",
+    "submit_team_plan",
+    "plan_fanout",
+    "run_team_plan",
+    "deliberate_team_plan",
+    "scout",
+    "task_control",
+    "task_detail",
+    "report_progress",
+    "wait_for_gate",
+    "budget_status",
+    // Bounded context and discovery utilities.
+    "read_tool_output",
+    "tool_help",
+    "tool_search",
 ];
 
 /// The coding bundle. It deliberately excludes project-level orchestration,
@@ -542,6 +923,13 @@ pub const TOOL_BUNDLE_DEFINITIONS: &[ToolBundleDefinition] = &[
         tools: LEADER_TOOLS,
     },
     ToolBundleDefinition {
+        kind: ToolBundleKind::LeaderOrchestrator,
+        title: "Leader Orchestrator",
+        summary: "Opt-in read-only orchestration: inspect, plan, delegate, review, coordinate, memory/sources, and inline artifacts. No shell, workspace writes, GUI, or remote writes.",
+        target_limit: Some(LEADER_ORCHESTRATOR_TOOL_LIMIT),
+        tools: LEADER_ORCHESTRATOR_TOOLS,
+    },
+    ToolBundleDefinition {
         kind: ToolBundleKind::Coding,
         title: "Coding",
         summary: "Workspace editing, shell/process, Git, code intelligence, tests, and coordination.",
@@ -602,8 +990,10 @@ pub struct ToolBundleSelection {
     pub profile: String,
     pub task_kind: Option<String>,
     pub reason: &'static str,
-    /// True when the full legacy bundle was selected because no deterministic
-    /// named bundle applied.
+    /// True when no task-kind partition applied and a deterministic role or
+    /// profile default was selected instead. `reason` distinguishes a missing
+    /// task kind from an unknown one, and from the last-resort unknown-role
+    /// `Full` fallback. `fallback` never means "all available tools".
     pub fallback: bool,
 }
 
@@ -639,8 +1029,8 @@ impl ToolBundleSelection {
 }
 
 /// Map a plan task `kind` to a bundle deterministically. The mapping is a
-/// deliberate allowlist: unknown kinds return `None` and the caller falls back
-/// to `Full` for backward compatibility.
+/// deliberate allowlist: unknown kinds return `None`, and the caller uses the
+/// role/profile default from [`default_bundle_for_profile`] instead of `Full`.
 pub fn task_kind_bundle(task_kind: &str) -> Option<ToolBundleKind> {
     let normalized = task_kind
         .trim()
@@ -664,9 +1054,68 @@ pub fn task_kind_bundle(task_kind: &str) -> Option<ToolBundleKind> {
     }
 }
 
+/// Explicit selection mode. The default is [`ToolBundleMode::Standard`], which
+/// preserves the historical per-role partition. `LeaderOrchestrator` is an
+/// opt-in surface for a Leader/Manager that only plans and delegates.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolBundleMode {
+    /// Existing role/task-kind selection.
+    #[default]
+    Standard,
+    /// Read-only Leader/Manager orchestration partition. It applies only to
+    /// Leader/Manager roles; every other role keeps its standard selection.
+    LeaderOrchestrator,
+}
+
+impl ToolBundleMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::LeaderOrchestrator => "leader_orchestrator",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "standard" | "default" => Some(Self::Standard),
+            "leader_orchestrator" | "orchestrator" => Some(Self::LeaderOrchestrator),
+            _ => None,
+        }
+    }
+}
+
+/// Deterministic default when a Worker/Labour task kind is missing or unknown.
+/// A known role never silently promotes to the `Full` catalog; the profile
+/// picks the smallest surface that can still do the role's work.
+pub fn default_bundle_for_profile(profile: &str) -> ToolBundleKind {
+    match profile {
+        PROFILE_CODING => ToolBundleKind::Coding,
+        PROFILE_RESEARCH => ToolBundleKind::Research,
+        PROFILE_VERIFICATION => ToolBundleKind::Verification,
+        // Generic work is usually not code, so it gets the six-tool surface.
+        PROFILE_GENERIC => ToolBundleKind::Minimal,
+        _ => ToolBundleKind::Minimal,
+    }
+}
+
 /// Choose the bundle for one run. Role decides the surface family; task kind
 /// only partitions Worker/Labour work. A Leader remains Leader for every task,
 /// and read-only roles never inherit a writable bundle.
+///
+/// A missing or unknown Worker/Labour task kind falls back to the profile's
+/// deterministic default ([`default_bundle_for_profile`]), not to `Full`. The
+/// selection keeps `fallback = true` and a distinct reason so telemetry shows
+/// that the run is not task-partitioned.
+///
+/// Tradeoff: the default is smaller and more cache-stable than the whole
+/// registry, but it is not tuned to the task. A run that needs a tool outside
+/// the partition can still discover it through `tool_search`; promotion is
+/// explicit and turn-boundary scoped. That is preferable to paying for the
+/// full catalog on every unknown kind, and it never silently widens the
+/// advertised surface back to `Full`.
 pub fn select_bundle(role: &str, profile: &str, task_kind: Option<&str>) -> ToolBundleSelection {
     let role = role.trim().to_ascii_lowercase();
     let profile = profile.trim().to_ascii_lowercase();
@@ -710,20 +1159,20 @@ pub fn select_bundle(role: &str, profile: &str, task_kind: Option<&str>) -> Tool
                     false,
                 ),
                 None => ToolBundleSelection::new(
-                    ToolBundleKind::Full,
+                    default_bundle_for_profile(&profile),
                     role,
                     profile,
                     Some(kind.to_string()),
-                    "task_kind_unknown_full",
+                    "task_kind_unknown_role_default",
                     true,
                 ),
             },
             None => ToolBundleSelection::new(
-                ToolBundleKind::Full,
+                default_bundle_for_profile(&profile),
                 role,
                 profile,
                 None,
-                "no_task_kind_full",
+                "no_task_kind_role_default",
                 true,
             ),
         },
@@ -736,6 +1185,36 @@ pub fn select_bundle(role: &str, profile: &str, task_kind: Option<&str>) -> Tool
             true,
         ),
     }
+}
+
+/// Role/task-kind selection with an explicit mode. `Standard` is exactly
+/// [`select_bundle`]. `LeaderOrchestrator` replaces the Leader/Manager surface
+/// with [`LEADER_ORCHESTRATOR_TOOLS`]; other roles ignore the mode so a
+/// Worker/Verifier/Scout can never be promoted or downgraded by it.
+pub fn select_bundle_with_mode(
+    role: &str,
+    profile: &str,
+    task_kind: Option<&str>,
+    mode: ToolBundleMode,
+) -> ToolBundleSelection {
+    if mode == ToolBundleMode::Standard {
+        return select_bundle(role, profile, task_kind);
+    }
+    let normalized_role = role.trim().to_ascii_lowercase();
+    if !matches!(normalized_role.as_str(), ROLE_LEADER | ROLE_MANAGER) {
+        return select_bundle(role, profile, task_kind);
+    }
+    ToolBundleSelection::new(
+        ToolBundleKind::LeaderOrchestrator,
+        normalized_role,
+        profile.trim().to_ascii_lowercase(),
+        task_kind
+            .map(str::trim)
+            .filter(|kind| !kind.is_empty())
+            .map(str::to_string),
+        "mode_leader_orchestrator",
+        false,
+    )
 }
 
 /// The exact advertised name list for a bundle, role, and profile before it is
@@ -760,6 +1239,13 @@ pub fn bundle_tool_names(kind: ToolBundleKind, role: &str, profile: &str) -> Vec
             if profile == PROFILE_CODING {
                 names.push("browser");
                 names.push("computer");
+            }
+        }
+        ToolBundleKind::LeaderOrchestrator => {
+            // Orchestrator mode is read-only by construction, so profile never
+            // adds GUI tools. Managers still get the parallel Worker batch.
+            if role == ROLE_MANAGER {
+                names.push("delegate_many");
             }
         }
         ToolBundleKind::Coding => {
@@ -1396,6 +1882,7 @@ pub fn catalog_entries() -> Vec<ToolBundleCatalogEntry> {
         .map(|definition| {
             let (role, profile) = match definition.kind {
                 ToolBundleKind::Leader => (ROLE_LEADER, PROFILE_GENERIC),
+                ToolBundleKind::LeaderOrchestrator => (ROLE_LEADER, PROFILE_GENERIC),
                 ToolBundleKind::Coding => (ROLE_WORKER, PROFILE_CODING),
                 ToolBundleKind::Research => (ROLE_WORKER, PROFILE_RESEARCH),
                 ToolBundleKind::Verification => (ROLE_VERIFIER, PROFILE_VERIFICATION),
@@ -1537,6 +2024,20 @@ mod tests {
         bundle_tool_names(kind, role, profile)
     }
 
+    /// Explicit `Full` selection for tests that intentionally exercise the
+    /// last-resort fallback. Production reaches `Full` only through an unknown
+    /// role or an explicit preview, never through a known role's task kind.
+    fn full_selection(role: &str, profile: &str) -> ToolBundleSelection {
+        ToolBundleSelection::new(
+            ToolBundleKind::Full,
+            role,
+            profile,
+            None,
+            "unknown_role_full",
+            true,
+        )
+    }
+
     #[test]
     fn task_kind_mapping_is_deterministic_and_case_insensitive() {
         for (kind, expected) in [
@@ -1586,17 +2087,54 @@ mod tests {
         assert!(!worker.fallback);
 
         let worker_missing = select_bundle("worker", "coding", None);
-        assert_eq!(worker_missing.kind, ToolBundleKind::Full);
+        assert_eq!(worker_missing.kind, ToolBundleKind::Coding);
         assert!(worker_missing.fallback);
-        assert_eq!(worker_missing.reason, "no_task_kind_full");
+        assert_eq!(worker_missing.reason, "no_task_kind_role_default");
 
         let worker_unknown = select_bundle("worker", "coding", Some("esoteric"));
-        assert_eq!(worker_unknown.kind, ToolBundleKind::Full);
+        assert_eq!(worker_unknown.kind, ToolBundleKind::Coding);
         assert!(worker_unknown.fallback);
-        assert_eq!(worker_unknown.reason, "task_kind_unknown_full");
+        assert_eq!(worker_unknown.reason, "task_kind_unknown_role_default");
 
         let labour = select_bundle("labour", "coding", Some("review"));
         assert_eq!(labour.kind, ToolBundleKind::Verification);
+    }
+
+    #[test]
+    fn unknown_task_kind_falls_back_to_the_profile_default_not_full() {
+        for (profile, expected) in [
+            ("coding", ToolBundleKind::Coding),
+            ("research", ToolBundleKind::Research),
+            ("verification", ToolBundleKind::Verification),
+            ("generic", ToolBundleKind::Minimal),
+            ("unrecognized-profile", ToolBundleKind::Minimal),
+        ] {
+            let selection = select_bundle("worker", profile, Some("esoteric"));
+            assert_eq!(selection.kind, expected, "profile {profile}");
+            assert!(selection.fallback, "profile {profile}");
+            assert_eq!(
+                selection.reason, "task_kind_unknown_role_default",
+                "profile {profile}"
+            );
+            assert_eq!(selection.task_kind.as_deref(), Some("esoteric"));
+            assert_ne!(selection.kind, ToolBundleKind::Full);
+        }
+        for profile in ["coding", "research", "verification", "generic"] {
+            let selection = select_bundle("labour", profile, None);
+            assert_eq!(selection.kind, default_bundle_for_profile(profile));
+            assert_eq!(selection.reason, "no_task_kind_role_default");
+            assert!(selection.fallback);
+        }
+        // Whitespace is treated as a missing kind, not an unknown one.
+        let blank = select_bundle("worker", "research", Some("   "));
+        assert_eq!(blank.kind, ToolBundleKind::Research);
+        assert_eq!(blank.reason, "no_task_kind_role_default");
+        // A genuinely unknown role still uses the explicit last-resort Full
+        // bundle: there is no role default to derive.
+        let unknown_role = select_bundle("intern", "coding", Some("esoteric"));
+        assert_eq!(unknown_role.kind, ToolBundleKind::Full);
+        assert_eq!(unknown_role.reason, "unknown_role_full");
+        assert!(unknown_role.fallback);
     }
 
     #[test]
@@ -1981,7 +2519,7 @@ mod tests {
     #[test]
     fn full_fallback_keeps_every_available_schema() {
         let available = schemas(&["write_file", "read_file", "shell", "remote_exec"]);
-        let selection = select_bundle("worker", "coding", Some("make-it-up"));
+        let selection = full_selection("worker", "coding");
         let frozen = freeze(selection, available.clone(), Vec::new());
         assert_eq!(frozen.kind(), ToolBundleKind::Full);
         assert!(frozen.selection.fallback);
@@ -1992,6 +2530,11 @@ mod tests {
         );
         assert_eq!(frozen.target_limit, None);
         assert_eq!(frozen.requested, Vec::<String>::new());
+        // A known role with an unknown kind no longer reaches this path.
+        assert_ne!(
+            select_bundle("worker", "coding", Some("make-it-up")).kind,
+            ToolBundleKind::Full
+        );
     }
 
     #[test]
@@ -2253,6 +2796,17 @@ mod tests {
             .find(|entry| entry.kind == ToolBundleKind::Leader)
             .unwrap();
         assert_eq!(leader.requested_count, 49);
+        let orchestrator = entries
+            .iter()
+            .find(|entry| entry.kind == ToolBundleKind::LeaderOrchestrator)
+            .unwrap();
+        assert_eq!(orchestrator.requested_count, 43);
+        assert_eq!(
+            orchestrator.target_limit,
+            Some(LEADER_ORCHESTRATOR_TOOL_LIMIT)
+        );
+        assert!(orchestrator.requested_count <= LEADER_ORCHESTRATOR_TOOL_LIMIT);
+        assert!(orchestrator.requested_count < leader.requested_count);
         let coding = entries
             .iter()
             .find(|entry| entry.kind == ToolBundleKind::Coding)
@@ -2279,6 +2833,7 @@ mod tests {
     fn kind_names_round_trip_and_display() {
         for kind in [
             ToolBundleKind::Leader,
+            ToolBundleKind::LeaderOrchestrator,
             ToolBundleKind::Coding,
             ToolBundleKind::Research,
             ToolBundleKind::Verification,
@@ -2292,20 +2847,30 @@ mod tests {
             ToolBundleKind::parse(" LEADER "),
             Some(ToolBundleKind::Leader)
         );
+        assert_eq!(
+            ToolBundleKind::parse("orchestrator"),
+            Some(ToolBundleKind::LeaderOrchestrator)
+        );
         assert_eq!(ToolBundleKind::parse("nope"), None);
         assert!(ToolBundleKind::Leader.is_partitioned());
+        assert!(ToolBundleKind::LeaderOrchestrator.is_partitioned());
         assert!(!ToolBundleKind::Full.is_partitioned());
     }
 
     #[test]
     fn target_limits_and_mcp_semantics_are_explicit() {
         assert_eq!(ToolBundleKind::Leader.target_limit(), Some(51));
+        assert_eq!(
+            ToolBundleKind::LeaderOrchestrator.target_limit(),
+            Some(LEADER_ORCHESTRATOR_TOOL_LIMIT)
+        );
         assert_eq!(ToolBundleKind::Coding.target_limit(), Some(40));
         assert_eq!(ToolBundleKind::Minimal.target_limit(), Some(12));
         assert_eq!(ToolBundleKind::Research.target_limit(), None);
         assert_eq!(ToolBundleKind::Verification.target_limit(), None);
         assert_eq!(ToolBundleKind::Full.target_limit(), None);
         assert!(ToolBundleKind::Leader.allows_dynamic_mcp());
+        assert!(ToolBundleKind::LeaderOrchestrator.allows_dynamic_mcp());
         assert!(ToolBundleKind::Coding.allows_dynamic_mcp());
         assert!(!ToolBundleKind::Minimal.allows_dynamic_mcp());
         assert!(ToolBundleKind::Full.allows_dynamic_mcp());
@@ -2357,7 +2922,7 @@ mod tests {
     #[test]
     fn full_bundle_appends_dynamic_mcp_but_minimal_does_not() {
         let full = freeze(
-            select_bundle("worker", "coding", None),
+            full_selection("worker", "coding"),
             schemas(&["read_file", "remote_exec"]),
             schemas(&["mcp__z__z", "mcp__a__a"]),
         );
@@ -2531,6 +3096,364 @@ mod tests {
     }
 
     #[test]
+    fn leader_orchestrator_bundle_is_read_only_bounded_and_stable() {
+        let names = selected_names(
+            ToolBundleKind::LeaderOrchestrator,
+            ROLE_LEADER,
+            PROFILE_GENERIC,
+        );
+        assert_eq!(names.len(), LEADER_ORCHESTRATOR_TOOLS.len());
+        assert_eq!(names.len(), 43);
+        assert!(names.len() <= LEADER_ORCHESTRATOR_TOOL_LIMIT);
+        assert!(
+            names.len() < LEADER_TOOLS.len(),
+            "orchestrator must be smaller than the default Leader surface"
+        );
+        for forbidden in [
+            "write_file",
+            "edit_file",
+            "apply_patch",
+            "file_manage",
+            "run_script",
+            "shell",
+            "process",
+            "wait_for",
+            "run_project_task",
+            "project_profile",
+            "local_http",
+            "browser",
+            "computer",
+            "mcp",
+            "remote_write",
+            "remote_exec",
+            "remote_worktree",
+            "remote_git",
+            "remote_read",
+            "remote_list",
+            "archive_extract",
+            "media_transcode",
+            "publish_artifact_file",
+        ] {
+            assert!(
+                !names.contains(&forbidden),
+                "orchestrator bundle must not advertise {forbidden}"
+            );
+        }
+        for required in [
+            "read_file",
+            "read_files",
+            "grep",
+            "git",
+            "repo_map",
+            "fetch_url",
+            "web_search",
+            "recall",
+            "remember",
+            "search_sources",
+            "publish_artifact",
+            "list_artifacts",
+            "read_artifact",
+            "ask_user",
+            "coordinate",
+            "team_status",
+            "todo_write",
+            "delegate",
+            "delegate_acp",
+            "submit_team_plan",
+            "plan_fanout",
+            "run_team_plan",
+            "deliberate_team_plan",
+            "scout",
+            "task_control",
+            "task_detail",
+            "report_progress",
+            "wait_for_gate",
+            "budget_status",
+            "tool_search",
+        ] {
+            assert!(
+                names.contains(&required),
+                "orchestrator bundle missing {required}"
+            );
+        }
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(names, sorted, "names must be sorted and unique");
+        for name in &names {
+            assert!(catalog_entry(name).is_some(), "missing metadata for {name}");
+        }
+        // A coding profile never re-adds the GUI surfaces in this mode.
+        let coding = selected_names(
+            ToolBundleKind::LeaderOrchestrator,
+            ROLE_LEADER,
+            PROFILE_CODING,
+        );
+        assert_eq!(coding, names);
+        // Managers keep the parallel Worker batch and lose every write tool.
+        let manager = selected_names(
+            ToolBundleKind::LeaderOrchestrator,
+            ROLE_MANAGER,
+            PROFILE_CODING,
+        );
+        assert!(manager.contains(&"delegate_many"));
+        assert!(manager.len() <= LEADER_ORCHESTRATOR_TOOL_LIMIT);
+        for name in &manager {
+            let spec = catalog_entry(name).expect("catalog");
+            assert!(!spec.workspace_write, "Manager received {name}");
+            assert!(
+                !matches!(*name, "shell" | "process" | "browser" | "computer"),
+                "Manager received {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn orchestrator_freeze_is_smaller_than_the_standard_leader_bundle() {
+        let standard = freeze(
+            select_bundle(ROLE_LEADER, PROFILE_GENERIC, None),
+            schemas(LEADER_TOOLS),
+            Vec::new(),
+        );
+        let orchestrator = freeze(
+            select_bundle_with_mode(
+                ROLE_LEADER,
+                PROFILE_GENERIC,
+                None,
+                ToolBundleMode::LeaderOrchestrator,
+            ),
+            schemas(LEADER_ORCHESTRATOR_TOOLS),
+            Vec::new(),
+        );
+        assert_eq!(orchestrator.kind(), ToolBundleKind::LeaderOrchestrator);
+        assert_eq!(orchestrator.builtin_count(), 43);
+        assert_eq!(orchestrator.omitted, Vec::<String>::new());
+        assert_eq!(orchestrator.within_target(), Some(true));
+        assert!(orchestrator.builtin_count() < standard.builtin_count());
+        assert!(orchestrator.schema_bytes() < standard.schema_bytes());
+        assert_ne!(orchestrator.bundle_hash, standard.bundle_hash);
+        assert_ne!(orchestrator.tools_hash, standard.tools_hash);
+        assert_ne!(
+            bundle_contract_hash(&orchestrator.selection),
+            bundle_contract_hash(&standard.selection)
+        );
+        let again = freeze(
+            select_bundle_with_mode(
+                ROLE_LEADER,
+                PROFILE_GENERIC,
+                None,
+                ToolBundleMode::LeaderOrchestrator,
+            ),
+            schemas(LEADER_ORCHESTRATOR_TOOLS),
+            Vec::new(),
+        );
+        assert_eq!(orchestrator.tool_names(), again.tool_names());
+        assert_eq!(orchestrator.bundle_hash, again.bundle_hash);
+        assert_eq!(orchestrator.tools_hash, again.tools_hash);
+    }
+
+    #[test]
+    fn mode_selection_preserves_the_standard_default() {
+        for (role, profile, kind) in [
+            (ROLE_LEADER, PROFILE_GENERIC, None),
+            (ROLE_MANAGER, PROFILE_CODING, Some("implementation")),
+            (ROLE_WORKER, PROFILE_CODING, Some("implementation")),
+            (ROLE_VERIFIER, PROFILE_VERIFICATION, Some("review")),
+            (ROLE_SCOUT, PROFILE_RESEARCH, None),
+        ] {
+            assert_eq!(
+                select_bundle_with_mode(role, profile, kind, ToolBundleMode::Standard),
+                select_bundle(role, profile, kind),
+                "{role}/{profile}"
+            );
+        }
+        let orchestrator = select_bundle_with_mode(
+            ROLE_LEADER,
+            PROFILE_GENERIC,
+            Some("implementation"),
+            ToolBundleMode::LeaderOrchestrator,
+        );
+        assert_eq!(orchestrator.kind, ToolBundleKind::LeaderOrchestrator);
+        assert_eq!(orchestrator.reason, "mode_leader_orchestrator");
+        assert!(!orchestrator.fallback);
+        assert_eq!(orchestrator.task_kind.as_deref(), Some("implementation"));
+        let manager = select_bundle_with_mode(
+            " Manager ",
+            " Coding ",
+            None,
+            ToolBundleMode::LeaderOrchestrator,
+        );
+        assert_eq!(manager.kind, ToolBundleKind::LeaderOrchestrator);
+        assert_eq!(manager.role, "manager");
+        assert_eq!(manager.profile, "coding");
+        // Other roles ignore the mode entirely.
+        for (role, profile) in [
+            (ROLE_WORKER, PROFILE_CODING),
+            (ROLE_LABOUR, PROFILE_CODING),
+            (ROLE_VERIFIER, PROFILE_VERIFICATION),
+            (ROLE_SCOUT, PROFILE_RESEARCH),
+        ] {
+            assert_eq!(
+                select_bundle_with_mode(
+                    role,
+                    profile,
+                    Some("implementation"),
+                    ToolBundleMode::LeaderOrchestrator
+                ),
+                select_bundle(role, profile, Some("implementation")),
+                "{role}/{profile}"
+            );
+        }
+        for mode in [ToolBundleMode::Standard, ToolBundleMode::LeaderOrchestrator] {
+            assert_eq!(ToolBundleMode::parse(mode.as_str()), Some(mode));
+        }
+        assert_eq!(
+            ToolBundleMode::parse("default"),
+            Some(ToolBundleMode::Standard)
+        );
+        assert_eq!(ToolBundleMode::default(), ToolBundleMode::Standard);
+    }
+
+    #[test]
+    fn capability_gates_are_bounded_sorted_and_catalogued() {
+        let mut previous = "";
+        let mut seen = BTreeSet::new();
+        for gate in TOOL_CAPABILITY_GATES {
+            assert!(seen.insert(gate.tool), "duplicate gate for {}", gate.tool);
+            assert!(
+                gate.tool > previous,
+                "gate table must be sorted by tool name"
+            );
+            previous = gate.tool;
+            assert!(
+                catalog_entry(gate.tool).is_some(),
+                "gated tool {} is not catalogued",
+                gate.tool
+            );
+            assert!(
+                !gate.requires.is_empty(),
+                "gate for {} requires nothing",
+                gate.tool
+            );
+            for capability in gate.requires {
+                assert!(
+                    ToolCapability::ALL.contains(capability),
+                    "{} requires an unknown capability",
+                    gate.tool
+                );
+            }
+        }
+        assert_eq!(seen.len(), TOOL_CAPABILITY_GATES.len());
+        assert_eq!(ToolCapability::ALL.len(), 8);
+    }
+
+    #[test]
+    fn capability_defaults_are_permissive_and_none_is_conservative() {
+        let permissive = ToolCapabilities::default();
+        assert_eq!(permissive, ToolCapabilities::all());
+        assert!(permissive.gated_off().is_empty());
+        let conservative = ToolCapabilities::none();
+        assert_eq!(conservative.gated_off().len(), 8);
+        for tool in [
+            "mcp",
+            "remote_read",
+            "remote_write",
+            "remote_exec",
+            "remote_git",
+            "remote_list",
+            "remote_worktree",
+            "archive_list",
+            "archive_extract",
+            "media_info",
+            "media_transcode",
+            "browser",
+            "computer",
+            "web_search",
+            "publish_artifact_file",
+            "lsp_query",
+        ] {
+            assert!(permissive.allows_tool(tool), "permissive hid {tool}");
+            assert!(!conservative.allows_tool(tool), "none advertised {tool}");
+        }
+        // Core/read surfaces are never capability-gated.
+        for tool in [
+            "fetch_url",
+            "read_file",
+            "shell",
+            "write_file",
+            "publish_artifact",
+            "list_artifacts",
+            "read_artifact",
+            "read_pdf",
+            "read_image",
+            "read_document",
+            "data_query",
+            "use_skill",
+        ] {
+            assert!(conservative.allows_tool(tool), "none hid core tool {tool}");
+        }
+        let payload = conservative.payload();
+        assert_eq!(payload["mcp_configured"], false);
+        assert_eq!(payload["gated_off"].as_array().unwrap().len(), 8);
+        assert_eq!(payload["gated_off"][0], "mcp");
+        assert_eq!(payload["gated_off"][7], "lsp");
+    }
+
+    #[test]
+    fn capability_flags_control_only_their_gated_tools() {
+        for (capability, allowed, denied) in [
+            (ToolCapability::Mcp, "mcp", "remote_read"),
+            (ToolCapability::RemoteHost, "remote_write", "mcp"),
+            (ToolCapability::ArchiveMedia, "media_info", "browser"),
+            (ToolCapability::BrowserHelper, "browser", "computer"),
+            (ToolCapability::ComputerHelper, "computer", "browser"),
+            (ToolCapability::WebSearch, "web_search", "lsp_query"),
+            (
+                ToolCapability::Artifacts,
+                "publish_artifact_file",
+                "archive_extract",
+            ),
+            (ToolCapability::Lsp, "lsp_query", "mcp"),
+        ] {
+            let capabilities = ToolCapabilities::none().with(capability, true);
+            assert!(
+                capabilities.allows_tool(allowed),
+                "{} should enable {allowed}",
+                capability.as_str()
+            );
+            assert!(
+                !capabilities.allows_tool(denied),
+                "{} should not enable {denied}",
+                capability.as_str()
+            );
+        }
+        // archive_extract needs both the archive reader and the artifact store.
+        let archive_only = ToolCapabilities::none().with(ToolCapability::ArchiveMedia, true);
+        assert!(archive_only.allows_tool("archive_list"));
+        assert!(!archive_only.allows_tool("archive_extract"));
+        let both = archive_only.with(ToolCapability::Artifacts, true);
+        assert!(both.allows_tool("archive_extract"));
+    }
+
+    #[test]
+    fn capability_serde_defaults_missing_fields_to_permissive() {
+        let full: ToolCapabilities =
+            serde_json::from_value(serde_json::json!({})).expect("empty object deserializes");
+        assert_eq!(full, ToolCapabilities::all());
+        let partial: ToolCapabilities =
+            serde_json::from_value(serde_json::json!({"mcp_configured": false}))
+                .expect("partial object deserializes");
+        assert!(!partial.mcp_configured);
+        assert!(partial.remote_host_configured);
+        assert!(partial.allows_tool("remote_read"));
+        assert!(!partial.allows_tool("mcp"));
+        let round_trip: ToolCapabilities =
+            serde_json::from_value(serde_json::to_value(ToolCapabilities::none()).unwrap())
+                .unwrap();
+        assert_eq!(round_trip, ToolCapabilities::none());
+    }
+
+    #[test]
     fn selection_normalizes_role_and_profile_case_and_whitespace() {
         let selection = select_bundle("  WoRkEr ", " CODING ", Some("  Trivial  "));
         assert_eq!(selection.kind, ToolBundleKind::Minimal);
@@ -2654,11 +3577,7 @@ mod tests {
     fn summary_payload_marks_unbundled_tools_without_panicking() {
         let mut custom = schema("custom_tool");
         custom.description = "custom".into();
-        let frozen = freeze(
-            select_bundle("worker", "coding", None),
-            vec![custom],
-            Vec::new(),
-        );
+        let frozen = freeze(full_selection("worker", "coding"), vec![custom], Vec::new());
         let summary = frozen.summary_payload(true);
         assert_eq!(summary["tools"][0]["category"], "unbundled");
         assert_eq!(summary["tools"][0]["workspace_write"], false);
@@ -2697,6 +3616,9 @@ mod tests {
             }
             match entry.kind {
                 ToolBundleKind::Leader => assert_eq!(entry.representative_role, "leader"),
+                ToolBundleKind::LeaderOrchestrator => {
+                    assert_eq!(entry.representative_role, "leader")
+                }
                 ToolBundleKind::Verification => assert_eq!(entry.representative_role, "verifier"),
                 ToolBundleKind::Coding | ToolBundleKind::Minimal => {
                     assert_eq!(entry.representative_role, "worker")
@@ -2712,6 +3634,7 @@ mod tests {
         assert!(audit_matrix().is_empty(), "{:?}", audit_matrix());
         for kind in [
             ToolBundleKind::Leader,
+            ToolBundleKind::LeaderOrchestrator,
             ToolBundleKind::Coding,
             ToolBundleKind::Research,
             ToolBundleKind::Verification,
@@ -2744,6 +3667,10 @@ mod tests {
     #[test]
     fn definitions_are_stable_and_full_has_no_explicit_tools() {
         assert_eq!(definition(ToolBundleKind::Leader).tools, LEADER_TOOLS);
+        assert_eq!(
+            definition(ToolBundleKind::LeaderOrchestrator).tools,
+            LEADER_ORCHESTRATOR_TOOLS
+        );
         assert_eq!(definition(ToolBundleKind::Coding).tools, CODING_TOOLS);
         assert_eq!(definition(ToolBundleKind::Research).tools, RESEARCH_TOOLS);
         assert_eq!(
@@ -2878,6 +3805,9 @@ mod tests {
             (ToolBundleKind::Leader, "leader", "generic", 49),
             (ToolBundleKind::Leader, "leader", "coding", 51),
             (ToolBundleKind::Leader, "manager", "coding", 44),
+            (ToolBundleKind::LeaderOrchestrator, "leader", "generic", 43),
+            (ToolBundleKind::LeaderOrchestrator, "leader", "coding", 43),
+            (ToolBundleKind::LeaderOrchestrator, "manager", "coding", 44),
             (ToolBundleKind::Coding, "worker", "coding", 39),
             (ToolBundleKind::Coding, "labour", "coding", 37),
             (ToolBundleKind::Coding, "worker", "research", 37),
@@ -3018,7 +3948,7 @@ mod tests {
     #[test]
     fn full_bundle_has_no_target_and_no_explicit_requests() {
         let frozen = freeze(
-            select_bundle("worker", "coding", None),
+            full_selection("worker", "coding"),
             schemas(&["read_file", "write_file"]),
             Vec::new(),
         );
@@ -3033,6 +3963,7 @@ mod tests {
     fn requested_names_are_always_catalogued_for_partitioned_bundles() {
         for kind in [
             ToolBundleKind::Leader,
+            ToolBundleKind::LeaderOrchestrator,
             ToolBundleKind::Coding,
             ToolBundleKind::Research,
             ToolBundleKind::Verification,
@@ -3083,10 +4014,13 @@ mod tests {
     fn selection_payload_includes_fallback_and_task_kind() {
         let fallback = select_bundle("worker", "coding", Some("unknown"));
         let payload = fallback.payload();
-        assert_eq!(payload["bundle"], "full");
+        assert_eq!(payload["bundle"], "coding");
         assert_eq!(payload["fallback"], true);
         assert_eq!(payload["task_kind"], "unknown");
-        assert_eq!(payload["reason"], "task_kind_unknown_full");
+        assert_eq!(payload["reason"], "task_kind_unknown_role_default");
+        let missing = select_bundle("worker", "generic", None);
+        assert_eq!(missing.payload()["bundle"], "minimal");
+        assert_eq!(missing.payload()["fallback"], true);
     }
 
     #[test]
@@ -3108,7 +4042,7 @@ mod tests {
     #[test]
     fn category_counts_cover_mcp_and_unbundled_tools() {
         let frozen = freeze(
-            select_bundle("worker", "coding", None),
+            full_selection("worker", "coding"),
             vec![schema("custom_tool")],
             vec![schema("mcp__a__alpha")],
         );

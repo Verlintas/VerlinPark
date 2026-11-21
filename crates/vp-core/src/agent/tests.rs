@@ -16352,6 +16352,76 @@ async fn program_tick_creates_one_session_and_never_duplicates_it() {
 }
 
 #[tokio::test]
+async fn program_tick_splits_the_program_budget_across_parallel_milestones() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let program = engine
+        .create_program(vp_protocol::types::ProgramCreateParams {
+            project_id: project.id.clone(),
+            goal: "Parallel program budget".into(),
+            policy: Some(vp_protocol::types::ProgramPolicy {
+                auto_dispatch: true,
+                max_attempts: 2,
+                retry_backoff_secs: 60,
+                dependency_failure: vp_protocol::types::DependencyFailurePolicy::Block,
+                token_budget: None,
+                cost_budget_usd: None,
+                max_parallel_milestones: 2,
+            }),
+            token_budget: Some(10_000),
+            cost_budget_usd: None,
+            activate: true,
+        })
+        .await
+        .unwrap();
+    for title in ["First", "Second"] {
+        engine
+            .create_program_milestone(vp_protocol::types::ProgramMilestoneCreateParams {
+                program_id: program.id.clone(),
+                key: None,
+                title: title.into(),
+                objective: format!("Deliver {title}."),
+                acceptance: vec!["the deliverable is verified".into()],
+                deps: Vec::new(),
+                priority: Some(0),
+                max_attempts: Some(2),
+                profile: Some("coding".into()),
+                write_scope: vec!["src".into()],
+                token_budget: None,
+                cost_budget_usd: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    let tick = service.reconcile_programs(Some(&project.id)).await.unwrap();
+    assert_eq!(tick.sessions_started, 2);
+    let sessions = engine
+        .list_sessions(Some(project.id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(sessions.len(), 2);
+    for session in &sessions {
+        assert_eq!(session.token_budget, Some(5_000));
+    }
+    let granted = sessions
+        .iter()
+        .filter_map(|session| session.token_budget)
+        .sum::<u64>();
+    assert!(
+        granted <= 10_000,
+        "parallel milestone sessions were granted {granted} of 10,000 tokens"
+    );
+    assert_eq!(
+        engine.programs().reserved_for_program(&program.id).tokens,
+        granted
+    );
+    for session in &sessions {
+        service.cancel(&session.id);
+    }
+}
+
+#[tokio::test]
 async fn cancelling_a_program_cancels_every_non_terminal_milestone() {
     let dir = TempDir::new().unwrap();
     let (engine, service, project) = test_service(&dir);
@@ -22117,10 +22187,377 @@ async fn frozen_tool_bundle_matches_the_role_matrix_and_stays_stable() {
     let unknown_bundle = frozen_tool_bundle(&config, &unknown, &no_mcp);
     assert_eq!(
         unknown_bundle.kind(),
-        crate::tool_bundle::ToolBundleKind::Full
+        crate::tool_bundle::ToolBundleKind::Coding,
+        "an unknown task kind uses the profile default, not the full catalog"
     );
     assert!(unknown_bundle.selection.fallback);
+    assert_eq!(
+        unknown_bundle.selection.reason,
+        "task_kind_unknown_role_default"
+    );
     assert!(unknown_bundle.builtin_count() > minimal_bundle.builtin_count());
+    assert!(unknown_bundle.builtin_count() < crate::tool_bundle::LEADER_TOOL_LIMIT);
+}
+
+#[tokio::test]
+async fn permissive_capabilities_keep_the_legacy_tool_schema_surface() {
+    let dir = TempDir::new().unwrap();
+    let (_engine, service, _project) = test_service(&dir);
+    let config = service
+        .config
+        .read()
+        .unwrap()
+        .as_ref()
+        .expect("test service configured")
+        .clone();
+    let permissive = crate::tool_bundle::ToolCapabilities::default();
+    assert_eq!(permissive, crate::tool_bundle::ToolCapabilities::all());
+    for (role, profile) in [
+        (AgentRole::Leader, AgentProfile::Generic),
+        (AgentRole::Leader, AgentProfile::Coding),
+        (AgentRole::Leader, AgentProfile::Research),
+        (AgentRole::Manager, AgentProfile::Generic),
+        (AgentRole::Manager, AgentProfile::Coding),
+        (AgentRole::Worker, AgentProfile::Coding),
+        (AgentRole::Worker, AgentProfile::Research),
+        (AgentRole::Worker, AgentProfile::Verification),
+        (AgentRole::Worker, AgentProfile::Generic),
+        (AgentRole::Labour, AgentProfile::Coding),
+        (AgentRole::Verifier, AgentProfile::Verification),
+        (AgentRole::Scout, AgentProfile::Research),
+    ] {
+        for allow in [true, false] {
+            let legacy = tool_schemas(&config, role, profile, allow);
+            let gated = tool_schemas_with_capabilities(&config, role, profile, allow, &permissive);
+            let legacy_names = legacy
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>();
+            let gated_names = gated
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                legacy_names,
+                gated_names,
+                "permissive gating changed {}/{}/allow={allow}",
+                role.as_str(),
+                profile.as_str()
+            );
+            assert_eq!(
+                crate::tool_bundle::canonical_tools_hash(&legacy),
+                crate::tool_bundle::canonical_tools_hash(&gated),
+                "permissive gating changed schema bytes for {}",
+                role.as_str()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn capability_gating_hides_conditional_tools_and_keeps_core_surfaces() {
+    let dir = TempDir::new().unwrap();
+    let (_engine, service, _project) = test_service(&dir);
+    let config = service
+        .config
+        .read()
+        .unwrap()
+        .as_ref()
+        .expect("test service configured")
+        .clone();
+    let none = crate::tool_bundle::ToolCapabilities::none();
+    let conditional = [
+        "mcp",
+        "remote_read",
+        "remote_write",
+        "remote_list",
+        "remote_exec",
+        "remote_git",
+        "remote_worktree",
+        "archive_list",
+        "archive_extract",
+        "media_info",
+        "media_transcode",
+        "browser",
+        "computer",
+        "web_search",
+        "publish_artifact_file",
+        "lsp_query",
+    ];
+    for (role, profile) in [
+        (AgentRole::Leader, AgentProfile::Generic),
+        (AgentRole::Leader, AgentProfile::Coding),
+        (AgentRole::Manager, AgentProfile::Coding),
+        (AgentRole::Worker, AgentProfile::Coding),
+        (AgentRole::Worker, AgentProfile::Research),
+        (AgentRole::Worker, AgentProfile::Verification),
+        (AgentRole::Worker, AgentProfile::Generic),
+        (AgentRole::Labour, AgentProfile::Coding),
+        (AgentRole::Verifier, AgentProfile::Verification),
+        (AgentRole::Scout, AgentProfile::Research),
+    ] {
+        let tools = tool_schemas_with_capabilities(&config, role, profile, true, &none);
+        let names = tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>();
+        for absent in conditional {
+            assert!(
+                !names.iter().any(|name| name == absent),
+                "{}/{} advertised {absent} without its capability",
+                role.as_str(),
+                profile.as_str()
+            );
+        }
+        assert!(
+            names.iter().any(|name| name == "read_file"),
+            "{}/{} lost read_file",
+            role.as_str(),
+            profile.as_str()
+        );
+        let unique = names.iter().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "{}/{} advertised duplicate schema names",
+            role.as_str(),
+            profile.as_str()
+        );
+    }
+    // fetch_url is not gated by web search configuration.
+    let leader = tool_schemas_with_capabilities(
+        &config,
+        AgentRole::Leader,
+        AgentProfile::Generic,
+        true,
+        &none,
+    );
+    let leader_names = leader
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(leader_names.contains(&"fetch_url"));
+    // Inline session artifacts are a core surface; file publishing is not.
+    for present in ["publish_artifact", "list_artifacts", "read_artifact"] {
+        assert!(leader_names.contains(&present), "missing core {present}");
+    }
+    assert!(!leader_names.contains(&"publish_artifact_file"));
+    // One capability re-enables only its own surface.
+    let mcp_only = crate::tool_bundle::ToolCapabilities::none()
+        .with(crate::tool_bundle::ToolCapability::Mcp, true);
+    let leader = tool_schemas_with_capabilities(
+        &config,
+        AgentRole::Leader,
+        AgentProfile::Generic,
+        true,
+        &mcp_only,
+    );
+    let names = leader
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"mcp"));
+    assert!(!names.contains(&"web_search"));
+    assert!(names.contains(&"fetch_url"));
+    let archive_only = crate::tool_bundle::ToolCapabilities::none()
+        .with(crate::tool_bundle::ToolCapability::ArchiveMedia, true);
+    let leader = tool_schemas_with_capabilities(
+        &config,
+        AgentRole::Leader,
+        AgentProfile::Generic,
+        true,
+        &archive_only,
+    );
+    assert!(leader.iter().any(|tool| tool.name == "archive_list"));
+    assert!(leader.iter().any(|tool| tool.name == "media_info"));
+    // archive_extract also needs the artifact store.
+    assert!(!leader.iter().any(|tool| tool.name == "archive_extract"));
+}
+
+#[tokio::test]
+async fn leader_orchestrator_bundle_is_read_only_smaller_and_stable() {
+    let dir = TempDir::new().unwrap();
+    let (_engine, service, _project) = test_service(&dir);
+    let config = service
+        .config
+        .read()
+        .unwrap()
+        .as_ref()
+        .expect("test service configured")
+        .clone();
+    let available = tool_schemas(&config, AgentRole::Leader, AgentProfile::Generic, true);
+    let standard = crate::tool_bundle::freeze(
+        crate::tool_bundle::select_bundle("leader", "generic", None),
+        available.clone(),
+        Vec::new(),
+    );
+    let selection = crate::tool_bundle::select_bundle_with_mode(
+        "leader",
+        "generic",
+        None,
+        crate::tool_bundle::ToolBundleMode::LeaderOrchestrator,
+    );
+    let orchestrator = crate::tool_bundle::freeze(selection.clone(), available.clone(), Vec::new());
+    assert_eq!(
+        orchestrator.kind(),
+        crate::tool_bundle::ToolBundleKind::LeaderOrchestrator
+    );
+    assert_eq!(orchestrator.selection.reason, "mode_leader_orchestrator");
+    assert!(!orchestrator.selection.fallback);
+    assert!(
+        orchestrator.omitted.is_empty(),
+        "{:?}",
+        orchestrator.omitted
+    );
+    assert!(
+        orchestrator.builtin_count() <= crate::tool_bundle::LEADER_ORCHESTRATOR_TOOL_LIMIT,
+        "orchestrator advertised {} tools",
+        orchestrator.builtin_count()
+    );
+    assert!(
+        orchestrator.builtin_count() < standard.builtin_count(),
+        "orchestrator {} is not smaller than standard {}",
+        orchestrator.builtin_count(),
+        standard.builtin_count()
+    );
+    assert!(orchestrator.schema_bytes() < standard.schema_bytes());
+    assert!(orchestrator.estimated_tokens() < standard.estimated_tokens());
+    assert_eq!(orchestrator.within_target(), Some(true));
+    for forbidden in [
+        "write_file",
+        "edit_file",
+        "apply_patch",
+        "file_manage",
+        "run_script",
+        "shell",
+        "process",
+        "wait_for",
+        "run_project_task",
+        "project_profile",
+        "local_http",
+        "browser",
+        "computer",
+        "mcp",
+        "remote_write",
+        "remote_exec",
+        "remote_worktree",
+        "publish_artifact_file",
+    ] {
+        assert!(
+            !orchestrator.contains(forbidden),
+            "orchestrator advertised {forbidden}"
+        );
+    }
+    for required in [
+        "read_file",
+        "grep",
+        "git",
+        "recall",
+        "remember",
+        "search_sources",
+        "publish_artifact",
+        "list_artifacts",
+        "read_artifact",
+        "coordinate",
+        "team_status",
+        "delegate",
+        "delegate_acp",
+        "submit_team_plan",
+        "run_team_plan",
+        "deliberate_team_plan",
+        "scout",
+        "task_control",
+        "report_progress",
+        "wait_for_gate",
+        "budget_status",
+        "tool_search",
+    ] {
+        assert!(
+            orchestrator.contains(required),
+            "orchestrator missing {required}"
+        );
+    }
+    let mut names = orchestrator.tool_names();
+    let sorted = {
+        let mut copy = names.clone();
+        copy.sort();
+        copy
+    };
+    assert_eq!(names, sorted, "advertised order must be deterministic");
+    names.dedup();
+    assert_eq!(names.len(), orchestrator.tool_count());
+    let again = crate::tool_bundle::freeze(selection, available, Vec::new());
+    assert_eq!(orchestrator.tool_names(), again.tool_names());
+    assert_eq!(orchestrator.bundle_hash, again.bundle_hash);
+    assert_eq!(orchestrator.tools_hash, again.tools_hash);
+    assert_ne!(orchestrator.tools_hash, standard.tools_hash);
+}
+
+#[tokio::test]
+async fn advertised_tool_schema_budget_is_bounded_for_every_role() {
+    let dir = TempDir::new().unwrap();
+    let (_engine, service, _project) = test_service(&dir);
+    let config = service
+        .config
+        .read()
+        .unwrap()
+        .as_ref()
+        .expect("test service configured")
+        .clone();
+    let permissive = crate::tool_bundle::ToolCapabilities::default();
+    for (role, profile, limit, allow) in [
+        (
+            AgentRole::Leader,
+            AgentProfile::Generic,
+            crate::tool_bundle::LEADER_TOOL_LIMIT,
+            true,
+        ),
+        (
+            AgentRole::Leader,
+            AgentProfile::Coding,
+            crate::tool_bundle::LEADER_TOOL_LIMIT,
+            true,
+        ),
+        (
+            AgentRole::Manager,
+            AgentProfile::Coding,
+            crate::tool_bundle::LEADER_TOOL_LIMIT,
+            true,
+        ),
+        (
+            AgentRole::Worker,
+            AgentProfile::Coding,
+            crate::tool_bundle::CODING_TOOL_LIMIT,
+            true,
+        ),
+        (
+            AgentRole::Labour,
+            AgentProfile::Coding,
+            crate::tool_bundle::CODING_TOOL_LIMIT,
+            false,
+        ),
+    ] {
+        let available = tool_schemas_with_capabilities(&config, role, profile, allow, &permissive);
+        let selection = crate::tool_bundle::select_bundle(
+            role.as_str(),
+            profile.as_str(),
+            Some("implementation"),
+        );
+        let frozen = crate::tool_bundle::freeze(selection, available, Vec::new());
+        assert!(
+            frozen.builtin_count() <= limit,
+            "{} advertised {} tools over the {limit} budget",
+            role.as_str(),
+            frozen.builtin_count()
+        );
+        assert_eq!(frozen.within_target(), Some(true));
+        assert!(
+            frozen.builtin_count() < crate::tool_bundle::BUNDLE_TOOL_CATALOG.len(),
+            "{} advertised the whole catalog",
+            role.as_str()
+        );
+        assert!(frozen.schema_bytes() > 0);
+    }
 }
 
 #[tokio::test]
@@ -22295,13 +22732,22 @@ async fn tool_bundle_now_reports_minimal_worker_and_catalog_without_a_run() {
             tool.name
         );
     }
-    assert_eq!(result.catalog.len(), 6);
+    assert_eq!(result.catalog.len(), 7);
     let leader = result
         .catalog
         .iter()
         .find(|row| row.bundle == "leader")
         .unwrap();
     assert_eq!(leader.target_limit, Some(51));
+    let orchestrator = result
+        .catalog
+        .iter()
+        .find(|row| row.bundle == "leader_orchestrator")
+        .expect("orchestrator catalog row");
+    assert_eq!(
+        orchestrator.target_limit,
+        Some(crate::tool_bundle::LEADER_ORCHESTRATOR_TOOL_LIMIT)
+    );
 
     let snapshot = service
         .tool_bundle_now(&session.id, &[], None, false)
@@ -22651,7 +23097,7 @@ async fn bundle_catalog_is_exposed_through_agent_info_without_warnings() {
     let dir = TempDir::new().unwrap();
     let (_engine, service, _project) = test_service(&dir);
     let catalog = service.tool_bundle_catalog();
-    assert_eq!(catalog.bundles.len(), 6);
+    assert_eq!(catalog.bundles.len(), 7);
     assert!(catalog.warnings.is_empty(), "{:?}", catalog.warnings);
     let names = catalog
         .bundles
@@ -22662,6 +23108,7 @@ async fn bundle_catalog_is_exposed_through_agent_info_without_warnings() {
         names,
         vec![
             "leader",
+            "leader_orchestrator",
             "coding",
             "research",
             "verification",
@@ -22670,9 +23117,23 @@ async fn bundle_catalog_is_exposed_through_agent_info_without_warnings() {
         ]
     );
     let info = service.info();
-    assert_eq!(info.tool_bundles.len(), 6);
-    assert_eq!(info.tool_bundles[4].bundle, "minimal");
-    assert_eq!(info.tool_bundles[4].target_limit, Some(12));
+    assert_eq!(info.tool_bundles.len(), 7);
+    let orchestrator = info
+        .tool_bundles
+        .iter()
+        .find(|row| row.bundle == "leader_orchestrator")
+        .expect("orchestrator catalog row");
+    assert_eq!(
+        orchestrator.target_limit,
+        Some(crate::tool_bundle::LEADER_ORCHESTRATOR_TOOL_LIMIT)
+    );
+    assert!(orchestrator.requested_count < crate::tool_bundle::LEADER_TOOLS.len());
+    let minimal = info
+        .tool_bundles
+        .iter()
+        .find(|row| row.bundle == "minimal")
+        .expect("minimal catalog row");
+    assert_eq!(minimal.target_limit, Some(12));
 }
 
 #[tokio::test]
@@ -22773,8 +23234,19 @@ async fn tool_bundle_matrix_covers_standard_combinations_without_session_state()
     assert_eq!(verifier.bundle, "verification");
     assert_eq!(verifier.builtin_count, 38);
     let unknown = find("worker", "coding", Some("unknown-task-kind"));
-    assert_eq!(unknown.bundle, "full");
+    assert_eq!(unknown.bundle, "coding");
     assert!(unknown.fallback);
+    assert_eq!(unknown.reason, "task_kind_unknown_role_default");
+    assert_eq!(unknown.builtin_count, 39);
+    let missing_kind = find("worker", "coding", None);
+    assert_eq!(missing_kind.bundle, "coding");
+    assert!(missing_kind.fallback);
+    assert_eq!(missing_kind.reason, "no_task_kind_role_default");
+    assert_eq!(missing_kind.builtin_count, 39);
+    let generic_worker = find("worker", "generic", None);
+    assert_eq!(generic_worker.bundle, "minimal");
+    assert!(generic_worker.fallback);
+    assert_eq!(generic_worker.builtin_count, 3);
     let labour = find("labour", "coding", Some("implementation"));
     assert_eq!(labour.bundle, "coding");
     assert_eq!(labour.builtin_count, 37);
@@ -22804,8 +23276,20 @@ async fn tool_bundle_matrix_covers_standard_combinations_without_session_state()
             .rows
             .iter()
             .filter(|row| row.task_kind.as_deref() == Some("custom-unknown"))
-            .all(|row| row.bundle == "full" || row.role != "worker")
+            .all(|row| row.bundle != "full"),
+        "a known role never falls back to the full catalog for an unknown kind"
     );
+    let custom_worker = custom
+        .rows
+        .iter()
+        .find(|row| {
+            row.role == "worker"
+                && row.profile == "coding"
+                && row.task_kind.as_deref() == Some("custom-unknown")
+        })
+        .expect("custom worker row");
+    assert_eq!(custom_worker.bundle, "coding");
+    assert!(custom_worker.fallback);
 }
 
 #[tokio::test]

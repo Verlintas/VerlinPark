@@ -27,6 +27,8 @@ impl Engine {
             time_budget_secs,
             0,
             false,
+            None,
+            None,
         )
         .await
     }
@@ -38,8 +40,18 @@ impl Engine {
         token_budget: Option<u64>,
         priority: i32,
     ) -> Result<Session> {
-        self.create_session_full(project_id, goal, token_budget, None, None, priority, false)
-            .await
+        self.create_session_full(
+            project_id,
+            goal,
+            token_budget,
+            None,
+            None,
+            priority,
+            false,
+            None,
+            None,
+        )
+        .await
     }
 
     /// Create a session with every admission and budget option. This is the
@@ -62,6 +74,8 @@ impl Engine {
             time_budget_secs,
             priority,
             false,
+            None,
+            None,
         )
         .await
     }
@@ -86,6 +100,39 @@ impl Engine {
             time_budget_secs,
             priority,
             unlimited,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Create a session with an explicit budget mode and optional session-level
+    /// auto policy. Auto creation fails closed unless the resolved policy
+    /// declares at least one hard cap; there is no silent unlimited fallback.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_session_with_budget_options(
+        &self,
+        project_id: String,
+        goal: String,
+        token_budget: Option<u64>,
+        cost_budget_usd: Option<f64>,
+        time_budget_secs: Option<u64>,
+        budget_mode: Option<BudgetMode>,
+        auto_budget: Option<AutoBudgetPolicy>,
+        priority: i32,
+        unlimited: bool,
+    ) -> Result<Session> {
+        let budget_mode = budget_mode.or_else(|| auto_budget.as_ref().map(|_| BudgetMode::Auto));
+        self.create_session_full(
+            project_id,
+            goal,
+            token_budget,
+            cost_budget_usd,
+            time_budget_secs,
+            priority,
+            unlimited,
+            budget_mode,
+            auto_budget,
         )
         .await
     }
@@ -100,31 +147,122 @@ impl Engine {
         time_budget_secs: Option<u64>,
         priority: i32,
         unlimited: bool,
+        budget_mode: Option<BudgetMode>,
+        auto_budget: Option<AutoBudgetPolicy>,
     ) -> Result<Session> {
         if !(-100..=100).contains(&priority) {
             anyhow::bail!("session priority must be between -100 and 100");
         }
-        if unlimited
+        let mode = budget_mode.unwrap_or(if unlimited {
+            BudgetMode::Unlimited
+        } else {
+            BudgetMode::Fixed
+        });
+        let unlimited = unlimited || mode == BudgetMode::Unlimited;
+        if unlimited && mode != BudgetMode::Unlimited {
+            return Err(BudgetValidationError::new(
+                auto_budget_codes::BUDGET_MODE_CONFLICT,
+                "an unlimited session cannot also select a fixed or auto budget mode",
+            )
+            .into());
+        }
+        if matches!(mode, BudgetMode::Fixed | BudgetMode::Unlimited) && auto_budget.is_some() {
+            return Err(BudgetValidationError::new(
+                auto_budget_codes::BUDGET_POLICY_NOT_APPLICABLE,
+                "a session auto-budget policy requires budget mode auto",
+            )
+            .into());
+        }
+        if mode == BudgetMode::Unlimited
             && (token_budget.is_some() || cost_budget_usd.is_some() || time_budget_secs.is_some())
         {
-            anyhow::bail!("an unlimited session cannot also declare token, cost, or time budgets");
+            return Err(BudgetValidationError::new(
+                auto_budget_codes::BUDGET_MODE_CONFLICT,
+                "an unlimited session cannot also declare token, cost, or time budgets",
+            )
+            .into());
         }
         if token_budget == Some(0) {
-            anyhow::bail!("token budget must be greater than zero");
+            return Err(BudgetValidationError::new(
+                auto_budget_codes::INVALID_BUDGET,
+                "token budget must be greater than zero",
+            )
+            .into());
         }
         if cost_budget_usd.is_some_and(|value| !value.is_finite() || value <= 0.0) {
-            anyhow::bail!("cost budget must be a positive finite number");
+            return Err(BudgetValidationError::new(
+                auto_budget_codes::INVALID_BUDGET,
+                "cost budget must be a positive finite number",
+            )
+            .into());
         }
         if time_budget_secs == Some(0) {
-            anyhow::bail!("time budget must be greater than zero");
+            return Err(BudgetValidationError::new(
+                auto_budget_codes::INVALID_BUDGET,
+                "time budget must be greater than zero",
+            )
+            .into());
         }
         let store = self.store.clone();
         let project_id_for_load = project_id.clone();
-        let project = tokio::task::spawn_blocking(move || store.get_project(&project_id_for_load))
-            .await??
-            .ok_or_else(|| anyhow::anyhow!("project not found: {project_id}"))?;
+        let (project, project_auto_policy) = tokio::task::spawn_blocking(move || {
+            let project = store
+                .get_project(&project_id_for_load)?
+                .ok_or_else(|| anyhow::anyhow!("project not found: {project_id_for_load}"))?;
+            let policy = store.get_project_auto_budget_policy(&project.id)?;
+            Ok::<_, anyhow::Error>((project, policy))
+        })
+        .await??;
 
+        let mut token_budget = token_budget;
+        let mut cost_budget_usd = cost_budget_usd;
+        let mut time_budget_secs = time_budget_secs;
+        let mut auto_budget_record = None;
         let session_id = Uuid::now_v7().to_string();
+        if mode == BudgetMode::Auto {
+            let policy = match auto_budget {
+                Some(policy) => policy,
+                None => {
+                    if !project_auto_policy.enabled {
+                        return Err(BudgetValidationError::new(
+                            auto_budget_codes::AUTO_BUDGET_POLICY_REQUIRED,
+                            "auto budget requires an enabled project policy or an explicit session policy",
+                        )
+                        .into());
+                    }
+                    project_auto_policy.clone()
+                }
+            };
+            policy.validate()?;
+            policy.require_hard_cap()?;
+            let caps = policy.hard_caps();
+            token_budget = token_budget.or(policy.resolved_initial_token_budget()).or(caps.token);
+            cost_budget_usd = cost_budget_usd
+                .or(policy.resolved_initial_cost_budget_usd())
+                .or(caps.cost_usd);
+            time_budget_secs = time_budget_secs
+                .or(policy.resolved_initial_wall_clock_secs())
+                .or(caps.wall_clock_secs);
+            if let (Some(value), Some(cap)) = (token_budget, caps.token) {
+                token_budget = Some(value.min(cap));
+            }
+            if let (Some(value), Some(cap)) = (cost_budget_usd, caps.cost_usd) {
+                cost_budget_usd = Some(value.min(cap));
+            }
+            if let (Some(value), Some(cap)) = (time_budget_secs, caps.wall_clock_secs) {
+                time_budget_secs = Some(value.min(cap));
+            }
+            let now = vp_protocol::now_rfc3339();
+            auto_budget_record = Some(SessionAutoBudgetRecord {
+                session_id: session_id.clone(),
+                mode: BudgetMode::Auto,
+                policy,
+                state: SessionAutoBudgetState::default(),
+                caps,
+                created_at: now.clone(),
+                updated_at: now,
+            });
+        }
         let session_id_for_worktree = session_id.clone();
         let project_id_for_worktree = project.id.clone();
         let root = PathBuf::from(&project.root);
@@ -154,11 +292,13 @@ impl Engine {
             let worktree_path = worktree_path.clone();
             let branch = branch.clone();
             let base_commit = base_commit.clone();
+            let auto_budget_record = auto_budget_record.clone();
             move || {
-                // The session row and its `session.created` event commit in one
-                // transaction; `db-rebuild` therefore never skips the session
-                // while an orphan worktree remains on disk.
-                store.create_session_with_worktree_and_event(
+                // The session row, its `session.created` event, and the auto
+                // budget row commit in one transaction; `db-rebuild` therefore
+                // never skips the session or its hard caps while an orphan
+                // worktree remains on disk.
+                store.create_session_with_worktree_and_event_budget(
                     &session_id,
                     &project_id,
                     &goal,
@@ -170,6 +310,9 @@ impl Engine {
                     unlimited,
                     &base_commit,
                     priority,
+                    mode,
+                    auto_budget_record.as_ref(),
+                    None,
                 )
             }
         })

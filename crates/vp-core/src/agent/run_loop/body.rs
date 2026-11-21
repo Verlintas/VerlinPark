@@ -183,8 +183,17 @@ pub(in crate::agent) async fn run_loop_body(
         None => crate::contract::MutationUsage::default(),
     };
     let mut identity_memory_telemetry = None;
-    let sections = build_prompt_sections(
+    // Resolve the session tool surface once and use the same frozen bundle for
+    // prompt sections, hashes, context estimates, provider requests, cache warm,
+    // tool_search promotion, and Code Mode bindings.
+    let PromptAssembly {
+        surface,
+        frozen_bundle,
+        sections,
+        dynamic_mcp: dynamic_mcp_tools,
+    } = build_prompt_and_bundle(
         engine,
+        config,
         project,
         session,
         spec,
@@ -193,6 +202,7 @@ pub(in crate::agent) async fn run_loop_body(
         true,
         InstructionBuildMode::Materialize,
         Some(&mut identity_memory_telemetry),
+        Some(&session.id),
     )
     .await?;
     // Tail memory is appended to history once, at the position where it was
@@ -215,13 +225,10 @@ pub(in crate::agent) async fn run_loop_body(
     // Retained for older adapters and the Anthropic legacy fallback. It never
     // contains volatile run context or memory.
     let stable_prefix = sections.stable_prefix();
-    // The tool bundle is frozen for the run. Skill activation is enforced at
-    // execution time, not by filtering schemas mid-run, and dynamic MCP schemas
-    // are sorted and appended exactly once. This is the prefix that every
-    // provider call in the run receives unchanged.
-    let dynamic_mcp_tools =
-        collect_dynamic_mcp_tools(engine, spec.role, &project.id, Some(&session.id)).await;
-    let frozen_bundle = frozen_tool_bundle(config, spec, &dynamic_mcp_tools);
+    // The tool bundle is frozen for the run by `build_prompt_and_bundle`.
+    // Skill activation is enforced at execution time, not by filtering schemas
+    // mid-run, and dynamic MCP schemas are sorted and appended exactly once.
+    // This is the prefix that every provider call in the run receives unchanged.
     let mut tools = frozen_bundle.tools.clone();
     let system_tokens = estimate_context_tokens(&system);
     let mut tool_tokens = serde_json::to_string(&tools)
@@ -311,6 +318,8 @@ pub(in crate::agent) async fn run_loop_body(
         "cache_break_events": crate::conversation::CACHE_BREAK_EVENT,
         "model": model_name,
         "tool_bundle": frozen_bundle.selection.kind.as_str(),
+        "tool_bundle_mode": surface.mode.as_str(),
+        "tool_surface": surface.payload(),
         "tool_bundle_hash": frozen_bundle.bundle_hash,
         "tool_bundle_reason": frozen_bundle.selection.reason,
         "tool_bundle_fallback": frozen_bundle.selection.fallback,
@@ -395,7 +404,7 @@ pub(in crate::agent) async fn run_loop_body(
         &session.id,
         spec,
         "context.tool_bundle",
-        frozen_bundle.manifest_payload(),
+        tool_bundle_manifest_with_surface(&frozen_bundle, surface),
     )
     .await?;
     // Seed miss attribution from the latest persisted ordinary agent call.
@@ -450,7 +459,7 @@ pub(in crate::agent) async fn run_loop_body(
     if resumed && cache_policy.warm_on_resume && !budget.exhausted() {
         // Explicit policy opt-in only. The default is false, so a normal run
         // still makes exactly one provider call per turn.
-        let warm_sections = build_prompt_sections(
+        let warm_sections = build_prompt_sections_with_surface(
             engine,
             project,
             session,
@@ -460,6 +469,8 @@ pub(in crate::agent) async fn run_loop_body(
             false,
             InstructionBuildMode::Materialize,
             None,
+            surface,
+            &frozen_bundle,
         )
         .await?;
         match warm_prompt_cache(
@@ -470,6 +481,7 @@ pub(in crate::agent) async fn run_loop_body(
             budget,
             &warm_sections,
             &tools,
+            surface,
             "resume",
         )
         .await
@@ -540,8 +552,19 @@ pub(in crate::agent) async fn run_loop_body(
         std::collections::BTreeSet::new();
     let mut tool_bundle_revision = 0u32;
     let mut active_bundle_hash = frozen_bundle.bundle_hash.clone();
+    // Only the top-level Leader owns the session auto-budget/turn/no-progress
+    // state. Parallel Workers/Labour/Verifier runs never mutate it.
+    let mut auto_budget = if top_level && spec.role == AgentRole::Leader {
+        AutoBudgetRuntime::load(engine, session).await?
+    } else {
+        None
+    };
+    let max_turns = auto_budget
+        .as_ref()
+        .map(AutoBudgetRuntime::per_run_turn_limit)
+        .unwrap_or(config.max_turns);
 
-    for turn in 0..config.max_turns {
+    for turn in 0..max_turns {
         // A long plan can outlive the assignment/workspace lease taken when
         // the run attached. Renew both at a bounded cadence. Lease loss is an
         // event-backed warning, not a silent switch to the legacy path.
@@ -591,10 +614,23 @@ pub(in crate::agent) async fn run_loop_body(
         if control.is_cancelled() {
             return Ok(LoopOutcome::Cancelled);
         }
+        // Auto budget is evaluated before every top-level Leader provider call.
+        // It may extend a low-runway budget, or pause at the hard cap and wait
+        // for an explicit operator resume/top-up. Fixed/unlimited sessions and
+        // scoped child runs skip this entirely.
+        if let Some(runtime) = auto_budget.as_mut()
+            && !runtime
+                .before_turn(engine, session, spec, control, budget)
+                .await?
+        {
+            return Ok(LoopOutcome::Cancelled);
+        }
         if budget.exhausted() {
             return Ok(LoopOutcome::BudgetExceeded(BudgetStop::session(budget)));
         }
-        if let Some(reason) = budget.warning() {
+        if auto_budget.is_none()
+            && let Some(reason) = budget.warning()
+        {
             emit(
                 engine,
                 &session.id,
@@ -602,11 +638,11 @@ pub(in crate::agent) async fn run_loop_body(
                 "agent.budget_warning",
                 serde_json::json!({
                     "reason": reason,
-                    "limit": budget.limit,
+                    "limit": budget.token_limit(),
                     "spent": budget.spent(),
-                    "cost_limit_usd": budget.cost_limit,
+                    "cost_limit_usd": budget.cost_limit(),
                     "cost_spent_usd": budget.cost_spent(),
-                    "time_budget_secs": budget.time_limit.map(|limit| limit.as_secs()),
+                    "time_budget_secs": budget.time_limit().map(|limit| limit.as_secs()),
                     "elapsed_secs": budget.elapsed_secs(),
                 }),
             )
@@ -617,9 +653,18 @@ pub(in crate::agent) async fn run_loop_body(
         // tool_search result; the next request sees the new schema set.
         if !pending_promotions.is_empty() {
             let candidates = std::mem::take(&mut pending_promotions);
-            let available = tool_schemas(config, spec.role, spec.profile, spec.allow_delegation);
+            let available = tool_schemas_with_capabilities(
+                config,
+                spec.role,
+                spec.profile,
+                spec.allow_delegation,
+                &surface.capabilities,
+            );
             let mut added = Vec::new();
             for name in candidates {
+                if !surface.capabilities.allows_tool(&name) {
+                    continue;
+                }
                 if tools.iter().any(|tool| tool.name == name) {
                     continue;
                 }
@@ -653,6 +698,8 @@ pub(in crate::agent) async fn run_loop_body(
                         "bundle.revision",
                         serde_json::json!({
                             "bundle": frozen_bundle.selection.kind.as_str(),
+                            "tool_bundle_mode": surface.mode.as_str(),
+                            "tool_surface": surface.payload(),
                             "revision": tool_bundle_revision,
                             "applied": false,
                             "reason": "context_limit",
@@ -701,6 +748,8 @@ pub(in crate::agent) async fn run_loop_body(
                         "bundle.revision",
                         serde_json::json!({
                             "bundle": frozen_bundle.selection.kind.as_str(),
+                            "tool_bundle_mode": surface.mode.as_str(),
+                            "tool_surface": surface.payload(),
                             "revision": tool_bundle_revision,
                             "applied": true,
                             "previous_tools_hash": old_tools_hash,
@@ -994,7 +1043,7 @@ pub(in crate::agent) async fn run_loop_body(
             .await?;
             warned_project = true;
         }
-        let mut desired_output = if !budget.is_unlimited() && budget.limit.is_some() {
+        let mut desired_output = if !budget.is_unlimited() && budget.token_limit().is_some() {
             let remaining = budget.available_tokens().unwrap_or(0);
             if remaining <= input_estimate.saturating_add(MIN_OUTPUT_TOKENS) {
                 return Ok(LoopOutcome::BudgetExceeded(BudgetStop::session_tokens(
@@ -1009,8 +1058,8 @@ pub(in crate::agent) async fn run_loop_body(
         // task id with the normal scope requests. A non-critical request is
         // clamped to the free headroom, or deferred with a typed reason, but
         // never above the session/project/department hard budget.
-        let governor_budget = if budget.limit.is_some() {
-            (budget.available_tokens(), budget.limit)
+        let governor_budget = if budget.token_limit().is_some() {
+            (budget.available_tokens(), budget.token_limit())
         } else if let Some(limit) = plan_budget.project_tokens {
             (Some(limit.saturating_sub(project_spent.0)), Some(limit))
         } else {
@@ -1102,7 +1151,7 @@ pub(in crate::agent) async fn run_loop_body(
             .as_ref()
             .map_or(desired_output, |lease| lease.granted_output_tokens());
         let mut token_reservation = None;
-        if !budget.is_unlimited() && budget.limit.is_some() {
+        if !budget.is_unlimited() && budget.token_limit().is_some() {
             let Some(reservation) =
                 budget.reserve_tokens(input_estimate.saturating_add(output_budget))
             else {
@@ -1616,6 +1665,23 @@ pub(in crate::agent) async fn run_loop_body(
                 serde_json::json!({"turn": turn + 1}),
             )
             .await?;
+            if let Some(runtime) = auto_budget.as_mut() {
+                let current_turn = runtime.current_turn();
+                if !runtime
+                    .finish_turn(
+                        engine,
+                        session,
+                        spec,
+                        control,
+                        budget,
+                        current_turn,
+                        false,
+                    )
+                    .await?
+                {
+                    return Ok(LoopOutcome::Cancelled);
+                }
+            }
             return Ok(LoopOutcome::Final(text));
         }
 
@@ -1992,6 +2058,23 @@ pub(in crate::agent) async fn run_loop_body(
                     serde_json::json!({"turn": turn + 1, "parallel": true}),
                 )
                 .await?;
+                if let Some(runtime) = auto_budget.as_mut() {
+                    let current_turn = runtime.current_turn();
+                    if !runtime
+                        .finish_turn(
+                            engine,
+                            session,
+                            spec,
+                            control,
+                            budget,
+                            current_turn,
+                            true,
+                        )
+                        .await?
+                    {
+                        return Ok(LoopOutcome::Cancelled);
+                    }
+                }
                 continue;
             }
         }
@@ -2025,11 +2108,29 @@ pub(in crate::agent) async fn run_loop_body(
             &tool_context,
             &plan_budget,
             &frozen_bundle,
+            surface,
             &tools,
         )
         .await?
         {
             return Ok(outcome);
+        }
+        if let Some(runtime) = auto_budget.as_mut() {
+            let current_turn = runtime.current_turn();
+            if !runtime
+                .finish_turn(
+                    engine,
+                    session,
+                    spec,
+                    control,
+                    budget,
+                    current_turn,
+                    true,
+                )
+                .await?
+            {
+                return Ok(LoopOutcome::Cancelled);
+            }
         }
     }
 

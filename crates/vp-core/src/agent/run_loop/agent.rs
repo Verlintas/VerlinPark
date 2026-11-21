@@ -52,7 +52,9 @@ pub(in crate::agent) async fn run_agent(
         session_workspace_id: None,
         parent_workspace_id: None,
     };
-    let budget = SessionBudget::new(
+    let budget_status = engine.session_budget(&session.id).await?;
+    let auto_active = budget_status.mode == BudgetMode::Auto && !budget_status.unlimited;
+    let mut budget = SessionBudget::new(
         session.token_budget,
         session.tokens_in + session.tokens_out,
         AgentCaps {
@@ -70,6 +72,19 @@ pub(in crate::agent) async fn run_agent(
         config.max_workers,
         config.max_labour,
     ));
+    if auto_active {
+        // Auto wall-clock is cumulative across runs. Seed the existing spend
+        // and apply the persisted effective budgets; the loop re-reads them at
+        // every turn boundary so a top-up lands without a restart.
+        let elapsed_secs = budget_status
+            .state
+            .as_ref()
+            .map(|state| state.elapsed_secs)
+            .unwrap_or(0);
+        budget = budget.with_cumulative_elapsed(elapsed_secs);
+        budget.apply_status(&budget_status);
+        budget.set_remaining_time(budget_status.remaining_secs);
+    }
     control.arm_preemption_deadline(
         budget.wall_clock_deadline(),
         engine.get_preemption_policy(&session.project_id).await?,
@@ -97,7 +112,7 @@ pub(in crate::agent) async fn run_agent(
             .await?
         }
     };
-    if budget.exhausted() {
+    if budget.exhausted() && !auto_active {
         if let Err(error) = journal
             .finish_failed(
                 &engine,

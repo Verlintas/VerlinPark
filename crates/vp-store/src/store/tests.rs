@@ -12089,6 +12089,7 @@ fn context_checkpoint_bundle_validation_checks_session_and_project() {
         team_templates: Vec::new(),
         project_team_templates: Vec::new(),
         team_template_events: Vec::new(),
+        session_auto_budget: None,
     };
     validate_session_bundle(&bundle).unwrap();
     bundle.context_checkpoints[0].project_id = "other-project".into();
@@ -12371,6 +12372,7 @@ fn importing_a_projection_only_bundle_synthesizes_checkpoint_events() {
         team_templates: Vec::new(),
         project_team_templates: Vec::new(),
         team_template_events: Vec::new(),
+        session_auto_budget: None,
     };
     let imported = Store::open(data.path().join("imported")).unwrap();
     imported.import_session_bundle(&bundle).unwrap();
@@ -14254,6 +14256,7 @@ fn bundle_import_preserves_supervised_process_lifecycle_rows() {
         team_templates: Vec::new(),
         project_team_templates: Vec::new(),
         team_template_events: Vec::new(),
+        session_auto_budget: None,
     };
     validate_session_bundle(&bundle).unwrap();
     let data = TempDir::new().unwrap();
@@ -14347,6 +14350,7 @@ fn supervised_process_bundle_validation_rejects_wrong_session() {
         team_templates: Vec::new(),
         project_team_templates: Vec::new(),
         team_template_events: Vec::new(),
+        session_auto_budget: None,
     };
     let error = validate_session_bundle(&bundle).unwrap_err();
     assert!(error.to_string().contains("belongs to session"), "{error}");
@@ -16595,6 +16599,7 @@ fn bundle_import_preserves_instruction_state_and_rejects_missing_blobs() {
         team_templates: Vec::new(),
         project_team_templates: Vec::new(),
         team_template_events: Vec::new(),
+        session_auto_budget: None,
     };
     store.import_session_bundle(&bundle).unwrap();
     assert_eq!(
@@ -16687,6 +16692,7 @@ fn bundle_import_rejects_a_corrupt_instruction_blob() {
         team_templates: Vec::new(),
         project_team_templates: Vec::new(),
         team_template_events: Vec::new(),
+        session_auto_budget: None,
     };
     assert!(store.import_session_bundle(&bundle).is_err());
 }
@@ -19504,6 +19510,7 @@ fn empty_session_bundle(project: Project, session: Session) -> vp_protocol::type
         team_templates: Vec::new(),
         project_team_templates: Vec::new(),
         team_template_events: Vec::new(),
+        session_auto_budget: None,
     }
 }
 

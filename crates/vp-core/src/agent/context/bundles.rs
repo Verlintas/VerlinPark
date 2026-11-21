@@ -16,6 +16,7 @@ pub(in crate::agent) async fn warm_prompt_cache(
     budget: &SessionBudget,
     sections: &crate::prompt_cache::PromptSections,
     tools: &[ToolSchema],
+    surface: ToolSurface,
     source: &str,
 ) -> Result<SessionCacheWarmResult> {
     let model = model_for(config, spec.role);
@@ -84,7 +85,7 @@ pub(in crate::agent) async fn warm_prompt_cache(
         tools: tools.to_vec(),
     };
     let input_estimate = estimate_request_tokens(&request);
-    let reserve = !budget.is_unlimited() && budget.limit.is_some();
+    let reserve = !budget.is_unlimited() && budget.token_limit().is_some();
     let reservation = if reserve {
         budget.reserve_tokens(input_estimate.saturating_add(32))
     } else {
@@ -226,6 +227,8 @@ pub(in crate::agent) async fn warm_prompt_cache(
         },
         "cache_breakpoints": plan.breakpoints,
         "cache_ttl": plan.ttl.as_str(),
+        "tool_bundle_mode": surface.mode.as_str(),
+        "tool_surface": surface.payload(),
         "cache_ttl_explicit": plan.ttl_explicit,
         "cache_automatic": plan.automatic,
         "first_token_ms": first_token_ms,
@@ -321,6 +324,249 @@ pub(in crate::agent) fn default_profile_for_preview(role: AgentRole) -> AgentPro
         }
         AgentRole::Verifier => AgentProfile::Verification,
         AgentRole::Scout => AgentProfile::Research,
+    }
+}
+
+/// The selected advertisement surface for one run.
+///
+/// `mode` chooses the standard role partition or the opt-in read-only Leader
+/// orchestrator partition. `capabilities` gates conditional schemas and dynamic
+/// MCP tools. Both are computed once per run and reused by the initial frozen
+/// bundle, prompt hashes, cache warm/plan, compaction, and checkpoints so those
+/// paths cannot mix hashes from a different surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::agent) struct ToolSurface {
+    pub mode: crate::tool_bundle::ToolBundleMode,
+    pub capabilities: crate::tool_bundle::ToolCapabilities,
+    /// Stable reason recorded in prompt/cache telemetry.
+    pub reason: &'static str,
+}
+
+impl ToolSurface {
+    /// Historical behavior: standard role/task-kind partition with every
+    /// conditional capability visible.
+    pub(in crate::agent) fn standard() -> Self {
+        Self {
+            mode: crate::tool_bundle::ToolBundleMode::Standard,
+            capabilities: crate::tool_bundle::ToolCapabilities::default(),
+            reason: "standard",
+        }
+    }
+
+    /// Standard partition with an explicit capability probe.
+    pub(in crate::agent) fn standard_with(
+        capabilities: crate::tool_bundle::ToolCapabilities,
+        reason: &'static str,
+    ) -> Self {
+        Self {
+            mode: crate::tool_bundle::ToolBundleMode::Standard,
+            capabilities,
+            reason,
+        }
+    }
+
+    /// Read-only Leader orchestration partition.
+    pub(in crate::agent) fn leader_orchestrator(
+        capabilities: crate::tool_bundle::ToolCapabilities,
+    ) -> Self {
+        Self {
+            mode: crate::tool_bundle::ToolBundleMode::LeaderOrchestrator,
+            capabilities,
+            reason: "auto_adaptive_leader_orchestrator",
+        }
+    }
+
+    /// Hash/telemetry shape. `ToolCapabilities::payload` already includes the
+    /// deterministic `gated_off` list.
+    pub(in crate::agent) fn payload(self) -> Value {
+        serde_json::json!({
+            "mode": self.mode.as_str(),
+            "reason": self.reason,
+            "capabilities": self.capabilities.payload(),
+        })
+    }
+}
+
+/// Resolve the tool surface once for a run from the persisted budget mode.
+///
+/// - `fixed` and `unlimited` keep the historical standard partition and the
+///   permissive capability default, so no existing schema bytes move.
+/// - `auto` with `auto_tool_bundle = false` is explicit solo/manual behavior:
+///   also the historical standard surface.
+/// - `auto` with `auto_tool_bundle = true` probes capabilities. The Leader gets
+///   the read-only orchestrator bundle only when a stored TeamPlan has at least
+///   one task; with no plan or an empty plan it keeps the standard writable
+///   surface (`auto_leader_no_plan_standard`) so the default Auto preset can
+///   still handle a simple first coding task. Manager/Worker/Labour/Verifier/
+///   Scout keep the standard role partition with the same probed capabilities.
+///
+/// A budget-probe or plan-probe failure falls back to the historical standard/
+/// permissive surface rather than silently removing tools. Capability probes
+/// are best-effort and permissive per dimension: an error keeps that capability
+/// visible, while a successful "not configured" result hides only the tools it
+/// gates.
+pub(in crate::agent) async fn resolve_tool_surface(
+    engine: &Engine,
+    session: &Session,
+    spec: &AgentSpec,
+) -> ToolSurface {
+    let status = match engine.session_budget(&session.id).await {
+        Ok(status) => status,
+        Err(error) => {
+            tracing::warn!(%error, session_id = %session.id, "tool surface budget probe failed; keeping the standard surface");
+            return ToolSurface::standard();
+        }
+    };
+    if status.mode != BudgetMode::Auto {
+        let reason = match status.mode {
+            BudgetMode::Unlimited => "unlimited_standard",
+            _ => "fixed_standard",
+        };
+        return ToolSurface::standard_with(crate::tool_bundle::ToolCapabilities::default(), reason);
+    }
+    let policy = status.policy.unwrap_or_default();
+    if !policy.auto_tool_bundle {
+        return ToolSurface::standard_with(
+            crate::tool_bundle::ToolCapabilities::default(),
+            "auto_tool_bundle_disabled_standard",
+        );
+    }
+    let capabilities = probe_tool_capabilities(engine, &session.project_id).await;
+    if spec.role == AgentRole::Leader {
+        // Auto is the default preset and small coding sessions start without a
+        // TeamPlan. Hiding workspace/shell tools before a plan exists would
+        // leave the Leader unable to implement a simple first task. The
+        // orchestrator surface is therefore opt-in to an actual stored plan.
+        match engine.get_team_plan(&session.id).await {
+            Ok(Some(plan)) if !plan.tasks.is_empty() => {
+                ToolSurface::leader_orchestrator(capabilities)
+            }
+            Ok(_) => ToolSurface::standard_with(capabilities, "auto_leader_no_plan_standard"),
+            Err(error) => {
+                tracing::warn!(%error, session_id = %session.id, "TeamPlan probe failed; keeping the writable Leader standard surface");
+                ToolSurface::standard_with(
+                    capabilities,
+                    "auto_leader_plan_probe_failed_standard",
+                )
+            }
+        }
+    } else {
+        ToolSurface::standard_with(capabilities, "auto_adaptive_role_standard")
+    }
+}
+
+/// Best-effort capability probe for conditional advertisement.
+///
+/// The probe deliberately does not inspect PATH for the packaged browser or
+/// computer helpers. Those helpers live inside the app bundle and are normally
+/// discovered by their own runtime status path, so a PATH miss would hide a
+/// working tool. They stay advertised unless one of the explicit disable flags
+/// (`VERLINPARK_BROWSER_TOOLS`, `VERLINPARK_BROWSER_TOOL`,
+/// `VERLINPARK_DISABLE_BROWSER`, or the computer equivalents) is falsey.
+///
+/// LSP has no cheap, side-effect-free server probe; it defaults to available and
+/// an unavailable server is reported as a typed `LSP_UNAVAILABLE` tool error.
+/// The artifact store also defaults to available because `ArtifactPolicy` has no
+/// enabled bit; a failed policy read is permissive.
+async fn probe_tool_capabilities(
+    engine: &Engine,
+    project_id: &str,
+) -> crate::tool_bundle::ToolCapabilities {
+    let mut capabilities = crate::tool_bundle::ToolCapabilities::none();
+    capabilities.mcp_configured = match engine.list_mcp_servers().await {
+        Ok(result) => result.servers.iter().any(|server| server.enabled),
+        Err(error) => {
+            tracing::warn!(%error, "MCP capability probe failed; keeping MCP visible");
+            true
+        }
+    };
+    capabilities.remote_host_configured = match engine.get_execution_host(project_id).await {
+        Ok(host) => host.mode == vp_protocol::remote::ExecutionHostMode::Ssh,
+        Err(error) => {
+            tracing::warn!(%error, "remote-host capability probe failed; keeping remote tools visible");
+            true
+        }
+    };
+    capabilities.archive_media_available =
+        archive_media_available_from(&crate::tooling::media::MediaTools::discover());
+    capabilities.browser_helper_available =
+        gui_tool_available_from("browser", |name| std::env::var(name).ok());
+    capabilities.computer_helper_available =
+        gui_tool_available_from("computer", |name| std::env::var(name).ok());
+    capabilities.web_search_configured =
+        web_search_configured_from(|name| std::env::var(name).ok());
+    capabilities.artifacts_enabled = match engine.get_artifact_policy(project_id).await {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::warn!(%error, "artifact policy probe failed; keeping file artifacts visible");
+            true
+        }
+    };
+    // A missing LSP server is a typed tool error, not a reason to hide the
+    // whole code-intelligence surface.
+    capabilities.lsp_available = true;
+    capabilities
+}
+
+/// The archive/media gate is one combined capability. Archive readers are pure
+/// Rust, but media metadata/transcoding needs one host helper; advertise the
+/// combined surface when at least one trusted media tool exists.
+pub(in crate::agent) fn archive_media_available_from(
+    tools: &crate::tooling::media::MediaTools,
+) -> bool {
+    tools.ffprobe.is_some() || tools.ffmpeg.is_some() || tools.sips.is_some()
+}
+
+/// GUI helpers are advertised by default. Only an explicit falsey disable flag
+/// hides them; a PATH probe is intentionally not used. Shared with tests via an
+/// injected environment lookup so the decision is deterministic.
+pub(in crate::agent) fn gui_tool_available_from(
+    kind: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> bool {
+    let names: &[&str] = match kind {
+        "browser" => &[
+            "VERLINPARK_BROWSER_TOOLS",
+            "VERLINPARK_BROWSER_TOOL",
+            "VERLINPARK_DISABLE_BROWSER",
+        ],
+        "computer" => &[
+            "VERLINPARK_COMPUTER_TOOLS",
+            "VERLINPARK_COMPUTER_TOOL",
+            "VERLINPARK_DISABLE_COMPUTER",
+        ],
+        _ => return true,
+    };
+    !names.iter().any(|name| {
+        lookup(name).is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no" | "disabled"
+            )
+        })
+    })
+}
+
+/// Mirror the provider configuration check in `tooling/web.rs` without
+/// widening that module's private config type. `searxng` needs an endpoint;
+/// `brave` and `tavily` need an API key. Unknown providers are not advertised.
+pub(in crate::agent) fn web_search_configured_from(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> bool {
+    let provider = lookup("VERLINPARK_SEARCH_PROVIDER")
+        .unwrap_or_else(|| "searxng".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    let endpoint = lookup("VERLINPARK_SEARCH_ENDPOINT")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let api_key = lookup("VERLINPARK_SEARCH_API_KEY")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    match provider.as_str() {
+        "searxng" => endpoint.is_some(),
+        "brave" | "tavily" => api_key.is_some(),
+        _ => false,
     }
 }
 
@@ -467,30 +713,79 @@ pub(in crate::agent) fn preview_spec(
 /// Deterministic tool-bundle selection for one run. The role decides the
 /// surface family; a known plan task kind partitions Worker/Labour work. The
 /// result is computed once and frozen for the whole run.
-pub(in crate::agent) fn tool_bundle_selection(
+pub(in crate::agent) fn tool_bundle_selection_with_surface(
     spec: &AgentSpec,
+    surface: ToolSurface,
 ) -> crate::tool_bundle::ToolBundleSelection {
-    crate::tool_bundle::select_bundle(
+    crate::tool_bundle::select_bundle_with_mode(
         spec.role.as_str(),
         spec.profile.as_str(),
         spec.task_kind.as_deref(),
+        surface.mode,
     )
 }
 
 /// Build the exact tool prefix the provider will see: role policy first, then
 /// the named bundle filter, then dynamic MCP schemas sorted and appended once.
 /// This is the only production path that constructs provider tool schemas.
+///
+/// This legacy entry point keeps the historical standard/permissive surface so
+/// existing callers and tests keep identical bytes. New runtime paths resolve a
+/// [`ToolSurface`] once and call [`frozen_tool_bundle_with_surface`].
 pub(in crate::agent) fn frozen_tool_bundle(
     config: &AgentConfig,
     spec: &AgentSpec,
     mcp: &[McpToolBinding],
 ) -> crate::tool_bundle::FrozenToolBundle {
-    let available = tool_schemas(config, spec.role, spec.profile, spec.allow_delegation);
-    let mcp_schemas = mcp
-        .iter()
-        .map(|binding| binding.schema.clone())
-        .collect::<Vec<_>>();
-    crate::tool_bundle::freeze(tool_bundle_selection(spec), available, mcp_schemas)
+    frozen_tool_bundle_with_surface(config, spec, mcp, ToolSurface::standard())
+}
+
+/// Freeze one bundle from an already-resolved surface. Capability gating is
+/// applied through the schema builder; dynamic MCP schemas are appended only
+/// when MCP is available and the selected mode is not the read-only Leader
+/// orchestrator (MCP tools can mutate external state, so they are not part of a
+/// read-only Leader surface). Delegation/Worker roles keep dynamic MCP.
+pub(in crate::agent) fn frozen_tool_bundle_with_surface(
+    config: &AgentConfig,
+    spec: &AgentSpec,
+    mcp: &[McpToolBinding],
+    surface: ToolSurface,
+) -> crate::tool_bundle::FrozenToolBundle {
+    let available = tool_schemas_with_capabilities(
+        config,
+        spec.role,
+        spec.profile,
+        spec.allow_delegation,
+        &surface.capabilities,
+    );
+    let selection = tool_bundle_selection_with_surface(spec, surface);
+    let mcp_schemas = if surface.capabilities.mcp_configured
+        && surface.mode != crate::tool_bundle::ToolBundleMode::LeaderOrchestrator
+    {
+        mcp.iter()
+            .map(|binding| binding.schema.clone())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    crate::tool_bundle::freeze(selection, available, mcp_schemas)
+}
+
+/// Durable manifest payload with the surface metadata that explains why a
+/// conditional tool was omitted. Used by `context.tool_bundle`.
+pub(in crate::agent) fn tool_bundle_manifest_with_surface(
+    frozen_bundle: &crate::tool_bundle::FrozenToolBundle,
+    surface: ToolSurface,
+) -> Value {
+    let mut payload = frozen_bundle.manifest_payload();
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "bundle_mode".into(),
+            serde_json::json!(surface.mode.as_str()),
+        );
+        object.insert("surface".into(), surface.payload());
+    }
+    payload
 }
 
 /// Preview an explicitly named bundle without changing the role-derived
@@ -550,5 +845,474 @@ pub(in crate::agent) fn prompt_prefix_fingerprint(
         tool_bundle_hash,
         stable_system_hash,
         prefix_hash,
+    }
+}
+
+#[cfg(test)]
+mod tool_surface_tests {
+    use super::*;
+    use std::path::Path;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn init_repo(path: &Path) {
+        std::fs::write(path.join("README.md"), "hello\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@verlinpark.local"],
+            vec!["config", "user.name", "VerlinPark Test"],
+            vec!["add", "."],
+            vec!["commit", "-q", "-m", "initial"],
+        ] {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+    }
+
+    async fn fixture() -> (TempDir, TempDir, Engine, Project) {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let project = engine
+            .add_project(
+                repo.path().to_string_lossy().to_string(),
+                Some("tool-surface".into()),
+            )
+            .await
+            .unwrap();
+        (data, repo, engine, project)
+    }
+
+    fn test_config(engine: &Engine) -> AgentConfig {
+        AgentConfig {
+            provider: Arc::new(vp_providers::openai::ScriptedProvider::new(
+                "test",
+                Vec::new(),
+            )),
+            provider_name: "test".into(),
+            model: "test-model".into(),
+            role_models: RoleModels::default(),
+            base_url: None,
+            max_turns: 4,
+            max_tokens: Some(1024),
+            max_managers: 5,
+            max_workers: 10,
+            max_labour: 20,
+            auto_expand_workers: false,
+            integration_command: None,
+            tools: ToolRegistry::default_tools(),
+            max_active_sessions: 1,
+            scope_locks: Arc::new(ScopeLocks::with_store(engine.store().clone())),
+            capacity: Arc::new(CapacityController::new(10, 20)),
+            provider_idle_timeout_secs: 300,
+            question_timeout_secs: 1800,
+            approval_mode: ApprovalMode::default(),
+            approval_timeout_secs: 600,
+            compact_after_tokens: 0,
+            compact_keep_messages: 8,
+            compact_keep_tokens: 1_000_000,
+            compact_prepare_ratio: 0.6,
+            context_window: 128_000,
+        }
+    }
+
+    async fn auto_session(
+        engine: &Engine,
+        project_id: &str,
+        auto_tool_bundle: bool,
+    ) -> Session {
+        let policy = AutoBudgetPolicy {
+            enabled: true,
+            initial_token_budget: Some(10_000),
+            hard_token_cap: Some(20_000),
+            auto_tool_bundle,
+            ..AutoBudgetPolicy::default()
+        };
+        engine
+            .create_session_with_budget_options(
+                project_id.to_string(),
+                "tool surface".into(),
+                None,
+                None,
+                None,
+                Some(BudgetMode::Auto),
+                Some(policy),
+                0,
+                false,
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn fixed_session(engine: &Engine, project_id: &str) -> Session {
+        engine
+            .create_session_with_budget_options(
+                project_id.to_string(),
+                "fixed tool surface".into(),
+                Some(10_000),
+                None,
+                None,
+                Some(BudgetMode::Fixed),
+                None,
+                0,
+                false,
+            )
+            .await
+            .unwrap()
+    }
+
+    fn test_plan_task() -> vp_protocol::types::PlanTask {
+        vp_protocol::types::PlanTask {
+            id: "task-1".to_string(),
+            department: "implementation".to_string(),
+            title: "implement".to_string(),
+            kind: "coding".to_string(),
+            priority: 0,
+            profile: None,
+            deps: Vec::new(),
+            write_scope: Vec::new(),
+            acceptance: Vec::new(),
+            token_budget: None,
+            cost_budget_usd: None,
+            parent_task_id: None,
+            fanout_key: None,
+            fanout_join_for: None,
+        }
+    }
+
+    fn store_test_plan(engine: &Engine, session: &Session, with_task: bool) {
+        let plan = vp_protocol::types::TeamPlan {
+            goal: "tool surface plan".to_string(),
+            departments: vec![vp_protocol::types::PlanDepartment {
+                name: "implementation".to_string(),
+                manager_title: "Implementation".to_string(),
+                profile: "coding".to_string(),
+                objective: "implement the task".to_string(),
+                token_budget: None,
+                cost_budget_usd: None,
+            }],
+            tasks: if with_task {
+                vec![test_plan_task()]
+            } else {
+                Vec::new()
+            },
+        };
+        engine
+            .store()
+            .set_team_plan(&session.id, &serde_json::to_string(&plan).unwrap())
+            .unwrap();
+    }
+
+    fn assert_no_duplicate_tools(bundle: &crate::tool_bundle::FrozenToolBundle) {
+        let mut names = bundle
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        let unique = names
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(names.len(), unique.len(), "duplicate advertised tools");
+    }
+
+    #[tokio::test]
+    async fn auto_leader_uses_read_only_orchestrator_surface() {
+        let (_data, _repo, engine, project) = fixture().await;
+        let session = auto_session(&engine, &project.id, true).await;
+        store_test_plan(&engine, &session, true);
+        let spec = preview_spec(AgentRole::Leader, AgentProfile::Coding, None);
+        let surface = resolve_tool_surface(&engine, &session, &spec).await;
+        assert_eq!(
+            surface.mode,
+            crate::tool_bundle::ToolBundleMode::LeaderOrchestrator
+        );
+        assert_eq!(surface.reason, "auto_adaptive_leader_orchestrator");
+
+        let config = test_config(&engine);
+        let frozen = frozen_tool_bundle_with_surface(&config, &spec, &[], surface);
+        assert_eq!(
+            frozen.selection.kind,
+            crate::tool_bundle::ToolBundleKind::LeaderOrchestrator
+        );
+        for expected in [
+            "read_file",
+            "grep",
+            "submit_team_plan",
+            "plan_fanout",
+            "run_team_plan",
+            "delegate",
+            "tool_search",
+        ] {
+            assert!(frozen.contains(expected), "missing {expected}");
+        }
+        for absent in [
+            "shell",
+            "write_file",
+            "edit_file",
+            "apply_patch",
+            "run_script",
+            "computer",
+            "browser",
+            "mcp",
+        ] {
+            assert!(!frozen.contains(absent), "unexpected {absent}");
+        }
+        assert_no_duplicate_tools(&frozen);
+    }
+
+    #[tokio::test]
+    async fn auto_leader_without_a_plan_keeps_the_standard_coding_surface() {
+        let (_data, _repo, engine, project) = fixture().await;
+        let session = auto_session(&engine, &project.id, true).await;
+        let spec = preview_spec(AgentRole::Leader, AgentProfile::Coding, None);
+        let surface = resolve_tool_surface(&engine, &session, &spec).await;
+        assert_eq!(surface.mode, crate::tool_bundle::ToolBundleMode::Standard);
+        assert_eq!(surface.reason, "auto_leader_no_plan_standard");
+        let config = test_config(&engine);
+        let frozen = frozen_tool_bundle_with_surface(&config, &spec, &[], surface);
+        assert!(frozen.contains("shell"));
+        assert!(frozen.contains("write_file"));
+        assert!(frozen.contains("apply_patch"));
+
+        store_test_plan(&engine, &session, false);
+        let surface = resolve_tool_surface(&engine, &session, &spec).await;
+        assert_eq!(surface.mode, crate::tool_bundle::ToolBundleMode::Standard);
+        assert_eq!(surface.reason, "auto_leader_no_plan_standard");
+
+        // Replacing the empty plan with a one-task plan selects the read-only
+        // orchestrator surface.
+        store_test_plan(&engine, &session, true);
+        let surface = resolve_tool_surface(&engine, &session, &spec).await;
+        assert_eq!(
+            surface.mode,
+            crate::tool_bundle::ToolBundleMode::LeaderOrchestrator
+        );
+        assert_eq!(surface.reason, "auto_adaptive_leader_orchestrator");
+    }
+
+    #[tokio::test]
+    async fn fixed_leader_keeps_the_standard_surface() {
+        let (_data, _repo, engine, project) = fixture().await;
+        let session = fixed_session(&engine, &project.id).await;
+        let spec = preview_spec(AgentRole::Leader, AgentProfile::Coding, None);
+        let surface = resolve_tool_surface(&engine, &session, &spec).await;
+        assert_eq!(surface.mode, crate::tool_bundle::ToolBundleMode::Standard);
+        assert_eq!(
+            surface.capabilities,
+            crate::tool_bundle::ToolCapabilities::default()
+        );
+        assert_eq!(surface.reason, "fixed_standard");
+
+        let config = test_config(&engine);
+        let frozen = frozen_tool_bundle_with_surface(&config, &spec, &[], surface);
+        assert_eq!(
+            frozen.selection.kind,
+            crate::tool_bundle::ToolBundleKind::Leader
+        );
+        for expected in ["shell", "write_file", "apply_patch", "browser", "computer"] {
+            assert!(frozen.contains(expected), "missing {expected}");
+        }
+        assert_no_duplicate_tools(&frozen);
+    }
+
+    #[tokio::test]
+    async fn auto_without_auto_tool_bundle_is_explicitly_standard() {
+        let (_data, _repo, engine, project) = fixture().await;
+        let session = auto_session(&engine, &project.id, false).await;
+        let spec = preview_spec(AgentRole::Leader, AgentProfile::Generic, None);
+        let surface = resolve_tool_surface(&engine, &session, &spec).await;
+        assert_eq!(surface.mode, crate::tool_bundle::ToolBundleMode::Standard);
+        assert_eq!(
+            surface.capabilities,
+            crate::tool_bundle::ToolCapabilities::default()
+        );
+        assert_eq!(surface.reason, "auto_tool_bundle_disabled_standard");
+    }
+
+    #[tokio::test]
+    async fn auto_manager_stays_standard_with_probed_capabilities() {
+        let (_data, _repo, engine, project) = fixture().await;
+        let session = auto_session(&engine, &project.id, true).await;
+        let spec = preview_spec(AgentRole::Manager, AgentProfile::Generic, None);
+        let surface = resolve_tool_surface(&engine, &session, &spec).await;
+        assert_eq!(surface.mode, crate::tool_bundle::ToolBundleMode::Standard);
+        assert_eq!(surface.reason, "auto_adaptive_role_standard");
+        // No MCP servers, remote host, or media helpers were configured in the
+        // fixture, so the probe reports those dimensions absent.
+        assert!(!surface.capabilities.mcp_configured);
+        assert!(!surface.capabilities.remote_host_configured);
+    }
+
+    #[tokio::test]
+    async fn absent_capabilities_remove_conditional_tools() {
+        let (_data, _repo, engine, project) = fixture().await;
+        let config = test_config(&engine);
+        let none = crate::tool_bundle::ToolCapabilities::none();
+        for tool in [
+            "mcp",
+            "remote_read",
+            "remote_exec",
+            "archive_list",
+            "archive_extract",
+            "media_info",
+            "media_transcode",
+            "browser",
+            "computer",
+            "web_search",
+            "lsp_query",
+        ] {
+            assert!(!none.allows_tool(tool), "{tool} should be gated off");
+        }
+
+        let surface = ToolSurface::standard_with(none, "test_none");
+        let verification = preview_spec(AgentRole::Verifier, AgentProfile::Verification, None);
+        let frozen = frozen_tool_bundle_with_surface(&config, &verification, &[], surface);
+        for absent in ["archive_list", "media_info", "mcp", "lsp_query"] {
+            assert!(!frozen.contains(absent), "unexpected {absent}");
+        }
+
+        let research = preview_spec(AgentRole::Worker, AgentProfile::Research, None);
+        let frozen = frozen_tool_bundle_with_surface(&config, &research, &[], surface);
+        for absent in ["archive_list", "media_info", "web_search"] {
+            assert!(!frozen.contains(absent), "unexpected {absent}");
+        }
+
+        let leader = preview_spec(AgentRole::Leader, AgentProfile::Coding, None);
+        let frozen = frozen_tool_bundle_with_surface(&config, &leader, &[], surface);
+        for absent in ["mcp", "browser", "computer", "lsp_query"] {
+            assert!(!frozen.contains(absent), "unexpected {absent}");
+        }
+        assert!(!project.id.is_empty());
+        assert!(!engine.store().data_dir().as_os_str().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prompt_cache_and_compaction_share_the_run_surface_and_tools_hash() {
+        let (_data, _repo, engine, project) = fixture().await;
+        // Keep this fixture focused on tools/sections, not contract derivation.
+        engine
+            .set_contract_policy(
+                &project.id,
+                vp_protocol::types::ContractPolicy {
+                    enabled: false,
+                    ..vp_protocol::types::ContractPolicy::default()
+                },
+            )
+            .await
+            .unwrap();
+        let session = auto_session(&engine, &project.id, true).await;
+        store_test_plan(&engine, &session, true);
+        let config = test_config(&engine);
+        let spec = preview_spec(AgentRole::Leader, AgentProfile::Generic, None);
+
+        let live = build_prompt_and_bundle(
+            &engine,
+            &config,
+            &project,
+            &session,
+            &spec,
+            None,
+            &session.goal,
+            true,
+            InstructionBuildMode::Preview,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        // Cache warm/plan omit memory; tail memory must not move the prefix.
+        let cache = build_prompt_and_bundle(
+            &engine,
+            &config,
+            &project,
+            &session,
+            &spec,
+            None,
+            &session.goal,
+            false,
+            InstructionBuildMode::Preview,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(live.surface, cache.surface);
+        assert_eq!(live.frozen_bundle.tools_hash, cache.frozen_bundle.tools_hash);
+        let model = model_for(&config, AgentRole::Leader);
+        let live_hashes = live.sections.hashes(&model, &live.frozen_bundle.tools);
+        let cache_hashes = cache.sections.hashes(&model, &cache.frozen_bundle.tools);
+        assert_eq!(live_hashes.prefix_hash, cache_hashes.prefix_hash);
+        assert_eq!(live_hashes.tools_hash, cache_hashes.tools_hash);
+        assert_eq!(
+            live_hashes.tools_hash,
+            crate::tool_bundle::canonical_tools_hash(&live.frozen_bundle.tools)
+        );
+        assert_eq!(
+            live.frozen_bundle.selection.kind,
+            crate::tool_bundle::ToolBundleKind::LeaderOrchestrator
+        );
+
+        // Manual compaction/checkpoints use `build_session_prompt_context`.
+        let context = build_session_prompt_context(
+            &engine,
+            &config,
+            &session,
+            &project,
+            InstructionBuildMode::Preview,
+        )
+        .await
+        .unwrap();
+        assert_eq!(context.tool_surface, live.surface);
+        assert_eq!(
+            context.tool_bundle_kind,
+            crate::tool_bundle::ToolBundleKind::LeaderOrchestrator
+        );
+        assert_eq!(context.tools_hash, live_hashes.tools_hash);
+        assert_eq!(context.tool_count, live.frozen_bundle.tool_count());
+        assert_eq!(context.prefix_hash, live_hashes.prefix_hash);
+        assert_no_duplicate_tools(&live.frozen_bundle);
+    }
+
+    #[test]
+    fn capability_probes_are_deterministic_and_permissive() {
+        assert!(gui_tool_available_from("browser", |_| None));
+        assert!(!gui_tool_available_from("browser", |name| {
+            (name == "VERLINPARK_BROWSER_TOOLS").then(|| "0".to_string())
+        }));
+        assert!(!gui_tool_available_from("computer", |name| {
+            (name == "VERLINPARK_DISABLE_COMPUTER").then(|| "off".to_string())
+        }));
+        assert!(!archive_media_available_from(
+            &crate::tooling::media::MediaTools::with_programs(None, None, None)
+        ));
+        assert!(archive_media_available_from(
+            &crate::tooling::media::MediaTools::with_programs(
+                Some(PathBuf::from("/usr/bin/ffprobe")),
+                None,
+                None,
+            )
+        ));
+        assert!(!web_search_configured_from(|_| None));
+        assert!(!web_search_configured_from(|name| {
+            (name == "VERLINPARK_SEARCH_PROVIDER").then(|| "searxng".to_string())
+        }));
+        assert!(web_search_configured_from(|name| match name {
+            "VERLINPARK_SEARCH_PROVIDER" => Some("searxng".to_string()),
+            "VERLINPARK_SEARCH_ENDPOINT" => Some("https://search.invalid".to_string()),
+            _ => None,
+        }));
+        assert!(web_search_configured_from(|name| match name {
+            "VERLINPARK_SEARCH_PROVIDER" => Some("brave".to_string()),
+            "VERLINPARK_SEARCH_API_KEY" => Some("test-key".to_string()),
+            _ => None,
+        }));
     }
 }

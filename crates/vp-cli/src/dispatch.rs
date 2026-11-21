@@ -123,6 +123,8 @@ pub(crate) async fn run_command(
         | Command::ProjectUsage { .. }
         | Command::ProjectCache { .. }
         | Command::ProjectBudgetSet { .. }
+        | Command::ProjectAutoBudget { .. }
+        | Command::ProjectAutoBudgetSet { .. }
         | Command::Governor { .. }
         | Command::CriticalPath { .. }
         | Command::GovernorPreview { .. }
@@ -277,6 +279,9 @@ pub(crate) async fn run_command(
         | Command::Diff { .. } => git::dispatch(command, discovery, json).await,
         Command::Sessions { .. }
         | Command::SessionNew { .. }
+        | Command::SessionBudget { .. }
+        | Command::SessionBudgetSet { .. }
+        | Command::SessionBudgetForecast { .. }
         | Command::SessionUnlimited { .. }
         | Command::SessionPriority { .. }
         | Command::Search { .. }

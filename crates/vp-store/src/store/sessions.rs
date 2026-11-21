@@ -198,6 +198,61 @@ impl Store {
         priority: i32,
         extra_payload: Option<serde_json::Value>,
     ) -> Result<(Session, Event)> {
+        let budget_mode = if unlimited {
+            BudgetMode::Unlimited
+        } else {
+            BudgetMode::Fixed
+        };
+        self.create_session_with_worktree_and_event_budget(
+            id,
+            project_id,
+            goal,
+            worktree,
+            branch,
+            token_budget,
+            cost_budget_usd,
+            time_budget_secs,
+            unlimited,
+            base_commit,
+            priority,
+            budget_mode,
+            None,
+            extra_payload,
+        )
+    }
+
+    /// Atomic session creation with an optional auto-budget row. The session
+    /// row, `session.created` event, and `session_auto_budgets` row commit in
+    /// one transaction, so a crash cannot leave an auto session without its
+    /// hard caps or an orphan policy row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_session_with_worktree_and_event_budget(
+        &self,
+        id: &str,
+        project_id: &str,
+        goal: &str,
+        worktree: &str,
+        branch: &str,
+        token_budget: Option<u64>,
+        cost_budget_usd: Option<f64>,
+        time_budget_secs: Option<u64>,
+        unlimited: bool,
+        base_commit: &str,
+        priority: i32,
+        budget_mode: BudgetMode,
+        auto_budget: Option<&SessionAutoBudgetRecord>,
+        extra_payload: Option<serde_json::Value>,
+    ) -> Result<(Session, Event)> {
+        if auto_budget.is_some_and(|record| record.session_id != id) {
+            return Err(anyhow!(
+                "session auto-budget row id does not match the session id"
+            ));
+        }
+        if auto_budget.is_some() && budget_mode != BudgetMode::Auto {
+            return Err(anyhow!(
+                "a session auto-budget row requires budget mode auto"
+            ));
+        }
         let session = self.build_session(
             id.to_string(),
             project_id,
@@ -211,7 +266,12 @@ impl Store {
             Some(base_commit.to_string()),
             priority,
         )?;
-        let mut payload = session_created_payload(&session);
+        let mut payload = session_created_payload(&session, budget_mode);
+        if let Some(record) = auto_budget
+            && let Some(object) = payload.as_object_mut()
+        {
+            object.insert("auto_budget".to_string(), serde_json::to_value(record)?);
+        }
         if let Some(extra) = extra_payload {
             match (payload.as_object_mut(), extra) {
                 (Some(payload), serde_json::Value::Object(extra)) => {
@@ -227,6 +287,9 @@ impl Store {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         insert_session_row(&tx, &session)?;
+        if let Some(record) = auto_budget {
+            crate::store::auto_budget::insert_session_auto_budget_tx(&tx, record)?;
+        }
         let event = insert_event_tx(&tx, &session.id, "session.created", payload)?;
         tx.commit()?;
         drop(conn);
@@ -412,6 +475,17 @@ impl Store {
         )?;
         if changed == 0 {
             return Err(anyhow!("session not found: {session_id}"));
+        }
+        if !unlimited {
+            // The compatibility flag restores the stored mode. An explicit
+            // `mode=unlimited` row has no underlying mode to restore, so it
+            // falls back to fixed; an auto row keeps its auto mode and can be
+            // resumed under the same caps.
+            tx.execute(
+                "UPDATE session_auto_budgets SET mode = 'fixed', updated_at = ?1
+                 WHERE session_id = ?2 AND mode = 'unlimited'",
+                params![now_rfc3339(), session_id],
+            )?;
         }
         let event = insert_event_tx(
             &tx,
@@ -1585,7 +1659,7 @@ fn insert_session_row(conn: &Connection, session: &Session) -> Result<()> {
     Ok(())
 }
 
-fn session_created_payload(session: &Session) -> serde_json::Value {
+fn session_created_payload(session: &Session, budget_mode: BudgetMode) -> serde_json::Value {
     serde_json::json!({
         "goal": session.goal,
         "project_id": session.project_id,
@@ -1596,7 +1670,7 @@ fn session_created_payload(session: &Session) -> serde_json::Value {
         "cost_budget_usd": session.cost_budget_usd,
         "time_budget_secs": session.time_budget_secs,
         "unlimited": session.unlimited,
-        "budget_mode": if session.unlimited { "unlimited" } else { "limited" },
+        "budget_mode": budget_mode.as_str(),
         "base_commit": session.base_commit,
         "prompt_layout": session.prompt_layout,
         "created_at": session.created_at,

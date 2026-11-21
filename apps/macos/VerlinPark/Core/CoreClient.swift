@@ -748,7 +748,9 @@ actor CoreClient {
         costBudgetUSD: Double? = nil,
         timeBudgetSecs: Int? = nil,
         priority: Int = 0,
-        unlimited: Bool = false
+        unlimited: Bool = false,
+        budgetMode: BudgetMode? = nil,
+        autoBudget: AutoBudgetPolicy? = nil
     ) async throws -> Session {
         var params: [String: JSONValue] = [
             "project_id": .string(projectID),
@@ -756,7 +758,13 @@ actor CoreClient {
             "priority": .number(Double(priority)),
             "unlimited": .bool(unlimited),
         ]
-        if !unlimited {
+        if let budgetMode {
+            params["budget_mode"] = .string(budgetMode.rawValue)
+        }
+        if let autoBudget {
+            params["auto_budget"] = try jsonValue(autoBudget)
+        }
+        if !unlimited, !(budgetMode?.isAuto ?? false) {
             if let tokenBudget, tokenBudget > 0 {
                 params["token_budget"] = .number(Double(tokenBudget))
             }
@@ -774,7 +782,7 @@ actor CoreClient {
     func setSessionUnlimited(
         sessionID: String,
         unlimited: Bool
-    ) async throws -> SessionUnlimitedResult {
+    ) async throws -> SetSessionBudgetResult {
         try await request(
             method: "session.budget.set",
             params: [
@@ -782,7 +790,59 @@ actor CoreClient {
                 "unlimited": .bool(unlimited),
             ]
         )
-        .decode(SessionUnlimitedResult.self)
+        .decode(SetSessionBudgetResult.self)
+    }
+
+    // MARK: Auto budget
+
+    func sessionBudget(sessionID: String) async throws -> SessionBudgetStatus {
+        try await request(
+            method: "session.budget.get",
+            params: ["session_id": .string(sessionID)]
+        )
+        .decode(SessionBudgetStatus.self)
+    }
+
+    func sessionBudgetForecast(
+        sessionID: String
+    ) async throws -> SessionBudgetForecastResult {
+        try await request(
+            method: "session.budget.forecast",
+            params: ["session_id": .string(sessionID)]
+        )
+        .decode(SessionBudgetForecastResult.self)
+    }
+
+    func setSessionBudget(
+        _ params: SetSessionBudgetParams
+    ) async throws -> SetSessionBudgetResult {
+        try await request(
+            method: "session.budget.set",
+            params: try params.requestObject()
+        )
+        .decode(SetSessionBudgetResult.self)
+    }
+
+    func projectAutoBudget(projectID: String) async throws -> AutoBudgetPolicyResult {
+        try await request(
+            method: "project.auto_budget.get",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(AutoBudgetPolicyResult.self)
+    }
+
+    func setProjectAutoBudget(
+        projectID: String,
+        policy: AutoBudgetPolicy
+    ) async throws -> AutoBudgetPolicyResult {
+        try await request(
+            method: "project.auto_budget.set",
+            params: [
+                "project_id": .string(projectID),
+                "policy": try jsonValue(policy),
+            ]
+        )
+        .decode(AutoBudgetPolicyResult.self)
     }
 
     func checkpointSession(sessionID: String, label: String?) async throws -> SessionCheckpoint {

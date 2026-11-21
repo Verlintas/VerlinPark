@@ -31,7 +31,8 @@ use render::{
     print_human_for, print_json, print_portable_anchor_export, print_portable_anchor_import,
     print_portable_anchor_verify, print_repository_backup, print_repository_list,
     print_repository_prune, print_repository_rekey, print_repository_restore,
-    print_repository_verify, tool_activity_csv,
+    print_repository_verify, project_auto_budget_csv, session_budget_csv,
+    session_budget_forecast_csv, tool_activity_csv,
 };
 use rpc::{confirm_cli_action, read_discovery};
 
@@ -919,10 +920,32 @@ async fn run(cli: Cli) -> Result<()> {
     let human_hint = render::human_hint(&cli.command);
     let discovery = read_discovery(cli.data_dir.as_deref())?;
     let want_tool_activity_csv = matches!(&cli.command, Command::ToolActivity { csv: true, .. });
+    let want_session_budget_csv = matches!(&cli.command, Command::SessionBudget { csv: true, .. });
+    let want_budget_forecast_csv = matches!(
+        &cli.command,
+        Command::SessionBudgetForecast { csv: true, .. }
+    );
+    let want_auto_budget_csv = matches!(
+        &cli.command,
+        Command::ProjectAutoBudget { csv: true, .. }
+            | Command::ProjectAutoBudgetSet { csv: true, .. }
+    );
     let value = dispatch::run_command(cli.command, discovery, cli.json).await?;
     if let Some(value) = value {
         if want_tool_activity_csv {
             print!("{}", tool_activity_csv(&value));
+            return Ok(());
+        }
+        if want_session_budget_csv {
+            print!("{}", session_budget_csv(&value));
+            return Ok(());
+        }
+        if want_budget_forecast_csv {
+            print!("{}", session_budget_forecast_csv(&value));
+            return Ok(());
+        }
+        if want_auto_budget_csv {
+            print!("{}", project_auto_budget_csv(&value));
             return Ok(());
         }
         if cli.json {

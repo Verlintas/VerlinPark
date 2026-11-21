@@ -2,6 +2,102 @@
 
 use super::*;
 
+const AUTO_BUDGET_POLICY_FIELDS: &[&str] = &[
+    "enabled",
+    "initial_token_budget",
+    "initial_cost_budget_usd",
+    "initial_wall_clock_secs",
+    "hard_token_cap",
+    "hard_cost_cap_usd",
+    "hard_wall_clock_secs",
+    "extend_ratio",
+    "max_multiplier",
+    "forecast_calls",
+    "min_runway_turns",
+    "warn_at_ratio",
+    "pause_at_ratio",
+    "max_turns_per_run",
+    "max_total_turns",
+    "no_progress_turns",
+    "no_progress_action",
+    "auto_tool_bundle",
+];
+
+fn typed_local_error(code: &'static str, message: impl Into<String>) -> anyhow::Error {
+    crate::rpc::CliRpcError {
+        kind: "local",
+        code: None,
+        typed_code: Some(code.to_string()),
+        message: message.into(),
+        hint: None,
+        data: None,
+    }
+    .into()
+}
+
+/// Parse a full policy JSON object. Unknown keys are rejected locally so a
+/// misspelled cap cannot be silently ignored (which would preserve the old cap
+/// and look like a successful widening or narrowing).
+pub(super) fn parse_auto_budget_policy_json(text: &str) -> Result<Value> {
+    let parsed: Value =
+        serde_json::from_str(text).context("--policy-file must contain one JSON policy object")?;
+    let object = parsed
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("--policy-file must contain a JSON object"))?;
+    for key in object.keys() {
+        if !AUTO_BUDGET_POLICY_FIELDS.contains(&key.as_str()) {
+            return Err(typed_local_error(
+                vp_protocol::types::auto_budget_codes::INVALID_AUTO_BUDGET_POLICY,
+                format!("unknown auto-budget policy field `{key}`"),
+            ));
+        }
+    }
+    Ok(parsed)
+}
+
+/// Overlay a policy file and explicit flags onto the stored policy. Fields not
+/// named by either source keep their current value, so a one-field edit cannot
+/// silently clear a hard cap.
+pub(super) fn merge_auto_budget_policy(
+    mut policy: Value,
+    file: Option<&Value>,
+    updates: &[(&'static str, Value)],
+) -> Value {
+    if !policy.is_object() {
+        policy = json!({});
+    }
+    if let Some(file) = file.and_then(Value::as_object) {
+        for (key, value) in file {
+            policy[key] = value.clone();
+        }
+    }
+    for (key, value) in updates {
+        policy[*key] = value.clone();
+    }
+    policy
+}
+
+fn read_policy_file(path: &str) -> Result<String> {
+    if path == "-" {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
+            .context("reading the auto-budget policy from stdin")?;
+        return Ok(text);
+    }
+    std::fs::read_to_string(path)
+        .with_context(|| format!("reading the auto-budget policy file {path}"))
+}
+
+fn policy_update(
+    updates: &mut Vec<(&'static str, Value)>,
+    key: &'static str,
+    value: Option<Value>,
+) {
+    if let Some(value) = value {
+        updates.push((key, value));
+    }
+}
+
 pub(super) async fn dispatch(
     command: Command,
     discovery: Discovery,
@@ -54,6 +150,166 @@ pub(super) async fn dispatch(
                         "cost_budget_usd": cost_budget_usd,
                     }
                 }),
+            )
+            .await?
+        }
+        Command::ProjectAutoBudget { project, .. } => {
+            rpc(
+                &discovery,
+                "project.auto_budget.get",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::ProjectAutoBudgetSet {
+            project,
+            enabled,
+            initial_token_budget,
+            initial_cost_budget_usd,
+            initial_wall_clock_secs,
+            hard_token_cap,
+            hard_cost_cap_usd,
+            hard_wall_clock_secs,
+            extend_ratio,
+            max_multiplier,
+            forecast_calls,
+            min_runway_turns,
+            warn_at_ratio,
+            pause_at_ratio,
+            max_turns_per_run,
+            max_total_turns,
+            no_progress_turns,
+            no_progress_action,
+            auto_tool_bundle,
+            clear_initial_token_budget,
+            clear_initial_cost_budget_usd,
+            clear_initial_wall_clock_secs,
+            clear_hard_token_cap,
+            clear_hard_cost_cap_usd,
+            clear_hard_wall_clock_secs,
+            clear_max_total_turns,
+            policy_file,
+            ..
+        } => {
+            let mut updates: Vec<(&'static str, Value)> = Vec::new();
+            policy_update(&mut updates, "enabled", enabled.map(Value::from));
+            policy_update(
+                &mut updates,
+                "initial_token_budget",
+                initial_token_budget.map(Value::from),
+            );
+            policy_update(
+                &mut updates,
+                "initial_cost_budget_usd",
+                initial_cost_budget_usd.map(Value::from),
+            );
+            policy_update(
+                &mut updates,
+                "initial_wall_clock_secs",
+                initial_wall_clock_secs.map(Value::from),
+            );
+            policy_update(
+                &mut updates,
+                "hard_token_cap",
+                hard_token_cap.map(Value::from),
+            );
+            policy_update(
+                &mut updates,
+                "hard_cost_cap_usd",
+                hard_cost_cap_usd.map(Value::from),
+            );
+            policy_update(
+                &mut updates,
+                "hard_wall_clock_secs",
+                hard_wall_clock_secs.map(Value::from),
+            );
+            policy_update(&mut updates, "extend_ratio", extend_ratio.map(Value::from));
+            policy_update(
+                &mut updates,
+                "max_multiplier",
+                max_multiplier.map(Value::from),
+            );
+            policy_update(
+                &mut updates,
+                "forecast_calls",
+                forecast_calls.map(Value::from),
+            );
+            policy_update(
+                &mut updates,
+                "min_runway_turns",
+                min_runway_turns.map(Value::from),
+            );
+            policy_update(
+                &mut updates,
+                "warn_at_ratio",
+                warn_at_ratio.map(Value::from),
+            );
+            policy_update(
+                &mut updates,
+                "pause_at_ratio",
+                pause_at_ratio.map(Value::from),
+            );
+            policy_update(
+                &mut updates,
+                "max_turns_per_run",
+                max_turns_per_run.map(Value::from),
+            );
+            policy_update(
+                &mut updates,
+                "max_total_turns",
+                max_total_turns.map(Value::from),
+            );
+            policy_update(
+                &mut updates,
+                "no_progress_turns",
+                no_progress_turns.map(Value::from),
+            );
+            policy_update(
+                &mut updates,
+                "no_progress_action",
+                no_progress_action.map(|action| json!(action.as_str())),
+            );
+            policy_update(
+                &mut updates,
+                "auto_tool_bundle",
+                auto_tool_bundle.map(Value::from),
+            );
+            for (clear, key) in [
+                (clear_initial_token_budget, "initial_token_budget"),
+                (clear_initial_cost_budget_usd, "initial_cost_budget_usd"),
+                (clear_initial_wall_clock_secs, "initial_wall_clock_secs"),
+                (clear_hard_token_cap, "hard_token_cap"),
+                (clear_hard_cost_cap_usd, "hard_cost_cap_usd"),
+                (clear_hard_wall_clock_secs, "hard_wall_clock_secs"),
+                (clear_max_total_turns, "max_total_turns"),
+            ] {
+                if clear {
+                    updates.push((key, Value::Null));
+                }
+            }
+
+            let policy_file_value = match policy_file.as_deref() {
+                Some(path) => Some(parse_auto_budget_policy_json(&read_policy_file(path)?)?),
+                None => None,
+            };
+            if updates.is_empty() && policy_file_value.is_none() {
+                bail!("pass at least one auto-budget policy field or --policy-file -");
+            }
+            // Read-modify-write: unspecified fields (especially hard caps)
+            // keep the stored value instead of falling back to defaults.
+            let current = rpc(
+                &discovery,
+                "project.auto_budget.get",
+                json!({"project_id": project}),
+            )
+            .await?;
+            let current_policy = current.get("policy").cloned().unwrap_or_else(|| json!({}));
+            let policy =
+                merge_auto_budget_policy(current_policy, policy_file_value.as_ref(), &updates);
+            rpc(
+                &discovery,
+                "project.auto_budget.set",
+                json!({"project_id": project, "policy": policy}),
             )
             .await?
         }
@@ -452,4 +708,61 @@ pub(super) async fn dispatch(
         _ => unreachable!("command routed to the wrong dispatch family"),
     };
     Ok(Some(value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_merge_preserves_unspecified_caps() {
+        let current = json!({
+            "enabled": true,
+            "initial_token_budget": 10_000,
+            "hard_token_cap": 50_000,
+            "hard_cost_cap_usd": 5.0,
+        });
+        let merged = merge_auto_budget_policy(
+            current,
+            None,
+            &[("hard_cost_cap_usd", json!(7.5)), ("enabled", json!(false))],
+        );
+        assert_eq!(merged["enabled"], false);
+        assert_eq!(merged["hard_token_cap"], 50_000);
+        assert_eq!(merged["hard_cost_cap_usd"], 7.5);
+        assert_eq!(merged["initial_token_budget"], 10_000);
+    }
+
+    #[test]
+    fn policy_merge_applies_file_then_flags() {
+        let current = json!({"hard_token_cap": 50_000, "enabled": false});
+        let file = json!({"enabled": true, "min_runway_turns": 3});
+        let merged = merge_auto_budget_policy(
+            current,
+            Some(&file),
+            &[("enabled", json!(false)), ("forecast_calls", json!(12))],
+        );
+        assert_eq!(merged["enabled"], false);
+        assert_eq!(merged["min_runway_turns"], 3);
+        assert_eq!(merged["forecast_calls"], 12);
+        assert_eq!(merged["hard_token_cap"], 50_000);
+    }
+
+    #[test]
+    fn policy_file_rejects_unknown_fields() {
+        let error =
+            parse_auto_budget_policy_json(r#"{"hard_token_cap": 100, "typo": 1}"#).unwrap_err();
+        let typed = error.downcast_ref::<crate::rpc::CliRpcError>().unwrap();
+        assert_eq!(
+            typed.typed_code.as_deref(),
+            Some(vp_protocol::types::auto_budget_codes::INVALID_AUTO_BUDGET_POLICY)
+        );
+        assert!(typed.message.contains("typo"));
+    }
+
+    #[test]
+    fn policy_file_requires_an_object() {
+        assert!(parse_auto_budget_policy_json("[1, 2]").is_err());
+        assert!(parse_auto_budget_policy_json("not json").is_err());
+    }
 }

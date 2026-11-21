@@ -1215,6 +1215,7 @@ fn minimal_bundle(
         team_templates: Vec::new(),
         project_team_templates: Vec::new(),
         team_template_events: Vec::new(),
+        session_auto_budget: None,
     }
 }
 

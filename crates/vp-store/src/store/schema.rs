@@ -399,6 +399,34 @@ impl Store {
                 updated_at TEXT NOT NULL
             );
 
+            -- Project-scoped default policy for deterministic auto budgets. A
+            -- missing row means the disabled default; auto session creation
+            -- then requires an explicit session policy with a hard cap.
+            CREATE TABLE IF NOT EXISTS project_auto_budget_policies (
+                project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                policy_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_project_auto_budget_policies_updated
+                ON project_auto_budget_policies(updated_at DESC);
+
+            -- Bounded project-policy audit trail. Project configuration has no
+            -- session event stream, so this is the project-scoped event record
+            -- for `project.auto_budget.updated` and is carried by the manifest.
+            CREATE TABLE IF NOT EXISTS project_auto_budget_events (
+                id         TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                seq        INTEGER NOT NULL,
+                kind       TEXT NOT NULL,
+                payload    TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(project_id, seq)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_project_auto_budget_events_project
+                ON project_auto_budget_events(project_id, seq DESC);
+
             CREATE TABLE IF NOT EXISTS sessions (
                 id         TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -419,6 +447,22 @@ impl Store {
                 tokens_out    INTEGER NOT NULL DEFAULT 0,
                 created_at    TEXT NOT NULL
             );
+
+            -- Durable auto-budget mode/policy/operational state. Effective
+            -- budgets remain on `sessions`; hard caps are copied here so a
+            -- later project-policy edit cannot widen an existing session.
+            CREATE TABLE IF NOT EXISTS session_auto_budgets (
+                session_id  TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                mode        TEXT NOT NULL,
+                policy_json TEXT NOT NULL,
+                state_json  TEXT NOT NULL,
+                caps_json   TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_session_auto_budgets_mode
+                ON session_auto_budgets(mode);
 
             CREATE TABLE IF NOT EXISTS events (
                 session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,

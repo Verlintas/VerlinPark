@@ -229,6 +229,11 @@ impl Engine {
                 vp_store::store::team_template::manifest_records(&template_store, &template_project)
             })
             .await??;
+        let auto_store = store.clone();
+        let auto_session = session_id.clone();
+        let session_auto_budget =
+            tokio::task::spawn_blocking(move || auto_store.get_session_auto_budget(&auto_session))
+                .await??;
         Ok(SessionBundle {
             version: 1,
             exported_at: vp_protocol::now_rfc3339(),
@@ -324,6 +329,7 @@ impl Engine {
             team_templates,
             project_team_templates,
             team_template_events,
+            session_auto_budget,
         })
     }
 }

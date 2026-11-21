@@ -123,6 +123,11 @@ impl AgentService {
                             "output_reserve_tokens": compaction_policy.output_reserve,
                             "messages": conversation.len(),
                             "calibration": calibration.factor,
+                            "tool_bundle": prompt.tool_bundle_kind.as_str(),
+                            "tool_bundle_mode": prompt.tool_surface.mode.as_str(),
+                            "tool_surface": prompt.tool_surface.payload(),
+                            "tools_hash": prompt.tools_hash,
+                            "tool_count": prompt.tool_count,
                         }),
                     )
                     .await?;

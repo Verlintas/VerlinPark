@@ -95,6 +95,11 @@ impl AgentService {
         .await??
         .map(|(program, _event)| program)
         .ok_or_else(|| anyhow!("program {program_id} could not be cancelled"))?;
+        // Every non-terminal milestone was cancelled above. Release any
+        // program allowance still held by a session/lifecycle race.
+        let controller = self.engine.programs();
+        controller.release_program_reservations(program_id);
+        let _ = controller.release_stale_reservations();
         self.engine.record_project_manifest().await?;
         Ok(program)
     }

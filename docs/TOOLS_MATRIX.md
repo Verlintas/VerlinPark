@@ -12,6 +12,15 @@
 - Dynamic MCP tools are not listed individually. The `mcp` bridge exposes only
   tools from configured, enabled, pinned servers; Manager/Verifier can
   inspect/read but cannot call or cancel.
+- **Auto budget sessions** use the capability-gated surface. Conditional
+  `mcp`/`remote_*`/`archive_*`/`media_*`/`browser`/`computer`/`web_search`
+  schemas are hidden when their configured capability is absent. Once an Auto
+  Leader has a stored TeamPlan, it receives the read-only
+  `leader_orchestrator` bundle (43 tools, no shell/write/apply_patch/computer/
+  browser/remote_write); without a plan it keeps the standard writable Leader
+  surface so simple first tasks are not blocked. Fixed/unlimited sessions keep
+  the standard permissive matrix above. `auto_tool_bundle=false` opts out.
+- A token cap is always enforceable; a USD cap requires configured role prices.
 - `run_script` binds only the current read-only tool set by default; with
   `allow_write` it additionally binds `write_file`, `edit_file`, and
   `apply_patch`. It has no shell, network, process, GUI, MCP, or delegation

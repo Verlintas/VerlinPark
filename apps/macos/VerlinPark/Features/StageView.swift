@@ -52,6 +52,7 @@ private struct ProjectStageView: View {
     @State private var showingFork = false
     @State private var showingSteer = false
     @State private var showingDefer = false
+    @State private var showingBudget = false
     @FocusState private var composerFocused: Bool
     @State private var composerHovering = false
 
@@ -59,6 +60,37 @@ private struct ProjectStageView: View {
         VStack(spacing: 0) {
             stageHeader
             VPHairline()
+            if let summary = model.budgetRunway {
+                StageBudgetCard(summary: summary) {
+                    showingBudget = true
+                }
+                .padding(.horizontal, 18)
+                .padding(.vertical, 8)
+                VPHairline()
+            } else if model.selectedSession != nil,
+                      let message = model.sessionBudgetStatusMessage
+            {
+                HStack(spacing: 8) {
+                    Image(systemName: "gauge.with.dots.needle.50percent")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(VPTheme.warning)
+                    Text("Budget unavailable · \(message)")
+                        .font(VPTheme.mono(7.5))
+                        .foregroundStyle(VPTheme.textTertiary)
+                        .lineLimit(1)
+                    Spacer()
+                    Button("Refresh") {
+                        Task { await model.loadSessionBudget() }
+                    }
+                    .buttonStyle(.plain)
+                    .font(VPTheme.mono(7.5))
+                    .foregroundStyle(VPTheme.textSecondary)
+                    .disabled(model.sessionBudgetBusy)
+                }
+                .padding(.horizontal, 18)
+                .padding(.vertical, 7)
+                VPHairline()
+            }
             if let session = model.selectedSession,
                let preemption = model.sessionPreemption,
                preemption.preempted,
@@ -115,6 +147,12 @@ private struct ProjectStageView: View {
         .sheet(isPresented: $showingDefer) {
             if let session = model.selectedSession {
                 DeferSheet(session: session)
+                    .environment(model)
+            }
+        }
+        .sheet(isPresented: $showingBudget) {
+            if let status = model.sessionBudgetStatus {
+                SessionBudgetSheet(status: status)
                     .environment(model)
             }
         }

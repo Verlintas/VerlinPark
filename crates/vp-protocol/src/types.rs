@@ -2916,6 +2916,672 @@ pub struct IntegrationPolicyResult {
     pub policy: IntegrationPolicy,
 }
 
+/// Stable validation codes for auto-budget requests. These are wire values:
+/// clients/tests may branch on them instead of parsing prose.
+pub mod auto_budget_codes {
+    pub const INVALID_BUDGET_MODE: &str = "INVALID_BUDGET_MODE";
+    pub const INVALID_BUDGET: &str = "INVALID_BUDGET";
+    pub const INVALID_BUDGET_CAP: &str = "INVALID_BUDGET_CAP";
+    pub const BUDGET_BELOW_SPENT: &str = "BUDGET_BELOW_SPENT";
+    pub const AUTO_BUDGET_CAP_REQUIRED: &str = "AUTO_BUDGET_CAP_REQUIRED";
+    pub const AUTO_BUDGET_POLICY_REQUIRED: &str = "AUTO_BUDGET_POLICY_REQUIRED";
+    pub const AUTO_BUDGET_CAP_REACHED: &str = "AUTO_BUDGET_CAP_REACHED";
+    pub const INVALID_AUTO_BUDGET_POLICY: &str = "INVALID_AUTO_BUDGET_POLICY";
+    pub const INVALID_AUTO_BUDGET_STATE: &str = "INVALID_AUTO_BUDGET_STATE";
+    pub const BUDGET_MODE_CONFLICT: &str = "BUDGET_MODE_CONFLICT";
+    pub const BUDGET_POLICY_NOT_APPLICABLE: &str = "BUDGET_POLICY_NOT_APPLICABLE";
+}
+
+/// A typed, stable-code validation failure for budget mode/policy/budget
+/// admission. Store and engine layers wrap this in `anyhow::Error`, so callers
+/// can still downcast to inspect `code`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetValidationError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl BudgetValidationError {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for BudgetValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for BudgetValidationError {}
+
+/// Explicit session budget mode. `unlimited` is never selected implicitly and
+/// remains wire-compatible with the legacy `Session.unlimited` flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BudgetMode {
+    #[default]
+    Fixed,
+    Auto,
+    Unlimited,
+}
+
+impl BudgetMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fixed => "fixed",
+            Self::Auto => "auto",
+            Self::Unlimited => "unlimited",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, BudgetValidationError> {
+        match value {
+            "fixed" => Ok(Self::Fixed),
+            "auto" => Ok(Self::Auto),
+            "unlimited" => Ok(Self::Unlimited),
+            other => Err(BudgetValidationError::new(
+                auto_budget_codes::INVALID_BUDGET_MODE,
+                format!("unknown budget mode `{other}`; expected fixed, auto, or unlimited"),
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for BudgetMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for BudgetMode {
+    type Err = BudgetValidationError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum NoProgressAction {
+    #[default]
+    Pause,
+    Escalate,
+}
+
+impl NoProgressAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pause => "pause",
+            Self::Escalate => "escalate",
+        }
+    }
+}
+
+/// Resolved hard caps for one auto-budget session. These are a durable copy of
+/// the policy caps so a later project-policy edit cannot silently widen an
+/// existing session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct AutoBudgetCaps {
+    #[serde(default)]
+    pub token: Option<u64>,
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
+    #[serde(default)]
+    pub wall_clock_secs: Option<u64>,
+}
+
+impl AutoBudgetCaps {
+    pub fn is_empty(&self) -> bool {
+        self.token.is_none() && self.cost_usd.is_none() && self.wall_clock_secs.is_none()
+    }
+
+    pub fn from_policy(policy: &AutoBudgetPolicy) -> Self {
+        Self {
+            token: policy.hard_token_cap,
+            cost_usd: policy.hard_cost_cap_usd,
+            wall_clock_secs: policy.hard_wall_clock_secs,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), BudgetValidationError> {
+        if self.token == Some(0) {
+            return Err(BudgetValidationError::new(
+                auto_budget_codes::INVALID_BUDGET_CAP,
+                "hard token cap must be greater than zero",
+            ));
+        }
+        if let Some(cost) = self.cost_usd
+            && (!cost.is_finite() || cost <= 0.0)
+        {
+            return Err(BudgetValidationError::new(
+                auto_budget_codes::INVALID_BUDGET_CAP,
+                "hard cost cap must be a positive finite USD value",
+            ));
+        }
+        if self.wall_clock_secs == Some(0) {
+            return Err(BudgetValidationError::new(
+                auto_budget_codes::INVALID_BUDGET_CAP,
+                "hard wall-clock cap must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Project-scoped default policy for deterministic auto budgets. A session may
+/// override it at creation; the resulting hard caps are copied into the
+/// session auto row so project edits cannot widen an existing session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutoBudgetPolicy {
+    /// Project default: auto creation fails unless this is enabled or the
+    /// caller supplies an explicit session policy.
+    pub enabled: bool,
+    pub initial_token_budget: Option<u64>,
+    pub initial_cost_budget_usd: Option<f64>,
+    pub initial_wall_clock_secs: Option<u64>,
+    pub hard_token_cap: Option<u64>,
+    pub hard_cost_cap_usd: Option<f64>,
+    pub hard_wall_clock_secs: Option<u64>,
+    pub extend_ratio: f64,
+    pub max_multiplier: f64,
+    pub forecast_calls: u32,
+    pub min_runway_turns: u32,
+    pub warn_at_ratio: f64,
+    pub pause_at_ratio: f64,
+    pub max_turns_per_run: u32,
+    pub max_total_turns: Option<u32>,
+    pub no_progress_turns: u32,
+    pub no_progress_action: NoProgressAction,
+    pub auto_tool_bundle: bool,
+}
+
+impl Default for AutoBudgetPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            initial_token_budget: None,
+            initial_cost_budget_usd: None,
+            initial_wall_clock_secs: None,
+            hard_token_cap: None,
+            hard_cost_cap_usd: None,
+            hard_wall_clock_secs: None,
+            extend_ratio: 0.25,
+            max_multiplier: 4.0,
+            forecast_calls: 8,
+            min_runway_turns: 4,
+            warn_at_ratio: 0.20,
+            pause_at_ratio: 0.05,
+            max_turns_per_run: 60,
+            max_total_turns: None,
+            no_progress_turns: 6,
+            no_progress_action: NoProgressAction::Pause,
+            auto_tool_bundle: true,
+        }
+    }
+}
+
+impl AutoBudgetPolicy {
+    pub fn has_hard_cap(&self) -> bool {
+        self.hard_token_cap.is_some()
+            || self.hard_cost_cap_usd.is_some()
+            || self.hard_wall_clock_secs.is_some()
+    }
+
+    pub fn hard_caps(&self) -> AutoBudgetCaps {
+        AutoBudgetCaps::from_policy(self)
+    }
+
+    /// Effective initial budgets for the one-cap Auto UX. An explicit initial
+    /// budget always wins. When only a hard cap is supplied, start at
+    /// `hard / max_multiplier` so the policy has a real extension runway
+    /// instead of immediately starting at the cap (which would behave like a
+    /// fixed budget). The result is bounded to `1..=hard`.
+    pub fn resolved_initial_token_budget(&self) -> Option<u64> {
+        resolved_initial_u64(self.initial_token_budget, self.hard_token_cap, self.max_multiplier)
+    }
+
+    pub fn resolved_initial_cost_budget_usd(&self) -> Option<f64> {
+        resolved_initial_f64(
+            self.initial_cost_budget_usd,
+            self.hard_cost_cap_usd,
+            self.max_multiplier,
+        )
+    }
+
+    pub fn resolved_initial_wall_clock_secs(&self) -> Option<u64> {
+        resolved_initial_u64(
+            self.initial_wall_clock_secs,
+            self.hard_wall_clock_secs,
+            self.max_multiplier,
+        )
+    }
+
+    pub fn require_hard_cap(&self) -> Result<(), BudgetValidationError> {
+        if !self.has_hard_cap() {
+            return Err(BudgetValidationError::new(
+                auto_budget_codes::AUTO_BUDGET_CAP_REQUIRED,
+                "auto budget requires at least one hard token, cost, or wall-clock cap",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate numeric bounds. `require_hard_cap` is separate because a
+    /// project default policy may legitimately exist without a cap while auto
+    /// creation must fail closed.
+    pub fn validate(&self) -> Result<(), BudgetValidationError> {
+        if self.initial_token_budget == Some(0) {
+            return Err(BudgetValidationError::new(
+                auto_budget_codes::INVALID_BUDGET,
+                "initial token budget must be greater than zero",
+            ));
+        }
+        if let Some(cost) = self.initial_cost_budget_usd
+            && (!cost.is_finite() || cost <= 0.0)
+        {
+            return Err(BudgetValidationError::new(
+                auto_budget_codes::INVALID_BUDGET,
+                "initial cost budget must be a positive finite USD value",
+            ));
+        }
+        if self.initial_wall_clock_secs == Some(0) {
+            return Err(BudgetValidationError::new(
+                auto_budget_codes::INVALID_BUDGET,
+                "initial wall-clock budget must be greater than zero",
+            ));
+        }
+        self.hard_caps().validate()?;
+        if !self.extend_ratio.is_finite() || self.extend_ratio <= 0.0 || self.extend_ratio > 1.0 {
+            return Err(BudgetValidationError::new(
+                auto_budget_codes::INVALID_AUTO_BUDGET_POLICY,
+                "extend_ratio must be a finite value in (0, 1]",
+            ));
+        }
+        if !self.max_multiplier.is_finite() || self.max_multiplier < 1.0 {
+            return Err(BudgetValidationError::new(
+                auto_budget_codes::INVALID_AUTO_BUDGET_POLICY,
+                "max_multiplier must be a finite value >= 1.0",
+            ));
+        }
+        if !(1..=1_000).contains(&self.forecast_calls) {
+            return Err(BudgetValidationError::new(
+                auto_budget_codes::INVALID_AUTO_BUDGET_POLICY,
+                "forecast_calls must be between 1 and 1000",
+            ));
+        }
+        if self.min_runway_turns > 1_000 {
+            return Err(BudgetValidationError::new(
+                auto_budget_codes::INVALID_AUTO_BUDGET_POLICY,
+                "min_runway_turns must be at most 1000",
+            ));
+        }
+        for (name, value) in [
+            ("warn_at_ratio", self.warn_at_ratio),
+            ("pause_at_ratio", self.pause_at_ratio),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(BudgetValidationError::new(
+                    auto_budget_codes::INVALID_AUTO_BUDGET_POLICY,
+                    format!("{name} must be a finite value in [0, 1]"),
+                ));
+            }
+        }
+        if self.pause_at_ratio > self.warn_at_ratio {
+            return Err(BudgetValidationError::new(
+                auto_budget_codes::INVALID_AUTO_BUDGET_POLICY,
+                "pause_at_ratio must not exceed warn_at_ratio",
+            ));
+        }
+        if !(1..=200).contains(&self.max_turns_per_run) {
+            return Err(BudgetValidationError::new(
+                auto_budget_codes::INVALID_AUTO_BUDGET_POLICY,
+                "max_turns_per_run must be between 1 and 200",
+            ));
+        }
+        if let Some(total) = self.max_total_turns
+            && (total == 0 || total < self.max_turns_per_run)
+        {
+            return Err(BudgetValidationError::new(
+                auto_budget_codes::INVALID_AUTO_BUDGET_POLICY,
+                "max_total_turns must be at least max_turns_per_run",
+            ));
+        }
+        if self.no_progress_turns > 1_000 {
+            return Err(BudgetValidationError::new(
+                auto_budget_codes::INVALID_AUTO_BUDGET_POLICY,
+                "no_progress_turns must be at most 1000",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn resolved_initial_u64(
+    explicit: Option<u64>,
+    cap: Option<u64>,
+    max_multiplier: f64,
+) -> Option<u64> {
+    if explicit.is_some() {
+        return explicit;
+    }
+    let cap = cap?;
+    let divisor = if max_multiplier.is_finite() && max_multiplier >= 1.0 {
+        max_multiplier
+    } else {
+        1.0
+    };
+    let derived = (cap as f64 / divisor).ceil();
+    Some((derived as u64).clamp(1, cap))
+}
+
+fn resolved_initial_f64(
+    explicit: Option<f64>,
+    cap: Option<f64>,
+    max_multiplier: f64,
+) -> Option<f64> {
+    if explicit.is_some() {
+        return explicit;
+    }
+    let cap = cap?;
+    let divisor = if max_multiplier.is_finite() && max_multiplier >= 1.0 {
+        max_multiplier
+    } else {
+        1.0
+    };
+    Some((cap / divisor).max(f64::MIN_POSITIVE).min(cap))
+}
+
+/// Bounded operational state for an auto-budget session. Lifecycle changes are
+/// event-backed; forecast snapshots are operational and may be rewritten
+/// without appending an event.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SessionAutoBudgetState {
+    pub extensions: u32,
+    pub last_extension_at: Option<String>,
+    pub total_turns: u32,
+    pub turns_without_progress: u32,
+    pub last_progress_seq: u64,
+    pub last_forecast: Option<BudgetForecast>,
+    pub paused_reason: Option<String>,
+    pub paused_at: Option<String>,
+    /// Cumulative wall-clock time across runs. Auto sessions never receive a
+    /// fresh full window after a resume.
+    pub elapsed_secs: u64,
+    /// Opaque bounded runtime state (for example a no-progress tracker).
+    /// Protocol and store layers preserve it verbatim; they do not interpret
+    /// it. Serialized state is capped at [`MAX_SESSION_AUTO_STATE_BYTES`].
+    #[serde(default)]
+    pub progress: Option<Value>,
+}
+
+/// Maximum serialized size of [`SessionAutoBudgetState`]. Oversized imported
+/// state fails closed instead of growing events or the SQLite row without
+/// bound.
+pub const MAX_SESSION_AUTO_STATE_BYTES: usize = 64 * 1024;
+
+impl SessionAutoBudgetState {
+    pub fn validate(&self) -> Result<(), BudgetValidationError> {
+        let encoded = serde_json::to_vec(self).map_err(|error| {
+            BudgetValidationError::new(
+                auto_budget_codes::INVALID_AUTO_BUDGET_STATE,
+                format!("session auto-budget state is not serializable: {error}"),
+            )
+        })?;
+        if encoded.len() > MAX_SESSION_AUTO_STATE_BYTES {
+            return Err(BudgetValidationError::new(
+                auto_budget_codes::INVALID_AUTO_BUDGET_STATE,
+                format!(
+                    "session auto-budget state is {} bytes; the limit is {} bytes",
+                    encoded.len(),
+                    MAX_SESSION_AUTO_STATE_BYTES
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Durable session auto-budget row. Effective budgets live on `sessions`; the
+/// hard caps and operational state live here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionAutoBudgetRecord {
+    pub session_id: String,
+    pub mode: BudgetMode,
+    #[serde(default)]
+    pub policy: AutoBudgetPolicy,
+    #[serde(default)]
+    pub state: SessionAutoBudgetState,
+    #[serde(default)]
+    pub caps: AutoBudgetCaps,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetForecastSource {
+    #[default]
+    Unavailable,
+    /// Accept the early lowercase-only spelling for archive compatibility.
+    #[serde(alias = "providerledger")]
+    ProviderLedger,
+    Mixed,
+    Estimate,
+}
+
+impl BudgetForecastSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::ProviderLedger => "provider_ledger",
+            Self::Mixed => "mixed",
+            Self::Estimate => "estimate",
+        }
+    }
+}
+
+/// Deterministic, ledger-derived forecast. It is never model-generated.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct BudgetForecast {
+    pub sample_calls: u32,
+    pub avg_input_tokens_per_call: u64,
+    pub avg_output_tokens_per_call: u64,
+    pub avg_cost_usd_per_call: f64,
+    pub remaining_tokens: Option<u64>,
+    pub remaining_cost_usd: Option<f64>,
+    pub remaining_secs: Option<u64>,
+    pub runway_turns: Option<u32>,
+    pub runway_secs: Option<u64>,
+    pub runway_cost_usd: Option<f64>,
+    pub critical_path_turns: Option<u32>,
+    pub source: BudgetForecastSource,
+    pub generated_at: String,
+}
+
+/// Effective/hard budget view returned by `session.budget.get`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionBudgetStatus {
+    pub session_id: String,
+    pub mode: BudgetMode,
+    pub unlimited: bool,
+    pub effective_token_budget: Option<u64>,
+    pub effective_cost_budget_usd: Option<f64>,
+    pub effective_time_budget_secs: Option<u64>,
+    pub hard_token_cap: Option<u64>,
+    pub hard_cost_cap_usd: Option<f64>,
+    pub hard_wall_clock_secs: Option<u64>,
+    pub spent_tokens: u64,
+    pub spent_cost_usd: f64,
+    pub elapsed_secs: u64,
+    pub remaining_tokens: Option<u64>,
+    pub remaining_cost_usd: Option<f64>,
+    pub remaining_secs: Option<u64>,
+    pub policy: Option<AutoBudgetPolicy>,
+    pub state: Option<SessionAutoBudgetState>,
+    pub forecast: BudgetForecast,
+    pub updated_at: Option<String>,
+}
+
+/// One atomic auto-budget extension request. Requested values are additional
+/// amounts; the store uses the larger of the policy's extension step and the
+/// caller's request, then clamps to the hard cap and never below spend.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AutoBudgetExtension {
+    #[serde(default)]
+    pub requested_token_extension: Option<u64>,
+    #[serde(default)]
+    pub requested_cost_extension_usd: Option<f64>,
+    #[serde(default)]
+    pub requested_wall_clock_extension_secs: Option<u64>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub forecast: Option<BudgetForecast>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoBudgetExtensionOutcome {
+    Extended,
+    CapReached,
+}
+
+impl AutoBudgetExtensionOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Extended => "extended",
+            Self::CapReached => auto_budget_codes::AUTO_BUDGET_CAP_REACHED,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AutoBudgetExtensionResult {
+    pub session_id: String,
+    pub extended: bool,
+    /// `extended` or `AUTO_BUDGET_CAP_REACHED`.
+    pub code: String,
+    pub outcome: AutoBudgetExtensionOutcome,
+    pub reason: String,
+    pub old_token_budget: Option<u64>,
+    pub old_cost_budget_usd: Option<f64>,
+    pub old_time_budget_secs: Option<u64>,
+    pub new_token_budget: Option<u64>,
+    pub new_cost_budget_usd: Option<f64>,
+    pub new_time_budget_secs: Option<u64>,
+    pub event_seq: Option<u64>,
+    pub budget: SessionBudgetStatus,
+}
+
+/// Project policy audit event. Project configuration has no session event
+/// stream, so this bounded project-scoped audit row is the event trail.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectAutoBudgetEvent {
+    pub id: String,
+    pub project_id: String,
+    pub seq: u64,
+    pub kind: String,
+    pub payload: Value,
+    pub created_at: String,
+}
+
+pub const SESSION_BUDGET_UPDATED_EVENT: &str = "session.budget.updated";
+pub const SESSION_BUDGET_AUTO_EXTENDED_EVENT: &str = "session.budget.auto_extended";
+pub const SESSION_AUTO_PAUSED_EVENT: &str = "session.auto_paused";
+pub const SESSION_AUTO_RESUMED_EVENT: &str = "session.auto_resumed";
+/// Emitted only when opaque operational state (such as the no-progress
+/// tracker) changes. Forecast-only snapshots stay operational and do not
+/// append events.
+pub const SESSION_AUTO_STATE_EVENT: &str = "session.auto_state";
+pub const PROJECT_AUTO_BUDGET_UPDATED_EVENT: &str = "project.auto_budget.updated";
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionBudgetParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionBudgetForecastParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionBudgetForecastResult {
+    pub session_id: String,
+    pub forecast: BudgetForecast,
+}
+
+/// Set mode/unlimited/effective budgets/hard caps. Omitted fields keep their
+/// current value; explicit `clear_*` flags remove an optional budget or cap.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SetSessionBudgetParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub mode: Option<BudgetMode>,
+    /// Compatibility alias for `mode=unlimited`/restoring the stored mode.
+    #[serde(default)]
+    pub unlimited: Option<bool>,
+    #[serde(default)]
+    pub token_budget: Option<u64>,
+    #[serde(default)]
+    pub cost_budget_usd: Option<f64>,
+    #[serde(default)]
+    pub time_budget_secs: Option<u64>,
+    #[serde(default)]
+    pub clear_token_budget: bool,
+    #[serde(default)]
+    pub clear_cost_budget: bool,
+    #[serde(default)]
+    pub clear_time_budget: bool,
+    #[serde(default)]
+    pub hard_token_cap: Option<u64>,
+    #[serde(default)]
+    pub hard_cost_cap_usd: Option<f64>,
+    #[serde(default)]
+    pub hard_wall_clock_secs: Option<u64>,
+    #[serde(default)]
+    pub clear_hard_token_cap: bool,
+    #[serde(default)]
+    pub clear_hard_cost_cap: bool,
+    #[serde(default)]
+    pub clear_hard_wall_clock_cap: bool,
+    /// Optional policy replacement. Hard caps in the policy are used unless an
+    /// explicit cap field above overrides them.
+    #[serde(default)]
+    pub policy: Option<AutoBudgetPolicy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetSessionBudgetResult {
+    pub session_id: String,
+    pub budget: SessionBudgetStatus,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AutoBudgetPolicyParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetAutoBudgetPolicyParams {
+    pub project_id: String,
+    pub policy: AutoBudgetPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AutoBudgetPolicyResult {
+    pub project_id: String,
+    pub policy: AutoBudgetPolicy,
+    pub updated_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateSessionParams {
     pub project_id: String,
@@ -2932,6 +3598,13 @@ pub struct CreateSessionParams {
     /// with explicit token/cost/time budgets.
     #[serde(default)]
     pub unlimited: bool,
+    /// Optional explicit mode. Omitted decodes as `fixed` (or `unlimited` when
+    /// the legacy `unlimited` flag is set).
+    #[serde(default)]
+    pub budget_mode: Option<BudgetMode>,
+    /// Optional session-level auto policy. Auto requires at least one hard cap.
+    #[serde(default)]
+    pub auto_budget: Option<AutoBudgetPolicy>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -11535,6 +12208,11 @@ pub struct SessionBundle {
     /// and counts only, never context or template bodies.
     #[serde(default)]
     pub team_template_events: Vec<TeamTemplateEvent>,
+    /// Durable session auto-budget row. Older bundles decode as `None`.
+    /// Imported archives keep the row as read-only evidence and never inherit
+    /// a run-loop extension.
+    #[serde(default)]
+    pub session_auto_budget: Option<SessionAutoBudgetRecord>,
 }
 
 /// Project policy for automatic crash resume. Manual `session.run.resume`
@@ -20835,6 +21513,7 @@ mod context_checkpoint_bundle_tests {
             team_templates: Vec::new(),
             project_team_templates: Vec::new(),
             team_template_events: Vec::new(),
+            session_auto_budget: None,
         };
         let encoded = serde_json::to_string(&bundle).unwrap();
         let decoded: SessionBundle = serde_json::from_str(&encoded).unwrap();
@@ -25673,5 +26352,170 @@ mod team_template_protocol_tests {
             team_template_codes::TEMPLATE_BUDGET_WIDENING,
             "TEMPLATE_BUDGET_WIDENING"
         );
+    }
+}
+
+#[cfg(test)]
+mod auto_budget_type_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn budget_mode_defaults_and_values_are_stable_wire_values() {
+        assert_eq!(BudgetMode::default(), BudgetMode::Fixed);
+        assert_eq!(BudgetMode::Fixed.as_str(), "fixed");
+        assert_eq!(BudgetMode::Auto.as_str(), "auto");
+        assert_eq!(BudgetMode::Unlimited.as_str(), "unlimited");
+        assert_eq!(BudgetMode::parse("auto").unwrap(), BudgetMode::Auto);
+        let error = BudgetMode::parse("variable").unwrap_err();
+        assert_eq!(error.code, "INVALID_BUDGET_MODE");
+        let decoded: BudgetMode = serde_json::from_value(json!("unlimited")).unwrap();
+        assert_eq!(decoded, BudgetMode::Unlimited);
+    }
+
+    #[test]
+    fn budget_forecast_source_wire_values_are_snake_case() {
+        assert_eq!(
+            serde_json::to_value(BudgetForecastSource::ProviderLedger).unwrap(),
+            json!("provider_ledger")
+        );
+        assert_eq!(
+            serde_json::to_value(BudgetForecastSource::Mixed).unwrap(),
+            json!("mixed")
+        );
+        assert_eq!(
+            serde_json::to_value(BudgetForecastSource::Estimate).unwrap(),
+            json!("estimate")
+        );
+        assert_eq!(
+            serde_json::to_value(BudgetForecastSource::Unavailable).unwrap(),
+            json!("unavailable")
+        );
+        let decoded: BudgetForecastSource =
+            serde_json::from_value(json!("provider_ledger")).unwrap();
+        assert_eq!(decoded, BudgetForecastSource::ProviderLedger);
+        let legacy: BudgetForecastSource =
+            serde_json::from_value(json!("providerledger")).unwrap();
+        assert_eq!(legacy, BudgetForecastSource::ProviderLedger);
+
+        let forecast = BudgetForecast {
+            source: BudgetForecastSource::ProviderLedger,
+            generated_at: "2026-11-21T00:00:00Z".into(),
+            ..BudgetForecast::default()
+        };
+        let encoded = serde_json::to_value(&forecast).unwrap();
+        assert_eq!(encoded["source"], "provider_ledger");
+        let round_trip: BudgetForecast = serde_json::from_value(encoded).unwrap();
+        assert_eq!(round_trip.source, BudgetForecastSource::ProviderLedger);
+    }
+
+    #[test]
+    fn auto_budget_derives_initial_from_one_cap_and_preserves_explicit_initial() {
+        let derived = AutoBudgetPolicy {
+            enabled: true,
+            hard_token_cap: Some(4_000_000),
+            hard_cost_cap_usd: Some(8.0),
+            hard_wall_clock_secs: Some(3_600),
+            ..AutoBudgetPolicy::default()
+        };
+        assert_eq!(
+            derived.resolved_initial_token_budget(),
+            Some(1_000_000)
+        );
+        assert_eq!(derived.resolved_initial_cost_budget_usd(), Some(2.0));
+        assert_eq!(derived.resolved_initial_wall_clock_secs(), Some(900));
+
+        let explicit = AutoBudgetPolicy {
+            initial_token_budget: Some(250_000),
+            initial_cost_budget_usd: Some(0.5),
+            initial_wall_clock_secs: Some(60),
+            hard_token_cap: Some(1_000_000),
+            hard_cost_cap_usd: Some(4.0),
+            hard_wall_clock_secs: Some(600),
+            ..AutoBudgetPolicy::default()
+        };
+        assert_eq!(explicit.resolved_initial_token_budget(), Some(250_000));
+        assert_eq!(explicit.resolved_initial_cost_budget_usd(), Some(0.5));
+        assert_eq!(explicit.resolved_initial_wall_clock_secs(), Some(60));
+    }
+
+    #[test]
+    fn auto_budget_policy_defaults_and_validation_are_explicit() {
+        let policy = AutoBudgetPolicy::default();
+        assert!(!policy.enabled);
+        assert_eq!(policy.extend_ratio, 0.25);
+        assert_eq!(policy.max_multiplier, 4.0);
+        assert_eq!(policy.forecast_calls, 8);
+        assert_eq!(policy.min_runway_turns, 4);
+        assert_eq!(policy.warn_at_ratio, 0.20);
+        assert_eq!(policy.pause_at_ratio, 0.05);
+        assert_eq!(policy.max_turns_per_run, 60);
+        assert_eq!(policy.no_progress_turns, 6);
+        assert_eq!(policy.no_progress_action, NoProgressAction::Pause);
+        assert!(policy.auto_tool_bundle);
+        policy.validate().unwrap();
+        let error = policy.require_hard_cap().unwrap_err();
+        assert_eq!(error.code, "AUTO_BUDGET_CAP_REQUIRED");
+
+        let invalid = AutoBudgetPolicy {
+            max_turns_per_run: 201,
+            ..AutoBudgetPolicy::default()
+        };
+        assert_eq!(
+            invalid.validate().unwrap_err().code,
+            "INVALID_AUTO_BUDGET_POLICY"
+        );
+
+        let decoded: AutoBudgetPolicy = serde_json::from_value(json!({
+            "hard_token_cap": 5000
+        }))
+        .unwrap();
+        assert_eq!(decoded.hard_token_cap, Some(5_000));
+        assert_eq!(decoded.extend_ratio, 0.25);
+        assert_eq!(decoded.no_progress_action, NoProgressAction::Pause);
+    }
+
+    #[test]
+    fn create_session_params_decode_legacy_as_fixed() {
+        let params: CreateSessionParams = serde_json::from_value(json!({
+            "project_id": "prj",
+            "goal": "legacy"
+        }))
+        .unwrap();
+        assert!(!params.unlimited);
+        assert!(params.budget_mode.is_none());
+        assert!(params.auto_budget.is_none());
+
+        let auto: CreateSessionParams = serde_json::from_value(json!({
+            "project_id": "prj",
+            "goal": "auto",
+            "budget_mode": "auto",
+            "auto_budget": {"enabled": true, "hard_cost_cap_usd": 3.0}
+        }))
+        .unwrap();
+        assert_eq!(auto.budget_mode, Some(BudgetMode::Auto));
+        assert_eq!(auto.auto_budget.unwrap().hard_cost_cap_usd, Some(3.0));
+    }
+
+    #[test]
+    fn set_session_budget_params_are_additive_and_typed() {
+        let params: SetSessionBudgetParams = serde_json::from_value(json!({
+            "session_id": "ses"
+        }))
+        .unwrap();
+        assert!(params.mode.is_none());
+        assert!(!params.clear_token_budget);
+        assert!(params.policy.is_none());
+
+        let params: SetSessionBudgetParams = serde_json::from_value(json!({
+            "session_id": "ses",
+            "mode": "auto",
+            "hard_token_cap": 5000,
+            "policy": {"enabled": true}
+        }))
+        .unwrap();
+        assert_eq!(params.mode, Some(BudgetMode::Auto));
+        assert_eq!(params.hard_token_cap, Some(5_000));
+        assert!(params.policy.unwrap().enabled);
     }
 }

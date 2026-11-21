@@ -19,21 +19,23 @@ use vp_protocol::types::{
     AgentIdentityError, AgentIdentityEvent, AgentIdentityPolicy, AgentInboxMessage, AgentMessage,
     AgentRecord, AgentWorkspace, AgentWorkspaceEvent, Approval, ApprovalAuditEvent, ApprovalGrant,
     ApprovalTemplate, Artifact, ArtifactPolicy, ArtifactProvenance, ArtifactVersion,
-    AttentionPolicy, CacheEpochBundleBucket, CacheEpochReuseSession, CachePolicy,
-    CheckpointRetentionPolicy, ContextCheckpoint, ContextCheckpointPolicy, ContinuationOutcome,
-    ContractPolicy, CriticalPathPolicy, EffectEvidence, EffectPolicy, EffectReceipt, EffectState,
-    EffectTarget, Event, GatePolicy, GateRecord, GuiActionInfo, GuiPolicy, InstructionBlob,
-    IntakeTask, IntegrationPolicy, MailboxPolicy, McpServer, McpServerConfig, McpTask, McpToolPin,
+    AttentionPolicy, AutoBudgetCaps, AutoBudgetPolicy, BudgetMode, BudgetValidationError,
+    CacheEpochBundleBucket, CacheEpochReuseSession, CachePolicy, CheckpointRetentionPolicy,
+    ContextCheckpoint, ContextCheckpointPolicy, ContinuationOutcome, ContractPolicy,
+    CriticalPathPolicy, EffectEvidence, EffectPolicy, EffectReceipt, EffectState, EffectTarget,
+    Event, GatePolicy, GateRecord, GuiActionInfo, GuiPolicy, InstructionBlob, IntakeTask,
+    IntegrationPolicy, MailboxPolicy, McpServer, McpServerConfig, McpTask, McpToolPin,
     McpTransport, MemoryConflict, MemoryEmbeddingJobStatus, MemoryEmbeddingPolicy,
     MemoryEmbeddingUsage, MemoryEmbeddingsStatusResult, MemoryEvidence, MemoryHealthResult,
     MemoryItem, MemoryPolicy, MemoryStatCount, MergeQueueEntry, MergeQueueSource, MetricCount,
     ModelPreset, OrchestrationDecision, OrchestrationNote, OrchestrationPolicy,
     OrchestrationRecovery, PlanTaskProgress, PreemptionPolicy, PreemptionSessionSummary,
     ProcessPolicy, Program, ProgramEvent, ProgramMilestone, ProgramMilestoneStatus, ProgramPolicy,
-    ProgramStatus, ProgramUsage, Project, ProjectBudget, ProjectTeamTemplate, ProjectUsageSession,
-    PromptPrefixAggregate, PromptPrefixObservation, PromptPrefixRecord, PromptSectionRef, Question,
-    RunBudgetSnapshot, RunCheckpoint, RunStep, RunToolCall, ScheduledTask, SearchHit, Session,
-    SessionBundle, SessionContinuation, SessionInstructionState, SessionRun, SessionRunPolicy,
+    ProgramStatus, ProgramUsage, Project, ProjectAutoBudgetEvent, ProjectBudget,
+    ProjectTeamTemplate, ProjectUsageSession, PromptPrefixAggregate, PromptPrefixObservation,
+    PromptPrefixRecord, PromptSectionRef, Question, RunBudgetSnapshot, RunCheckpoint, RunStep,
+    RunToolCall, ScheduledTask, SearchHit, Session, SessionAutoBudgetRecord, SessionBundle,
+    SessionContinuation, SessionInstructionState, SessionRun, SessionRunPolicy,
     SessionWorkerWorkspace, ShellPolicy, Skill, Source, SourceChunk, SourceCollection,
     SourceEmbeddingIntegrity, SourceEmbeddingJobStatus, SourceEmbeddingPolicy,
     SourceEmbeddingStatusResult, SourceEmbeddingUsage, SourceRetrievalPolicy, SourceSearchHit,
@@ -1016,6 +1018,13 @@ pub struct SessionRepair {
     /// Event-derived prompt layout (`2` or `3`). `None` leaves the projection
     /// untouched.
     pub prompt_layout: Option<u32>,
+    /// Event-derived effective budgets. `None` leaves the column untouched;
+    /// `Some(None)` clears it.
+    pub token_budget: Option<Option<u64>>,
+    pub cost_budget_usd: Option<Option<f64>>,
+    pub time_budget_secs: Option<Option<u64>>,
+    /// Event-derived auto-budget row. `None` leaves the existing row alone.
+    pub auto_budget: Option<SessionAutoBudgetRecord>,
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub cost_spent_usd: f64,
@@ -1498,6 +1507,14 @@ pub struct ProjectManifestSnapshot {
     /// enabled, bounded default.
     #[serde(default)]
     pub preemption_policy: PreemptionPolicy,
+    /// Project-scoped auto-budget defaults. Older manifests decode as the
+    /// disabled default; session hard caps are copied at creation.
+    #[serde(default)]
+    pub auto_budget_policy: AutoBudgetPolicy,
+    /// Bounded project auto-budget audit events. Project configuration has no
+    /// session event stream, so the manifest is their rebuild snapshot.
+    #[serde(default)]
+    pub project_auto_budget_events: Vec<ProjectAutoBudgetEvent>,
     pub budget: ProjectBudget,
     #[serde(default)]
     pub task_scheduler_policy: TaskSchedulerPolicy,
@@ -1793,6 +1810,32 @@ fn validate_session_bundle(bundle: &SessionBundle) -> Result<()> {
     validate_storage_id("session", &bundle.session.id)?;
     if bundle.session.project_id != bundle.project.id {
         return Err(anyhow!("bundle session/project ids do not match"));
+    }
+    if let Some(record) = &bundle.session_auto_budget {
+        if record.session_id != bundle.session.id {
+            return Err(anyhow!(
+                "bundle auto-budget row belongs to session {}, not {}",
+                record.session_id,
+                bundle.session.id
+            ));
+        }
+        record
+            .policy
+            .validate()
+            .map_err(|error| anyhow!("bundle auto-budget policy is invalid: {error}"))?;
+        record
+            .caps
+            .validate()
+            .map_err(|error| anyhow!("bundle auto-budget caps are invalid: {error}"))?;
+        record
+            .state
+            .validate()
+            .map_err(|error| anyhow!("bundle auto-budget state is invalid: {error}"))?;
+        if record.mode == BudgetMode::Auto && record.caps.is_empty() {
+            return Err(anyhow!(
+                "bundle auto-budget row is auto but has no hard cap"
+            ));
+        }
     }
     let mut bundle_event_seqs = std::collections::HashSet::new();
     for event in &bundle.events {
@@ -6687,6 +6730,7 @@ mod acp;
 mod agents;
 mod approvals;
 mod artifacts;
+pub mod auto_budget;
 mod backup;
 mod cache;
 mod context;
@@ -6725,6 +6769,7 @@ mod lease;
 pub mod team_template;
 pub mod workspaces;
 
+pub use auto_budget::SessionBudgetUpdate;
 pub use continuation_lease::{
     ContinuationAckLostReason, ContinuationClaimToken, SessionContinuationAckError,
     SessionContinuationClaim, SessionContinuationClaimStatus,

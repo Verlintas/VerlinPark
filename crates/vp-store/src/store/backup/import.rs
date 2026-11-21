@@ -817,6 +817,9 @@ impl Store {
                 plan_runtime_snapshot_json
             ],
         )?;
+        if let Some(record) = &bundle.session_auto_budget {
+            crate::store::auto_budget::insert_session_auto_budget_tx(&tx, record)?;
+        }
         // Session workspace bindings require the imported session row; insert
         // them after the session itself.
         for binding in &bundle.session_worker_workspaces {

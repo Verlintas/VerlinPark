@@ -1,6 +1,6 @@
 # VerlinPark 决策记录
 
-> 最后更新：2026-11-11
+> 最后更新：2026-11-21
 > 格式：Architecture Decision Record（ADR）  
 > 规则：已接受的决策不删除；如果改变，新增一条“Supersedes”记录。
 
@@ -234,6 +234,7 @@
 | [0228](adr/0228-dispatch-module-splits.md) | CLI render/dispatch and daemon dispatch split by output/command/route family; behavior and protocol unchanged | Accepted | Maintainability |
 | [0229](adr/0229-live-provider-and-budget-estimation.md) | Live provider compatibility: omit empty `tool_calls`, context-aware budget preflight with 25% headroom, validate DeepSeek streaming and full agent flow | Accepted | Providers/Reliability |
 | [0230](adr/0230-reliability-hardening-round.md) | Reliability hardening: persisted approval preview, cross-session ownership, non-consuming journal replay, plan/replay guards, manifest v2, provider finish reasons, CLI policy patches, GUI in-flight lease, Swift reconnect/gap handling | Accepted | Reliability/Security |
+| [0231](adr/0231-auto-budget-and-adaptive-tooling.md) | Auto budget and adaptive tooling: fixed/auto/unlimited, deterministic extension/forecast/pause, cumulative wall clock, no-progress evidence, program reservations, capability gates and orchestrator bundle | Accepted | Runtime/Budget/Tooling |
 
 ---
 

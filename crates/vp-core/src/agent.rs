@@ -22,21 +22,24 @@ use vp_protocol::remote::{
     RemoteIntegrationResult, RemoteIntegrationVerification,
 };
 use vp_protocol::types::{
-    AgentInfo, AgentProbeResult, AgentRecord, ApprovalMode, CapacityInfo, ConfigureAgentParams,
-    ContextCheckpoint, ContextCheckpointDetailResult, ContextCompactionSummary, ContextMeasurement,
+    AgentInfo, AgentProbeResult, AgentRecord, ApprovalMode, AutoBudgetExtension, AutoBudgetPolicy,
+    BudgetMode, CapacityInfo, ConfigureAgentParams, ContextCheckpoint,
+    ContextCheckpointDetailResult, ContextCompactionSummary, ContextMeasurement,
     ContextRestorePreflight, ContextRestoreResult, ContextStructuredState, EffectReceipt,
     EffectState, IntakeDispatchResult, IntakeTask, MERGE_SOURCE_REMOTE, MergeQueueEntry,
     MergeQueueSource, OrchestrationRecovery, PlanDepartment, PlanRevisionDetailResult, PlanTask,
     Program, ProgramMilestone, ProgramTickResult, Project, ReviseTeamPlanResult, RoleModels,
-    RunBudgetSnapshot, ScheduledTask, SchedulerProjectStatus, SchedulerStatusResult, Session,
-    SessionCachePlanResult, SessionCachePlanRole, SessionCacheWarmResult, SessionCheckpoint,
-    SessionCheckpointDiffResult, SessionCheckpointRestoreResult, SessionCompactResult,
-    SessionForkResult, SessionMergeForkResult, SessionPreemptResult, SessionPreemptionResult,
-    SessionRunCancelResult, SessionRunResumeResult, Skill, SourceCitation, SourceSearchHit,
-    StallRecoveryMode, StoredMessage, TeamPlan, TodoItem, ToolBundleCatalogResult,
-    ToolBundleCatalogRow, ToolBundleCategoryCount, ToolBundleDiffResult, ToolBundleHistoryEntry,
-    ToolBundleHistoryResult, ToolBundleLastRun, ToolBundleMatrixResult, ToolBundleMatrixRow,
-    ToolBundleResult, ToolBundleRoleResult, ToolBundleToolInfo, ToolBundleWarningInfo,
+    RunBudgetSnapshot, SESSION_AUTO_PAUSED_EVENT, SESSION_AUTO_RESUMED_EVENT, ScheduledTask,
+    SchedulerProjectStatus, SchedulerStatusResult, Session, SessionAutoBudgetState,
+    SessionBudgetStatus, SessionCachePlanResult, SessionCachePlanRole, SessionCacheWarmResult,
+    SessionCheckpoint, SessionCheckpointDiffResult, SessionCheckpointRestoreResult,
+    SessionCompactResult, SessionForkResult, SessionMergeForkResult, SessionPreemptResult,
+    SessionPreemptionResult, SessionRunCancelResult, SessionRunResumeResult, Skill,
+    SourceCitation, SourceSearchHit, StallRecoveryMode, StoredMessage, TeamPlan, TodoItem,
+    ToolBundleCatalogResult, ToolBundleCatalogRow, ToolBundleCategoryCount, ToolBundleDiffResult,
+    ToolBundleHistoryEntry, ToolBundleHistoryResult, ToolBundleLastRun, ToolBundleMatrixResult,
+    ToolBundleMatrixRow, ToolBundleResult, ToolBundleRoleResult, ToolBundleToolInfo,
+    ToolBundleWarningInfo,
 };
 use vp_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, OpenAiCompatibleProvider, Provider, ProviderError,
@@ -677,7 +680,6 @@ impl RunControl {
             .map(|policy| policy.clone())
             .unwrap_or_default()
     }
-
     fn preempt_report(&self) -> Option<crate::preemption::Snapshot> {
         self.preempt.snapshot()
     }
@@ -742,6 +744,28 @@ impl RunControl {
     fn subscribe_paused(&self) -> watch::Receiver<bool> {
         self.paused.subscribe()
     }
+}
+
+/// Arm the wall-clock preemption deadline from the effective session budget.
+/// Auto sessions use the cumulative remainder instead of a fresh per-run
+/// window; fixed sessions keep the legacy `time_budget_secs` deadline.
+pub(in crate::agent) async fn arm_session_preemption(
+    engine: &Engine,
+    session: &Session,
+    control: &RunControl,
+    policy: vp_protocol::types::PreemptionPolicy,
+) -> Result<()> {
+    let status = engine.session_budget(&session.id).await?;
+    if status.mode == BudgetMode::Auto && !status.unlimited {
+        let deadline = status
+            .remaining_secs
+            .filter(|remaining| *remaining > 0)
+            .map(|remaining| Instant::now() + Duration::from_secs(remaining));
+        control.arm_preemption_deadline(deadline, policy);
+    } else {
+        control.arm_preemption(session.time_budget_secs, policy);
+    }
+    Ok(())
 }
 
 /// Daemon-wide session admission with explicit priority. Higher priority runs
@@ -1623,19 +1647,57 @@ const SCOUT_CAP: usize = 3;
 const SCOUT_SUMMARY_MAX_CHARS: usize = 6_000;
 
 struct SessionBudget {
-    limit: Option<u64>,
-    cost_limit: Option<f64>,
-    time_limit: Option<Duration>,
+    limits: Mutex<BudgetLimits>,
     /// Shared with the engine so an explicit unlimited toggle affects a live
     /// run at the next turn/tool boundary.
     unlimited: Arc<AtomicBool>,
-    started: std::time::Instant,
+    /// Active (non-paused) wall clock. Fixed sessions keep the legacy per-run
+    /// window; auto sessions seed a cumulative base and pause the clock while
+    /// an operator decides, so waiting never consumes budget.
+    clock: Mutex<BudgetClock>,
     caps: AgentCaps,
     worker_cap: AtomicUsize,
     /// Shared Worker/Labour targets and live reservation counters. The tick
     /// updates this object; reservations see a target change atomically.
     scaling_slots: Option<Arc<ScalingSlots>>,
     state: Mutex<BudgetState>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BudgetClock {
+    started: Instant,
+    /// Active wall-clock time before `started` (earlier runs or earlier
+    /// active segments of this run).
+    elapsed_base: Duration,
+    paused_at: Option<Instant>,
+}
+
+impl BudgetClock {
+    fn new(elapsed_base: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            elapsed_base,
+            paused_at: None,
+        }
+    }
+}
+
+/// Effective economic limits. They are separate from live spend/reservations
+/// because an operator top-up or a deterministic auto extension can replace
+/// them at a turn boundary without resetting token/cost spend.
+#[derive(Clone, Copy, Debug, Default)]
+struct BudgetLimits {
+    token: Option<u64>,
+    cost: Option<f64>,
+    time: Option<Duration>,
+}
+
+fn limit_increased<T: PartialOrd + Copy>(previous: Option<T>, next: Option<T>) -> bool {
+    match (previous, next) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(previous), Some(next)) => next > previous,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1693,11 +1755,13 @@ struct TokenReservation<'a> {
 impl SessionBudget {
     fn new(limit: Option<u64>, spent: u64, caps: AgentCaps) -> Self {
         Self {
-            limit,
-            cost_limit: None,
-            time_limit: None,
+            limits: Mutex::new(BudgetLimits {
+                token: limit,
+                cost: None,
+                time: None,
+            }),
             unlimited: Arc::new(AtomicBool::new(false)),
-            started: std::time::Instant::now(),
+            clock: Mutex::new(BudgetClock::new(Duration::ZERO)),
             caps,
             worker_cap: AtomicUsize::new(caps.workers),
             scaling_slots: None,
@@ -1719,7 +1783,9 @@ impl SessionBudget {
     }
 
     fn with_cost(mut self, limit: Option<f64>, spent: f64) -> Self {
-        self.cost_limit = limit;
+        if let Ok(limits) = self.limits.get_mut() {
+            limits.cost = limit;
+        }
         if let Ok(mut state) = self.state.lock() {
             state.cost_spent = spent;
         }
@@ -1732,8 +1798,21 @@ impl SessionBudget {
     }
 
     fn with_time(mut self, seconds: Option<u64>) -> Self {
-        self.time_limit = seconds.map(Duration::from_secs);
-        self.started = std::time::Instant::now();
+        if let Ok(limits) = self.limits.get_mut() {
+            limits.time = seconds.map(Duration::from_secs);
+        }
+        if let Ok(clock) = self.clock.get_mut() {
+            *clock = BudgetClock::new(Duration::ZERO);
+        }
+        self
+    }
+
+    /// Seed the cumulative wall clock used by auto sessions. This never
+    /// changes token or cost spend and never resets an already running clock.
+    fn with_cumulative_elapsed(mut self, elapsed_secs: u64) -> Self {
+        if let Ok(clock) = self.clock.get_mut() {
+            *clock = BudgetClock::new(Duration::from_secs(elapsed_secs));
+        }
         self
     }
 
@@ -1742,17 +1821,77 @@ impl SessionBudget {
         self
     }
 
+    fn limits_snapshot(&self) -> BudgetLimits {
+        self.limits.lock().map(|limits| *limits).unwrap_or_default()
+    }
+
+    fn token_limit(&self) -> Option<u64> {
+        self.limits_snapshot().token
+    }
+
+    fn cost_limit(&self) -> Option<f64> {
+        self.limits_snapshot().cost
+    }
+
+    fn time_limit(&self) -> Option<Duration> {
+        self.limits_snapshot().time
+    }
+
+    /// Apply a persisted effective-budget view after an operator top-up or an
+    /// auto extension. Token/cost spend, reservations, and the cumulative
+    /// wall-clock base are deliberately preserved.
+    fn apply_status(&self, status: &SessionBudgetStatus) {
+        let next = BudgetLimits {
+            token: status.effective_token_budget,
+            cost: status.effective_cost_budget_usd,
+            time: status.effective_time_budget_secs.map(Duration::from_secs),
+        };
+        let previous = self.limits_snapshot();
+        if let Ok(mut limits) = self.limits.lock() {
+            *limits = next;
+        }
+        self.unlimited.store(status.unlimited, Ordering::SeqCst);
+        if let Ok(mut state) = self.state.lock() {
+            if limit_increased(previous.token, next.token) {
+                state.warned_tokens = false;
+            }
+            if limit_increased(previous.cost, next.cost) {
+                state.warned_cost = false;
+            }
+            if limit_increased(previous.time, next.time) {
+                state.warned_time = false;
+            }
+        }
+    }
+
+    /// Set the remaining wall-clock allowance without touching the cumulative
+    /// elapsed base or token/cost spend. `None` keeps the clock unlimited.
+    fn set_remaining_time(&self, remaining_secs: Option<u64>) {
+        let total = remaining_secs.map(|remaining| {
+            Duration::from_secs(self.elapsed_secs().saturating_add(remaining))
+        });
+        if let Ok(mut limits) = self.limits.lock() {
+            limits.time = total;
+        }
+    }
+
+    fn remaining_time_secs(&self) -> Option<u64> {
+        self.time_limit()
+            .map(|limit| limit.saturating_sub(self.elapsed()).as_secs())
+    }
+
     fn is_unlimited(&self) -> bool {
         self.unlimited.load(Ordering::SeqCst)
     }
 
     fn run_snapshot(&self) -> RunBudgetSnapshot {
+        let limits = self.limits_snapshot();
         RunBudgetSnapshot {
-            token_limit: self.limit,
+            token_limit: limits.token,
             tokens_spent: self.spent(),
-            cost_limit_usd: self.cost_limit,
+            cost_limit_usd: limits.cost,
             cost_spent_usd: self.cost_spent(),
-            time_limit_secs: self.time_limit.map(|limit| limit.as_secs()),
+            time_limit_secs: limits.time.map(|limit| limit.as_secs()),
             elapsed_secs: self.elapsed_secs(),
             unlimited: self.is_unlimited(),
         }
@@ -1760,12 +1899,10 @@ impl SessionBudget {
 
     fn add_cost(&self, cost: f64) -> bool {
         let unlimited = self.is_unlimited();
+        let cost_limit = self.cost_limit();
         if let Ok(mut state) = self.state.lock() {
             state.cost_spent += cost.max(0.0);
-            return !unlimited
-                && self
-                    .cost_limit
-                    .is_some_and(|limit| state.cost_spent >= limit);
+            return !unlimited && cost_limit.is_some_and(|limit| state.cost_spent >= limit);
         }
         true
     }
@@ -1774,20 +1911,18 @@ impl SessionBudget {
         if self.is_unlimited() {
             return None;
         }
-        if self.limit.is_some_and(|limit| self.spent() >= limit) {
+        let limits = self.limits_snapshot();
+        if limits.token.is_some_and(|limit| self.spent() >= limit) {
             return Some("tokens");
         }
         if let Ok(state) = self.state.lock()
-            && self
-                .cost_limit
+            && limits
+                .cost
                 .is_some_and(|limit| state.cost_spent + state.reserved_cost >= limit)
         {
             return Some("cost");
         }
-        if self
-            .time_limit
-            .is_some_and(|limit| self.started.elapsed() >= limit)
-        {
+        if limits.time.is_some_and(|limit| self.elapsed() >= limit) {
             return Some("time");
         }
         None
@@ -1797,23 +1932,24 @@ impl SessionBudget {
         if self.is_unlimited() {
             return None;
         }
+        let limits = self.limits_snapshot();
         let mut state = self.state.lock().ok()?;
-        if let Some(limit) = self.limit
+        if let Some(limit) = limits.token
             && state.spent >= limit.saturating_mul(8) / 10
             && !state.warned_tokens
         {
             state.warned_tokens = true;
             return Some("tokens");
         }
-        if let Some(limit) = self.cost_limit
+        if let Some(limit) = limits.cost
             && state.cost_spent + state.reserved_cost >= limit * 0.8
             && !state.warned_cost
         {
             state.warned_cost = true;
             return Some("cost");
         }
-        if let Some(limit) = self.time_limit
-            && self.started.elapsed() >= limit.mul_f64(0.8)
+        if let Some(limit) = limits.time
+            && self.elapsed() >= limit.mul_f64(0.8)
             && !state.warned_time
         {
             state.warned_time = true;
@@ -1851,14 +1987,67 @@ impl SessionBudget {
             .unwrap_or(0.0)
     }
 
+    fn elapsed(&self) -> Duration {
+        let Ok(clock) = self.clock.lock() else {
+            return Duration::ZERO;
+        };
+        let reference = clock.paused_at.unwrap_or_else(Instant::now);
+        clock
+            .elapsed_base
+            .saturating_add(reference.saturating_duration_since(clock.started))
+    }
+
     fn elapsed_secs(&self) -> u64 {
-        self.started.elapsed().as_secs()
+        self.elapsed().as_secs()
+    }
+
+    /// Stop the active wall clock. The run loop calls this while an auto pause
+    /// waits for an operator, so operator decision time never consumes the
+    /// cumulative wall-clock budget.
+    fn pause_clock(&self) {
+        if let Ok(mut clock) = self.clock.lock()
+            && clock.paused_at.is_none()
+        {
+            clock.paused_at = Some(Instant::now());
+        }
+    }
+
+    /// Resume the active wall clock after an operator resume. The paused
+    /// interval is excluded from `elapsed_base` and from the deadline.
+    fn resume_clock(&self) {
+        let Ok(mut clock) = self.clock.lock() else {
+            return;
+        };
+        let Some(paused_at) = clock.paused_at.take() else {
+            return;
+        };
+        clock.elapsed_base = clock
+            .elapsed_base
+            .saturating_add(paused_at.saturating_duration_since(clock.started));
+        clock.started = Instant::now();
+    }
+
+    fn is_clock_paused(&self) -> bool {
+        self.clock
+            .lock()
+            .map(|clock| clock.paused_at.is_some())
+            .unwrap_or(false)
     }
 
     /// Exact instant at which the wall-clock budget expires, using the same
-    /// `started` clock as `exceeded_reason`.
+    /// cumulative clock as `exceeded_reason`. `None` means no deadline (no time
+    /// budget, unlimited, paused, or the cumulative allowance is spent).
     fn wall_clock_deadline(&self) -> Option<Instant> {
-        self.time_limit.map(|limit| self.started + limit)
+        let limit = self.time_limit()?;
+        let clock = self.clock.lock().ok()?;
+        if clock.paused_at.is_some() {
+            return None;
+        }
+        let remaining = limit.checked_sub(clock.elapsed_base)?;
+        if remaining.is_zero() {
+            return None;
+        }
+        Some(clock.started + remaining)
     }
 
     fn worker_cap(&self) -> usize {
@@ -1900,7 +2089,7 @@ impl SessionBudget {
         if self.is_unlimited() {
             return true;
         }
-        let Some(limit) = self.limit else {
+        let Some(limit) = self.token_limit() else {
             return true;
         };
         self.available_tokens()
@@ -1911,7 +2100,7 @@ impl SessionBudget {
         if self.is_unlimited() {
             return None;
         }
-        let limit = self.limit?;
+        let limit = self.token_limit()?;
         let state = self.state.lock().ok()?;
         Some(
             limit
@@ -1924,7 +2113,7 @@ impl SessionBudget {
         if self.is_unlimited() {
             return None;
         }
-        let limit = self.limit?;
+        let limit = self.token_limit()?;
         let mut state = self.state.lock().ok()?;
         let committed = state.spent.saturating_add(state.reserved_tokens);
         if committed.saturating_add(amount) > limit {
@@ -1947,7 +2136,7 @@ impl SessionBudget {
         if self.is_unlimited() {
             return Ok(None);
         }
-        let Some(limit) = self.cost_limit else {
+        let Some(limit) = self.cost_limit() else {
             return Ok(None);
         };
         // Reserve conservatively: the cache mix is unknown before the call, so
@@ -2050,6 +2239,839 @@ impl SessionBudget {
     }
 }
 
+/// Bounded event scan page and ceiling for the no-progress tracker. A turn
+/// never reads more than the ceiling, so a large session log cannot stall the
+/// provider loop.
+const AUTO_BUDGET_PROGRESS_SCAN_PAGE: u32 = 500;
+const AUTO_BUDGET_PROGRESS_SCAN_MAX_EVENTS: usize = 5_000;
+
+/// Top-level Leader auto-budget controller. It owns only the policy copy, the
+/// persisted operational state, and the bounded no-progress tracker. Extension
+/// and pause decisions are deterministic; no model call is involved.
+#[derive(Debug, Clone)]
+pub(in crate::agent) struct AutoBudgetRuntime {
+    policy: AutoBudgetPolicy,
+    state: SessionAutoBudgetState,
+    tracker: crate::auto_progress::ProgressTracker,
+    /// Cleared when an operator switches the live session away from `auto`.
+    /// A stale runtime never extends, pauses, or escalates after that switch.
+    active: bool,
+    /// One warning per threshold crossing. Cleared when the ratios recover or
+    /// an auto extension succeeds.
+    warned_low: bool,
+}
+
+impl AutoBudgetRuntime {
+    pub(in crate::agent) fn from_status(
+        session: &Session,
+        status: &SessionBudgetStatus,
+    ) -> Option<Self> {
+        if status.mode != BudgetMode::Auto || status.unlimited {
+            return None;
+        }
+        let policy = status.policy.clone().unwrap_or_default();
+        let mut state = status.state.clone().unwrap_or_default();
+        let tracker = load_progress_tracker(session, &state);
+        state.turns_without_progress = tracker.turns_without_progress();
+        state.last_progress_seq = tracker.last_progress_seq();
+        Some(Self {
+            policy,
+            state,
+            tracker,
+            active: true,
+            warned_low: false,
+        })
+    }
+
+    /// Auto sessions use the policy's per-run turn ceiling, not the provider
+    /// adapter's global default. The hard clamp is part of the policy contract.
+    pub(in crate::agent) fn per_run_turn_limit(&self) -> u32 {
+        self.policy.max_turns_per_run.clamp(1, 200)
+    }
+
+    /// Cumulative provider-turn ordinal for the current top-level session.
+    pub(in crate::agent) fn current_turn(&self) -> u32 {
+        self.state.total_turns
+    }
+
+    fn no_progress_policy(&self) -> crate::auto_progress::NoProgressPolicy {
+        let action = match self.policy.no_progress_action {
+            vp_protocol::types::NoProgressAction::Pause => {
+                crate::auto_progress::NoProgressAction::Pause
+            }
+            vp_protocol::types::NoProgressAction::Escalate => {
+                crate::auto_progress::NoProgressAction::Escalate
+            }
+        };
+        crate::auto_progress::NoProgressPolicy::new(self.policy.no_progress_turns, action)
+    }
+
+    fn sync_state_from_tracker(&mut self) {
+        self.state.turns_without_progress = self.tracker.turns_without_progress();
+        self.state.last_progress_seq = self.tracker.last_progress_seq();
+        if let Ok(value) = serde_json::to_value(&self.tracker) {
+            self.state.progress = Some(value);
+        }
+    }
+
+    /// Merge a fresh store/engine status into the live runtime state while
+    /// preserving the in-run tracker snapshot and monotonic counters.
+    fn absorb_status(&mut self, status: &SessionBudgetStatus) {
+        if let Some(policy) = &status.policy {
+            self.policy = policy.clone();
+        }
+        if let Some(state) = &status.state {
+            let progress = self.state.progress.clone();
+            let total_turns = self.state.total_turns;
+            let elapsed_secs = self.state.elapsed_secs;
+            let paused_reason = self.state.paused_reason.clone();
+            let paused_at = self.state.paused_at.clone();
+            self.state = state.clone();
+            self.state.progress = progress;
+            self.state.total_turns = self.state.total_turns.max(total_turns);
+            self.state.elapsed_secs = self.state.elapsed_secs.max(elapsed_secs);
+            if self.state.paused_reason.is_none() {
+                self.state.paused_reason = paused_reason;
+                self.state.paused_at = paused_at;
+            }
+            self.sync_state_from_tracker();
+        }
+    }
+
+    async fn persist(&mut self, engine: &Engine, session_id: &str) -> Result<()> {
+        self.sync_state_from_tracker();
+        engine
+            .update_session_auto_budget_state(session_id, self.state.clone())
+            .await?;
+        Ok(())
+    }
+
+    /// One bounded forecast warning per threshold crossing. It is driven by the
+    /// session policy's `warn_at_ratio`, not the generic 80% spent heuristic.
+    async fn maybe_warn_low_runway(
+        &mut self,
+        engine: &Engine,
+        session_id: &str,
+        status: &SessionBudgetStatus,
+    ) -> Result<()> {
+        let low = auto_budget_below_warn_ratio(status, &self.policy);
+        if !low {
+            self.warned_low = false;
+            return Ok(());
+        }
+        if self.warned_low {
+            return Ok(());
+        }
+        let dimensions = json!({
+            "tokens": budget_dimension_u64(
+                status.remaining_tokens,
+                status.effective_token_budget,
+            ),
+            "cost": budget_dimension_f64(
+                status.remaining_cost_usd,
+                status.effective_cost_budget_usd,
+            ),
+            "time": budget_dimension_u64(
+                status.remaining_secs,
+                status.effective_time_budget_secs,
+            ),
+        });
+        engine
+            .append_event(
+                session_id,
+                "session.budget.forecast_warning",
+                json!({
+                    "schema": "verlinpark.auto_budget_warning/v1",
+                    "warn_at_ratio": self.policy.warn_at_ratio,
+                    "forecast": status.forecast,
+                    "dimensions": dimensions,
+                    "total_turns": self.state.total_turns,
+                    "extensions": self.state.extensions,
+                }),
+            )
+            .await?;
+        self.warned_low = true;
+        Ok(())
+    }
+
+    /// Apply the persisted state at run start without appending a lifecycle
+    /// event. Returns the runtime only when the session is explicitly auto.
+    pub(in crate::agent) async fn load(
+        engine: &Engine,
+        session: &Session,
+    ) -> Result<Option<Self>> {
+        let status = engine.session_budget(&session.id).await?;
+        Ok(Self::from_status(session, &status))
+    }
+
+    fn pause_details(
+        status: Option<&SessionBudgetStatus>,
+        extra: serde_json::Value,
+    ) -> serde_json::Value {
+        let budget = status.map(|status| {
+            json!({
+                "effective_token_budget": status.effective_token_budget,
+                "effective_cost_budget_usd": status.effective_cost_budget_usd,
+                "effective_time_budget_secs": status.effective_time_budget_secs,
+                "hard_token_cap": status.hard_token_cap,
+                "hard_cost_cap_usd": status.hard_cost_cap_usd,
+                "hard_wall_clock_secs": status.hard_wall_clock_secs,
+                "remaining_tokens": status.remaining_tokens,
+                "remaining_cost_usd": status.remaining_cost_usd,
+                "remaining_secs": status.remaining_secs,
+            })
+        });
+        json!({
+            "schema": "verlinpark.auto_budget_pause/v1",
+            "forecast": status.map(|status| status.forecast.clone()),
+            "budget": budget,
+            "details": extra,
+        })
+    }
+
+    /// Pause at a safe turn boundary and wait for the operator to resume. The
+    /// run is not finalized as failed and no provider/tool call is made while
+    /// paused. Returns `false` when the run was cancelled instead of resumed.
+    #[allow(clippy::too_many_arguments)]
+    async fn pause_and_wait(
+        &mut self,
+        engine: &Engine,
+        session: &Session,
+        spec: &AgentSpec,
+        control: &RunControl,
+        budget: &SessionBudget,
+        reason: &str,
+        status: Option<&SessionBudgetStatus>,
+        details: serde_json::Value,
+    ) -> Result<bool> {
+        self.pause(engine, session, control, budget, reason, status, details)
+            .await?;
+        // Stop the active wall clock before the wait. The guard keeps repeated
+        // pause transitions idempotent; `resume_clock` shifts the run clock
+        // forward by exactly the paused interval.
+        if !budget.is_clock_paused() {
+            budget.pause_clock();
+        }
+        // A paused session has no wall-clock deadline; an operator decision
+        // must not race a preemption timer that was armed before the pause.
+        control.arm_preemption_deadline(None, control.preemption_policy());
+        let resumed = wait_for_task_resume(engine, &session.id, spec, control).await?;
+        budget.resume_clock();
+        control.arm_preemption_deadline(
+            budget.wall_clock_deadline(),
+            control.preemption_policy(),
+        );
+        if !resumed {
+            return Ok(false);
+        }
+        self.clear_paused_after_operator_resume(engine, &session.id)
+            .await?;
+        Ok(true)
+    }
+
+    /// Record one auto pause and persist the bounded state. Exposed separately
+    /// so a non-turn-scoped plan run can pause without inventing a wait loop.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::agent) async fn pause(
+        &mut self,
+        engine: &Engine,
+        session: &Session,
+        control: &RunControl,
+        budget: &SessionBudget,
+        reason: &str,
+        status: Option<&SessionBudgetStatus>,
+        details: serde_json::Value,
+    ) -> Result<()> {
+        let now = vp_protocol::now_rfc3339();
+        self.state.paused_reason = Some(reason.to_string());
+        self.state.paused_at = Some(now.clone());
+        self.state.elapsed_secs = budget.elapsed_secs();
+        if let Some(status) = status {
+            self.state.last_forecast = Some(status.forecast.clone());
+        }
+        self.sync_state_from_tracker();
+        control.pause();
+        engine.update_session_status(&session.id, "paused").await?;
+        let mut payload = Self::pause_details(status, details);
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("reason".into(), json!(reason));
+            object.insert("session_id".into(), json!(session.id));
+            object.insert("paused_at".into(), json!(now));
+            object.insert("total_turns".into(), json!(self.state.total_turns));
+            object.insert("elapsed_secs".into(), json!(self.state.elapsed_secs));
+            object.insert("extensions".into(), json!(self.state.extensions));
+        }
+        engine
+            .update_session_auto_budget_state_with_event(
+                &session.id,
+                self.state.clone(),
+                SESSION_AUTO_PAUSED_EVENT,
+                payload,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn clear_paused_after_operator_resume(
+        &mut self,
+        engine: &Engine,
+        session_id: &str,
+    ) -> Result<()> {
+        let Some(previous_reason) = self.state.paused_reason.clone() else {
+            return Ok(());
+        };
+        let previous_turns = self.tracker.reset_on_operator_resume();
+        self.state.paused_reason = None;
+        self.state.paused_at = None;
+        self.sync_state_from_tracker();
+        engine
+            .update_session_auto_budget_state_with_event(
+                session_id,
+                self.state.clone(),
+                SESSION_AUTO_RESUMED_EVENT,
+                json!({
+                    "schema": "verlinpark.auto_resume/v1",
+                    "reason": previous_reason,
+                    "operator_reset": true,
+                    "previous_turns_without_progress": previous_turns,
+                    "total_turns": self.state.total_turns,
+                    "elapsed_secs": self.state.elapsed_secs,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Run before every top-level Leader provider call. Returns `false` when
+    /// the run was cancelled while paused.
+    pub(in crate::agent) async fn before_turn(
+        &mut self,
+        engine: &Engine,
+        session: &Session,
+        spec: &AgentSpec,
+        control: &RunControl,
+        budget: &SessionBudget,
+    ) -> Result<bool> {
+        loop {
+            if control.is_cancelled() || control.is_preempted() {
+                return Ok(false);
+            }
+            let status = engine.session_budget(&session.id).await?;
+            budget.apply_status(&status);
+            self.absorb_status(&status);
+            self.state.elapsed_secs = budget.elapsed_secs();
+            // Every turn re-arms the exact remaining cumulative window so a
+            // top-up (or a newly extended window) takes effect immediately.
+            control.arm_preemption_deadline(
+                budget.wall_clock_deadline(),
+                control.preemption_policy(),
+            );
+
+            if status.mode != BudgetMode::Auto || status.unlimited {
+                // An explicit operator switch to fixed/unlimited is honored at
+                // the next turn. Auto never selects unlimited itself.
+                self.active = false;
+                self.persist(engine, &session.id).await?;
+                return Ok(true);
+            }
+            self.active = true;
+            self.maybe_warn_low_runway(engine, &session.id, &status)
+                .await?;
+
+            if let Some(max_total) = self.policy.max_total_turns
+                && self.state.total_turns >= max_total
+            {
+                let details = json!({
+                    "limit": max_total,
+                    "total_turns": self.state.total_turns,
+                });
+                if !self
+                    .pause_and_wait(
+                        engine,
+                        session,
+                        spec,
+                        control,
+                        budget,
+                        "max_total_turns",
+                        Some(&status),
+                        details,
+                    )
+                    .await?
+                {
+                    return Ok(false);
+                }
+                continue;
+            }
+
+            let mut effective = status.clone();
+            if auto_budget_needs_extension(
+                &status,
+                &self.policy,
+                self.state.elapsed_secs,
+                self.state.total_turns,
+            ) {
+                let request = auto_budget_extension_request(
+                    &status,
+                    &self.policy,
+                    self.state.elapsed_secs,
+                    self.state.total_turns,
+                );
+                let result = engine
+                    .extend_session_auto_budget(&session.id, request)
+                    .await?;
+                budget.apply_status(&result.budget);
+                self.absorb_status(&result.budget);
+                self.state.elapsed_secs = budget.elapsed_secs();
+                control.arm_preemption_deadline(
+                    budget.wall_clock_deadline(),
+                    control.preemption_policy(),
+                );
+                effective = result.budget.clone();
+                if result.extended {
+                    self.warned_low = false;
+                }
+                if !result.extended {
+                    let details = json!({
+                        "code": "AUTO_BUDGET_CAP_REACHED",
+                        "missing": budget_missing_dimensions(&effective),
+                        "extensions": self.state.extensions,
+                    });
+                    if !self
+                        .pause_and_wait(
+                            engine,
+                            session,
+                            spec,
+                            control,
+                            budget,
+                            "budget_cap",
+                            Some(&effective),
+                            details,
+                        )
+                        .await?
+                    {
+                        return Ok(false);
+                    }
+                    continue;
+                }
+            }
+
+            if budget.exhausted() {
+                let details = json!({
+                    "missing": budget_missing_dimensions(&effective),
+                    "extensions": self.state.extensions,
+                });
+                if !self
+                    .pause_and_wait(
+                        engine,
+                        session,
+                        spec,
+                        control,
+                        budget,
+                        "budget_cap",
+                        Some(&effective),
+                        details,
+                    )
+                    .await?
+                {
+                    return Ok(false);
+                }
+                continue;
+            }
+
+            self.state.total_turns = self.state.total_turns.saturating_add(1);
+            self.state.elapsed_secs = budget.elapsed_secs();
+            self.state.last_forecast = Some(effective.forecast.clone());
+            self.persist(engine, &session.id).await?;
+            return Ok(true);
+        }
+    }
+
+    /// Finalize one completed top-level Leader turn: bounded event scan,
+    /// tracker persistence, and the deterministic pause/escalate decision.
+    /// Returns `false` when a no-progress pause was cancelled.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::agent) async fn finish_turn(
+        &mut self,
+        engine: &Engine,
+        session: &Session,
+        spec: &AgentSpec,
+        control: &RunControl,
+        budget: &SessionBudget,
+        turn: u32,
+        allow_pause: bool,
+    ) -> Result<bool> {
+        if !self.active {
+            return Ok(true);
+        }
+        self.state.total_turns = self.state.total_turns.max(turn);
+        let mut cursor = self
+            .tracker
+            .scan_floor_seq()
+            .max(self.tracker.last_observed_seq());
+        let mut scanned = 0usize;
+        let mut truncated = false;
+        let mut progress_seen = false;
+        loop {
+            let page = engine
+                .list_events(
+                    session.id.clone(),
+                    cursor,
+                    AUTO_BUDGET_PROGRESS_SCAN_PAGE,
+                )
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            let page_len = page.len();
+            let mut advanced = false;
+            for event in &page {
+                if event.seq <= cursor {
+                    continue;
+                }
+                let outcome = self.tracker.observe(event, u64::from(turn));
+                progress_seen |= outcome.is_progress();
+                cursor = event.seq;
+                advanced = true;
+                scanned = scanned.saturating_add(1);
+                if scanned >= AUTO_BUDGET_PROGRESS_SCAN_MAX_EVENTS {
+                    truncated = true;
+                    break;
+                }
+            }
+            if truncated || !advanced || page_len < AUTO_BUDGET_PROGRESS_SCAN_PAGE as usize {
+                break;
+            }
+        }
+        let count = self.tracker.finish_turn(u64::from(turn));
+        self.state.total_turns = self.state.total_turns.max(turn);
+        self.state.turns_without_progress = count;
+        self.state.elapsed_secs = budget.elapsed_secs();
+        self.sync_state_from_tracker();
+        let policy = self.no_progress_policy();
+        self.persist(engine, &session.id).await?;
+
+        // A capped window without any progress evidence is incomplete input.
+        // Never pause or escalate on it; persist the advanced cursor and let a
+        // later, complete window decide. This prevents a large event backlog
+        // from creating a false no-progress stop.
+        if truncated && !progress_seen {
+            engine
+                .append_event(
+                    &session.id,
+                    "session.auto_state_warning",
+                    json!({
+                        "schema": "verlinpark.auto_progress_scan/v1",
+                        "code": "NO_PROGRESS_SCAN_TRUNCATED",
+                        "scanned_events": scanned,
+                        "cursor": cursor,
+                        "threshold": policy.no_progress_turns,
+                        "total_turns": self.state.total_turns,
+                        "turns_without_progress": count,
+                    }),
+                )
+                .await?;
+            return Ok(true);
+        }
+
+        let decision = self.tracker.decide(&policy);
+
+        match decision {
+            crate::auto_progress::NoProgressDecision::Pause if allow_pause => {
+                let mut evidence = self.tracker.event_payload(&policy);
+                if let Some(object) = evidence.as_object_mut() {
+                    object.insert("scan_truncated".into(), json!(truncated));
+                    object.insert("scan_events".into(), json!(scanned));
+                    object.insert("total_turns".into(), json!(self.state.total_turns));
+                }
+                if !self
+                    .pause_and_wait(
+                        engine,
+                        session,
+                        spec,
+                        control,
+                        budget,
+                        "no_progress",
+                        None,
+                        evidence,
+                    )
+                    .await?
+                {
+                    return Ok(false);
+                }
+            }
+            crate::auto_progress::NoProgressDecision::Escalate
+                if count == policy.no_progress_turns =>
+            {
+                let summary = self.tracker.summary(&policy);
+                let message = format!(
+                    "auto budget no-progress: {count} completed turn(s) without durable progress \
+                     (threshold {}); last progress seq {}; evidence count {}; operator action required",
+                    policy.no_progress_turns, summary.last_progress_seq, summary.evidence_count
+                );
+                engine
+                    .record_coordination_note(
+                        &session.id,
+                        "escalate",
+                        "warning",
+                        spec.task_id.as_deref(),
+                        None,
+                        None,
+                        &spec.id,
+                        &spec.name,
+                        Some(spec.role.as_str()),
+                        &message,
+                    )
+                    .await?;
+            }
+            _ => {}
+        }
+        Ok(true)
+    }
+}
+
+fn load_progress_tracker(
+    session: &Session,
+    state: &SessionAutoBudgetState,
+) -> crate::auto_progress::ProgressTracker {
+    state
+        .progress
+        .as_ref()
+        .and_then(|value| serde_json::from_value::<crate::auto_progress::ProgressTracker>(
+            value.clone(),
+        ).ok())
+        .map(crate::auto_progress::ProgressTracker::normalized)
+        .filter(|tracker| !tracker.session_id().is_empty() && tracker.session_id() == session.id)
+        .unwrap_or_else(|| crate::auto_progress::ProgressTracker::new(session.id.clone(), None))
+}
+
+fn auto_budget_needs_extension(
+    status: &SessionBudgetStatus,
+    policy: &AutoBudgetPolicy,
+    elapsed_secs: u64,
+    total_turns: u32,
+) -> bool {
+    let min_runway = policy.min_runway_turns.max(1);
+    // Only a dimension with a resolved hard cap can be auto-extended. A low
+    // runway on an uncapped effective budget (for example a time-only policy
+    // with a bounded initial token budget) must not trigger a CapReached pause.
+    let token_runway_below = status.hard_token_cap.is_some()
+        && auto_token_runway_turns(status).is_some_and(|runway| runway < min_runway);
+    let cost_runway_below = status.hard_cost_cap_usd.is_some()
+        && auto_cost_runway_turns(status, policy)
+            .is_some_and(|runway| runway < min_runway);
+    let time_runway_below = status.hard_wall_clock_secs.is_some()
+        && auto_time_runway_turns(status, policy, elapsed_secs, total_turns)
+            .is_some_and(|runway| runway < min_runway);
+    if token_runway_below || cost_runway_below || time_runway_below {
+        return true;
+    }
+    let ratios = [
+        status
+            .hard_token_cap
+            .is_some()
+            .then(|| remaining_ratio(status.remaining_tokens, status.effective_token_budget))
+            .flatten(),
+        status
+            .hard_cost_cap_usd
+            .is_some()
+            .then(|| {
+                remaining_cost_ratio(
+                    status.remaining_cost_usd,
+                    status.effective_cost_budget_usd,
+                )
+            })
+            .flatten(),
+        status
+            .hard_wall_clock_secs
+            .is_some()
+            .then(|| remaining_ratio(status.remaining_secs, status.effective_time_budget_secs))
+            .flatten(),
+    ];
+    ratios
+        .into_iter()
+        .flatten()
+        .any(|ratio| ratio <= policy.pause_at_ratio)
+}
+
+fn auto_budget_below_warn_ratio(
+    status: &SessionBudgetStatus,
+    policy: &AutoBudgetPolicy,
+) -> bool {
+    let ratios = [
+        remaining_ratio(status.remaining_tokens, status.effective_token_budget),
+        remaining_cost_ratio(status.remaining_cost_usd, status.effective_cost_budget_usd),
+        remaining_ratio(status.remaining_secs, status.effective_time_budget_secs),
+    ];
+    ratios
+        .into_iter()
+        .flatten()
+        .any(|ratio| ratio <= policy.warn_at_ratio)
+}
+
+fn remaining_ratio(remaining: Option<u64>, budget: Option<u64>) -> Option<f64> {
+    match (remaining, budget) {
+        (Some(remaining), Some(budget)) if budget > 0 => {
+            Some(remaining as f64 / budget as f64)
+        }
+        _ => None,
+    }
+}
+
+fn remaining_cost_ratio(remaining: Option<f64>, budget: Option<f64>) -> Option<f64> {
+    match (remaining, budget) {
+        (Some(remaining), Some(budget)) if budget > 0.0 => Some(remaining / budget),
+        _ => None,
+    }
+}
+
+fn budget_dimension_u64(remaining: Option<u64>, budget: Option<u64>) -> serde_json::Value {
+    json!({
+        "remaining": remaining,
+        "budget": budget,
+        "ratio": remaining_ratio(remaining, budget),
+    })
+}
+
+fn budget_dimension_f64(remaining: Option<f64>, budget: Option<f64>) -> serde_json::Value {
+    json!({
+        "remaining": remaining,
+        "budget": budget,
+        "ratio": remaining_cost_ratio(remaining, budget),
+    })
+}
+
+/// Deterministic seconds-per-turn estimate for the wall-clock runway. The first
+/// turn has no observed history, so it uses a bounded policy estimate instead
+/// of assuming every turn is free.
+fn auto_turn_seconds(
+    status: &SessionBudgetStatus,
+    policy: &AutoBudgetPolicy,
+    elapsed_secs: u64,
+    total_turns: u32,
+) -> u64 {
+    if total_turns > 0 && elapsed_secs > 0 {
+        return (elapsed_secs / u64::from(total_turns)).max(1);
+    }
+    let initial = status
+        .effective_time_budget_secs
+        .or(policy.initial_wall_clock_secs)
+        .unwrap_or(1);
+    (initial / u64::from(policy.max_turns_per_run.max(1))).max(1)
+}
+
+fn auto_time_runway_turns(
+    status: &SessionBudgetStatus,
+    policy: &AutoBudgetPolicy,
+    elapsed_secs: u64,
+    total_turns: u32,
+) -> Option<u32> {
+    let remaining = status.remaining_secs?;
+    let per_turn = auto_turn_seconds(status, policy, elapsed_secs, total_turns);
+    Some((remaining / per_turn).min(u64::from(u32::MAX)) as u32)
+}
+
+fn auto_cost_runway_turns(
+    status: &SessionBudgetStatus,
+    _policy: &AutoBudgetPolicy,
+) -> Option<u32> {
+    let remaining = status.remaining_cost_usd?;
+    let avg = status.forecast.avg_cost_usd_per_call;
+    if avg <= 0.0 {
+        return None;
+    }
+    let runway = (remaining / avg).max(0.0);
+    Some(runway.min(f64::from(u32::MAX)) as u32)
+}
+
+fn auto_token_runway_turns(status: &SessionBudgetStatus) -> Option<u32> {
+    let remaining = status.remaining_tokens?;
+    let avg = status
+        .forecast
+        .avg_input_tokens_per_call
+        .saturating_add(status.forecast.avg_output_tokens_per_call);
+    if avg == 0 {
+        return None;
+    }
+    Some((remaining / avg).min(u64::from(u32::MAX)) as u32)
+}
+
+fn auto_budget_extension_request(
+    status: &SessionBudgetStatus,
+    policy: &AutoBudgetPolicy,
+    elapsed_secs: u64,
+    total_turns: u32,
+) -> AutoBudgetExtension {
+    let min_runway = policy.min_runway_turns.max(1);
+    let avg_tokens = status
+        .forecast
+        .avg_input_tokens_per_call
+        .saturating_add(status.forecast.avg_output_tokens_per_call);
+    let token_needed = avg_tokens
+        .saturating_mul(u64::from(min_runway))
+        .saturating_sub(status.remaining_tokens.unwrap_or(0));
+    let requested_token_extension =
+        (status.hard_token_cap.is_some() && token_needed > 0).then_some(token_needed);
+    let cost_needed =
+        status.forecast.avg_cost_usd_per_call * f64::from(min_runway)
+            - status.remaining_cost_usd.unwrap_or(0.0);
+    let requested_cost_extension_usd =
+        (status.hard_cost_cap_usd.is_some() && cost_needed > f64::EPSILON)
+            .then_some(cost_needed);
+
+    let per_turn_secs = auto_turn_seconds(status, policy, elapsed_secs, total_turns);
+    let remaining_secs = status.remaining_secs.unwrap_or(0);
+    let time_runway_below = auto_time_runway_turns(status, policy, elapsed_secs, total_turns)
+        .is_some_and(|runway| runway < min_runway);
+    let time_ratio_low = remaining_ratio(status.remaining_secs, status.effective_time_budget_secs)
+        .is_some_and(|ratio| ratio <= policy.pause_at_ratio);
+    let time_needed = per_turn_secs
+        .saturating_mul(u64::from(min_runway))
+        .saturating_sub(remaining_secs);
+    let requested_wall_clock_extension_secs = (status.hard_wall_clock_secs.is_some()
+        && (time_runway_below || time_ratio_low))
+    .then_some(time_needed.max(1));
+
+    let mut dimensions = Vec::new();
+    if requested_token_extension.is_some() {
+        dimensions.push("tokens");
+    }
+    if requested_cost_extension_usd.is_some() {
+        dimensions.push("cost");
+    }
+    if requested_wall_clock_extension_secs.is_some() {
+        dimensions.push("time");
+    }
+    let reason = if dimensions.is_empty() {
+        "auto_runway".to_string()
+    } else {
+        format!("auto_runway:{}", dimensions.join("+"))
+    };
+    AutoBudgetExtension {
+        requested_token_extension,
+        requested_cost_extension_usd,
+        requested_wall_clock_extension_secs,
+        reason: Some(reason),
+        forecast: Some(status.forecast.clone()),
+    }
+}
+
+fn budget_missing_dimensions(status: &SessionBudgetStatus) -> Vec<&'static str> {
+    let mut dimensions = Vec::new();
+    if status.remaining_tokens == Some(0) {
+        dimensions.push("tokens");
+    }
+    if status
+        .remaining_cost_usd
+        .is_some_and(|remaining| remaining <= 0.0)
+    {
+        dimensions.push("cost");
+    }
+    if status.remaining_secs == Some(0) {
+        dimensions.push("time");
+    }
+    dimensions
+}
+
 impl TokenReservation<'_> {
     /// Replace the pre-flight reservation with the provider's reported usage.
     /// Returns true when the limit is now reached.
@@ -2062,7 +3084,7 @@ impl TokenReservation<'_> {
         };
         state.reserved_tokens = state.reserved_tokens.saturating_sub(amount);
         state.spent = state.spent.saturating_add(actual);
-        !unlimited && self.budget.limit.is_some_and(|limit| state.spent >= limit)
+        !unlimited && self.budget.token_limit().is_some_and(|limit| state.spent >= limit)
     }
 }
 
@@ -2095,7 +3117,7 @@ impl CostReservation<'_> {
         !unlimited
             && self
                 .budget
-                .cost_limit
+                .cost_limit()
                 .is_some_and(|limit| state.cost_spent >= limit)
     }
 }
@@ -2158,9 +3180,9 @@ impl BudgetStop {
             reason: budget.exceeded_reason().unwrap_or("tokens").to_string(),
             code: "BUDGET_EXHAUSTED".to_string(),
             id: None,
-            limit_tokens: budget.limit,
+            limit_tokens: budget.token_limit(),
             spent_tokens: budget.spent(),
-            limit_cost: budget.cost_limit,
+            limit_cost: budget.cost_limit(),
             spent_cost: budget.cost_spent(),
             reserved_tokens: 0,
             reserved_cost: budget.reserved_cost(),
@@ -2215,9 +3237,9 @@ impl BudgetStop {
             reason: reason.as_str().to_string(),
             code: reason.code().to_string(),
             id,
-            limit_tokens: budget.limit,
+            limit_tokens: budget.token_limit(),
             spent_tokens: budget.spent(),
-            limit_cost: budget.cost_limit,
+            limit_cost: budget.cost_limit(),
             spent_cost: budget.cost_spent(),
             reserved_tokens: budget.reserved_tokens(),
             reserved_cost: budget.reserved_cost(),
@@ -2759,6 +3781,10 @@ use scout::*;
 use script::*;
 use support::*;
 use tools::*;
+
+#[cfg(test)]
+#[path = "agent/auto_budget_runtime_tests.rs"]
+mod auto_budget_runtime_tests;
 
 #[cfg(test)]
 #[path = "agent/tests.rs"]

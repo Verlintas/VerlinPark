@@ -74,7 +74,9 @@ pub(in crate::agent) async fn run_plan_resume(
     {
         tracing::warn!(%error, agent_id = %spec.id, "failed to persist run identity binding");
     }
-    let budget = SessionBudget::new(
+    let budget_status = engine.session_budget(&session.id).await?;
+    let auto_runtime = AutoBudgetRuntime::from_status(&session, &budget_status);
+    let mut budget = SessionBudget::new(
         session.token_budget,
         session.tokens_in + session.tokens_out,
         AgentCaps {
@@ -92,6 +94,16 @@ pub(in crate::agent) async fn run_plan_resume(
         config.max_workers,
         config.max_labour,
     ));
+    if auto_runtime.is_some() {
+        let elapsed_secs = budget_status
+            .state
+            .as_ref()
+            .map(|state| state.elapsed_secs)
+            .unwrap_or(0);
+        budget = budget.with_cumulative_elapsed(elapsed_secs);
+        budget.apply_status(&budget_status);
+        budget.set_remaining_time(budget_status.remaining_secs);
+    }
     control.arm_preemption_deadline(
         budget.wall_clock_deadline(),
         engine.get_preemption_policy(&session.project_id).await?,

@@ -4,6 +4,7 @@ use anyhow::Result;
 use serde_json::{Value, json};
 
 mod activity;
+mod budget;
 mod effects;
 mod forges;
 mod human;
@@ -15,6 +16,8 @@ mod support;
 
 #[allow(unused_imports)]
 pub(crate) use activity::*;
+#[allow(unused_imports)]
+pub(crate) use budget::*;
 #[allow(unused_imports)]
 pub(crate) use effects::*;
 #[allow(unused_imports)]

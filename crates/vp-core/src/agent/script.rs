@@ -30,6 +30,7 @@ pub(super) async fn run_script_tool(
     journal: &crate::run_journal::RunJournal,
     input: &Value,
     advertised: &[vp_providers::ToolSchema],
+    surface: ToolSurface,
     call_id: &str,
     turn: u32,
     run_contract: Option<&crate::contract::TaskContract>,
@@ -74,7 +75,15 @@ pub(super) async fn run_script_tool(
             "this role cannot enable script write bindings",
         )));
     }
-    let bindings = crate::script::bindings(advertised, allow_write);
+    // Code Mode binds only the capability-gated tools from the same frozen
+    // surface as the provider request. A gated-off MCP/remote/media/GUI schema
+    // can never become an inner binding through a permissive legacy list.
+    let gated_advertised = advertised
+        .iter()
+        .filter(|tool| surface.capabilities.allows_tool(&tool.name))
+        .cloned()
+        .collect::<Vec<_>>();
+    let bindings = crate::script::bindings(&gated_advertised, allow_write);
     if bindings.is_empty() {
         return Ok(ScriptToolOutcome::Output(ToolOutput::error_coded(
             "run_script",
@@ -166,13 +175,16 @@ pub(super) async fn run_script_tool(
                     "max_calls": limits.max_calls,
                     "max_write_calls": limits.max_write_calls,
                     "timeout_ms": limits.wall_ms,
-                    "tool_bundle": crate::tool_bundle::select_bundle(
+                    "tool_bundle": crate::tool_bundle::select_bundle_with_mode(
                         spec.role.as_str(),
                         spec.profile.as_str(),
                         spec.task_kind.as_deref(),
+                        surface.mode,
                     )
                     .kind
                     .as_str(),
+                    "tool_bundle_mode": surface.mode.as_str(),
+                    "tool_surface": surface.payload(),
                 });
                 return Ok(ScriptToolOutcome::Output(ToolOutput::ok_structured(
                     crate::tools::truncate(text),
@@ -197,6 +209,7 @@ pub(super) async fn run_script_tool(
                     effect_policy,
                     tool_context,
                     tool_token,
+                    surface,
                     &request,
                 )
                 .await?;
@@ -254,6 +267,7 @@ pub(super) async fn execute_script_inner_call(
     effect_policy: &vp_protocol::types::EffectPolicy,
     tool_context: &ToolContext,
     tool_token: &crate::preemption::Token,
+    surface: ToolSurface,
     request: &crate::script::ScriptCallRequest,
 ) -> Result<ScriptInnerOutcome> {
     let tool_name = request.tool.as_str();
@@ -263,6 +277,26 @@ pub(super) async fn execute_script_inner_call(
     let read_only = request.read_only;
     let mut approval_wait_ms: Option<u64> = None;
     let mut risk = RiskLevel::ReadOnly;
+
+    if !surface.capabilities.allows_tool(tool_name) {
+        return Ok(ScriptInnerOutcome {
+            output: ToolOutput::error_coded(
+                tool_name,
+                crate::tooling::errors::ToolErrorCode::TOOL_NOT_AVAILABLE,
+                format!(
+                    "tool '{tool_name}' is not available in the current capability surface"
+                ),
+            )
+            .with_failure_evidence(format!(
+                "tool={tool_name}; gated_off={:?}",
+                surface.capabilities.gated_off()
+            )),
+            risk,
+            approval_wait_ms,
+            duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            cancelled: false,
+        });
+    }
 
     let registry_tool = config
         .tools

@@ -71,9 +71,10 @@ impl AgentService {
             });
             let task_kind = explicit_task_kind.clone().or(inferred_kind);
             let spec = stable_agent_spec(&session, agent, role, task_kind);
+            let surface = resolve_tool_surface(&self.engine, &session, &spec).await;
             let dynamic_mcp =
                 collect_dynamic_mcp_tools(&self.engine, spec.role, &session.project_id, None).await;
-            let frozen = frozen_tool_bundle(&config, &spec, &dynamic_mcp);
+            let frozen = frozen_tool_bundle_with_surface(&config, &spec, &dynamic_mcp, surface);
             let tools = if include_tools {
                 frozen
                     .tools

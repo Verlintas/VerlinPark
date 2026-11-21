@@ -178,6 +178,17 @@ final class AppModel {
     var otelBusy = false
     var governorStatus: GovernorSessionStatus?
     var governorStatusMessage: String?
+    var sessionBudgetStatus: SessionBudgetStatus?
+    var sessionBudgetBusy = false
+    var sessionBudgetError: BudgetValidationIssue?
+    var sessionBudgetStatusMessage: String?
+    var projectAutoBudgetPolicy = AutoBudgetPolicy()
+    var projectAutoBudgetDraft = AutoBudgetPolicyDraft()
+    var projectAutoBudgetUpdatedAt: String?
+    var projectAutoBudgetPolicyProjectID: String?
+    var projectAutoBudgetBusy = false
+    var projectAutoBudgetError: BudgetValidationIssue?
+    var projectAutoBudgetStatus: String?
     var efficiencyBusy = false
     var efficiencyStatus: String?
     var shellPolicy = ShellPolicy.allow
@@ -486,6 +497,7 @@ final class AppModel {
     private var orchestrationRefreshTask: Task<Void, Never>?
     private var longTaskRefreshTask: Task<Void, Never>?
     private var efficiencyRefreshTask: Task<Void, Never>?
+    private var sessionBudgetRefreshTask: Task<Void, Never>?
     private var toolActivityRefreshTask: Task<Void, Never>?
     var taskActionBusyID: String?
     var taskActionStatus: String?
@@ -739,7 +751,8 @@ final class AppModel {
         return models
     }
 
-    private let core = CoreClient()
+    private let core: CoreClient
+    private let budgetRPC: any BudgetRPC
     private let daemon = DaemonController()
     private let secretStore: any SecretStore
     private let secretAccount: String
@@ -783,8 +796,16 @@ final class AppModel {
 
     init(
         secretStore: any SecretStore = KeychainSecretStore(),
-        secretAccount: String = "provider.apiKey"
+        secretAccount: String = "provider.apiKey",
+        budgetRPC: (any BudgetRPC)? = nil
     ) {
+        let core = CoreClient()
+        self.core = core
+        if let budgetRPC {
+            self.budgetRPC = budgetRPC
+        } else {
+            self.budgetRPC = core
+        }
         self.secretStore = secretStore
         self.secretAccount = secretAccount
     }
@@ -903,6 +924,16 @@ final class AppModel {
         selectedSessionID == sessionID && selectionGeneration == generation
     }
 
+    private func resetProjectAutoBudgetState() {
+        projectAutoBudgetPolicy = AutoBudgetPolicy()
+        projectAutoBudgetDraft = AutoBudgetPolicyDraft()
+        projectAutoBudgetUpdatedAt = nil
+        projectAutoBudgetPolicyProjectID = nil
+        projectAutoBudgetBusy = false
+        projectAutoBudgetError = nil
+        projectAutoBudgetStatus = nil
+    }
+
     private func resetLongTaskState() {
         longTaskRefreshTask?.cancel()
         steeringMessages = []
@@ -929,6 +960,11 @@ final class AppModel {
     private func resetEfficiencyState() {
         efficiencyRefreshTask?.cancel()
         toolActivityRefreshTask?.cancel()
+        sessionBudgetRefreshTask?.cancel()
+        sessionBudgetStatus = nil
+        sessionBudgetBusy = false
+        sessionBudgetError = nil
+        sessionBudgetStatusMessage = nil
         sessionCacheStatus = nil
         sessionCacheCalls = []
         sessionCacheCallsTruncated = false
@@ -1086,6 +1122,7 @@ final class AppModel {
             await loadArtifactPolicy()
             await loadMailboxPolicy()
             await loadProjectBudget()
+            await loadProjectAutoBudgetPolicy(force: true)
             await loadAcpAgents()
             await loadMcpServers()
             await loadMemoryPolicy()
@@ -1178,6 +1215,7 @@ final class AppModel {
             projectTokenBudgetText = ""
             projectCostBudgetText = ""
             projectBudgetStatus = nil
+            resetProjectAutoBudgetState()
             projectUsage = nil
             projectUsageStatus = nil
             teamPlan = nil
@@ -1261,6 +1299,7 @@ final class AppModel {
         projectTokenBudgetText = ""
         projectCostBudgetText = ""
         projectBudgetStatus = nil
+        resetProjectAutoBudgetState()
         projectUsage = nil
         projectUsageStatus = nil
         memories = []
@@ -1332,6 +1371,7 @@ final class AppModel {
         Task { await loadArtifactPolicy() }
         Task { await loadMailboxPolicy() }
         Task { await loadProjectBudget() }
+        Task { await loadProjectAutoBudgetPolicy(force: true) }
         Task { await loadEfficiency() }
         Task { await loadProjectForkForest() }
         Task { await loadDashboardSnapshot() }
@@ -1430,6 +1470,7 @@ final class AppModel {
         selectionLoadTask = Task {
             await loadEvents()
             await loadEfficiency()
+            await loadSessionBudget()
             await loadCheckpoints()
             await loadLineage()
             await loadTodos()
@@ -1675,17 +1716,18 @@ final class AppModel {
             ?? 200_000
     }
 
-    var defaultUnlimitedBudget: Bool {
-        UserDefaults.standard.bool(forKey: "verlinpark.session.unlimitedBudget")
-    }
-
+    /// Creates a session with an explicit budget mode. Auto never falls back to
+    /// unlimited: a missing or invalid hard cap is a local validation error
+    /// that leaves the session uncreated.
     func createSession(
         goal: String,
         tokenBudget: Int? = nil,
         costBudgetUSD: Double? = nil,
         timeBudgetSecs: Int? = nil,
         priority: Int = 0,
-        unlimited: Bool? = nil
+        unlimited: Bool? = nil,
+        budgetMode: BudgetMode? = nil,
+        autoBudget: AutoBudgetPolicy? = nil
     ) async -> Bool {
         guard let projectID = selectedProjectID else {
             lastError = "Choose a project first."
@@ -1693,8 +1735,31 @@ final class AppModel {
         }
         let trimmed = goal.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
-        let isUnlimited = unlimited ?? defaultUnlimitedBudget
-        let budget: Int? = if isUnlimited {
+        let mode = budgetMode ?? (unlimited == true ? .unlimited : .fixed)
+        let isUnlimited = unlimited ?? mode.isUnlimited
+        if mode.isUnlimited != isUnlimited {
+            lastError = "Budget mode and unlimited flag disagree."
+            return false
+        }
+        if mode.isAuto {
+            do {
+                if let autoBudget {
+                    try autoBudget.validate()
+                    try autoBudget.requireHardCap()
+                } else if !projectAutoBudgetPolicy.enabled
+                    || !projectAutoBudgetPolicy.hasHardCap
+                {
+                    throw BudgetValidationIssue(
+                        code: "AUTO_BUDGET_CAP_REQUIRED",
+                        message: "Auto budget needs a hard cap. Add a maximum USD or token amount, or choose Fixed."
+                    )
+                }
+            } catch {
+                lastError = BudgetValidationIssue.from(error).displayText
+                return false
+            }
+        }
+        let budget: Int? = if isUnlimited || mode.isAuto {
             nil
         } else {
             (tokenBudget ?? defaultTokenBudget).clampedTokenBudget
@@ -1710,16 +1775,22 @@ final class AppModel {
                 projectID: projectID,
                 goal: trimmed,
                 tokenBudget: budget,
-                costBudgetUSD: isUnlimited ? nil : costBudgetUSD,
-                timeBudgetSecs: isUnlimited ? nil : timeBudgetSecs,
+                costBudgetUSD: isUnlimited || mode.isAuto ? nil : costBudgetUSD,
+                timeBudgetSecs: isUnlimited || mode.isAuto ? nil : timeBudgetSecs,
                 priority: priority,
-                unlimited: isUnlimited
+                unlimited: isUnlimited,
+                budgetMode: mode,
+                autoBudget: mode.isAuto ? autoBudget : nil
             )
             let loaded = try await core.listSessions(projectID: projectID)
             guard selectedProjectID == projectID else { return false }
             sessions = loaded
             selectSession(session.id)
-            showToast("Session created", detail: session.goal, kind: .success)
+            showToast(
+                mode.isAuto ? "Auto-budget session created" : "Session created",
+                detail: session.goal,
+                kind: .success
+            )
             return true
         } catch {
             // D10: the daemon may create the row/worktree and then fail to
@@ -1790,6 +1861,7 @@ final class AppModel {
             if pendingPromptOperations[sessionID]?.id == operationID {
                 pendingPromptOperations.removeValue(forKey: sessionID)
             }
+            await loadSessionBudget(silent: true)
             return true
         } catch {
             handle(error)
@@ -1838,27 +1910,9 @@ final class AppModel {
                 sessionID: sessionID,
                 unlimited: unlimited
             )
-            if let index = sessions.firstIndex(where: { $0.id == sessionID }) {
-                let old = sessions[index]
-                sessions[index] = Session(
-                    id: old.id,
-                    projectId: old.projectId,
-                    goal: old.goal,
-                    status: old.status,
-                    priority: old.priority,
-                    worktree: old.worktree,
-                    branch: old.branch,
-                    tokenBudget: old.tokenBudget,
-                    costBudgetUsd: old.costBudgetUsd,
-                    timeBudgetSecs: old.timeBudgetSecs,
-                    unlimited: result.unlimited,
-                    costSpentUsd: old.costSpentUsd,
-                    baseCommit: old.baseCommit,
-                    tokensIn: old.tokensIn,
-                    tokensOut: old.tokensOut,
-                    createdAt: old.createdAt
-                )
-            }
+            guard selectedSessionID == sessionID else { return }
+            sessionBudgetStatus = result.budget
+            mergeBudgetIntoSessionRows(result.budget)
             showToast(
                 unlimited ? "Unlimited budget enabled" : "Stored budget limits restored",
                 detail: unlimited
@@ -1867,6 +1921,7 @@ final class AppModel {
                 kind: unlimited ? .warning : .success
             )
         } catch {
+            sessionBudgetError = BudgetValidationIssue.from(error)
             handle(error)
         }
     }
@@ -1893,6 +1948,7 @@ final class AppModel {
         guard let sessionID = selectedSessionID else { return }
         do {
             _ = try await core.resumeSession(sessionID: sessionID)
+            await loadSessionBudget(silent: true)
         } catch {
             handle(error)
         }
@@ -4434,6 +4490,254 @@ final class AppModel {
         projectTokenBudgetText = ""
         projectCostBudgetText = ""
         await saveProjectBudget()
+    }
+
+    // MARK: Auto budget
+
+    var budgetRunway: BudgetRunwaySummary? {
+        sessionBudgetStatus.map { BudgetRunwaySummary(status: $0) }
+    }
+
+    /// Reason from the newest `session.budget.auto_extended` event for the
+    /// selected session. This is the runtime's deterministic reason string;
+    /// the card never infers one when the event window does not contain it.
+    var lastAutoBudgetExtensionReason: String? {
+        guard let sessionID = selectedSessionID else { return nil }
+        for event in events.reversed()
+        where event.sessionId == sessionID && event.type == "session.budget.auto_extended"
+        {
+            return event.payload.objectValue?["reason"]?.stringValue
+        }
+        return nil
+    }
+
+    /// Loads the selected session's mode, effective/hard caps, spent totals,
+    /// forecast, and auto-budget state. This is a read-only RPC; an older
+    /// daemon without the method leaves the card unavailable rather than
+    /// changing any budget.
+    func loadSessionBudget(silent: Bool = false) async {
+        guard let sessionID = selectedSessionID else {
+            sessionBudgetStatus = nil
+            sessionBudgetError = nil
+            sessionBudgetStatusMessage = nil
+            sessionBudgetBusy = false
+            return
+        }
+        let generation = selectionGeneration
+        if !silent {
+            sessionBudgetBusy = true
+        }
+        defer {
+            if isCurrent(sessionID: sessionID, generation: generation) {
+                sessionBudgetBusy = false
+            }
+        }
+        do {
+            let status = try await budgetRPC.sessionBudget(sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            sessionBudgetStatus = status
+            mergeBudgetIntoSessionRows(status)
+            sessionBudgetError = nil
+            sessionBudgetStatusMessage = nil
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            sessionBudgetError = BudgetValidationIssue.from(error)
+            sessionBudgetStatusMessage = sessionBudgetError?.displayText
+        }
+    }
+
+    /// Read-only forecast preview. The status RPC already includes a forecast;
+    /// this explicit call is used by the card's forecast refresh so the UI
+    /// never has to mutate a budget just to read one.
+    func loadSessionBudgetForecast() async {
+        guard let sessionID = selectedSessionID else { return }
+        let generation = selectionGeneration
+        do {
+            let result = try await budgetRPC.sessionBudgetForecast(sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            if var status = sessionBudgetStatus {
+                status.forecast = result.forecast
+                sessionBudgetStatus = status
+            } else {
+                await loadSessionBudget(silent: true)
+            }
+            sessionBudgetError = nil
+            sessionBudgetStatusMessage = nil
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            sessionBudgetError = BudgetValidationIssue.from(error)
+            sessionBudgetStatusMessage = sessionBudgetError?.displayText
+        }
+    }
+
+    private func refreshSessionBudgetSoon() {
+        sessionBudgetRefreshTask?.cancel()
+        sessionBudgetRefreshTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
+            await self?.loadSessionBudget(silent: true)
+        }
+    }
+
+    /// Validates and applies an explicit budget edit. Never retries and never
+    /// substitutes `unlimited` for a missing cap; the typed validation or RPC
+    /// error stays visible to the sheet and card.
+    @discardableResult
+    func saveSessionBudget(_ draft: SessionBudgetEditDraft) async -> Bool {
+        guard let sessionID = selectedSessionID, let status = sessionBudgetStatus else {
+            sessionBudgetError = BudgetValidationIssue(
+                code: "SESSION_REQUIRED",
+                message: "Select a session before editing its budget."
+            )
+            return false
+        }
+        let params: SetSessionBudgetParams
+        do {
+            params = try draft.params(sessionID: sessionID, status: status)
+        } catch {
+            sessionBudgetError = BudgetValidationIssue.from(error)
+            return false
+        }
+        sessionBudgetBusy = true
+        defer { sessionBudgetBusy = false }
+        do {
+            let result = try await budgetRPC.setSessionBudget(params)
+            guard selectedSessionID == sessionID else { return false }
+            sessionBudgetStatus = result.budget
+            sessionBudgetError = nil
+            sessionBudgetStatusMessage = nil
+            mergeBudgetIntoSessionRows(result.budget)
+            showToast(
+                "Budget updated",
+                detail: BudgetRunwaySummary(status: result.budget).headline,
+                kind: .success
+            )
+            return true
+        } catch {
+            sessionBudgetError = BudgetValidationIssue.from(error)
+            return false
+        }
+    }
+
+    private func mergeBudgetIntoSessionRows(_ status: SessionBudgetStatus) {
+        func apply(_ old: Session) -> Session {
+            Session(
+                id: old.id,
+                projectId: old.projectId,
+                goal: old.goal,
+                status: old.status,
+                priority: old.priority,
+                worktree: old.worktree,
+                branch: old.branch,
+                tokenBudget: status.effectiveTokenBudget.flatMap { Int(exactly: $0) },
+                costBudgetUsd: status.effectiveCostBudgetUSD,
+                timeBudgetSecs: status.effectiveTimeBudgetSecs.flatMap { Int(exactly: $0) },
+                unlimited: status.unlimited,
+                costSpentUsd: old.costSpentUsd,
+                baseCommit: old.baseCommit,
+                tokensIn: old.tokensIn,
+                tokensOut: old.tokensOut,
+                createdAt: old.createdAt
+            )
+        }
+        if let index = sessions.firstIndex(where: { $0.id == status.sessionID }) {
+            sessions[index] = apply(sessions[index])
+        }
+        if let index = allSessions.firstIndex(where: { $0.id == status.sessionID }) {
+            allSessions[index] = apply(allSessions[index])
+        }
+    }
+
+    func loadProjectAutoBudgetPolicy(force: Bool = false) async {
+        guard let projectID = selectedProjectID else {
+            resetProjectAutoBudgetState()
+            return
+        }
+        if !force,
+           projectAutoBudgetPolicyProjectID == projectID,
+           projectAutoBudgetError == nil
+        {
+            return
+        }
+        let generation = selectionGeneration
+        projectAutoBudgetBusy = true
+        defer {
+            if generation == selectionGeneration {
+                projectAutoBudgetBusy = false
+            }
+        }
+        do {
+            let result = try await budgetRPC.projectAutoBudget(projectID: projectID)
+            guard selectedProjectID == projectID, generation == selectionGeneration else {
+                return
+            }
+            projectAutoBudgetPolicy = result.policy
+            projectAutoBudgetDraft = AutoBudgetPolicyDraft(policy: result.policy)
+            projectAutoBudgetUpdatedAt = result.updatedAt
+            projectAutoBudgetPolicyProjectID = projectID
+            projectAutoBudgetError = nil
+            projectAutoBudgetStatus = nil
+        } catch {
+            guard selectedProjectID == projectID, generation == selectionGeneration else {
+                return
+            }
+            projectAutoBudgetError = BudgetValidationIssue.from(error)
+            projectAutoBudgetStatus = projectAutoBudgetError?.displayText
+            projectAutoBudgetPolicyProjectID = projectID
+        }
+    }
+
+    @discardableResult
+    func saveProjectAutoBudgetPolicy() async -> Bool {
+        guard let projectID = selectedProjectID else {
+            projectAutoBudgetError = BudgetValidationIssue(
+                code: "PROJECT_REQUIRED",
+                message: "Select a project before saving Auto Budget defaults."
+            )
+            return false
+        }
+        let policy: AutoBudgetPolicy
+        do {
+            policy = try projectAutoBudgetDraft.makePolicy()
+        } catch {
+            projectAutoBudgetError = BudgetValidationIssue.from(error)
+            return false
+        }
+        projectAutoBudgetBusy = true
+        defer { projectAutoBudgetBusy = false }
+        do {
+            let result = try await budgetRPC.setProjectAutoBudget(
+                projectID: projectID,
+                policy: policy
+            )
+            guard selectedProjectID == projectID else { return false }
+            projectAutoBudgetPolicy = result.policy
+            projectAutoBudgetDraft = AutoBudgetPolicyDraft(policy: result.policy)
+            projectAutoBudgetUpdatedAt = result.updatedAt
+            projectAutoBudgetPolicyProjectID = projectID
+            projectAutoBudgetError = nil
+            projectAutoBudgetStatus = "Auto Budget defaults saved."
+            showToast(
+                "Auto Budget defaults saved",
+                detail: result.policy.enabled
+                    ? BudgetFormatting.combined(
+                        tokens: result.policy.hardTokenCap,
+                        cost: result.policy.hardCostCapUSD,
+                        seconds: result.policy.hardWallClockSecs,
+                        empty: "No hard cap"
+                    )
+                    : "Auto is disabled for new sessions.",
+                kind: .success
+            )
+            return true
+        } catch {
+            projectAutoBudgetError = BudgetValidationIssue.from(error)
+            return false
+        }
+    }
+
+    func reloadProjectAutoBudgetPolicy() async {
+        await loadProjectAutoBudgetPolicy(force: true)
     }
 
     func loadMailboxPolicy() async {
@@ -10705,6 +11009,14 @@ final class AppModel {
             "context.prompt_prefix"].contains(event.type)
         {
             refreshEfficiencySoon()
+        }
+
+        if event.sessionId == selectedSessionID,
+           ["session.budget.updated", "session.budget.auto_extended",
+            "session.budget_mode_changed", "session.auto_paused", "session.auto_resumed",
+            "session.auto_state"].contains(event.type)
+        {
+            refreshSessionBudgetSoon()
         }
 
         if event.sessionId == selectedSessionID,

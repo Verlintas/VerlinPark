@@ -356,20 +356,18 @@ pub(in crate::agent) async fn run_budget_status(
         .await?;
     let project_budget = engine.get_project_budget(&project.id).await?;
     let session_value = json!({
-        "limit_tokens": budget.limit,
+        "limit_tokens": budget.token_limit(),
         "spent_tokens": spent_tokens,
-        "remaining_tokens": budget.limit.map(|limit| limit.saturating_sub(spent_tokens)),
-        "limit_cost_usd": budget.cost_limit,
+        "remaining_tokens": budget.token_limit().map(|limit| limit.saturating_sub(spent_tokens)),
+        "limit_cost_usd": budget.cost_limit(),
         "spent_cost_usd": spent_cost,
         "reserved_cost_usd": budget.reserved_cost(),
         "remaining_cost_usd": budget
-            .cost_limit
+            .cost_limit()
             .map(|limit| (limit - spent_cost - budget.reserved_cost()).max(0.0)),
-        "time_limit_secs": budget.time_limit.map(|limit| limit.as_secs()),
+        "time_limit_secs": budget.time_limit().map(|limit| limit.as_secs()),
         "elapsed_secs": budget.elapsed_secs(),
-        "remaining_time_secs": budget
-            .time_limit
-            .map(|limit| limit.saturating_sub(Duration::from_secs(budget.elapsed_secs())).as_secs()),
+        "remaining_time_secs": budget.remaining_time_secs(),
         "unlimited": unlimited,
     });
     let task_value = spec.task_id.as_ref().map(|task_id| {
@@ -407,18 +405,18 @@ pub(in crate::agent) async fn run_budget_status(
         "session tokens {}/{} · USD ${:.4}/{}{} · elapsed {}s{}\ntask tokens {}{} · department tokens {}{} · project tokens {}/{}",
         spent_tokens,
         budget
-            .limit
+            .token_limit()
             .map(|limit| limit.to_string())
             .unwrap_or_else(|| "unlimited".to_string()),
         spent_cost,
         budget
-            .cost_limit
+            .cost_limit()
             .map(|limit| format!("{limit:.4}"))
             .unwrap_or_else(|| "unlimited".to_string()),
         if unlimited { " · unlimited mode" } else { "" },
         budget.elapsed_secs(),
         budget
-            .time_limit
+            .time_limit()
             .map(|limit| format!("/{}", limit.as_secs()))
             .unwrap_or_default(),
         spec.task_id.as_deref().unwrap_or("none"),

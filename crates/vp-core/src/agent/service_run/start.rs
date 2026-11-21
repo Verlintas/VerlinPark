@@ -93,7 +93,7 @@ impl AgentService {
             .engine
             .get_preemption_policy(&session.project_id)
             .await?;
-        control.arm_preemption(session.time_budget_secs, preemption_policy);
+        arm_session_preemption(&self.engine, &session, &control, preemption_policy).await?;
         {
             let mut runs = self
                 .runs
@@ -419,13 +419,21 @@ impl AgentService {
                 return Err(error);
             }
         };
+        let cumulative_elapsed = self
+            .engine
+            .session_budget(session_id)
+            .await
+            .ok()
+            .filter(|status| status.mode == BudgetMode::Auto && !status.unlimited)
+            .and_then(|status| status.state.map(|state| state.elapsed_secs))
+            .unwrap_or(0);
         let budget = RunBudgetSnapshot {
             token_limit: session.token_budget,
             tokens_spent: session.tokens_in.saturating_add(session.tokens_out),
             cost_limit_usd: session.cost_budget_usd,
             cost_spent_usd: session.cost_spent_usd,
             time_limit_secs: session.time_budget_secs,
-            elapsed_secs: 0,
+            elapsed_secs: cumulative_elapsed,
             unlimited: session.unlimited,
         };
         let journal = match crate::run_journal::begin_resumed_run(

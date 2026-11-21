@@ -181,6 +181,109 @@ pub(crate) fn validation_error(id: Option<Value>, error: &anyhow::Error) -> Opti
     ))
 }
 
+/// Auto-budget validation uses a stable typed taxonomy. The engine and store
+/// wrap `BudgetValidationError` in `anyhow::Error`, so the code is preserved by
+/// downcasting instead of being flattened into `INTERNAL_ERROR`. A few store
+/// paths format the typed error into a new message; those bounded prefixes keep
+/// their stable code rather than inventing one from arbitrary prose.
+pub(crate) fn budget_error(id: Option<Value>, error: anyhow::Error) -> RpcResponse {
+    if let Some(typed) = error.downcast_ref::<vp_protocol::types::BudgetValidationError>() {
+        let (retryable, hint) = match typed.code {
+            vp_protocol::types::auto_budget_codes::BUDGET_BELOW_SPENT => (
+                false,
+                "raise the budget or hard cap above the amount already spent",
+            ),
+            vp_protocol::types::auto_budget_codes::AUTO_BUDGET_CAP_REQUIRED => (
+                false,
+                "choose --mode fixed or provide at least one hard token, cost, or wall-clock cap",
+            ),
+            vp_protocol::types::auto_budget_codes::AUTO_BUDGET_POLICY_REQUIRED => (
+                false,
+                "enable the project auto-budget policy or pass an explicit session policy",
+            ),
+            vp_protocol::types::auto_budget_codes::INVALID_BUDGET_MODE => {
+                (false, "use fixed, auto, or unlimited")
+            }
+            vp_protocol::types::auto_budget_codes::BUDGET_MODE_CONFLICT => (
+                false,
+                "do not combine unlimited with fixed/auto, or set conflicting mode fields",
+            ),
+            vp_protocol::types::auto_budget_codes::BUDGET_POLICY_NOT_APPLICABLE => (
+                false,
+                "a session auto-budget policy only applies when the mode is auto",
+            ),
+            _ => (
+                false,
+                "fix the budget fields reported in the message and retry",
+            ),
+        };
+        return typed_client_error(
+            id,
+            codes::INVALID_PARAMS,
+            typed.code,
+            typed.message.clone(),
+            retryable,
+            hint,
+        );
+    }
+
+    let message = format!("{error:#}");
+    let lowered = message.to_ascii_lowercase();
+    if lowered.contains("imported sessions are read-only archives") {
+        return typed_client_error(
+            id,
+            codes::CONFLICT,
+            "SESSION_IMPORTED_READONLY",
+            message,
+            false,
+            "imported sessions are read-only archives; create a new session or work from the source session",
+        );
+    }
+    if lowered.contains("session not found") {
+        return typed_client_error(
+            id,
+            codes::NOT_FOUND,
+            "SESSION_NOT_FOUND",
+            message,
+            false,
+            "select an existing session before retrying",
+        );
+    }
+    if lowered.contains("invalid auto-budget policy:") {
+        return typed_client_error(
+            id,
+            codes::INVALID_PARAMS,
+            vp_protocol::types::auto_budget_codes::INVALID_AUTO_BUDGET_POLICY,
+            message,
+            false,
+            "fix the policy ranges reported in the message and retry",
+        );
+    }
+    if lowered.contains("invalid hard budget cap:") {
+        return typed_client_error(
+            id,
+            codes::INVALID_PARAMS,
+            vp_protocol::types::auto_budget_codes::INVALID_BUDGET_CAP,
+            message,
+            false,
+            "hard caps must be positive finite values",
+        );
+    }
+    if lowered.contains("session has no auto-budget row") {
+        return typed_client_error(
+            id,
+            codes::NOT_FOUND,
+            "SESSION_AUTO_BUDGET_NOT_FOUND",
+            message,
+            false,
+            "switch the session to auto mode before changing auto-only state",
+        );
+    }
+    // `project not found`, priority, and the legacy unlimited conflict keep
+    // their existing typed mappings.
+    validation_or_internal(id, error)
+}
+
 /// Idempotent-operation errors first, then bounded validation failures, then
 /// the ordinary internal error. Used by RPC arms that accept an
 /// `operation_id`.

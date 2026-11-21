@@ -8148,3 +8148,368 @@ mod cli_reliability_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod auto_budget_cli_tests {
+    use super::*;
+    use crate::render::{
+        budget_lines, project_auto_budget_csv, session_budget_csv, session_budget_forecast_csv,
+    };
+
+    fn parse(args: &[&str]) -> Cli {
+        let args = args
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .collect::<Vec<_>>();
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(args).unwrap())
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    fn status() -> Value {
+        json!({
+            "session_id": "ses-1",
+            "mode": "auto",
+            "unlimited": false,
+            "effective_token_budget": 10_000,
+            "effective_cost_budget_usd": 2.5,
+            "effective_time_budget_secs": 3_600,
+            "hard_token_cap": 50_000,
+            "hard_cost_cap_usd": 10.0,
+            "hard_wall_clock_secs": 14_400,
+            "spent_tokens": 1_234,
+            "spent_cost_usd": 0.5,
+            "elapsed_secs": 90,
+            "remaining_tokens": 8_766,
+            "remaining_cost_usd": 2.0,
+            "remaining_secs": 3_510,
+            "policy": {
+                "enabled": true,
+                "extend_ratio": 0.25,
+                "max_multiplier": 4.0,
+                "forecast_calls": 8,
+                "min_runway_turns": 4
+            },
+            "state": {
+                "extensions": 1,
+                "total_turns": 3,
+                "turns_without_progress": 0,
+                "elapsed_secs": 90,
+                "paused_reason": null
+            },
+            "forecast": {
+                "sample_calls": 8,
+                "avg_input_tokens_per_call": 600,
+                "avg_output_tokens_per_call": 525,
+                "avg_cost_usd_per_call": 0.25,
+                "remaining_tokens": 8_766,
+                "remaining_cost_usd": 2.0,
+                "remaining_secs": 3_510,
+                "runway_turns": 7,
+                "runway_secs": 3_510,
+                "runway_cost_usd": 1.75,
+                "critical_path_turns": null,
+                "source": "provider_ledger",
+                "generated_at": "2026-11-21T00:00:00Z"
+            },
+            "updated_at": "2026-11-21T00:00:00Z"
+        })
+    }
+
+    #[test]
+    fn session_budget_commands_parse_with_partial_flags() {
+        let cli = parse(&["vp", "session-budget", "ses-1"]);
+        match cli.command {
+            Command::SessionBudget { session, csv } => {
+                assert_eq!(session, "ses-1");
+                assert!(!csv);
+            }
+            other => panic!("expected session-budget, got {other:?}"),
+        }
+
+        let cli = parse(&[
+            "vp",
+            "session-budget-set",
+            "ses-1",
+            "--mode",
+            "auto",
+            "--hard-token-cap",
+            "50000",
+            "--hard-cost-cap-usd",
+            "7.5",
+            "--clear-time-budget",
+            "--unlimited",
+            "false",
+        ]);
+        match cli.command {
+            Command::SessionBudgetSet {
+                session,
+                mode,
+                hard_token_cap,
+                hard_cost_cap_usd,
+                clear_time_budget,
+                unlimited,
+                token_budget,
+                ..
+            } => {
+                assert_eq!(session, "ses-1");
+                assert_eq!(mode, Some(BudgetModeArg::Auto));
+                assert_eq!(hard_token_cap, Some(50_000));
+                assert_eq!(hard_cost_cap_usd, Some(7.5));
+                assert!(clear_time_budget);
+                assert_eq!(unlimited, Some(false));
+                assert!(token_budget.is_none());
+            }
+            other => panic!("expected session-budget-set, got {other:?}"),
+        }
+
+        let cli = parse(&["vp", "session-budget-forecast", "ses-1", "--csv"]);
+        assert!(matches!(
+            cli.command,
+            Command::SessionBudgetForecast { csv: true, .. }
+        ));
+    }
+
+    #[test]
+    fn project_auto_budget_commands_parse_policy_fields() {
+        let cli = parse(&["vp", "project-auto-budget", "prj-1"]);
+        match cli.command {
+            Command::ProjectAutoBudget { project, csv } => {
+                assert_eq!(project, "prj-1");
+                assert!(!csv);
+            }
+            other => panic!("expected project-auto-budget, got {other:?}"),
+        }
+
+        let cli = parse(&[
+            "vp",
+            "project-auto-budget-set",
+            "prj-1",
+            "--enabled",
+            "--hard-cost-cap-usd",
+            "5",
+            "--no-progress-action",
+            "escalate",
+            "--max-turns-per-run",
+            "40",
+        ]);
+        match cli.command {
+            Command::ProjectAutoBudgetSet {
+                project,
+                enabled,
+                hard_cost_cap_usd,
+                no_progress_action,
+                max_turns_per_run,
+                ..
+            } => {
+                assert_eq!(project, "prj-1");
+                assert_eq!(enabled, Some(true));
+                assert_eq!(hard_cost_cap_usd, Some(5.0));
+                assert!(matches!(
+                    no_progress_action,
+                    Some(NoProgressActionArg::Escalate)
+                ));
+                assert_eq!(max_turns_per_run, Some(40));
+            }
+            other => panic!("expected project-auto-budget-set, got {other:?}"),
+        }
+
+        let cli = parse(&[
+            "vp",
+            "project-auto-budget-set",
+            "prj-1",
+            "--enabled",
+            "false",
+            "--policy-file",
+            "-",
+        ]);
+        match cli.command {
+            Command::ProjectAutoBudgetSet {
+                enabled,
+                policy_file,
+                ..
+            } => {
+                assert_eq!(enabled, Some(false));
+                assert_eq!(policy_file.as_deref(), Some("-"));
+            }
+            other => panic!("expected project-auto-budget-set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_new_auto_flags_parse() {
+        let cli = parse(&[
+            "vp",
+            "session-new",
+            "prj-1",
+            "ship it",
+            "--auto",
+            "--max-usd",
+            "5",
+            "--max-token",
+            "100000",
+            "--max-hours",
+            "2.5",
+        ]);
+        match cli.command {
+            Command::SessionNew {
+                auto,
+                max_usd,
+                max_token,
+                max_hours,
+                budget_mode,
+                unlimited,
+                ..
+            } => {
+                assert!(auto);
+                assert_eq!(max_usd, Some(5.0));
+                assert_eq!(max_token, Some(100_000));
+                assert_eq!(max_hours, Some(2.5));
+                assert!(budget_mode.is_none());
+                assert!(!unlimited);
+            }
+            other => panic!("expected session-new, got {other:?}"),
+        }
+
+        let cli = parse(&[
+            "vp",
+            "session-new",
+            "prj-1",
+            "goal",
+            "--budget-mode",
+            "fixed",
+            "--unlimited",
+        ]);
+        match cli.command {
+            Command::SessionNew {
+                budget_mode,
+                unlimited,
+                ..
+            } => {
+                assert_eq!(budget_mode, Some(BudgetModeArg::Fixed));
+                assert!(unlimited);
+            }
+            other => panic!("expected session-new, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn budget_status_renderer_shows_mode_limits_spend_and_runway() {
+        let lines = budget_lines(&status()).expect("status lines");
+        let text = lines.join("\n");
+        assert!(text.contains("session ses-1 budget"));
+        assert!(text.contains("mode auto"));
+        assert!(text.contains("effective"));
+        assert!(text.contains("10,000"));
+        assert!(text.contains("hard caps"));
+        assert!(text.contains("50,000"));
+        assert!(text.contains("1,234 tokens"));
+        assert!(text.contains("8 call(s)"));
+        assert!(text.contains("provider_ledger"));
+        assert!(text.contains("7 turn(s)"));
+        assert!(text.contains("extensions=1"));
+    }
+
+    #[test]
+    fn budget_set_renderer_marks_the_nested_status_as_updated() {
+        let value = json!({"session_id": "ses-1", "budget": status()});
+        let text = budget_lines(&value).expect("set lines").join("\n");
+        assert!(text.contains("session ses-1 budget updated"));
+        assert!(text.contains("mode auto"));
+    }
+
+    #[test]
+    fn budget_forecast_renderer_is_forecast_only() {
+        let value = json!({"session_id": "ses-1", "forecast": status()["forecast"].clone()});
+        let text = budget_lines(&value).expect("forecast lines").join("\n");
+        assert!(text.contains("session ses-1 budget forecast"));
+        assert!(text.contains("samples"));
+        assert!(text.contains("provider_ledger"));
+        assert!(text.contains("critical    unknown"));
+        assert!(!text.contains("effective"));
+    }
+
+    #[test]
+    fn auto_policy_renderer_is_compact_and_unrelated_shapes_are_ignored() {
+        let value = json!({
+            "project_id": "prj-1",
+            "updated_at": "2026-11-21T00:00:00Z",
+            "policy": {
+                "enabled": true,
+                "initial_token_budget": 10_000,
+                "initial_cost_budget_usd": 1.0,
+                "initial_wall_clock_secs": 3_600,
+                "hard_token_cap": 50_000,
+                "hard_cost_cap_usd": 5.0,
+                "hard_wall_clock_secs": 14_400,
+                "extend_ratio": 0.25,
+                "max_multiplier": 4.0,
+                "forecast_calls": 8,
+                "min_runway_turns": 4,
+                "warn_at_ratio": 0.2,
+                "pause_at_ratio": 0.05,
+                "max_turns_per_run": 60,
+                "max_total_turns": null,
+                "no_progress_turns": 6,
+                "no_progress_action": "pause",
+                "auto_tool_bundle": true
+            }
+        });
+        let text = budget_lines(&value).expect("policy lines").join("\n");
+        assert!(text.contains("project prj-1 auto budget"));
+        assert!(text.contains("hard caps"));
+        assert!(text.contains("50,000"));
+        assert!(text.contains("no-progress 6 (pause)"));
+        assert!(text.contains("tool bundle auto=true"));
+
+        assert!(budget_lines(&json!({"session_id": "ses-1"})).is_none());
+        assert!(budget_lines(&json!({"policy": {"enabled": true}})).is_none());
+    }
+
+    #[test]
+    fn budget_csv_paths_have_one_header_and_one_row() {
+        let value = status();
+        let csv = session_budget_csv(&value);
+        let mut lines = csv.lines();
+        let header = lines.next().unwrap();
+        assert!(header.starts_with("session_id,mode,unlimited,effective_token_budget"));
+        let row = lines.next().unwrap();
+        assert!(row.starts_with("ses-1,auto,false,10000,2.5,3600,50000"));
+        assert!(lines.next().is_none());
+
+        let forecast = json!({"session_id": "ses-1", "forecast": value["forecast"].clone()});
+        let csv = session_budget_forecast_csv(&forecast);
+        let mut lines = csv.lines();
+        assert!(lines.next().unwrap().starts_with("session_id,sample_calls"));
+        assert!(lines.next().unwrap().starts_with("ses-1,8,600,525,0.25"));
+        assert!(lines.next().is_none());
+
+        let policy = json!({
+            "project_id": "prj-1",
+            "updated_at": "2026-11-21T00:00:00Z",
+            "policy": {
+                "enabled": true,
+                "hard_token_cap": 50_000,
+                "no_progress_action": "pause",
+                "auto_tool_bundle": true
+            }
+        });
+        let csv = project_auto_budget_csv(&policy);
+        let mut lines = csv.lines();
+        assert!(
+            lines
+                .next()
+                .unwrap()
+                .starts_with("project_id,updated_at,enabled")
+        );
+        assert!(
+            lines
+                .next()
+                .unwrap()
+                .starts_with("prj-1,2026-11-21T00:00:00Z,true")
+        );
+    }
+}

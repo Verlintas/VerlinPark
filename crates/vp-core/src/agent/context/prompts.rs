@@ -265,6 +265,11 @@ pub(in crate::agent) struct SessionPromptContext {
     pub(in crate::agent) tool_tokens: u64,
     pub(in crate::agent) base_tokens: u64,
     pub(in crate::agent) prefix_hash: String,
+    /// The exact surface and bundle that produced `prefix_hash`.
+    pub(in crate::agent) tool_surface: ToolSurface,
+    pub(in crate::agent) tool_bundle_kind: crate::tool_bundle::ToolBundleKind,
+    pub(in crate::agent) tools_hash: String,
+    pub(in crate::agent) tool_count: usize,
 }
 
 pub(in crate::agent) async fn build_session_prompt_context(
@@ -315,8 +320,9 @@ pub(in crate::agent) async fn build_session_prompt_context(
         parent_workspace_id: None,
     };
     let contract = derive_contract_for_run(engine, project, session, &spec).await?;
-    let sections = build_prompt_sections(
+    let assembly = build_prompt_and_bundle(
         engine,
+        config,
         project,
         session,
         &spec,
@@ -325,15 +331,13 @@ pub(in crate::agent) async fn build_session_prompt_context(
         true,
         mode,
         None,
+        None,
     )
     .await?;
-    let dynamic_mcp =
-        collect_dynamic_mcp_tools(engine, spec.role, &session.project_id, Some(&session.id)).await;
-    let frozen_bundle = frozen_tool_bundle(config, &spec, &dynamic_mcp);
-    let tools = frozen_bundle.tools.clone();
+    let tools = assembly.frozen_bundle.tools.clone();
     let model = model_for(config, spec.role);
-    let hashes = sections.hashes(&model, &tools);
-    let system_tokens = estimate_context_tokens(&sections.render());
+    let hashes = assembly.sections.hashes(&model, &tools);
+    let system_tokens = estimate_context_tokens(&assembly.sections.render());
     let tool_tokens = serde_json::to_string(&tools)
         .map(|schema| estimate_context_tokens(&schema))
         .unwrap_or(0);
@@ -345,6 +349,10 @@ pub(in crate::agent) async fn build_session_prompt_context(
         tool_tokens,
         base_tokens: system_tokens.saturating_add(tool_tokens),
         prefix_hash,
+        tool_surface: assembly.surface,
+        tool_bundle_kind: assembly.frozen_bundle.selection.kind,
+        tools_hash: hashes.tools_hash,
+        tool_count: tools.len(),
     })
 }
 
@@ -501,6 +509,108 @@ pub(in crate::agent) async fn derive_contract_for_run(
     Ok(Some(contract))
 }
 
+/// One exact prompt assembly: the resolved surface, the frozen tool bundle, and
+/// the layout-aware sections. Runtime paths use this type so provider tools,
+/// `PromptSectionHashes`, `context.prompt_prefix`, cache warm/plan, compaction,
+/// and checkpoints all describe the same prefix.
+pub(in crate::agent) struct PromptAssembly {
+    pub(in crate::agent) surface: ToolSurface,
+    pub(in crate::agent) frozen_bundle: crate::tool_bundle::FrozenToolBundle,
+    pub(in crate::agent) sections: crate::prompt_cache::PromptSections,
+    /// The exact dynamic MCP bindings frozen into `frozen_bundle`. Dispatch uses
+    /// this same list, so it never re-discovers a different schema set.
+    pub(in crate::agent) dynamic_mcp: Vec<McpToolBinding>,
+}
+
+/// Resolve the session surface once, freeze its exact tool bundle, and build the
+/// matching prompt sections.
+///
+/// `mcp_session_id` is `Some(session_id)` for a real run so MCP pins can sync.
+/// Read-only preview/warm/checkpoint paths pass `None` and must not mutate pin
+/// trust.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::agent) async fn build_prompt_and_bundle(
+    engine: &Engine,
+    config: &AgentConfig,
+    project: &Project,
+    session: &Session,
+    spec: &AgentSpec,
+    contract: Option<&crate::contract::TaskContract>,
+    objective: &str,
+    include_memory: bool,
+    mode: InstructionBuildMode,
+    memory_meta: Option<&mut Option<crate::identity_memory::IdentityMemoryBrief>>,
+    mcp_session_id: Option<&str>,
+) -> Result<PromptAssembly> {
+    let surface = resolve_tool_surface(engine, session, spec).await;
+    let dynamic_mcp =
+        collect_dynamic_mcp_tools(engine, spec.role, &project.id, mcp_session_id).await;
+    let frozen_bundle = frozen_tool_bundle_with_surface(config, spec, &dynamic_mcp, surface);
+    let sections = build_prompt_sections_with_surface(
+        engine,
+        project,
+        session,
+        spec,
+        contract,
+        objective,
+        include_memory,
+        mode,
+        memory_meta,
+        surface,
+        &frozen_bundle,
+    )
+    .await?;
+    Ok(PromptAssembly {
+        surface,
+        frozen_bundle,
+        sections,
+        dynamic_mcp,
+    })
+}
+
+/// Build prompt sections from the exact frozen bundle and surface resolved for
+/// the run. The prompt text itself is tool-independent, but this contract makes
+/// it impossible to assemble a request with one surface and hash it with a
+/// different one: a capability-gated schema in the frozen bundle is rejected.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::agent) async fn build_prompt_sections_with_surface(
+    engine: &Engine,
+    project: &Project,
+    session: &Session,
+    spec: &AgentSpec,
+    contract: Option<&crate::contract::TaskContract>,
+    objective: &str,
+    include_memory: bool,
+    mode: InstructionBuildMode,
+    memory_meta: Option<&mut Option<crate::identity_memory::IdentityMemoryBrief>>,
+    surface: ToolSurface,
+    frozen_bundle: &crate::tool_bundle::FrozenToolBundle,
+) -> Result<crate::prompt_cache::PromptSections> {
+    if let Some(tool) = frozen_bundle
+        .tools
+        .iter()
+        .find(|tool| !surface.capabilities.allows_tool(&tool.name))
+    {
+        return Err(anyhow!(
+            "frozen tool bundle includes '{}' but surface capability {:?} is unavailable",
+            tool.name,
+            surface.capabilities.gated_off()
+        ));
+    }
+    build_prompt_sections(
+        engine,
+        project,
+        session,
+        spec,
+        contract,
+        objective,
+        include_memory,
+        mode,
+        memory_meta,
+    )
+    .await
+}
+
 /// Build the exact prompt for one run.
 ///
 /// `include_memory` is false only for an explicit cache warm, which must send
@@ -509,6 +619,9 @@ pub(in crate::agent) async fn derive_contract_for_run(
 /// Layout v3 materializes the ordered instruction store: the current objective
 /// is only a user message (plus `run/task` for task-scoped agents), never part
 /// of a Leader's head prefix, and memory is a tail section.
+///
+/// This legacy signature keeps working for existing callers; new runtime paths
+/// use [`build_prompt_and_bundle`] so the surface and frozen tools are shared.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::agent) async fn build_prompt_sections(
     engine: &Engine,

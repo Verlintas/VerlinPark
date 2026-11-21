@@ -182,6 +182,34 @@ pub(super) fn tool_schemas(
     profile: AgentProfile,
     allow_delegation: bool,
 ) -> Vec<ToolSchema> {
+    // Permissive compatibility path: every conditional surface stays visible,
+    // so existing callers keep byte-identical schemas. A runtime that probes
+    // MCP/remote/GUI/search/LSP/artifact availability calls
+    // `tool_schemas_with_capabilities` with explicit flags.
+    tool_schemas_with_capabilities(
+        config,
+        role,
+        profile,
+        allow_delegation,
+        &crate::tool_bundle::ToolCapabilities::default(),
+    )
+}
+
+/// Build the role policy schema set and drop conditional tools whose runtime
+/// capability is absent.
+///
+/// Capability gating is advertisement-only and happens last, after role policy
+/// and every special-tool branch, so a gated tool cannot reappear through a
+/// different source. Dispatch policy, approvals, sandboxing, contracts, and
+/// effect receipts remain authoritative; `tool_search` still knows the hidden
+/// schema through the role policy surface.
+pub(super) fn tool_schemas_with_capabilities(
+    config: &AgentConfig,
+    role: AgentRole,
+    profile: AgentProfile,
+    allow_delegation: bool,
+    capabilities: &crate::tool_bundle::ToolCapabilities,
+) -> Vec<ToolSchema> {
     let mut tools = config
         .tools
         .schemas()
@@ -204,6 +232,7 @@ pub(super) fn tool_schemas(
         if role.allows_tool(profile, "media_info") {
             tools.push(media_info_tool_schema());
         }
+        retain_available_capabilities(&mut tools, capabilities);
         return tools;
     }
     tools.push(ToolSchema {
@@ -988,5 +1017,16 @@ pub(super) fn tool_schemas(
             }),
         });
     }
+    retain_available_capabilities(&mut tools, capabilities);
     tools
+}
+
+/// Drop conditional schemas whose capability was not advertised. Unconditional
+/// schemas are untouched, and the relative order of the remaining tools is
+/// preserved so the bundle freeze sees the same deterministic input order.
+fn retain_available_capabilities(
+    tools: &mut Vec<ToolSchema>,
+    capabilities: &crate::tool_bundle::ToolCapabilities,
+) {
+    tools.retain(|tool| capabilities.allows_tool(&tool.name));
 }

@@ -583,6 +583,26 @@ pub(super) async fn handle(
             },
             Err(response) => response_with_id(id, response),
         },
+        "project.auto_budget.get" => match parse_params::<AutoBudgetPolicyParams>(request.params) {
+            Ok(params) => match state
+                .engine
+                .get_project_auto_budget_policy(&params.project_id)
+                .await
+            {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => budget_error(id, error),
+            },
+            Err(response) => response_with_id(id, response),
+        },
+        "project.auto_budget.set" => {
+            match parse_params::<SetAutoBudgetPolicyParams>(request.params) {
+                Ok(params) => match state.engine.set_project_auto_budget_policy(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => budget_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "project.cleanup_worktrees" => {
             match parse_params::<CleanupWorktreesParams>(request.params) {
                 Ok(params) => match state

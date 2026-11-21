@@ -39,8 +39,9 @@ impl AgentService {
                 .cloned();
             let task_kind = plan_task_kind_for_agent(&self.engine, &session.id, &agent).await;
             let spec = stable_agent_spec(&session, agent, role, task_kind);
-            let sections = build_prompt_sections(
+            let assembly = build_prompt_and_bundle(
                 &self.engine,
+                &config,
                 &project,
                 &session,
                 &spec,
@@ -49,11 +50,14 @@ impl AgentService {
                 false,
                 InstructionBuildMode::Preview,
                 None,
+                None,
             )
             .await?;
-            let dynamic_mcp =
-                collect_dynamic_mcp_tools(&self.engine, spec.role, &session.project_id, None).await;
-            let frozen_bundle = frozen_tool_bundle(&config, &spec, &dynamic_mcp);
+            let PromptAssembly {
+                sections,
+                frozen_bundle,
+                ..
+            } = assembly;
             let tools = frozen_bundle.tools.clone();
             let system = sections.render();
             let hashes = sections.hashes(&model_for(&config, spec.role), &tools);
@@ -155,9 +159,12 @@ impl AgentService {
             let task_kind = plan_task_kind_for_agent(&self.engine, &session.id, &agent).await;
             let spec = stable_agent_spec(&session, agent, role, task_kind);
             // Warm only the stable sections. Memory, objective, and
-            // conversation history are deliberately excluded.
-            let sections = build_prompt_sections(
+            // conversation history are deliberately excluded. The session
+            // surface is resolved here so a warm prefix matches the next live
+            // run instead of silently using the standard/permissive surface.
+            let assembly = build_prompt_and_bundle(
                 &self.engine,
+                &config,
                 &project,
                 &session,
                 &spec,
@@ -166,11 +173,15 @@ impl AgentService {
                 false,
                 InstructionBuildMode::Materialize,
                 None,
+                None,
             )
             .await?;
-            let dynamic_mcp =
-                collect_dynamic_mcp_tools(&self.engine, spec.role, &session.project_id, None).await;
-            let frozen_bundle = frozen_tool_bundle(&config, &spec, &dynamic_mcp);
+            let PromptAssembly {
+                sections,
+                frozen_bundle,
+                surface,
+                ..
+            } = assembly;
             let tools = frozen_bundle.tools.clone();
             let budget = SessionBudget::new(
                 session.token_budget,
@@ -201,6 +212,7 @@ impl AgentService {
                 &budget,
                 &sections,
                 &tools,
+                surface,
                 "manual",
             )
             .await

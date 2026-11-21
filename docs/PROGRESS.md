@@ -1,10 +1,25 @@
 # VerlinPark 进度
 
-> 最后更新：2026-11-18
+> 最后更新：2026-11-21
 > 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark + task contracts/intent authorization/MCP schema pins + effect receipts/postconditions + external gates/durable waits + runtime pinning/controller replay + reliability/OTel + project-scoped identities S1–S8 + failure attribution/cascade + production hardening rounds 1–3 (ADR-0213/0214/0215) + C7 bounded fan-out (ADR-0216) + C8 tool search v2 (ADR-0217) + C9 MCP async tasks (ADR-0218) + C10 Code Mode (ADR-0219) + C11 loopback A2A (ADR-0221) + C12 advisory progress ledger (ADR-0220) + M3.1 store split 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
+
+---
+
+## 2026-11-21 Auto Budget / adaptive tooling
+
+Implemented the production Auto Budget foundation:
+
+- `BudgetMode(fixed|auto|unlimited)`, project/session `AutoBudgetPolicy`, hard caps, derived one-cap initial budgets, atomic event-backed extension, bounded recent-usage forecast, cumulative auto wall clock, `max_turns_per_run`/`max_total_turns`.
+- Automatic pause at hard cap, operator top-up at the next turn, explicit resume, paused-time exclusion, deterministic no-progress evidence tracker with pause/escalate and truncated-scan fail-safe.
+- Program/milestone budget reservations across parallel sessions.
+- `ToolCapabilities` conditional advertisement; Auto Leader uses the read-only orchestrator bundle only after a TeamPlan exists, otherwise the standard writable surface. `tool_search`, Code Mode bindings, cache plan/warm, compaction, and checkpoints share the same surface/hash.
+- RPC/CLI/Swift: `session.budget.get/set/forecast`, `project.auto_budget.get/set`, `vp session-budget*`, Auto/Fixed/Unlimited new-session preset with one hard cap, Settings Automation, Stage runway/pause card.
+- ADR-0231 and [AUTO_BUDGET_PLAN.md](AUTO_BUDGET_PLAN.md); detailed matrix in [TOOLS_MATRIX.md](TOOLS_MATRIX.md).
+
+Current limits: program/auto reservations are process-local (same-host SQLite, no cross-host fencing); `critical_path_turns` is not yet populated; plan-resume seeds the clock but does not yet run the turn-boundary auto loop; the host’s `syspolicyd`/test-binary launch stall prevented executing newly linked Rust/Swift test binaries, so the new suites are compile-checked and targeted runs completed before the stall are reported in the review/commit. No silent unlimited fallback.
 
 ---
 

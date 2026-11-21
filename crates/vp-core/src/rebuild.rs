@@ -425,6 +425,25 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
             )?;
             store.set_process_policy(&snapshot.project.id, &snapshot.process_policy)?;
             store.set_preemption_policy(&snapshot.project.id, &snapshot.preemption_policy)?;
+            snapshot.auto_budget_policy.validate().map_err(|error| {
+                anyhow::anyhow!(
+                    "auto-budget policy for project {} is invalid: {error}",
+                    snapshot.project.id
+                )
+            })?;
+            store.set_project_auto_budget_policy_snapshot(
+                &snapshot.project.id,
+                &snapshot.auto_budget_policy,
+            )?;
+            for event in &snapshot.project_auto_budget_events {
+                if event.project_id != snapshot.project.id {
+                    anyhow::bail!(
+                        "project auto-budget event {} belongs to another project in the manifest",
+                        event.id
+                    );
+                }
+                store.insert_project_auto_budget_event_snapshot(event)?;
+            }
             store.set_project_budget(&snapshot.project.id, &snapshot.budget)?;
             store
                 .set_task_scheduler_policy(&snapshot.project.id, &snapshot.task_scheduler_policy)?;

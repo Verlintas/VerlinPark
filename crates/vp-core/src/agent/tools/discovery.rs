@@ -111,6 +111,7 @@ pub(in crate::agent) async fn run_tool_search(
     spec: &AgentSpec,
     project_id: &str,
     frozen_bundle: &crate::tool_bundle::FrozenToolBundle,
+    surface: ToolSurface,
     input: Value,
 ) -> Result<ToolOutput> {
     use crate::tooling::search::{
@@ -165,10 +166,20 @@ pub(in crate::agent) async fn run_tool_search(
         schema: Option<Value>,
     }
 
-    let builtin_schemas = tool_schemas(config, spec.role, spec.profile, spec.allow_delegation)
-        .into_iter()
-        .filter(|tool| tool.name != "tool_search")
-        .collect::<Vec<_>>();
+    // Discovery must use the exact capability-gated schema surface as the run.
+    // The legacy permissive builder would still return an MCP/remote/media/GUI
+    // schema that the provider cannot currently execute, and `tool_search
+    // promote=true` would then re-advertise it.
+    let builtin_schemas = tool_schemas_with_capabilities(
+        config,
+        spec.role,
+        spec.profile,
+        spec.allow_delegation,
+        &surface.capabilities,
+    )
+    .into_iter()
+    .filter(|tool| tool.name != "tool_search")
+    .collect::<Vec<_>>();
     let available_builtins = builtin_schemas
         .iter()
         .map(|tool| tool.name.clone())
@@ -195,10 +206,11 @@ pub(in crate::agent) async fn run_tool_search(
         })
         .collect::<Vec<_>>();
 
-    let mcp_callable = matches!(
-        spec.role,
-        AgentRole::Leader | AgentRole::Worker | AgentRole::Labour
-    );
+    let mcp_callable = surface.capabilities.mcp_configured
+        && matches!(
+            spec.role,
+            AgentRole::Leader | AgentRole::Worker | AgentRole::Labour
+        );
     let pin_map = engine
         .project_mcp_pins(project_id, None)
         .await
@@ -210,7 +222,11 @@ pub(in crate::agent) async fn run_tool_search(
                 .collect::<HashMap<_, _>>()
         })
         .unwrap_or_default();
-    let servers = engine.list_mcp_servers().await?.servers;
+    let servers = if surface.capabilities.mcp_configured {
+        engine.list_mcp_servers().await?.servers
+    } else {
+        Vec::new()
+    };
     for server in servers.into_iter().filter(|server| server.enabled).take(20) {
         let Ok(tools) = engine.mcp_tools(&server.id).await else {
             continue;
@@ -496,6 +512,8 @@ pub(in crate::agent) async fn run_tool_search(
             "prerequisite_additions": closure.additions,
             "mcp_callable": mcp_callable,
             "bundle": frozen_bundle.selection.kind.as_str(),
+            "bundle_mode": surface.mode.as_str(),
+            "tool_surface": surface.payload(),
             "bundle_hash": frozen_bundle.bundle_hash,
             "advertised_count": advertised.len(),
             "outside_bundle": results.iter().filter(|result| !result["in_bundle"].as_bool().unwrap_or(false)).count(),

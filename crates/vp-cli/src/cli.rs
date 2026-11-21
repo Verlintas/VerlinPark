@@ -97,6 +97,38 @@ impl AcpTransportArg {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum BudgetModeArg {
+    Fixed,
+    Auto,
+    Unlimited,
+}
+
+impl BudgetModeArg {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Fixed => "fixed",
+            Self::Auto => "auto",
+            Self::Unlimited => "unlimited",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum NoProgressActionArg {
+    Pause,
+    Escalate,
+}
+
+impl NoProgressActionArg {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Pause => "pause",
+            Self::Escalate => "escalate",
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub(crate) enum DaemonAgentAction {
     /// Write ~/Library/LaunchAgents/com.verlinpark.daemon.plist and bootstrap it.
@@ -2136,6 +2168,143 @@ pub(crate) enum Command {
         /// Ignore session, plan, department, and project budget gates.
         #[arg(long)]
         unlimited: bool,
+        /// Explicit budget mode: fixed, auto, or unlimited.
+        #[arg(long, value_enum)]
+        budget_mode: Option<BudgetModeArg>,
+        /// Auto preset: use the project auto policy and optional hard caps.
+        #[arg(long)]
+        auto: bool,
+        /// Hard token cap in auto mode (effective token budget in fixed mode).
+        #[arg(long)]
+        max_token: Option<u64>,
+        /// Hard cost cap in USD in auto mode (effective cost budget in fixed mode).
+        #[arg(long)]
+        max_usd: Option<f64>,
+        /// Hard wall-clock cap in hours in auto mode (effective limit in fixed mode).
+        #[arg(long)]
+        max_hours: Option<f64>,
+    },
+    /// Show a session's budget mode, effective/hard limits, spend, and forecast.
+    SessionBudget {
+        session: String,
+        /// Emit one CSV row instead of the human summary.
+        #[arg(long)]
+        csv: bool,
+    },
+    /// Update a session's budget mode, effective budgets, or hard caps.
+    SessionBudgetSet {
+        session: String,
+        /// Budget mode: fixed, auto, or unlimited.
+        #[arg(long, value_enum)]
+        mode: Option<BudgetModeArg>,
+        /// Effective token budget. Omitted fields keep their current value.
+        #[arg(long)]
+        token_budget: Option<u64>,
+        /// Effective cost budget in USD. Omitted fields keep their current value.
+        #[arg(long)]
+        cost_budget_usd: Option<f64>,
+        /// Effective wall-clock budget in seconds. Omitted fields keep their value.
+        #[arg(long)]
+        time_budget_secs: Option<u64>,
+        /// Hard token cap used by auto mode.
+        #[arg(long)]
+        hard_token_cap: Option<u64>,
+        /// Hard cost cap in USD used by auto mode.
+        #[arg(long)]
+        hard_cost_cap_usd: Option<f64>,
+        /// Hard wall-clock cap in seconds used by auto mode.
+        #[arg(long)]
+        hard_wall_clock_secs: Option<u64>,
+        #[arg(long)]
+        clear_token_budget: bool,
+        #[arg(long)]
+        clear_cost_budget: bool,
+        #[arg(long)]
+        clear_time_budget: bool,
+        #[arg(long)]
+        clear_hard_token_cap: bool,
+        #[arg(long)]
+        clear_hard_cost_cap: bool,
+        #[arg(long)]
+        clear_hard_wall_clock_cap: bool,
+        /// Compatibility alias for `--mode unlimited`; `false` restores the stored mode.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        unlimited: Option<bool>,
+    },
+    /// Preview a session's deterministic budget forecast and runway.
+    SessionBudgetForecast {
+        session: String,
+        /// Emit one CSV row instead of the human summary.
+        #[arg(long)]
+        csv: bool,
+    },
+    /// Show the project's default auto-budget policy.
+    ProjectAutoBudget {
+        project: String,
+        /// Emit one CSV row instead of the human summary.
+        #[arg(long)]
+        csv: bool,
+    },
+    /// Update the project auto-budget policy. Unspecified fields keep their current values.
+    ProjectAutoBudgetSet {
+        project: String,
+        /// Enable or disable the project default. Pass `--enabled false` to disable.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        enabled: Option<bool>,
+        #[arg(long)]
+        initial_token_budget: Option<u64>,
+        #[arg(long)]
+        initial_cost_budget_usd: Option<f64>,
+        #[arg(long)]
+        initial_wall_clock_secs: Option<u64>,
+        #[arg(long)]
+        hard_token_cap: Option<u64>,
+        #[arg(long)]
+        hard_cost_cap_usd: Option<f64>,
+        #[arg(long)]
+        hard_wall_clock_secs: Option<u64>,
+        #[arg(long)]
+        extend_ratio: Option<f64>,
+        #[arg(long)]
+        max_multiplier: Option<f64>,
+        #[arg(long)]
+        forecast_calls: Option<u32>,
+        #[arg(long)]
+        min_runway_turns: Option<u32>,
+        #[arg(long)]
+        warn_at_ratio: Option<f64>,
+        #[arg(long)]
+        pause_at_ratio: Option<f64>,
+        #[arg(long)]
+        max_turns_per_run: Option<u32>,
+        #[arg(long)]
+        max_total_turns: Option<u32>,
+        #[arg(long)]
+        no_progress_turns: Option<u32>,
+        #[arg(long, value_enum)]
+        no_progress_action: Option<NoProgressActionArg>,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        auto_tool_bundle: Option<bool>,
+        #[arg(long)]
+        clear_initial_token_budget: bool,
+        #[arg(long)]
+        clear_initial_cost_budget_usd: bool,
+        #[arg(long)]
+        clear_initial_wall_clock_secs: bool,
+        #[arg(long)]
+        clear_hard_token_cap: bool,
+        #[arg(long)]
+        clear_hard_cost_cap_usd: bool,
+        #[arg(long)]
+        clear_hard_wall_clock_secs: bool,
+        #[arg(long)]
+        clear_max_total_turns: bool,
+        /// Read a full policy JSON object from a file, or `-` for stdin.
+        #[arg(long, value_name = "PATH")]
+        policy_file: Option<String>,
+        /// Emit one CSV row instead of the human summary.
+        #[arg(long)]
+        csv: bool,
     },
     /// Enable or disable unlimited budget mode for a session.
     SessionUnlimited {

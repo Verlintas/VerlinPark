@@ -27,6 +27,10 @@ impl Engine {
                     output.saturating_add(event.payload["output_tokens"].as_u64().unwrap_or(0)),
                 )
             });
+        let budget_projection = crate::auto_budget::budget_projection_from_events(&data.events)?;
+        let auto_budget = budget_projection
+            .as_ref()
+            .and_then(|projection| projection.auto_record(&data.session.id));
 
         let plan_event = data.events.iter().rev().find(|event| {
             matches!(
@@ -258,6 +262,16 @@ impl Engine {
             priority,
             unlimited: Some(replay_session_unlimited(&data.events)),
             prompt_layout: replay_session_prompt_layout(&data.events),
+            token_budget: budget_projection
+                .as_ref()
+                .map(|projection| projection.token_budget),
+            cost_budget_usd: budget_projection
+                .as_ref()
+                .map(|projection| projection.cost_budget_usd),
+            time_budget_secs: budget_projection
+                .as_ref()
+                .map(|projection| projection.time_budget_secs),
+            auto_budget,
             tokens_in,
             tokens_out,
             cost_spent_usd,

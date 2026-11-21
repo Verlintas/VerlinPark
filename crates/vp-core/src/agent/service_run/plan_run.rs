@@ -74,7 +74,7 @@ impl AgentService {
             .engine
             .get_preemption_policy(&session.project_id)
             .await?;
-        control.arm_preemption(session.time_budget_secs, preemption_policy);
+        arm_session_preemption(&self.engine, &session, &control, preemption_policy).await?;
         {
             let mut runs = self
                 .runs

@@ -11,6 +11,8 @@
 //! milestone to run next.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -65,6 +67,176 @@ pub struct ProgramCandidate {
 pub struct ProgramLaunchBudget {
     pub token_budget: Option<u64>,
     pub cost_budget_usd: Option<f64>,
+}
+
+/// A long-lived reservation of program allowance held by one milestone for the
+/// lifetime of its session/run. Settled usage is only visible after provider
+/// calls; without this, two parallel milestones would each be granted the full
+/// remaining program allowance.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ProgramReservation {
+    pub tokens: u64,
+    pub cost_usd: f64,
+}
+
+/// Identity of one program budget pool. The data directory keeps independent
+/// stores (including test stores in one process) from sharing reservations.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProgramBudgetScope {
+    data_dir: PathBuf,
+    program_id: String,
+}
+
+impl ProgramBudgetScope {
+    fn new(data_dir: &Path, program_id: &str) -> Self {
+        Self {
+            data_dir: data_dir.to_path_buf(),
+            program_id: program_id.to_string(),
+        }
+    }
+
+    fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    fn program_id(&self) -> &str {
+        &self.program_id
+    }
+}
+
+/// Fail-closed guard against a leaked reservation. Normal programs are bounded
+/// to 100 tasks (and far fewer milestones), and terminal entries are released
+/// on every controller tick, so this is not a capacity target.
+const MAX_PROGRAM_RESERVATIONS: usize = 10_000;
+
+#[derive(Debug, Default)]
+struct ProgramBudgetPool {
+    reservations: HashMap<String, ProgramReservation>,
+}
+
+/// Process-wide reservations for program/milestone budgets.
+///
+/// The store's `program_usage` ledger is authoritative for settled spend, but
+/// it is updated only after a provider call. This ledger holds each milestone's
+/// granted program+satisfied-session allowance from before session creation
+/// until the milestone session settles, so concurrent starts see disjoint
+/// capacity instead of the same remainder.
+///
+/// The ledger is process-local by design: it coordinates milestones started by
+/// one daemon, the same scope as the existing in-memory budget registry. A
+/// restart starts empty, and `release_stale_reservations` releases entries
+/// whose milestone is no longer live so a long-running daemon cannot leak them.
+#[derive(Debug, Default)]
+struct ProgramBudgetLedger {
+    pools: Mutex<HashMap<ProgramBudgetScope, ProgramBudgetPool>>,
+}
+
+impl ProgramBudgetLedger {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ProgramBudgetScope, ProgramBudgetPool>> {
+        self.pools
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Atomically replace this milestone's reservation. The closure sees the
+    /// tokens/cost already reserved by sibling milestones and decides the grant
+    /// under the lock, so a concurrent start cannot double-spend the remainder.
+    fn reserve(
+        &self,
+        scope: &ProgramBudgetScope,
+        milestone_id: &str,
+        compute: impl FnOnce(ProgramReservation) -> Result<ProgramReservation>,
+    ) -> Result<ProgramReservation> {
+        let mut pools = self.lock();
+        let replacing = pools
+            .get(scope)
+            .is_some_and(|pool| pool.reservations.contains_key(milestone_id));
+        let total = pools
+            .values()
+            .map(|pool| pool.reservations.len())
+            .sum::<usize>();
+        if !replacing && total >= MAX_PROGRAM_RESERVATIONS {
+            anyhow::bail!(
+                "program budget reservation ledger is at capacity ({MAX_PROGRAM_RESERVATIONS})"
+            );
+        }
+        let other = {
+            let pool = pools.entry(scope.clone()).or_default();
+            pool.reservations.remove(milestone_id);
+            pool.reservations.values().fold(
+                ProgramReservation::default(),
+                |mut total, reservation| {
+                    total.tokens = total.tokens.saturating_add(reservation.tokens);
+                    total.cost_usd += reservation.cost_usd;
+                    total
+                },
+            )
+        };
+        let reservation = compute(other)?;
+        pools
+            .entry(scope.clone())
+            .or_default()
+            .reservations
+            .insert(milestone_id.to_string(), reservation);
+        Ok(reservation)
+    }
+
+    fn release(&self, scope: &ProgramBudgetScope, milestone_id: &str) -> bool {
+        let mut pools = self.lock();
+        let released = pools
+            .get_mut(scope)
+            .is_some_and(|pool| pool.reservations.remove(milestone_id).is_some());
+        if pools
+            .get(scope)
+            .is_some_and(|pool| pool.reservations.is_empty())
+        {
+            pools.remove(scope);
+        }
+        released
+    }
+
+    fn release_scope(&self, scope: &ProgramBudgetScope) -> usize {
+        self.lock()
+            .remove(scope)
+            .map_or(0, |pool| pool.reservations.len())
+    }
+
+    fn reservations(&self, scope: &ProgramBudgetScope) -> Vec<(String, ProgramReservation)> {
+        self.lock()
+            .get(scope)
+            .map(|pool| {
+                pool.reservations
+                    .iter()
+                    .map(|(milestone_id, reservation)| (milestone_id.clone(), *reservation))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn reserved(&self, scope: &ProgramBudgetScope) -> ProgramReservation {
+        self.lock()
+            .get(scope)
+            .map(|pool| {
+                pool.reservations.values().fold(
+                    ProgramReservation::default(),
+                    |mut total, reservation| {
+                        total.tokens = total.tokens.saturating_add(reservation.tokens);
+                        total.cost_usd += reservation.cost_usd;
+                        total
+                    },
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    fn scopes(&self) -> Vec<ProgramBudgetScope> {
+        self.lock().keys().cloned().collect()
+    }
+}
+
+fn program_budget_ledger() -> &'static ProgramBudgetLedger {
+    static LEDGER: OnceLock<ProgramBudgetLedger> = OnceLock::new();
+    LEDGER.get_or_init(ProgramBudgetLedger::default)
 }
 
 impl ProgramController {
@@ -138,6 +310,9 @@ impl ProgramController {
     }
 
     fn reconcile_blocking(&self, project_id: Option<&str>) -> Result<ProgramReconcileResult> {
+        // Drop reservations whose milestone is already terminal/missing (for
+        // example after a crash between a ledger write and a release).
+        self.release_stale_reservations()?;
         let programs = self.store.list_programs(project_id, None, Some(10_000))?;
         let mut result = ProgramReconcileResult {
             programs: programs.len(),
@@ -239,6 +414,8 @@ impl ProgramController {
                     } else if self.store.fail_program(&program.id, &reason)?.is_some() {
                         result.failed += 1;
                     }
+                    // Every milestone is terminal; no allowance can be spent.
+                    self.release_program_reservations(&program.id);
                 }
                 result.milestones_advanced += advanced_ids.len();
                 continue;
@@ -365,11 +542,14 @@ impl ProgramController {
                 let result = self
                     .milestone_result(&session, task)
                     .unwrap_or_else(|| format!("task {} completed", task.task_id));
-                if self
+                let completed = self
                     .store
                     .complete_program_milestone(&milestone.id, &result)?
-                    .is_some()
-                {
+                    .is_some();
+                // The session has settled and the milestone is terminal, so
+                // the granted allowance can return to the program pool.
+                self.release_milestone_reservation(program, &milestone.id);
+                if completed {
                     return Ok(true);
                 }
                 Ok(false)
@@ -522,6 +702,10 @@ impl ProgramController {
         reason: &str,
     ) -> Result<()> {
         let reason = bounded_reason(reason);
+        // The attempt is over (session terminal, start failure, or ledger
+        // inconsistency). Return this milestone's granted allowance to the
+        // program pool before deciding whether it may retry.
+        self.release_milestone_reservation(program, &milestone.id);
         // Session exhaustion is per attempt; aggregate milestone exhaustion is
         // permanent for the milestone. Both stop automatic retries.
         let session_budget_exhausted = milestone
@@ -580,6 +764,9 @@ impl ProgramController {
         program: &Program,
         milestones: &[ProgramMilestone],
     ) -> Result<bool> {
+        // The settled ledger already covers the program cap. No grant may
+        // remain outstanding once the program is declared exhausted.
+        self.release_program_reservations(&program.id);
         let reason = "program budget is exhausted; no further milestone will be dispatched";
         let mut any_active = false;
         for milestone in milestones {
@@ -680,8 +867,13 @@ impl ProgramController {
             if program.archived || !program.policy.auto_dispatch {
                 continue;
             }
+            // A terminal milestone must not keep allowance reserved just
+            // because no reconcile tick has observed its transition yet.
+            self.release_settled_reservations_for_program(&program.id)?;
             let usage = self.store.program_usage(&program.id)?;
-            if program_budget_exhausted(&program, &usage) {
+            if program_budget_exhausted(&program, &usage)
+                || !self.program_has_unreserved_allowance(&program, &usage)
+            {
                 continue;
             }
             let milestones = self.store.list_program_milestones(&program.id)?;
@@ -800,14 +992,163 @@ impl ProgramController {
         program: &Program,
         milestone: &ProgramMilestone,
     ) -> Result<ProgramLaunchBudget> {
-        let program_usage = self.store.program_usage(&program.id)?;
-        let milestone_usage = self.store.program_milestone_usage(&milestone.id)?;
-        let (token_budget, cost_budget_usd) =
-            effective_budget(program, milestone, &program_usage, &milestone_usage)?;
+        // A terminal/abandoned milestone from an earlier tick must not keep
+        // capacity reserved while this start computes its grant.
+        self.release_settled_reservations_for_program(&program.id)?;
+        let scope = self.reservation_scope(&program.id);
+        let reservation = program_budget_ledger().reserve(&scope, &milestone.id, |other| {
+            // Re-read settled usage under the reservation lock so a concurrent
+            // settlement between the caller's snapshot and the grant is not
+            // mistaken for free capacity.
+            let program_usage = self.store.program_usage(&program.id)?;
+            let milestone_usage = self.store.program_milestone_usage(&milestone.id)?;
+            let share_count = self.concurrent_milestone_count(program)?;
+            let (tokens, cost) = effective_budget(
+                program,
+                milestone,
+                &program_usage,
+                &milestone_usage,
+                other,
+                share_count,
+            )?;
+            Ok(ProgramReservation {
+                tokens: tokens.unwrap_or(0),
+                cost_usd: cost.unwrap_or(0.0),
+            })
+        })?;
         Ok(ProgramLaunchBudget {
-            token_budget,
-            cost_budget_usd,
+            token_budget: (reservation.tokens > 0).then_some(reservation.tokens),
+            cost_budget_usd: (reservation.cost_usd > 0.0).then_some(reservation.cost_usd),
         })
+    }
+
+    /// Long-lived reservations currently held by this program. Exposed for
+    /// diagnostics and deterministic tests; spend still comes from the ledger.
+    pub fn reserved_for_program(&self, program_id: &str) -> ProgramReservation {
+        program_budget_ledger().reserved(&self.reservation_scope(program_id))
+    }
+
+    /// Release every reservation for one program. Used by program cancellation
+    /// (all milestones become terminal) and by the all-terminal reconcile path.
+    pub fn release_program_reservations(&self, program_id: &str) -> usize {
+        program_budget_ledger().release_scope(&self.reservation_scope(program_id))
+    }
+
+    /// Release reservations whose milestone is gone or is no longer running or
+    /// verifying. This covers a crash/restart-style window where the ledger
+    /// still holds an entry after the projection became terminal.
+    pub fn release_stale_reservations(&self) -> Result<usize> {
+        let mut released = 0usize;
+        for scope in program_budget_ledger().scopes() {
+            if scope.data_dir() != self.store.data_dir() {
+                continue;
+            }
+            let Some(program) = self.store.get_program(scope.program_id())? else {
+                released += program_budget_ledger().release_scope(&scope);
+                continue;
+            };
+            if program.archived || program.status.is_terminal() {
+                released += program_budget_ledger().release_scope(&scope);
+                continue;
+            }
+            released += self.release_settled_reservations_for_program(&program.id)?;
+        }
+        Ok(released)
+    }
+
+    fn reservation_scope(&self, program_id: &str) -> ProgramBudgetScope {
+        ProgramBudgetScope::new(self.store.data_dir(), program_id)
+    }
+
+    fn release_milestone_reservation(&self, program: &Program, milestone_id: &str) -> bool {
+        program_budget_ledger().release(&self.reservation_scope(&program.id), milestone_id)
+    }
+
+    fn release_settled_reservations_for_program(&self, program_id: &str) -> Result<usize> {
+        let scope = self.reservation_scope(program_id);
+        let milestones = self.store.list_program_milestones(program_id)?;
+        let live = milestones
+            .iter()
+            .filter(|milestone| {
+                matches!(
+                    milestone.status,
+                    ProgramMilestoneStatus::Running | ProgramMilestoneStatus::Verifying
+                )
+            })
+            .map(|milestone| milestone.id.as_str())
+            .collect::<HashSet<_>>();
+        let mut released = 0usize;
+        for (milestone_id, _) in program_budget_ledger().reservations(&scope) {
+            if !live.contains(milestone_id.as_str())
+                && program_budget_ledger().release(&scope, &milestone_id)
+            {
+                released += 1;
+            }
+        }
+        Ok(released)
+    }
+
+    /// Number of milestones that can consume program allowance concurrently
+    /// right now: active milestones plus dependency-ready pending/ready/failed
+    /// milestones whose retry is due, capped by the program's parallel slot
+    /// limit. A long sequential chain (or a single-slot program) therefore
+    /// keeps the full remaining allowance for its head instead of pre-splitting
+    /// it across milestones that cannot start yet.
+    fn concurrent_milestone_count(&self, program: &Program) -> Result<u64> {
+        let milestones = self.store.list_program_milestones(&program.id)?;
+        let completed = milestones
+            .iter()
+            .filter(|milestone| milestone.status == ProgramMilestoneStatus::Completed)
+            .map(|milestone| milestone.id.as_str())
+            .collect::<HashSet<_>>();
+        let now = OffsetDateTime::now_utc();
+        let count = milestones
+            .iter()
+            .filter(|milestone| {
+                if milestone.status.is_active() {
+                    return true;
+                }
+                if milestone.attempts >= milestone.max_attempts {
+                    return false;
+                }
+                match milestone.status {
+                    ProgramMilestoneStatus::Ready => true,
+                    ProgramMilestoneStatus::Pending | ProgramMilestoneStatus::Failed => {
+                        if !milestone
+                            .deps
+                            .iter()
+                            .all(|dependency| completed.contains(dependency.as_str()))
+                        {
+                            return false;
+                        }
+                        milestone.status != ProgramMilestoneStatus::Failed
+                            || milestone
+                                .next_attempt_at
+                                .as_deref()
+                                .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+                                .map(|next| next <= now)
+                                .unwrap_or(true)
+                    }
+                    _ => false,
+                }
+            })
+            .count();
+        let slots = u64::from(program.policy.max_parallel_milestones.max(1));
+        Ok((count.max(1) as u64).min(slots))
+    }
+
+    fn program_has_unreserved_allowance(&self, program: &Program, usage: &ProgramUsage) -> bool {
+        let reserved = self.reserved_for_program(&program.id);
+        let tokens_available = program.token_budget.is_none_or(|budget| {
+            budget
+                .saturating_sub(usage.token_spent)
+                .saturating_sub(reserved.tokens)
+                > 0
+        });
+        let cost_available = program
+            .cost_budget_usd
+            .is_none_or(|budget| budget - usage.cost_spent_usd - reserved.cost_usd > f64::EPSILON);
+        tokens_available && cost_available
     }
 
     pub fn replay(&self, program_id: &str, repair: bool) -> Result<ProgramReplayReport> {
@@ -1183,7 +1524,10 @@ fn effective_budget(
     milestone: &ProgramMilestone,
     program_usage: &ProgramUsage,
     milestone_usage: &ProgramUsage,
+    reserved_by_other_milestones: ProgramReservation,
+    share_count: u64,
 ) -> Result<(Option<u64>, Option<f64>)> {
+    let share_count = share_count.max(1);
     // Milestone budgets are per milestone, not per attempt. Retries inherit
     // only the unused remainder so a bounded milestone cannot spend its full
     // allowance again on every automatic attempt.
@@ -1201,14 +1545,28 @@ fn effective_budget(
         None => None,
     };
     if let Some(program_budget) = program.token_budget {
-        let remaining = program_budget.saturating_sub(program_usage.token_spent);
+        let spent = program_usage.token_spent.min(program_budget);
+        let remaining = program_budget
+            .saturating_sub(spent)
+            .saturating_sub(reserved_by_other_milestones.tokens);
         if remaining == 0 {
-            anyhow::bail!("program token budget is exhausted");
+            if spent >= program_budget {
+                anyhow::bail!("program token budget is exhausted");
+            }
+            anyhow::bail!("program token budget is fully reserved by active milestones");
         }
-        token_budget = Some(token_budget.map_or(remaining, |budget| budget.min(remaining)));
+        // Split the remaining program allowance across milestones that can
+        // actually run concurrently. This is what makes two parallel starts
+        // disjoint instead of granting the full remainder to both.
+        let fair_share = (program_budget / share_count).max(1);
+        let allowance = fair_share.min(remaining);
+        token_budget = Some(token_budget.map_or(allowance, |budget| budget.min(allowance)));
     }
     let mut cost_budget = match milestone.cost_budget_usd.or(program.policy.cost_budget_usd) {
         Some(budget) => {
+            if !budget.is_finite() || budget <= 0.0 {
+                anyhow::bail!("milestone cost budget is invalid");
+            }
             let remaining = budget - milestone_usage.cost_spent_usd;
             if remaining <= f64::EPSILON {
                 anyhow::bail!(
@@ -1221,11 +1579,20 @@ fn effective_budget(
         None => None,
     };
     if let Some(program_budget) = program.cost_budget_usd {
-        let remaining = (program_budget - program_usage.cost_spent_usd).max(0.0);
-        if remaining <= f64::EPSILON {
-            anyhow::bail!("program cost budget is exhausted");
+        if !program_budget.is_finite() || program_budget <= 0.0 {
+            anyhow::bail!("program cost budget is invalid");
         }
-        cost_budget = Some(cost_budget.map_or(remaining, |budget| budget.min(remaining)));
+        let spent = program_usage.cost_spent_usd.max(0.0).min(program_budget);
+        let remaining = (program_budget - spent - reserved_by_other_milestones.cost_usd).max(0.0);
+        if remaining <= f64::EPSILON {
+            if spent >= program_budget - f64::EPSILON {
+                anyhow::bail!("program cost budget is exhausted");
+            }
+            anyhow::bail!("program cost budget is fully reserved by active milestones");
+        }
+        let fair_share = (program_budget / share_count as f64).max(f64::MIN_POSITIVE);
+        let allowance = fair_share.min(remaining);
+        cost_budget = Some(cost_budget.map_or(allowance, |budget| budget.min(allowance)));
     }
     Ok((token_budget, cost_budget))
 }
@@ -2073,6 +2440,369 @@ mod tests {
         assert_eq!(milestone.status, ProgramMilestoneStatus::Blocked);
         assert!(milestone.last_error.unwrap().contains("budget"));
         assert!(milestone.next_attempt_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn parallel_milestones_receive_disjoint_program_allowances() {
+        let (_dir, engine, project) = setup();
+        let program = engine
+            .create_program(ProgramCreateParams {
+                project_id: project.id.clone(),
+                goal: "Shared program budget".into(),
+                policy: Some(policy()),
+                token_budget: Some(10_000),
+                cost_budget_usd: None,
+                activate: true,
+            })
+            .await
+            .unwrap();
+        let first = add_milestone(&engine, &program, "First", Vec::new()).await;
+        let second = add_milestone(&engine, &program, "Second", Vec::new()).await;
+        let controller = engine.programs();
+        controller.reconcile(Some(&project.id)).await.unwrap();
+
+        let claimed_first = controller.claim_start(&first.id).unwrap().unwrap();
+        let first_budget = controller
+            .budget_for_start(&program, &claimed_first)
+            .unwrap();
+        let claimed_second = controller.claim_start(&second.id).unwrap().unwrap();
+        let second_budget = controller
+            .budget_for_start(&program, &claimed_second)
+            .unwrap();
+
+        assert_eq!(first_budget.token_budget, Some(5_000));
+        assert_eq!(second_budget.token_budget, Some(5_000));
+        let granted = first_budget.token_budget.unwrap() + second_budget.token_budget.unwrap();
+        assert!(
+            granted <= 10_000,
+            "parallel milestones were granted {granted} of a 10,000-token program"
+        );
+        assert_eq!(controller.reserved_for_program(&program.id).tokens, granted);
+    }
+
+    #[tokio::test]
+    async fn parallel_milestones_share_a_cost_budget() {
+        let (_dir, engine, project) = setup();
+        let program = engine
+            .create_program(ProgramCreateParams {
+                project_id: project.id.clone(),
+                goal: "Shared USD budget".into(),
+                policy: Some(policy()),
+                token_budget: None,
+                cost_budget_usd: Some(4.0),
+                activate: true,
+            })
+            .await
+            .unwrap();
+        let first = add_milestone(&engine, &program, "First", Vec::new()).await;
+        let second = add_milestone(&engine, &program, "Second", Vec::new()).await;
+        let controller = engine.programs();
+        controller.reconcile(Some(&project.id)).await.unwrap();
+
+        let claimed_first = controller.claim_start(&first.id).unwrap().unwrap();
+        let first_budget = controller
+            .budget_for_start(&program, &claimed_first)
+            .unwrap();
+        let claimed_second = controller.claim_start(&second.id).unwrap().unwrap();
+        let second_budget = controller
+            .budget_for_start(&program, &claimed_second)
+            .unwrap();
+
+        assert!((first_budget.cost_budget_usd.unwrap() - 2.0).abs() < 1e-9);
+        assert!((second_budget.cost_budget_usd.unwrap() - 2.0).abs() < 1e-9);
+        let granted =
+            first_budget.cost_budget_usd.unwrap() + second_budget.cost_budget_usd.unwrap();
+        assert!(
+            granted <= 4.0 + 1e-9,
+            "parallel milestones were granted ${granted} of a $4.00 program"
+        );
+        assert!((controller.reserved_for_program(&program.id).cost_usd - granted).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn retry_receives_only_the_unreserved_program_remainder() {
+        let (_dir, engine, project) = setup();
+        let program = engine
+            .create_program(ProgramCreateParams {
+                project_id: project.id.clone(),
+                goal: "Retry remainder".into(),
+                policy: Some(policy()),
+                token_budget: Some(10_000),
+                cost_budget_usd: None,
+                activate: true,
+            })
+            .await
+            .unwrap();
+        let first = add_milestone(&engine, &program, "Retried", Vec::new()).await;
+        let second = add_milestone(&engine, &program, "Still running", Vec::new()).await;
+        let controller = engine.programs();
+        controller.reconcile(Some(&project.id)).await.unwrap();
+
+        let claimed_first = controller.claim_start(&first.id).unwrap().unwrap();
+        let first_budget = controller
+            .budget_for_start(&program, &claimed_first)
+            .unwrap();
+        assert_eq!(first_budget.token_budget, Some(5_000));
+        let claimed_second = controller.claim_start(&second.id).unwrap().unwrap();
+        let second_budget = controller
+            .budget_for_start(&program, &claimed_second)
+            .unwrap();
+        assert_eq!(second_budget.token_budget, Some(5_000));
+
+        // Settle the first attempt at 4,000 tokens, then fail it. Its grant is
+        // released, but the sibling's 5,000-token grant is still held.
+        let session = engine
+            .store()
+            .create_session_with_limits(&project.id, "first attempt", Some(5_000), None, None)
+            .unwrap();
+        engine
+            .store()
+            .update_session_status(&session.id, "idle")
+            .unwrap();
+        controller
+            .attach_session(&first.id, &session.id, 1)
+            .unwrap();
+        engine
+            .store()
+            .add_session_usage(&session.id, 3_000, 1_000)
+            .unwrap();
+        controller
+            .fail_start(&program, &claimed_first, "attempt failed")
+            .unwrap();
+        assert_eq!(controller.reserved_for_program(&program.id).tokens, 5_000);
+
+        let retry = engine
+            .store()
+            .get_program_milestone(&first.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.status, ProgramMilestoneStatus::Failed);
+        let retry_budget = controller.budget_for_start(&program, &retry).unwrap();
+        assert_eq!(
+            retry_budget.token_budget,
+            Some(1_000),
+            "a retry must only receive the program remainder that is not reserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_start_releases_the_program_reservation() {
+        let (_dir, engine, project) = setup();
+        let program = engine
+            .create_program(ProgramCreateParams {
+                project_id: project.id.clone(),
+                goal: "Failed start".into(),
+                policy: Some(policy()),
+                token_budget: Some(10_000),
+                cost_budget_usd: None,
+                activate: true,
+            })
+            .await
+            .unwrap();
+        let milestone = add_milestone(&engine, &program, "No session", Vec::new()).await;
+        let controller = engine.programs();
+        controller.reconcile(Some(&project.id)).await.unwrap();
+
+        let claimed = controller.claim_start(&milestone.id).unwrap().unwrap();
+        let budget = controller.budget_for_start(&program, &claimed).unwrap();
+        assert_eq!(budget.token_budget, Some(10_000));
+        assert_eq!(controller.reserved_for_program(&program.id).tokens, 10_000);
+
+        controller
+            .fail_start(&program, &claimed, "could not create a program session")
+            .unwrap();
+        assert_eq!(
+            controller.reserved_for_program(&program.id).tokens,
+            0,
+            "a failed start must not leak the milestone's grant"
+        );
+
+        let retry = engine
+            .store()
+            .get_program_milestone(&milestone.id)
+            .unwrap()
+            .unwrap();
+        let retry_budget = controller.budget_for_start(&program, &retry).unwrap();
+        assert_eq!(retry_budget.token_budget, Some(10_000));
+    }
+
+    #[tokio::test]
+    async fn completed_and_cancelled_milestones_release_program_reservations() {
+        let (_dir, engine, project) = setup();
+        let program = engine
+            .create_program(ProgramCreateParams {
+                project_id: project.id.clone(),
+                goal: "Terminal releases".into(),
+                policy: Some(policy()),
+                token_budget: Some(10_000),
+                cost_budget_usd: None,
+                activate: true,
+            })
+            .await
+            .unwrap();
+        let first = add_milestone(&engine, &program, "Completes", Vec::new()).await;
+        let second = add_milestone(&engine, &program, "Cancelled", Vec::new()).await;
+        let controller = engine.programs();
+        controller.reconcile(Some(&project.id)).await.unwrap();
+
+        let claimed_first = controller.claim_start(&first.id).unwrap().unwrap();
+        controller
+            .budget_for_start(&program, &claimed_first)
+            .unwrap();
+        let claimed_second = controller.claim_start(&second.id).unwrap().unwrap();
+        controller
+            .budget_for_start(&program, &claimed_second)
+            .unwrap();
+        assert_eq!(controller.reserved_for_program(&program.id).tokens, 10_000);
+
+        engine
+            .store()
+            .complete_program_milestone(&first.id, "verified")
+            .unwrap();
+        controller.release_stale_reservations().unwrap();
+        assert_eq!(controller.reserved_for_program(&program.id).tokens, 5_000);
+
+        engine
+            .store()
+            .cancel_program_milestone(&second.id, "operator stop", false)
+            .unwrap();
+        controller.release_stale_reservations().unwrap();
+        assert_eq!(controller.reserved_for_program(&program.id).tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn restart_style_sweep_releases_abandoned_reservations() {
+        let (_dir, engine, project) = setup();
+        let program = engine
+            .create_program(ProgramCreateParams {
+                project_id: project.id.clone(),
+                goal: "Restart sweep".into(),
+                policy: Some(policy()),
+                token_budget: Some(10_000),
+                cost_budget_usd: None,
+                activate: true,
+            })
+            .await
+            .unwrap();
+        let first = add_milestone(&engine, &program, "Crashed", Vec::new()).await;
+        let second = add_milestone(&engine, &program, "Live", Vec::new()).await;
+        let controller = engine.programs();
+        controller.reconcile(Some(&project.id)).await.unwrap();
+        let claimed_first = controller.claim_start(&first.id).unwrap().unwrap();
+        controller
+            .budget_for_start(&program, &claimed_first)
+            .unwrap();
+        let claimed_second = controller.claim_start(&second.id).unwrap().unwrap();
+        controller
+            .budget_for_start(&program, &claimed_second)
+            .unwrap();
+        assert_eq!(controller.reserved_for_program(&program.id).tokens, 10_000);
+
+        // Simulate a crash between the projection write and the in-memory
+        // release: the milestone is terminal, but its grant is still held.
+        engine
+            .store()
+            .block_program_milestone(&first.id, "dispatch crashed")
+            .unwrap();
+        let restarted = Engine::new(engine.store().clone());
+        let restarted_controller = restarted.programs();
+        assert_eq!(
+            restarted_controller
+                .reserved_for_program(&program.id)
+                .tokens,
+            10_000
+        );
+        restarted_controller
+            .reconcile(Some(&project.id))
+            .await
+            .unwrap();
+        assert_eq!(
+            restarted_controller
+                .reserved_for_program(&program.id)
+                .tokens,
+            5_000,
+            "the restart sweep must release a terminal milestone's reservation"
+        );
+
+        engine
+            .store()
+            .cancel_program_milestone(&second.id, "operator stop", false)
+            .unwrap();
+        restarted_controller
+            .reconcile(Some(&project.id))
+            .await
+            .unwrap();
+        assert_eq!(
+            restarted_controller
+                .reserved_for_program(&program.id)
+                .tokens,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn single_slot_program_serializes_milestones_on_the_full_allowance() {
+        let (_dir, engine, project) = setup();
+        let mut single_slot = policy();
+        single_slot.max_parallel_milestones = 1;
+        let program = engine
+            .create_program(ProgramCreateParams {
+                project_id: project.id.clone(),
+                goal: "Serialized program budget".into(),
+                policy: Some(single_slot),
+                token_budget: Some(10_000),
+                cost_budget_usd: None,
+                activate: true,
+            })
+            .await
+            .unwrap();
+        let first = add_milestone(&engine, &program, "First", Vec::new()).await;
+        let _second = add_milestone(&engine, &program, "Second", Vec::new()).await;
+        let controller = engine.programs();
+        controller.reconcile(Some(&project.id)).await.unwrap();
+
+        let claimed = controller.claim_start(&first.id).unwrap().unwrap();
+        let budget = controller.budget_for_start(&program, &claimed).unwrap();
+        assert_eq!(
+            budget.token_budget,
+            Some(10_000),
+            "a single-slot program must not pre-split its allowance across milestones that cannot run"
+        );
+        assert_eq!(controller.reserved_for_program(&program.id).tokens, 10_000);
+        assert!(
+            controller
+                .ready_candidates_in_project(Some(&project.id), None, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn sequential_milestones_keep_the_full_allowance_for_the_ready_head() {
+        let (_dir, engine, project) = setup();
+        let program = engine
+            .create_program(ProgramCreateParams {
+                project_id: project.id.clone(),
+                goal: "Sequential program budget".into(),
+                policy: Some(policy()),
+                token_budget: Some(10_000),
+                cost_budget_usd: None,
+                activate: true,
+            })
+            .await
+            .unwrap();
+        let first = add_milestone(&engine, &program, "Head", Vec::new()).await;
+        let _second = add_milestone(&engine, &program, "Tail", vec![first.id.clone()]).await;
+        let controller = engine.programs();
+        controller.reconcile(Some(&project.id)).await.unwrap();
+
+        let claimed = controller.claim_start(&first.id).unwrap().unwrap();
+        let budget = controller.budget_for_start(&program, &claimed).unwrap();
+        assert_eq!(
+            budget.token_budget,
+            Some(10_000),
+            "a dependency-blocked milestone must not take a share before it can run"
+        );
     }
 
     #[tokio::test]
@@ -3491,8 +4221,15 @@ mod plan_tests {
             token_spent: 7_500,
             cost_spent_usd: 0.8,
         };
-        let (tokens, cost) =
-            effective_budget(&program, &milestone, &program_usage, &milestone_usage).unwrap();
+        let (tokens, cost) = effective_budget(
+            &program,
+            &milestone,
+            &program_usage,
+            &milestone_usage,
+            ProgramReservation::default(),
+            1,
+        )
+        .unwrap();
         assert_eq!(tokens, Some(2_500));
         assert!((cost.unwrap() - 0.2).abs() < 1e-9);
         let plan = milestone_plan_with_budget(&program, &milestone, tokens, cost);
@@ -3509,7 +4246,15 @@ mod plan_tests {
             token_spent: 1_000,
             cost_spent_usd: 0.0,
         };
-        let error = effective_budget(&program, &milestone, &usage, &usage).unwrap_err();
+        let error = effective_budget(
+            &program,
+            &milestone,
+            &usage,
+            &usage,
+            ProgramReservation::default(),
+            1,
+        )
+        .unwrap_err();
         assert!(
             error
                 .to_string()
