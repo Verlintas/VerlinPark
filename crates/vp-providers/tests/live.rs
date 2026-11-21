@@ -42,7 +42,7 @@ fn request(model: String) -> ChatRequest {
         system_sections: Vec::new(),
         tail_sections: Vec::new(),
         cache: None,
-        max_tokens: Some(256),
+        max_tokens: Some(1024),
         temperature: Some(0.0),
         tools: Vec::new(),
     }

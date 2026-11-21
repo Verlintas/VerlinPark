@@ -31,7 +31,7 @@ use super::{
 pub const LIVE_GATE_ENV: &str = "VERLINPARK_CACHE_BENCH_LIVE";
 pub const DEFAULT_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
 const LIVE_STABLE_WORDS: usize = 1_800;
-const LIVE_MAX_OUTPUT_TOKENS: u32 = 64;
+const LIVE_MAX_OUTPUT_TOKENS: u32 = 256;
 
 /// A live setting is constructed only through [`live_settings_from_env`] or
 /// [`LiveCacheBenchSettings::from_parts`]. The API key is never serialized or
@@ -222,7 +222,7 @@ pub async fn run_live_benchmark_with_provider(
     }
     let system = live_instruction_text();
     let mut conversation = vec![ChatMessage::user(
-        "We are benchmarking prompt-cache continuity. Reply briefly and continue.",
+        "We are benchmarking prompt-cache continuity. Reply with exactly one short sentence and continue.",
     )];
     let mut calls = Vec::with_capacity(settings.turns);
     let mut previous_input = 0u64;
@@ -247,7 +247,7 @@ pub async fn run_live_benchmark_with_provider(
             }
         }
         let user = ChatMessage::user(format!(
-            "Turn {}: continue the controlled development session. Read one small file and report one line.",
+            "Turn {}: continue the controlled development session. Read one small file and report one short sentence (max 20 words).",
             turn + 1
         ));
         conversation.push(user);

@@ -174,6 +174,11 @@ no hidden model or provider routing was added.
 - `cargo test -p vp-bench --lib`: 146 passed; harness: 11 passed / 1 ignored.
 - `vp-protocol`, `vp-remote`, `vp-a2a`, and `vp-remote-agent` suites pass.
 - `xcodebuild test`: 430 app tests + 132 helper tests passed.
+- Live DeepSeek `deepseek-flash` smoke (key only in the environment):
+  provider stream 53 chunks / 65 input / 281 output; small cache-bench 95.5471%
+  (marked `unrealistic`, not a long-prefix acceptance claim); full Leader →
+  `write_file` E2E 4 calls / 48,072 input / 318 output / 46,976 cache-read /
+  **97.7201%** hit ratio, session idle, exact file content.
 - Ten review reports and the consolidated report are in
   `docs/reviews/2026-11-19/`.
 - Detailed per-workstream results and the remaining gaps are recorded in the

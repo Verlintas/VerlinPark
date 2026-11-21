@@ -280,7 +280,12 @@
 - `cargo test -p vp-bench --lib`：**146 passed**；`--test harness`：**11 passed / 1 ignored**。
 - `vp-protocol` / `vp-remote` / `vp-a2a` / `vp-remote-agent` 测试全部通过。
 - `xcodebuild ... test`：**430 app tests + 132 helper tests passed**。
+- Live DeepSeek（`deepseek-flash`，`https://api.deepseek.com`，key 仅通过环境变量传入，未写入仓库/日志/事件）最终树验证：
+  - provider stream：53 chunks，65 input / 281 output，正常 `DONE`。
+  - small live cache-bench：95.5471% hit ratio，`provider_reported`，但 prefix ~5.7k，明确标为 `unrealistic`，不冒充 200k long-prefix acceptance。
+  - full Leader → `write_file` E2E：4 calls，48,072 input / 318 output / 46,976 cache-read，**97.7201% cache hit**，session 正常 `idle`，文件内容精确，`tail_delta` 为最后 miss reason。
 - 额外定向回归：parallel deny template、invalid tool args、empty provider turn、两次 resume、journal replay、plan resubmission/revision CAS、batch abort sibling、skip dependency、gate expiry、merge boundary cancel、deferred run、replay/repair revised plan、archive round-trip、provider finish reasons、bench tamper/negative controls 全部通过。
+- Tool schema/policy 对齐回归：Manager/Verifier 不 advertised `archive_extract`/`media_transcode`；Scout 恢复只读 `archive_list`/`media_info`；Leader/Worker/Verifier policy surface 的 role-specific 漂移已清除。
 - 宿主机曾出现 `syspolicyd` 代码签名队列导致新二进制启动延迟；以上为最终冻结树上实际执行的完整结果。
 
 ### 8.4 明确剩余 gap
