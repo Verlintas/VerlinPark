@@ -1,6 +1,6 @@
 # VerlinPark 文档索引
 
-> 最后更新：2026-11-13
+> 最后更新：2026-11-21
 > 仓库：<https://github.com/Verlintas/VerlinPark>
 
 文档分成三类，避免把“设计目标”误读成“已经实现”：
@@ -14,6 +14,7 @@
 | **Design** | [ARCHITECTURE.md](ARCHITECTURE.md) | 目标架构、协议、数据模型、状态机；实现状态见 PROGRESS/AUDIT |
 | **Design** | [PLAN.md](PLAN.md) | 长期产品计划、范围、里程碑、风险；保留早期设计章节作为背景 |
 | **Current** | [TOOLING_ROADMAP.md](TOOLING_ROADMAP.md) | Agent 工具完整清单、已实现 wave 状态、剩余 media/search/introspection/GUI 缺口与设计预算 |
+| **Current** | [TOOLS_MATRIX.md](TOOLS_MATRIX.md) | 当前 advertised built-in tool × Leader/Manager/Worker/Verifier/Labour/Scout 访问矩阵（2026-11-21） |
 | **Reference** | [DECISIONS.md](DECISIONS.md) | Accepted ADR 索引；改架构先加 ADR |
 | **Reference** | [RESEARCH.md](RESEARCH.md) | 2026-10 的竞品/技术调研；历史背景，不是当前状态 |
 | **Reference** | [AGENT_ORCHESTRATION_AND_CACHE_RESEARCH.md](AGENT_ORCHESTRATION_AND_CACHE_RESEARCH.md) | Prompt/KV cache 命中率、Codex/Claude Code/OpenHands/Aider/Magentic-One 等架构对比与 VerlinPark 改进建议 |
