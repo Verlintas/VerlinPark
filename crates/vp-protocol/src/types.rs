@@ -2929,6 +2929,10 @@ pub mod auto_budget_codes {
     pub const INVALID_AUTO_BUDGET_POLICY: &str = "INVALID_AUTO_BUDGET_POLICY";
     pub const INVALID_AUTO_BUDGET_STATE: &str = "INVALID_AUTO_BUDGET_STATE";
     pub const BUDGET_MODE_CONFLICT: &str = "BUDGET_MODE_CONFLICT";
+    /// Legacy `session.create {unlimited:true, token_budget:...}` conflict code.
+    /// Kept on the wire for major-version-1 compatibility; new explicit mode
+    /// conflicts use `BUDGET_MODE_CONFLICT`.
+    pub const SESSION_UNLIMITED_CONFLICT: &str = "SESSION_UNLIMITED_CONFLICT";
     pub const BUDGET_POLICY_NOT_APPLICABLE: &str = "BUDGET_POLICY_NOT_APPLICABLE";
 }
 
@@ -3143,7 +3147,11 @@ impl AutoBudgetPolicy {
     /// instead of immediately starting at the cap (which would behave like a
     /// fixed budget). The result is bounded to `1..=hard`.
     pub fn resolved_initial_token_budget(&self) -> Option<u64> {
-        resolved_initial_u64(self.initial_token_budget, self.hard_token_cap, self.max_multiplier)
+        resolved_initial_u64(
+            self.initial_token_budget,
+            self.hard_token_cap,
+            self.max_multiplier,
+        )
     }
 
     pub fn resolved_initial_cost_budget_usd(&self) -> Option<f64> {
@@ -26394,8 +26402,7 @@ mod auto_budget_type_tests {
         let decoded: BudgetForecastSource =
             serde_json::from_value(json!("provider_ledger")).unwrap();
         assert_eq!(decoded, BudgetForecastSource::ProviderLedger);
-        let legacy: BudgetForecastSource =
-            serde_json::from_value(json!("providerledger")).unwrap();
+        let legacy: BudgetForecastSource = serde_json::from_value(json!("providerledger")).unwrap();
         assert_eq!(legacy, BudgetForecastSource::ProviderLedger);
 
         let forecast = BudgetForecast {
@@ -26418,10 +26425,7 @@ mod auto_budget_type_tests {
             hard_wall_clock_secs: Some(3_600),
             ..AutoBudgetPolicy::default()
         };
-        assert_eq!(
-            derived.resolved_initial_token_budget(),
-            Some(1_000_000)
-        );
+        assert_eq!(derived.resolved_initial_token_budget(), Some(1_000_000));
         assert_eq!(derived.resolved_initial_cost_budget_usd(), Some(2.0));
         assert_eq!(derived.resolved_initial_wall_clock_secs(), Some(900));
 

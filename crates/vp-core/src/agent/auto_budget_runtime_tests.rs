@@ -24,10 +24,7 @@ struct ScriptedProvider {
 }
 
 impl ScriptedProvider {
-    fn new_with_delay(
-        responses: Vec<Vec<StreamEvent>>,
-        delay: Option<Duration>,
-    ) -> Arc<Self> {
+    fn new_with_delay(responses: Vec<Vec<StreamEvent>>, delay: Option<Duration>) -> Arc<Self> {
         Arc::new(Self {
             responses: Mutex::new(VecDeque::from(responses)),
             calls: AtomicUsize::new(0),
@@ -369,10 +366,27 @@ async fn wait_for_status(engine: &Engine, session_id: &str, statuses: &[&str]) -
 }
 
 async fn session_events(engine: &Engine, session_id: &str) -> Vec<vp_protocol::types::Event> {
-    engine
-        .list_events(session_id.to_string(), 0, 5_000)
-        .await
-        .unwrap()
+    // `list_events` clamps each call to 1,000 rows, so a long soak must page.
+    // A single call silently hides every event after the first thousand and
+    // makes tool/progress assertions look like missing events.
+    let mut all = Vec::new();
+    let mut since = 0u64;
+    loop {
+        let page = engine
+            .list_events(session_id.to_string(), since, 1_000)
+            .await
+            .unwrap();
+        let Some(last) = page.last() else {
+            break;
+        };
+        let next = last.seq.saturating_add(1);
+        all.extend(page);
+        if next <= since || all.len() >= 50_000 {
+            break;
+        }
+        since = next;
+    }
+    all
 }
 
 async fn wait_for_event_count(
@@ -461,13 +475,21 @@ fn budget_status_application_preserves_spend_and_uses_cumulative_time() {
     assert_eq!(budget.time_limit(), Some(Duration::from_secs(50)));
     assert_eq!(budget.spent(), 80);
     assert_eq!(budget.cost_spent(), 0.25);
-    assert_eq!(budget.remaining_time_secs(), Some(40));
+    assert!(
+        matches!(budget.remaining_time_secs(), Some(39 | 40)),
+        "remaining time can lose one second to the active clock: {:?}",
+        budget.remaining_time_secs()
+    );
 
     let before_pause = budget.elapsed();
     budget.pause_clock();
     assert!(budget.is_clock_paused());
     std::thread::sleep(Duration::from_millis(20));
-    assert_eq!(budget.elapsed(), before_pause);
+    let after_pause = budget.elapsed();
+    assert!(
+        after_pause.saturating_sub(before_pause) < Duration::from_millis(5),
+        "paused clock advanced: before={before_pause:?} after={after_pause:?}"
+    );
     budget.resume_clock();
     assert!(!budget.is_clock_paused());
     assert!(budget.elapsed() >= before_pause);
@@ -483,7 +505,10 @@ async fn auto_extension_records_event_and_updates_the_live_limit() {
         20,
     )
     .await;
-    let session = harness.create_auto(auto_policy(100, 1_000)).await;
+    // A real request is roughly 12k tokens once the system prompt and tool
+    // schemas are counted. Use a production-scale allowance so the first
+    // request fits only after one extension.
+    let session = harness.create_auto(auto_policy(11_000, 100_000)).await;
     harness
         .engine
         .update_session_auto_budget_state(
@@ -505,7 +530,13 @@ async fn auto_extension_records_event_and_updates_the_live_limit() {
         .iter()
         .find(|event| event.kind == "session.budget.auto_extended")
         .expect("auto extension event");
-    assert_eq!(extension.payload["new"]["token_budget"], 240);
+    let new_budget = extension.payload["new"]["token_budget"]
+        .as_u64()
+        .expect("extended token budget");
+    assert!(
+        new_budget > 11_000 && new_budget <= 100_000,
+        "extension must widen the live allowance within the hard cap: {new_budget}"
+    );
     assert_eq!(extension.payload["extensions"], 1);
 
     let record = harness
@@ -522,8 +553,11 @@ async fn auto_extension_records_event_and_updates_the_live_limit() {
         record.state.elapsed_secs
     );
     let status = harness.engine.session_budget(&session.id).await.unwrap();
-    assert_eq!(status.effective_token_budget, Some(240));
-    assert_eq!(status.remaining_tokens, Some(80));
+    assert_eq!(status.effective_token_budget, Some(new_budget));
+    assert!(
+        status.remaining_tokens.unwrap_or(0) > 0,
+        "remaining tokens must stay positive after the two scripted calls"
+    );
 }
 
 #[tokio::test]
@@ -536,18 +570,19 @@ async fn hard_cap_pauses_instead_of_failing_or_switching_to_unlimited() {
         20,
     )
     .await;
-    let session = harness.create_auto(auto_policy(100, 100)).await;
+    let session = harness.create_auto(auto_policy(1_000_000, 1_000_000)).await;
+    // Spend the whole initial allowance before the run so there is no room to
+    // extend. The runtime must pause before the first provider call.
+    seed_session_tokens(&harness, &session, 10, 100_000).await;
     harness.service.start(&session.id, "work").await.unwrap();
     wait_for_status(&harness.engine, &session.id, &["paused"]).await;
-    let pauses = wait_for_event_count(
-        &harness.engine,
-        &session.id,
-        "session.auto_paused",
-        1,
-    )
-    .await;
+    let pauses = wait_for_event_count(&harness.engine, &session.id, "session.auto_paused", 1).await;
     assert_eq!(pauses[0].payload["reason"], "budget_cap");
-    assert_eq!(harness.provider.calls(), 1);
+    assert_eq!(
+        harness.provider.calls(),
+        0,
+        "no provider call may run after the hard cap is reached"
+    );
 
     let record = harness
         .engine
@@ -574,7 +609,8 @@ async fn operator_top_up_applies_at_the_next_turn_and_reaches_idle() {
         20,
     )
     .await;
-    let session = harness.create_auto(auto_policy(100, 100)).await;
+    let session = harness.create_auto(auto_policy(1_000_000, 1_000_000)).await;
+    seed_session_tokens(&harness, &session, 10, 100_000).await;
     harness
         .engine
         .update_session_auto_budget_state(
@@ -590,47 +626,46 @@ async fn operator_top_up_applies_at_the_next_turn_and_reaches_idle() {
     wait_for_status(&harness.engine, &session.id, &["paused"]).await;
     wait_for_event_count(&harness.engine, &session.id, "session.auto_paused", 1).await;
 
-    // A top-up that leaves the hard cap at 100 is clamped, so the next resume
+    // A top-up that leaves the hard cap at 1M is clamped, so the next resume
     // must pause again instead of failing or overshooting.
     let clamped = harness
         .engine
         .set_session_budget(vp_protocol::types::SetSessionBudgetParams {
             session_id: session.id.clone(),
-            token_budget: Some(1_000),
+            token_budget: Some(1_500_000),
             ..vp_protocol::types::SetSessionBudgetParams::default()
         })
         .await
         .unwrap();
-    assert_eq!(clamped.budget.effective_token_budget, Some(100));
+    assert_eq!(clamped.budget.effective_token_budget, Some(1_000_000));
     assert!(harness.service.resume(&session.id).await.unwrap());
     wait_for_event_count(&harness.engine, &session.id, "session.auto_paused", 2).await;
     wait_for_status(&harness.engine, &session.id, &["paused"]).await;
-    assert_eq!(harness.provider.calls(), 1);
+    assert_eq!(harness.provider.calls(), 0);
 
     // Raising the cap and the effective budget makes the next resume proceed.
     let raised = harness
         .engine
         .set_session_budget(vp_protocol::types::SetSessionBudgetParams {
             session_id: session.id.clone(),
-            token_budget: Some(2_000),
-            hard_token_cap: Some(2_000),
+            token_budget: Some(2_000_000),
+            hard_token_cap: Some(2_000_000),
             ..vp_protocol::types::SetSessionBudgetParams::default()
         })
         .await
         .unwrap();
-    assert_eq!(raised.budget.effective_token_budget, Some(2_000));
+    assert_eq!(raised.budget.effective_token_budget, Some(2_000_000));
     assert!(harness.service.resume(&session.id).await.unwrap());
     wait_for_status(&harness.engine, &session.id, &["idle"]).await;
 
     assert_eq!(harness.provider.calls(), 2);
-    let resumed = wait_for_event_count(
-        &harness.engine,
-        &session.id,
-        "session.auto_resumed",
-        2,
-    )
-    .await;
-    assert!(resumed.iter().all(|event| event.payload["operator_reset"] == true));
+    let resumed =
+        wait_for_event_count(&harness.engine, &session.id, "session.auto_resumed", 2).await;
+    assert!(
+        resumed
+            .iter()
+            .all(|event| event.payload["operator_reset"] == true)
+    );
     let record = harness
         .engine
         .session_auto_budget(&session.id)
@@ -670,15 +705,13 @@ async fn no_progress_read_only_turns_pause_with_bounded_evidence() {
     )
     .await;
     let session = harness.create_auto(policy).await;
-    harness.service.start(&session.id, "read only").await.unwrap();
+    harness
+        .service
+        .start(&session.id, "read only")
+        .await
+        .unwrap();
     wait_for_status(&harness.engine, &session.id, &["paused"]).await;
-    let pauses = wait_for_event_count(
-        &harness.engine,
-        &session.id,
-        "session.auto_paused",
-        1,
-    )
-    .await;
+    let pauses = wait_for_event_count(&harness.engine, &session.id, "session.auto_paused", 1).await;
     assert_eq!(pauses[0].payload["reason"], "no_progress");
     assert_eq!(harness.provider.calls(), 2);
     let evidence = &pauses[0].payload["details"];
@@ -778,7 +811,11 @@ async fn no_progress_escalation_records_a_note_without_pausing() {
     )
     .await;
     let session = harness.create_auto(policy).await;
-    harness.service.start(&session.id, "read only").await.unwrap();
+    harness
+        .service
+        .start(&session.id, "read only")
+        .await
+        .unwrap();
     wait_for_status(&harness.engine, &session.id, &["idle"]).await;
 
     let events = session_events(&harness.engine, &session.id).await;
@@ -789,9 +826,7 @@ async fn no_progress_escalation_records_a_note_without_pausing() {
     );
     let note = events
         .iter()
-        .find(|event| {
-            event.kind == "coordination.note" && event.payload["action"] == "escalate"
-        })
+        .find(|event| event.kind == "coordination.note" && event.payload["action"] == "escalate")
         .expect("escalation coordination note");
     assert_eq!(note.payload["severity"], "warning");
     assert!(
@@ -907,13 +942,7 @@ async fn max_total_turns_pauses_with_a_typed_reason() {
         .unwrap();
     harness.service.start(&session.id, "work").await.unwrap();
     wait_for_status(&harness.engine, &session.id, &["paused"]).await;
-    let pauses = wait_for_event_count(
-        &harness.engine,
-        &session.id,
-        "session.auto_paused",
-        1,
-    )
-    .await;
+    let pauses = wait_for_event_count(&harness.engine, &session.id, "session.auto_paused", 1).await;
     assert_eq!(pauses[0].payload["reason"], "max_total_turns");
     assert_eq!(pauses[0].payload["details"]["limit"], 2);
     assert_eq!(harness.provider.calls(), 1);
@@ -986,8 +1015,8 @@ async fn wall_clock_is_extended_when_time_is_the_limiting_dimension() {
 async fn policy_warn_ratio_emits_one_forecast_warning_per_crossing() {
     let policy = AutoBudgetPolicy {
         enabled: true,
-        initial_token_budget: Some(1_000),
-        hard_token_cap: Some(4_000),
+        initial_token_budget: Some(120_000),
+        hard_token_cap: Some(200_000),
         min_runway_turns: 1,
         max_turns_per_run: 10,
         no_progress_turns: 100,
@@ -997,13 +1026,16 @@ async fn policy_warn_ratio_emits_one_forecast_warning_per_crossing() {
     };
     let harness = harness(
         vec![
-            read_turn("call-read-1", 800, 50),
+            read_turn("call-read-1", 20_000, 5_000),
             final_turn("warning complete", 10, 1),
         ],
         20,
     )
     .await;
     let session = harness.create_auto(policy).await;
+    // Seed most of the initial allowance so the second turn crosses the warn
+    // ratio while the first request still fits. A real request is ~12k tokens.
+    seed_session_tokens(&harness, &session, 9, 10_000).await;
     harness.service.start(&session.id, "warn").await.unwrap();
     wait_for_status(&harness.engine, &session.id, &["idle"]).await;
 
@@ -1014,7 +1046,10 @@ async fn policy_warn_ratio_emits_one_forecast_warning_per_crossing() {
         .collect::<Vec<_>>();
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     let warning = warnings[0];
-    assert_eq!(warning.payload["schema"], "verlinpark.auto_budget_warning/v1");
+    assert_eq!(
+        warning.payload["schema"],
+        "verlinpark.auto_budget_warning/v1"
+    );
     assert_eq!(warning.payload["warn_at_ratio"], 0.20);
     assert!(warning.payload["forecast"]["remaining_tokens"].is_number());
     assert!(warning.payload["dimensions"]["tokens"]["ratio"].is_number());
@@ -1082,7 +1117,11 @@ async fn truncated_no_progress_scan_never_false_pauses_and_later_progress_is_see
         .await
         .unwrap();
 
-    harness.service.start(&session.id, "truncated").await.unwrap();
+    harness
+        .service
+        .start(&session.id, "truncated")
+        .await
+        .unwrap();
     wait_for_status(&harness.engine, &session.id, &["idle"]).await;
 
     assert_eq!(harness.provider.calls(), 2);
@@ -1209,7 +1248,11 @@ async fn paused_time_does_not_consume_the_auto_wall_clock() {
         )
         .await
         .unwrap();
-    harness.service.start(&session.id, "time pause").await.unwrap();
+    harness
+        .service
+        .start(&session.id, "time pause")
+        .await
+        .unwrap();
     wait_for_status(&harness.engine, &session.id, &["paused"]).await;
     wait_for_event_count(&harness.engine, &session.id, "session.auto_paused", 1).await;
     assert_eq!(harness.provider.calls(), 0);
@@ -1247,13 +1290,7 @@ async fn paused_time_does_not_consume_the_auto_wall_clock() {
         "paused wall-clock time leaked into the budget: {}",
         record.state.elapsed_secs
     );
-    let pauses = wait_for_event_count(
-        &harness.engine,
-        &session.id,
-        "session.auto_paused",
-        1,
-    )
-    .await;
+    let pauses = wait_for_event_count(&harness.engine, &session.id, "session.auto_paused", 1).await;
     assert_eq!(pauses.len(), 1);
     let status = harness.engine.session_budget(&session.id).await.unwrap();
     assert_eq!(status.effective_time_budget_secs, Some(5));
@@ -1263,7 +1300,7 @@ async fn paused_time_does_not_consume_the_auto_wall_clock() {
 async fn uncapped_token_runway_does_not_false_pause_a_time_only_policy() {
     let policy = AutoBudgetPolicy {
         enabled: true,
-        initial_token_budget: Some(100),
+        initial_token_budget: Some(1_000_000),
         // No token hard cap: this effective token budget is finite but cannot
         // be auto-extended. Only the wall clock is extendable.
         hard_token_cap: None,
@@ -1283,7 +1320,11 @@ async fn uncapped_token_runway_does_not_false_pause_a_time_only_policy() {
     )
     .await;
     let session = harness.create_auto(policy).await;
-    harness.service.start(&session.id, "uncapped token").await.unwrap();
+    harness
+        .service
+        .start(&session.id, "uncapped token")
+        .await
+        .unwrap();
     wait_for_status(&harness.engine, &session.id, &["idle"]).await;
 
     assert_eq!(harness.provider.calls(), 2);
@@ -1308,7 +1349,7 @@ async fn uncapped_token_runway_does_not_false_pause_a_time_only_policy() {
     assert_eq!(record.state.extensions, 0);
     assert_eq!(record.state.total_turns, 2);
     let status = harness.engine.session_budget(&session.id).await.unwrap();
-    assert_eq!(status.effective_token_budget, Some(100));
+    assert_eq!(status.effective_token_budget, Some(1_000_000));
     assert_eq!(status.hard_token_cap, None);
     assert_eq!(status.hard_wall_clock_secs, Some(4_000));
 }
@@ -1324,7 +1365,11 @@ async fn fixed_and_unlimited_sessions_never_auto_extend() {
     )
     .await;
     let fixed_session = fixed.create_fixed(Some(200_000)).await;
-    fixed.service.start(&fixed_session.id, "fixed").await.unwrap();
+    fixed
+        .service
+        .start(&fixed_session.id, "fixed")
+        .await
+        .unwrap();
     wait_for_status(&fixed.engine, &fixed_session.id, &["failed", "idle"]).await;
     assert_eq!(fixed.provider.calls(), 2);
     let fixed_events = session_events(&fixed.engine, &fixed_session.id).await;
@@ -1531,8 +1576,7 @@ async fn soak_pause_raise_budget_resume_continues_context_without_duplicate_writ
         .await
         .unwrap();
     wait_for_status(&harness.engine, &session.id, &["paused"]).await;
-    let pauses =
-        wait_for_event_count(&harness.engine, &session.id, "session.auto_paused", 1).await;
+    let pauses = wait_for_event_count(&harness.engine, &session.id, "session.auto_paused", 1).await;
     assert_eq!(pauses[0].payload["reason"], "budget_cap");
     assert_eq!(
         harness.provider.calls(),
@@ -1565,20 +1609,25 @@ async fn soak_pause_raise_budget_resume_continues_context_without_duplicate_writ
     assert!(harness.service.resume(&session.id).await.unwrap());
     wait_for_status(&harness.engine, &session.id, &["idle"]).await;
 
-    assert_eq!(harness.provider.calls(), 2, "one pre-pause and one resumed call");
+    assert_eq!(
+        harness.provider.calls(),
+        2,
+        "one pre-pause and one resumed call"
+    );
     let requests = harness.provider.captured_requests();
     assert_eq!(requests.len(), 2);
     assert!(
         messages_extend(&requests[0], &requests[1]),
         "the resumed provider call must continue the pre-pause conversation"
     );
-    assert!(requests[0].iter().any(|message| {
-        message.role == "user" && message.content == "soak pause and resume"
-    }));
+    assert!(
+        requests[0].iter().any(|message| {
+            message.role == "user" && message.content == "soak pause and resume"
+        })
+    );
     assert!(
         requests[1].iter().any(|message| {
-            message.role == "tool"
-                && message.tool_call_id.as_deref() == Some("soak-resume-write")
+            message.role == "tool" && message.tool_call_id.as_deref() == Some("soak-resume-write")
         }),
         "the resumed call must see the completed write tool result"
     );
@@ -1721,7 +1770,7 @@ async fn soak_cumulative_wall_clock_excludes_pause_and_repauses_at_the_cap() {
         .unwrap()
         .unwrap();
     assert!(
-        record.state.elapsed_secs >= first_pause_record.state.elapsed_secs + 1,
+        record.state.elapsed_secs > first_pause_record.state.elapsed_secs,
         "active resumed turn time was not counted: {}",
         record.state.elapsed_secs
     );

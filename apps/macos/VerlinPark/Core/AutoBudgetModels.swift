@@ -24,7 +24,7 @@ private struct BudgetDynamicCodingKey: CodingKey {
 private enum BudgetJSONCoding {
     static func extras<Known: CodingKey & CaseIterable>(
         from decoder: Decoder,
-        known: Known.Type
+        known _: Known.Type
     ) throws -> [String: JSONValue] {
         let container = try decoder.container(keyedBy: BudgetDynamicCodingKey.self)
         let knownKeys = Set(Known.allCases.map(\.stringValue))
@@ -37,7 +37,7 @@ private enum BudgetJSONCoding {
 
     static func encodeExtras<Known: CodingKey & CaseIterable>(
         _ extras: [String: JSONValue],
-        known: Known.Type,
+        known _: Known.Type,
         to encoder: Encoder
     ) throws {
         guard !extras.isEmpty else { return }
@@ -1805,15 +1805,15 @@ enum BudgetFormatting {
         if value >= 1_000_000 {
             return String(format: "%.1fM", Double(value) / 1_000_000)
         }
-        if value >= 1_000 {
-            return String(format: "%.1fk", Double(value) / 1_000)
+        if value >= 1000 {
+            return String(format: "%.1fk", Double(value) / 1000)
         }
         return "\(value)"
     }
 
     static func money(_ value: Double?) -> String {
         guard let value, value.isFinite else { return "—" }
-        if value >= 1_000 {
+        if value >= 1000 {
             return String(format: "$%.1f", value)
         }
         if value > 0, value < 0.01 {

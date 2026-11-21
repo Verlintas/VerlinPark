@@ -23244,9 +23244,9 @@ async fn tool_bundle_matrix_covers_standard_combinations_without_session_state()
     assert_eq!(missing_kind.reason, "no_task_kind_role_default");
     assert_eq!(missing_kind.builtin_count, 39);
     let generic_worker = find("worker", "generic", None);
-    assert_eq!(generic_worker.bundle, "minimal");
+    assert_eq!(generic_worker.bundle, "coding");
     assert!(generic_worker.fallback);
-    assert_eq!(generic_worker.builtin_count, 3);
+    assert_eq!(generic_worker.builtin_count, 28);
     let labour = find("labour", "coding", Some("implementation"));
     assert_eq!(labour.bundle, "coding");
     assert_eq!(labour.builtin_count, 37);

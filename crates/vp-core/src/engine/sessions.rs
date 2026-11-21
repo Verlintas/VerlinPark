@@ -153,6 +153,9 @@ impl Engine {
         if !(-100..=100).contains(&priority) {
             anyhow::bail!("session priority must be between -100 and 100");
         }
+        // Keep the legacy `unlimited=true` conflict code stable for existing
+        // clients; only explicit `budget_mode` conflicts use the new code.
+        let legacy_unlimited = unlimited && budget_mode.is_none();
         let mode = budget_mode.unwrap_or(if unlimited {
             BudgetMode::Unlimited
         } else {
@@ -176,8 +179,13 @@ impl Engine {
         if mode == BudgetMode::Unlimited
             && (token_budget.is_some() || cost_budget_usd.is_some() || time_budget_secs.is_some())
         {
+            let code = if legacy_unlimited {
+                auto_budget_codes::SESSION_UNLIMITED_CONFLICT
+            } else {
+                auto_budget_codes::BUDGET_MODE_CONFLICT
+            };
             return Err(BudgetValidationError::new(
-                auto_budget_codes::BUDGET_MODE_CONFLICT,
+                code,
                 "an unlimited session cannot also declare token, cost, or time budgets",
             )
             .into());
@@ -236,7 +244,9 @@ impl Engine {
             policy.validate()?;
             policy.require_hard_cap()?;
             let caps = policy.hard_caps();
-            token_budget = token_budget.or(policy.resolved_initial_token_budget()).or(caps.token);
+            token_budget = token_budget
+                .or(policy.resolved_initial_token_budget())
+                .or(caps.token);
             cost_budget_usd = cost_budget_usd
                 .or(policy.resolved_initial_cost_budget_usd())
                 .or(caps.cost_usd);

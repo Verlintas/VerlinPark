@@ -130,7 +130,7 @@ final class AutoBudgetTests: XCTestCase {
         XCTAssertFalse(status.unlimited)
         XCTAssertEqual(status.effectiveTokenBudget, 100_000)
         XCTAssertEqual(status.hardTokenCap, 500_000)
-        XCTAssertEqual(status.spentTokens, 62_000)
+        XCTAssertEqual(status.spentTokens, 62000)
         XCTAssertEqual(status.state?.extensions, 2)
         XCTAssertEqual(status.state?.turnsWithoutProgress, 6)
         XCTAssertEqual(status.forecast.runwayTurns, 9)
@@ -521,7 +521,7 @@ final class AutoBudgetTests: XCTestCase {
                 code: -32000,
                 message: "auto budget requires a hard cap",
                 data: .object([
-                    "code": .string("AUTO_BUDGET_CAP_REQUIRED")
+                    "code": .string("AUTO_BUDGET_CAP_REQUIRED"),
                 ])
             )
         )
@@ -584,7 +584,7 @@ final class AutoBudgetTests: XCTestCase {
                 unlimited: false,
                 costSpentUsd: 0.42,
                 baseCommit: nil,
-                tokensIn: 62_000,
+                tokensIn: 62000,
                 tokensOut: 0,
                 createdAt: ""
             ),
@@ -612,8 +612,8 @@ final class AutoBudgetTests: XCTestCase {
             hardCostCapUSD: 25,
             noProgressTurns: 8
         )
-        let fake = FakeBudgetRPC(
-            status: try decode(SessionBudgetStatus.self, autoStatusJSON),
+        let fake = try FakeBudgetRPC(
+            status: decode(SessionBudgetStatus.self, autoStatusJSON),
             projectResult: AutoBudgetPolicyResult(
                 projectID: "p1",
                 policy: policy,
@@ -653,8 +653,8 @@ final class AutoBudgetTests: XCTestCase {
 
     @MainActor
     func testAppModelExposesLastAutoExtensionReason() throws {
-        let model = AppModel(budgetRPC: FakeBudgetRPC(
-            status: try decode(SessionBudgetStatus.self, autoStatusJSON)
+        let model = try AppModel(budgetRPC: FakeBudgetRPC(
+            status: decode(SessionBudgetStatus.self, autoStatusJSON)
         ))
         model.selectedSessionID = "s1"
         model.events = [
@@ -675,8 +675,8 @@ final class AutoBudgetTests: XCTestCase {
 
     @MainActor
     func testAppModelProjectPolicySaveRequiresCapWhenEnabled() async throws {
-        let fake = FakeBudgetRPC(
-            status: try decode(SessionBudgetStatus.self, autoStatusJSON)
+        let fake = try FakeBudgetRPC(
+            status: decode(SessionBudgetStatus.self, autoStatusJSON)
         )
         let model = AppModel(budgetRPC: fake)
         model.selectedProjectID = "p1"

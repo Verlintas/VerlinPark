@@ -283,9 +283,7 @@ pub(super) async fn execute_script_inner_call(
             output: ToolOutput::error_coded(
                 tool_name,
                 crate::tooling::errors::ToolErrorCode::TOOL_NOT_AVAILABLE,
-                format!(
-                    "tool '{tool_name}' is not available in the current capability surface"
-                ),
+                format!("tool '{tool_name}' is not available in the current capability surface"),
             )
             .with_failure_evidence(format!(
                 "tool={tool_name}; gated_off={:?}",

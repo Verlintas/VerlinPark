@@ -379,7 +379,9 @@ struct NewSessionSheet: View {
         if budgetDraft.capKind != .tokens, let cap = policy.hardTokenCap {
             parts.append("\(BudgetFormatting.tokens(cap)) tokens")
         }
-        if parts.isEmpty { return nil }
+        if parts.isEmpty {
+            return nil
+        }
         return "Other project hard caps still apply: " + parts.joined(separator: " · ") + "."
     }
 

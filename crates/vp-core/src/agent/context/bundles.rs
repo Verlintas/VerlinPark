@@ -444,10 +444,7 @@ pub(in crate::agent) async fn resolve_tool_surface(
             Ok(_) => ToolSurface::standard_with(capabilities, "auto_leader_no_plan_standard"),
             Err(error) => {
                 tracing::warn!(%error, session_id = %session.id, "TeamPlan probe failed; keeping the writable Leader standard surface");
-                ToolSurface::standard_with(
-                    capabilities,
-                    "auto_leader_plan_probe_failed_standard",
-                )
+                ToolSurface::standard_with(capabilities, "auto_leader_plan_probe_failed_standard")
             }
         }
     } else {
@@ -922,11 +919,7 @@ mod tool_surface_tests {
         }
     }
 
-    async fn auto_session(
-        engine: &Engine,
-        project_id: &str,
-        auto_tool_bundle: bool,
-    ) -> Session {
+    async fn auto_session(engine: &Engine, project_id: &str, auto_tool_bundle: bool) -> Session {
         let policy = AutoBudgetPolicy {
             enabled: true,
             initial_token_budget: Some(10_000),
@@ -1211,7 +1204,21 @@ mod tool_surface_tests {
         let session = auto_session(&engine, &project.id, true).await;
         store_test_plan(&engine, &session, true);
         let config = test_config(&engine);
-        let spec = preview_spec(AgentRole::Leader, AgentProfile::Generic, None);
+
+        // Manual compaction/checkpoints use `build_session_prompt_context`.
+        // Derive its exact Leader spec first, then run the live prompt path with
+        // that same spec so this test compares the shared surface, not two
+        // differently constructed preview specs.
+        let context = build_session_prompt_context(
+            &engine,
+            &config,
+            &session,
+            &project,
+            InstructionBuildMode::Preview,
+        )
+        .await
+        .unwrap();
+        let spec = context.spec.clone();
 
         let live = build_prompt_and_bundle(
             &engine,
@@ -1245,7 +1252,10 @@ mod tool_surface_tests {
         .await
         .unwrap();
         assert_eq!(live.surface, cache.surface);
-        assert_eq!(live.frozen_bundle.tools_hash, cache.frozen_bundle.tools_hash);
+        assert_eq!(
+            live.frozen_bundle.tools_hash,
+            cache.frozen_bundle.tools_hash
+        );
         let model = model_for(&config, AgentRole::Leader);
         let live_hashes = live.sections.hashes(&model, &live.frozen_bundle.tools);
         let cache_hashes = cache.sections.hashes(&model, &cache.frozen_bundle.tools);
@@ -1260,16 +1270,6 @@ mod tool_surface_tests {
             crate::tool_bundle::ToolBundleKind::LeaderOrchestrator
         );
 
-        // Manual compaction/checkpoints use `build_session_prompt_context`.
-        let context = build_session_prompt_context(
-            &engine,
-            &config,
-            &session,
-            &project,
-            InstructionBuildMode::Preview,
-        )
-        .await
-        .unwrap();
         assert_eq!(context.tool_surface, live.surface);
         assert_eq!(
             context.tool_bundle_kind,

@@ -1101,12 +1101,32 @@ pub fn default_bundle_for_profile(profile: &str) -> ToolBundleKind {
     }
 }
 
+/// Role-aware default for a Worker/Labour run with no known task kind.
+///
+/// A Worker is a technical lead: it must be able to inspect, design, review,
+/// and delegate Labour even when the plan did not label the task kind. The
+/// generic/unknown profile therefore keeps the Coding surface for Workers;
+/// Labour and every other role use the profile default. This is still a named
+/// partition, never `Full`.
+pub fn default_bundle_for_role_profile(role: &str, profile: &str) -> ToolBundleKind {
+    let normalized_role = role.trim().to_ascii_lowercase();
+    if normalized_role == ROLE_WORKER {
+        return match profile.trim().to_ascii_lowercase().as_str() {
+            PROFILE_RESEARCH => ToolBundleKind::Research,
+            PROFILE_VERIFICATION => ToolBundleKind::Verification,
+            _ => ToolBundleKind::Coding,
+        };
+    }
+    default_bundle_for_profile(profile)
+}
+
 /// Choose the bundle for one run. Role decides the surface family; task kind
 /// only partitions Worker/Labour work. A Leader remains Leader for every task,
 /// and read-only roles never inherit a writable bundle.
 ///
-/// A missing or unknown Worker/Labour task kind falls back to the profile's
-/// deterministic default ([`default_bundle_for_profile`]), not to `Full`. The
+/// A missing or unknown Worker/Labour task kind falls back to the role-aware
+/// deterministic default ([`default_bundle_for_role_profile`]), not to `Full`.
+/// The
 /// selection keeps `fallback = true` and a distinct reason so telemetry shows
 /// that the run is not task-partitioned.
 ///
@@ -1159,7 +1179,7 @@ pub fn select_bundle(role: &str, profile: &str, task_kind: Option<&str>) -> Tool
                     false,
                 ),
                 None => ToolBundleSelection::new(
-                    default_bundle_for_profile(&profile),
+                    default_bundle_for_role_profile(&role, &profile),
                     role,
                     profile,
                     Some(kind.to_string()),
@@ -1168,7 +1188,7 @@ pub fn select_bundle(role: &str, profile: &str, task_kind: Option<&str>) -> Tool
                 ),
             },
             None => ToolBundleSelection::new(
-                default_bundle_for_profile(&profile),
+                default_bundle_for_role_profile(&role, &profile),
                 role,
                 profile,
                 None,
@@ -2101,13 +2121,15 @@ mod tests {
     }
 
     #[test]
-    fn unknown_task_kind_falls_back_to_the_profile_default_not_full() {
+    fn unknown_task_kind_falls_back_to_the_role_default_not_full() {
+        // A Worker keeps a delegating, design-capable surface for generic or
+        // unknown profiles; Labour still uses the profile's minimal default.
         for (profile, expected) in [
             ("coding", ToolBundleKind::Coding),
             ("research", ToolBundleKind::Research),
             ("verification", ToolBundleKind::Verification),
-            ("generic", ToolBundleKind::Minimal),
-            ("unrecognized-profile", ToolBundleKind::Minimal),
+            ("generic", ToolBundleKind::Coding),
+            ("unrecognized-profile", ToolBundleKind::Coding),
         ] {
             let selection = select_bundle("worker", profile, Some("esoteric"));
             assert_eq!(selection.kind, expected, "profile {profile}");
@@ -4019,7 +4041,7 @@ mod tests {
         assert_eq!(payload["task_kind"], "unknown");
         assert_eq!(payload["reason"], "task_kind_unknown_role_default");
         let missing = select_bundle("worker", "generic", None);
-        assert_eq!(missing.payload()["bundle"], "minimal");
+        assert_eq!(missing.payload()["bundle"], "coding");
         assert_eq!(missing.payload()["fallback"], true);
     }
 

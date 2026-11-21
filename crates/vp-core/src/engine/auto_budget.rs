@@ -271,6 +271,7 @@ mod tests {
         AutoBudgetPolicy {
             enabled: true,
             initial_token_budget: Some(1_000),
+            initial_cost_budget_usd: Some(2.5),
             hard_token_cap: Some(5_000),
             hard_cost_cap_usd: Some(2.5),
             ..AutoBudgetPolicy::default()

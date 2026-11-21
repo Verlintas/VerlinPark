@@ -162,10 +162,19 @@ For each top-level Leader provider turn, before the provider call:
 An extension request carries additional token/cost/time amounts. The store uses
 the larger of the policy step (`extend_ratio * initial`) and the requested runway
 amount, clamps to the dimension ceiling, never moves below already-spent value,
-and returns a typed no-op at the cap. Concurrent extension calls serialize on
-one SQLite `BEGIN IMMEDIATE` transaction, so the stored effective budget cannot
-jump past the cap. A successful extension writes
-`session.budget.auto_extended`; a no-op at the cap writes no event.
+and returns a typed no-op at the cap. A targeted request extends only the
+dimensions it names, so a time-only extension cannot silently raise an unrelated
+token or cost allowance; a fully default request extends every capped dimension
+by one policy step. Concurrent extension calls serialize on one SQLite
+`BEGIN IMMEDIATE` transaction, so the stored effective budget cannot jump past
+the cap. A successful extension writes `session.budget.auto_extended`; a no-op
+at the cap writes no event.
+
+Before the token reservation, the top-level Leader also checks the exact
+estimated request size against the remaining effective tokens. A fresh session
+with no forecast samples can have a request that is larger than its initial
+allowance; the runtime extends first, or pauses at the hard cap, instead of
+letting the first provider call fail as a generic budget error.
 
 Auto wall clock is cumulative across runs. The live clock is seeded from the
 persisted `elapsed_secs`; pausing stops the active clock, so operator decision
@@ -296,12 +305,15 @@ the standard surface. `auto_tool_bundle=false` is the explicit solo/manual
 opt-out.
 
 Worker/Labour task selection remains deterministic: missing or unknown task
-kinds fall back to the profile default (`coding`, `research`, `verification`, or
-`minimal`) with `reason=task_kind_unknown_role_default` and `fallback=true`, not
-to the `full` catalog. Unknown roles still use `full`. A bundle is frozen at run
-start; an explicit `tool_search` promotion is the only turn-boundary revision,
-and it emits a priced `bundle.revision`/new prompt prefix rather than silently
-changing the schema set.
+kinds fall back to a role-aware default with
+`reason=task_kind_unknown_role_default` and `fallback=true`, not to the `full`
+catalog. A Worker keeps the coding surface (or its explicit research /
+verification profile surface) so it can still inspect, design, review, and
+delegate Labour; Labour and other roles use the profile default (`coding`,
+`research`, `verification`, or `minimal`). Unknown roles still use `full`. A
+bundle is frozen at run start; an explicit `tool_search` promotion is the only
+turn-boundary revision, and it emits a priced `bundle.revision`/new prompt
+prefix rather than silently changing the schema set.
 
 ### 9. Operator surfaces
 
@@ -436,33 +448,26 @@ Typed validation codes are wire values: `INVALID_BUDGET_MODE`,
 
 ## Verification
 
-Final compile status: `cargo check --workspace --all-targets` passes, as do
-`cargo check -p vp-core --tests`, `cargo check -p vp-store --tests`, and
-`cargo check -p vp-protocol --tests`. The Swift app and test bundle build
-(`xcodebuild build-for-testing`) succeed.
+Final verification after the host reboot (2026-11-21):
 
-Test execution had to stop on this host: newly linked Rust and Swift binaries
-are killed or hang at `_dyld_start` behind a wedged `/usr/libexec/syspolicyd`
-(~500% CPU); even pre-existing `--list` invocations and `rustfmt --version`
-hang. Therefore the new Auto Budget/program/tool-surface/no-progress suites are
-compile-checked but not fully executed here, and `cargo fmt`/`cargo clippy`
-could not be launched. Earlier in the round, before the host stall, the following
-actually ran and passed: store auto-budget 10, core auto-budget 12, protocol
-auto-budget 4, program 41+6, tool bundle 81, no-progress 21, and the full
-pre-Auto baseline suites (3,890 Rust, 430 app + 132 helper Swift). The final
-counts below are a checklist for the next executable environment, not invented
-passes.
+- `cargo fmt --all -- --check` — passed.
+- `cargo check --workspace --all-targets` — passed.
+- `cargo clippy --workspace --all-targets -- -D warnings` — passed.
+- `cargo test --workspace` — **4,513 passed, 0 failed, 6 ignored** (the ignored
+  cases are the existing live-provider tests).
+- `swiftformat --lint apps/macos/VerlinPark apps/macos/VerlinParkTests` —
+  passed.
+- `xcodebuild build-for-testing` and `test-without-building` on macOS —
+  **455 app tests + 132 computer-helper tests passed, 0 failed**.
 
-Compilation and lint:
+Targeted deterministic suites that ran during the round also passed:
+store auto-budget 11, core auto-budget runtime 20, protocol auto-budget 6,
+program 49, tool-bundle 81, no-progress 21, and the full core integration set
+(including identity prompts and the adversarial corpus). No live provider call
+was made for this round. The deterministic 50-turn soak uses a fake provider;
+the limitation about a real-latency long-task soak below remains accurate.
 
-```bash
-cargo fmt --all -- --check
-cargo check --workspace --all-targets
-cargo clippy --workspace --all-targets -- -D warnings
-swiftformat --lint apps/macos/VerlinPark apps/macos/VerlinParkTests
-```
-
-Targeted deterministic suites (run from the repository root):
+Commands:
 
 ```bash
 cargo test -p vp-protocol

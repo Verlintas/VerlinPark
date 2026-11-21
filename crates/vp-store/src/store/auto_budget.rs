@@ -347,7 +347,9 @@ impl Store {
         if effective_mode == BudgetMode::Auto {
             // Auto starts at the policy's initial value, falling back to the
             // hard cap for dimensions where no separate initial was declared.
-            token_budget = token_budget.or(policy.resolved_initial_token_budget()).or(caps.token);
+            token_budget = token_budget
+                .or(policy.resolved_initial_token_budget())
+                .or(caps.token);
             cost_budget_usd = cost_budget_usd
                 .or(policy.resolved_initial_cost_budget_usd())
                 .or(caps.cost_usd);
@@ -622,13 +624,35 @@ impl Store {
             .or(current.time_budget_secs)
             .or(caps.wall_clock_secs);
 
+        // A targeted request (any dimension specified) extends only those
+        // dimensions. A fully default request keeps the operator/legacy
+        // "extend every capped dimension by one policy step" behavior.
+        let targeted = extension.requested_token_extension.is_some()
+            || extension.requested_cost_extension_usd.is_some()
+            || extension.requested_wall_clock_extension_secs.is_some();
+        let token_request = if targeted {
+            extension.requested_token_extension
+        } else {
+            caps.token.map(|_| 0)
+        };
+        let cost_request = if targeted {
+            extension.requested_cost_extension_usd
+        } else {
+            caps.cost_usd.map(|_| 0.0)
+        };
+        let time_request = if targeted {
+            extension.requested_wall_clock_extension_secs
+        } else {
+            caps.wall_clock_secs.map(|_| 0)
+        };
+
         let (new_token, token_changed) = extend_u64(
             current.token_budget,
             caps.token,
             initial_token,
             policy.extend_ratio,
             policy.max_multiplier,
-            extension.requested_token_extension,
+            token_request,
             spent_tokens,
         );
         let (new_cost, cost_changed) = extend_f64(
@@ -637,7 +661,7 @@ impl Store {
             initial_cost,
             policy.extend_ratio,
             policy.max_multiplier,
-            extension.requested_cost_extension_usd,
+            cost_request,
             current.cost_spent_usd,
         );
         let (new_time, time_changed) = extend_u64(
@@ -646,7 +670,7 @@ impl Store {
             initial_time,
             policy.extend_ratio,
             policy.max_multiplier,
-            extension.requested_wall_clock_extension_secs,
+            time_request,
             elapsed_secs,
         );
         let changed = token_changed || cost_changed || time_changed;
@@ -806,6 +830,12 @@ fn extend_u64(
     let Some(current) = current else {
         return (current, false);
     };
+    // Only extend a dimension the caller actually asked for. A time-only
+    // extension must not silently raise an unrelated token/cost budget just
+    // because that dimension also has a hard cap.
+    let Some(requested) = requested else {
+        return (Some(current), false);
+    };
     let Some(ceiling) = extension_ceiling(hard_cap, initial, max_multiplier) else {
         return (Some(current), false);
     };
@@ -814,7 +844,7 @@ fn extend_u64(
     }
     let baseline = initial.unwrap_or(current);
     let step = ((baseline as f64 * extend_ratio).ceil() as u64).max(1);
-    let delta = step.max(requested.unwrap_or(0));
+    let delta = step.max(requested);
     let target = current
         .saturating_add(delta)
         .min(ceiling)
@@ -838,6 +868,9 @@ fn extend_f64(
     let Some(current) = current else {
         return (current, false);
     };
+    let Some(requested) = requested else {
+        return (Some(current), false);
+    };
     let Some(cap) = hard_cap else {
         return (Some(current), false);
     };
@@ -852,7 +885,7 @@ fn extend_f64(
         return (Some(current), false);
     }
     let step = (initial * extend_ratio).max(f64::EPSILON);
-    let delta = step.max(requested.unwrap_or(0.0));
+    let delta = step.max(requested);
     let target = (current + delta).min(ceiling).max(floor.min(ceiling));
     if target > current {
         (Some(target), true)
@@ -1202,6 +1235,7 @@ mod tests {
         AutoBudgetPolicy {
             enabled: true,
             initial_token_budget: Some(1_000),
+            initial_cost_budget_usd: Some(2.5),
             hard_token_cap: Some(5_000),
             hard_cost_cap_usd: Some(2.5),
             ..AutoBudgetPolicy::default()
@@ -1483,6 +1517,50 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].payload["old"]["token_budget"], 1_000);
         assert_eq!(events[1].payload["new"]["token_budget"], 1_500);
+    }
+
+    #[test]
+    fn targeted_time_extension_does_not_raise_token_or_cost_budgets() {
+        let (_data, store, project) = fixture();
+        let session = store.create_session(&project.id, "time only").unwrap();
+        let policy = AutoBudgetPolicy {
+            enabled: true,
+            initial_token_budget: Some(1_000_000),
+            hard_token_cap: Some(2_000_000),
+            initial_cost_budget_usd: Some(2.0),
+            hard_cost_cap_usd: Some(8.0),
+            initial_wall_clock_secs: Some(60),
+            hard_wall_clock_secs: Some(600),
+            ..AutoBudgetPolicy::default()
+        };
+        store
+            .set_session_budget_with_event(
+                &session.id,
+                &SessionBudgetUpdate {
+                    mode: Some(BudgetMode::Auto),
+                    policy: Some(policy),
+                    ..SessionBudgetUpdate::default()
+                },
+            )
+            .unwrap();
+
+        let result = store
+            .extend_session_auto_budget_with_event(
+                &session.id,
+                &AutoBudgetExtension {
+                    requested_wall_clock_extension_secs: Some(30),
+                    reason: Some("time runway".into()),
+                    ..AutoBudgetExtension::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(result.outcome, AutoBudgetExtensionOutcome::Extended);
+        assert_eq!(result.old_token_budget, Some(1_000_000));
+        assert_eq!(result.new_token_budget, Some(1_000_000));
+        assert_eq!(result.old_cost_budget_usd, Some(2.0));
+        assert_eq!(result.new_cost_budget_usd, Some(2.0));
+        assert_eq!(result.old_time_budget_secs, Some(60));
+        assert_eq!(result.new_time_budget_secs, Some(90));
     }
 
     #[test]

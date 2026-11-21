@@ -818,7 +818,7 @@ actor CoreClient {
     ) async throws -> SetSessionBudgetResult {
         try await request(
             method: "session.budget.set",
-            params: try params.requestObject()
+            params: params.requestObject()
         )
         .decode(SetSessionBudgetResult.self)
     }
@@ -839,7 +839,7 @@ actor CoreClient {
             method: "project.auto_budget.set",
             params: [
                 "project_id": .string(projectID),
-                "policy": try jsonValue(policy),
+                "policy": jsonValue(policy),
             ]
         )
         .decode(AutoBudgetPolicyResult.self)

@@ -21,6 +21,11 @@
   surface so simple first tasks are not blocked. Fixed/unlimited sessions keep
   the standard permissive matrix above. `auto_tool_bundle=false` opts out.
 - A token cap is always enforceable; a USD cap requires configured role prices.
+- A missing or unknown task kind no longer falls back to the full catalog.
+  Worker keeps the coding surface for generic/unknown profiles (or its explicit
+  research/verification profile); Labour and other roles use the profile
+  default, including `minimal` for generic work. `tool_search` is still the
+  explicit escape hatch for a tool outside the partition.
 - `run_script` binds only the current read-only tool set by default; with
   `allow_write` it additionally binds `write_file`, `edit_file`, and
   `apply_patch`. It has no shell, network, process, GUI, MCP, or delegation

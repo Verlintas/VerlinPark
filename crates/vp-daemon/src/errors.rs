@@ -208,6 +208,10 @@ pub(crate) fn budget_error(id: Option<Value>, error: anyhow::Error) -> RpcRespon
                 false,
                 "do not combine unlimited with fixed/auto, or set conflicting mode fields",
             ),
+            vp_protocol::types::auto_budget_codes::SESSION_UNLIMITED_CONFLICT => (
+                false,
+                "an unlimited session cannot also declare token, cost, or time budgets",
+            ),
             vp_protocol::types::auto_budget_codes::BUDGET_POLICY_NOT_APPLICABLE => (
                 false,
                 "a session auto-budget policy only applies when the mode is auto",

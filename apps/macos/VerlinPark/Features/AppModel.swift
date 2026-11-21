@@ -4504,7 +4504,7 @@ final class AppModel {
     var lastAutoBudgetExtensionReason: String? {
         guard let sessionID = selectedSessionID else { return nil }
         for event in events.reversed()
-        where event.sessionId == sessionID && event.type == "session.budget.auto_extended"
+            where event.sessionId == sessionID && event.type == "session.budget.auto_extended"
         {
             return event.payload.objectValue?["reason"]?.stringValue
         }
@@ -10713,7 +10713,9 @@ final class AppModel {
                 if let pending, pending.sessionID == selectedSessionID {
                     await backfillSelectedSessionEvents(since: pending.since)
                 }
-                if !gapResyncQueued { break }
+                if !gapResyncQueued {
+                    break
+                }
                 // Coalesce a burst of gap frames without delaying the first
                 // global reconciliation.
                 try? await Task.sleep(for: .milliseconds(50))

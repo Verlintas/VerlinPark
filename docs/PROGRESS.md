@@ -19,7 +19,9 @@ Implemented the production Auto Budget foundation:
 - RPC/CLI/Swift: `session.budget.get/set/forecast`, `project.auto_budget.get/set`, `vp session-budget*`, Auto/Fixed/Unlimited new-session preset with one hard cap, Settings Automation, Stage runway/pause card.
 - ADR-0231 and [AUTO_BUDGET_PLAN.md](AUTO_BUDGET_PLAN.md); detailed matrix in [TOOLS_MATRIX.md](TOOLS_MATRIX.md).
 
-Current limits: program/auto reservations are process-local (same-host SQLite, no cross-host fencing); `critical_path_turns` is not yet populated; plan-resume seeds the clock but does not yet run the turn-boundary auto loop; the host’s `syspolicyd`/test-binary launch stall prevented executing newly linked Rust/Swift test binaries, so the new suites are compile-checked and targeted runs completed before the stall are reported in the review/commit. No silent unlimited fallback.
+Verification: `cargo test --workspace` passed **4,513 / 0 failed / 6 ignored**; `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `swiftformat --lint` passed; `xcodebuild test` passed **455 app + 132 helper** tests. Deterministic coverage includes a 50-turn fake-provider soak, pause/raise-budget/resume without duplicate writes, cumulative wall-clock excluding paused time, truncated no-progress scans, capability-gated schemas, and program parallel-budget reservations.
+
+Current limits: program/auto reservations are process-local (same-host SQLite, no cross-host fencing); `critical_path_turns` is not yet populated; plan-resume seeds the clock but does not yet run the turn-boundary auto loop; a real-latency 50+ turn provider soak was not run in this round. No silent unlimited fallback.
 
 ---
 

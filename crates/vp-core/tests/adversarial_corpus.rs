@@ -2410,7 +2410,7 @@ fn bundle_selection_role_matrix() {
             "worker",
             "generic",
             Some("mystery"),
-            ToolBundleKind::Minimal,
+            ToolBundleKind::Coding,
             "task_kind_unknown_role_default",
             true,
         ),

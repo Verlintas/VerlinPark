@@ -138,7 +138,9 @@ struct StageBudgetCard: View {
             Button("Raise budget…", action: onEdit)
                 .buttonStyle(.bordered)
                 .controlSize(.mini)
-                .help("Set an explicit effective budget or hard cap. Never switches to unlimited automatically.")
+                .help(
+                    "Set an explicit effective budget or hard cap. Never switches to unlimited automatically."
+                )
         }
     }
 
@@ -251,8 +253,12 @@ struct StageBudgetCard: View {
     }
 
     private var icon: String {
-        if summary.unlimited { return "infinity" }
-        if summary.isPaused { return "pause.circle" }
+        if summary.unlimited {
+            return "infinity"
+        }
+        if summary.isPaused {
+            return "pause.circle"
+        }
         return summary.mode.isAuto ? "wand.and.stars" : "gauge.with.dots.needle.50percent"
     }
 
@@ -367,9 +373,11 @@ struct SessionBudgetSheet: View {
                 .font(VPTheme.font(18, weight: .semibold, rounded: true))
                 .foregroundStyle(VPTheme.textPrimary)
                 .lineLimit(2)
-                Text("Session \(status.sessionID.prefix(8)) · changing a budget does not resume a paused run.")
-                    .font(VPTheme.mono(8))
-                    .foregroundStyle(VPTheme.textTertiary)
+                Text(
+                    "Session \(status.sessionID.prefix(8)) · changing a budget does not resume a paused run."
+                )
+                .font(VPTheme.mono(8))
+                .foregroundStyle(VPTheme.textTertiary)
             }
             Spacer()
             Button("Cancel") { dismiss() }

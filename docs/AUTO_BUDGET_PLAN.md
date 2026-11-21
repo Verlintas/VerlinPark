@@ -1,7 +1,9 @@
 # Auto budget and adaptive tooling plan
 
-- Status: implemented (verification/test execution limited by host process-launch stall)
+- Status: implemented and verified
 - Date: 2026-11-21
+- Verification: full workspace 4,513 Rust passed / 0 failed / 6 ignored;
+  455 app + 132 helper Swift passed; fmt, clippy, and swiftformat clean.
 - Scope: deterministic auto budget, forecast, hard caps, no-progress pause,
   conditional tool advertisement, program/milestone reservations, and the
   operator surfaces needed to use them.

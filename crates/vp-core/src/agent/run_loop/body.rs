@@ -1003,6 +1003,25 @@ pub(in crate::agent) async fn run_loop_body(
         const MIN_OUTPUT_TOKENS: u64 = 64;
         let configured_output = config.max_tokens.unwrap_or(4096).max(1) as u64;
         let input_estimate = estimate_request_tokens(&request);
+        // The first request of an Auto session may be larger than its initial
+        // budget even when the forecast has no samples yet. Extend/pause before
+        // the token reservation so a fresh Auto session never fails at the
+        // first provider call just because the initial allowance was small.
+        if let Some(runtime) = auto_budget.as_mut()
+            && !runtime
+                .ensure_request_fits(
+                    engine,
+                    session,
+                    spec,
+                    control,
+                    budget,
+                    input_estimate,
+                    MIN_OUTPUT_TOKENS,
+                )
+                .await?
+        {
+            return Ok(LoopOutcome::Cancelled);
+        }
         let prices = role_prices(config, spec.role);
         let (input_price, output_price) = (prices.input, prices.output);
         let scope_spent = if plan_budget.active() && !budget.is_unlimited() {
@@ -1668,15 +1687,7 @@ pub(in crate::agent) async fn run_loop_body(
             if let Some(runtime) = auto_budget.as_mut() {
                 let current_turn = runtime.current_turn();
                 if !runtime
-                    .finish_turn(
-                        engine,
-                        session,
-                        spec,
-                        control,
-                        budget,
-                        current_turn,
-                        false,
-                    )
+                    .finish_turn(engine, session, spec, control, budget, current_turn, false)
                     .await?
                 {
                     return Ok(LoopOutcome::Cancelled);
@@ -2061,15 +2072,7 @@ pub(in crate::agent) async fn run_loop_body(
                 if let Some(runtime) = auto_budget.as_mut() {
                     let current_turn = runtime.current_turn();
                     if !runtime
-                        .finish_turn(
-                            engine,
-                            session,
-                            spec,
-                            control,
-                            budget,
-                            current_turn,
-                            true,
-                        )
+                        .finish_turn(engine, session, spec, control, budget, current_turn, true)
                         .await?
                     {
                         return Ok(LoopOutcome::Cancelled);
@@ -2118,15 +2121,7 @@ pub(in crate::agent) async fn run_loop_body(
         if let Some(runtime) = auto_budget.as_mut() {
             let current_turn = runtime.current_turn();
             if !runtime
-                .finish_turn(
-                    engine,
-                    session,
-                    spec,
-                    control,
-                    budget,
-                    current_turn,
-                    true,
-                )
+                .finish_turn(engine, session, spec, control, budget, current_turn, true)
                 .await?
             {
                 return Ok(LoopOutcome::Cancelled);
