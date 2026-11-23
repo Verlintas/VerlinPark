@@ -1,6 +1,7 @@
 //! Project budgets, session usage ledger, and cost accounting.
 
 use super::*;
+use vp_protocol::types::UsageTotals;
 
 impl Store {
     pub fn get_project_budget(&self, project_id: &str) -> Result<ProjectBudget> {
@@ -255,6 +256,51 @@ impl Store {
             }
         }
         Ok((entry, events))
+    }
+
+    /// Session-wide aggregates without materializing per-call ledger rows.
+    /// Bucket breakdowns are intentionally empty; callers that need them use
+    /// `usage_ledger`.
+    pub fn usage_totals(&self, session_id: &str) -> Result<UsageTotals> {
+        let conn = self.lock()?;
+        let (calls, input, output, cache_read, cache_write, cost) = conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(cache_read_tokens), 0),
+                    COALESCE(SUM(cache_write_tokens), 0),
+                    COALESCE(SUM(cost_usd), 0)
+             FROM usage_ledger WHERE session_id = ?1",
+            params![session_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)? as u64,
+                    row.get::<_, i64>(3)? as u64,
+                    row.get::<_, i64>(4)? as u64,
+                    row.get::<_, f64>(5)?,
+                ))
+            },
+        )?;
+        Ok(UsageTotals {
+            calls,
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: cache_read,
+            cache_write_tokens: cache_write,
+            cache_hit_ratio: if input == 0 {
+                0.0
+            } else {
+                (cache_read as f64 / input as f64).clamp(0.0, 1.0)
+            },
+            cost_usd: cost,
+            by_role: Vec::new(),
+            by_model: Vec::new(),
+            by_agent: Vec::new(),
+            by_task: Vec::new(),
+            by_department: Vec::new(),
+        })
     }
 
     pub fn usage_spent(

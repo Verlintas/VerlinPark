@@ -1,6 +1,6 @@
 # VerlinPark 文档索引
 
-> 最后更新：2026-11-23
+> 最后更新：2026-11-24
 > 仓库：<https://github.com/Verlintas/VerlinPark>
 
 文档分成三类，避免把“设计目标”误读成“已经实现”：
@@ -55,6 +55,8 @@
 | **Current** | [adr/0231-auto-budget-and-adaptive-tooling.md](adr/0231-auto-budget-and-adaptive-tooling.md) | Auto budget and adaptive tooling：三模式、硬上限内确定性扩展、cumulative wall clock、evidence-only no-progress、program 预留、capability gates/orchestrator bundle；含未接线项与剩余缺口 |
 | **Current** | [adr/0232-collab-agent-inspector-and-direct-channel.md](adr/0232-collab-agent-inspector-and-direct-channel.md) | V1 Collab Agent Inspector + operator 直连通道：bounded `agent.inspect`、agent-scoped event index、`agent.message.send` 的 steering/inbox/`AGENT_NOT_ACTIVE` 语义、bounded/redacted Context/Conversation；live 硬化后 steering 要求 live durable run |
 | **Current** | [adr/0233-non-destructive-provider-reconnect.md](adr/0233-non-destructive-provider-reconnect.md) | 非破坏性 provider reconnect：daemon 未配置或 provider identity 完全匹配时才自动应用客户端设置；不匹配必须由 Settings 显式保存替换 |
+| **Current** | [adr/0234-run-contract-and-anytime-execution.md](adr/0234-run-contract-and-anytime-execution.md) | Run Contract + anytime execution：多资源治理（钱/时间/注意力/风险/上下文/容量/质量/进展）、profile、收尾 reserve、证据驱动停止、partial delivery；P0 + R1 observe 已实现 |
+| **Current** | [RUN_CONTRACT_AND_RESOURCE_GOVERNOR_PLAN.md](RUN_CONTRACT_AND_RESOURCE_GOVERNOR_PLAN.md) | R1–R4 实施计划：resource math、profiles、run contract、governor、anytime delivery、attention/trust、metareasoning、RPC/CLI/UI、测试矩阵 |
 | **Reference** | [OBSCURA_ASSESSMENT.md](OBSCURA_ASSESSMENT.md) | Obscura（Rust/V8/CDP/MCP headless browser）评估：适用场景、安全约束、三种集成方案、结论为 cache 轮之后再做可选外部网页后端 |
 | **Reference** | [PRIDE_FLAGS.md](PRIDE_FLAGS.md) | Pride flag 资产来源与许可 |
 | **Reference** | [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) | FlagKit 等第三方资产许可 |

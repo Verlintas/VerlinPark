@@ -1820,6 +1820,21 @@ fn shell_path_in_scope(contract: &TaskContract, raw: &str, worktree: &Path) -> b
     {
         return true;
     }
+    // The shell sandbox exports these stable paths. They are the explicit
+    // throwaway/read-only roots for Agent commands; the actual Seatbelt profile
+    // remains authoritative if a command tries to override the variable.
+    for prefix in [
+        "$VERLINPARK_SCRATCH",
+        "${VERLINPARK_SCRATCH}",
+        "$VERLINPARK_WORKTREE",
+        "${VERLINPARK_WORKTREE}",
+        "$TMPDIR",
+        "${TMPDIR}",
+    ] {
+        if raw.starts_with(prefix) {
+            return true;
+        }
+    }
     if raw.starts_with('/') || raw.starts_with('~') || raw.contains('$') {
         return false;
     }
@@ -2771,6 +2786,22 @@ mod tests {
         assert!(analyze_shell_command("ssh host ls", &contract, worktree).remote);
         let parsed = analyze_shell_command("echo x > /etc/passwd", &contract, worktree);
         assert!(parsed.writes_outside_scope);
+    }
+
+    #[test]
+    fn shell_scratch_and_tmpdir_writes_are_not_scope_violations() {
+        let contract = derive_contract(derivation(vec!["src".into()])).unwrap();
+        let worktree = Path::new(".");
+        let scratch = analyze_shell_command(
+            "mkdir -p \"$VERLINPARK_SCRATCH/proof\" && cp src/lib.rs \"$VERLINPARK_SCRATCH/proof/\"",
+            &contract,
+            worktree,
+        );
+        assert!(!scratch.writes_outside_scope, "{scratch:?}");
+        let tmp = analyze_shell_command("echo x > \"$TMPDIR/proof.txt\"", &contract, worktree);
+        assert!(!tmp.writes_outside_scope, "{tmp:?}");
+        let home = analyze_shell_command("echo x > \"$HOME/proof.txt\"", &contract, worktree);
+        assert!(home.writes_outside_scope, "{home:?}");
     }
 
     #[test]

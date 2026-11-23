@@ -1226,6 +1226,14 @@ impl Engine {
         ))
     }
 
+    /// Aggregate-only session usage for read-only resource snapshots. It does
+    /// not materialize per-call ledger rows.
+    pub async fn usage_totals(&self, session_id: &str) -> Result<UsageTotals> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        tokio::task::spawn_blocking(move || store.usage_totals(&id)).await?
+    }
+
     pub async fn usage_spent(
         &self,
         session_id: &str,

@@ -434,7 +434,7 @@ impl AgentTool for ReadFiles {
                         "== {} ({} lines, sha256 {}) ==\n{}",
                         relative,
                         total_lines,
-                        &hash[..12.min(hash.len())],
+                        hash,
                         lines.join("\n")
                     ));
                     results.push(json!({
@@ -1662,6 +1662,10 @@ mod tests {
         assert!(!output.is_error);
         assert!(output.content.contains("two"));
         assert!(output.content.contains("three"));
+        assert!(
+            output.content.contains(&sha256_hex(b"one\ntwo\n")),
+            "the display text must contain the full hash the write tools expect"
+        );
         assert_eq!(
             output.structured.unwrap()["files"]
                 .as_array()

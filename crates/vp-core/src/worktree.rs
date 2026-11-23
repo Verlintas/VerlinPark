@@ -156,6 +156,12 @@ pub fn status_porcelain(worktree: &Path) -> Result<String> {
     git_output(worktree, &["status", "--porcelain"])
 }
 
+/// Full porcelain status, including every untracked file. Used by bounded
+/// readiness/change summaries; callers must cap the displayed rows.
+pub fn status_porcelain_all(worktree: &Path) -> Result<String> {
+    git_output(worktree, &["status", "--porcelain", "-uall"])
+}
+
 /// Current branch name for a session worktree.
 pub fn current_branch(worktree: &Path) -> Result<String> {
     git_output(worktree, &["rev-parse", "--abbrev-ref", "HEAD"])

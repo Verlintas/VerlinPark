@@ -119,7 +119,7 @@ pub const RECIPES: &[ToolRecipe] = &[
             "shell",
         ],
         steps: &[
-            "Read the target file and keep its sha256; do not edit from memory.",
+            "Read the target file and keep its full 64-character sha256; never copy a shortened display prefix.",
             "Prefer edit_file for one exact replacement and apply_patch for a validated multi-file update.",
             "Pass expected_sha256 when you have it so a concurrent change fails closed with HASH_MISMATCH.",
             "Use dry_run first for a risky rewrite, inspect the bounded diff, then apply.",
@@ -152,6 +152,7 @@ pub const RECIPES: &[ToolRecipe] = &[
             "Run the focused check first with run_project_task; it returns failures and next_actions.",
             "For a long-running server, use process and wait_for instead of a blocking shell call.",
             "Read the first real failure, fix it, and rerun only the affected check.",
+            "Shell commands already start in the worktree; use $VERLINPARK_SCRATCH for throwaway verification copies and never create scratch/verification directories inside the worktree.",
             "Report the exact command, exit code, and the evidence you observed.",
         ],
         example: "run_project_task {\"kind\":\"test\",\"args\":[\"crates/vp-core\",\"tooling::errors\"]}",

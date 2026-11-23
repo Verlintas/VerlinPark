@@ -1340,6 +1340,29 @@ pub(crate) fn detect_profile(root: &Path) -> ProjectProfileData {
         test_roots.push("tests".to_string());
     }
 
+    // A bare Python project often has no pyproject/requirements file but still
+    // uses unittest discovery. Detect that shape so run_project_task does not
+    // fall back to an unsupported shell guess.
+    if !commands.contains_key("test")
+        && root.join("tests").is_dir()
+        && contains_python_test_files(&root.join("tests"))
+    {
+        insert_command(
+            &mut commands,
+            "test",
+            CommandCandidate {
+                command: "python3 -m unittest discover -s tests -v".to_string(),
+                source: "python unittest".to_string(),
+                confidence: 0.72,
+                note: Some(
+                    "detected tests/test_*.py without a pytest configuration; use an explicit custom command if the project prefers pytest"
+                        .to_string(),
+                ),
+            },
+        );
+        test_roots.push("tests".to_string());
+    }
+
     if root.join("go.mod").exists() {
         package_managers.insert("go".to_string());
         insert_command(
@@ -1550,6 +1573,15 @@ pub(crate) fn detect_profile(root: &Path) -> ProjectProfileData {
         warnings,
         truncated,
     }
+}
+
+fn contains_python_test_files(directory: &Path) -> bool {
+    std::fs::read_dir(directory).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            name.starts_with("test_") && name.ends_with(".py")
+        })
+    })
 }
 
 fn insert_command(
@@ -2717,6 +2749,27 @@ error[E0425]: cannot find value `x` in this scope
         let profile = detect_profile(go.path());
         assert_eq!(profile.commands["test"].command, "go test ./...");
         assert_eq!(profile.commands["build"].command, "go build ./...");
+    }
+
+    #[tokio::test]
+    async fn detects_bare_python_unittest_without_packaging_metadata() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        std::fs::write(
+            dir.path().join("src/calc.py"),
+            "def add(a, b):\n    return a + b\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tests/test_calc.py"),
+            "import unittest\n\nclass T(unittest.TestCase):\n    def test_add(self):\n        pass\n",
+        )
+        .unwrap();
+        let profile = detect_profile(dir.path());
+        let test = profile.commands.get("test").expect("unittest command");
+        assert_eq!(test.command, "python3 -m unittest discover -s tests -v");
+        assert_eq!(test.source, "python unittest");
     }
 
     #[tokio::test]

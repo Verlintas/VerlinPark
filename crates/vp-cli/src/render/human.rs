@@ -8,6 +8,7 @@ mod operator;
 mod orchestration;
 mod programs;
 mod projects;
+mod resources;
 mod sessions;
 mod sources;
 mod status;
@@ -107,6 +108,9 @@ pub(crate) fn print_human_for(hint: Option<&str>, value: &Value) {
         return;
     }
     if super::budget::print(value) {
+        return;
+    }
+    if resources::print(value) {
         return;
     }
     if briefs::print(value) {

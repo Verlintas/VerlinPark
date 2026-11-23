@@ -66,11 +66,41 @@ Verification gaps:
 |---|---|---|---|---|
 | V1-D01 | S1 | Steering trusted an Agent row's `running` status and queued a row even after the durable provider run had completed (`session.steer` as well as `agent.message.send`). The message stayed `pending` forever because no future provider boundary could consume it. | **CLOSED** | Shared `steer_session_inner` now uses `Store::has_live_agent_run`; the direct-message route additionally routes a completed-run identity Agent to inbox and an ephemeral Agent to typed `AGENT_NOT_ACTIVE`. Engine tests cover live-run steering, completed-run ephemeral/identity, and the daemon RPC test covers the typed error and no extra pending row. |
 | V1-D02 | S0 | On reconnect, the macOS client could overwrite a daemon configured outside the app with stale local provider defaults (including a keyless localhost endpoint). | **CLOSED** | `ProviderSyncRules`; four Swift regression tests; live DeepSeek daemon check after launching with localhost defaults; ADR-0233 |
-| V1-D03 | S1 | A raw-shell git commit produced an `EFFECT_UNKNOWN` receipt that blocked integration. The agent has no reconciliation tool, so the Leader retried with a new manual run and burned the remaining budget; the operator had to reconcile through the CLI. This is fail-closed C2 behavior, but the recovery path is expensive and not guided. | **OPEN** | Run C: receipt `shell:cmd-a2047bef607b`, `EFFECT_UNKNOWN`, task `impl-calc-pow-mod`; reconciled with commit `2d47d49` but the session failed at 1,456,885 tokens |
+| V1-D03 | S1 | A raw-shell git commit produced an `EFFECT_UNKNOWN` receipt that blocked integration. The agent has no reconciliation tool, so the Leader retried with a new manual run and burned the remaining budget; the operator had to reconcile through the CLI. This is fail-closed C2 behavior, but the recovery path is expensive and not guided. | **MITIGATED** | P0 now marks the task `blocked` with an operator reconciliation reason instead of a normal `failed` retry (`integration_blocked_by_effect_unknown` + test). The operator reconcile path is still explicit; R2 pause/attention is still open (V1-D05). |
 | V1-D04 | S2 | A plan Worker row can remain `running` after its provider run completes while the task is committed, verified, and merged. Messaging is now safe, but status surfaces still show the Worker as running. | **OPEN** | Run A: Worker run completed at 04:34:45, row still `running` at 04:40; ADR-0232 hardening |
 | V1-D05 | S2 | Session budget exhaustion during post-failure recovery has no automatic pause/escalation for `EFFECT_UNKNOWN` or repeated integration blocks. Run C failed at the hard budget with no merged result. | **OPEN** | Run C totals above; the task error names the reconciliation requirement, but the Leader's recovery still consumed the allowance |
 | V1-D06 | S2 | The GUI direct-message path to a **running Worker** and the idle **identity** inbox path were not both captured live in the same round. | **OPEN (verification)** | CLI route and Swift/engine tests pass; acceptance scenario 8 still needs the manual GUI pass |
 | V1-D07 | S2 | A plan Worker's first-class run can be committing/verifying while the agent row is shown as `running`; the UI has no distinct "verifying/merging" state. | **OPEN** | Overlaps V1-D04; the team graph showed a Worker "RUNNING" with no provider activity |
+| V1-D08 | S1 | `read_files` rendered a 12-character sha256 prefix while `edit_file`/`write_file` required the full hash; the resulting `HASH_MISMATCH` looked like a concurrent edit and caused repeated re-read loops. | **CLOSED** | `read_files` now prints the full hash; write/edit errors include `actual_sha256`, a truncation-specific message, and an actionable hint; tool tests cover both paths |
+| V1-D09 | S1 | A bare Python `unittest` project without pyproject/pytest metadata was reported as `PROJECT_UNSUPPORTED`, pushing Agent runs into shell guessing. | **CLOSED** | `project_profile` detects `tests/test_*.py` and proposes `python3 -m unittest discover -s tests -v`; regression test covers the bare fixture |
+| V1-D10 | S1 | Contract analysis treated scratch verification writes and absolute read-only git commands as host-state/scope violations, creating repeated approvals and `.scratch-proof` artifacts in the worktree. | **CLOSED (P0)** | Shell exports `$VERLINPARK_WORKTREE`/`$VERLINPARK_SCRATCH`; prompts/recipes say cwd is the worktree; contract allows the stable scratch/TMPDIR prefixes; absolute read-only git (`status/diff/log/show/rev-parse/...`) is ReadOnly; `clean`/`reset --hard` remains Destructive. Tests cover all paths. |
+| V1-D11 | S1 | Fixed token budgets charged cache-read input at full weight, ignored missing prices, starved verification, and failed solvable runs; the dashboard could not show the difference between cheap-but-stuck and expensive-near-completion. | **PARTIAL** | R1 now exposes raw vs weighted tokens, money with `pricing_source`, time, attention, risk, context, capacity, quality, and progress plus readiness/forecast. Raw token caps remain authoritative until R2 governor/cost-weighted settlement; see ADR-0234 plan. |
+| V1-D12 | S2 | Operator attention had no budget or governor: repeated host-state approvals could consume the run without triggering a policy decision. | **OPEN (R2)** | R1 counts weighted interrupts and exposes an attention dimension/cap view; no automatic pause or policy prompt yet |
+
+## Run Contract R1 (2026-11-24)
+
+Implemented the observe-only first slice from ADR-0234:
+
+- `session.resources` returns a bounded multi-resource snapshot (money, raw and
+  cache-weighted tokens, time, attention, risk, context, capacity, quality,
+  progress), forecast, bottleneck, warnings, and nested readiness.
+- `session.readiness` returns the conservative `none/dirty/committed/tests_passed/
+  verified/merged/partial/blocked` level, shippable/mergeable flags, latest
+  commit/verifier/merge, bounded changed paths, remaining work, and blockers.
+- `session.run_contract.get` returns the derived profile, hard/soft targets,
+  completion reserve, attention cap, acceptance, stop policy, and warnings.
+- `vp resources`, `vp readiness`, and `vp run-contract` use the same RPCs; the
+  macOS Stage has a read-only resource strip/card backed only by
+  `session.resources`.
+- R1 does not pause, spend, top up, approve, reconcile, merge, or route. It
+  appends no events. Missing prices are labeled `unconfigured`; readiness does
+  not infer tests from raw shell output.
+
+Tests: three core resource/readiness tests, two daemon RPC read-only tests,
+three Swift decoder tests, plus the P0 hash/scratch/permission/unittest/effect
+tests. The targeted suites pass; the final full-suite/clippy rerun is blocked
+by the recurring host `syspolicyd` spin described below, so it is not claimed
+as green.
 
 ## Carried findings from the V1 plan
 
@@ -99,27 +129,43 @@ ledger does not claim they are fixed.
 
 ## Verification commands
 
-Rust targeted final (after the last steering guard):
+Rust targeted final (after the last steering guard and P0/R1):
 
 ```bash
 cargo test -p vp-core --lib steering
 # 8 passed, 0 failed (includes the 7 operator-route tests and the inspector test)
 cargo test -p vp-daemon --bin verlinpadd tests::agent_operator_rpc_tests
+# 2 passed, 0 failed (operator route + read-only resources/readiness/contract RPCs)
+cargo test -p vp-core --lib engine::resources::tests
+# 3 passed, 0 failed (snapshot/readiness/attention math)
+cargo test -p vp-core --lib 'tools::tests'
+# 28 passed, 0 failed (incl. full-hash, scratch env, shell confinement)
+cargo test -p vp-core --lib 'permissions::tests::read_only_git'
+# 2 passed, 0 failed (absolute read-only git vs clean destructive)
+cargo test -p vp-core --lib 'tooling::project::tests'
+# 16 passed, 0 failed (incl. bare Python unittest detection)
+cargo test -p vp-core --lib 'tooling::files::tests'
+# 8 passed, 0 failed (incl. full-hash display)
+cargo test -p vp-core --lib 'contract::tests::shell_scratch'
 # 1 passed, 0 failed
-cargo test -p vp-core --lib engine::operator::tests
-# 7 passed, 0 failed (run before the final shared-guard edit; same assertions)
+cargo test -p vp-core --lib 'agent::plan::execute::tests'
+# 1 passed, 0 failed (EFFECT_UNKNOWN blocked classification)
 ```
 
-An earlier full `cargo test --workspace` run passed every other crate and
-failed only the daemon operator RPC test, which asserted the old steering
-behavior. That test was updated and passed in the final targeted run. The final
-full-workspace rerun was blocked by a host problem, not a code failure:
-`syspolicyd` entered a sustained ~530–546% CPU spin and newly built binaries
-stalled in `_dyld_start` (including a minimal `/tmp` Rust binary). The host
-needs its policy service restarted/rebooted before the final full-suite number
-can be recorded. `cargo clippy --workspace --all-targets -- -D warnings`
-passed after the `has_live_agent_run` refactor and before the last shared
-steering guard; that guard compiled and passed in the targeted tests above.
+An earlier full `cargo test --workspace` run (before P0/R1) passed every crate
+and failed only the daemon operator RPC test, which asserted the old steering
+behavior. That test was updated and passed in the targeted runs above. The
+P0/R1-targeted suites and Swift tests pass, and the final `cargo check -p
+vp-core -p vp-cli -p vp-daemon` passes.
+
+The final full-workspace + clippy run is blocked by a host problem, not a code
+failure: `syspolicyd` entered a sustained ~530–550% CPU spin and newly built
+binaries stalled in `_dyld_start` (including a minimal `/tmp` Rust binary).
+Killing all stuck test processes does not clear it; without restart access the
+host policy service cannot be restarted. A previous occurrence cleared only
+after the host was left alone/restarted. Re-run the full suite and clippy once
+the host policy service is healthy; no code failure has been observed in the
+targeted suites.
 
 Swift:
 
@@ -127,8 +173,12 @@ Swift:
 cd apps/macos && xcodegen generate
 xcodebuild -project VerlinPark.xcodeproj -scheme VerlinPark \
   -destination 'platform=macOS,arch=arm64' \
+  -only-testing:VerlinParkTests/ResourceGovernorTests test
+# 3 passed, 0 failed
+xcodebuild -project VerlinPark.xcodeproj -scheme VerlinPark \
+  -destination 'platform=macOS,arch=arm64' \
   -only-testing:VerlinParkTests/RuntimeReliabilityTests test
-# 31 passed, 0 failed
+# 31 passed, 0 failed (earlier round)
 ```
 
 Live provider smoke (key from the daemon environment/Keychain only):

@@ -23,6 +23,7 @@ pub(crate) mod operator;
 pub(crate) mod plans;
 pub(crate) mod programs;
 pub(crate) mod projects;
+pub(crate) mod resources;
 pub(crate) mod runs;
 pub(crate) mod sessions;
 pub(crate) mod sources;

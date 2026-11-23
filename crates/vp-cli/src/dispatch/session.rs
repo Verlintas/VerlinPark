@@ -605,6 +605,30 @@ pub(super) async fn dispatch(
                 };
                 rpc(&discovery, method, json!({"session_id": session})).await?
             }
+            Command::Resources { session } => {
+                rpc(
+                    &discovery,
+                    "session.resources",
+                    json!({"session_id": session}),
+                )
+                .await?
+            }
+            Command::Readiness { session } => {
+                rpc(
+                    &discovery,
+                    "session.readiness",
+                    json!({"session_id": session}),
+                )
+                .await?
+            }
+            Command::RunContract { session } => {
+                rpc(
+                    &discovery,
+                    "session.run_contract.get",
+                    json!({"session_id": session}),
+                )
+                .await?
+            }
             _ => unreachable!("command routed to the wrong dispatch family"),
         };
     Ok(Some(value))

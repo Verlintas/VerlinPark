@@ -1378,6 +1378,30 @@ actor CoreClient {
             .decode(SessionEffectsReport.self)
     }
 
+    func sessionResources(sessionID: String) async throws -> ResourceSnapshotView {
+        try await request(
+            method: "session.resources",
+            params: ["session_id": .string(sessionID)]
+        )
+        .decode(ResourceSnapshotView.self)
+    }
+
+    func sessionReadiness(sessionID: String) async throws -> ReadinessSnapshotView {
+        try await request(
+            method: "session.readiness",
+            params: ["session_id": .string(sessionID)]
+        )
+        .decode(ReadinessSnapshotView.self)
+    }
+
+    func runContract(sessionID: String) async throws -> RunContractView {
+        try await request(
+            method: "session.run_contract.get",
+            params: ["session_id": .string(sessionID)]
+        )
+        .decode(RunContractView.self)
+    }
+
     func sessionGates(
         sessionID: String,
         state: String? = nil,

@@ -1,12 +1,51 @@
 # VerlinPark 进度
 
-> 最后更新：2026-11-23
+> 最后更新：2026-11-24
 > 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark + task contracts/intent authorization/MCP schema pins + effect receipts/postconditions + external gates/durable waits + runtime pinning/controller replay + reliability/OTel + project-scoped identities S1–S8 + failure attribution/cascade + production hardening rounds 1–3 (ADR-0213/0214/0215) + C7 bounded fan-out (ADR-0216) + C8 tool search v2 (ADR-0217) + C9 MCP async tasks (ADR-0218) + C10 Code Mode (ADR-0219) + C11 loopback A2A (ADR-0221) + C12 advisory progress ledger (ADR-0220) + M3.1 store split 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
 
 ---
+
+## 2026-11-24 P0 tool friction + R1 Run Contract/resource observability
+
+按 ADR-0234 / `RUN_CONTRACT_AND_RESOURCE_GOVERNOR_PLAN.md` 落地第一轮。P0
+先修 live run 里最贵的工具摩擦：
+
+- `read_files` 文本现在返回完整 64 位 sha256；`edit_file`/`write_file` 对
+  truncated hash 返回明确的 `HASH_MISMATCH` + `actual_sha256` + 提示，不再
+  把“复制了显示前缀”误报成“文件被改过”。
+- 裸 Python 项目（只有 `tests/test_*.py`、没有 pyproject/pytest 配置）现在
+  会被 `project_profile` 识别为 `python3 -m unittest discover -s tests -v`，
+  不再把 `PROJECT_UNSUPPORTED` 推给 shell fallback。
+- Shell 导出 `VERLINPARK_WORKTREE` / `VERLINPARK_SCRATCH`；tool description、
+  security contract、recipes 明确“cwd 已是 worktree，不要 cd”；合同分析允许
+  写 `$VERLINPARK_SCRATCH` / `$TMPDIR`，验证 scratch 不再污染 worktree。
+- 只读 git 子命令（status/diff/log/show/rev-parse/rev-list/cat-file/ls-files/
+  ls-tree/grep/describe/blame/shortlog）即使使用绝对 `-C` checkout 也保持
+  `ReadOnly`，不再触发 host-state 审批；`clean`/`reset --hard` 仍为
+  Destructive。
+- `EFFECT_UNKNOWN` 的 integration 失败现在把 task 标记为 `blocked` 并说明
+  “operator 必须先 reconcile”，不再作为普通 failed 自动重跑；保留已验证
+  commit 与 reconcile 路径。
+
+R1 先做只读多资源观测，不改变任何 budget/approval/merge 行为：
+
+- `ResourceSnapshot`（money/raw tokens/weighted tokens/time/attention/risk/
+  context/capacity/quality/progress）、`ReadinessSnapshot`（none/dirty/
+  committed/verified/merged/partial/blocked、shippable/mergeable、commit/
+  blocker/remaining work）、`RunContractView`（profile、hard/soft targets、
+  completion reserve、attention cap、stop policy、acceptance）。
+- RPC：`session.resources`、`session.readiness`、`session.run_contract.get`；
+  CLI：`vp resources`、`vp readiness`、`vp run-contract`。
+- macOS Stage 增加只读 resource strip/card（bottleneck、readiness、5 个主维度、
+  展开后的全维度和 warnings），并增加 Swift 模型/decoder tests。
+- R1 不写入事件、不暂停/加预算/改 merge；pricing 未配置时明确显示
+  `unconfigured` 并使用 weighted tokens fallback，不伪造 `$0.00`。
+- 测试：core resource/readiness tests、daemon RPC read-only test、P0 tool/
+  permission/contract/project tests、Swift ResourceGovernorTests；完整
+  workspace/clippy 结果见 `V1_READINESS_LEDGER.md`。
 
 ## 2026-11-23 真实 DeepSeek + GUI 验证与 two hardenings
 

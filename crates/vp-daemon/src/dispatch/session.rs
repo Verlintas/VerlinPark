@@ -31,6 +31,33 @@ pub(super) async fn handle(
             }
             Err(response) => response_with_id(id, response),
         },
+        "session.resources" => {
+            match parse_params::<vp_protocol::types::SessionResourcesParams>(request.params) {
+                Ok(params) => match state.engine.session_resources(&params.session_id).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "session.readiness" => {
+            match parse_params::<vp_protocol::types::SessionReadinessParams>(request.params) {
+                Ok(params) => match state.engine.session_readiness(&params.session_id).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "session.run_contract.get" => {
+            match parse_params::<vp_protocol::types::SessionRunContractParams>(request.params) {
+                Ok(params) => match state.engine.run_contract_view(&params.session_id).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "session.effects" => match parse_params::<SessionEffectsParams>(request.params) {
             Ok(params) => {
                 let include_settled = params.include_settled.unwrap_or(true);

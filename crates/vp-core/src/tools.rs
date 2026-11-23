@@ -1434,13 +1434,23 @@ impl AgentTool for EditFile {
         if let Some(expected) = input.get("expected_sha256").and_then(Value::as_str)
             && expected != before_hash
         {
+            let truncated = expected.len() < before_hash.len() && before_hash.starts_with(expected);
             return Ok(ToolOutput::error_structured(
-                "file hash changed since it was read",
+                if truncated {
+                    "expected_sha256 is a truncated prefix, not the full content hash"
+                } else {
+                    "file hash does not match expected_sha256"
+                },
                 json!({
                     "code": "HASH_MISMATCH",
                     "path": path,
                     "expected_sha256": expected,
                     "actual_sha256": before_hash,
+                    "hint": if truncated {
+                        "Use the full 64-character sha256 from read_files/read_file, or pass actual_sha256 after re-reading; never copy the shortened display prefix."
+                    } else {
+                        "Re-read the file and pass its current full sha256 as expected_sha256."
+                    },
                 }),
             ));
         }
@@ -1545,20 +1555,34 @@ impl AgentTool for WriteFile {
             if let Some(expected) = input.get("expected_sha256").and_then(Value::as_str)
                 && expected != hash
             {
+                let truncated = expected.len() < hash.len() && hash.starts_with(expected);
                 return Ok(ToolOutput::error_structured(
-                    "file hash changed since it was read",
+                    if truncated {
+                        "expected_sha256 is a truncated prefix, not the full content hash"
+                    } else {
+                        "file hash does not match expected_sha256"
+                    },
                     json!({
                         "code": "HASH_MISMATCH",
                         "path": path,
                         "expected_sha256": expected,
                         "actual_sha256": hash,
+                        "hint": if truncated {
+                            "Use the full 64-character sha256 from read_files/read_file, or pass actual_sha256 after re-reading; never copy the shortened display prefix."
+                        } else {
+                            "Re-read the file and pass its current full sha256 as expected_sha256."
+                        },
                     }),
                 ));
             }
         } else if input.get("expected_sha256").is_some() {
             return Ok(ToolOutput::error_structured(
                 "expected_sha256 was provided but the file does not exist",
-                json!({"code": "HASH_MISMATCH", "path": path}),
+                json!({
+                    "code": "HASH_MISMATCH",
+                    "path": path,
+                    "hint": "Omit expected_sha256 when creating a new file."
+                }),
             ));
         }
         if let Some(parent) = path.parent() {
@@ -1795,6 +1819,12 @@ pub(crate) async fn sandboxed_command(context: &ToolContext) -> Result<Command> 
         .env("TMPDIR", &tmp)
         .env("TMP", &tmp)
         .env("TEMP", &tmp)
+        // Stable, documented paths for Agent commands. The shell already starts
+        // in the worktree; scratch is the only writable throwaway area outside
+        // it. Keeping the names stable avoids `cd $(git rev-parse ...)` wrappers
+        // and keeps verification copies out of the worktree diff.
+        .env("VERLINPARK_WORKTREE", &root)
+        .env("VERLINPARK_SCRATCH", &scratch)
         .env("XDG_CACHE_HOME", scratch.join("cache"))
         .env("CARGO_HOME", scratch.join("cargo"))
         .env("GOCACHE", scratch.join("go-build"))
@@ -1827,7 +1857,7 @@ impl AgentTool for Shell {
     }
 
     fn description(&self) -> &'static str {
-        "Run a non-interactive shell command in the agent worktree. Writes are confined to the worktree, its Git metadata, and runtime scratch; host-level commands may require permission."
+        "Run a non-interactive shell command in the agent worktree. The command already starts in the worktree; do not cd to the git root. Writes are confined to the worktree, its Git metadata, and runtime scratch; use $VERLINPARK_SCRATCH for throwaway verification copies, never a scratch directory inside the worktree. Host-level commands may require permission."
     }
 
     fn schema(&self) -> Value {
@@ -2557,6 +2587,67 @@ mod tests {
             .execute(&context, json!({"path": "../../etc/passwd"}))
             .await;
         assert!(error.is_err());
+    }
+
+    #[tokio::test]
+    async fn shell_exposes_the_worktree_and_scratch_paths() {
+        let (dir, context) = ctx();
+        let output = Shell
+            .execute(
+                &context,
+                json!({"command": "printf '%s\\n%s\\n' \"$VERLINPARK_WORKTREE\" \"$VERLINPARK_SCRATCH\""}),
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error, "{}", output.content);
+        let root = dir.path().canonicalize().unwrap();
+        let scratch = context.sandbox_root.canonicalize().unwrap();
+        assert!(output.content.contains(root.to_str().unwrap()));
+        assert!(output.content.contains(scratch.to_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn truncated_hash_errors_explain_the_full_hash_requirement() {
+        let (_dir, context) = ctx();
+        let full = sha256_hex(b"hello\nworld\n");
+        let truncated = &full[..12];
+
+        let edit = EditFile
+            .execute(
+                &context,
+                json!({
+                    "path": "hello.txt",
+                    "old_string": "world",
+                    "new_string": "there",
+                    "expected_sha256": truncated,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(edit.is_error);
+        let structured = edit.structured.unwrap();
+        assert_eq!(structured["code"], "HASH_MISMATCH");
+        assert_eq!(structured["actual_sha256"], full);
+        assert!(
+            structured["hint"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("full 64-character")
+        );
+
+        let write = WriteFile
+            .execute(
+                &context,
+                json!({
+                    "path": "hello.txt",
+                    "content": "replacement\n",
+                    "expected_sha256": truncated,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(write.is_error);
+        assert_eq!(write.structured.unwrap()["code"], "HASH_MISMATCH");
     }
 
     #[tokio::test]

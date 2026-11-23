@@ -764,6 +764,14 @@ pub(in crate::agent) async fn execute_team_plan(
                                 }
                             } else if success {
                                 ("completed", report.clone(), None)
+                            } else if integration_blocked_by_effect_unknown(&report) {
+                                (
+                                    "blocked",
+                                    report.clone(),
+                                    Some(
+                                        "operator must reconcile the unresolved effect receipt(s) before retrying integration",
+                                    ),
+                                )
                             } else {
                                 ("failed", report.clone(), None)
                             };
@@ -772,6 +780,9 @@ pub(in crate::agent) async fn execute_team_plan(
                                 "task_status": status,
                                 "summary": truncate(&detail),
                             });
+                            if integration_blocked_by_effect_unknown(&report) {
+                                payload["effect_blocked"] = serde_json::json!(true);
+                            }
                             if cancelled_after_finish {
                                 payload["cancel_observed"] = serde_json::json!(true);
                             }
@@ -1195,4 +1206,29 @@ pub(in crate::agent) async fn execute_team_plan(
         "Plan complete: {completed} completed, {failed} not completed."
     ));
     Ok(PlanRunResult::Done(reports.join("\n")))
+}
+
+/// An unresolved effect is a security boundary, not a normal implementation
+/// failure. Retrying it as a fresh task burns budget and cannot merge; the
+/// operator must reconcile the receipt first.
+fn integration_blocked_by_effect_unknown(report: &str) -> bool {
+    report.starts_with("merge/integration failed:") && report.contains("EFFECT_UNKNOWN")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::integration_blocked_by_effect_unknown;
+
+    #[test]
+    fn effect_unknown_integration_is_distinguished_from_a_normal_failure() {
+        assert!(integration_blocked_by_effect_unknown(
+            "merge/integration failed: EFFECT_UNKNOWN: 0 intent and 1 unknown effect receipt(s) block integration\nverdict: APPROVED"
+        ));
+        assert!(!integration_blocked_by_effect_unknown(
+            "merge/integration failed: session worktree is dirty\nverdict: APPROVED"
+        ));
+        assert!(!integration_blocked_by_effect_unknown(
+            "verification error: provider timeout"
+        ));
+    }
 }

@@ -282,3 +282,45 @@ async fn agent_inspect_and_direct_message_route_with_truthful_typed_errors() {
         "the completed run must not add a pending steering row"
     );
 }
+
+#[tokio::test]
+async fn session_resource_readiness_and_contract_rpcs_are_read_only() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("resources-rpc"))
+        .unwrap();
+    let session = store.create_session(&project.id, "resource RPCs").unwrap();
+    let engine = Engine::new(store);
+    let state = app_state(data.path(), engine.clone());
+    engine
+        .create_leader_agent(&session.id, "leader-model")
+        .await
+        .unwrap();
+    let before = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap()
+        .len();
+
+    for (method, key) in [
+        ("session.resources", "dimensions"),
+        ("session.readiness", "level"),
+        ("session.run_contract.get", "profile"),
+    ] {
+        let response = call(&state, method, json!({"session_id": session.id})).await;
+        assert!(response.error.is_none(), "{method}: {:?}", response.error);
+        let result = response.result.unwrap();
+        assert!(
+            result.get(key).is_some(),
+            "{method}: missing {key}: {result}"
+        );
+    }
+    let after = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap()
+        .len();
+    assert_eq!(before, after, "read-only RPCs must not append events");
+}

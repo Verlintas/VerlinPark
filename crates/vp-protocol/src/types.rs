@@ -3437,6 +3437,192 @@ pub struct SessionBudgetStatus {
     pub updated_at: Option<String>,
 }
 
+/// One bounded dimension of the Run Contract resource snapshot. Values are
+/// display/forecast data, not a new authority or a replacement for the usage
+/// ledger. `state` is `ok`, `watch`, `soft_limit`, `hard_limit`, or
+/// `unavailable`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResourceDimension {
+    pub key: String,
+    pub label: String,
+    pub unit: String,
+    pub used: f64,
+    #[serde(default)]
+    pub remaining: Option<f64>,
+    #[serde(default)]
+    pub soft_target: Option<f64>,
+    #[serde(default)]
+    pub hard_cap: Option<f64>,
+    #[serde(default)]
+    pub forecast_p50: Option<f64>,
+    #[serde(default)]
+    pub forecast_p90: Option<f64>,
+    pub state: String,
+    pub source: String,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResourceCount {
+    pub key: String,
+    pub count: u32,
+    #[serde(default)]
+    pub weight: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ResourceAttention {
+    pub pending: u32,
+    pub approved: u32,
+    pub denied: u32,
+    pub expired: u32,
+    /// Weighted interrupts (workspace write = 1, external = 2, host-state = 3,
+    /// destructive = 5, question/manual decision = 2).
+    pub interrupts: u32,
+    #[serde(default)]
+    pub by_risk: Vec<ResourceCount>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReadinessSnapshot {
+    pub session_id: String,
+    /// `none`, `dirty`, `committed`, `tests_passed`, `verified`, `merged`,
+    /// `partial`, or `blocked`.
+    pub level: String,
+    #[serde(default)]
+    pub shippable: bool,
+    #[serde(default)]
+    pub mergeable: bool,
+    #[serde(default)]
+    pub latest_commit: Option<String>,
+    #[serde(default)]
+    pub latest_test: Option<String>,
+    #[serde(default)]
+    pub verifier: Option<String>,
+    #[serde(default)]
+    pub merge: Option<String>,
+    #[serde(default)]
+    pub changed_paths: Vec<String>,
+    #[serde(default)]
+    pub remaining_work: Vec<String>,
+    #[serde(default)]
+    pub blockers: Vec<String>,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResourceSnapshot {
+    pub session_id: String,
+    pub generated_at: String,
+    pub profile: String,
+    #[serde(default)]
+    pub dimensions: Vec<ResourceDimension>,
+    #[serde(default)]
+    pub bottleneck: Option<String>,
+    #[serde(default)]
+    pub attention: ResourceAttention,
+    #[serde(default)]
+    pub readiness: Option<ReadinessSnapshot>,
+    #[serde(default)]
+    pub forecast: Option<BudgetForecast>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub sample_calls: u32,
+    #[serde(default)]
+    pub pricing_source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResourceSoftTargets {
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
+    #[serde(default)]
+    pub time_secs: Option<u64>,
+    #[serde(default)]
+    pub attention: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunStopPolicy {
+    #[serde(default = "default_run_require_evidence")]
+    pub require_evidence: bool,
+    #[serde(default = "default_run_no_progress_turns")]
+    pub no_progress_turns: u32,
+    #[serde(default = "default_run_marginal_value_ratio")]
+    pub marginal_value_ratio: f64,
+    #[serde(default = "default_run_partial_delivery")]
+    pub partial_delivery: bool,
+}
+
+fn default_run_require_evidence() -> bool {
+    true
+}
+
+fn default_run_no_progress_turns() -> u32 {
+    6
+}
+
+fn default_run_marginal_value_ratio() -> f64 {
+    0.20
+}
+
+fn default_run_partial_delivery() -> bool {
+    true
+}
+
+impl Default for RunStopPolicy {
+    fn default() -> Self {
+        Self {
+            require_evidence: default_run_require_evidence(),
+            no_progress_turns: default_run_no_progress_turns(),
+            marginal_value_ratio: default_run_marginal_value_ratio(),
+            partial_delivery: default_run_partial_delivery(),
+        }
+    }
+}
+
+/// Derived, read-only view of the run contract. R1 does not persist overrides;
+/// the effective values come from the session budget, plan, approval mode, and
+/// project policies.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunContractView {
+    pub session_id: String,
+    pub project_id: String,
+    pub profile: String,
+    pub source: String,
+    pub goal: String,
+    #[serde(default)]
+    pub acceptance: Vec<String>,
+    pub risk_ceiling: String,
+    pub autonomy: String,
+    #[serde(default)]
+    pub hard_caps: AutoBudgetCaps,
+    pub soft_targets: ResourceSoftTargets,
+    pub completion_reserve_ratio: f64,
+    pub attention_cap: u32,
+    pub stop_policy: RunStopPolicy,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionResourcesParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionReadinessParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionRunContractParams {
+    pub session_id: String,
+}
+
 /// One atomic auto-budget extension request. Requested values are additional
 /// amounts; the store uses the larger of the policy's extension step and the
 /// caller's request, then clamps to the hard cap and never below spend.

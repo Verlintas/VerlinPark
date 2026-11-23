@@ -299,7 +299,10 @@ pub(crate) async fn run_command(
         | Command::CitationAudit { .. }
         | Command::Citations { .. }
         | Command::Transcript { .. }
-        | Command::Usage { .. } => session::dispatch(command, discovery, json).await,
+        | Command::Usage { .. }
+        | Command::Resources { .. }
+        | Command::Readiness { .. }
+        | Command::RunContract { .. } => session::dispatch(command, discovery, json).await,
         Command::Scheduler { .. }
         | Command::Programs { .. }
         | Command::ProgramStatus { .. }

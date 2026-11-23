@@ -179,6 +179,9 @@ final class AppModel {
     var governorStatus: GovernorSessionStatus?
     var governorStatusMessage: String?
     var sessionBudgetStatus: SessionBudgetStatus?
+    var sessionResources: ResourceSnapshotView?
+    var sessionResourcesError: String?
+    var sessionResourcesBusy = false
     var sessionBudgetBusy = false
     var sessionBudgetError: BudgetValidationIssue?
     var sessionBudgetStatusMessage: String?
@@ -991,6 +994,9 @@ final class AppModel {
         sessionBudgetBusy = false
         sessionBudgetError = nil
         sessionBudgetStatusMessage = nil
+        sessionResources = nil
+        sessionResourcesError = nil
+        sessionResourcesBusy = false
         sessionCacheStatus = nil
         sessionCacheCalls = []
         sessionCacheCallsTruncated = false
@@ -1501,6 +1507,7 @@ final class AppModel {
             await loadEvents()
             await loadEfficiency()
             await loadSessionBudget()
+            await loadSessionResources(silent: true)
             await loadCheckpoints()
             await loadLineage()
             await loadTodos()
@@ -4597,6 +4604,35 @@ final class AppModel {
             guard isCurrent(sessionID: sessionID, generation: generation) else { return }
             sessionBudgetError = BudgetValidationIssue.from(error)
             sessionBudgetStatusMessage = sessionBudgetError?.displayText
+        }
+    }
+
+    /// Read-only Run Contract/resource snapshot. It is refreshed on selection
+    /// and on explicit refresh, never in a polling loop.
+    func loadSessionResources(silent: Bool = false) async {
+        guard let sessionID = selectedSessionID else {
+            sessionResources = nil
+            sessionResourcesError = nil
+            sessionResourcesBusy = false
+            return
+        }
+        let generation = selectionGeneration
+        if !silent {
+            sessionResourcesBusy = true
+        }
+        defer {
+            if isCurrent(sessionID: sessionID, generation: generation) {
+                sessionResourcesBusy = false
+            }
+        }
+        do {
+            let snapshot = try await core.sessionResources(sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            sessionResources = snapshot
+            sessionResourcesError = nil
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            sessionResourcesError = error.localizedDescription
         }
     }
 

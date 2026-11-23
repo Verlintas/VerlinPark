@@ -1263,6 +1263,50 @@ fn assess_cargo(args: &[String]) -> PermissionAssessment {
 }
 
 fn assess_git(args: &[String], cwd: &Path, worktree: &Path) -> PermissionAssessment {
+    // Read-only inspection is read-only even when `-C` names another checkout
+    // (the Verifier uses an absolute isolated clone). The shell read policy and
+    // Seatbelt profile, not the approval risk tier, are the read boundary.
+    let mut scan = 0;
+    while scan < args.len() {
+        let arg = &args[scan];
+        if arg == "-C" || arg == "--git-dir" || arg == "--work-tree" || arg == "-c" {
+            scan += 2;
+            continue;
+        }
+        if arg.starts_with("--git-dir=") || arg.starts_with("--work-tree=") {
+            scan += 1;
+            continue;
+        }
+        break;
+    }
+    let scanned_subcommand = args.get(scan).map(String::as_str).unwrap_or_default();
+    if matches!(
+        scanned_subcommand,
+        "status"
+            | "diff"
+            | "log"
+            | "show"
+            | "rev-parse"
+            | "rev-list"
+            | "cat-file"
+            | "ls-files"
+            | "ls-tree"
+            | "grep"
+            | "describe"
+            | "blame"
+            | "shortlog"
+    ) {
+        return PermissionAssessment::new(RiskLevel::ReadOnly, "Git inspection");
+    }
+    if scanned_subcommand == "clean"
+        || (scanned_subcommand == "reset" && args.iter().any(|arg| arg == "--hard"))
+    {
+        return PermissionAssessment::new(
+            RiskLevel::Destructive,
+            "Git operation deletes or discards workspace changes",
+        );
+    }
+
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
@@ -2072,6 +2116,16 @@ mod tests {
             "pwd; git -C . log --oneline -3; git -C . status --porcelain -uall; git -C . diff --stat HEAD",
         );
         assert!(assessment.risk < RiskLevel::HostState, "{assessment:?}");
+    }
+
+    #[test]
+    fn read_only_git_inspection_of_an_absolute_checkout_is_not_host_state() {
+        let assessment = shell(
+            "git -C /private/tmp/verify-commit status --porcelain; git -C /private/tmp/verify-commit log --oneline -3; git -C /private/tmp/verify-commit rev-parse HEAD",
+        );
+        assert_eq!(assessment.risk, RiskLevel::ReadOnly, "{assessment:?}");
+        let destructive = shell("git -C /private/tmp/verify-commit clean -fdx");
+        assert_eq!(destructive.risk, RiskLevel::Destructive, "{destructive:?}");
     }
 
     #[test]

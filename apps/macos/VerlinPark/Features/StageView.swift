@@ -91,6 +91,12 @@ private struct ProjectStageView: View {
                 .padding(.vertical, 7)
                 VPHairline()
             }
+            if let resources = model.sessionResources {
+                StageResourceCard(resources: resources)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 6)
+                VPHairline()
+            }
             if let session = model.selectedSession,
                let preemption = model.sessionPreemption,
                preemption.preempted,

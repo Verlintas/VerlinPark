@@ -2,7 +2,9 @@
 
 - Status: Final plan; implementation in progress. Collab Agent
   Inspector/Direct Channel implemented (2026-11-22) and live-provider exercised
-  (2026-11-23). Open findings and live evidence are tracked in
+  (2026-11-23). Run Contract/resource observability R1 and the P0 tool-friction
+  fixes are implemented (2026-11-24); the R2 governor/attention phase is still
+  open. Open findings and live evidence are tracked in
   [V1_READINESS_LEDGER.md](V1_READINESS_LEDGER.md).
 - Date: 2026-11-22 (live validation update 2026-11-23)
 - Owner: Verlintas

@@ -2721,6 +2721,12 @@ pub(crate) enum Command {
         #[arg(long)]
         csv: bool,
     },
+    /// Show the derived multi-resource Run Contract snapshot.
+    Resources { session: String },
+    /// Show the current shippable/mergeable readiness level.
+    Readiness { session: String },
+    /// Show the derived Run Contract envelope.
+    RunContract { session: String },
     /// Show session cache-read telemetry and the prompt-prefix generation.
     Cache { session: String },
     /// Show the finalized stable cache epoch, cross-session reuse, and the
