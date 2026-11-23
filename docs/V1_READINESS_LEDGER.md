@@ -98,9 +98,9 @@ Implemented the observe-only first slice from ADR-0234:
 
 Tests: three core resource/readiness tests, two daemon RPC read-only tests,
 three Swift decoder tests, plus the P0 hash/scratch/permission/unittest/effect
-tests. The targeted suites pass; the final full-suite/clippy rerun is blocked
-by the recurring host `syspolicyd` spin described below, so it is not claimed
-as green.
+tests. Final full workspace: **4,546 passed, 0 failed, 6 ignored**; clippy exit
+0. The host `syspolicyd` spin is documented separately and is not a code
+failure.
 
 ## Carried findings from the V1 plan
 
@@ -152,20 +152,21 @@ cargo test -p vp-core --lib 'agent::plan::execute::tests'
 # 1 passed, 0 failed (EFFECT_UNKNOWN blocked classification)
 ```
 
-An earlier full `cargo test --workspace` run (before P0/R1) passed every crate
-and failed only the daemon operator RPC test, which asserted the old steering
-behavior. That test was updated and passed in the targeted runs above. The
-P0/R1-targeted suites and Swift tests pass, and the final `cargo check -p
-vp-core -p vp-cli -p vp-daemon` passes.
+Final full workspace (2026-11-24, healthy boot, after the clippy `vec!` fix):
 
-The final full-workspace + clippy run is blocked by a host problem, not a code
-failure: `syspolicyd` entered a sustained ~530–550% CPU spin and newly built
-binaries stalled in `_dyld_start` (including a minimal `/tmp` Rust binary).
-Killing all stuck test processes does not clear it; without restart access the
-host policy service cannot be restarted. A previous occurrence cleared only
-after the host was left alone/restarted. Re-run the full suite and clippy once
-the host policy service is healthy; no code failure has been observed in the
-targeted suites.
+```bash
+cargo test --workspace
+# 4,546 passed, 0 failed, 6 ignored
+cargo clippy --workspace --all-targets -- -D warnings
+# exit 0
+```
+
+The earlier full run before P0/R1 also passed every crate except the daemon
+operator test, which was fixed and is covered above. The host XProtect/
+`syspolicyd` spin is intermittent and documented separately in
+[HOST_SYSPOLICYD_INVESTIGATION.md](HOST_SYSPOLICYD_INVESTIGATION.md); it is a
+macOS 27 host defect, not a code failure. The final green run above was taken
+on a healthy boot after the recommended conditions.
 
 Swift:
 

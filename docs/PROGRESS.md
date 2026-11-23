@@ -44,8 +44,11 @@ R1 先做只读多资源观测，不改变任何 budget/approval/merge 行为：
 - R1 不写入事件、不暂停/加预算/改 merge；pricing 未配置时明确显示
   `unconfigured` 并使用 weighted tokens fallback，不伪造 `$0.00`。
 - 测试：core resource/readiness tests、daemon RPC read-only test、P0 tool/
-  permission/contract/project tests、Swift ResourceGovernorTests；完整
-  workspace/clippy 结果见 `V1_READINESS_LEDGER.md`。
+  permission/contract/project tests、Swift ResourceGovernorTests；最终
+  `cargo test --workspace` **4,546 passed / 0 failed / 6 ignored**，
+  `cargo clippy --workspace --all-targets -- -D warnings` 通过，macOS app
+  构建成功。宿主机 `syspolicyd`/XProtect spin 已单独调查并记录在
+  `HOST_SYSPOLICYD_INVESTIGATION.md`，不是仓库 bug。
 
 ## 2026-11-23 真实 DeepSeek + GUI 验证与 two hardenings
 

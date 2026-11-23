@@ -205,28 +205,29 @@ impl Engine {
             0.0
         };
 
-        let mut dimensions = Vec::new();
-        dimensions.push(resource_money(&budget, cost, pricing_source));
-        dimensions.push(resource_tokens(
-            "tokens",
-            "Raw tokens",
-            raw_tokens as f64,
-            budget.remaining_tokens,
-            budget.hard_token_cap.or(budget.effective_token_budget),
-            "usage_ledger",
-            "Cumulative input + output tokens; includes cache-read/write subsets.",
-        ));
-        dimensions.push(resource_tokens(
-            "weighted_tokens",
-            "Weighted tokens",
-            weighted_tokens,
-            None,
-            None,
-            "usage_ledger",
-            "Cache-aware equivalent (cache read 0.1x, cache write 1.25x, output 1x). Not a hard cap.",
-        ));
-        dimensions.push(resource_time(&budget));
-        dimensions.push(resource_attention_dim(&attention, 20));
+        let mut dimensions = vec![
+            resource_money(&budget, cost, pricing_source),
+            resource_tokens(
+                "tokens",
+                "Raw tokens",
+                raw_tokens as f64,
+                budget.remaining_tokens,
+                budget.hard_token_cap.or(budget.effective_token_budget),
+                "usage_ledger",
+                "Cumulative input + output tokens; includes cache-read/write subsets.",
+            ),
+            resource_tokens(
+                "weighted_tokens",
+                "Weighted tokens",
+                weighted_tokens,
+                None,
+                None,
+                "usage_ledger",
+                "Cache-aware equivalent (cache read 0.1x, cache write 1.25x, output 1x). Not a hard cap.",
+            ),
+            resource_time(&budget),
+            resource_attention_dim(&attention, 20),
+        ];
         let risk_state = if effects.blocked {
             "hard_limit"
         } else if risk_used > 0 {
