@@ -5714,6 +5714,27 @@ final class AppModel {
         let baseURL = providerBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         let model = providerModel.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !baseURL.isEmpty, !model.isEmpty else { return false }
+        guard let info = agentInfo else {
+            providerStatus =
+                "The daemon provider state could not be read; saved client provider settings were not applied."
+            return false
+        }
+        if !ProviderSyncRules.shouldApplyOnConnect(
+            daemonConfigured: info.configured,
+            kind: providerKind,
+            baseURL: baseURL,
+            model: model,
+            daemonProvider: info.provider,
+            daemonBaseURL: info.baseUrl,
+            daemonModel: info.model
+        ) {
+            // The daemon was configured outside this client. Reconnect must
+            // not overwrite it with stale local defaults; saving Settings is
+            // the explicit replacement path.
+            providerStatus =
+                "The daemon is already configured with \(info.provider ?? "another provider") · \(info.model ?? "unknown model"). Saved client provider settings were left unchanged; save provider settings to replace it."
+            return false
+        }
         let apiKey: String
         switch resolveProviderCredential() {
         case let .key(key):

@@ -164,10 +164,42 @@ async fn agent_inspect_and_direct_message_route_with_truthful_typed_errors() {
     assert_eq!(persisted.messages.len(), 1);
 
     // A running Agent uses steering, and the same operation id replays the
-    // first result instead of creating a duplicate steering row.
+    // first result instead of creating a duplicate steering row. The route
+    // requires a live durable run, not only the agent status projection.
     engine
         .update_agent_status(&leader, "running")
         .await
+        .unwrap();
+    let run_id = "operator-rpc-run".to_string();
+    let now = now_rfc3339();
+    store
+        .start_session_run(&vp_protocol::types::SessionRun {
+            run_id: run_id.clone(),
+            session_id: session.id.clone(),
+            project_id: project.id.clone(),
+            agent_id: leader.clone(),
+            agent_name: "Leader".into(),
+            agent_role: "leader".into(),
+            task_id: None,
+            department: None,
+            objective: "operator RPC".into(),
+            provider: "test".into(),
+            model: "leader-model".into(),
+            status: "running".into(),
+            attempt: 1,
+            resumed_from_run_id: None,
+            resume_root_id: run_id.clone(),
+            top_level: true,
+            started_at: now.clone(),
+            updated_at: now,
+            ended_at: None,
+            budget: Default::default(),
+            worktree_head: String::new(),
+            plan_revision: 0,
+            runtime_snapshot: None,
+            last_event_seq: 0,
+            failure: None,
+        })
         .unwrap();
     let task_mismatch = call(
         &state,
@@ -215,4 +247,38 @@ async fn agent_inspect_and_direct_message_route_with_truthful_typed_errors() {
         .unwrap();
     assert_eq!(steering.steering.len(), 1);
     assert_eq!(steering.steering[0].id, steering_id);
+
+    // A stale `running` row after the durable run ended must not accept a
+    // second undeliverable steering message.
+    store
+        .finish_session_run(&run_id, "completed", None)
+        .unwrap();
+    let after_run = call(
+        &state,
+        "agent.message.send",
+        json!({
+            "session_id": session.id,
+            "agent_id": leader,
+            "body": "this run already ended",
+        }),
+    )
+    .await;
+    let error = after_run
+        .error
+        .expect("completed run must not accept steering");
+    assert_eq!(error.code, codes::CONFLICT);
+    assert_eq!(
+        error.data.expect("typed not-active data")["code"],
+        "AGENT_NOT_ACTIVE"
+    );
+    assert_eq!(
+        engine
+            .session_steering(&session.id, None, None)
+            .await
+            .unwrap()
+            .steering
+            .len(),
+        1,
+        "the completed run must not add a pending steering row"
+    );
 }

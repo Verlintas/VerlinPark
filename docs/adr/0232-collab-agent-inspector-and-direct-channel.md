@@ -370,6 +370,31 @@ Required scenarios:
    not treat it as evidence; imported sessions remain inspectable but cannot
    send.
 
+### Post-implementation hardening (2026-11-23)
+
+Live-provider GUI testing found that an Agent row can stay `running` after its
+durable provider run has already completed: a plan Worker is held `running`
+while its task is committed, verified, and merged. `agent.message.send` used to
+trust that row status and queue steering that no future provider boundary could
+consume; the row stayed `pending` forever.
+
+The shared steering path (`session.steer` / `vp steer`, used by
+`agent.message.send`) now requires a live durable run
+(`session_runs.status = 'running'` and `ended_at IS NULL`) for the target
+Agent, in addition to `running`/`waiting_input` agent status. A stale running
+row without a live run is rejected by `session.steer`; the direct-message route
+treats it as inactive: an identity Agent receives the durable inbox message,
+and an ephemeral Agent fails with typed `AGENT_NOT_ACTIVE`. Regression tests
+cover the live-run steering path, completed-run stale status at the engine and
+daemon RPC layers, and the completed-run identity inbox. The run-end steering
+cancellation remains unchanged; this closes the post-run creation gap.
+
+Live evidence: a real DeepSeek `deepseek-flash` team run delivered operator
+steering to a running Labour (`pending` → `delivered`) and showed the truthful
+idle-ephemeral `AGENT_NOT_ACTIVE` state in the macOS Messages tab. A separate
+one-task run reached Worker → Labour → Verifier → merge queue → deterministic
+Integrator with a clean session branch and passing tests.
+
 The final counts are recorded above. The index, inspect, live-send, idle-identity,
 ephemeral `AGENT_NOT_ACTIVE`, authority, Swift, and persistence scenarios are
 covered by the store/core/daemon/CLI and Swift tests; the manual macOS GUI smoke

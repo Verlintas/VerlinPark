@@ -364,6 +364,75 @@ final class RuntimeReliabilityTests: XCTestCase {
         XCTAssertEqual(store.readCount, 0)
     }
 
+    func testProviderSyncAppliesToUnconfiguredDaemon() {
+        XCTAssertTrue(
+            ProviderSyncRules.shouldApplyOnConnect(
+                daemonConfigured: false,
+                kind: "openai-compatible",
+                baseURL: "http://127.0.0.1:11434/v1",
+                model: "qwen2.5-coder",
+                daemonProvider: nil,
+                daemonBaseURL: nil,
+                daemonModel: nil
+            )
+        )
+    }
+
+    func testProviderSyncReappliesTheSameProviderIdempotently() {
+        XCTAssertTrue(
+            ProviderSyncRules.shouldApplyOnConnect(
+                daemonConfigured: true,
+                kind: "openai-compatible",
+                baseURL: "https://api.deepseek.com/",
+                model: "deepseek-flash",
+                daemonProvider: "openai-compatible",
+                daemonBaseURL: "https://api.deepseek.com",
+                daemonModel: "deepseek-flash"
+            ),
+            "a matching provider may be re-applied to refresh caps, mode, and the stored key"
+        )
+    }
+
+    func testProviderSyncDoesNotOverwriteAManualDaemonProvider() {
+        XCTAssertFalse(
+            ProviderSyncRules.shouldApplyOnConnect(
+                daemonConfigured: true,
+                kind: "openai-compatible",
+                baseURL: "http://127.0.0.1:11434/v1",
+                model: "qwen2.5-coder",
+                daemonProvider: "openai-compatible",
+                daemonBaseURL: "https://api.deepseek.com",
+                daemonModel: "deepseek-flash"
+            ),
+            "a reconnect must not replace a daemon provider configured outside this client"
+        )
+        XCTAssertFalse(
+            ProviderSyncRules.matchesDaemon(
+                kind: "openai-compatible",
+                baseURL: "https://api.deepseek.com",
+                model: "deepseek-flash",
+                daemonProvider: "openai-compatible",
+                daemonBaseURL: "https://api.deepseek.com",
+                daemonModel: "deepseek-v4-pro"
+            )
+        )
+    }
+
+    func testProviderSyncFailsClosedWhenDaemonIdentityIsIncomplete() {
+        XCTAssertFalse(
+            ProviderSyncRules.shouldApplyOnConnect(
+                daemonConfigured: true,
+                kind: "openai-compatible",
+                baseURL: "https://api.deepseek.com",
+                model: "deepseek-flash",
+                daemonProvider: nil,
+                daemonBaseURL: nil,
+                daemonModel: nil
+            ),
+            "missing daemon provider metadata must not authorize an overwrite"
+        )
+    }
+
     @MainActor
     func testKeychainSaveFailureAbortsBeforeDaemonConfigure() async {
         let store = FakeSecretStore(values: [:])

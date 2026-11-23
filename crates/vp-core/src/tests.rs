@@ -22,6 +22,42 @@ fn init_repo(path: &Path) {
     }
 }
 
+fn start_live_run(engine: &Engine, session: &Session, agent_id: &str) -> String {
+    let run_id = uuid::Uuid::now_v7().to_string();
+    let now = vp_protocol::now_rfc3339();
+    engine
+        .store()
+        .start_session_run(&vp_protocol::types::SessionRun {
+            run_id: run_id.clone(),
+            session_id: session.id.clone(),
+            project_id: session.project_id.clone(),
+            agent_id: agent_id.to_string(),
+            agent_name: "Leader".into(),
+            agent_role: "leader".into(),
+            task_id: None,
+            department: None,
+            objective: "steering test".into(),
+            provider: "test".into(),
+            model: "test-model".into(),
+            status: "running".into(),
+            attempt: 1,
+            resumed_from_run_id: None,
+            resume_root_id: run_id.clone(),
+            top_level: true,
+            started_at: now.clone(),
+            updated_at: now,
+            ended_at: None,
+            budget: Default::default(),
+            worktree_head: String::new(),
+            plan_revision: 0,
+            runtime_snapshot: None,
+            last_event_seq: 0,
+            failure: None,
+        })
+        .unwrap();
+    run_id
+}
+
 #[tokio::test]
 async fn searches_sessions_and_validates_the_query() {
     let data = TempDir::new().unwrap();
@@ -5618,6 +5654,7 @@ async fn steering_targets_a_running_leader_orders_and_replays() {
         .update_agent_status(&leader_id, "running")
         .await
         .unwrap();
+    start_live_run(&engine, &session, &leader_id);
 
     let first = engine
         .steer_session(&session.id, "first instruction", None, None, None)
@@ -5730,6 +5767,7 @@ async fn steering_rejects_wrong_targets_scopes_tasks_and_cleans_up_runs() {
         .update_agent_status(&leader_id, "running")
         .await
         .unwrap();
+    start_live_run(&engine, &session, &leader_id);
     let worker = engine
         .create_agent(&session.id, "worker", "Worker One", None, None, "test")
         .await
@@ -5742,6 +5780,7 @@ async fn steering_rejects_wrong_targets_scopes_tasks_and_cleans_up_runs() {
         .update_agent_status(&worker.id, "running")
         .await
         .unwrap();
+    start_live_run(&engine, &session, &worker.id);
     engine
         .set_team_plan(&session.id, &orchestration_test_plan())
         .await
@@ -10298,6 +10337,7 @@ async fn steering_operation_replays_and_retries_after_failure() {
         .update_agent_status(&leader_id, "running")
         .await
         .unwrap();
+    start_live_run(&engine, &session, &leader_id);
     let first = engine
         .steer_session(
             &session.id,

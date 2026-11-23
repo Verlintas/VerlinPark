@@ -1,8 +1,10 @@
 # VerlinPark V1 最终计划
 
 - Status: Final plan; implementation in progress. Collab Agent
-  Inspector/Direct Channel implemented and verified (2026-11-22).
-- Date: 2026-11-22
+  Inspector/Direct Channel implemented (2026-11-22) and live-provider exercised
+  (2026-11-23). Open findings and live evidence are tracked in
+  [V1_READINESS_LEDGER.md](V1_READINESS_LEDGER.md).
+- Date: 2026-11-22 (live validation update 2026-11-23)
 - Owner: Verlintas
 - Scope: **single-project coding ADE**
 - Primary use: the owner's own development of a large, complex project
@@ -369,6 +371,24 @@ The owner must run these on the real target project before V1 is accepted.
      queued/pending states and no fake instant reply.
    - Verify redaction/bounds, unread badges, cross-session rejection, and that a
      message cannot approve an approval or bypass a gate.
+
+### 7.1 Live validation update (2026-11-23)
+
+Real DeepSeek `deepseek-flash` runs were executed in a temporary data
+directory. A one-task run completed Worker → Labour → Verifier → merge queue →
+deterministic Integrator, merged `c7244f7`, and passed the integration test
+command. A three-task run failed honestly at its 2M token budget before
+verification. A second one-task run hit `EFFECT_UNKNOWN` from an unprobed raw
+shell commit, was separately verified, and failed at its 1.5M budget during
+recovery after the operator reconciled the receipt.
+
+The live round found and closed two V1 bugs: steering could be queued to an
+Agent whose durable run had already ended (stale `running` row), and an app
+reconnect could overwrite a daemon provider configured outside the client with
+stale local defaults. Both have regression tests; the provider fix has a live
+daemon check. Remaining findings, including the effect-reconciliation recovery
+cost and the missing live GUI running-Worker send, are listed in
+[V1_READINESS_LEDGER.md](V1_READINESS_LEDGER.md).
 
 ## 8. Phase plan
 

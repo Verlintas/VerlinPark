@@ -235,7 +235,8 @@
 | [0229](adr/0229-live-provider-and-budget-estimation.md) | Live provider compatibility: omit empty `tool_calls`, context-aware budget preflight with 25% headroom, validate DeepSeek streaming and full agent flow | Accepted | Providers/Reliability |
 | [0230](adr/0230-reliability-hardening-round.md) | Reliability hardening: persisted approval preview, cross-session ownership, non-consuming journal replay, plan/replay guards, manifest v2, provider finish reasons, CLI policy patches, GUI in-flight lease, Swift reconnect/gap handling | Accepted | Reliability/Security |
 | [0231](adr/0231-auto-budget-and-adaptive-tooling.md) | Auto budget and adaptive tooling: fixed/auto/unlimited, deterministic extension/forecast/pause, cumulative wall clock, no-progress evidence, program reservations, capability gates and orchestrator bundle | Accepted | Runtime/Budget/Tooling |
-| [0232](adr/0232-collab-agent-inspector-and-direct-channel.md) | Collab Agent Inspector + direct operator channel: bounded `agent.inspect`, agent-scoped event index, `agent.message.send` routing through steering/inbox with typed `AGENT_NOT_ACTIVE`, bounded/redacted Context/Conversation | Accepted (2026-11-22) | UI/Observability/Runtime |
+| [0232](adr/0232-collab-agent-inspector-and-direct-channel.md) | Collab Agent Inspector + direct operator channel: bounded `agent.inspect`, agent-scoped event index, `agent.message.send` routing through steering/inbox with typed `AGENT_NOT_ACTIVE`, bounded/redacted Context/Conversation; steering now requires a live durable run | Accepted (2026-11-22, hardened 2026-11-23) | UI/Observability/Runtime |
+| [0233](adr/0233-non-destructive-provider-reconnect.md) | Non-destructive provider reconnect: apply stored client provider only when the daemon is unconfigured or the provider identity matches; a mismatch requires an explicit Settings save | Accepted (2026-11-23) | Client/Provider/Data safety |
 
 ---
 

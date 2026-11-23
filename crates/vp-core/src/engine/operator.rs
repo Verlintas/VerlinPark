@@ -155,7 +155,20 @@ impl Engine {
             }
         }
 
-        if matches!(target.status.as_str(), "running" | "waiting_input") {
+        // Agent status can lag behind the durable run: a plan Worker row stays
+        // `running` while its task is verified/merged after the provider run
+        // already returned. Queuing steering then would leave a pending row
+        // that no future provider boundary can consume. Require a live run.
+        let store = self.store.clone();
+        let run_session = session_id.to_string();
+        let run_agent = target.id.clone();
+        let has_live_run =
+            tokio::task::spawn_blocking(move || store.has_live_agent_run(&run_session, &run_agent))
+                .await??;
+        let accepts_steering =
+            has_live_run && matches!(target.status.as_str(), "running" | "waiting_input");
+
+        if accepts_steering {
             // Existing cooperative steering path. Delivery happens at the
             // target run's next provider boundary and is cancelled if the run
             // ends first; this router must not claim instant delivery.
@@ -184,7 +197,7 @@ impl Engine {
             return Err(operator_error(
                 agent_operator_codes::AGENT_NOT_ACTIVE,
                 format!(
-                    "agent {} is {} and has no persisted project identity, so it cannot receive a durable inbox message; start or retry its task, then message it while it is running",
+                    "agent {} is not actively running (agent status {}, no live durable run) and has no persisted project identity, so it cannot receive a durable inbox message; start or retry its task, then message it while it is running",
                     target.id, target.status
                 ),
             ));
@@ -290,7 +303,8 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
     use vp_protocol::types::{
-        AgentInboxListParams, CreateAgentIdentityParams, PlanDepartment, PlanTask, TeamPlan,
+        AgentInboxListParams, CreateAgentIdentityParams, PlanDepartment, PlanTask, SessionRun,
+        TeamPlan,
     };
 
     fn setup() -> (TempDir, TempDir, Engine, Project, Session) {
@@ -319,6 +333,42 @@ mod tests {
             .into_iter()
             .find(|agent| agent.id == id)
             .expect("leader row")
+    }
+
+    fn start_live_run(engine: &Engine, session: &Session, agent_id: &str) -> String {
+        let run_id = uuid::Uuid::now_v7().to_string();
+        let now = vp_protocol::now_rfc3339();
+        engine
+            .store()
+            .start_session_run(&SessionRun {
+                run_id: run_id.clone(),
+                session_id: session.id.clone(),
+                project_id: session.project_id.clone(),
+                agent_id: agent_id.to_string(),
+                agent_name: "Leader".into(),
+                agent_role: "leader".into(),
+                task_id: None,
+                department: None,
+                objective: "operator steering".into(),
+                provider: "test".into(),
+                model: "test-model".into(),
+                status: "running".into(),
+                attempt: 1,
+                resumed_from_run_id: None,
+                resume_root_id: run_id.clone(),
+                top_level: true,
+                started_at: now.clone(),
+                updated_at: now,
+                ended_at: None,
+                budget: Default::default(),
+                worktree_head: String::new(),
+                plan_revision: 0,
+                runtime_snapshot: None,
+                last_event_seq: 0,
+                failure: None,
+            })
+            .unwrap();
+        run_id
     }
 
     fn code_of(error: &anyhow::Error) -> Option<&'static str> {
@@ -365,6 +415,7 @@ mod tests {
             .update_agent_status(&agent.id, "running")
             .await
             .unwrap();
+        start_live_run(&engine, &session, &agent.id);
 
         let params = AgentMessageSendParams {
             session_id: session.id.clone(),
@@ -405,6 +456,95 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.steering.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn completed_run_does_not_accept_steering_from_a_stale_running_status() {
+        let (_data, _repo, engine, _project, session) = setup();
+        let agent = leader(&engine, &session).await;
+        engine
+            .update_agent_status(&agent.id, "running")
+            .await
+            .unwrap();
+        let run_id = start_live_run(&engine, &session, &agent.id);
+        engine
+            .store()
+            .finish_session_run(&run_id, "completed", None)
+            .unwrap();
+
+        let error = engine
+            .send_agent_operator_message(AgentMessageSendParams {
+                session_id: session.id.clone(),
+                agent_id: agent.id,
+                body: "this run already ended".into(),
+                ..AgentMessageSendParams::default()
+            })
+            .await
+            .expect_err("a completed run must not accept steering");
+        assert_eq!(
+            code_of(&error),
+            Some(agent_operator_codes::AGENT_NOT_ACTIVE)
+        );
+        assert!(
+            engine
+                .session_steering(&session.id, None, None)
+                .await
+                .unwrap()
+                .steering
+                .is_empty(),
+            "no pending steering may be left behind for a finished run"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_run_identity_agent_uses_the_inbox() {
+        let (_data, _repo, engine, project, session) = setup();
+        let agent = leader(&engine, &session).await;
+        let identity = engine
+            .create_agent_identity(CreateAgentIdentityParams {
+                project_id: project.id.clone(),
+                role: "worker".into(),
+                department: Some("impl".into()),
+                title: Some("Implementation".into()),
+                profile: Some("coding".into()),
+                ..CreateAgentIdentityParams::default()
+            })
+            .await
+            .expect("identity")
+            .identity;
+        engine
+            .set_agent_identity_binding(&agent.id, Some(&identity.id))
+            .await
+            .unwrap();
+        engine
+            .update_agent_status(&agent.id, "running")
+            .await
+            .unwrap();
+        let run_id = start_live_run(&engine, &session, &agent.id);
+        engine
+            .store()
+            .finish_session_run(&run_id, "completed", None)
+            .unwrap();
+
+        let result = engine
+            .send_agent_operator_message(AgentMessageSendParams {
+                session_id: session.id.clone(),
+                agent_id: agent.id,
+                body: "read this after the run".into(),
+                ..AgentMessageSendParams::default()
+            })
+            .await
+            .expect("identity inbox route");
+        assert_eq!(result.delivery.kind, "inbox");
+        assert_eq!(result.delivery.status, "unread");
+        assert!(
+            engine
+                .session_steering(&session.id, None, None)
+                .await
+                .unwrap()
+                .steering
+                .is_empty()
+        );
     }
 
     #[tokio::test]

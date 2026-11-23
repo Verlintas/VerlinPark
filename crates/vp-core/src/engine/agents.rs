@@ -1880,6 +1880,42 @@ mod inspector_tests {
         }
     }
 
+    fn start_live_run(engine: &Engine, session: &Session, agent_id: &str) -> String {
+        let run_id = uuid::Uuid::now_v7().to_string();
+        let now = vp_protocol::now_rfc3339();
+        engine
+            .store()
+            .start_session_run(&vp_protocol::types::SessionRun {
+                run_id: run_id.clone(),
+                session_id: session.id.clone(),
+                project_id: session.project_id.clone(),
+                agent_id: agent_id.to_string(),
+                agent_name: "Worker".into(),
+                agent_role: "worker".into(),
+                task_id: Some("T1".into()),
+                department: Some("impl".into()),
+                objective: "inspector steering".into(),
+                provider: "test".into(),
+                model: "worker-model".into(),
+                status: "running".into(),
+                attempt: 1,
+                resumed_from_run_id: None,
+                resume_root_id: run_id.clone(),
+                top_level: false,
+                started_at: now.clone(),
+                updated_at: now,
+                ended_at: None,
+                budget: Default::default(),
+                worktree_head: String::new(),
+                plan_revision: 0,
+                runtime_snapshot: None,
+                last_event_seq: 0,
+                failure: None,
+            })
+            .unwrap();
+        run_id
+    }
+
     async fn worker_fixture(engine: &Engine, session: &Session) -> AgentRecord {
         let leader = engine
             .create_leader_agent(&session.id, "leader-model")
@@ -2378,6 +2414,7 @@ mod inspector_tests {
             .set_agent_identity_binding(&worker.id, Some(&identity.id))
             .await
             .unwrap();
+        start_live_run(&engine, &session, &worker.id);
         engine
             .steer_session(
                 &session.id,

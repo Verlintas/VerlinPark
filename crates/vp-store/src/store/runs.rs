@@ -791,6 +791,25 @@ impl Store {
         Ok((event_cursor, message_cursor))
     }
 
+    /// Cheap check for a live provider run owned by one Agent. A plan task
+    /// Agent row can outlive its run while verification/merge is in progress,
+    /// so callers that need a real delivery boundary must use this rather than
+    /// the agent status projection.
+    pub fn has_live_agent_run(&self, session_id: &str, agent_id: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        let exists = conn
+            .query_row(
+                "SELECT 1 FROM session_runs
+                 WHERE session_id = ?1 AND agent_id = ?2
+                   AND status = 'running' AND ended_at IS NULL
+                 LIMIT 1",
+                params![session_id, agent_id],
+                |_| Ok(()),
+            )
+            .optional()?;
+        Ok(exists.is_some())
+    }
+
     pub fn list_all_session_runs(&self, session_id: &str) -> Result<Vec<SessionRun>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(

@@ -1,6 +1,6 @@
 # VerlinPark 文档索引
 
-> 最后更新：2026-11-22
+> 最后更新：2026-11-23
 > 仓库：<https://github.com/Verlintas/VerlinPark>
 
 文档分成三类，避免把“设计目标”误读成“已经实现”：
@@ -9,7 +9,8 @@
 |---|---|---|
 | **Current** | [PROGRESS.md](PROGRESS.md) | 当前真实可用的能力、限制、测试结果；状态以这里为准 |
 | **Current** | [STATUS.md](STATUS.md) | 当前项目状态、路线完成度、已知边界与下一阶段建议（2026-11-22） |
-| **Current** | [V1_FINAL_PLAN.md](V1_FINAL_PLAN.md) | V1 单项目 coding 最终计划：范围、Collab Agent Inspector/Direct Channel、零遗留缺陷门禁、验收场景、阶段与 fork 点（2026-11-22） |
+| **Current** | [V1_FINAL_PLAN.md](V1_FINAL_PLAN.md) | V1 单项目 coding 最终计划：范围、Collab Agent Inspector/Direct Channel、零遗留缺陷门禁、验收场景、阶段与 fork 点（2026-11-22，live 更新 2026-11-23） |
+| **Current** | [V1_READINESS_LEDGER.md](V1_READINESS_LEDGER.md) | V1 缺陷/证据台账：2026-11-23 真实 DeepSeek/GUI 运行、已关闭的 steering 与 provider reconnect 缺陷、未关闭的 effect-recovery/状态投影项、carried §6 与剩余验收缺口 |
 | **Current** | [AUDIT.md](AUDIT.md) | 最近一次项目重审：P0/P1/P2 问题、证据、建议顺序 |
 | **Current** | [audit/2026-11-09-findings.md](audit/2026-11-09-findings.md) | 2026-11-09 全量审查完整台账（[CSV](audit/2026-11-09-findings.csv)）；116 个原始 finding 合并为 65 条并保留全部来源 ID |
 | **Design** | [ARCHITECTURE.md](ARCHITECTURE.md) | 目标架构、协议、数据模型、状态机；实现状态见 PROGRESS/AUDIT |
@@ -52,7 +53,8 @@
 | **Current** | [adr/0229-live-provider-and-budget-estimation.md](adr/0229-live-provider-and-budget-estimation.md) | Live DeepSeek 兼容性：空 tool_calls 省略、预算估算一致化、真实 E2E 验证与 97.4% cache smoke |
 | **Current** | [AUTO_BUDGET_PLAN.md](AUTO_BUDGET_PLAN.md) | Auto budget 与 adaptive tooling 实现计划：fixed/auto/unlimited、确定性扩展/forecast/no-progress pause、program/milestone reservations、conditional tool capabilities 与 orchestrator bundle |
 | **Current** | [adr/0231-auto-budget-and-adaptive-tooling.md](adr/0231-auto-budget-and-adaptive-tooling.md) | Auto budget and adaptive tooling：三模式、硬上限内确定性扩展、cumulative wall clock、evidence-only no-progress、program 预留、capability gates/orchestrator bundle；含未接线项与剩余缺口 |
-| **Current** | [adr/0232-collab-agent-inspector-and-direct-channel.md](adr/0232-collab-agent-inspector-and-direct-channel.md) | V1 Collab Agent Inspector + operator 直连通道：bounded `agent.inspect`、agent-scoped event index、`agent.message.send` 的 steering/inbox/`AGENT_NOT_ACTIVE` 语义、bounded/redacted Context/Conversation |
+| **Current** | [adr/0232-collab-agent-inspector-and-direct-channel.md](adr/0232-collab-agent-inspector-and-direct-channel.md) | V1 Collab Agent Inspector + operator 直连通道：bounded `agent.inspect`、agent-scoped event index、`agent.message.send` 的 steering/inbox/`AGENT_NOT_ACTIVE` 语义、bounded/redacted Context/Conversation；live 硬化后 steering 要求 live durable run |
+| **Current** | [adr/0233-non-destructive-provider-reconnect.md](adr/0233-non-destructive-provider-reconnect.md) | 非破坏性 provider reconnect：daemon 未配置或 provider identity 完全匹配时才自动应用客户端设置；不匹配必须由 Settings 显式保存替换 |
 | **Reference** | [OBSCURA_ASSESSMENT.md](OBSCURA_ASSESSMENT.md) | Obscura（Rust/V8/CDP/MCP headless browser）评估：适用场景、安全约束、三种集成方案、结论为 cache 轮之后再做可选外部网页后端 |
 | **Reference** | [PRIDE_FLAGS.md](PRIDE_FLAGS.md) | Pride flag 资产来源与许可 |
 | **Reference** | [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) | FlagKit 等第三方资产许可 |

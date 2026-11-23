@@ -99,6 +99,23 @@ impl Engine {
                 target.status
             );
         }
+        // A plan Worker can stay `running` while its task is verified/merged
+        // after the provider run ended. Steering then has no delivery
+        // boundary and would remain pending forever.
+        let store = self.store.clone();
+        let live_session = session_id.to_string();
+        let live_agent = target.id.clone();
+        let has_live_run = tokio::task::spawn_blocking(move || {
+            store.has_live_agent_run(&live_session, &live_agent)
+        })
+        .await??;
+        if !has_live_run {
+            anyhow::bail!(
+                "target agent {} is {} but has no live durable run; steering requires a running run",
+                target.id,
+                target.status
+            );
+        }
         if let Some(task_id) = task_id {
             if target.task_id.as_deref() != Some(task_id) {
                 anyhow::bail!(

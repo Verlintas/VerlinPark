@@ -1,12 +1,47 @@
 # VerlinPark 进度
 
-> 最后更新：2026-11-22
+> 最后更新：2026-11-23
 > 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark + task contracts/intent authorization/MCP schema pins + effect receipts/postconditions + external gates/durable waits + runtime pinning/controller replay + reliability/OTel + project-scoped identities S1–S8 + failure attribution/cascade + production hardening rounds 1–3 (ADR-0213/0214/0215) + C7 bounded fan-out (ADR-0216) + C8 tool search v2 (ADR-0217) + C9 MCP async tasks (ADR-0218) + C10 Code Mode (ADR-0219) + C11 loopback A2A (ADR-0221) + C12 advisory progress ledger (ADR-0220) + M3.1 store split 已跑通
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
 
 ---
+
+## 2026-11-23 真实 DeepSeek + GUI 验证与 two hardenings
+
+真实 DeepSeek `deepseek-flash`（key 仅来自环境/Keychain）在临时数据目录完成
+了 V1 的 live 验证。任务 B（1 个任务：multiply/divide + tests）完整走通
+Worker → Labour → Verifier → merge queue → deterministic Integrator，merge
+`c7244f7`，integration command 4 tests 通过；531,916 input / 11,393 output，
+471,552 cache-read，88.65% cache hit，0 append-only break。任务 A（3 任务，
+2M budget）在验证前诚实耗尽预算；任务 C（1 任务，1.5M）被一个未声明 probe 的
+raw-shell git commit 产生 `EFFECT_UNKNOWN` 阻断，operator reconcile 后的
+Leader recovery 再次耗尽预算，未 merge（ledger V1-D03/D05）。
+
+这一轮发现并关闭了两个 V1 缺陷：
+
+- steering（`session.steer` / `agent.message.send`）曾只信任 Agent 行的
+  `running` 状态；plan Worker 的 durable run 已结束但行仍为 `running` 时，
+  steering 会永久停在 `pending`。现在共享 `steer_session_inner` 要求
+  `session_runs.status = 'running'` 且 `ended_at IS NULL`；没有 live run 时
+  identity Agent 走 inbox，ephemeral Agent 返回 typed `AGENT_NOT_ACTIVE`。
+  回归测试覆盖 live-run、completed-run stale status（engine + daemon RPC）
+  与 completed-run identity inbox。
+- app reconnect 曾可能用本地 stale defaults 覆盖由环境/其他 client 配置的
+  daemon provider（localhost 无 key 时尤其是静默覆盖）。新增
+  `ProviderSyncRules`：daemon 未配置，或 provider kind/base URL/model 完全
+  匹配时才自动应用；不匹配保留 daemon 并提示需在 Settings 显式保存。Swift
+  回归测试 4 个；live 检查用 localhost 默认值启动 app 后 `provider-test`
+  仍为 `deepseek-flash`。
+
+GUI 侧已确认 Collab Agent Inspector 的 Overview/Context/Messages 三个视图
+（Conversation/Activity tab 存在，但本轮未逐页读取内容）、idle ephemeral
+`AGENT_NOT_ACTIVE`、running Labour 的 steering `pending → delivered`，以及
+真实 team graph 的 Leader/Manager/Worker/Verifier/Labour 活动。剩余验收缺口
+（GUI 对 running Worker 的直发、idle identity inbox 的 GUI 证据、
+effect-recovery 引导、Worker 状态投影）记录在
+[V1_READINESS_LEDGER.md](V1_READINESS_LEDGER.md)。
 
 ## 2026-11-22 Collab Agent Inspector and Direct Channel
 
