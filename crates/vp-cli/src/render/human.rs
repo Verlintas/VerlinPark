@@ -1,6 +1,7 @@
 //! Ordered human renderer dispatch.
 
 mod briefs;
+mod delivery;
 mod maintenance;
 mod mcp;
 mod memory;
@@ -105,6 +106,9 @@ pub(crate) fn print_human(value: &Value) {
 pub(crate) fn print_human_for(hint: Option<&str>, value: &Value) {
     if let Some(line) = removal_line(hint, value) {
         println!("{line}");
+        return;
+    }
+    if delivery::print(value) {
         return;
     }
     if resources::print(value) {

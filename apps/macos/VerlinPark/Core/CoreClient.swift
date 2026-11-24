@@ -1420,6 +1420,35 @@ actor CoreClient {
         .decode(ReadinessSnapshotView.self)
     }
 
+    func sessionDelivery(sessionID: String) async throws -> SessionDeliveryResultView {
+        try await request(
+            method: "session.delivery",
+            params: ["session_id": .string(sessionID)]
+        )
+        .decode(SessionDeliveryResultView.self)
+    }
+
+    /// One explicit partial-delivery record. The daemon refuses a non-confirm
+    /// request, running/queued or imported sessions, empty deliveries, and
+    /// already-complete merged sessions. This never commits, merges, approves,
+    /// or resumes anything.
+    func recordPartialDelivery(
+        sessionID: String,
+        summary: String?,
+        remainingWork: [String],
+        recordedBy: String?
+    ) async throws -> PartialDeliveryResultView {
+        var params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "confirm": .bool(true),
+            "remaining_work": .array(remainingWork.map { .string($0) }),
+        ]
+        params["summary"] = summary.map { .string($0) } ?? .null
+        params["recorded_by"] = recordedBy.map { .string($0) } ?? .null
+        return try await request(method: "session.delivery.partial", params: params)
+            .decode(PartialDeliveryResultView.self)
+    }
+
     /// One explicit additive top-up. The daemon clamps to existing hard caps
     /// and never selects Unlimited. `resume` only asks the daemon to resume a
     /// paused/failed/cancelled session after the increment; it does not bypass

@@ -304,6 +304,8 @@ pub(crate) async fn run_command(
         | Command::Usage { .. }
         | Command::Resources { .. }
         | Command::Readiness { .. }
+        | Command::Delivery { .. }
+        | Command::PartialDelivery { .. }
         | Command::RunContract { .. }
         | Command::RunContractSet { .. }
         | Command::TopUp { .. } => session::dispatch(command, discovery, json).await,

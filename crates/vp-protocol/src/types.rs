@@ -3484,6 +3484,47 @@ pub struct ResourceAttention {
     pub by_risk: Vec<ResourceCount>,
 }
 
+/// Stable schema marker for [`PartialDeliveryRecord`]. The record is an
+/// explicit operator statement, not a merge, verification, or completion.
+pub const PARTIAL_DELIVERY_SCHEMA: &str = "verlinpark.partial_delivery/v1";
+
+fn default_partial_delivery_schema() -> String {
+    PARTIAL_DELIVERY_SCHEMA.to_string()
+}
+
+/// Event-only explicit partial-delivery record. It is derived from the
+/// readiness snapshot plus bounded operator text and never grants merge,
+/// approval, budget, capacity, or Verifier authority.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PartialDeliveryRecord {
+    #[serde(default = "default_partial_delivery_schema")]
+    pub schema: String,
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub recorded_at: String,
+    #[serde(default)]
+    pub recorded_by: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub remaining_work: Vec<String>,
+    #[serde(default)]
+    pub readiness_level: String,
+    #[serde(default)]
+    pub latest_commit: Option<String>,
+    #[serde(default)]
+    pub changed_paths: Vec<String>,
+    #[serde(default)]
+    pub blockers: Vec<String>,
+    #[serde(default)]
+    pub uncommitted: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReadinessSnapshot {
     pub session_id: String,
@@ -3508,6 +3549,9 @@ pub struct ReadinessSnapshot {
     pub remaining_work: Vec<String>,
     #[serde(default)]
     pub blockers: Vec<String>,
+    /// Newest explicit partial-delivery record, when one was recorded.
+    #[serde(default)]
+    pub partial_delivery: Option<PartialDeliveryRecord>,
     pub generated_at: String,
 }
 
@@ -3779,6 +3823,9 @@ impl ProjectRunPolicy {
 
 pub const SESSION_RUN_CONTRACT_UPDATED_EVENT: &str = "session.run_contract.updated";
 pub const SESSION_RESOURCE_DECISION_EVENT: &str = "session.resource.decision";
+/// Event-only explicit partial-delivery record. Replay and import carry it
+/// with the rest of the session event stream; there is no projection table.
+pub const SESSION_PARTIAL_DELIVERY_EVENT: &str = "session.partial_delivery";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionResourcesParams {
@@ -3788,6 +3835,41 @@ pub struct SessionResourcesParams {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionReadinessParams {
     pub session_id: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PartialDeliveryParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub remaining_work: Vec<String>,
+    #[serde(default)]
+    pub recorded_by: Option<String>,
+    /// Explicit operator confirmation. The engine rejects a missing or false
+    /// value with `DELIVERY_CONFIRM_REQUIRED`.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PartialDeliveryResult {
+    pub session_id: String,
+    pub record: PartialDeliveryRecord,
+    pub readiness: ReadinessSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionDeliveryParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionDeliveryResult {
+    pub session_id: String,
+    #[serde(default)]
+    pub partial: Option<PartialDeliveryRecord>,
+    pub readiness: ReadinessSnapshot,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -27418,5 +27500,113 @@ mod agent_inspector_protocol_tests {
             updated_by: None,
         };
         valid.validate().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod partial_delivery_protocol_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn readiness() -> ReadinessSnapshot {
+        ReadinessSnapshot {
+            session_id: "ses-1".into(),
+            level: "dirty".into(),
+            shippable: false,
+            mergeable: false,
+            latest_commit: None,
+            latest_test: None,
+            verifier: None,
+            merge: None,
+            changed_paths: vec!["src/lib.rs".into()],
+            remaining_work: vec!["T1: pending".into()],
+            blockers: Vec::new(),
+            partial_delivery: None,
+            generated_at: "2026-11-24T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn partial_delivery_params_default_to_unconfirmed_and_empty() {
+        let params: PartialDeliveryParams =
+            serde_json::from_value(json!({"session_id": "ses-1"})).unwrap();
+        assert_eq!(params.session_id, "ses-1");
+        assert!(params.summary.is_none());
+        assert!(params.remaining_work.is_empty());
+        assert!(params.recorded_by.is_none());
+        assert!(!params.confirm);
+    }
+
+    #[test]
+    fn partial_delivery_record_round_trips_and_decodes_missing_fields() {
+        let record = PartialDeliveryRecord {
+            schema: PARTIAL_DELIVERY_SCHEMA.into(),
+            id: "pd-1".into(),
+            session_id: "ses-1".into(),
+            project_id: "prj-1".into(),
+            recorded_at: "2026-11-24T00:00:00Z".into(),
+            recorded_by: "operator".into(),
+            summary: "stopped after the parser".into(),
+            remaining_work: vec!["wire the CLI".into()],
+            readiness_level: "dirty".into(),
+            latest_commit: Some("abc123".into()),
+            changed_paths: vec!["src/parser.rs".into()],
+            blockers: vec!["1 pending approval(s)".into()],
+            uncommitted: true,
+        };
+        let encoded = serde_json::to_value(&record).unwrap();
+        let decoded: PartialDeliveryRecord = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded, record);
+        assert_eq!(encoded["schema"], PARTIAL_DELIVERY_SCHEMA);
+
+        let minimal: PartialDeliveryRecord = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(minimal.schema, PARTIAL_DELIVERY_SCHEMA);
+        assert!(minimal.id.is_empty());
+        assert!(minimal.remaining_work.is_empty());
+        assert!(minimal.latest_commit.is_none());
+        assert!(!minimal.uncommitted);
+    }
+
+    #[test]
+    fn readiness_and_delivery_results_round_trip_with_optional_record() {
+        let old: ReadinessSnapshot = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "level": "none",
+            "generated_at": "2026-11-24T00:00:00Z"
+        }))
+        .unwrap();
+        assert!(old.partial_delivery.is_none());
+
+        let delivery = SessionDeliveryResult {
+            session_id: "ses-1".into(),
+            partial: None,
+            readiness: readiness(),
+        };
+        let decoded: SessionDeliveryResult =
+            serde_json::from_value(serde_json::to_value(&delivery).unwrap()).unwrap();
+        assert_eq!(decoded, delivery);
+
+        let partial = PartialDeliveryResult {
+            session_id: "ses-1".into(),
+            record: PartialDeliveryRecord {
+                schema: PARTIAL_DELIVERY_SCHEMA.into(),
+                id: "pd-1".into(),
+                session_id: "ses-1".into(),
+                project_id: "prj-1".into(),
+                recorded_at: "2026-11-24T00:00:00Z".into(),
+                recorded_by: "operator".into(),
+                summary: "partial".into(),
+                remaining_work: Vec::new(),
+                readiness_level: "dirty".into(),
+                latest_commit: None,
+                changed_paths: Vec::new(),
+                blockers: Vec::new(),
+                uncommitted: true,
+            },
+            readiness: readiness(),
+        };
+        let decoded: PartialDeliveryResult =
+            serde_json::from_value(serde_json::to_value(&partial).unwrap()).unwrap();
+        assert_eq!(decoded, partial);
     }
 }

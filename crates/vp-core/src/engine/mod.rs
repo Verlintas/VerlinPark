@@ -12,6 +12,7 @@ pub(crate) mod artifacts;
 pub(crate) mod auto_budget;
 pub(crate) mod checkpoints;
 pub(crate) mod collaboration;
+pub(crate) mod delivery;
 pub(crate) mod effects;
 pub(crate) mod gui;
 pub(crate) mod intake;

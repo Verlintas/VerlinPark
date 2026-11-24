@@ -186,6 +186,15 @@ final class AppModel {
     var sessionResourceTopUpError: String?
     var sessionResourceTopUpNotice: String?
     var sessionResourceTopUpResult: TopUpSessionResourcesResult?
+    // Explicit partial-delivery record for the selected session. Only daemon
+    // responses populate this state; a partial record never means complete,
+    // merged, approved, or resumable.
+    var sessionDelivery: SessionDeliveryResultView?
+    var sessionDeliveryError: String?
+    var sessionDeliveryBusy = false
+    var partialDeliveryBusy = false
+    var partialDeliveryError: String?
+    var partialDeliveryStatus: String?
     var sessionBudgetBusy = false
     var sessionBudgetError: BudgetValidationIssue?
     var sessionBudgetStatusMessage: String?
@@ -920,6 +929,66 @@ final class AppModel {
         )
     }
 
+    /// The explicit partial-delivery record for the selected session. A result
+    /// for another session, or a record with an unrecognized schema, is never
+    /// shown as this session's delivery.
+    var selectedSessionDelivery: SessionDeliveryResultView? {
+        guard let sessionID = selectedSessionID, let sessionDelivery,
+              sessionDelivery.sessionID == sessionID
+        else {
+            return nil
+        }
+        return sessionDelivery
+    }
+
+    var selectedPartialDelivery: PartialDeliveryRecordView? {
+        guard let sessionID = selectedSessionID else { return nil }
+        return selectedSessionDelivery?.partialRecord(for: sessionID)
+    }
+
+    /// A disabled action must explain itself. This mirrors only the client-side
+    /// proof; the daemon remains authoritative for every eligibility rule.
+    var partialDeliveryActionBlockReason: String? {
+        guard let session = selectedSession else {
+            return "Select a session before recording a partial delivery."
+        }
+        if session.status == "imported" {
+            return "Imported sessions are read-only; partial delivery is unavailable."
+        }
+        if connection != .connected {
+            return "The daemon is not connected; reconnect before recording a partial delivery."
+        }
+        if ["running", "queued", "waiting_input", "landed"].contains(session.status) {
+            return "Wait until the session is idle, paused, or failed before recording a partial delivery."
+        }
+        if sessionDeliveryBusy {
+            return "Loading the current delivery state…"
+        }
+        if partialDeliveryBusy {
+            return "Recording a partial delivery…"
+        }
+        if sessionResourcesBusy {
+            return "Refreshing resources…"
+        }
+        guard let delivery = selectedSessionDelivery else {
+            return "Delivery state is unavailable; refresh resources to retry."
+        }
+        if delivery.readiness.level == "none" {
+            return "Nothing to deliver yet: there is no commit, dirty path, task, verification, or blocker."
+        }
+        if delivery.readiness.level == "merged",
+           delivery.readiness.remainingWork.isEmpty,
+           delivery.readiness.blockers.isEmpty
+        {
+            return "This session is already merged with no remaining work or blockers."
+        }
+        return nil
+    }
+
+    var canRecordPartialDelivery: Bool {
+        partialDeliveryActionBlockReason == nil
+    }
+
     /// The project policy editor is available only for the selected project
     /// while nothing else is loading or saving it.
     var canEditProjectRunPolicy: Bool {
@@ -1061,6 +1130,12 @@ final class AppModel {
         sessionResourceTopUpError = nil
         sessionResourceTopUpNotice = nil
         sessionResourceTopUpResult = nil
+        sessionDelivery = nil
+        sessionDeliveryError = nil
+        sessionDeliveryBusy = false
+        partialDeliveryBusy = false
+        partialDeliveryError = nil
+        partialDeliveryStatus = nil
         resourcePauseBusy = false
         resourcePauseNotice = nil
         resourcePauseError = nil
@@ -1593,6 +1668,7 @@ final class AppModel {
             await loadEfficiency()
             await loadSessionBudget()
             await loadSessionResources(silent: true)
+            await loadSessionDelivery(silent: true)
             await loadCheckpoints()
             await loadLineage()
             await loadTodos()
@@ -2103,6 +2179,7 @@ final class AppModel {
             }
             await loadSessionBudget(silent: true)
             await loadSessionResources(silent: true)
+            await loadSessionDelivery(silent: true)
         } catch {
             guard isCurrent(sessionID: sessionID, generation: generation) else { return }
             resourcePauseError = BudgetValidationIssue.from(error).displayText
@@ -4754,6 +4831,46 @@ final class AppModel {
         }
     }
 
+    /// Read-only delivery state for the selected session. It carries the
+    /// daemon-recorded partial delivery (if any) and readiness; nothing is
+    /// inferred when the RPC fails.
+    func loadSessionDelivery(silent: Bool = false) async {
+        guard let sessionID = selectedSessionID else {
+            sessionDelivery = nil
+            sessionDeliveryError = nil
+            sessionDeliveryBusy = false
+            partialDeliveryBusy = false
+            partialDeliveryError = nil
+            partialDeliveryStatus = nil
+            return
+        }
+        let generation = selectionGeneration
+        if !silent {
+            sessionDeliveryBusy = true
+        }
+        defer {
+            if isCurrent(sessionID: sessionID, generation: generation) {
+                sessionDeliveryBusy = false
+            }
+        }
+        do {
+            let result = try await core.sessionDelivery(sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            guard result.sessionID == sessionID else {
+                sessionDeliveryError = BudgetValidationIssue(
+                    code: "INVALID_DELIVERY_RESPONSE",
+                    message: "The daemon returned delivery state for a different session; no local state was changed."
+                ).displayText
+                return
+            }
+            sessionDelivery = result
+            sessionDeliveryError = nil
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            sessionDeliveryError = BudgetValidationIssue.from(error).displayText
+        }
+    }
+
     /// Explicit operator profile change. The daemon validates and records an
     /// event; the card then reloads the derived snapshot instead of guessing.
     func setRunProfile(_ profile: RunProfile) async {
@@ -4873,6 +4990,106 @@ final class AppModel {
             sessionResourceTopUpError = issue.displayText
             return false
         }
+    }
+
+    /// Records one explicit partial delivery. It is never automatic, never a
+    /// resume/merge/approval/completion, and the daemon result is applied only
+    /// while the same session is still selected.
+    @discardableResult
+    func recordPartialDelivery(
+        summary: String,
+        remainingWork: [String],
+        recordedBy: String?
+    ) async -> Bool {
+        guard let sessionID = selectedSessionID else {
+            partialDeliveryError = BudgetValidationIssue(
+                code: "SESSION_REQUIRED",
+                message: "Select a session before recording a partial delivery."
+            ).displayText
+            return false
+        }
+        if let reason = partialDeliveryActionBlockReason {
+            partialDeliveryError = BudgetValidationIssue(
+                code: "PARTIAL_DELIVERY_UNAVAILABLE",
+                message: reason
+            ).displayText
+            return false
+        }
+        guard let request = PartialDeliveryRequest.normalized(
+            summary: summary,
+            remainingWork: remainingWork,
+            recordedBy: recordedBy
+        ) else {
+            partialDeliveryError = BudgetValidationIssue(
+                code: "INVALID_PARTIAL_DELIVERY",
+                message: "Enter a summary or at least one remaining-work item before recording."
+            ).displayText
+            return false
+        }
+        let generation = selectionGeneration
+        partialDeliveryBusy = true
+        partialDeliveryError = nil
+        partialDeliveryStatus = nil
+        defer {
+            if isCurrent(sessionID: sessionID, generation: generation) {
+                partialDeliveryBusy = false
+            }
+        }
+        do {
+            let result = try await core.recordPartialDelivery(
+                sessionID: sessionID,
+                summary: request.summary,
+                remainingWork: request.remainingWork,
+                recordedBy: request.recordedBy
+            )
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return false }
+            guard result.sessionID == sessionID else {
+                partialDeliveryError = BudgetValidationIssue(
+                    code: "INVALID_DELIVERY_RESPONSE",
+                    message: "The daemon returned a partial-delivery result for a different session; no local state was changed."
+                ).displayText
+                return false
+            }
+            guard result.record.isPartialDelivery else {
+                partialDeliveryError = BudgetValidationIssue(
+                    code: "INVALID_DELIVERY_RESPONSE",
+                    message: "The daemon returned an unrecognized partial-delivery record; no local state was changed."
+                ).displayText
+                return false
+            }
+            guard result.record.sessionID.isEmpty || result.record.sessionID == sessionID else {
+                partialDeliveryError = BudgetValidationIssue(
+                    code: "INVALID_DELIVERY_RESPONSE",
+                    message: "The daemon record belongs to a different session; no local state was changed."
+                ).displayText
+                return false
+            }
+            sessionDelivery = result.delivery
+            sessionDeliveryError = nil
+            partialDeliveryStatus =
+                "Recorded partial delivery · \(result.record.recordedAtLabel) · \(result.record.readinessLabel) · not a merge or completion."
+            partialDeliveryError = nil
+            showToast(
+                "Partial delivery recorded",
+                detail: "Record only · not merged or completed",
+                kind: .info
+            )
+            await loadSessionResources(silent: true)
+            await loadSessionDelivery(silent: true)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return false }
+            return true
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return false }
+            partialDeliveryError = BudgetValidationIssue.from(error).displayText
+            return false
+        }
+    }
+
+    /// Clears stale partial-delivery feedback when the operator edits the
+    /// sheet or reopens it.
+    func clearPartialDeliveryFeedback() {
+        partialDeliveryError = nil
+        partialDeliveryStatus = nil
     }
 
     /// Clears the previous top-up result/error when the operator edits a field,
@@ -11651,7 +11868,19 @@ final class AppModel {
             resourcePauseNotice = nil
             resourcePauseError = nil
             refreshSessionBudgetSoon()
-            Task { await self.loadSessionResources(silent: true) }
+            Task {
+                await self.loadSessionResources(silent: true)
+                await self.loadSessionDelivery(silent: true)
+            }
+        }
+
+        if event.sessionId == selectedSessionID,
+           event.type == PartialDeliveryRecordView.eventKind
+        {
+            Task {
+                await self.loadSessionDelivery(silent: true)
+                await self.loadSessionResources(silent: true)
+            }
         }
 
         if event.sessionId == selectedSessionID,

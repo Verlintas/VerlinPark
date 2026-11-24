@@ -49,6 +49,24 @@ pub(super) async fn handle(
                 Err(response) => response_with_id(id, response),
             }
         }
+        "session.delivery" => {
+            match parse_params::<vp_protocol::types::SessionDeliveryParams>(request.params) {
+                Ok(params) => match state.engine.session_delivery(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "session.delivery.partial" => {
+            match parse_params::<vp_protocol::types::PartialDeliveryParams>(request.params) {
+                Ok(params) => match state.engine.record_partial_delivery(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => partial_delivery_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "session.run_contract.get" => {
             match parse_params::<vp_protocol::types::SessionRunContractParams>(request.params) {
                 Ok(params) => match state.engine.run_contract_view(&params.session_id).await {
@@ -1204,5 +1222,169 @@ pub(super) async fn handle(
             id,
             RpcError::new(codes::METHOD_NOT_FOUND, "method not found"),
         ),
+    }
+}
+
+/// Partial-delivery failures carry a stable `DELIVERY_*` code in `data.code`
+/// and map to `INVALID_PARAMS`; unexpected store/internal failures keep the
+/// ordinary `INTERNAL_ERROR`.
+fn partial_delivery_error(id: Option<serde_json::Value>, error: anyhow::Error) -> RpcResponse {
+    if let Some(typed) = error.downcast_ref::<vp_core::PartialDeliveryError>() {
+        return RpcResponse::error(
+            id,
+            RpcError::with_data(
+                codes::INVALID_PARAMS,
+                typed.message.clone(),
+                json!({"code": typed.code}),
+            ),
+        );
+    }
+    internal_error(id, error)
+}
+
+#[cfg(test)]
+mod partial_delivery_rpc_tests {
+    use super::*;
+    use serde_json::Value;
+    use std::path::Path;
+    use std::process::Command;
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tempfile::TempDir;
+    use vp_core::Engine;
+    use vp_core::agent::AgentService;
+    use vp_protocol::now_rfc3339;
+    use vp_protocol::rpc::RpcRequest;
+    use vp_protocol::types::{PartialDeliveryResult, SessionDeliveryResult};
+    use vp_store::Store;
+
+    fn init_repo(path: &Path) {
+        std::fs::write(path.join("README.md"), "hello\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@verlinpark.local"],
+            vec!["config", "user.name", "VerlinPark Test"],
+            vec!["add", "."],
+            vec!["commit", "-q", "-m", "initial"],
+        ] {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+    }
+
+    async fn call(state: &AppState, method: &str, params: Value) -> Value {
+        let response =
+            crate::dispatch::dispatch(state, RpcRequest::new(json!(1), method, params)).await;
+        assert!(
+            response.error.is_none(),
+            "{} failed: {:?}",
+            method,
+            response.error
+        );
+        response.result.unwrap_or(Value::Null)
+    }
+
+    async fn call_error(state: &AppState, method: &str, params: Value) -> RpcError {
+        let response =
+            crate::dispatch::dispatch(state, RpcRequest::new(json!(1), method, params)).await;
+        response
+            .error
+            .unwrap_or_else(|| panic!("{method} unexpectedly succeeded"))
+    }
+
+    #[tokio::test]
+    async fn delivery_rpcs_record_read_and_reject_unconfirmed_partial_delivery() {
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let data = TempDir::new().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("delivery-rpc"))
+            .unwrap();
+        let session = store
+            .create_session(&project.id, "partial delivery rpc")
+            .unwrap();
+        let engine = Engine::new(store);
+        let session = engine.ensure_session_worktree(&session.id).await.unwrap();
+        engine
+            .store()
+            .update_session_status(&session.id, "idle")
+            .unwrap();
+        let worktree = session.worktree.as_deref().expect("session worktree");
+        std::fs::create_dir_all(Path::new(worktree).join("src")).unwrap();
+        std::fs::write(Path::new(worktree).join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        let state = AppState {
+            engine: engine.clone(),
+            agent: AgentService::from_env(engine.clone()),
+            token: Arc::new("test-token".to_string()),
+            data_dir: data.path().to_path_buf(),
+            started_at: now_rfc3339(),
+            started: Instant::now(),
+            pid: std::process::id(),
+        };
+
+        let before = call(
+            &state,
+            "session.delivery",
+            json!({"session_id": session.id}),
+        )
+        .await;
+        let before: SessionDeliveryResult = serde_json::from_value(before).unwrap();
+        assert!(before.partial.is_none());
+        assert_eq!(before.readiness.level, "dirty");
+
+        let unconfirmed = call_error(
+            &state,
+            "session.delivery.partial",
+            json!({
+                "session_id": session.id,
+                "summary": "stopped after the parser"
+            }),
+        )
+        .await;
+        assert_eq!(unconfirmed.code, codes::INVALID_PARAMS);
+        let data = unconfirmed.data.expect("typed delivery error data");
+        assert_eq!(data["code"], "DELIVERY_CONFIRM_REQUIRED");
+
+        let recorded = call(
+            &state,
+            "session.delivery.partial",
+            json!({
+                "session_id": session.id,
+                "summary": "stopped after the parser",
+                "remaining_work": ["wire the CLI", "run the verifier"],
+                "recorded_by": "operator",
+                "confirm": true
+            }),
+        )
+        .await;
+        let recorded: PartialDeliveryResult = serde_json::from_value(recorded).unwrap();
+        assert_eq!(recorded.session_id, session.id);
+        assert_eq!(recorded.record.schema, "verlinpark.partial_delivery/v1");
+        assert_eq!(recorded.record.readiness_level, "dirty");
+        assert!(recorded.record.uncommitted);
+        assert_eq!(recorded.record.remaining_work.len(), 2);
+        assert_eq!(
+            recorded.readiness.partial_delivery.as_ref(),
+            Some(&recorded.record)
+        );
+
+        let after = call(
+            &state,
+            "session.delivery",
+            json!({"session_id": session.id}),
+        )
+        .await;
+        let after: SessionDeliveryResult = serde_json::from_value(after).unwrap();
+        assert_eq!(after.partial.as_ref(), Some(&recorded.record));
+        assert_eq!(
+            after.readiness.partial_delivery.as_ref(),
+            Some(&recorded.record)
+        );
     }
 }

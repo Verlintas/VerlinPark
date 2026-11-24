@@ -213,6 +213,11 @@ mod engine;
 // and the public `vp_core::...` paths keep resolving.
 pub use engine::leases::{ComputerLeaseGuard, RuntimeLeaseGuard, SessionLease};
 
+// Explicit partial-delivery failures carry a stable code for the daemon's RPC
+// mapper. The record itself is event-only; this re-export exposes only the
+// typed error and its codes.
+pub use engine::delivery::{PartialDeliveryError, partial_delivery_codes};
+
 // Shared free helpers moved into `engine::support`; re-exported so existing
 // `crate::helper` paths used by sibling modules and tests keep resolving.
 pub(crate) use engine::support::*;

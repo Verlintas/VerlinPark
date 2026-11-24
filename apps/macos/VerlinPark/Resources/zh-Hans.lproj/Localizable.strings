@@ -204,6 +204,7 @@
 "Seconds per run." = "每次运行的秒数。";
 "optional" = "可选";
 "Cancel" = "取消";
+"Record partial delivery" = "记录部分交付";
 "Create session" = "创建会话";
 "isolated worktree · verifier gate" = "隔离 worktree · Verifier 门禁";
 "Message the Leader…" = "给 Leader 发消息…";

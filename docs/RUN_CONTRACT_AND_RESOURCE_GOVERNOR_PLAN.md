@@ -1,6 +1,6 @@
 # Run Contract and Resource Governor plan
 
-- Status: Accepted; P0/R1/R2a/R2b core implemented (lean turn-boundary pause, child Auto request-fit incl. cost/time, project RunPolicy, attention batch prompt, macOS top-up/pause/project policy); R2b partial-delivery action, governor snapshot caching, and R3/R4 open
+- Status: Accepted; P0/R1/R2a/R2b core implemented (lean turn-boundary pause, child Auto request-fit incl. cost/time, project RunPolicy, attention batch prompt, explicit partial delivery, macOS top-up/pause/project policy); R2b rescue/reallocation, governor snapshot caching, and R3/R4 open
 - Date: 2026-11-24
 - Owner: Verlintas
 - Scope: V1 single-project coding
@@ -433,8 +433,9 @@ Phase R2b (implemented core):
 - Lean true turn-boundary pause/wait (no readiness/git status on the run path),
   Auto Budget token request-fit for every role plus cost/time fit for children.
 - macOS top-up/readiness, project policy editor, event-derived pause banner,
-  and a bounded attention batch prompt with Inbox/Policy actions.
-- Open: explicit partial-delivery/rescue, governor snapshot caching.
+  a bounded attention batch prompt with Inbox/Policy actions, and an explicit
+  partial-delivery record sheet.
+- Open: rescue/reallocation, governor snapshot caching.
 
 ### 13.2 CLI
 
@@ -558,12 +559,21 @@ Implemented:
   surface; the existing approval queue, dedup/coalescing, and batch-resolve path
   remain the only decision path. No grant, template, approval, or profile is
   applied automatically.
+- Explicit partial delivery: `session.partial_delivery` is an event-only
+  operator record with bounded summary, remaining work, readiness level,
+  commit, uncommitted paths, and blockers; it is exposed through
+  `session.delivery` / `session.delivery.partial`, CLI `delivery` /
+  `partial-delivery`, and a Stage record row/sheet. `--yes` / `confirm=true` is
+  required; running/queued/imported/empty/already-complete sessions are refused
+  with typed `DELIVERY_*` codes. The record never commits, merges, approves,
+  completes, resumes, changes budgets/capacity, or bypasses the Verifier/
+  Integrator; it survives export/import and a newer record wins.
 - Readiness-blocked remains a dispatch gate, not a turn pause (avoids
   deadlocking approval/effect flows in an active run).
 
 Remaining:
 
-- Explicit partial-delivery action and rescue/reallocation.
+- Rescue/reallocation for near-completion work.
 - Governor snapshot caching for large worktrees/plans.
 
 ### R3 — Allocate (next)
@@ -629,7 +639,7 @@ Implemented **P0 + R1 + R2a + R2b core**:
 - project-level run policy plus macOS project-policy editor and event-derived
   pause banner;
 - bounded attention batch prompt with approval Inbox and policy actions;
+- explicit partial-delivery record with RPC/CLI/Stage UI;
 - ledger/docs updated with the multi-resource model.
 
-Next: explicit partial-delivery action/rescue, governor snapshot caching, then
-R3/R4.
+Next: rescue/reallocation, governor snapshot caching, then R3/R4.

@@ -261,6 +261,375 @@ struct ReadinessSnapshotView: Codable, Sendable, Equatable {
     }
 }
 
+// MARK: - Explicit partial delivery
+
+/// Daemon-returned record of an explicitly labeled partial delivery. This is
+/// evidence that remaining work was declared; it is never a merge, Verifier
+/// approval, completion, or resumable run. Display strings are bounded and
+/// missing additive fields decode to conservative defaults.
+struct PartialDeliveryRecordView: Codable, Sendable, Equatable, Identifiable {
+    static let schema = "verlinpark.partial_delivery/v1"
+    static let eventKind = "session.partial_delivery"
+    static let summaryCharacterLimit = 2000
+    static let remainingItemLimit = 50
+    static let remainingItemCharacterLimit = 500
+    static let recordedByCharacterLimit = 120
+
+    let schema: String
+    let id: String
+    let sessionID: String
+    let projectID: String
+    let recordedAt: String
+    let recordedBy: String?
+    let summary: String
+    let remainingWork: [String]
+    let readinessLevel: String
+    let latestCommit: String?
+    let changedPaths: [String]
+    let blockers: [String]
+    let uncommitted: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case schema, id, summary, blockers, uncommitted
+        case sessionID = "session_id"
+        case projectID = "project_id"
+        case recordedAt = "recorded_at"
+        case recordedBy = "recorded_by"
+        case remainingWork = "remaining_work"
+        case readinessLevel = "readiness_level"
+        case latestCommit = "latest_commit"
+        case changedPaths = "changed_paths"
+    }
+
+    init(
+        schema: String = PartialDeliveryRecordView.schema,
+        id: String,
+        sessionID: String,
+        projectID: String = "",
+        recordedAt: String = "",
+        recordedBy: String? = nil,
+        summary: String = "",
+        remainingWork: [String] = [],
+        readinessLevel: String = "partial",
+        latestCommit: String? = nil,
+        changedPaths: [String] = [],
+        blockers: [String] = [],
+        uncommitted: Bool = false
+    ) {
+        self.schema = schema
+        self.id = id
+        self.sessionID = sessionID
+        self.projectID = projectID
+        self.recordedAt = recordedAt
+        self.recordedBy = recordedBy
+        self.summary = summary
+        self.remainingWork = remainingWork
+        self.readinessLevel = readinessLevel
+        self.latestCommit = latestCommit
+        self.changedPaths = changedPaths
+        self.blockers = blockers
+        self.uncommitted = uncommitted
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schema =
+            try container.decodeIfPresent(String.self, forKey: .schema)
+                ?? PartialDeliveryRecordView.schema
+        id = try container.decodeIfPresent(String.self, forKey: .id) ?? ""
+        sessionID = try container.decodeIfPresent(String.self, forKey: .sessionID) ?? ""
+        projectID = try container.decodeIfPresent(String.self, forKey: .projectID) ?? ""
+        recordedAt = try container.decodeIfPresent(String.self, forKey: .recordedAt) ?? ""
+        recordedBy = try container.decodeIfPresent(String.self, forKey: .recordedBy)
+        summary = try container.decodeIfPresent(String.self, forKey: .summary) ?? ""
+        remainingWork =
+            try container.decodeIfPresent([String].self, forKey: .remainingWork) ?? []
+        readinessLevel =
+            try container.decodeIfPresent(String.self, forKey: .readinessLevel) ?? ""
+        latestCommit = try container.decodeIfPresent(String.self, forKey: .latestCommit)
+        changedPaths = try container.decodeIfPresent([String].self, forKey: .changedPaths) ?? []
+        blockers = try container.decodeIfPresent([String].self, forKey: .blockers) ?? []
+        uncommitted = try container.decodeIfPresent(Bool.self, forKey: .uncommitted) ?? false
+    }
+
+    var isPartialDelivery: Bool {
+        schema == Self.schema
+    }
+
+    /// The record's own label. It is intentionally not `MERGED`, `VERIFIED`,
+    /// or `COMPLETED`; only the daemon readiness level may report those.
+    var statusLabel: String {
+        "PARTIAL DELIVERY"
+    }
+
+    /// Operator-facing truthfulness note for the compact Stage row.
+    var truthfulCaveat: String {
+        "Recorded partial delivery — not a merge, approval, or completion."
+    }
+
+    var recordedAtLabel: String {
+        Self.bounded(recordedAt, limit: 40) ?? "time not reported"
+    }
+
+    var recordedByLabel: String? {
+        Self.bounded(recordedBy, limit: 80)
+    }
+
+    var summaryLabel: String {
+        Self.bounded(summary, limit: 280) ?? "No summary recorded"
+    }
+
+    var readinessLabel: String {
+        let value = readinessLevel.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch value {
+        case "none": return "NONE"
+        case "dirty": return "DIRTY"
+        case "committed": return "COMMITTED"
+        case "tests_passed": return "TESTS PASSED"
+        case "verified": return "VERIFIED"
+        case "merged": return "MERGED"
+        case "partial": return "PARTIAL"
+        case "blocked": return "BLOCKED"
+        case "": return "NOT REPORTED"
+        default: return String(value.uppercased().prefix(24))
+        }
+    }
+
+    var remainingCountLabel: String {
+        let count = remainingWork.count
+        return count == 1 ? "1 remaining item" : "\(count) remaining items"
+    }
+
+    var remainingPreview: String? {
+        guard let first = remainingWork.first else { return nil }
+        return Self.bounded(first, limit: 200)
+    }
+
+    var shortCommit: String? {
+        guard let latestCommit, !latestCommit.isEmpty else { return nil }
+        return String(latestCommit.prefix(12))
+    }
+
+    private static func bounded(_ raw: String?, limit: Int) -> String? {
+        guard let raw else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return String(trimmed.prefix(max(0, limit)))
+    }
+}
+
+/// Result of `session.delivery`. `partial` is nil when the daemon has no
+/// recorded partial delivery; that must never be presented as completion.
+struct SessionDeliveryResultView: Codable, Sendable, Equatable {
+    let sessionID: String
+    let partial: PartialDeliveryRecordView?
+    let readiness: ReadinessSnapshotView
+
+    enum CodingKeys: String, CodingKey {
+        case partial, readiness
+        case sessionID = "session_id"
+    }
+
+    init(
+        sessionID: String,
+        partial: PartialDeliveryRecordView?,
+        readiness: ReadinessSnapshotView
+    ) {
+        self.sessionID = sessionID
+        self.partial = partial
+        self.readiness = readiness
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = try container.decodeIfPresent(String.self, forKey: .sessionID) ?? ""
+        partial = try container.decodeIfPresent(PartialDeliveryRecordView.self, forKey: .partial)
+        readiness = try container.decode(ReadinessSnapshotView.self, forKey: .readiness)
+    }
+
+    /// Selection guard used by the Stage. A record from another session (or an
+    /// unrecognized schema) is never shown as this session's delivery.
+    func partialRecord(for targetSessionID: String) -> PartialDeliveryRecordView? {
+        guard !targetSessionID.isEmpty, sessionID == targetSessionID, let partial, partial.isPartialDelivery,
+              partial.sessionID.isEmpty || partial.sessionID == targetSessionID
+        else {
+            return nil
+        }
+        return partial
+    }
+}
+
+/// Result of `session.delivery.partial`. Both the record and readiness snapshot
+/// are required: a partial response is a decode error, never a fabricated
+/// success.
+struct PartialDeliveryResultView: Codable, Sendable, Equatable {
+    let sessionID: String
+    let record: PartialDeliveryRecordView
+    let readiness: ReadinessSnapshotView
+
+    enum CodingKeys: String, CodingKey {
+        case record, readiness
+        case sessionID = "session_id"
+    }
+
+    init(
+        sessionID: String,
+        record: PartialDeliveryRecordView,
+        readiness: ReadinessSnapshotView
+    ) {
+        self.sessionID = sessionID
+        self.record = record
+        self.readiness = readiness
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = try container.decodeIfPresent(String.self, forKey: .sessionID) ?? ""
+        record = try container.decode(PartialDeliveryRecordView.self, forKey: .record)
+        readiness = try container.decode(ReadinessSnapshotView.self, forKey: .readiness)
+    }
+
+    var delivery: SessionDeliveryResultView {
+        SessionDeliveryResultView(
+            sessionID: sessionID,
+            partial: record,
+            readiness: readiness
+        )
+    }
+}
+
+/// Bounded, normalized operator input for one explicit partial-delivery
+/// record. The daemon repeats validation and is authoritative.
+struct PartialDeliveryRequest: Equatable, Sendable {
+    let summary: String?
+    let remainingWork: [String]
+    let recordedBy: String?
+
+    var hasContent: Bool {
+        summary != nil || !remainingWork.isEmpty
+    }
+
+    /// Trims and client-bounds input. Returns nil when the request would be
+    /// empty, which the daemon also rejects.
+    static func normalized(
+        summary: String?,
+        remainingWork: [String],
+        recordedBy: String?
+    ) -> PartialDeliveryRequest? {
+        let summaryText = (summary ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedSummary = summaryText.isEmpty
+            ? nil
+            : String(summaryText.prefix(PartialDeliveryRecordView.summaryCharacterLimit))
+        let normalizedItems = PartialDeliveryLimits.items(from: remainingWork)
+            .prefix(PartialDeliveryRecordView.remainingItemLimit)
+            .map { String($0.prefix(PartialDeliveryRecordView.remainingItemCharacterLimit)) }
+        let recordedByText = (recordedBy ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedRecordedBy = recordedByText.isEmpty
+            ? nil
+            : String(recordedByText.prefix(PartialDeliveryRecordView.recordedByCharacterLimit))
+        guard normalizedSummary != nil || !normalizedItems.isEmpty else { return nil }
+        return PartialDeliveryRequest(
+            summary: normalizedSummary,
+            remainingWork: Array(normalizedItems),
+            recordedBy: normalizedRecordedBy
+        )
+    }
+}
+
+/// Editable sheet state. Views own bindings only; line parsing, normalization,
+/// and bounds stay here so they are unit-testable and cannot drift per view.
+struct PartialDeliveryDraft: Equatable, Sendable {
+    var summary = ""
+    var remainingWorkText = ""
+    var recordedBy = ""
+
+    var remainingWorkItems: [String] {
+        PartialDeliveryLimits.items(from: remainingWorkText)
+    }
+
+    var summaryCharacterCount: Int {
+        summary.trimmingCharacters(in: .whitespacesAndNewlines).count
+    }
+
+    var remainingItemCount: Int {
+        remainingWorkItems.count
+    }
+
+    var recordedByCharacterCount: Int {
+        recordedBy.trimmingCharacters(in: .whitespacesAndNewlines).count
+    }
+
+    var isOverSummaryLimit: Bool {
+        summaryCharacterCount > PartialDeliveryRecordView.summaryCharacterLimit
+    }
+
+    var isOverRemainingItemLimit: Bool {
+        remainingItemCount > PartialDeliveryRecordView.remainingItemLimit
+    }
+
+    var hasOverlongRemainingItem: Bool {
+        remainingWorkItems.contains {
+            $0.count > PartialDeliveryRecordView.remainingItemCharacterLimit
+        }
+    }
+
+    var isOverRecordedByLimit: Bool {
+        recordedByCharacterCount > PartialDeliveryRecordView.recordedByCharacterLimit
+    }
+
+    /// True when submission will trim one or more over-limit fields. The sheet
+    /// must show this instead of silently implying the full text was sent.
+    var isClientBounded: Bool {
+        isOverSummaryLimit || isOverRemainingItemLimit || hasOverlongRemainingItem
+            || isOverRecordedByLimit
+    }
+
+    var request: PartialDeliveryRequest? {
+        PartialDeliveryRequest.normalized(
+            summary: summary,
+            remainingWork: remainingWorkItems,
+            recordedBy: recordedBy
+        )
+    }
+
+    var validationIssue: BudgetValidationIssue? {
+        guard request == nil else { return nil }
+        return BudgetValidationIssue(
+            code: "INVALID_PARTIAL_DELIVERY",
+            message: "Enter a summary or at least one remaining-work item before recording."
+        )
+    }
+
+    func makeRequest() throws -> PartialDeliveryRequest {
+        guard let request else {
+            throw validationIssue ?? BudgetValidationIssue(
+                code: "INVALID_PARTIAL_DELIVERY",
+                message: "Enter a summary or at least one remaining-work item before recording."
+            )
+        }
+        return request
+    }
+}
+
+private enum PartialDeliveryLimits {
+    static func items(from values: [String]) -> [String] {
+        values.flatMap { items(from: $0) }
+    }
+
+    /// One non-empty item per line. CRLF/CR is normalized, whitespace is
+    /// trimmed, and blank lines are dropped.
+    static func items(from text: String) -> [String] {
+        text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+}
+
 struct ResourceSnapshotView: Codable, Sendable, Equatable {
     let sessionID: String
     let generatedAt: String

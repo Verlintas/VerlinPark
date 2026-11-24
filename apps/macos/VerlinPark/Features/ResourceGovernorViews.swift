@@ -58,6 +58,7 @@ struct StageResourceCard: View {
 
     @State private var expanded = false
     @State private var showingTopUp = false
+    @State private var showingPartialDelivery = false
 
     private var readiness: ReadinessSnapshotView? {
         resources.readiness
@@ -85,7 +86,17 @@ struct StageResourceCard: View {
                     readinessCompactLine(readiness)
                 }
             }
+            if let partial = model.selectedPartialDelivery {
+                partialDeliveryRow(partial)
+            }
+            partialDeliveryActionRow
             if let error = model.sessionResourcesError {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(VPTheme.mono(7.5))
+                    .foregroundStyle(VPTheme.warning)
+                    .lineLimit(2)
+            }
+            if let error = model.sessionDeliveryError {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
                     .font(VPTheme.mono(7.5))
                     .foregroundStyle(VPTheme.warning)
@@ -114,6 +125,10 @@ struct StageResourceCard: View {
         )
         .sheet(isPresented: $showingTopUp) {
             TopUpResourcesSheet(snapshot: resources)
+                .environment(model)
+        }
+        .sheet(isPresented: $showingPartialDelivery) {
+            PartialDeliverySheet(sessionID: model.selectedSessionID ?? resources.sessionID)
                 .environment(model)
         }
     }
@@ -398,7 +413,10 @@ struct StageResourceCard: View {
             .buttonStyle(VPGlassIconButtonStyle(size: 20, tint: VPTheme.textTertiary))
             .help(expanded ? "Collapse resources" : "Expand resources")
             Button {
-                Task { await model.loadSessionResources() }
+                Task {
+                    await model.loadSessionResources()
+                    await model.loadSessionDelivery()
+                }
             } label: {
                 Image(systemName: "arrow.clockwise")
             }
@@ -561,6 +579,110 @@ struct StageResourceCard: View {
                     .foregroundStyle(VPTheme.textSecondary)
                     .lineLimit(2)
             }
+        }
+    }
+
+    private func partialDeliveryRow(_ record: PartialDeliveryRecordView) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                Image(systemName: "shippingbox.fill")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(VPTheme.warning)
+                Text(record.statusLabel)
+                    .font(VPTheme.mono(6.5, weight: .semibold))
+                    .tracking(0.6)
+                    .foregroundStyle(VPTheme.warning)
+                Text(record.recordedAtLabel)
+                    .font(VPTheme.mono(6.5))
+                    .foregroundStyle(VPTheme.textTertiary)
+                    .lineLimit(1)
+                Text(record.readinessLabel)
+                    .font(VPTheme.mono(6.5, weight: .semibold))
+                    .foregroundStyle(VPTheme.textSecondary)
+                if let by = record.recordedByLabel {
+                    Text("by \(by)")
+                        .font(VPTheme.mono(6.5))
+                        .foregroundStyle(VPTheme.textTertiary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 4)
+                Text(record.remainingCountLabel)
+                    .font(VPTheme.mono(6.5))
+                    .foregroundStyle(VPTheme.textTertiary)
+            }
+            Text(record.summaryLabel)
+                .font(VPTheme.mono(7))
+                .foregroundStyle(VPTheme.textSecondary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 10) {
+                if let commit = record.shortCommit {
+                    Text("commit \(commit)")
+                        .help(record.latestCommit ?? "")
+                }
+                if record.uncommitted {
+                    Text("uncommitted changes")
+                        .foregroundStyle(VPTheme.warning)
+                }
+                if let preview = record.remainingPreview {
+                    Text("next: \(preview)")
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 4)
+                Text("RECORD · NOT A MERGE OR COMPLETION")
+                    .font(VPTheme.mono(6.2, weight: .semibold))
+                    .foregroundStyle(VPTheme.textTertiary)
+            }
+            .font(VPTheme.mono(6.5))
+            .foregroundStyle(VPTheme.textTertiary)
+        }
+        .padding(7)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            VPTheme.warning.opacity(0.06),
+            in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .strokeBorder(VPTheme.warning.opacity(0.17), lineWidth: 1)
+        }
+        .help(record.truthfulCaveat)
+    }
+
+    private var partialDeliveryActionRow: some View {
+        HStack(spacing: 7) {
+            Button {
+                model.clearPartialDeliveryFeedback()
+                showingPartialDelivery = true
+            } label: {
+                Label("Record partial…", systemImage: "square.and.pencil")
+            }
+            .buttonStyle(.plain)
+            .font(VPTheme.mono(6.8, weight: model.canRecordPartialDelivery ? .semibold : .regular))
+            .foregroundStyle(
+                model.canRecordPartialDelivery ? VPTheme.accent : VPTheme.textTertiary
+            )
+            .disabled(!model.canRecordPartialDelivery)
+            .help(
+                model.partialDeliveryActionBlockReason
+                    ?? "Record an explicit partial delivery. This never merges or completes the session."
+            )
+            if model.partialDeliveryBusy || model.sessionDeliveryBusy {
+                ProgressView().controlSize(.mini)
+            }
+            if let reason = model.partialDeliveryActionBlockReason {
+                Text(reason)
+                    .font(VPTheme.mono(6.5))
+                    .foregroundStyle(VPTheme.textTertiary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("Explicit record · never an automatic merge or resume")
+                    .font(VPTheme.mono(6.2))
+                    .foregroundStyle(VPTheme.textTertiary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 4)
         }
     }
 
@@ -997,6 +1119,389 @@ struct TopUpResourcesSheet: View {
                 .accessibilityLabel(title)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func badge(_ title: String, tint: Color) -> some View {
+        Text(title)
+            .font(VPTheme.mono(6.5, weight: .semibold))
+            .tracking(0.4)
+            .foregroundStyle(tint)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(tint.opacity(0.11), in: Capsule())
+            .overlay {
+                Capsule().strokeBorder(tint.opacity(0.22), lineWidth: 1)
+            }
+    }
+}
+
+// MARK: - Explicit partial-delivery sheet
+
+/// One explicit partial-delivery record. It never commits, merges, approves,
+/// completes, or resumes the session; the daemon validates eligibility and is
+/// authoritative for every rejection.
+struct PartialDeliverySheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    let sessionID: String
+
+    @State private var draft = PartialDeliveryDraft()
+
+    private var imported: Bool {
+        model.selectedSession?.status == "imported"
+    }
+
+    private var runningOrQueued: Bool {
+        guard let status = model.selectedSession?.status else { return false }
+        return ["running", "queued"].contains(status)
+    }
+
+    private var sessionMatches: Bool {
+        !sessionID.isEmpty && model.selectedSessionID == sessionID
+    }
+
+    private var canSubmit: Bool {
+        model.canRecordPartialDelivery
+            && sessionMatches
+            && draft.request != nil
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            VPHairline()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 15) {
+                    warning
+                    summaryField
+                    remainingWorkField
+                    recordedByField
+                    boundsLine
+                    validationLine
+                    feedback
+                }
+                .padding(20)
+            }
+            VPHairline()
+            footer
+        }
+        .frame(width: 560)
+        .frame(maxHeight: 720)
+        .background { VPCrystalBackdrop() }
+        .tint(VPTheme.accent)
+        .onChange(of: draft) { _, _ in
+            model.clearPartialDeliveryFeedback()
+        }
+        .onAppear {
+            model.clearPartialDeliveryFeedback()
+        }
+    }
+
+    private var header: some View {
+        HStack(alignment: .top, spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(VPTheme.warning.opacity(0.12))
+                    .frame(width: 40, height: 40)
+                Image(systemName: "shippingbox")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(VPTheme.warning)
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text("RECORD PARTIAL DELIVERY")
+                    .font(VPTheme.mono(7.5, weight: .semibold))
+                    .tracking(1.2)
+                    .foregroundStyle(VPTheme.warning)
+                Text("Label remaining work without claiming completion")
+                    .font(VPTheme.font(18, weight: .semibold, rounded: true))
+                    .foregroundStyle(VPTheme.textPrimary)
+                    .lineLimit(2)
+                Text(
+                    "Session \(sessionID.isEmpty ? "—" : String(sessionID.prefix(8))) · explicit operator action"
+                )
+                .font(VPTheme.mono(8))
+                .foregroundStyle(VPTheme.textTertiary)
+            }
+            Spacer()
+            Button("Cancel") { dismiss() }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .keyboardShortcut(.cancelAction)
+                .disabled(model.partialDeliveryBusy)
+        }
+        .padding(20)
+        .background(VPTheme.rail)
+    }
+
+    private var warning: some View {
+        Label(
+            "This records a partial delivery only. It does not commit, merge, approve, complete, or resume the session, and it does not bypass the Verifier or Integrator. The daemon validates eligibility and rejects empty deliveries, running/queued or imported sessions, and already-complete merged sessions.",
+            systemImage: "exclamationmark.triangle.fill"
+        )
+        .font(VPTheme.mono(7.5))
+        .foregroundStyle(VPTheme.warning)
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(9)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(VPTheme.warning.opacity(0.07), in: RoundedRectangle(cornerRadius: 9))
+        .overlay {
+            RoundedRectangle(cornerRadius: 9)
+                .strokeBorder(VPTheme.warning.opacity(0.18), lineWidth: 1)
+        }
+    }
+
+    private var summaryField: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("SUMMARY")
+                    .font(VPTheme.mono(8, weight: .semibold))
+                    .tracking(0.7)
+                    .foregroundStyle(VPTheme.textSecondary)
+                Spacer()
+                Text(
+                    "\(draft.summaryCharacterCount) / \(PartialDeliveryRecordView.summaryCharacterLimit) characters"
+                )
+                .font(VPTheme.mono(7))
+                .foregroundStyle(
+                    draft.isOverSummaryLimit ? VPTheme.warning : VPTheme.textTertiary
+                )
+            }
+            TextEditor(text: $draft.summary)
+                .font(VPTheme.mono(10))
+                .scrollContentBackground(.hidden)
+                .padding(7)
+                .frame(minHeight: 78)
+                .background(
+                    VPTheme.surface,
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(VPTheme.hairline, lineWidth: 1)
+                }
+                .overlay(alignment: .topLeading) {
+                    if draft.summary.isEmpty {
+                        Text("What is complete, and what remains uncertain?")
+                            .font(VPTheme.mono(9))
+                            .foregroundStyle(VPTheme.textTertiary)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 11)
+                            .allowsHitTesting(false)
+                    }
+                }
+                .disabled(model.partialDeliveryBusy)
+        }
+    }
+
+    private var remainingWorkField: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("REMAINING WORK")
+                    .font(VPTheme.mono(8, weight: .semibold))
+                    .tracking(0.7)
+                    .foregroundStyle(VPTheme.textSecondary)
+                Spacer()
+                Text(
+                    "\(draft.remainingItemCount) / \(PartialDeliveryRecordView.remainingItemLimit) items"
+                )
+                .font(VPTheme.mono(7))
+                .foregroundStyle(
+                    draft.isOverRemainingItemLimit ? VPTheme.warning : VPTheme.textTertiary
+                )
+            }
+            TextEditor(text: $draft.remainingWorkText)
+                .font(VPTheme.mono(10))
+                .scrollContentBackground(.hidden)
+                .padding(7)
+                .frame(minHeight: 104)
+                .background(
+                    VPTheme.surface,
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(VPTheme.hairline, lineWidth: 1)
+                }
+                .overlay(alignment: .topLeading) {
+                    if draft.remainingWorkText.isEmpty {
+                        Text("One remaining-work item per line")
+                            .font(VPTheme.mono(9))
+                            .foregroundStyle(VPTheme.textTertiary)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 11)
+                            .allowsHitTesting(false)
+                    }
+                }
+                .disabled(model.partialDeliveryBusy)
+            Text(
+                "Blank lines are ignored. Each item is bounded to \(PartialDeliveryRecordView.remainingItemCharacterLimit) characters and at most \(PartialDeliveryRecordView.remainingItemLimit) items are sent."
+            )
+            .font(VPTheme.mono(7))
+            .foregroundStyle(VPTheme.textTertiary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var recordedByField: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("RECORDED BY (OPTIONAL)")
+                    .font(VPTheme.mono(8, weight: .semibold))
+                    .tracking(0.7)
+                    .foregroundStyle(VPTheme.textSecondary)
+                Spacer()
+                Text(
+                    "\(draft.recordedByCharacterCount) / \(PartialDeliveryRecordView.recordedByCharacterLimit)"
+                )
+                .font(VPTheme.mono(7))
+                .foregroundStyle(
+                    draft.isOverRecordedByLimit ? VPTheme.warning : VPTheme.textTertiary
+                )
+            }
+            TextField("e.g. operator", text: $draft.recordedBy)
+                .textFieldStyle(.plain)
+                .font(VPTheme.mono(10))
+                .vpFieldSurface(radius: 8)
+                .accessibilityLabel("Recorded by")
+                .disabled(model.partialDeliveryBusy)
+        }
+    }
+
+    @ViewBuilder
+    private var boundsLine: some View {
+        if draft.isClientBounded {
+            Text(
+                "Over-limit text is trimmed to the client bounds before sending: \(PartialDeliveryRecordView.summaryCharacterLimit) summary characters, \(PartialDeliveryRecordView.remainingItemLimit) remaining items, \(PartialDeliveryRecordView.remainingItemCharacterLimit) characters per item, and \(PartialDeliveryRecordView.recordedByCharacterLimit) recorded-by characters."
+            )
+            .font(VPTheme.mono(7))
+            .foregroundStyle(VPTheme.warning)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    @ViewBuilder
+    private var validationLine: some View {
+        if !sessionMatches {
+            Label(
+                "The selected session changed; close this sheet and reopen it from the active session.",
+                systemImage: "arrow.triangle.2.circlepath"
+            )
+            .font(VPTheme.mono(7.5))
+            .foregroundStyle(VPTheme.warning)
+            .fixedSize(horizontal: false, vertical: true)
+        } else if imported {
+            Label(
+                "Imported sessions are read-only; partial delivery is unavailable.",
+                systemImage: "lock.fill"
+            )
+            .font(VPTheme.mono(7.5))
+            .foregroundStyle(VPTheme.textTertiary)
+        } else if runningOrQueued {
+            Label(
+                "Running and queued sessions cannot record a partial delivery. Wait until the session is idle, paused, or failed.",
+                systemImage: "clock.fill"
+            )
+            .font(VPTheme.mono(7.5))
+            .foregroundStyle(VPTheme.warning)
+            .fixedSize(horizontal: false, vertical: true)
+        } else if let reason = model.partialDeliveryActionBlockReason {
+            Text(reason)
+                .font(VPTheme.mono(7.5))
+                .foregroundStyle(VPTheme.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        } else if draft.request == nil {
+            Text("Add a summary or at least one remaining-work item to enable recording.")
+                .font(VPTheme.mono(7.5))
+                .foregroundStyle(VPTheme.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    @ViewBuilder
+    private var feedback: some View {
+        if let status = model.partialDeliveryStatus {
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 6) {
+                    badge("RECORDED", tint: VPTheme.success)
+                    if let readiness = model.selectedPartialDelivery?.readinessLabel {
+                        badge(readiness, tint: VPTheme.textTertiary)
+                    }
+                    Spacer(minLength: 4)
+                    Text("not merged or completed")
+                        .font(VPTheme.mono(6.5, weight: .semibold))
+                        .foregroundStyle(VPTheme.textTertiary)
+                }
+                Text(status)
+                    .font(VPTheme.mono(7.5))
+                    .foregroundStyle(VPTheme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(9)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(VPTheme.success.opacity(0.08), in: RoundedRectangle(cornerRadius: 9))
+            .overlay {
+                RoundedRectangle(cornerRadius: 9)
+                    .strokeBorder(VPTheme.success.opacity(0.22), lineWidth: 1)
+            }
+        }
+        if let error = model.partialDeliveryError {
+            Label(error, systemImage: "exclamationmark.triangle.fill")
+                .font(VPTheme.mono(7.5))
+                .foregroundStyle(VPTheme.warning)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(9)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(VPTheme.warning.opacity(0.08), in: RoundedRectangle(cornerRadius: 9))
+        }
+    }
+
+    private var footer: some View {
+        HStack(spacing: 8) {
+            if model.partialDeliveryBusy {
+                ProgressView().controlSize(.small)
+                Text("Recording…")
+                    .font(VPTheme.mono(7))
+                    .foregroundStyle(VPTheme.textSecondary)
+            } else {
+                Text(
+                    model.partialDeliveryActionBlockReason
+                        ?? (draft.request == nil
+                            ? "Add a summary or at least one remaining item."
+                            : "One explicit record · not a merge or completion")
+                )
+                .font(VPTheme.mono(7))
+                .foregroundStyle(VPTheme.textTertiary)
+                .lineLimit(2)
+            }
+            Spacer()
+            Button(L10n.t(model.partialDeliveryStatus == nil ? "Cancel" : "Close")) {
+                dismiss()
+            }
+            .keyboardShortcut(.cancelAction)
+            .disabled(model.partialDeliveryBusy)
+            Button {
+                submit()
+            } label: {
+                Label(L10n.t("Record partial delivery"), systemImage: "shippingbox")
+            }
+            .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
+            .keyboardShortcut(.defaultAction)
+            .disabled(!canSubmit)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 13)
+        .background(VPTheme.rail)
+    }
+
+    private func submit() {
+        guard let request = draft.request else { return }
+        Task {
+            await model.recordPartialDelivery(
+                summary: request.summary ?? "",
+                remainingWork: request.remainingWork,
+                recordedBy: request.recordedBy
+            )
+        }
     }
 
     private func badge(_ title: String, tint: Color) -> some View {

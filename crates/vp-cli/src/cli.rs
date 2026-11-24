@@ -2746,6 +2746,24 @@ pub(crate) enum Command {
     Resources { session: String },
     /// Show the current shippable/mergeable readiness level.
     Readiness { session: String },
+    /// Show the latest explicit partial-delivery record and current readiness.
+    Delivery { session: String },
+    /// Record an explicit partial delivery for an inactive session.
+    PartialDelivery {
+        session: String,
+        /// Operator summary of what was delivered. Bounded to 2000 characters.
+        #[arg(long)]
+        summary: Option<String>,
+        /// One remaining work item; repeat the flag for multiple items.
+        #[arg(long = "remaining", value_name = "TEXT")]
+        remaining: Vec<String>,
+        /// Operator label stored with the record (defaults to `operator`).
+        #[arg(long)]
+        recorded_by: Option<String>,
+        /// Required confirmation; does not merge, verify, or complete work.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Show the derived Run Contract envelope.
     RunContract { session: String },
     /// Set a bounded session Run Contract override (profile/reserve/attention).

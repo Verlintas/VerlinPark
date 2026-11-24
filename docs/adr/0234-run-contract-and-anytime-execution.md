@@ -260,8 +260,9 @@ Negative and limits:
    top-up/readiness, project-policy editor, and an event-derived pause banner
    that shows a bounded attention batch with Inbox/Policy actions; first
    selection loads the full session resource state and resource failures are
-   visible with an explicit retry. Explicit partial-delivery action and
-   rescue/reallocation remain.
+   visible with an explicit retry. Explicit partial delivery is event-only
+   (`session.partial_delivery`) with RPC/CLI/Stage surfaces; it never merges,
+   approves, completes, or resumes. Rescue/reallocation remains.
 4. **R3 allocate**: task/plan-aware allocation, rescue/reallocation, learning
    from actuals, metareasoning/replan.
 5. **R4 deliver**: anytime UI, trade-off frontier, calibrated trust, daily

@@ -112,16 +112,29 @@ pre-dispatch deferral，不改变 approval/Verifier/merge 行为：
   Inbox 与 Policy 入口；真正的批准/拒绝仍走现有 approval queue 与
   batch-resolve，不会自动 grant/template/profile。GUI smoke 用真实
   `session.resource.paused` 事件验证了 banner、batch 条目和 Policy 跳转。
-- R2b 仍未做显式 partial-delivery action/rescue 和 governor 快照缓存。
+- Explicit partial delivery：`session.partial_delivery` 是 event-only operator
+  记录，包含 bounded summary/remaining work/readiness level/commit/
+  uncommitted paths/blockers；`ReadinessSnapshot.partial_delivery` 读最新事件。
+  RPC `session.delivery` / `session.delivery.partial`，CLI `delivery` /
+  `partial-delivery --yes`，Stage resource card 显示 `PARTIAL DELIVERY` 记录行
+  并提供显式 Record partial sheet。daemon 要求 confirm，拒绝 running/queued/
+  imported/empty/already-complete，返回 typed `DELIVERY_*` 错误；记录不
+  commit/merge/approve/complete/resume，不改变 budget/capacity，也不绕过
+  Verifier/Integrator。记录随 export/import 保留，较新的记录胜出。
+  CLI 与 GUI smoke 已用真实 daemon 验证：dirty session 记录后 readiness 行、
+  Stage 记录行和 sheet 均正确显示，且明确标注不是 merge/completion。
+- R2b 仍未做 rescue/reallocation 和 governor 快照缓存。
 - 测试：R1 full workspace **4,546**；R2a 后 **4,551**；R2b core 后 **4,554**；
   项目 RunPolicy 后 **4,559**；R2b final（lean turn/cost-time/UI）后
-  **4,570**；attention batch prompt 后 **4,571 passed / 0 failed / 6
-  ignored**，`cargo clippy --workspace --all-targets -- -D warnings` 通过。
-  targeted：27 auto-budget、368 agent、13 resource、2 project-policy/rebuild、
-  2 protocol stop-policy、434 store、52 daemon、188 CLI、19 Swift
-  `ResourceGovernorTests`、6 Swift `MarkdownTranscriptTests`，full Swift
-  **635**（503 app + 132 helper）均通过。宿主机 `syspolicyd`/XProtect spin
-  已单独调查并记录在 `HOST_SYSPOLICYD_INVESTIGATION.md`，不是仓库 bug。
+  **4,570**；attention batch prompt 后 **4,571**；explicit partial delivery
+  后 **4,584 passed / 0 failed / 6 ignored**，
+  `cargo clippy --workspace --all-targets -- -D warnings` 通过。targeted：
+  27 auto-budget、368 agent、13 resource、2 project-policy/rebuild、2 protocol
+  stop-policy、3 partial-delivery protocol、6 delivery engine、434 store、53
+  daemon、191 CLI、27 Swift `ResourceGovernorTests`、6 Swift
+  `MarkdownTranscriptTests`，full Swift **643**（511 app + 132 helper）均通过。
+  宿主机 `syspolicyd`/XProtect spin 已单独调查并记录在
+  `HOST_SYSPOLICYD_INVESTIGATION.md`，不是仓库 bug。
 
 ## 2026-11-23 真实 DeepSeek + GUI 验证与 two hardenings
 

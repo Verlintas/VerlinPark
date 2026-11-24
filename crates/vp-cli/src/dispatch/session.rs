@@ -3,7 +3,7 @@
 use super::*;
 
 /// Build a typed local CLI failure (no daemon RPC was made). The stable code
-/// matches the daemon's auto-budget taxonomy so scripts see the same reason.
+/// matches the daemon taxonomy so scripts see the same reason.
 fn typed_local_error(code: &'static str, message: impl Into<String>) -> anyhow::Error {
     crate::rpc::CliRpcError {
         kind: "local",
@@ -14,6 +14,30 @@ fn typed_local_error(code: &'static str, message: impl Into<String>) -> anyhow::
         data: None,
     }
     .into()
+}
+
+/// Build the `session.delivery.partial` params. `--yes` is required locally so
+/// an accidental command cannot write a partial-delivery event before the RPC.
+fn partial_delivery_params(
+    session: String,
+    summary: Option<String>,
+    remaining: Vec<String>,
+    recorded_by: Option<String>,
+    yes: bool,
+) -> Result<Value> {
+    if !yes {
+        return Err(typed_local_error(
+            vp_core::partial_delivery_codes::DELIVERY_CONFIRM_REQUIRED,
+            "recording a partial delivery requires --yes; it does not merge, verify, or complete work",
+        ));
+    }
+    Ok(json!({
+        "session_id": session,
+        "summary": summary,
+        "remaining_work": remaining,
+        "recorded_by": recorded_by,
+        "confirm": true,
+    }))
 }
 
 fn validate_positive_tokens(label: &str, value: Option<u64>, cap: bool) -> Result<()> {
@@ -622,6 +646,24 @@ pub(super) async fn dispatch(
             )
             .await?
         }
+        Command::Delivery { session } => {
+            rpc(
+                &discovery,
+                "session.delivery",
+                json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::PartialDelivery {
+            session,
+            summary,
+            remaining,
+            recorded_by,
+            yes,
+        } => {
+            let params = partial_delivery_params(session, summary, remaining, recorded_by, yes)?;
+            rpc(&discovery, "session.delivery.partial", params).await?
+        }
         Command::RunContract { session } => {
             rpc(
                 &discovery,
@@ -1006,5 +1048,74 @@ mod tests {
         assert_eq!(decoded.hard_token_cap, Some(5_000));
         assert!(decoded.unlimited.is_none());
         assert!(!decoded.clear_token_budget);
+    }
+
+    #[test]
+    fn delivery_and_partial_delivery_flags_parse_and_require_yes() {
+        use clap::Parser;
+
+        let cli = crate::cli::Cli::try_parse_from(["vp", "delivery", "ses-1"]).unwrap();
+        match cli.command {
+            Command::Delivery { session } => assert_eq!(session, "ses-1"),
+            other => panic!("expected delivery command, got {other:?}"),
+        }
+
+        let cli = crate::cli::Cli::try_parse_from([
+            "vp",
+            "partial-delivery",
+            "ses-1",
+            "--summary",
+            "stopped after the parser",
+            "--remaining",
+            "wire the CLI",
+            "--remaining",
+            "run the verifier",
+            "--recorded-by",
+            "operator",
+            "--yes",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::PartialDelivery {
+                session,
+                summary,
+                remaining,
+                recorded_by,
+                yes,
+            } => {
+                assert_eq!(session, "ses-1");
+                assert_eq!(summary.as_deref(), Some("stopped after the parser"));
+                assert_eq!(
+                    remaining,
+                    vec!["wire the CLI".to_string(), "run the verifier".to_string()]
+                );
+                assert_eq!(recorded_by.as_deref(), Some("operator"));
+                assert!(yes);
+                let params =
+                    partial_delivery_params(session, summary, remaining, recorded_by, yes).unwrap();
+                let decoded: vp_protocol::types::PartialDeliveryParams =
+                    serde_json::from_value(params).unwrap();
+                assert_eq!(decoded.session_id, "ses-1");
+                assert!(decoded.confirm);
+                assert_eq!(decoded.remaining_work.len(), 2);
+            }
+            other => panic!("expected partial-delivery command, got {other:?}"),
+        }
+
+        let error = partial_delivery_params(
+            "ses-1".into(),
+            Some("stopped".into()),
+            Vec::new(),
+            None,
+            false,
+        )
+        .expect_err("missing --yes must fail before the RPC");
+        let typed = error
+            .downcast_ref::<crate::rpc::CliRpcError>()
+            .expect("typed local CLI error");
+        assert_eq!(
+            typed.typed_code.as_deref(),
+            Some(vp_core::partial_delivery_codes::DELIVERY_CONFIRM_REQUIRED)
+        );
     }
 }

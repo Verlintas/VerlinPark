@@ -143,6 +143,7 @@ impl Engine {
                 }
             });
         let merge = queue.last().map(|entry| entry.status.clone());
+        let partial_delivery = self.latest_partial_delivery(session_id).await?;
 
         Ok(ReadinessSnapshot {
             session_id: session_id.to_string(),
@@ -156,6 +157,7 @@ impl Engine {
             changed_paths,
             remaining_work,
             blockers,
+            partial_delivery,
             generated_at: now_rfc3339(),
         })
     }

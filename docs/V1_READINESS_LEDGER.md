@@ -75,7 +75,7 @@ Verification gaps:
 | V1-D09 | S1 | A bare Python `unittest` project without pyproject/pytest metadata was reported as `PROJECT_UNSUPPORTED`, pushing Agent runs into shell guessing. | **CLOSED** | `project_profile` detects `tests/test_*.py` and proposes `python3 -m unittest discover -s tests -v`; regression test covers the bare fixture |
 | V1-D10 | S1 | Contract analysis treated scratch verification writes and absolute read-only git commands as host-state/scope violations, creating repeated approvals and `.scratch-proof` artifacts in the worktree. | **CLOSED (P0)** | Shell exports `$VERLINPARK_WORKTREE`/`$VERLINPARK_SCRATCH`; prompts/recipes say cwd is the worktree; contract allows the stable scratch/TMPDIR prefixes; absolute read-only git (`status/diff/log/show/rev-parse/...`) is ReadOnly; `clean`/`reset --hard` remains Destructive. Tests cover all paths. |
 | V1-D11 | S1 | Fixed token budgets charged cache-read input at full weight, ignored missing prices, starved verification, and failed solvable runs; the dashboard could not show the difference between cheap-but-stuck and expensive-near-completion. | **PARTIAL (R2a)** | R1 exposes raw vs weighted tokens, money with `pricing_source`, time, attention, risk, context, capacity, quality, and progress plus readiness/forecast. R2a adds operator top-up (clamped to caps) and pre-dispatch completion-reserve deferral. Raw token caps remain authoritative; cost-weighted settlement/automatic reallocation is R2b/R3. |
-| V1-D12 | S2 | Operator attention had no budget or governor: repeated host-state approvals could consume the run without triggering a policy decision. | **PARTIAL (R2b)** | Pre-dispatch deferral and a true turn-boundary pause (`session.resource.paused`) now stop new work at the attention cap; a bare resume re-pauses until the cap/policy changes. The pause carries a bounded attention batch (risk groups + at most 8 approval metadata rows, no raw input) and the Stage banner opens Inbox or Policies. The existing approval queue, coalescing, and batch resolve remain the only decision path; no automatic grant/template/profile. Explicit partial delivery/rescue remains open. |
+| V1-D12 | S2 | Operator attention had no budget or governor: repeated host-state approvals could consume the run without triggering a policy decision. | **PARTIAL (R2b)** | Pre-dispatch deferral and a true turn-boundary pause (`session.resource.paused`) now stop new work at the attention cap; a bare resume re-pauses until the cap/policy changes. The pause carries a bounded attention batch (risk groups + at most 8 approval metadata rows, no raw input) and the Stage banner opens Inbox or Policies. The existing approval queue, coalescing, and batch resolve remain the only decision path; no automatic grant/template/profile. Explicit partial delivery is event-only and available; rescue/reallocation remains open. |
 
 ## Run Contract R1/R2a/R2b (2026-11-24)
 
@@ -125,6 +125,16 @@ Implemented the observe/operator slice from ADR-0234:
   cap, risk groups, and up to 8 approval metadata rows (tool/risk/task/
   priority/waiters/reason). Raw tool input, command text, and file contents are
   excluded; approvals still resolve only through the existing queue/batch.
+- Explicit partial delivery is an event-only `session.partial_delivery` record
+  with bounded summary, remaining work, readiness level, commit, uncommitted
+  paths, and blockers. `session.delivery` / `session.delivery.partial`, CLI
+  `delivery` / `partial-delivery`, and the Stage record row/sheet surface it.
+  `--yes` / `confirm=true` is required; running/queued/imported/empty/
+  already-complete sessions are refused with typed `DELIVERY_*` codes. It never
+  commits, merges, approves, completes, resumes, changes budgets/capacity, or
+  bypasses the Verifier/Integrator; export/import preserves the record and a
+  newer record wins. It is advisory evidence and can become stale as newer work
+  lands.
 - Project-level RunPolicy adds persisted defaults (profile/reserve/attention/
   stop), manifest recording and `db-rebuild` restore, RPC
   `project.run_policy.get/set`, and CLI `project-run-policy` /
@@ -149,12 +159,13 @@ Implemented the observe/operator slice from ADR-0234:
 
 Tests: R2b targeted: 27 auto-budget runtime tests, 368 `agent::tests`, 13
 resource tests, 2 project-policy/rebuild tests, 2 protocol stop-policy tests,
-434 store tests, 52 daemon tests, 188 CLI tests, 19 targeted Swift
-`ResourceGovernorTests`, 6 Swift `MarkdownTranscriptTests`, and 635 full Swift
-tests (503 app + 132 helper); P0 tests remain. Final full workspace after the
-last R2b slice is recorded below;
-the final attention prompt run was **4,571 passed, 0 failed, 6 ignored**;
-clippy exit 0. R2b project policy was 4,559; R2b core before it 4,554; R2a 4,551. A live
+434 store tests, 53 daemon tests, 191 CLI tests, 27 targeted Swift
+`ResourceGovernorTests`, 6 Swift `MarkdownTranscriptTests`, 3 partial-delivery
+protocol tests, 6 delivery-engine tests, and 643 full Swift tests (511 app +
+132 helper); P0 tests remain. Final full workspace after the last R2b slice is
+recorded below; the final explicit partial-delivery run was **4,584 passed,
+0 failed, 6 ignored**; clippy exit 0. R2b project policy was 4,559; R2b core
+before it 4,554; R2a 4,551. A live
 temp-daemon CLI smoke exercised `run-contract-set`, `resources`, `top-up`, and
 `readiness` end to end; a temp-daemon GUI smoke exercised first-selection
 resource loading and the Project RunPolicy card/editor.
@@ -202,6 +213,10 @@ cargo test -p vp-core --lib project_run_policy
 cargo test -p vp-protocol run_stop_policy
 cargo test -p vp-protocol project_and_session_run_policies
 # 2 passed, 0 failed (bounded stop policy and project/session rejection)
+cargo test -p vp-protocol partial_delivery
+# 3 passed, 0 failed (params/record/result round-trip and additive defaults)
+cargo test -p vp-core --lib engine::delivery::tests
+# 6 passed, 0 failed (confirm/active/imported/empty/complete/bounds/export-import)
 cargo test -p vp-store --lib
 # 434 passed, 0 failed (incl. project RunPolicy round-trip/validation)
 cargo test -p vp-core --lib agent::auto_budget_runtime_tests
@@ -221,24 +236,29 @@ cargo test -p vp-core --lib 'contract::tests::shell_scratch'
 cargo test -p vp-core --lib 'agent::plan::execute::tests'
 # 1 passed, 0 failed (EFFECT_UNKNOWN blocked classification)
 cargo test -p vp-daemon
-# 52 unit + 1 governance passed
+# 53 unit + 1 governance passed
+cargo test -p vp-daemon partial_delivery
+# 1 passed, 0 failed (RPC record/read/typed confirmation error)
 cargo test -p vp-cli
-# 188 unit + 10 integration + 1 governance passed
+# 191 unit + 10 integration + 1 governance passed
+cargo test -p vp-cli --bin vp delivery
+# 3 passed, 0 failed (CLI parse/--yes/human render)
 ```
 
-Final full workspace after the attention prompt slice (2026-11-24, healthy boot):
+Final full workspace after the explicit partial-delivery slice (2026-11-24,
+healthy boot):
 
 ```bash
 cargo test --workspace
-# 4,571 passed, 0 failed, 6 ignored
+# 4,584 passed, 0 failed, 6 ignored
 cargo clippy --workspace --all-targets -- -D warnings
 # exit 0
 ```
 
 R2b project policy was 4,559, R2b core before it 4,554, R2a 4,551, R1 4,546.
-Full Swift after the slice: 635 (503 app + 132 helper), including the
-Markdown transcript renderer, display preferences, and the attention batch
-prompt.
+Full Swift after the slice: 643 (511 app + 132 helper), including the Markdown
+transcript renderer, display preferences, attention batch prompt, and partial
+delivery sheet.
 
 The earlier full run before P0/R1 also passed every crate except the daemon
 operator test, which was fixed and is covered above. The host XProtect/

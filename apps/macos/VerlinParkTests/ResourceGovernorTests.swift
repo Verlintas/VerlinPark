@@ -630,6 +630,386 @@ final class ResourceGovernorTests: XCTestCase {
         XCTAssertNil(noBatch.attentionBatch)
     }
 
+    // MARK: - Explicit partial delivery
+
+    func testSessionDeliveryDecodesNullAndPartialRecord() throws {
+        let nullJSON = try XCTUnwrap("""
+        {
+          "session_id": "ses-1",
+          "partial": null,
+          "readiness": {"session_id":"ses-1","level":"none","shippable":false,
+                        "mergeable":false,"changed_paths":[],"remaining_work":[],
+                        "blockers":[],"generated_at":"2026-11-24T00:00:00Z"}
+        }
+        """.data(using: .utf8))
+        let nullResult = try JSONDecoder().decode(SessionDeliveryResultView.self, from: nullJSON)
+        XCTAssertEqual(nullResult.sessionID, "ses-1")
+        XCTAssertNil(nullResult.partial)
+        XCTAssertEqual(nullResult.readiness.level, "none")
+        XCTAssertNil(nullResult.partialRecord(for: "ses-1"))
+
+        let recordJSON = try XCTUnwrap("""
+        {
+          "session_id": "ses-1",
+          "partial": {
+            "schema": "verlinpark.partial_delivery/v1",
+            "id": "pd-1",
+            "session_id": "ses-1",
+            "project_id": "prj-1",
+            "recorded_at": "2026-11-24T01:02:03Z",
+            "recorded_by": "operator",
+            "summary": "Implemented the sheet; remaining tests are pending.",
+            "remaining_work": ["T2: run focused tests", "T3: review diff"],
+            "readiness_level": "partial",
+            "latest_commit": "abcdef1234567890",
+            "changed_paths": ["apps/macos/VerlinPark/Features/ResourceGovernorViews.swift"],
+            "blockers": ["EFFECT_UNKNOWN on integration"],
+            "uncommitted": true
+          },
+          "readiness": {"session_id":"ses-1","level":"partial","shippable":true,
+                        "mergeable":false,"changed_paths":["a.swift"],
+                        "remaining_work":["T2: run focused tests"],"blockers":[],
+                        "generated_at":"2026-11-24T00:00:00Z"}
+        }
+        """.data(using: .utf8))
+        let result = try JSONDecoder().decode(SessionDeliveryResultView.self, from: recordJSON)
+        let partial = try XCTUnwrap(result.partial)
+        XCTAssertEqual(partial.id, "pd-1")
+        XCTAssertEqual(partial.sessionID, "ses-1")
+        XCTAssertEqual(partial.projectID, "prj-1")
+        XCTAssertEqual(partial.recordedBy, "operator")
+        XCTAssertEqual(partial.remainingWork.count, 2)
+        XCTAssertEqual(partial.readinessLabel, "PARTIAL")
+        XCTAssertEqual(partial.remainingCountLabel, "2 remaining items")
+        XCTAssertEqual(partial.shortCommit, "abcdef123456")
+        XCTAssertTrue(partial.uncommitted)
+        XCTAssertTrue(partial.isPartialDelivery)
+        XCTAssertEqual(result.partialRecord(for: "ses-1")?.id, "pd-1")
+        XCTAssertNil(result.partialRecord(for: "ses-2"))
+    }
+
+    func testPartialDeliveryRecordDefaultsMissingAdditiveFields() throws {
+        let json = try XCTUnwrap("""
+        {"schema":"verlinpark.partial_delivery/v1","id":"pd-2",
+         "session_id":"ses-1","summary":"Partial only",
+         "remaining_work":[]}
+        """.data(using: .utf8))
+        let record = try JSONDecoder().decode(PartialDeliveryRecordView.self, from: json)
+        XCTAssertEqual(record.projectID, "")
+        XCTAssertEqual(record.recordedAt, "")
+        XCTAssertNil(record.recordedBy)
+        XCTAssertEqual(record.readinessLabel, "NOT REPORTED")
+        XCTAssertTrue(record.changedPaths.isEmpty)
+        XCTAssertTrue(record.blockers.isEmpty)
+        XCTAssertFalse(record.uncommitted)
+        XCTAssertTrue(record.isPartialDelivery)
+
+        let missingSchemaJSON = try XCTUnwrap("""
+        {"id":"pd-2b","session_id":"ses-1","summary":"Partial only"}
+        """.data(using: .utf8))
+        let missingSchema = try JSONDecoder().decode(
+            PartialDeliveryRecordView.self,
+            from: missingSchemaJSON
+        )
+        XCTAssertEqual(missingSchema.schema, PartialDeliveryRecordView.schema)
+        XCTAssertTrue(missingSchema.isPartialDelivery)
+
+        let wrongSchemaJSON = try XCTUnwrap("""
+        {"schema":"other/v1","id":"pd-3","session_id":"ses-1","summary":"Partial"}
+        """.data(using: .utf8))
+        let wrongSchema = try JSONDecoder().decode(
+            PartialDeliveryRecordView.self,
+            from: wrongSchemaJSON
+        )
+        XCTAssertFalse(wrongSchema.isPartialDelivery)
+    }
+
+    func testPartialDeliveryResultDecodesRecordAndReadiness() throws {
+        let json = try XCTUnwrap("""
+        {
+          "session_id": "ses-1",
+          "record": {
+            "schema": "verlinpark.partial_delivery/v1",
+            "id": "pd-4",
+            "session_id": "ses-1",
+            "summary": "Only the explicit record was added.",
+            "remaining_work": ["T1: wire the card"],
+            "readiness_level": "partial"
+          },
+          "readiness": {"session_id":"ses-1","level":"partial","shippable":false,
+                        "mergeable":false,"changed_paths":[],"remaining_work":[],
+                        "blockers":[],"generated_at":"2026-11-24T00:00:00Z"}
+        }
+        """.data(using: .utf8))
+        let result = try JSONDecoder().decode(PartialDeliveryResultView.self, from: json)
+        XCTAssertEqual(result.sessionID, "ses-1")
+        XCTAssertEqual(result.record.id, "pd-4")
+        XCTAssertEqual(result.readiness.level, "partial")
+        XCTAssertEqual(result.delivery.sessionID, "ses-1")
+        XCTAssertEqual(result.delivery.partial?.id, "pd-4")
+
+        let withoutRecord = try XCTUnwrap("""
+        {"session_id":"ses-1","record":null,
+         "readiness":{"session_id":"ses-1","level":"partial"}}
+        """.data(using: .utf8))
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(PartialDeliveryResultView.self, from: withoutRecord)
+        )
+        let withoutReadiness = try XCTUnwrap("""
+        {"session_id":"ses-1","record":{"schema":"verlinpark.partial_delivery/v1",
+         "id":"pd-5","session_id":"ses-1","summary":"Partial"}}
+        """.data(using: .utf8))
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(PartialDeliveryResultView.self, from: withoutReadiness)
+        )
+        let sessionWithoutReadiness = try XCTUnwrap("""
+        {"session_id":"ses-1","partial":null}
+        """.data(using: .utf8))
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(SessionDeliveryResultView.self, from: sessionWithoutReadiness)
+        )
+    }
+
+    func testPartialDeliveryEncodesSnakeCaseWireFields() throws {
+        let record = PartialDeliveryRecordView(
+            id: "pd-9",
+            sessionID: "ses-1",
+            projectID: "prj-1",
+            recordedAt: "2026-11-24T01:02:03Z",
+            recordedBy: "operator",
+            summary: "Partial only",
+            remainingWork: ["T1: pending"],
+            readinessLevel: "partial",
+            latestCommit: "abcdef1234567890",
+            changedPaths: ["a.swift"],
+            blockers: ["blocker"],
+            uncommitted: true
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(record)) as? [String: Any]
+        )
+        XCTAssertEqual(object["schema"] as? String, PartialDeliveryRecordView.schema)
+        XCTAssertEqual(object["session_id"] as? String, "ses-1")
+        XCTAssertEqual(object["project_id"] as? String, "prj-1")
+        XCTAssertEqual(object["recorded_at"] as? String, "2026-11-24T01:02:03Z")
+        XCTAssertEqual(object["recorded_by"] as? String, "operator")
+        XCTAssertEqual(object["remaining_work"] as? [String], ["T1: pending"])
+        XCTAssertEqual(object["readiness_level"] as? String, "partial")
+        XCTAssertEqual(object["latest_commit"] as? String, "abcdef1234567890")
+        XCTAssertEqual(object["changed_paths"] as? [String], ["a.swift"])
+        XCTAssertNil(object["sessionID"])
+
+        let result = try SessionDeliveryResultView(
+            sessionID: "ses-1",
+            partial: record,
+            readiness: readiness(level: "partial")
+        )
+        let resultObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(result)) as? [String: Any]
+        )
+        XCTAssertEqual(resultObject["session_id"] as? String, "ses-1")
+        XCTAssertNil(resultObject["sessionID"])
+        let partialObject = try XCTUnwrap(resultObject["partial"] as? [String: Any])
+        XCTAssertEqual(partialObject["recorded_at"] as? String, "2026-11-24T01:02:03Z")
+
+        let partialResult = try PartialDeliveryResultView(
+            sessionID: "ses-1",
+            record: record,
+            readiness: readiness(level: "partial")
+        )
+        let partialResultObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(partialResult))
+                as? [String: Any]
+        )
+        XCTAssertEqual(partialResultObject["session_id"] as? String, "ses-1")
+        XCTAssertEqual(
+            (partialResultObject["record"] as? [String: Any])?["session_id"] as? String,
+            "ses-1"
+        )
+        XCTAssertNil(partialResultObject["sessionID"])
+    }
+
+    func testPartialDeliveryDraftParsesLinesBoundsAndRequiresContent() throws {
+        var draft = PartialDeliveryDraft()
+        XCTAssertNil(draft.request)
+        XCTAssertNotNil(draft.validationIssue)
+        XCTAssertFalse(draft.isClientBounded)
+
+        draft.summary = "  "
+        draft.remainingWorkText = "\n  T1 done \r\n\r\nT2: tests\n"
+        let request = try XCTUnwrap(draft.request)
+        XCTAssertNil(request.summary)
+        XCTAssertEqual(request.remainingWork, ["T1 done", "T2: tests"])
+        XCTAssertNil(request.recordedBy)
+        XCTAssertFalse(draft.isClientBounded)
+        XCTAssertNil(draft.validationIssue)
+
+        draft.recordedBy = "  operator  "
+        XCTAssertEqual(draft.request?.recordedBy, "operator")
+        XCTAssertEqual(draft.remainingItemCount, 2)
+
+        draft.summary = String(repeating: "s", count: 2500)
+        XCTAssertTrue(draft.isOverSummaryLimit)
+        XCTAssertTrue(draft.isClientBounded)
+        XCTAssertEqual(
+            draft.request?.summary?.count,
+            PartialDeliveryRecordView.summaryCharacterLimit
+        )
+
+        draft = PartialDeliveryDraft()
+        draft.remainingWorkText = (0 ..< 60).map { "item-\($0)" }.joined(separator: "\n")
+        XCTAssertEqual(draft.remainingItemCount, 60)
+        XCTAssertTrue(draft.isOverRemainingItemLimit)
+        XCTAssertEqual(
+            draft.request?.remainingWork.count,
+            PartialDeliveryRecordView.remainingItemLimit
+        )
+
+        draft.remainingWorkText = String(repeating: "x", count: 600)
+        XCTAssertTrue(draft.hasOverlongRemainingItem)
+        XCTAssertEqual(
+            draft.request?.remainingWork.first?.count,
+            PartialDeliveryRecordView.remainingItemCharacterLimit
+        )
+
+        draft.recordedBy = String(repeating: "r", count: 200)
+        XCTAssertTrue(draft.isOverRecordedByLimit)
+        XCTAssertEqual(
+            draft.request?.recordedBy?.count,
+            PartialDeliveryRecordView.recordedByCharacterLimit
+        )
+
+        let splitItems = PartialDeliveryRequest.normalized(
+            summary: nil,
+            remainingWork: ["A\nB", "   ", "C"],
+            recordedBy: " "
+        )
+        XCTAssertEqual(splitItems?.remainingWork, ["A", "B", "C"])
+        XCTAssertNil(splitItems?.recordedBy)
+        XCTAssertNil(
+            PartialDeliveryRequest.normalized(
+                summary: " ",
+                remainingWork: [" ", ""],
+                recordedBy: "operator"
+            )
+        )
+    }
+
+    func testPartialDeliveryLabelsNeverImplyMergeOrCompletion() {
+        let record = PartialDeliveryRecordView(
+            id: "pd-10",
+            sessionID: "ses-1",
+            recordedAt: "2026-11-24T01:02:03Z",
+            recordedBy: "operator",
+            summary: "Partial only",
+            remainingWork: ["T1: pending"],
+            readinessLevel: "partial",
+            latestCommit: "abcdef1234567890"
+        )
+        XCTAssertEqual(record.statusLabel, "PARTIAL DELIVERY")
+        XCTAssertEqual(record.readinessLabel, "PARTIAL")
+        XCTAssertEqual(record.remainingCountLabel, "1 remaining item")
+        XCTAssertEqual(record.recordedAtLabel, "2026-11-24T01:02:03Z")
+        XCTAssertEqual(record.recordedByLabel, "operator")
+        XCTAssertEqual(record.shortCommit, "abcdef123456")
+        XCTAssertTrue(record.truthfulCaveat.contains("not a merge"))
+        XCTAssertTrue(record.truthfulCaveat.contains("completion"))
+
+        let labels = [
+            record.statusLabel,
+            record.readinessLabel,
+            record.truthfulCaveat,
+            record.remainingCountLabel,
+        ].joined(separator: " ").uppercased()
+        XCTAssertFalse(labels.contains("MERGED"))
+        XCTAssertFalse(labels.contains("COMPLETED"))
+        XCTAssertTrue(labels.contains("NOT A MERGE"))
+
+        let longRecord = PartialDeliveryRecordView(
+            id: "pd-11",
+            sessionID: "ses-1",
+            recordedAt: String(repeating: "t", count: 100),
+            recordedBy: String(repeating: "r", count: 200),
+            summary: String(repeating: "s", count: 1000),
+            remainingWork: ["one", "two"],
+            readinessLevel: "partial"
+        )
+        XCTAssertLessThanOrEqual(longRecord.summaryLabel.count, 280)
+        XCTAssertLessThanOrEqual(longRecord.recordedAtLabel.count, 40)
+        XCTAssertEqual(longRecord.recordedByLabel?.count, 80)
+        XCTAssertEqual(longRecord.remainingCountLabel, "2 remaining items")
+    }
+
+    func testPartialDeliveryValidationPreservesTypedDaemonError() {
+        let error = CoreError.rpc(
+            code: -32602,
+            message: "Session is running",
+            data: .object([
+                "code": .string("DELIVERY_SESSION_RUNNING"),
+                "hint": .string("Wait until the session is idle."),
+            ])
+        )
+        let issue = BudgetValidationIssue.from(error)
+        XCTAssertEqual(issue.code, "DELIVERY_SESSION_RUNNING")
+        XCTAssertTrue(issue.displayText.contains("Session is running"))
+        XCTAssertTrue(issue.displayText.contains("DELIVERY_SESSION_RUNNING"))
+        XCTAssertTrue(issue.displayText.contains("Wait until the session is idle."))
+
+        var draft = PartialDeliveryDraft()
+        XCTAssertThrowsError(try draft.makeRequest())
+        draft.remainingWorkText = "T1: finish the check"
+        XCTAssertNoThrow(try draft.makeRequest())
+    }
+
+    func testSessionDeliverySelectionGuardsRejectOtherSessionsAndSchemas() throws {
+        let readiness = try readiness(level: "partial")
+        let record = PartialDeliveryRecordView(
+            id: "pd-20",
+            sessionID: "ses-1",
+            summary: "Partial only"
+        )
+        let result = SessionDeliveryResultView(
+            sessionID: "ses-1",
+            partial: record,
+            readiness: readiness
+        )
+        XCTAssertNotNil(result.partialRecord(for: "ses-1"))
+        XCTAssertNil(result.partialRecord(for: "ses-2"))
+        XCTAssertNil(result.partialRecord(for: ""))
+
+        let wrongSchema = PartialDeliveryRecordView(
+            schema: "other/v1",
+            id: "pd-21",
+            sessionID: "ses-1",
+            summary: "Unknown schema"
+        )
+        let wrongSchemaResult = SessionDeliveryResultView(
+            sessionID: "ses-1",
+            partial: wrongSchema,
+            readiness: readiness
+        )
+        XCTAssertNil(wrongSchemaResult.partialRecord(for: "ses-1"))
+
+        let mismatched = PartialDeliveryRecordView(
+            id: "pd-22",
+            sessionID: "ses-2",
+            summary: "Wrong session"
+        )
+        let mismatchedResult = SessionDeliveryResultView(
+            sessionID: "ses-1",
+            partial: mismatched,
+            readiness: readiness
+        )
+        XCTAssertNil(mismatchedResult.partialRecord(for: "ses-1"))
+
+        let emptySession = SessionDeliveryResultView(
+            sessionID: "",
+            partial: record,
+            readiness: readiness
+        )
+        XCTAssertNil(emptySession.partialRecord(for: "ses-1"))
+    }
+
     private func pauseEvent(
         seq: UInt64,
         sessionID: String = "ses-1",
