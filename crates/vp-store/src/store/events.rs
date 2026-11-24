@@ -113,6 +113,18 @@ impl Store {
         Ok(seq.max(0) as u64)
     }
 
+    /// Newest event sequence for a session, used as a cheap cache key for
+    /// derived snapshots. Returns zero for a session with no events.
+    pub fn latest_session_seq(&self, session_id: &str) -> Result<u64> {
+        let conn = self.lock()?;
+        let seq = conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(seq.max(0) as u64)
+    }
+
     /// Latest events for a session in ascending order. Used by coordination
     /// views/tools that need the recent board without loading full history.
     pub fn recent_events(&self, session_id: &str, limit: u32) -> Result<Vec<Event>> {

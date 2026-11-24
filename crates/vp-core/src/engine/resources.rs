@@ -8,6 +8,7 @@ use super::*;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use vp_protocol::types::{
     AutoBudgetCaps, AutoBudgetExtension, BudgetMode, ProjectRunPolicy, ReadinessSnapshot,
     ResourceAttention, ResourceCount, ResourceDimension, ResourceSnapshot, ResourceSoftTargets,
@@ -16,6 +17,13 @@ use vp_protocol::types::{
     SetSessionBudgetParams, TopUpSessionResourcesParams,
 };
 
+const READINESS_CACHE_TTL: Duration = Duration::from_secs(2);
+const READINESS_CACHE_MAX_ENTRIES: usize = 64;
+
+fn readiness_cache_hit(cached: &CachedReadiness, seq: u64, now: Instant) -> bool {
+    cached.seq == seq && now.saturating_duration_since(cached.cached_at) <= READINESS_CACHE_TTL
+}
+
 impl Engine {
     async fn resource_session(&self, session_id: &str) -> Result<Session> {
         let store = self.store.clone();
@@ -23,6 +31,39 @@ impl Engine {
         tokio::task::spawn_blocking(move || store.get_session(&id))
             .await??
             .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))
+    }
+
+    async fn latest_session_seq(&self, session_id: &str) -> Result<u64> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        tokio::task::spawn_blocking(move || store.latest_session_seq(&id)).await?
+    }
+
+    fn cache_readiness(&self, session_id: &str, seq: u64, snapshot: &ReadinessSnapshot) {
+        let Ok(mut cache) = self.readiness_cache.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        cache.retain(|_, cached| {
+            now.saturating_duration_since(cached.cached_at) <= READINESS_CACHE_TTL
+        });
+        if cache.len() >= READINESS_CACHE_MAX_ENTRIES
+            && !cache.contains_key(session_id)
+            && let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, cached)| cached.cached_at)
+                .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest);
+        }
+        cache.insert(
+            session_id.to_string(),
+            CachedReadiness {
+                seq,
+                cached_at: now,
+                snapshot: snapshot.clone(),
+            },
+        );
     }
 
     async fn project_run_policy_record(
@@ -38,7 +79,33 @@ impl Engine {
     /// Bounded, newest-first readiness projection. It is intentionally
     /// conservative: `verified`/`merged` come from the merge queue and effect
     /// receipts, not from an agent's prose claim.
+    /// Fresh readiness. Explicit reads and state-changing operations use this
+    /// path; a direct worktree edit is reflected immediately.
     pub async fn session_readiness(&self, session_id: &str) -> Result<ReadinessSnapshot> {
+        self.compute_session_readiness(session_id).await
+    }
+
+    /// Short-lived readiness cache for the read-only resource card. It is keyed
+    /// by the newest event sequence and a 2-second TTL, so any appended event
+    /// invalidates it. An explicit external worktree edit can lag by the TTL;
+    /// callers that need exact freshness use `session_readiness`.
+    pub(crate) async fn session_readiness_cached(
+        &self,
+        session_id: &str,
+    ) -> Result<ReadinessSnapshot> {
+        let seq = self.latest_session_seq(session_id).await?;
+        if let Ok(cache) = self.readiness_cache.lock()
+            && let Some(cached) = cache.get(session_id).cloned()
+            && readiness_cache_hit(&cached, seq, Instant::now())
+        {
+            return Ok(cached.snapshot);
+        }
+        let snapshot = self.compute_session_readiness(session_id).await?;
+        self.cache_readiness(session_id, seq, &snapshot);
+        Ok(snapshot)
+    }
+
+    async fn compute_session_readiness(&self, session_id: &str) -> Result<ReadinessSnapshot> {
         let session = self.resource_session(session_id).await?;
         let effects = self.session_effects(session_id, None, false, 200).await?;
         let queue = self.list_merge_queue(session_id).await?;
@@ -145,7 +212,7 @@ impl Engine {
         let merge = queue.last().map(|entry| entry.status.clone());
         let partial_delivery = self.latest_partial_delivery(session_id).await?;
 
-        Ok(ReadinessSnapshot {
+        let snapshot = ReadinessSnapshot {
             session_id: session_id.to_string(),
             level: level.to_string(),
             shippable: matches!(level, "verified" | "merged") && blockers.is_empty(),
@@ -159,14 +226,15 @@ impl Engine {
             blockers,
             partial_delivery,
             generated_at: now_rfc3339(),
-        })
+        };
+        Ok(snapshot)
     }
 
     /// Bounded multi-resource snapshot. All values are derived; a missing
     /// price or test signal is reported as unavailable, never fabricated.
     pub async fn session_resources(&self, session_id: &str) -> Result<ResourceSnapshot> {
         let session = self.resource_session(session_id).await?;
-        let readiness = self.session_readiness(session_id).await?;
+        let readiness = self.session_readiness_cached(session_id).await?;
         let (project_run_policy, _) = self.project_run_policy_record(&session.project_id).await?;
         let contract_override = self.run_contract_override(session_id).await?;
         let profile = contract_override
@@ -2018,5 +2086,37 @@ mod tests {
         assert_eq!(attention.interrupts, 8);
         assert_eq!(risk, 13);
         assert_eq!(attention.by_risk.len(), 2);
+    }
+
+    #[test]
+    fn readiness_cache_hit_requires_the_same_event_seq_and_short_ttl() {
+        let now = Instant::now();
+        let snapshot = ReadinessSnapshot {
+            session_id: "ses-1".into(),
+            level: "committed".into(),
+            shippable: false,
+            mergeable: false,
+            latest_commit: Some("abc123".into()),
+            latest_test: None,
+            verifier: None,
+            merge: None,
+            changed_paths: Vec::new(),
+            remaining_work: Vec::new(),
+            blockers: Vec::new(),
+            partial_delivery: None,
+            generated_at: "2026-11-25T00:00:00Z".into(),
+        };
+        let cached = CachedReadiness {
+            seq: 9,
+            cached_at: now - Duration::from_millis(500),
+            snapshot,
+        };
+        assert!(readiness_cache_hit(&cached, 9, now));
+        assert!(!readiness_cache_hit(&cached, 10, now));
+        assert!(!readiness_cache_hit(
+            &cached,
+            9,
+            now + READINESS_CACHE_TTL + Duration::from_secs(1)
+        ));
     }
 }

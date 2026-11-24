@@ -5,9 +5,10 @@
   (2026-11-23). Run Contract/resource observability R1, the P0 tool-friction
   fixes, R2a profile/top-up/pre-dispatch, and R2b core lean turn-boundary pause +
   token/cost/time child Auto request-fit + attention batch prompt + explicit
-  partial delivery + rescue reserve/allocation preview + macOS top-up/pause/
-  project policy are implemented (2026-11-25); automatic envelope reallocation
-  and R3/R4 remain. Open findings and live evidence are tracked in
+  partial delivery + rescue reserve/allocation preview + readiness snapshot
+  cache + macOS top-up/pause/project policy complete R2b (2026-11-25); R3
+  per-task envelope/automatic reallocation and R4 remain. Open findings and
+  live evidence are tracked in
   [V1_READINESS_LEDGER.md](V1_READINESS_LEDGER.md).
 - Date: 2026-11-22 (live validation update 2026-11-23)
 - Owner: Verlintas

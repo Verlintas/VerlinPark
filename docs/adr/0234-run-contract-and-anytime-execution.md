@@ -265,8 +265,9 @@ Negative and limits:
    approves, completes, or resumes. A short-lived event-only rescue grant can
    release only the completion reserve for clean near-completion fixed-budget
    work, and an allocation preview recommends (but does not enact)
-   reallocation. Automatic envelope reallocation and governor snapshot caching
-   remain.
+   reallocation. A bounded 2-second readiness snapshot cache serves explicit
+   resource views, keyed by the newest event sequence; the turn governor never
+   reads it. Automatic task-envelope reallocation is R3.
 4. **R3 allocate**: task/plan-aware allocation, automatic envelope
    reallocation, learning from actuals, metareasoning/replan.
 5. **R4 deliver**: anytime UI, trade-off frontier, calibrated trust, daily

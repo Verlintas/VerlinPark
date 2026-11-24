@@ -1,6 +1,6 @@
 # Run Contract and Resource Governor plan
 
-- Status: Accepted; P0/R1/R2a/R2b core implemented (lean turn-boundary pause, child Auto request-fit incl. cost/time, project RunPolicy, attention batch prompt, explicit partial delivery, rescue reserve + allocation preview, macOS top-up/pause/project policy); R2b automatic envelope reallocation, governor snapshot caching, and R3/R4 open
+- Status: Accepted; P0/R1/R2a/R2b implemented (lean turn-boundary pause, child Auto request-fit incl. cost/time, project RunPolicy, attention batch prompt, explicit partial delivery, rescue reserve + allocation advisory, readiness snapshot cache, macOS operator surfaces); R3 automatic envelope reallocation/per-task envelopes and R4 open
 - Date: 2026-11-24
 - Owner: Verlintas
 - Scope: V1 single-project coding
@@ -435,7 +435,13 @@ Phase R2b (implemented core):
 - macOS top-up/readiness, project policy editor, event-derived pause banner,
   a bounded attention batch prompt with Inbox/Policy actions, an explicit
   partial-delivery record sheet, and a rescue-reserve confirmation surface.
-- Open: automatic envelope reallocation, governor snapshot caching.
+- Readiness snapshot cache for the resource card: 2-second TTL, keyed by the
+  newest session event sequence, bounded to 64 sessions, and bypassed by
+  `session.readiness`/state-changing operations. The lean turn path remains
+  uncached and does not call readiness.
+- No R2b items remain. Automatic task-envelope mutation is deliberately in R3,
+  where it belongs with per-task envelope allocation; R2b provides the rescue
+  action and advisory allocation preview.
 
 ### 13.2 CLI
 
@@ -528,7 +534,7 @@ secrets; no unbounded data.
 Acceptance: override validation/event replay, governor attention/reserve tests,
 fixed top-up clamping, daemon RPC tests, Swift profile tests.
 
-### R2b — Govern (core implemented; remaining below)
+### R2b — Govern (implemented)
 
 Implemented:
 
@@ -586,9 +592,9 @@ Implemented:
 
 Remaining:
 
-- Automatic envelope reallocation (reduce exploration/low-value work and
-  reallocate budgets); the current preview only recommends it.
-- Governor snapshot caching for large worktrees/plans.
+- None in R2b. Automatic task-envelope reallocation is deliberately R3, where
+  it belongs with per-task envelope allocation; the current allocation preview
+  only recommends it.
 
 ### R3 — Allocate (next)
 
@@ -656,6 +662,8 @@ Implemented **P0 + R1 + R2a + R2b core**:
 - bounded attention batch prompt with approval Inbox and policy actions;
 - explicit partial-delivery record with RPC/CLI/Stage UI;
 - rescue reserve grant + read-only allocation preview with RPC/CLI/Stage UI;
+- readiness snapshot cache for explicit resource views;
 - ledger/docs updated with the multi-resource model.
 
-Next: automatic envelope reallocation, governor snapshot caching, then R3/R4.
+Next: R3 allocate (per-task envelopes and automatic envelope reallocation),
+then R4 deliver.

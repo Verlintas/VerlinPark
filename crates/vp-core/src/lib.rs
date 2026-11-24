@@ -237,6 +237,17 @@ pub struct RunLeaseHeartbeat {
     pub warnings: Vec<String>,
 }
 
+/// Short-lived readiness snapshot keyed by the newest session event sequence.
+/// Readiness runs `git status` plus queue/effect queries; explicit operator
+/// views can reuse a snapshot for a couple of seconds, and any newly appended
+/// event invalidates it by sequence.
+#[derive(Clone)]
+pub(crate) struct CachedReadiness {
+    pub(crate) seq: u64,
+    pub(crate) cached_at: std::time::Instant,
+    pub(crate) snapshot: vp_protocol::types::ReadinessSnapshot,
+}
+
 #[derive(Clone)]
 pub struct Engine {
     store: Store,
@@ -265,6 +276,9 @@ pub struct Engine {
     /// One async mutex per project workspace. Same-component Worker runs in one
     /// session serialize; different components remain parallel.
     workspace_runs: Arc<WorkspaceRunLocks>,
+    /// Bounded, in-process readiness cache for explicit resource/readiness
+    /// views. It is never used by the lean turn governor.
+    readiness_cache: Arc<Mutex<HashMap<String, CachedReadiness>>>,
 }
 
 /// In-process serialization for workspace-bound Worker runs. Cross-session
@@ -340,6 +354,7 @@ impl Engine {
             continuation_claims: Arc::new(Mutex::new(HashMap::new())),
             pin_sync: Arc::new(tokio::sync::Mutex::new(())),
             workspace_runs: Arc::new(WorkspaceRunLocks::default()),
+            readiness_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 

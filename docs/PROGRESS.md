@@ -134,13 +134,20 @@ pre-dispatch deferral，不改变 approval/Verifier/merge 行为：
   并追加一次 `session.resource.rescue.used` receipt。CLI `rescue-status` /
   `rescue` 和 Stage confirmation sheet 已接入。allocation preview 的
   reallocation 只是 recommendation，不自动修改 task envelope。
-- R2b 仍未做 automatic envelope reallocation 和 governor 快照缓存。
+- Governor snapshot cache：`session_resources` 的 readiness 使用 2 秒 TTL、
+  以 session 最新 event seq 为 key、最多 64 个 session 的 in-process cache；
+  任何新 event 都会因 seq 改变而失效。`session.readiness`、partial delivery、
+  rescue grant 和所有 state-changing 操作仍走 fresh 路径；lean turn governor
+  不使用该 cache。这样大 worktree 的 `git status` 只在显式资源视图重复调用时
+  被复用，不会在 turn boundary 引入陈旧 readiness。
+- R2b 已完成；automatic task-envelope reallocation 按 ADR 归入 R3。
 - 测试：R1 full workspace **4,546**；R2a 后 **4,551**；R2b core 后 **4,554**；
   项目 RunPolicy 后 **4,559**；R2b final（lean turn/cost-time/UI）后
   **4,570**；attention batch prompt 后 **4,571**；explicit partial delivery
-  后 **4,584**；rescue reserve 后 **4,597 passed / 0 failed / 6 ignored**，
+  后 **4,584**；rescue reserve 后 **4,597**；readiness snapshot cache 后
+  **4,598 passed / 0 failed / 6 ignored**，
   `cargo clippy --workspace --all-targets -- -D warnings` 通过。targeted：
-  27 auto-budget、368 agent、13 resource、2 project-policy/rebuild、2 protocol
+  27 auto-budget、368 agent、14 resource、2 project-policy/rebuild、2 protocol
   stop-policy、3 partial-delivery protocol、6 delivery engine、3 rescue
   protocol、6 rescue engine、434 store、54 daemon、194 CLI、35 Swift
   `ResourceGovernorTests`、6 Swift `MarkdownTranscriptTests`，full Swift
