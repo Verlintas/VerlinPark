@@ -4,9 +4,9 @@
   Inspector/Direct Channel implemented (2026-11-22) and live-provider exercised
   (2026-11-23). Run Contract/resource observability R1, the P0 tool-friction
   fixes, R2a profile/top-up/pre-dispatch, and R2b core turn-boundary pause +
-  Worker/Labour auto request-fit + macOS top-up are implemented (2026-11-24);
-  attention batching, project run policy, explicit partial-delivery action, and
-  R3/R4 remain. Open findings and live evidence are tracked in
+  Worker/Labour auto request-fit + macOS top-up + project RunPolicy are
+  implemented (2026-11-24); attention batching, explicit partial-delivery
+  action, and R3/R4 remain. Open findings and live evidence are tracked in
   [V1_READINESS_LEDGER.md](V1_READINESS_LEDGER.md).
 - Date: 2026-11-22 (live validation update 2026-11-23)
 - Owner: Verlintas

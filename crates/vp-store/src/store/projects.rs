@@ -95,6 +95,72 @@ impl Store {
         .map_err(Into::into)
     }
 
+    /// Project-level Run Contract policy. A missing row is the derived
+    /// balanced default, not an implicit project policy.
+    pub fn get_project_run_policy(&self, project_id: &str) -> Result<ProjectRunPolicy> {
+        Ok(self.get_project_run_policy_record(project_id)?.0)
+    }
+
+    /// Return the stored policy plus its update timestamp, if a row exists.
+    /// `None` distinguishes an absent policy from an explicitly default one.
+    pub fn get_project_run_policy_record(
+        &self,
+        project_id: &str,
+    ) -> Result<(ProjectRunPolicy, Option<String>)> {
+        let conn = self.lock()?;
+        let stored: Option<(String, String)> = conn
+            .query_row(
+                "SELECT policy, updated_at FROM project_run_policies WHERE project_id = ?1",
+                params![project_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        match stored {
+            Some((raw, updated_at)) => {
+                let policy: ProjectRunPolicy =
+                    serde_json::from_str(&raw).context("parsing stored project run policy")?;
+                policy
+                    .validate()
+                    .map_err(|error| anyhow!("stored project run policy is invalid: {error}"))?;
+                Ok((policy, Some(updated_at)))
+            }
+            None => Ok((ProjectRunPolicy::default(), None)),
+        }
+    }
+
+    /// Validate and upsert a project Run Contract policy. Returns the stored
+    /// `updated_at` timestamp. The policy cannot widen any safety or capacity
+    /// gate; those remain independent project/session policy surfaces.
+    pub fn set_project_run_policy(
+        &self,
+        project_id: &str,
+        policy: &ProjectRunPolicy,
+    ) -> Result<String> {
+        policy.validate()?;
+        let encoded = serde_json::to_string(policy)?;
+        let now = now_rfc3339();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let exists: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM projects WHERE id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+        if exists == 0 {
+            return Err(anyhow!("project not found: {project_id}"));
+        }
+        tx.execute(
+            "INSERT INTO project_run_policies (project_id, policy, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(project_id) DO UPDATE SET
+                policy = excluded.policy,
+                updated_at = excluded.updated_at",
+            params![project_id, encoded, now],
+        )?;
+        tx.commit()?;
+        Ok(now)
+    }
+
     /// Append a full project/policy snapshot to `projects.jsonl`. The latest
     /// line per project is used by `read_project_manifest` for rebuilds.
     pub fn record_project_manifest(&self) -> Result<()> {
@@ -122,6 +188,8 @@ impl Store {
             )?;
             let (team_templates, project_team_templates, team_template_events) =
                 crate::store::team_template::manifest_records(self, &project.id)?;
+            let (run_policy, run_policy_updated_at) =
+                self.get_project_run_policy_record(&project.id)?;
             let snapshot = ProjectManifestSnapshot {
                 version: PROJECT_MANIFEST_VERSION,
                 truncated: false,
@@ -201,6 +269,7 @@ impl Store {
                 task_scheduler_policy: self.get_task_scheduler_policy(&project.id)?,
                 scaling_policy: self.get_scaling_policy(&project.id)?,
                 session_run_policy: self.get_session_run_policy(&project.id)?,
+                run_policy: run_policy_updated_at.map(|_| run_policy),
                 memory_policy: self.get_memory_policy(&project.id)?,
                 source_embedding_policy: self.get_source_embedding_policy(&project.id)?,
                 source_retrieval_policy: self.get_source_retrieval_policy(&project.id)?,

@@ -313,6 +313,64 @@ pub(super) async fn dispatch(
             )
             .await?
         }
+        Command::ProjectRunPolicy { project } => {
+            rpc(
+                &discovery,
+                "project.run_policy.get",
+                json!({"project_id": project}),
+            )
+            .await?
+        }
+        Command::ProjectRunPolicySet {
+            project,
+            profile,
+            reserve,
+            attention_cap,
+            no_progress_turns,
+        } => {
+            if profile.is_none()
+                && reserve.is_none()
+                && attention_cap.is_none()
+                && no_progress_turns.is_none()
+            {
+                bail!(
+                    "pass at least one of --profile, --reserve, --attention-cap, or --no-progress-turns"
+                );
+            }
+            // Read-modify-write: unspecified fields keep the stored policy.
+            let current = rpc(
+                &discovery,
+                "project.run_policy.get",
+                json!({"project_id": project}),
+            )
+            .await?;
+            let mut policy: vp_protocol::types::ProjectRunPolicy = serde_json::from_value(
+                current.get("policy").cloned().unwrap_or_else(|| json!({})),
+            )?;
+            if let Some(profile) = profile {
+                policy.default_profile = vp_protocol::types::RunProfile::parse(&profile)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "profile must be quality, balanced, fast, cheap, or unattended"
+                        )
+                    })?;
+            }
+            if let Some(reserve) = reserve {
+                policy.completion_reserve_ratio = reserve;
+            }
+            if let Some(attention_cap) = attention_cap {
+                policy.attention_cap = attention_cap;
+            }
+            if let Some(no_progress_turns) = no_progress_turns {
+                policy.stop_policy.no_progress_turns = no_progress_turns;
+            }
+            rpc(
+                &discovery,
+                "project.run_policy.set",
+                json!({"project_id": project, "policy": policy}),
+            )
+            .await?
+        }
         Command::Governor { session, limit } => {
             rpc(
                 &discovery,
@@ -764,5 +822,45 @@ mod tests {
     fn policy_file_requires_an_object() {
         assert!(parse_auto_budget_policy_json("[1, 2]").is_err());
         assert!(parse_auto_budget_policy_json("not json").is_err());
+    }
+
+    #[test]
+    fn project_run_policy_commands_parse_and_keep_partial_fields() {
+        let cli = Cli::try_parse_from(["vp", "project-run-policy", "proj-1"]).unwrap();
+        match cli.command {
+            Command::ProjectRunPolicy { project } => assert_eq!(project, "proj-1"),
+            other => panic!("expected project-run-policy, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "vp",
+            "project-run-policy-set",
+            "proj-1",
+            "--profile",
+            "fast",
+            "--reserve",
+            "0.3",
+            "--attention-cap",
+            "9",
+            "--no-progress-turns",
+            "4",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::ProjectRunPolicySet {
+                project,
+                profile,
+                reserve,
+                attention_cap,
+                no_progress_turns,
+            } => {
+                assert_eq!(project, "proj-1");
+                assert_eq!(profile.as_deref(), Some("fast"));
+                assert_eq!(reserve, Some(0.3));
+                assert_eq!(attention_cap, Some(9));
+                assert_eq!(no_progress_turns, Some(4));
+            }
+            other => panic!("expected project-run-policy-set, got {other:?}"),
+        }
     }
 }

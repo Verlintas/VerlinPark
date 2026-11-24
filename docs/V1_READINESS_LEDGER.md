@@ -114,13 +114,20 @@ Implemented the observe/operator slice from ADR-0234:
 - macOS adds a Top Up sheet, capped/resumed truth, readiness caveats, bounded
   report copy, and tests. It never removes a cap or claims a resume/merge the
   daemon did not report.
+- Project-level RunPolicy adds persisted defaults (profile/reserve/attention/
+  stop), manifest recording and `db-rebuild` restore, RPC
+  `project.run_policy.get/set`, and CLI `project-run-policy` /
+  `project-run-policy-set`. Session overrides win field-by-field; source is
+  `session_override` / `project_policy` / `derived`. It cannot widen any safety
+  or capacity gate.
 
-Tests: R2b targeted: 23 auto-budget runtime tests, 368 `agent::tests`, 7
-resource tests, 3 daemon RPC tests, 11 Swift `ResourceGovernorTests`; P0 tests
-remain. Final full workspace after R2b: **4,554 passed, 0 failed, 6 ignored**;
-clippy exit 0. R2a's final full run was 4,551 passed, 0 failed, 6 ignored; a
-live temp-daemon CLI smoke exercised `run-contract-set`, `resources`, `top-up`,
-and `readiness` end to end.
+Tests: R2b targeted: 23 auto-budget runtime tests, 368 `agent::tests`, 8
+resource tests, 2 project-policy/rebuild tests, 434 store tests, 52 daemon
+tests, 187 CLI tests, 11 Swift `ResourceGovernorTests`; P0 tests remain. Final
+full workspace after project policy: **4,559 passed, 0 failed, 6 ignored**;
+clippy exit 0. R2b core before project policy was 4,554; R2a was 4,551. A live
+temp-daemon CLI smoke exercised `run-contract-set`, `resources`, `top-up`, and
+`readiness` end to end.
 
 ## Carried findings from the V1 plan
 
@@ -149,7 +156,7 @@ ledger does not claim they are fixed.
 
 ## Verification commands
 
-Rust targeted final (after the last steering guard and P0/R1/R2a):
+Rust targeted final (after the last steering guard and P0/R1/R2a/R2b):
 
 ```bash
 cargo test -p vp-core --lib steering
@@ -157,7 +164,11 @@ cargo test -p vp-core --lib steering
 cargo test -p vp-daemon --bin verlinpadd tests::agent_operator_rpc_tests
 # 3 passed, 0 failed (operator route, read-only snapshots, contract override/top-up RPCs)
 cargo test -p vp-core --lib engine::resources::tests
-# 7 passed, 0 failed (snapshot/readiness/attention/governor/override/top-up)
+# 8 passed, 0 failed (snapshot/readiness/attention/governor/override/top-up/project defaults)
+cargo test -p vp-core --lib project_run_policy
+# 2 passed, 0 failed (project defaults/override precedence + manifest rebuild)
+cargo test -p vp-store --lib
+# 434 passed, 0 failed (incl. project RunPolicy round-trip/validation)
 cargo test -p vp-core --lib agent::auto_budget_runtime_tests
 # 23 passed, 0 failed (child request-fit, turn pause/resume, no-progress, wall clock)
 cargo test -p vp-core --lib agent::tests
@@ -174,19 +185,23 @@ cargo test -p vp-core --lib 'contract::tests::shell_scratch'
 # 1 passed, 0 failed
 cargo test -p vp-core --lib 'agent::plan::execute::tests'
 # 1 passed, 0 failed (EFFECT_UNKNOWN blocked classification)
+cargo test -p vp-daemon
+# 52 unit + 1 governance passed
+cargo test -p vp-cli
+# 187 unit + 10 integration + 1 governance passed
 ```
 
-Final full workspace after R2b (2026-11-24, healthy boot):
+Final full workspace after R2b project policy (2026-11-24, healthy boot):
 
 ```bash
 cargo test --workspace
-# 4,554 passed, 0 failed, 6 ignored
+# 4,559 passed, 0 failed, 6 ignored
 cargo clippy --workspace --all-targets -- -D warnings
 # exit 0
 ```
 
-R2a's final run was 4,551 passed / 0 failed / 6 ignored; R1's earlier run was
-4,546 passed / 0 failed / 6 ignored.
+R2b before project policy was 4,554 passed / 0 failed / 6 ignored; R2a was
+4,551; R1 was 4,546.
 
 The earlier full run before P0/R1 also passed every crate except the daemon
 operator test, which was fixed and is covered above. The host XProtect/

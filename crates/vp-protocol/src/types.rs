@@ -3695,6 +3695,61 @@ impl RunContractOverride {
     }
 }
 
+/// Project-scoped default Run Contract policy. It supplies the effective
+/// profile/reserve/attention/stop defaults for sessions that have no explicit
+/// operator override. It cannot widen approvals, sandbox, contracts, budgets,
+/// capacity, Verifier/Integrator gates, or model routing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectRunPolicy {
+    #[serde(default)]
+    pub default_profile: RunProfile,
+    #[serde(default = "default_project_run_completion_reserve_ratio")]
+    pub completion_reserve_ratio: f64,
+    #[serde(default = "default_project_run_attention_cap")]
+    pub attention_cap: u32,
+    #[serde(default)]
+    pub stop_policy: RunStopPolicy,
+}
+
+fn default_project_run_completion_reserve_ratio() -> f64 {
+    0.20
+}
+
+fn default_project_run_attention_cap() -> u32 {
+    20
+}
+
+impl Default for ProjectRunPolicy {
+    fn default() -> Self {
+        Self {
+            default_profile: RunProfile::Balanced,
+            completion_reserve_ratio: default_project_run_completion_reserve_ratio(),
+            attention_cap: default_project_run_attention_cap(),
+            stop_policy: RunStopPolicy::default(),
+        }
+    }
+}
+
+impl ProjectRunPolicy {
+    pub fn validate(&self) -> Result<(), BudgetValidationError> {
+        if !self.completion_reserve_ratio.is_finite()
+            || !(0.0..=0.50).contains(&self.completion_reserve_ratio)
+        {
+            return Err(BudgetValidationError::new(
+                auto_budget_codes::INVALID_BUDGET,
+                "project completion reserve ratio must be between 0.0 and 0.5",
+            ));
+        }
+        if self.attention_cap == 0 || self.attention_cap > 1_000 {
+            return Err(BudgetValidationError::new(
+                auto_budget_codes::INVALID_BUDGET,
+                "project attention cap must be between 1 and 1000",
+            ));
+        }
+        Ok(())
+    }
+}
+
 pub const SESSION_RUN_CONTRACT_UPDATED_EVENT: &str = "session.run_contract.updated";
 pub const SESSION_RESOURCE_DECISION_EVENT: &str = "session.resource.decision";
 
@@ -3711,6 +3766,27 @@ pub struct SessionReadinessParams {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionRunContractParams {
     pub session_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProjectRunPolicyParams {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetProjectRunPolicyParams {
+    pub project_id: String,
+    pub policy: ProjectRunPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectRunPolicyResult {
+    pub project_id: String,
+    pub policy: ProjectRunPolicy,
+    /// `None` when no explicit project policy row exists and the defaults are
+    /// being reported.
+    #[serde(default)]
+    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

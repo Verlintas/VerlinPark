@@ -255,8 +255,9 @@ Negative and limits:
 3. **R2 govern**: R2a implements event-backed profile/contract overrides,
    bounded top-up, and pre-dispatch attention/risk/completion-reserve deferral;
    R2b core adds true turn-boundary pause/wait, Auto Budget request-fit for
-   Worker/Labour, and macOS top-up/readiness. Attention batching, project run
-   policy, explicit partial-delivery action, and rescue/reallocation remain.
+   Worker/Labour, project RunPolicy with manifest/rebuild, and macOS
+   top-up/readiness. Attention batching, explicit partial-delivery action,
+   rescue/reallocation, and cost/time-only child request-fit remain.
 4. **R3 allocate**: task/plan-aware allocation, rescue/reallocation, learning
    from actuals, metareasoning/replan.
 5. **R4 deliver**: anytime UI, trade-off frontier, calibrated trust, daily

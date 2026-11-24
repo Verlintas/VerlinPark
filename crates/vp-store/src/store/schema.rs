@@ -2438,6 +2438,7 @@ impl Store {
                 ON computer_leases(session_id);
             "#,
         )?;
+        super::schema_run_policy::ensure(&conn)?;
         let fts_migrated = conn
             .query_row(
                 "SELECT value FROM store_meta WHERE key = 'memory_fts'",

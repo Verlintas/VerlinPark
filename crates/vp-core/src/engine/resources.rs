@@ -9,9 +9,9 @@ use super::*;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use vp_protocol::types::{
-    AutoBudgetCaps, AutoBudgetExtension, BudgetMode, ReadinessSnapshot, ResourceAttention,
-    ResourceCount, ResourceDimension, ResourceSnapshot, ResourceSoftTargets, RunContractOverride,
-    RunContractView, RunProfile, SESSION_RESOURCE_DECISION_EVENT,
+    AutoBudgetCaps, AutoBudgetExtension, BudgetMode, ProjectRunPolicy, ReadinessSnapshot,
+    ResourceAttention, ResourceCount, ResourceDimension, ResourceSnapshot, ResourceSoftTargets,
+    RunContractOverride, RunContractView, SESSION_RESOURCE_DECISION_EVENT,
     SESSION_RUN_CONTRACT_UPDATED_EVENT, SessionBudgetStatus, SetRunContractParams,
     SetSessionBudgetParams, TopUpSessionResourcesParams,
 };
@@ -23,6 +23,16 @@ impl Engine {
         tokio::task::spawn_blocking(move || store.get_session(&id))
             .await??
             .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))
+    }
+
+    async fn project_run_policy_record(
+        &self,
+        project_id: &str,
+    ) -> Result<(ProjectRunPolicy, Option<String>)> {
+        let store = self.store.clone();
+        let project_id = project_id.to_string();
+        tokio::task::spawn_blocking(move || store.get_project_run_policy_record(&project_id))
+            .await?
     }
 
     /// Bounded, newest-first readiness projection. It is intentionally
@@ -153,16 +163,18 @@ impl Engine {
     /// Bounded multi-resource snapshot. All values are derived; a missing
     /// price or test signal is reported as unavailable, never fabricated.
     pub async fn session_resources(&self, session_id: &str) -> Result<ResourceSnapshot> {
+        let session = self.resource_session(session_id).await?;
         let readiness = self.session_readiness(session_id).await?;
+        let (project_run_policy, _) = self.project_run_policy_record(&session.project_id).await?;
         let contract_override = self.run_contract_override(session_id).await?;
         let profile = contract_override
             .as_ref()
             .map(|value| value.profile)
-            .unwrap_or(RunProfile::Balanced);
+            .unwrap_or(project_run_policy.default_profile);
         let attention_cap = contract_override
             .as_ref()
             .and_then(|value| value.attention_cap)
-            .unwrap_or(20);
+            .unwrap_or(project_run_policy.attention_cap);
         let budget = self.session_budget(session_id).await?;
         let usage = self.usage_totals(session_id).await?;
         let context = self.session_context_status(session_id).await?;
@@ -391,23 +403,25 @@ impl Engine {
         let budget = self.session_budget(session_id).await?;
         let plan = self.get_team_plan(session_id).await?;
         let effects = self.session_effects(session_id, None, false, 200).await?;
+        let (project_run_policy, project_run_policy_updated_at) =
+            self.project_run_policy_record(&session.project_id).await?;
         let contract_override = self.run_contract_override(session_id).await?;
         let profile = contract_override
             .as_ref()
             .map(|value| value.profile)
-            .unwrap_or(RunProfile::Balanced);
+            .unwrap_or(project_run_policy.default_profile);
         let completion_reserve_ratio = contract_override
             .as_ref()
             .and_then(|value| value.completion_reserve_ratio)
-            .unwrap_or(0.20);
+            .unwrap_or(project_run_policy.completion_reserve_ratio);
         let attention_cap = contract_override
             .as_ref()
             .and_then(|value| value.attention_cap)
-            .unwrap_or(20);
+            .unwrap_or(project_run_policy.attention_cap);
         let stop_policy = contract_override
             .as_ref()
             .and_then(|value| value.stop_policy.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|| project_run_policy.stop_policy.clone());
         let hard_token = budget.hard_token_cap.or(budget.effective_token_budget);
         let hard_cost = budget
             .hard_cost_cap_usd
@@ -447,6 +461,8 @@ impl Engine {
             profile: profile.as_str().to_string(),
             source: if contract_override.is_some() {
                 "session_override".to_string()
+            } else if project_run_policy_updated_at.is_some() {
+                "project_policy".to_string()
             } else {
                 "derived".to_string()
             },
@@ -1005,7 +1021,9 @@ mod tests {
     use serde_json::json;
     use std::process::Command;
     use tempfile::TempDir;
-    use vp_protocol::types::{PlanDepartment, PlanTask, RunStopPolicy, TeamPlan};
+    use vp_protocol::types::{
+        PlanDepartment, PlanTask, RunProfile, RunStopPolicy, SetProjectRunPolicyParams, TeamPlan,
+    };
 
     fn init_repo(path: &Path) {
         std::fs::write(path.join("README.md"), "hello\n").unwrap();
@@ -1242,6 +1260,79 @@ mod tests {
             .unwrap()
             .len();
         assert_eq!(after, before + 1);
+    }
+
+    #[tokio::test]
+    async fn project_run_policy_supplies_defaults_and_session_override_wins() {
+        let (_data, _repo, engine, session) = fixture().await;
+        let initial = engine.run_contract_view(&session.id).await.unwrap();
+        assert_eq!(initial.source, "derived");
+        assert_eq!(initial.profile, "balanced");
+        assert_eq!(initial.completion_reserve_ratio, 0.20);
+        assert_eq!(initial.attention_cap, 20);
+
+        let policy = ProjectRunPolicy {
+            default_profile: RunProfile::Fast,
+            completion_reserve_ratio: 0.30,
+            attention_cap: 7,
+            stop_policy: RunStopPolicy {
+                no_progress_turns: 4,
+                ..RunStopPolicy::default()
+            },
+        };
+        let saved = engine
+            .set_project_run_policy(SetProjectRunPolicyParams {
+                project_id: session.project_id.clone(),
+                policy: policy.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(saved.policy, policy);
+        assert!(saved.updated_at.is_some());
+
+        let project_contract = engine.run_contract_view(&session.id).await.unwrap();
+        assert_eq!(project_contract.source, "project_policy");
+        assert_eq!(project_contract.profile, "fast");
+        assert_eq!(project_contract.completion_reserve_ratio, 0.30);
+        assert_eq!(project_contract.attention_cap, 7);
+        assert_eq!(project_contract.stop_policy.no_progress_turns, 4);
+
+        let project_resources = engine.session_resources(&session.id).await.unwrap();
+        assert_eq!(project_resources.profile, "fast");
+        assert_eq!(
+            project_resources
+                .dimension("attention")
+                .and_then(|dimension| dimension.hard_cap),
+            Some(7.0)
+        );
+
+        // A session override still wins field-by-field; unspecified optional
+        // fields inherit the project policy instead of hardcoded defaults.
+        let overridden = engine
+            .set_run_contract(SetRunContractParams {
+                session_id: session.id.clone(),
+                profile: RunProfile::Quality,
+                completion_reserve_ratio: None,
+                attention_cap: None,
+                stop_policy: None,
+                updated_by: Some("operator".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(overridden.source, "session_override");
+        assert_eq!(overridden.profile, "quality");
+        assert_eq!(overridden.completion_reserve_ratio, 0.30);
+        assert_eq!(overridden.attention_cap, 7);
+        assert_eq!(overridden.stop_policy.no_progress_turns, 4);
+
+        let overridden_resources = engine.session_resources(&session.id).await.unwrap();
+        assert_eq!(overridden_resources.profile, "quality");
+        assert_eq!(
+            overridden_resources
+                .dimension("attention")
+                .and_then(|dimension| dimension.hard_cap),
+            Some(7.0)
+        );
     }
 
     #[tokio::test]

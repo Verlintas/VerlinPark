@@ -1,6 +1,6 @@
 # Run Contract and Resource Governor plan
 
-- Status: Accepted; P0/R1/R2a implemented, R2b core implemented (turn-boundary pause, Worker/Labour auto request-fit, macOS top-up/readiness); R2b attention batching/project run policy/partial-delivery action and R3/R4 open
+- Status: Accepted; P0/R1/R2a/R2b core implemented (turn-boundary pause, Worker/Labour auto request-fit, project RunPolicy, macOS top-up/readiness); R2b attention batching/partial-delivery action and R3/R4 open
 - Date: 2026-11-24
 - Owner: Verlintas
 - Scope: V1 single-project coding
@@ -427,11 +427,13 @@ Phase R2a (operator mutations implemented):
   `session.resource.decision` only when it changes; it blocks new plan work but
   does not pause/rebalance an active run or bypass verification.
 
-Phase R2b (open):
+Phase R2b (implemented core):
 
-- `project.run_policy.get/set`.
-- True turn-boundary pause/wait, attention budget prompt, reallocation/rescue,
-  Auto Budget extension for Worker/Labour requests.
+- `project.run_policy.get/set` (persisted SQLite + manifest/rebuild).
+- True turn-boundary pause/wait, Auto Budget request-fit for every role.
+- macOS top-up/readiness.
+- Open: attention prompt/batching, explicit partial-delivery/rescue,
+  cost/time-only child request-fit, governor snapshot caching.
 
 ### 13.2 CLI
 
@@ -442,6 +444,8 @@ Implemented:
 - `vp run-contract <session> [--json]`
 - `vp run-contract-set <session> --profile ... [--reserve ...] [--attention-cap ...] [--no-progress-turns ...]`
 - `vp top-up <session> [--tokens N] [--cost N] [--time N] [--resume]`
+- `vp project-run-policy <project>`
+- `vp project-run-policy-set <project> [--profile ...] [--reserve ...] [--attention-cap ...] [--no-progress-turns ...]`
 
 ### 13.3 macOS
 
@@ -533,13 +537,15 @@ Implemented:
   turns/no-progress state.
 - macOS Top Up sheet, capped/resumed truth, readiness caveats, bounded report
   copy.
+- Project-level Run Contract policy: persisted SQLite policy, manifest/rebuild,
+  `project.run_policy.get/set`, CLI `project-run-policy`/`project-run-policy-set`,
+  project defaults with session override precedence.
 - Readiness-blocked remains a dispatch gate, not a turn pause (avoids
   deadlocking approval/effect flows in an active run).
 
 Remaining:
 
 - Attention prompt/batching and operator policy change workflow.
-- Project-level run policy.
 - Explicit partial-delivery action and rescue/reallocation.
 - Cost-only/time-only Auto request-fit for Worker/Labour (current request-fit
   extends tokens; Leader runway owns cost/time).

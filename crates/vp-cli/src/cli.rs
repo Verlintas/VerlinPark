@@ -2306,6 +2306,27 @@ pub(crate) enum Command {
         #[arg(long)]
         csv: bool,
     },
+    /// Show a project's default Run Contract policy.
+    #[command(name = "project-run-policy")]
+    ProjectRunPolicy { project: String },
+    /// Update a project's default Run Contract policy. Unspecified fields keep
+    /// their current values.
+    #[command(name = "project-run-policy-set")]
+    ProjectRunPolicySet {
+        project: String,
+        /// Default profile: quality, balanced, fast, cheap, or unattended.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Completion reserve ratio (0.0-0.5); verification/merge may spend it.
+        #[arg(long)]
+        reserve: Option<f64>,
+        /// Maximum weighted operator interrupts before dispatch/turn pause.
+        #[arg(long)]
+        attention_cap: Option<u32>,
+        /// No-progress turn limit inherited by the contract view.
+        #[arg(long)]
+        no_progress_turns: Option<u32>,
+    },
     /// Enable or disable unlimited budget mode for a session.
     SessionUnlimited {
         session: String,

@@ -659,6 +659,48 @@ impl Engine {
         self.get_project_budget(project_id).await
     }
 
+    /// Project-level Run Contract defaults. A missing row reports the derived
+    /// balanced defaults with no `updated_at`, so callers can distinguish it
+    /// from an explicit project policy.
+    pub async fn get_project_run_policy(&self, project_id: &str) -> Result<ProjectRunPolicyResult> {
+        let store = self.store.clone();
+        let project_id_owned = project_id.to_string();
+        let (policy, updated_at) = tokio::task::spawn_blocking(move || {
+            if store.get_project(&project_id_owned)?.is_none() {
+                return Err(anyhow::anyhow!("project not found: {project_id_owned}"));
+            }
+            store.get_project_run_policy_record(&project_id_owned)
+        })
+        .await??;
+        Ok(ProjectRunPolicyResult {
+            project_id: project_id.to_string(),
+            policy,
+            updated_at,
+        })
+    }
+
+    /// Persist a validated project Run Contract policy. This only changes
+    /// effective defaults; it cannot widen approvals, sandbox, contracts,
+    /// budgets, capacity, Verifier/Integrator gates, or model routing.
+    pub async fn set_project_run_policy(
+        &self,
+        params: SetProjectRunPolicyParams,
+    ) -> Result<ProjectRunPolicyResult> {
+        params.policy.validate()?;
+        let store = self.store.clone();
+        let project_id = params.project_id.clone();
+        let policy = params.policy.clone();
+        let updated_at =
+            tokio::task::spawn_blocking(move || store.set_project_run_policy(&project_id, &policy))
+                .await??;
+        self.record_project_manifest_best_effort().await;
+        Ok(ProjectRunPolicyResult {
+            project_id: params.project_id,
+            policy: params.policy,
+            updated_at: Some(updated_at),
+        })
+    }
+
     pub async fn record_project_manifest(&self) -> Result<()> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.record_project_manifest()).await?

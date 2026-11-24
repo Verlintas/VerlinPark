@@ -125,6 +125,8 @@ pub(crate) async fn run_command(
         | Command::ProjectBudgetSet { .. }
         | Command::ProjectAutoBudget { .. }
         | Command::ProjectAutoBudgetSet { .. }
+        | Command::ProjectRunPolicy { .. }
+        | Command::ProjectRunPolicySet { .. }
         | Command::Governor { .. }
         | Command::CriticalPath { .. }
         | Command::GovernorPreview { .. }

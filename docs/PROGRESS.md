@@ -62,15 +62,22 @@ pre-dispatch deferral，不改变 approval/Verifier/merge 行为：
   Verifier；只有 top-level Leader 拥有 cumulative turns/no-progress。
 - R2b macOS：Stage Top Up sheet（tokens/cost/time + resume、capped/resumed
   真实状态）、readiness caveats/remaining work/blockers、bounded report 复制；
-  UI 不发明 cap、resume 或 merge 结论。R2b 仍未做 attention batching/prompt、
-  项目级 run policy、显式 partial-delivery action/rescue、cost/time-only child
-  request-fit 和 governor 快照缓存。
-- 测试：R1 full workspace **4,546**；R2a 后 **4,551**；R2b targeted 23
-  auto-budget + 368 agent + 7 resource + 3 daemon RPC + 11 Swift tests 均通过；
-  R2b 后最终 full workspace **4,554 passed / 0 failed / 6 ignored**，
-  `cargo clippy --workspace --all-targets -- -D warnings` 通过。宿主机
-  `syspolicyd`/XProtect spin 已单独调查并记录在
-  `HOST_SYSPOLICYD_INVESTIGATION.md`，不是仓库 bug。
+  UI 不发明 cap、resume 或 merge 结论。
+- R2b 项目级 RunPolicy：`ProjectRunPolicy`（profile/reserve/attention/stop
+  defaults）持久化到 SQLite `project_run_policies`，写入 manifest 并由
+  `db-rebuild` 恢复；RPC `project.run_policy.get/set`，CLI
+  `project-run-policy`/`project-run-policy-set`；`run_contract_view` /
+  `session_resources` 在 session override 之后使用项目默认值，source 区分
+  `session_override` / `project_policy` / `derived`。项目 policy 不能放宽任何
+  approval/sandbox/contract/capacity/Verifier/Integrator 门。
+- R2b 仍未做 attention batching/prompt、显式 partial-delivery action/rescue、
+  cost/time-only child request-fit 和 governor 快照缓存。
+- 测试：R1 full workspace **4,546**；R2a 后 **4,551**；R2b core 后 **4,554**；
+  项目 RunPolicy 后最终 full workspace **4,559 passed / 0 failed / 6 ignored**，
+  `cargo clippy --workspace --all-targets -- -D warnings` 通过。targeted：
+  23 auto-budget、368 agent、8 resource、2 project-policy/rebuild、434 store、
+  52 daemon、187 CLI、11 Swift tests 均通过。宿主机 `syspolicyd`/XProtect
+  spin 已单独调查并记录在 `HOST_SYSPOLICYD_INVESTIGATION.md`，不是仓库 bug。
 
 ## 2026-11-23 真实 DeepSeek + GUI 验证与 two hardenings
 

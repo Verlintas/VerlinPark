@@ -1765,6 +1765,72 @@ mod protocol_transport_tests {
     }
 
     #[tokio::test]
+    async fn project_run_policy_rpcs_round_trip_and_validate() {
+        let (_data, _repo, state) = project_state().await;
+        let project = first_project_id(&state).await;
+
+        let response = budget_call(
+            &state,
+            "project.run_policy.get",
+            json!({"project_id": project}),
+        )
+        .await;
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let default = response.result.unwrap();
+        assert_eq!(default["policy"]["default_profile"], "balanced");
+        assert_eq!(default["policy"]["completion_reserve_ratio"], 0.20);
+        assert_eq!(default["policy"]["attention_cap"], 20);
+        assert!(default["updated_at"].is_null());
+
+        let response = budget_call(
+            &state,
+            "project.run_policy.set",
+            json!({
+                "project_id": project,
+                "policy": {"completion_reserve_ratio": 0.75},
+            }),
+        )
+        .await;
+        let error = response.error.expect("invalid reserve must fail");
+        assert_eq!(error.code, codes::INVALID_PARAMS);
+        let data = error.data.expect("typed policy code");
+        assert_eq!(data["code"], "INVALID_BUDGET");
+
+        let response = budget_call(
+            &state,
+            "project.run_policy.set",
+            json!({
+                "project_id": project,
+                "policy": {
+                    "default_profile": "fast",
+                    "completion_reserve_ratio": 0.30,
+                    "attention_cap": 9,
+                    "stop_policy": {"no_progress_turns": 4}
+                },
+            }),
+        )
+        .await;
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let saved = response.result.unwrap();
+        assert_eq!(saved["policy"]["default_profile"], "fast");
+        assert_eq!(saved["policy"]["completion_reserve_ratio"], 0.30);
+        assert_eq!(saved["policy"]["attention_cap"], 9);
+        assert_eq!(saved["policy"]["stop_policy"]["no_progress_turns"], 4);
+        assert!(saved["updated_at"].is_string());
+
+        let response = budget_call(
+            &state,
+            "project.run_policy.get",
+            json!({"project_id": project}),
+        )
+        .await;
+        let stored = response.result.unwrap();
+        assert_eq!(stored["policy"]["default_profile"], "fast");
+        assert_eq!(stored["policy"]["attention_cap"], 9);
+        assert_eq!(stored["updated_at"], saved["updated_at"]);
+    }
+
+    #[tokio::test]
     async fn session_budget_set_keeps_legacy_unlimited_requests_working() {
         let (_data, _repo, state) = project_state().await;
         let project = first_project_id(&state).await;

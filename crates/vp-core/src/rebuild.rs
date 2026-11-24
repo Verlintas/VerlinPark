@@ -449,6 +449,15 @@ pub async fn rebuild_database(data_dir: &Path, dry_run: bool) -> Result<RebuildR
                 .set_task_scheduler_policy(&snapshot.project.id, &snapshot.task_scheduler_policy)?;
             store.set_scaling_policy(&snapshot.project.id, &snapshot.scaling_policy)?;
             store.set_session_run_policy(&snapshot.project.id, &snapshot.session_run_policy)?;
+            if let Some(run_policy) = &snapshot.run_policy {
+                run_policy.validate().map_err(|error| {
+                    anyhow::anyhow!(
+                        "run policy for project {} is invalid: {error}",
+                        snapshot.project.id
+                    )
+                })?;
+                store.set_project_run_policy(&snapshot.project.id, run_policy)?;
+            }
             store.set_memory_policy(&snapshot.project.id, &snapshot.memory_policy)?;
             crate::source_embedding::validate_source_embedding_policy(
                 &snapshot.source_embedding_policy,
@@ -1560,5 +1569,80 @@ mod runtime_pin_rebuild_tests {
             .unwrap()
             .expect("plan runtime snapshot restored from events");
         assert!(crate::runtime_pin::parse_snapshot(&plan_snapshot).is_some());
+    }
+}
+
+#[cfg(test)]
+mod project_run_policy_rebuild_tests {
+    use super::*;
+    use std::path::Path;
+    use std::process::Command;
+    use tempfile::TempDir;
+    use vp_protocol::types::{
+        ProjectRunPolicy, RunProfile, RunStopPolicy, SetProjectRunPolicyParams,
+    };
+    use vp_store::Store;
+
+    fn init_repo(path: &Path) {
+        std::fs::write(path.join("README.md"), "hello\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@verlinpark.local"],
+            vec!["config", "user.name", "VerlinPark Test"],
+            vec!["add", "."],
+            vec!["commit", "-q", "-m", "initial"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(path)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rebuild_restores_an_explicit_project_run_policy() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let (project_id, policy) = {
+            let engine = Engine::new(Store::open(data.path()).unwrap());
+            let project = engine
+                .add_project(
+                    repo.path().to_string_lossy().to_string(),
+                    Some("run policy rebuild".into()),
+                )
+                .await
+                .unwrap();
+            let policy = ProjectRunPolicy {
+                default_profile: RunProfile::Quality,
+                completion_reserve_ratio: 0.25,
+                attention_cap: 12,
+                stop_policy: RunStopPolicy {
+                    no_progress_turns: 5,
+                    ..RunStopPolicy::default()
+                },
+            };
+            engine
+                .set_project_run_policy(SetProjectRunPolicyParams {
+                    project_id: project.id.clone(),
+                    policy: policy.clone(),
+                })
+                .await
+                .unwrap();
+            engine.record_project_manifest().await.unwrap();
+            (project.id, policy)
+        };
+
+        let report = rebuild_database(data.path(), false).await.unwrap();
+        assert_eq!(report.projects, 1);
+        let engine = Engine::new(Store::open(data.path()).unwrap());
+        let restored = engine.get_project_run_policy(&project_id).await.unwrap();
+        assert_eq!(restored.policy, policy);
+        assert!(restored.updated_at.is_some());
     }
 }

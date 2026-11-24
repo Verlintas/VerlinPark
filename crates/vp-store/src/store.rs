@@ -31,7 +31,7 @@ use vp_protocol::types::{
     ModelPreset, OrchestrationDecision, OrchestrationNote, OrchestrationPolicy,
     OrchestrationRecovery, PlanTaskProgress, PreemptionPolicy, PreemptionSessionSummary,
     ProcessPolicy, Program, ProgramEvent, ProgramMilestone, ProgramMilestoneStatus, ProgramPolicy,
-    ProgramStatus, ProgramUsage, Project, ProjectAutoBudgetEvent, ProjectBudget,
+    ProgramStatus, ProgramUsage, Project, ProjectAutoBudgetEvent, ProjectBudget, ProjectRunPolicy,
     ProjectTeamTemplate, ProjectUsageSession, PromptPrefixAggregate, PromptPrefixObservation,
     PromptPrefixRecord, PromptSectionRef, Question, RunBudgetSnapshot, RunCheckpoint, RunStep,
     RunToolCall, ScheduledTask, SearchHit, Session, SessionAutoBudgetRecord, SessionBundle,
@@ -1524,6 +1524,11 @@ pub struct ProjectManifestSnapshot {
     pub scaling_policy: ScalingPolicy,
     #[serde(default)]
     pub session_run_policy: SessionRunPolicy,
+    /// Explicit project-level Run Contract policy. `None` preserves the
+    /// distinction between "no policy row" (derived defaults) and an explicit
+    /// default-valued policy, and lets older manifests decode unchanged.
+    #[serde(default)]
+    pub run_policy: Option<ProjectRunPolicy>,
     #[serde(default)]
     pub memory_policy: MemoryPolicy,
     /// Opt-in derived source embedding policy. Older manifests decode as
@@ -6754,6 +6759,7 @@ mod runs;
 mod runtime;
 mod scheduler;
 mod schema;
+mod schema_run_policy;
 mod sessions;
 mod sources;
 mod test_cache;

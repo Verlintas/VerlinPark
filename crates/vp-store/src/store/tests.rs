@@ -19735,3 +19735,70 @@ fn deferred_runs_are_terminal_and_cancellation_is_scoped_to_active_runs() {
         .unwrap();
     assert!(!store.session_run_cancel_requested(&session.id).unwrap());
 }
+
+#[test]
+fn project_run_policy_round_trips_manifest_and_legacy_defaults() {
+    let (_data, store, repo) = test_store();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("run policy"))
+        .unwrap();
+
+    let (default, updated_at) = store.get_project_run_policy_record(&project.id).unwrap();
+    assert_eq!(default, ProjectRunPolicy::default());
+    assert!(updated_at.is_none());
+    assert_eq!(
+        store.get_project_run_policy(&project.id).unwrap(),
+        ProjectRunPolicy::default()
+    );
+
+    let invalid = ProjectRunPolicy {
+        completion_reserve_ratio: 0.75,
+        ..ProjectRunPolicy::default()
+    };
+    assert!(store.set_project_run_policy(&project.id, &invalid).is_err());
+    assert!(
+        store
+            .get_project_run_policy_record(&project.id)
+            .unwrap()
+            .1
+            .is_none()
+    );
+
+    let policy = ProjectRunPolicy {
+        default_profile: vp_protocol::types::RunProfile::Fast,
+        completion_reserve_ratio: 0.30,
+        attention_cap: 9,
+        stop_policy: vp_protocol::types::RunStopPolicy {
+            no_progress_turns: 4,
+            ..vp_protocol::types::RunStopPolicy::default()
+        },
+    };
+    let saved_at = store.set_project_run_policy(&project.id, &policy).unwrap();
+    assert!(!saved_at.is_empty());
+    assert_eq!(store.get_project_run_policy(&project.id).unwrap(), policy);
+    let (stored, record_updated_at) = store.get_project_run_policy_record(&project.id).unwrap();
+    assert_eq!(stored, policy);
+    assert_eq!(record_updated_at, Some(saved_at));
+
+    store.record_project_manifest().unwrap();
+    let snapshot = crate::read_project_manifest(store.data_dir())
+        .unwrap()
+        .into_iter()
+        .find(|snapshot| snapshot.project.id == project.id)
+        .unwrap();
+    assert_eq!(snapshot.run_policy, Some(policy));
+
+    let legacy = serde_json::from_value::<crate::ProjectManifestSnapshot>(serde_json::json!({
+        "version": 1,
+        "recorded_at": "2026-11-11T00:00:00Z",
+        "project": snapshot.project,
+        "shell_policy": vp_protocol::types::ShellPolicy::default(),
+        "integration_policy": vp_protocol::types::IntegrationPolicy::default(),
+        "artifact_policy": vp_protocol::types::ArtifactPolicy::default(),
+        "mailbox_policy": vp_protocol::types::MailboxPolicy::default(),
+        "worktree_policy": vp_protocol::types::WorktreeRetentionPolicy::default(),
+        "budget": vp_protocol::types::ProjectBudget::default()
+    }))
+    .unwrap();
+    assert!(legacy.run_policy.is_none());
+}
