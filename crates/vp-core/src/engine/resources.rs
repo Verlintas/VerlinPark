@@ -252,30 +252,7 @@ impl Engine {
             resource_time(&budget),
             resource_attention_dim(&attention, attention_cap),
         ];
-        let risk_state = if effects.blocked {
-            "hard_limit"
-        } else if risk_used > 0 {
-            "watch"
-        } else {
-            "ok"
-        };
-        dimensions.push(ResourceDimension {
-            key: "risk".to_string(),
-            label: "Risk".to_string(),
-            unit: "units".to_string(),
-            used: risk_used as f64,
-            remaining: None,
-            soft_target: Some(20.0),
-            hard_cap: None,
-            forecast_p50: None,
-            forecast_p90: None,
-            state: risk_state.to_string(),
-            source: "approvals/effects".to_string(),
-            note: Some(
-                "Risk is a ceiling, not a budget: host-state/destructive/external actions and unresolved effects cannot be purchased away."
-                    .to_string(),
-            ),
-        });
+        dimensions.push(resource_risk(risk_used, effects.blocked));
         dimensions.push(resource_context(
             context.usage.as_ref(),
             context.compaction_count,
@@ -377,7 +354,7 @@ impl Engine {
             );
         }
         warnings.push(
-            "R2a resource governance: pre-dispatch deferral, profile overrides, and operator top-up; automatic turn pause/rebalance is R2b."
+            "Run Contract governance: pre-dispatch deferral, profile/contract overrides, bounded top-up, and turn-boundary pause. It cannot approve, merge, rebalance, or route models."
                 .to_string(),
         );
 
@@ -633,108 +610,159 @@ impl Engine {
 
     /// Deterministic R2a resource guard. It never spends, approves, merges, or
     /// routes; it only returns a bounded decision for dispatch/turn boundaries.
+    ///
+    /// Dispatch keeps the full readiness gate. Turn boundaries use the lean
+    /// method below: an active run is already subject to approval, effect,
+    /// merge, and Verifier gates, and must not pay for a `git status`,
+    /// task-queue, merge-queue, and agent-roster scan before every provider
+    /// call.
     pub async fn resource_governor_decision(
         &self,
         session_id: &str,
         phase: &str,
     ) -> Result<ResourceGovernorDecision> {
+        if phase == "turn" {
+            return self.resource_governor_turn_decision(session_id).await;
+        }
         let snapshot = self.session_resources(session_id).await?;
         let contract = self.run_contract_view(session_id).await?;
-        let mut action = "continue".to_string();
-        let mut reason = String::new();
-        let readiness = snapshot.readiness.as_ref();
-        if readiness.is_some_and(|readiness| readiness.level == "blocked") {
-            action = "defer".to_string();
-            reason = "readiness_blocked".to_string();
-        } else if snapshot.attention.interrupts >= contract.attention_cap {
-            action = "defer".to_string();
-            reason = "attention_cap".to_string();
-        } else if contract.profile == "unattended"
-            && snapshot
-                .dimension("risk")
-                .is_some_and(|dimension| dimension.used > 0.0)
-        {
-            action = "defer".to_string();
-            reason = "unattended_risk".to_string();
-        }
-        if action == "continue" {
-            for key in ["money", "time", "context", "tokens"] {
-                if snapshot
-                    .dimension(key)
-                    .is_some_and(|dimension| dimension.state == "hard_limit")
-                {
-                    action = "defer".to_string();
-                    reason = format!("resource_cap_{key}");
-                    break;
-                }
-            }
-        }
-        if action == "continue" {
-            for (key, hard, remaining) in [
-                (
-                    "tokens",
-                    contract.hard_caps.token.map(|value| value as f64),
-                    snapshot
-                        .dimension("tokens")
-                        .and_then(|dimension| dimension.remaining),
-                ),
-                (
-                    "time",
-                    contract.hard_caps.wall_clock_secs.map(|value| value as f64),
-                    snapshot
-                        .dimension("time")
-                        .and_then(|dimension| dimension.remaining),
-                ),
-            ] {
-                let Some(hard) = hard else { continue };
-                let Some(remaining) = remaining else { continue };
-                let reserve = hard * contract.completion_reserve_ratio;
-                if remaining < reserve {
-                    action = "defer".to_string();
-                    reason = format!("completion_reserve_{key}");
-                    break;
-                }
-            }
-            if action == "continue"
-                && let (Some(hard), Some(remaining)) = (
-                    contract.hard_caps.cost_usd,
-                    snapshot
-                        .dimension("money")
-                        .and_then(|dimension| dimension.remaining),
-                )
-                && remaining < hard * contract.completion_reserve_ratio
-            {
-                action = "defer".to_string();
-                reason = "completion_reserve_money".to_string();
-            }
-        }
-        if action == "continue"
-            && snapshot.dimensions.iter().any(|dimension| {
-                matches!(
-                    dimension.key.as_str(),
-                    "money" | "time" | "attention" | "context" | "tokens"
-                ) && matches!(dimension.state.as_str(), "soft_limit" | "watch")
-            })
-        {
-            action = "warn".to_string();
-            reason = "soft_resource_limit".to_string();
-        }
-        let details = serde_json::json!({
-            "phase": phase,
-            "profile": contract.profile,
-            "bottleneck": snapshot.bottleneck,
-            "attention_cap": contract.attention_cap,
-            "completion_reserve_ratio": contract.completion_reserve_ratio,
-            "states": snapshot.dimensions.iter().map(|dimension| {
-                serde_json::json!({"key": dimension.key, "state": dimension.state, "used": dimension.used})
-            }).collect::<Vec<_>>(),
-        });
+        let inputs = ResourceGovernorInputs {
+            profile: &contract.profile,
+            attention_cap: contract.attention_cap,
+            attention_interrupts: snapshot.attention.interrupts,
+            completion_reserve_ratio: contract.completion_reserve_ratio,
+            hard_caps: &contract.hard_caps,
+            dimensions: &snapshot.dimensions,
+            readiness_blocked: snapshot
+                .readiness
+                .as_ref()
+                .is_some_and(|readiness| readiness.level == "blocked"),
+        };
+        let (action, reason) = resource_governor_action(&inputs);
+        let details = resource_governor_details(
+            phase,
+            &contract.profile,
+            snapshot.bottleneck.as_deref(),
+            contract.attention_cap,
+            contract.completion_reserve_ratio,
+            &snapshot.dimensions,
+        );
         Ok(ResourceGovernorDecision {
             session_id: session_id.to_string(),
             phase: phase.to_string(),
             action,
             reason,
             bottleneck: snapshot.bottleneck,
+            details,
+            generated_at: now_rfc3339(),
+        })
+    }
+
+    /// Lean R2b turn-boundary decision. It computes only the dimensions the
+    /// governor can act on at a safe provider boundary: attention/risk,
+    /// money/token/time hard limits, active context, and the completion
+    /// reserve. It deliberately does not call `session_readiness` (git status),
+    /// the task queue, the merge queue, or the agent roster; readiness remains
+    /// a dispatch-only new-work gate, while an active run must be able to
+    /// finish approval/effect/MCP flows.
+    pub(crate) async fn resource_governor_turn_decision(
+        &self,
+        session_id: &str,
+    ) -> Result<ResourceGovernorDecision> {
+        let session = self.resource_session(session_id).await?;
+        let budget = self.session_budget(session_id).await?;
+        let usage = self.usage_totals(session_id).await?;
+        let (project_run_policy, _) = self.project_run_policy_record(&session.project_id).await?;
+        let contract_override = self.run_contract_override(session_id).await?;
+        let profile = contract_override
+            .as_ref()
+            .map(|value| value.profile)
+            .unwrap_or(project_run_policy.default_profile);
+        let attention_cap = contract_override
+            .as_ref()
+            .and_then(|value| value.attention_cap)
+            .unwrap_or(project_run_policy.attention_cap);
+        let completion_reserve_ratio = contract_override
+            .as_ref()
+            .and_then(|value| value.completion_reserve_ratio)
+            .unwrap_or(project_run_policy.completion_reserve_ratio);
+        let context = self.session_context_status(session_id).await?;
+        let approvals = self.list_approvals(Some(session_id.to_string())).await?;
+        let effects = self.session_effects(session_id, None, false, 200).await?;
+        let (attention, risk_used) = resource_attention(&approvals, effects.counts.unknown);
+
+        let hard_token = budget.hard_token_cap.or(budget.effective_token_budget);
+        let hard_cost = budget
+            .hard_cost_cap_usd
+            .or(budget.effective_cost_budget_usd);
+        let hard_time = budget
+            .hard_wall_clock_secs
+            .or(budget.effective_time_budget_secs);
+        let raw_tokens = usage.input_tokens.saturating_add(usage.output_tokens);
+        let cost = budget.spent_cost_usd.max(usage.cost_usd);
+        let pricing_source = if cost > 0.0 {
+            "configured"
+        } else {
+            "unconfigured"
+        };
+        let dimensions = vec![
+            resource_money(&budget, cost, pricing_source),
+            resource_tokens(
+                "tokens",
+                "Raw tokens",
+                raw_tokens as f64,
+                budget.remaining_tokens,
+                hard_token,
+                "usage_ledger",
+                "Cumulative input + output tokens; includes cache-read/write subsets.",
+            ),
+            resource_time(&budget),
+            resource_attention_dim(&attention, attention_cap),
+            resource_risk(risk_used, effects.blocked),
+            resource_context(context.usage.as_ref(), context.compaction_count),
+        ];
+        let no_progress = budget
+            .state
+            .as_ref()
+            .map(|state| state.turns_without_progress)
+            .unwrap_or(0);
+        let bottleneck = resource_bottleneck(
+            &dimensions,
+            attention.pending,
+            no_progress,
+            effects.blocked,
+            false,
+        );
+        let hard_caps = AutoBudgetCaps {
+            token: hard_token,
+            cost_usd: hard_cost,
+            wall_clock_secs: hard_time,
+        };
+        let profile = profile.as_str();
+        let inputs = ResourceGovernorInputs {
+            profile,
+            attention_cap,
+            attention_interrupts: attention.interrupts,
+            completion_reserve_ratio,
+            hard_caps: &hard_caps,
+            dimensions: &dimensions,
+            readiness_blocked: false,
+        };
+        let (action, reason) = resource_governor_action(&inputs);
+        let details = resource_governor_details(
+            "turn",
+            profile,
+            bottleneck.as_deref(),
+            attention_cap,
+            completion_reserve_ratio,
+            &dimensions,
+        );
+        Ok(ResourceGovernorDecision {
+            session_id: session_id.to_string(),
+            phase: "turn".to_string(),
+            action,
+            reason,
+            bottleneck,
             details,
             generated_at: now_rfc3339(),
         })
@@ -926,6 +954,129 @@ fn resource_context(
     }
 }
 
+fn resource_risk(risk_used: u64, effects_blocked: bool) -> ResourceDimension {
+    let risk_state = if effects_blocked {
+        "hard_limit"
+    } else if risk_used > 0 {
+        "watch"
+    } else {
+        "ok"
+    };
+    ResourceDimension {
+        key: "risk".to_string(),
+        label: "Risk".to_string(),
+        unit: "units".to_string(),
+        used: risk_used as f64,
+        remaining: None,
+        soft_target: Some(20.0),
+        hard_cap: None,
+        forecast_p50: None,
+        forecast_p90: None,
+        state: risk_state.to_string(),
+        source: "approvals/effects".to_string(),
+        note: Some(
+            "Risk is a ceiling, not a budget: host-state/destructive/external actions and unresolved effects cannot be purchased away."
+                .to_string(),
+        ),
+    }
+}
+
+fn resource_dimension<'a>(
+    dimensions: &'a [ResourceDimension],
+    key: &str,
+) -> Option<&'a ResourceDimension> {
+    dimensions.iter().find(|dimension| dimension.key == key)
+}
+
+/// Shared decision inputs for the dispatch and lean turn phases. The action
+/// ladder is shared so the two paths cannot drift; only `readiness_blocked` and
+/// the dimension list differ between them.
+struct ResourceGovernorInputs<'a> {
+    profile: &'a str,
+    attention_cap: u32,
+    attention_interrupts: u32,
+    completion_reserve_ratio: f64,
+    hard_caps: &'a AutoBudgetCaps,
+    dimensions: &'a [ResourceDimension],
+    readiness_blocked: bool,
+}
+
+fn resource_governor_action(inputs: &ResourceGovernorInputs<'_>) -> (String, String) {
+    if inputs.readiness_blocked {
+        return ("defer".to_string(), "readiness_blocked".to_string());
+    }
+    if inputs.attention_interrupts >= inputs.attention_cap {
+        return ("defer".to_string(), "attention_cap".to_string());
+    }
+    if inputs.profile == "unattended"
+        && resource_dimension(inputs.dimensions, "risk")
+            .is_some_and(|dimension| dimension.used > 0.0)
+    {
+        return ("defer".to_string(), "unattended_risk".to_string());
+    }
+    for key in ["money", "time", "context", "tokens"] {
+        if resource_dimension(inputs.dimensions, key)
+            .is_some_and(|dimension| dimension.state == "hard_limit")
+        {
+            return ("defer".to_string(), format!("resource_cap_{key}"));
+        }
+    }
+    for (key, hard) in [
+        ("tokens", inputs.hard_caps.token.map(|value| value as f64)),
+        (
+            "time",
+            inputs.hard_caps.wall_clock_secs.map(|value| value as f64),
+        ),
+    ] {
+        let Some(hard) = hard else { continue };
+        let Some(remaining) =
+            resource_dimension(inputs.dimensions, key).and_then(|dimension| dimension.remaining)
+        else {
+            continue;
+        };
+        let reserve = hard * inputs.completion_reserve_ratio;
+        if remaining < reserve {
+            return ("defer".to_string(), format!("completion_reserve_{key}"));
+        }
+    }
+    if let (Some(hard), Some(remaining)) = (
+        inputs.hard_caps.cost_usd,
+        resource_dimension(inputs.dimensions, "money").and_then(|dimension| dimension.remaining),
+    ) && remaining < hard * inputs.completion_reserve_ratio
+    {
+        return ("defer".to_string(), "completion_reserve_money".to_string());
+    }
+    if inputs.dimensions.iter().any(|dimension| {
+        matches!(
+            dimension.key.as_str(),
+            "money" | "time" | "attention" | "context" | "tokens"
+        ) && matches!(dimension.state.as_str(), "soft_limit" | "watch")
+    }) {
+        return ("warn".to_string(), "soft_resource_limit".to_string());
+    }
+    ("continue".to_string(), String::new())
+}
+
+fn resource_governor_details(
+    phase: &str,
+    profile: &str,
+    bottleneck: Option<&str>,
+    attention_cap: u32,
+    completion_reserve_ratio: f64,
+    dimensions: &[ResourceDimension],
+) -> serde_json::Value {
+    serde_json::json!({
+        "phase": phase,
+        "profile": profile,
+        "bottleneck": bottleneck,
+        "attention_cap": attention_cap,
+        "completion_reserve_ratio": completion_reserve_ratio,
+        "states": dimensions.iter().map(|dimension| {
+            serde_json::json!({"key": dimension.key, "state": dimension.state, "used": dimension.used})
+        }).collect::<Vec<_>>(),
+    })
+}
+
 fn resource_state(used: Option<f64>, soft: Option<f64>, hard: Option<f64>) -> &'static str {
     let used = used.unwrap_or(0.0);
     if hard.is_some_and(|cap| cap > 0.0 && used >= cap) {
@@ -1044,6 +1195,29 @@ mod tests {
         }
     }
 
+    /// Record usage in both places a real provider call updates: the session
+    /// totals (budget status) and the per-agent usage ledger (resource
+    /// snapshot). `Engine::record_usage` intentionally updates only the session
+    /// totals, so it cannot be used to compare the two governor paths.
+    async fn record_usage(engine: &Engine, session_id: &str, input: u64, output: u64) {
+        engine
+            .record_agent_usage(
+                session_id,
+                "test-agent",
+                "Test Agent",
+                "leader",
+                None,
+                None,
+                "test-model",
+                input,
+                output,
+                false,
+                0.0,
+            )
+            .await
+            .unwrap();
+    }
+
     async fn fixture() -> (TempDir, TempDir, Engine, Session) {
         let data = TempDir::new().unwrap();
         let repo = TempDir::new().unwrap();
@@ -1142,7 +1316,7 @@ mod tests {
             resources
                 .warnings
                 .iter()
-                .any(|warning| warning.contains("R2a"))
+                .any(|warning| warning.contains("Run Contract governance"))
         );
         assert_eq!(resources.attention.pending, 0);
 
@@ -1461,6 +1635,222 @@ mod tests {
         assert!(capped);
         assert_eq!(budget.effective_token_budget, Some(1_200));
         assert_eq!(budget.hard_token_cap, Some(1_200));
+    }
+
+    #[tokio::test]
+    async fn turn_governor_attention_and_hard_token_limits_are_lean() {
+        let (_data, _repo, engine, session) = fixture().await;
+        let quiet = engine
+            .resource_governor_turn_decision(&session.id)
+            .await
+            .unwrap();
+        assert_eq!(quiet.action, "continue", "{quiet:?}");
+        assert_eq!(quiet.phase, "turn");
+        let quiet_states = quiet.details["states"].as_array().unwrap();
+        assert!(quiet_states.iter().any(|state| state["key"] == "attention"));
+        assert!(
+            quiet_states.iter().all(|state| state["key"] != "capacity"
+                && state["key"] != "quality"
+                && state["key"] != "progress"),
+            "the turn payload must not carry dispatch-only dimensions: {quiet_states:?}"
+        );
+
+        engine
+            .set_run_contract(SetRunContractParams {
+                session_id: session.id.clone(),
+                profile: RunProfile::Balanced,
+                completion_reserve_ratio: None,
+                attention_cap: Some(1),
+                stop_policy: None,
+                updated_by: None,
+            })
+            .await
+            .unwrap();
+        let (_approval, _receiver) = engine
+            .request_approval_with_risk(
+                &session.id,
+                "call-turn-attention",
+                "shell",
+                json!({"command": "git status"}),
+                None,
+                Some("host_state"),
+                Some("turn attention"),
+            )
+            .await
+            .unwrap();
+        let attention = engine
+            .resource_governor_turn_decision(&session.id)
+            .await
+            .unwrap();
+        assert_eq!(attention.action, "defer", "{attention:?}");
+        assert_eq!(attention.reason, "attention_cap");
+        assert_eq!(attention.details["phase"], "turn");
+        let dispatch = engine
+            .resource_governor_decision(&session.id, "dispatch")
+            .await
+            .unwrap();
+        assert_eq!(dispatch.action, "defer", "{dispatch:?}");
+        assert_eq!(dispatch.reason, "attention_cap");
+
+        engine
+            .set_run_contract(SetRunContractParams {
+                session_id: session.id.clone(),
+                profile: RunProfile::Balanced,
+                completion_reserve_ratio: None,
+                attention_cap: Some(100),
+                stop_policy: None,
+                updated_by: None,
+            })
+            .await
+            .unwrap();
+        engine
+            .set_session_budget(SetSessionBudgetParams {
+                session_id: session.id.clone(),
+                mode: Some(BudgetMode::Fixed),
+                token_budget: Some(1_000),
+                ..SetSessionBudgetParams::default()
+            })
+            .await
+            .unwrap();
+        record_usage(&engine, &session.id, 1_000, 0).await;
+        let tokens = engine
+            .resource_governor_turn_decision(&session.id)
+            .await
+            .unwrap();
+        assert_eq!(tokens.action, "defer", "{tokens:?}");
+        assert_eq!(tokens.reason, "resource_cap_tokens");
+        let dispatch = engine
+            .resource_governor_decision(&session.id, "dispatch")
+            .await
+            .unwrap();
+        assert_eq!(dispatch.action, "defer", "{dispatch:?}");
+        assert_eq!(dispatch.reason, "resource_cap_tokens");
+    }
+
+    #[tokio::test]
+    async fn turn_governor_completion_reserve_and_warn_match_dispatch() {
+        let (_data, _repo, engine, session) = fixture().await;
+        engine
+            .set_session_budget(SetSessionBudgetParams {
+                session_id: session.id.clone(),
+                mode: Some(BudgetMode::Fixed),
+                token_budget: Some(1_000),
+                ..SetSessionBudgetParams::default()
+            })
+            .await
+            .unwrap();
+        record_usage(&engine, &session.id, 850, 0).await;
+        let reserve = engine
+            .resource_governor_turn_decision(&session.id)
+            .await
+            .unwrap();
+        assert_eq!(reserve.action, "defer", "{reserve:?}");
+        assert_eq!(reserve.reason, "completion_reserve_tokens");
+        assert_eq!(reserve.details["completion_reserve_ratio"], 0.2);
+        let dispatch = engine
+            .resource_governor_decision(&session.id, "dispatch")
+            .await
+            .unwrap();
+        assert_eq!(dispatch.action, "defer", "{dispatch:?}");
+        assert_eq!(dispatch.reason, "completion_reserve_tokens");
+
+        let (_warn_data, _warn_repo, warn_engine, warn_session) = fixture().await;
+        warn_engine
+            .set_session_budget(SetSessionBudgetParams {
+                session_id: warn_session.id.clone(),
+                mode: Some(BudgetMode::Fixed),
+                token_budget: Some(1_000),
+                ..SetSessionBudgetParams::default()
+            })
+            .await
+            .unwrap();
+        record_usage(&warn_engine, &warn_session.id, 800, 0).await;
+        let warning = warn_engine
+            .resource_governor_turn_decision(&warn_session.id)
+            .await
+            .unwrap();
+        assert_eq!(warning.action, "warn", "{warning:?}");
+        assert_eq!(warning.reason, "soft_resource_limit");
+        let dispatch = warn_engine
+            .resource_governor_decision(&warn_session.id, "dispatch")
+            .await
+            .unwrap();
+        assert_eq!(dispatch.action, "warn", "{dispatch:?}");
+        assert_eq!(dispatch.reason, "soft_resource_limit");
+    }
+
+    #[tokio::test]
+    async fn turn_governor_context_hard_limit_matches_dispatch() {
+        let (_data, _repo, engine, session) = fixture().await;
+        engine
+            .append_event(
+                &session.id,
+                "context.usage",
+                json!({
+                    "estimated_tokens": 9_000,
+                    "context_window": 10_000,
+                    "threshold_tokens": 7_500,
+                    "hard_limit_tokens": 9_000,
+                    "threshold_source": "window_ratio",
+                    "threshold_ratio_basis_points": 9000,
+                    "messages": 10,
+                    "calibration": 1.0,
+                }),
+            )
+            .await
+            .unwrap();
+        let context = engine
+            .resource_governor_turn_decision(&session.id)
+            .await
+            .unwrap();
+        assert_eq!(context.action, "defer", "{context:?}");
+        assert_eq!(context.reason, "resource_cap_context");
+        let dispatch = engine
+            .resource_governor_decision(&session.id, "dispatch")
+            .await
+            .unwrap();
+        assert_eq!(dispatch.action, "defer", "{dispatch:?}");
+        assert_eq!(dispatch.reason, "resource_cap_context");
+    }
+
+    #[tokio::test]
+    async fn readiness_blocked_stays_a_dispatch_only_gate() {
+        let (_data, _repo, engine, session) = fixture().await;
+        let plan = crate::effect::classify_tool_effect(
+            "remote_write",
+            &json!({"path": "out/app.txt", "content": "deploy"}),
+            crate::permissions::RiskLevel::External,
+            false,
+            &vp_protocol::types::EffectPolicy::default(),
+        )
+        .unwrap()
+        .expect("remote write plan");
+        let prepare = engine
+            .prepare_tool_effect(&session.id, Some("T1"), "agent-1", "", &plan)
+            .await
+            .unwrap();
+        let intent = match prepare {
+            crate::effect::EffectPrepare::Proceed(receipt) => receipt,
+            other => panic!("expected proceed, got {other:?}"),
+        };
+        engine.begin_effect(intent).await.unwrap();
+
+        let readiness = engine.session_readiness(&session.id).await.unwrap();
+        assert_eq!(readiness.level, "blocked", "{readiness:?}");
+        let turn = engine
+            .resource_governor_turn_decision(&session.id)
+            .await
+            .unwrap();
+        assert_eq!(turn.action, "continue", "{turn:?}");
+        assert_ne!(turn.reason, "readiness_blocked");
+        assert_eq!(turn.bottleneck.as_deref(), Some("risk"));
+
+        let dispatch = engine
+            .resource_governor_decision(&session.id, "dispatch")
+            .await
+            .unwrap();
+        assert_eq!(dispatch.action, "defer", "{dispatch:?}");
+        assert_eq!(dispatch.reason, "readiness_blocked");
     }
 
     #[test]

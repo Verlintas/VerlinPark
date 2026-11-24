@@ -94,6 +94,18 @@ fn auto_policy_object(value: &Value) -> Option<&Value> {
     (has_project && looks_like_policy).then_some(policy)
 }
 
+fn project_run_policy_object(value: &Value) -> Option<&Value> {
+    let policy = value.get("policy").filter(|policy| policy.is_object())?;
+    let has_project = value
+        .get("project_id")
+        .and_then(Value::as_str)
+        .is_some_and(|project| !project.is_empty());
+    let looks_like_policy = policy.get("default_profile").is_some()
+        && policy.get("completion_reserve_ratio").is_some()
+        && policy.get("attention_cap").is_some();
+    (has_project && looks_like_policy).then_some(policy)
+}
+
 fn status_lines(status: &Value, updated: bool) -> Vec<String> {
     let mode = status["mode"].as_str().unwrap_or("?");
     let unlimited = status["unlimited"].as_bool().unwrap_or(false);
@@ -236,6 +248,57 @@ fn forecast_lines(value: &Value, forecast: &Value) -> Vec<String> {
     lines
 }
 
+fn project_run_policy_lines(value: &Value, policy: &Value) -> Vec<String> {
+    let stop = policy
+        .get("stop_policy")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    vec![
+        format!(
+            "project {} Run Contract defaults{}",
+            value["project_id"].as_str().unwrap_or("?"),
+            value["updated_at"]
+                .as_str()
+                .map(|at| format!(" · updated {at}"))
+                .unwrap_or_else(|| " · built-in defaults".to_string())
+        ),
+        format!(
+            "  profile     {}",
+            policy["default_profile"].as_str().unwrap_or("balanced")
+        ),
+        format!(
+            "  reserve     {:.0}% held for verification/merge",
+            policy["completion_reserve_ratio"].as_f64().unwrap_or(0.0) * 100.0
+        ),
+        format!(
+            "  attention   cap {} weighted interrupt(s)",
+            policy["attention_cap"].as_u64().unwrap_or(20)
+        ),
+        format!(
+            "  stop        no-progress {} turn(s) · evidence {} · partial delivery {}",
+            stop["no_progress_turns"].as_u64().unwrap_or(6),
+            if stop
+                .get("require_evidence")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+            {
+                "required"
+            } else {
+                "optional"
+            },
+            if stop
+                .get("partial_delivery")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+            {
+                "allowed"
+            } else {
+                "disabled"
+            }
+        ),
+    ]
+}
+
 fn auto_policy_lines(value: &Value, policy: &Value) -> Vec<String> {
     let mut lines = vec![format!(
         "project {} auto budget{}",
@@ -297,6 +360,9 @@ pub(crate) fn budget_lines(value: &Value) -> Option<Vec<String>> {
     }
     if let Some(forecast) = forecast_object(value) {
         return Some(forecast_lines(value, forecast));
+    }
+    if let Some(policy) = project_run_policy_object(value) {
+        return Some(project_run_policy_lines(value, policy));
     }
     if let Some(policy) = auto_policy_object(value) {
         return Some(auto_policy_lines(value, policy));

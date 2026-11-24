@@ -453,6 +453,417 @@ extension RunStopPolicyView {
         self.marginalValueRatio = marginalValueRatio
         self.partialDelivery = partialDelivery
     }
+
+    static let standard = RunStopPolicyView(
+        requireEvidence: true,
+        noProgressTurns: 6,
+        marginalValueRatio: 0.2,
+        partialDelivery: true
+    )
+}
+
+// MARK: - Project RunPolicy
+
+/// Project-scoped default Run Contract policy. These values only supply
+/// defaults for sessions that have no explicit override; they cannot widen
+/// approvals, sandbox, task contracts, budgets/capacity, Verifier, Integrator,
+/// or model routing. `updated_at` is absent when the daemon is reporting
+/// built-in defaults instead of a persisted explicit policy.
+struct ProjectRunPolicyView: Codable, Sendable, Equatable {
+    let defaultProfile: RunProfile
+    let completionReserveRatio: Double
+    let attentionCap: UInt32
+    let stopPolicy: RunStopPolicyView
+
+    enum CodingKeys: String, CodingKey {
+        case defaultProfile = "default_profile"
+        case completionReserveRatio = "completion_reserve_ratio"
+        case attentionCap = "attention_cap"
+        case stopPolicy = "stop_policy"
+    }
+
+    init(
+        defaultProfile: RunProfile = .balanced,
+        completionReserveRatio: Double = 0.20,
+        attentionCap: UInt32 = 20,
+        stopPolicy: RunStopPolicyView = .standard
+    ) {
+        self.defaultProfile = defaultProfile
+        self.completionReserveRatio = completionReserveRatio
+        self.attentionCap = attentionCap
+        self.stopPolicy = stopPolicy
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        defaultProfile =
+            try container.decodeIfPresent(RunProfile.self, forKey: .defaultProfile) ?? .balanced
+        completionReserveRatio =
+            try container.decodeIfPresent(Double.self, forKey: .completionReserveRatio) ?? 0.20
+        attentionCap =
+            try container.decodeIfPresent(UInt32.self, forKey: .attentionCap) ?? 20
+        stopPolicy =
+            try container.decodeIfPresent(RunStopPolicyView.self, forKey: .stopPolicy)
+                ?? .standard
+    }
+
+    var profileTitle: String {
+        defaultProfile.title
+    }
+
+    var reservePercentLabel: String {
+        let percent = completionReserveRatio * 100
+        if percent.rounded() == percent {
+            return "\(Int(percent))%"
+        }
+        return String(format: "%.1f%%", percent)
+    }
+
+    var attentionLabel: String {
+        "\(attentionCap)"
+    }
+
+    var noProgressLabel: String {
+        "\(stopPolicy.noProgressTurns) turns"
+    }
+
+    var stopPolicySummary: String {
+        var parts: [String] = []
+        parts.append(stopPolicy.requireEvidence ? "evidence required" : "evidence optional")
+        parts.append(stopPolicy.partialDelivery ? "partial delivery allowed" : "no partial delivery")
+        return parts.joined(separator: " · ")
+    }
+
+    /// Client-side mirror of the daemon validation. The daemon remains
+    /// authoritative; this only prevents an empty/invalid request.
+    func validate() throws {
+        guard completionReserveRatio.isFinite,
+              (0.0 ... 0.50).contains(completionReserveRatio)
+        else {
+            throw BudgetValidationIssue(
+                code: "INVALID_PROJECT_RUN_POLICY",
+                message: "Completion reserve must be between 0% and 50%."
+            )
+        }
+        guard attentionCap > 0, attentionCap <= 1000 else {
+            throw BudgetValidationIssue(
+                code: "INVALID_PROJECT_RUN_POLICY",
+                message: "Attention cap must be between 1 and 1000 interrupts."
+            )
+        }
+        guard stopPolicy.noProgressTurns <= 1000 else {
+            throw BudgetValidationIssue(
+                code: "INVALID_PROJECT_RUN_POLICY",
+                message: "No-progress turns must be at most 1000."
+            )
+        }
+        guard stopPolicy.marginalValueRatio.isFinite,
+              (0.0 ... 1.0).contains(stopPolicy.marginalValueRatio)
+        else {
+            throw BudgetValidationIssue(
+                code: "INVALID_PROJECT_RUN_POLICY",
+                message: "The stop policy marginal-value ratio must be between 0 and 1."
+            )
+        }
+    }
+
+    func jsonValue() throws -> JSONValue {
+        let data = try JSONEncoder().encode(self)
+        return try JSONDecoder().decode(JSONValue.self, from: data)
+    }
+}
+
+struct ProjectRunPolicyResultView: Codable, Sendable, Equatable {
+    let projectID: String
+    let policy: ProjectRunPolicyView
+    /// `nil` means the daemon is reporting built-in defaults, not an explicit
+    /// project policy row. The UI must not present those defaults as saved.
+    let updatedAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case policy
+        case projectID = "project_id"
+        case updatedAt = "updated_at"
+    }
+
+    init(projectID: String, policy: ProjectRunPolicyView, updatedAt: String? = nil) {
+        self.projectID = projectID
+        self.policy = policy
+        self.updatedAt = updatedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        projectID = try container.decode(String.self, forKey: .projectID)
+        policy = try container.decode(ProjectRunPolicyView.self, forKey: .policy)
+        updatedAt = try container.decodeIfPresent(String.self, forKey: .updatedAt)
+    }
+
+    var isExplicit: Bool {
+        guard let updatedAt else { return false }
+        return !updatedAt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var sourceLabel: String {
+        isExplicit ? "Explicit project policy" : "Built-in defaults"
+    }
+
+    var updatedLabel: String? {
+        guard isExplicit, let updatedAt else { return nil }
+        return "saved \(updatedAt)"
+    }
+}
+
+/// Editable form state for the project policy sheet. Parsing/validation stays
+/// here so views own bindings only and the daemon is never asked to store an
+/// empty or out-of-range policy.
+struct ProjectRunPolicyDraft: Equatable, Sendable {
+    var profile: RunProfile = .balanced
+    var completionReservePercentText = "20"
+    var attentionCapText = "20"
+    var noProgressTurnsText = "6"
+    var requireEvidence = true
+    var partialDelivery = true
+    var marginalValueRatio = 0.2
+
+    init() {}
+
+    init(policy: ProjectRunPolicyView) {
+        profile = policy.defaultProfile
+        completionReservePercentText = Self.percentText(policy.completionReserveRatio)
+        attentionCapText = String(policy.attentionCap)
+        noProgressTurnsText = String(policy.stopPolicy.noProgressTurns)
+        requireEvidence = policy.stopPolicy.requireEvidence
+        partialDelivery = policy.stopPolicy.partialDelivery
+        marginalValueRatio = policy.stopPolicy.marginalValueRatio
+    }
+
+    var validationIssue: BudgetValidationIssue? {
+        do {
+            _ = try makePolicy()
+            return nil
+        } catch {
+            return error as? BudgetValidationIssue
+                ?? BudgetValidationIssue(
+                    code: "INVALID_PROJECT_RUN_POLICY",
+                    message: error.localizedDescription
+                )
+        }
+    }
+
+    func makePolicy() throws -> ProjectRunPolicyView {
+        let percent = try Self.requiredDecimal(
+            completionReservePercentText,
+            label: "Completion reserve percent"
+        )
+        guard percent >= 0, percent <= 50 else {
+            throw BudgetValidationIssue(
+                code: "INVALID_PROJECT_RUN_POLICY",
+                message: "Completion reserve must be between 0% and 50%."
+            )
+        }
+        let attentionCap = try Self.requiredInteger(
+            attentionCapText,
+            label: "Attention cap"
+        )
+        guard attentionCap >= 1, attentionCap <= 1000 else {
+            throw BudgetValidationIssue(
+                code: "INVALID_PROJECT_RUN_POLICY",
+                message: "Attention cap must be between 1 and 1000 interrupts."
+            )
+        }
+        let noProgressTurns = try Self.requiredInteger(
+            noProgressTurnsText,
+            label: "No-progress turns"
+        )
+        guard noProgressTurns <= 1000 else {
+            throw BudgetValidationIssue(
+                code: "INVALID_PROJECT_RUN_POLICY",
+                message: "No-progress turns must be at most 1000."
+            )
+        }
+        let policy = ProjectRunPolicyView(
+            defaultProfile: profile,
+            completionReserveRatio: percent / 100,
+            attentionCap: attentionCap,
+            stopPolicy: RunStopPolicyView(
+                requireEvidence: requireEvidence,
+                noProgressTurns: noProgressTurns,
+                marginalValueRatio: marginalValueRatio,
+                partialDelivery: partialDelivery
+            )
+        )
+        try policy.validate()
+        return policy
+    }
+
+    private static func percentText(_ ratio: Double) -> String {
+        let percent = ratio * 100
+        if percent.rounded() == percent {
+            return String(Int(percent))
+        }
+        return String(
+            format: "%.1f",
+            locale: Locale(identifier: "en_US_POSIX"),
+            percent
+        )
+    }
+
+    private static func requiredDecimal(
+        _ raw: String,
+        label: String
+    ) throws -> Double {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let value = Double(text), value.isFinite else {
+            throw BudgetValidationIssue(
+                code: "INVALID_PROJECT_RUN_POLICY",
+                message: "\(label) must be a number."
+            )
+        }
+        return value
+    }
+
+    private static func requiredInteger(
+        _ raw: String,
+        label: String
+    ) throws -> UInt32 {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let value = UInt32(text) else {
+            throw BudgetValidationIssue(
+                code: "INVALID_PROJECT_RUN_POLICY",
+                message: "\(label) must be a whole number."
+            )
+        }
+        return value
+    }
+}
+
+// MARK: - Resource pause event
+
+/// Bounded projection of the newest `session.resource.paused` event for the
+/// selected session. A later resume/status event clears it; a bottleneck alone
+/// never creates one. If the event stream is unavailable the card must show
+/// nothing rather than infer a pause.
+struct ResourcePauseInfo: Equatable, Sendable {
+    static let schema = "verlinpark.resource_pause/v1"
+    static let eventKind = "session.resource.paused"
+
+    let sequence: UInt64
+    let phase: String?
+    let action: String?
+    let reason: String
+    let bottleneck: String?
+    let role: String?
+    let agentID: String?
+    let taskID: String?
+    let generatedAt: String?
+
+    init?(event: Event) {
+        guard event.type == Self.eventKind,
+              let payload = event.payload.objectValue,
+              payload["schema"]?.stringValue == Self.schema,
+              let reason = payload["reason"]?.stringValue,
+              !reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            return nil
+        }
+        sequence = event.seq
+        phase = payload["phase"]?.stringValue
+        action = payload["action"]?.stringValue
+        self.reason = reason
+        bottleneck = payload["bottleneck"]?.stringValue
+        role = payload["role"]?.stringValue
+        agentID = payload["agent_id"]?.stringValue
+        taskID = payload["task_id"]?.stringValue
+        generatedAt = payload["generated_at"]?.stringValue
+    }
+
+    var reasonLabel: String {
+        String(reason.trimmingCharacters(in: .whitespacesAndNewlines).prefix(240))
+    }
+
+    var roleLabel: String {
+        Self.bounded(role) ?? "role not reported"
+    }
+
+    var bottleneckLabel: String {
+        Self.bounded(bottleneck) ?? "bottleneck not reported"
+    }
+
+    var phaseActionLabel: String {
+        let parts = [phase, action]
+            .compactMap { Self.bounded($0) }
+        return parts.isEmpty ? "phase not reported" : parts.joined(separator: " · ")
+    }
+
+    var taskShortLabel: String? {
+        guard let taskID = Self.bounded(taskID) else { return nil }
+        return String(taskID.prefix(24))
+    }
+
+    var agentShortLabel: String? {
+        guard let agentID = Self.bounded(agentID) else { return nil }
+        return String(agentID.prefix(12))
+    }
+
+    static func resumeOutcomeNotice(resumed: Bool) -> String {
+        if resumed {
+            return "The daemon reported the session resumed. The pause clears when its resume event arrives."
+        }
+        return "The daemon did not resume the session. It may re-pause while the resource cap is unchanged."
+    }
+
+    /// Newest relevant event wins. Only real pause and clearing events are
+    /// considered; a `bottleneck` value on a resource snapshot is not a pause.
+    static func activePause(
+        in events: [Event],
+        sessionID: String,
+        eventStreamAvailable: Bool
+    ) -> ResourcePauseInfo? {
+        guard eventStreamAvailable else { return nil }
+        var latest: Event?
+        for event in events where event.sessionId == sessionID {
+            guard event.type == eventKind || clearsPause(event) else { continue }
+            if let current = latest {
+                if event.seq >= current.seq {
+                    latest = event
+                }
+            } else {
+                latest = event
+            }
+        }
+        guard let latest else { return nil }
+        if clearsPause(latest) {
+            return nil
+        }
+        return ResourcePauseInfo(event: latest)
+    }
+
+    /// A later resume or non-paused session status means the pause event is no
+    /// longer current. A `session.updated` with `paused` does not clear it.
+    static func clearsPause(_ event: Event) -> Bool {
+        switch event.type {
+        case "agent.resumed", "session.resumed":
+            return true
+        case "session.updated":
+            let status = (event.payload.objectValue?["status"]?.stringValue ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            return [
+                "running", "resumed", "idle", "failed", "cancelled", "landed",
+                "interrupted", "completed",
+            ].contains(status)
+        default:
+            return false
+        }
+    }
+
+    private static func bounded(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return String(trimmed.prefix(160))
+    }
 }
 
 // MARK: - Operator resource top-up

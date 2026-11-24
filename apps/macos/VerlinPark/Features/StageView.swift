@@ -96,6 +96,11 @@ private struct ProjectStageView: View {
                     .padding(.horizontal, 18)
                     .padding(.vertical, 6)
                 VPHairline()
+            } else if let error = model.sessionResourcesError {
+                StageResourceUnavailableCard(message: error)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 6)
+                VPHairline()
             }
             if let session = model.selectedSession,
                let preemption = model.sessionPreemption,

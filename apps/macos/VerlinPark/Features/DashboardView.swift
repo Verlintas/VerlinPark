@@ -477,6 +477,7 @@ struct DashboardView: View {
             }
         case .policies:
             if let project = model.selectedProject {
+                ProjectRunPolicyCard(project: project)
                 ShellPolicyCard(project: project)
                 ApprovalOptimizerCard(project: project)
                 IntegrationPolicyCard(project: project)
@@ -580,6 +581,7 @@ struct DashboardView: View {
             await model.loadMailboxPolicy()
             await model.loadWorktreePolicy()
         case .policies:
+            await model.loadProjectRunPolicy()
             await model.loadShellPolicy()
             await model.loadIntegrationPolicy()
             await model.loadGuiPolicy()

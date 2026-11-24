@@ -847,6 +847,32 @@ actor CoreClient {
         .decode(AutoBudgetPolicyResult.self)
     }
 
+    /// Read-only project Run Contract defaults. `updated_at` is absent when the
+    /// daemon is reporting built-in defaults rather than an explicit policy.
+    func projectRunPolicy(projectID: String) async throws -> ProjectRunPolicyResultView {
+        try await request(
+            method: "project.run_policy.get",
+            params: ["project_id": .string(projectID)]
+        )
+        .decode(ProjectRunPolicyResultView.self)
+    }
+
+    /// Explicit operator save. The daemon validates the policy and returns the
+    /// authoritative result; the client never assumes the save succeeded.
+    func setProjectRunPolicy(
+        projectID: String,
+        policy: ProjectRunPolicyView
+    ) async throws -> ProjectRunPolicyResultView {
+        try await request(
+            method: "project.run_policy.set",
+            params: [
+                "project_id": .string(projectID),
+                "policy": jsonValue(policy),
+            ]
+        )
+        .decode(ProjectRunPolicyResultView.self)
+    }
+
     func checkpointSession(sessionID: String, label: String?) async throws -> SessionCheckpoint {
         try await request(
             method: "session.checkpoint",

@@ -1,6 +1,52 @@
 import AppKit
 import SwiftUI
 
+/// Visible failure state for `session.resources`. A missing snapshot must not
+/// silently hide the whole resource strip; the operator sees the daemon/RPC
+/// error and can retry explicitly. This view never invents dimensions.
+struct StageResourceUnavailableCard: View {
+    @Environment(AppModel.self) private var model
+    let message: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(VPTheme.warning)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("RESOURCES UNAVAILABLE")
+                    .font(VPTheme.mono(6.5, weight: .semibold))
+                    .tracking(0.6)
+                    .foregroundStyle(VPTheme.warning)
+                Text(String(message.prefix(280)))
+                    .font(VPTheme.mono(7))
+                    .foregroundStyle(VPTheme.textSecondary)
+                    .lineLimit(2)
+            }
+            Spacer(minLength: 6)
+            Button {
+                Task { await model.loadSessionResources() }
+            } label: {
+                Label("Retry", systemImage: "arrow.clockwise")
+            }
+            .buttonStyle(.plain)
+            .font(VPTheme.mono(6.5, weight: .medium))
+            .foregroundStyle(VPTheme.accent)
+            .disabled(model.sessionResourcesBusy)
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            VPTheme.warning.opacity(0.06),
+            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(VPTheme.warning.opacity(0.18), lineWidth: 1)
+        }
+    }
+}
+
 /// Compact Stage view of `session.resources`. It shows the bottleneck,
 /// readiness, and the primary resource dimensions; the full dimension list is
 /// available on demand. Every displayed value is daemon-provided. The only
@@ -24,6 +70,9 @@ struct StageResourceCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             header
+            if let pause = model.resourcePause {
+                resourcePauseBanner(pause)
+            }
             if expanded {
                 Divider().overlay(VPTheme.hairline)
                 dimensionRows
@@ -79,6 +128,105 @@ struct StageResourceCard: View {
             return VPTheme.warning
         }
         return VPTheme.accent
+    }
+
+    private func resourcePauseBanner(_ pause: ResourcePauseInfo) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                Image(systemName: "pause.circle.fill")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(VPTheme.warning)
+                Text("PAUSED BY RESOURCE GOVERNOR")
+                    .font(VPTheme.mono(6.5, weight: .semibold))
+                    .tracking(0.6)
+                    .foregroundStyle(VPTheme.warning)
+                Text(pause.phaseActionLabel)
+                    .font(VPTheme.mono(6.5))
+                    .foregroundStyle(VPTheme.textTertiary)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                if model.resourcePauseBusy {
+                    ProgressView().controlSize(.mini)
+                }
+                Button {
+                    Task { await model.resumeResourcePausedSession() }
+                } label: {
+                    Label("Resume", systemImage: "play.fill")
+                }
+                .buttonStyle(.plain)
+                .font(VPTheme.mono(6.5, weight: .semibold))
+                .foregroundStyle(VPTheme.accent)
+                .disabled(model.resourcePauseBusy || isImportedSession)
+                .help("Ask the daemon to resume. It re-checks the same cap and may pause again.")
+                Button {
+                    model.clearSessionResourceTopUpFeedback()
+                    showingTopUp = true
+                } label: {
+                    Label("Top Up", systemImage: "plus.circle")
+                }
+                .buttonStyle(.plain)
+                .font(VPTheme.mono(6.5, weight: .medium))
+                .foregroundStyle(VPTheme.textSecondary)
+                .disabled(isImportedSession)
+                .help("Open the existing explicit top-up sheet")
+                Button {
+                    model.openApprovalCenter()
+                } label: {
+                    Label("Approvals", systemImage: "tray.full")
+                }
+                .buttonStyle(.plain)
+                .font(VPTheme.mono(6.5, weight: .medium))
+                .foregroundStyle(VPTheme.textSecondary)
+                .help("Open the Manage Dash approval and question inbox")
+            }
+            Text(pause.reasonLabel)
+                .font(VPTheme.mono(7.5))
+                .foregroundStyle(VPTheme.textSecondary)
+                .lineLimit(3)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 10) {
+                Text("role \(pause.roleLabel)")
+                Text("bottleneck \(pause.bottleneckLabel)")
+                if let task = pause.taskShortLabel {
+                    Text("task \(task)")
+                }
+                if let agent = pause.agentShortLabel {
+                    Text("agent \(agent)")
+                }
+                Spacer(minLength: 4)
+                Text("event #\(pause.sequence)")
+                    .foregroundStyle(VPTheme.textTertiary.opacity(0.8))
+            }
+            .font(VPTheme.mono(6.5))
+            .foregroundStyle(VPTheme.textTertiary)
+            .lineLimit(1)
+            if let notice = model.resourcePauseNotice {
+                Text(notice)
+                    .font(VPTheme.mono(7))
+                    .foregroundStyle(VPTheme.info)
+                    .lineLimit(2)
+            }
+            if let error = model.resourcePauseError {
+                Text(error)
+                    .font(VPTheme.mono(7))
+                    .foregroundStyle(VPTheme.warning)
+                    .lineLimit(2)
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            VPTheme.warning.opacity(0.07),
+            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(VPTheme.warning.opacity(0.20), lineWidth: 1)
+        }
+    }
+
+    private var isImportedSession: Bool {
+        model.selectedSession?.status == "imported"
     }
 
     private var header: some View {

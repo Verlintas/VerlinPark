@@ -254,10 +254,13 @@ Negative and limits:
    read-only form; no behavior change.
 3. **R2 govern**: R2a implements event-backed profile/contract overrides,
    bounded top-up, and pre-dispatch attention/risk/completion-reserve deferral;
-   R2b core adds true turn-boundary pause/wait, Auto Budget request-fit for
-   Worker/Labour, project RunPolicy with manifest/rebuild, and macOS
-   top-up/readiness. Attention batching, explicit partial-delivery action,
-   rescue/reallocation, and cost/time-only child request-fit remain.
+   R2b core adds a lean turn-boundary pause path (no readiness/`git status` on
+   the run path), Auto Budget token request-fit for every role plus cost/time
+   fit for children, project RunPolicy with manifest/rebuild, and macOS
+   top-up/readiness, project-policy editor, and an event-derived pause banner;
+   first selection loads the full session resource state and resource failures
+   are visible with an explicit retry. Attention batching, explicit
+   partial-delivery action, and rescue/reallocation remain.
 4. **R3 allocate**: task/plan-aware allocation, rescue/reallocation, learning
    from actuals, metareasoning/replan.
 5. **R4 deliver**: anytime UI, trade-off frontier, calibrated trust, daily

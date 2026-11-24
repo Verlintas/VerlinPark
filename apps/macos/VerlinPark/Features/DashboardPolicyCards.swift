@@ -418,6 +418,467 @@ struct MemoryPolicyCard: View {
     }
 }
 
+struct ProjectRunPolicyCard: View {
+    @Environment(AppModel.self) private var model
+    let project: Project
+
+    @State private var showingEditor = false
+
+    private var policy: ProjectRunPolicyView? {
+        guard model.projectRunPolicyProjectID == project.id else { return nil }
+        return model.projectRunPolicy
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            header
+            if let policy {
+                metrics(policy)
+                if let error = model.projectRunPolicyError {
+                    Label(error.displayText, systemImage: "exclamationmark.triangle.fill")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(VPTheme.warning)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let result = model.projectRunPolicyResult,
+                   result.projectID == project.id,
+                   !result.isExplicit
+                {
+                    Text(
+                        "No explicit project policy is stored; these are built-in defaults. Editing and saving creates one."
+                    )
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(VPTheme.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+                Text(
+                    "Defaults only. This policy cannot widen approvals, sandbox, task contracts or write scope, budgets/capacity, Verifier, Integrator, or model routing. It does not change existing session budgets or start/resume a run."
+                )
+                .font(.system(size: 9.5, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            } else if let error = model.projectRunPolicyError {
+                Label(error.displayText, systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(VPTheme.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if model.projectRunPolicyBusy {
+                Text("Loading project RunPolicy defaults…")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("RunPolicy defaults unavailable. No defaults were invented.")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            footer
+        }
+        .padding(14)
+        .background(
+            .white.opacity(0.035),
+            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .vpAppear(index: 0)
+        .task(id: project.id) {
+            await model.loadProjectRunPolicy()
+        }
+        .sheet(isPresented: $showingEditor) {
+            ProjectRunPolicySheet(project: project)
+                .environment(model)
+        }
+    }
+
+    private var header: some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: "dial.medium")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(VPTheme.accent)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                SectionLabel(title: "Project RunPolicy")
+                Text(project.name)
+                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 4)
+            if model.projectRunPolicyBusy {
+                ProgressView().controlSize(.mini)
+            }
+            if let result = model.projectRunPolicyResult,
+               result.projectID == project.id
+            {
+                Text(result.sourceLabel.uppercased())
+                    .font(.system(size: 7, weight: .semibold, design: .monospaced))
+                    .tracking(0.3)
+                    .foregroundStyle(result.isExplicit ? VPTheme.success : VPTheme.textTertiary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(
+                        (result.isExplicit ? VPTheme.success : VPTheme.textTertiary)
+                            .opacity(0.10),
+                        in: Capsule()
+                    )
+            }
+        }
+    }
+
+    private func metrics(_ policy: ProjectRunPolicyView) -> some View {
+        HStack(alignment: .top, spacing: 18) {
+            policyMetric("Profile", policy.profileTitle)
+            policyMetric("Reserve", policy.reservePercentLabel)
+            policyMetric("Attention cap", policy.attentionLabel)
+            policyMetric("No progress", policy.noProgressLabel)
+        }
+    }
+
+    private func policyMetric(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title.uppercased())
+                .font(.system(size: 7, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.tertiary)
+            Text(value)
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+        }
+        .frame(minWidth: 84, alignment: .leading)
+    }
+
+    private var footer: some View {
+        HStack(spacing: 8) {
+            if let result = model.projectRunPolicyResult,
+               result.projectID == project.id,
+               let updated = result.updatedLabel
+            {
+                Text(updated)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            } else if let policy {
+                Text(policy.stopPolicySummary)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            Button("Refresh") {
+                Task { await model.reloadProjectRunPolicy() }
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(model.projectRunPolicyBusy)
+            Button("Edit defaults") {
+                model.beginProjectRunPolicyEdit()
+                showingEditor = true
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            .disabled(!model.canEditProjectRunPolicy || policy == nil)
+        }
+    }
+}
+
+struct ProjectRunPolicySheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    let project: Project
+
+    private var projectMatches: Bool {
+        model.selectedProjectID == project.id
+    }
+
+    private var canSave: Bool {
+        projectMatches
+            && model.projectRunPolicyProjectID == project.id
+            && model.projectRunPolicy != nil
+            && !model.projectRunPolicyBusy
+            && model.projectRunPolicyDraft.validationIssue == nil
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            VPHairline()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 15) {
+                    if !projectMatches {
+                        Label(
+                            "The selected project changed. Close this sheet and reopen it from the active project.",
+                            systemImage: "arrow.triangle.2.circlepath"
+                        )
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(VPTheme.warning)
+                        .fixedSize(horizontal: false, vertical: true)
+                    }
+                    sourceLine
+                    fields
+                    stopPolicy
+                    validationLine
+                    feedback
+                    note
+                }
+                .padding(20)
+            }
+            VPHairline()
+            footer
+        }
+        .frame(width: 560)
+        .frame(maxHeight: 680)
+        .background { VPCrystalBackdrop() }
+        .tint(VPTheme.accent)
+        .onChange(of: model.projectRunPolicyDraft) { _, _ in
+            model.clearProjectRunPolicyFeedback()
+        }
+    }
+
+    private var header: some View {
+        HStack(alignment: .top, spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(VPTheme.accentWash)
+                    .frame(width: 40, height: 40)
+                Image(systemName: "dial.medium")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(VPTheme.accent)
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text("PROJECT RUNPOLICY")
+                    .font(VPTheme.mono(7.5, weight: .semibold))
+                    .tracking(1.2)
+                    .foregroundStyle(VPTheme.accent)
+                Text(project.name)
+                    .font(VPTheme.font(18, weight: .semibold, rounded: true))
+                    .foregroundStyle(VPTheme.textPrimary)
+                    .lineLimit(2)
+                Text("Default Run Contract values · explicit save only")
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(VPTheme.textTertiary)
+            }
+            Spacer()
+            Button("Cancel") { dismiss() }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .keyboardShortcut(.cancelAction)
+        }
+        .padding(20)
+        .background(VPTheme.rail)
+    }
+
+    @ViewBuilder
+    private var sourceLine: some View {
+        if let result = model.projectRunPolicyResult, result.projectID == project.id {
+            HStack(spacing: 8) {
+                Text(result.sourceLabel.uppercased())
+                    .font(VPTheme.mono(7, weight: .semibold))
+                    .foregroundStyle(result.isExplicit ? VPTheme.success : VPTheme.textTertiary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(
+                        (result.isExplicit ? VPTheme.success : VPTheme.textTertiary)
+                            .opacity(0.10),
+                        in: Capsule()
+                    )
+                if let updated = result.updatedLabel {
+                    Text(updated)
+                        .font(VPTheme.mono(7.5))
+                        .foregroundStyle(VPTheme.textTertiary)
+                        .lineLimit(1)
+                } else {
+                    Text("Saving creates an explicit project policy; nothing is stored until you save.")
+                        .font(VPTheme.mono(7.5))
+                        .foregroundStyle(VPTheme.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 4)
+            }
+        }
+    }
+
+    private var fields: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    fieldTitle("Default profile")
+                    Picker("Default profile", selection: valueBinding(\.profile)) {
+                        ForEach(RunProfile.allCases) { profile in
+                            Text(profile.title).tag(profile)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(width: 150)
+                }
+                textField(
+                    "Completion reserve",
+                    text: valueBinding(\.completionReservePercentText),
+                    suffix: "%",
+                    help: "0–50%"
+                )
+                textField(
+                    "Attention cap",
+                    text: valueBinding(\.attentionCapText),
+                    suffix: "intr.",
+                    help: "1–1000"
+                )
+                textField(
+                    "No-progress limit",
+                    text: valueBinding(\.noProgressTurnsText),
+                    suffix: "turns",
+                    help: "0–1000"
+                )
+            }
+            Text(
+                "Completion reserve is held for verification, integration, and landing. Attention cap counts weighted operator interrupts. No-progress is the evidence-free turn window in the stop policy."
+            )
+            .font(VPTheme.mono(7.5))
+            .foregroundStyle(VPTheme.textTertiary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+        .disabled(!projectMatches || model.projectRunPolicyBusy)
+    }
+
+    private var stopPolicy: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Toggle(
+                "Require acceptance evidence before stopping",
+                isOn: valueBinding(\.requireEvidence)
+            )
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            Toggle(
+                "Allow explicit partial delivery",
+                isOn: valueBinding(\.partialDelivery)
+            )
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            Text(
+                "The marginal-value ratio \(String(format: "%.2f", model.projectRunPolicyDraft.marginalValueRatio)) is preserved from the loaded policy; this sheet does not edit it."
+            )
+            .font(VPTheme.mono(7))
+            .foregroundStyle(VPTheme.textTertiary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+        .disabled(!projectMatches || model.projectRunPolicyBusy)
+    }
+
+    private func valueBinding<Value>(
+        _ keyPath: WritableKeyPath<ProjectRunPolicyDraft, Value>
+    ) -> Binding<Value> {
+        Binding(
+            get: { model.projectRunPolicyDraft[keyPath: keyPath] },
+            set: { model.projectRunPolicyDraft[keyPath: keyPath] = $0 }
+        )
+    }
+
+    private func textField(
+        _ title: String,
+        text: Binding<String>,
+        suffix: String,
+        help: String
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            fieldTitle(title)
+            HStack(spacing: 4) {
+                TextField(help, text: text)
+                    .textFieldStyle(.plain)
+                    .font(VPTheme.mono(10))
+                    .vpFieldSurface(radius: 8)
+                    .frame(width: 76)
+                    .accessibilityLabel(title)
+                Text(suffix)
+                    .font(VPTheme.mono(7))
+                    .foregroundStyle(VPTheme.textTertiary)
+            }
+            Text(help)
+                .font(VPTheme.mono(6.5))
+                .foregroundStyle(VPTheme.textTertiary)
+        }
+    }
+
+    private func fieldTitle(_ title: String) -> some View {
+        Text(title.uppercased())
+            .font(VPTheme.mono(6.5, weight: .semibold))
+            .tracking(0.4)
+            .foregroundStyle(VPTheme.textTertiary)
+    }
+
+    @ViewBuilder
+    private var validationLine: some View {
+        if !projectMatches {
+            EmptyView()
+        } else if let issue = model.projectRunPolicyDraft.validationIssue {
+            Label(issue.displayText, systemImage: "exclamationmark.triangle.fill")
+                .font(VPTheme.mono(7.5))
+                .foregroundStyle(VPTheme.warning)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    @ViewBuilder
+    private var feedback: some View {
+        if let error = model.projectRunPolicyError {
+            Label(error.displayText, systemImage: "exclamationmark.triangle.fill")
+                .font(VPTheme.mono(7.5))
+                .foregroundStyle(VPTheme.warning)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(9)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(VPTheme.warning.opacity(0.08), in: RoundedRectangle(cornerRadius: 9))
+        } else if let status = model.projectRunPolicyStatus {
+            Text(status)
+                .font(VPTheme.mono(7.5))
+                .foregroundStyle(VPTheme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(9)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(VPTheme.surfaceSunken.opacity(0.5), in: RoundedRectangle(cornerRadius: 9))
+        }
+    }
+
+    private var note: some View {
+        Text(
+            "These values are project defaults only. They cannot widen approvals, sandbox, write scope or task contracts, budgets/capacity, Verifier, Integrator, or model routing. Saving does not top up or resume any session."
+        )
+        .font(VPTheme.mono(7.5))
+        .foregroundStyle(VPTheme.textTertiary)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var footer: some View {
+        HStack(spacing: 8) {
+            if model.projectRunPolicyBusy {
+                ProgressView().controlSize(.small)
+            }
+            Text("No auto-save · daemon validates the policy")
+                .font(VPTheme.mono(7))
+                .foregroundStyle(VPTheme.textTertiary)
+            Spacer()
+            Button("Cancel") { dismiss() }
+                .keyboardShortcut(.cancelAction)
+            Button {
+                Task {
+                    if await model.saveProjectRunPolicy() {
+                        dismiss()
+                    }
+                }
+            } label: {
+                Label("Save defaults", systemImage: "checkmark.circle")
+            }
+            .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
+            .keyboardShortcut(.defaultAction)
+            .disabled(!canSave)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 13)
+        .background(VPTheme.rail)
+    }
+}
+
 struct ShellPolicyCard: View {
     @Environment(AppModel.self) private var model
     let project: Project

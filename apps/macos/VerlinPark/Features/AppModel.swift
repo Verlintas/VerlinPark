@@ -196,6 +196,21 @@ final class AppModel {
     var projectAutoBudgetBusy = false
     var projectAutoBudgetError: BudgetValidationIssue?
     var projectAutoBudgetStatus: String?
+    // Project RunPolicy defaults. `updatedAt == nil` means the daemon is
+    // reporting built-in defaults, not an explicit saved policy. Saving is
+    // always an explicit operator action; a load never writes.
+    var projectRunPolicy: ProjectRunPolicyView?
+    var projectRunPolicyDraft = ProjectRunPolicyDraft()
+    var projectRunPolicyResult: ProjectRunPolicyResultView?
+    var projectRunPolicyProjectID: String?
+    var projectRunPolicyBusy = false
+    var projectRunPolicyError: BudgetValidationIssue?
+    var projectRunPolicyStatus: String?
+    // Resource-pause banner state. The banner itself is derived from events;
+    // these only carry the explicit resume request outcome.
+    var resourcePauseBusy = false
+    var resourcePauseNotice: String?
+    var resourcePauseError: String?
     var efficiencyBusy = false
     var efficiencyStatus: String?
     var shellPolicy = ShellPolicy.allow
@@ -781,6 +796,7 @@ final class AppModel {
     private var reconnectAttempt = 0
     private var started = false
     private var selectionGeneration = 0
+    private var projectRunPolicyGeneration = 0
     private var searchGeneration = 0
     private var lastEventSequences: [String: UInt64] = [:]
     private var lastGlobalResyncAt = Date.distantPast
@@ -884,6 +900,35 @@ final class AppModel {
         sessions.first { $0.id == selectedSessionID }
     }
 
+    /// The active resource-governor pause for the selected session. It is
+    /// derived only from the loaded daemon event stream and the daemon-reported
+    /// paused status; a bottleneck on a resource snapshot alone is not a pause.
+    /// When the stream is unavailable (not connected or no events loaded) this
+    /// deliberately returns nil rather than showing a possibly stale pause.
+    var resourcePause: ResourcePauseInfo? {
+        guard connection == .connected,
+              let sessionID = selectedSessionID,
+              selectedSession?.status == "paused",
+              events.contains(where: { $0.sessionId == sessionID })
+        else {
+            return nil
+        }
+        return ResourcePauseInfo.activePause(
+            in: events,
+            sessionID: sessionID,
+            eventStreamAvailable: true
+        )
+    }
+
+    /// The project policy editor is available only for the selected project
+    /// while nothing else is loading or saving it.
+    var canEditProjectRunPolicy: Bool {
+        selectedProjectID != nil
+            && projectRunPolicy != nil
+            && projectRunPolicyError == nil
+            && !projectRunPolicyBusy
+    }
+
     /// The model the daemon will actually use for the session Leader.
     ///
     /// This is `agent.info.role_models.leader.model` when a role override is
@@ -955,6 +1000,17 @@ final class AppModel {
         projectAutoBudgetStatus = nil
     }
 
+    private func resetProjectRunPolicyState() {
+        projectRunPolicyGeneration &+= 1
+        projectRunPolicy = nil
+        projectRunPolicyDraft = ProjectRunPolicyDraft()
+        projectRunPolicyResult = nil
+        projectRunPolicyProjectID = nil
+        projectRunPolicyBusy = false
+        projectRunPolicyError = nil
+        projectRunPolicyStatus = nil
+    }
+
     private func resetLongTaskState() {
         longTaskRefreshTask?.cancel()
         steeringMessages = []
@@ -1005,6 +1061,9 @@ final class AppModel {
         sessionResourceTopUpError = nil
         sessionResourceTopUpNotice = nil
         sessionResourceTopUpResult = nil
+        resourcePauseBusy = false
+        resourcePauseNotice = nil
+        resourcePauseError = nil
         sessionCacheStatus = nil
         sessionCacheCalls = []
         sessionCacheCallsTruncated = false
@@ -1120,6 +1179,13 @@ final class AppModel {
     /// in-app approval center so risk, tool, and target stay visible.
     func requestApprovalReview(_ approvalID: String) {
         highlightedApprovalID = approvalID
+        openApprovalCenter()
+    }
+
+    /// Opens the Manage Dash approval/question inbox without resolving
+    /// anything. Used by the resource-pause banner when operator attention is
+    /// the bottleneck.
+    func openApprovalCenter() {
         requestedDashboardSection = .inbox
         approvalAttentionRequestID = UUID()
         Task { await loadPendingApprovals() }
@@ -1257,6 +1323,7 @@ final class AppModel {
             projectCostBudgetText = ""
             projectBudgetStatus = nil
             resetProjectAutoBudgetState()
+            resetProjectRunPolicyState()
             projectUsage = nil
             projectUsageStatus = nil
             teamPlan = nil
@@ -1342,6 +1409,7 @@ final class AppModel {
         projectCostBudgetText = ""
         projectBudgetStatus = nil
         resetProjectAutoBudgetState()
+        resetProjectRunPolicyState()
         projectUsage = nil
         projectUsageStatus = nil
         memories = []
@@ -1414,6 +1482,7 @@ final class AppModel {
         Task { await loadMailboxPolicy() }
         Task { await loadProjectBudget() }
         Task { await loadProjectAutoBudgetPolicy(force: true) }
+        Task { await loadProjectRunPolicy(force: true) }
         Task { await loadEfficiency() }
         Task { await loadProjectForkForest() }
         Task { await loadDashboardSnapshot() }
@@ -1996,6 +2065,39 @@ final class AppModel {
             await loadSessionBudget(silent: true)
         } catch {
             handle(error)
+        }
+    }
+
+    /// Explicit resume from the resource-pause banner. The daemon result is the
+    /// only source of a resume claim; the banner itself clears only when the
+    /// daemon's resume event arrives. A bare resume can legitimately re-pause
+    /// while the resource cap is unchanged.
+    func resumeResourcePausedSession() async {
+        guard let sessionID = selectedSessionID, resourcePause != nil, !resourcePauseBusy else { return }
+        let generation = selectionGeneration
+        resourcePauseBusy = true
+        resourcePauseNotice = nil
+        resourcePauseError = nil
+        defer {
+            if selectedSessionID == sessionID {
+                resourcePauseBusy = false
+            }
+        }
+        do {
+            let resumed = try await core.resumeSession(sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            let notice = ResourcePauseInfo.resumeOutcomeNotice(resumed: resumed)
+            if resumed {
+                resourcePauseNotice = notice
+                showToast("Resume requested", detail: notice, kind: .info)
+            } else {
+                resourcePauseError = notice
+            }
+            await loadSessionBudget(silent: true)
+            await loadSessionResources(silent: true)
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            resourcePauseError = BudgetValidationIssue.from(error).displayText
         }
     }
 
@@ -4941,6 +5043,155 @@ final class AppModel {
 
     func reloadProjectAutoBudgetPolicy() async {
         await loadProjectAutoBudgetPolicy(force: true)
+    }
+
+    /// Read-only project RunPolicy defaults. This never writes and never turns
+    /// built-in defaults into an explicit policy row.
+    func loadProjectRunPolicy(force: Bool = false) async {
+        guard let projectID = selectedProjectID else {
+            resetProjectRunPolicyState()
+            return
+        }
+        if !force,
+           projectRunPolicyProjectID == projectID,
+           projectRunPolicyError == nil,
+           projectRunPolicy != nil
+        {
+            return
+        }
+        guard !projectRunPolicyBusy else { return }
+        let generation = projectRunPolicyGeneration
+        projectRunPolicyBusy = true
+        defer {
+            if selectedProjectID == projectID, generation == projectRunPolicyGeneration {
+                projectRunPolicyBusy = false
+            }
+        }
+        do {
+            let result = try await core.projectRunPolicy(projectID: projectID)
+            guard selectedProjectID == projectID, generation == projectRunPolicyGeneration else {
+                return
+            }
+            guard result.projectID == projectID else {
+                projectRunPolicyError = BudgetValidationIssue(
+                    code: "INVALID_PROJECT_RUN_POLICY_RESPONSE",
+                    message: "The daemon returned a RunPolicy for a different project; no local state was changed."
+                )
+                projectRunPolicyStatus = projectRunPolicyError?.displayText
+                return
+            }
+            applyProjectRunPolicyResult(result)
+        } catch {
+            guard selectedProjectID == projectID, generation == projectRunPolicyGeneration else {
+                return
+            }
+            projectRunPolicyError = BudgetValidationIssue.from(error)
+            projectRunPolicyStatus = projectRunPolicyError?.displayText
+            projectRunPolicyProjectID = projectID
+        }
+    }
+
+    /// Explicit operator save. The draft is validated locally, then the daemon
+    /// returns the authoritative policy and `updated_at`. A save is never
+    /// automatic, and a result for another project is rejected.
+    @discardableResult
+    func saveProjectRunPolicy() async -> Bool {
+        guard let projectID = selectedProjectID else {
+            projectRunPolicyError = BudgetValidationIssue(
+                code: "PROJECT_REQUIRED",
+                message: "Select a project before saving RunPolicy defaults."
+            )
+            return false
+        }
+        guard projectRunPolicyProjectID == projectID, projectRunPolicy != nil else {
+            projectRunPolicyError = BudgetValidationIssue(
+                code: "POLICY_NOT_LOADED",
+                message: "RunPolicy defaults are not loaded for this project; reload before saving."
+            )
+            return false
+        }
+        if let issue = projectRunPolicyDraft.validationIssue {
+            projectRunPolicyError = issue
+            return false
+        }
+        let policy: ProjectRunPolicyView
+        do {
+            policy = try projectRunPolicyDraft.makePolicy()
+        } catch {
+            projectRunPolicyError = BudgetValidationIssue.from(error)
+            return false
+        }
+        guard !projectRunPolicyBusy else { return false }
+        let generation = projectRunPolicyGeneration
+        projectRunPolicyBusy = true
+        projectRunPolicyError = nil
+        projectRunPolicyStatus = nil
+        defer {
+            if selectedProjectID == projectID, generation == projectRunPolicyGeneration {
+                projectRunPolicyBusy = false
+            }
+        }
+        do {
+            let result = try await core.setProjectRunPolicy(
+                projectID: projectID,
+                policy: policy
+            )
+            guard selectedProjectID == projectID, generation == projectRunPolicyGeneration else {
+                return false
+            }
+            guard result.projectID == projectID else {
+                projectRunPolicyError = BudgetValidationIssue(
+                    code: "INVALID_PROJECT_RUN_POLICY_RESPONSE",
+                    message: "The daemon returned a RunPolicy for a different project; no local state was changed."
+                )
+                return false
+            }
+            applyProjectRunPolicyResult(result)
+            projectRunPolicyStatus = "Project RunPolicy defaults saved."
+            showToast(
+                "RunPolicy defaults saved",
+                detail: "\(result.policy.profileTitle) · reserve \(result.policy.reservePercentLabel) · attention \(result.policy.attentionLabel)",
+                kind: .success
+            )
+            return true
+        } catch {
+            guard selectedProjectID == projectID, generation == projectRunPolicyGeneration else {
+                return false
+            }
+            projectRunPolicyError = BudgetValidationIssue.from(error)
+            return false
+        }
+    }
+
+    func reloadProjectRunPolicy() async {
+        await loadProjectRunPolicy(force: true)
+    }
+
+    /// Seeds the editor from the current daemon-reported policy. Called only by
+    /// an explicit "Edit" action, so a read never silently creates a draft that
+    /// looks saved.
+    func beginProjectRunPolicyEdit() {
+        guard let result = projectRunPolicyResult,
+              let policy = projectRunPolicy, result.projectID == selectedProjectID else { return }
+        projectRunPolicyDraft = ProjectRunPolicyDraft(policy: policy)
+        clearProjectRunPolicyFeedback()
+    }
+
+    /// Clears stale load/save feedback when the operator edits the draft.
+    func clearProjectRunPolicyFeedback() {
+        projectRunPolicyError = nil
+        projectRunPolicyStatus = nil
+    }
+
+    private func applyProjectRunPolicyResult(_ result: ProjectRunPolicyResultView) {
+        projectRunPolicy = result.policy
+        projectRunPolicyResult = result
+        projectRunPolicyDraft = ProjectRunPolicyDraft(policy: result.policy)
+        projectRunPolicyProjectID = result.projectID
+        projectRunPolicyError = nil
+        projectRunPolicyStatus = result.isExplicit
+            ? nil
+            : "Using built-in defaults; no explicit project RunPolicy is saved."
     }
 
     func loadMailboxPolicy() async {
@@ -10836,7 +11087,21 @@ final class AppModel {
                 self.selectedSessionID = nil
             }
             if selectedSessionID == nil {
-                selectedSessionID = sessions.first?.id
+                // Auto-select through the normal selection path, not by
+                // assigning the id directly: a launch/first-project selection
+                // must load budget, resources, events, plan, diff, checkpoints,
+                // lineage, mailbox, questions, and related state. Assigning the
+                // id here skipped those loads and left the Stage resource strip
+                // empty until the operator selected a different session. Keep
+                // the current mode so a resident launch does not jump into the
+                // project stage; the data is loaded in the background and the
+                // early-return click path switches to the project stage.
+                let previousMode = mode
+                if let first = sessions.first?.id {
+                    selectSession(first)
+                }
+                mode = previousMode
+                return
             }
             await loadEvents()
             await loadTodos()
@@ -11370,6 +11635,15 @@ final class AppModel {
             "session.auto_state"].contains(event.type)
         {
             refreshSessionBudgetSoon()
+        }
+
+        if event.sessionId == selectedSessionID,
+           event.type == ResourcePauseInfo.eventKind || ResourcePauseInfo.clearsPause(event)
+        {
+            resourcePauseNotice = nil
+            resourcePauseError = nil
+            refreshSessionBudgetSoon()
+            Task { await self.loadSessionResources(silent: true) }
         }
 
         if event.sessionId == selectedSessionID,

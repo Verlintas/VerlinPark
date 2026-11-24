@@ -3,9 +3,9 @@
 - Status: Final plan; implementation in progress. Collab Agent
   Inspector/Direct Channel implemented (2026-11-22) and live-provider exercised
   (2026-11-23). Run Contract/resource observability R1, the P0 tool-friction
-  fixes, R2a profile/top-up/pre-dispatch, and R2b core turn-boundary pause +
-  Worker/Labour auto request-fit + macOS top-up + project RunPolicy are
-  implemented (2026-11-24); attention batching, explicit partial-delivery
+  fixes, R2a profile/top-up/pre-dispatch, and R2b core lean turn-boundary pause +
+  token/cost/time child Auto request-fit + macOS top-up/pause/project policy
+  are implemented (2026-11-24); attention batching, explicit partial-delivery
   action, and R3/R4 remain. Open findings and live evidence are tracked in
   [V1_READINESS_LEDGER.md](V1_READINESS_LEDGER.md).
 - Date: 2026-11-22 (live validation update 2026-11-23)
@@ -274,9 +274,13 @@ These are already discovered; V1 does not start with a clean slate.
 
 ### 6.2 Core runtime
 
-- Auto Budget currently extends only at top-level Leader turns. TeamPlan
-  Worker/Labour spend can exhaust the budget between Leader turns. Fix this, or
-  make plan sessions use Fixed budgets with an explicit UI warning.
+- Auto Budget previously extended only at top-level Leader turns, so TeamPlan
+  Worker/Labour spend could exhaust the budget between Leader turns. R2b adds
+  token request-fit for every role and cost/time request-fit for child runs at
+  provider boundaries, but the cost estimate is a recent per-call average, an
+  unpriced first call can still overshoot, and this is not exactly-once
+  accounting. Treat the residual gap as open until a live multi-Worker run
+  records evidence.
 - In-run plan revision is incomplete; the operator RPC/CLI exists, but the
   Leader cannot perform a bounded revision during discovery.
 - `db-rebuild` silently skips malformed source snapshots; report them in

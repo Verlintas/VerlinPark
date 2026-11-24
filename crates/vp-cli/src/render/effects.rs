@@ -103,6 +103,9 @@ pub(crate) fn effect_lines(value: &Value) -> Option<Vec<String>> {
     }
     if let Some(policy) = value.get("policy")
         && let Some(project) = value.get("project_id").and_then(Value::as_str)
+        && (policy.get("enabled").is_some()
+            || policy.get("unknown_blocks_merge").is_some()
+            || policy.get("shell_mode").is_some())
     {
         return Some(vec![format!(
             "project {project}  effects enabled={} unknown_blocks_merge={} stale_grace={}s shell_mode={} http_mutations={} http_reads={} mcp_mutations={} workspace_writes={}",

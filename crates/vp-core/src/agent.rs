@@ -1090,9 +1090,7 @@ pub(in crate::agent) async fn pause_for_resource_block(
         if control.is_cancelled() || control.is_preempted() {
             return Ok(false);
         }
-        let decision = engine
-            .resource_governor_decision(&session.id, "turn")
-            .await?;
+        let decision = engine.resource_governor_turn_decision(&session.id).await?;
         let Some(reason) = resource_turn_pause_reason(&decision, auto_budget_active) else {
             return Ok(true);
         };
@@ -2556,6 +2554,31 @@ impl AutoBudgetRuntime {
         })
     }
 
+    /// Bounded evidence for a request-fit pause. It carries every budget
+    /// dimension so a cost-only or time-only policy is as diagnosable as the
+    /// original token-only path.
+    fn request_fit_pause_details(
+        &self,
+        missing: &[&'static str],
+        needed: u64,
+        status: &SessionBudgetStatus,
+        reserved_tokens: u64,
+    ) -> serde_json::Value {
+        json!({
+            "code": "AUTO_BUDGET_CAP_REACHED",
+            "missing": missing,
+            "request_estimate": needed,
+            "remaining_tokens": status.remaining_tokens,
+            "reserved_tokens": reserved_tokens,
+            "hard_token_cap": status.hard_token_cap,
+            "remaining_cost_usd": status.remaining_cost_usd,
+            "hard_cost_cap_usd": status.hard_cost_cap_usd,
+            "remaining_secs": status.remaining_secs,
+            "hard_wall_clock_secs": status.hard_wall_clock_secs,
+            "extensions": self.state.extensions,
+        })
+    }
+
     /// Pause at a safe turn boundary and wait for the operator to resume. The
     /// run is not finalized as failed and no provider/tool call is made while
     /// paused. Returns `false` when the run was cancelled instead of resumed.
@@ -2879,8 +2902,13 @@ impl AutoBudgetRuntime {
     ///
     /// A fresh session has no forecast samples, so `before_turn` may see a
     /// healthy ratio while the first request estimate is already larger than
-    /// the initial allowance. Extend before the token reservation, or pause at
-    /// the hard cap; never let the first call fail as a generic budget error.
+    /// the initial allowance. Extend before the reservation, or pause at the
+    /// hard cap; never let a call fail as a generic budget error.
+    ///
+    /// Token fit applies to every role. Cost/time fit applies to child runs:
+    /// the top-level Leader's per-turn runway extension owns those dimensions,
+    /// while a Worker/Labour/Manager/Scout/Verifier call could otherwise start
+    /// below a hard cost or wall-clock cap between Leader turns.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::agent) async fn ensure_request_fits(
         &mut self,
@@ -2907,52 +2935,138 @@ impl AutoBudgetRuntime {
                 self.active = false;
                 return Ok(true);
             }
-            let Some(remaining) = status.remaining_tokens else {
-                return Ok(true);
-            };
-            // Other agents in the same plan run hold reservations against the
-            // shared SessionBudget. The store reports spend only, so subtract
-            // live reservations here; otherwise parallel Workers can each see
-            // the same headroom and one of them fails the later reservation.
-            let reserved = budget.reserved_tokens();
-            let available = remaining.saturating_sub(reserved);
-            if available >= needed {
-                return Ok(true);
-            }
-            let Some(hard_cap) = status.hard_token_cap else {
-                // Token usage is bounded by an effective budget but there is no
-                // extendable hard cap. Pause rather than silently failing.
-                let details = json!({
-                    "code": "AUTO_BUDGET_CAP_REACHED",
-                    "missing": ["tokens"],
-                    "request_estimate": needed,
-                    "remaining_tokens": remaining,
-                    "reserved_tokens": reserved,
-                    "extensions": self.state.extensions,
-                });
-                if !self
-                    .pause_and_wait(
-                        engine,
-                        session,
-                        spec,
-                        control,
-                        budget,
-                        "budget_cap",
-                        Some(&status),
-                        details,
-                    )
-                    .await?
-                {
-                    return Ok(false);
-                }
-                continue;
-            };
-            let request = AutoBudgetExtension {
-                requested_token_extension: Some(needed.saturating_sub(available)),
+
+            let mut request = AutoBudgetExtension {
                 reason: Some("request_fit".to_string()),
                 forecast: Some(status.forecast.clone()),
                 ..AutoBudgetExtension::default()
             };
+            let mut missing: Vec<&'static str> = Vec::new();
+
+            // Other agents in the same plan run hold reservations against the
+            // shared SessionBudget. The store reports spend only, so subtract
+            // live reservations here; otherwise parallel Workers can each see
+            // the same headroom and one of them fails the later reservation.
+            if let Some(remaining) = status.remaining_tokens {
+                let reserved = budget.reserved_tokens();
+                let available = remaining.saturating_sub(reserved);
+                if available < needed {
+                    if status.hard_token_cap.is_none() {
+                        // Token usage is bounded by an effective budget but
+                        // there is no extendable hard cap. Pause rather than
+                        // silently failing.
+                        let details =
+                            self.request_fit_pause_details(&["tokens"], needed, &status, reserved);
+                        if !self
+                            .pause_and_wait(
+                                engine,
+                                session,
+                                spec,
+                                control,
+                                budget,
+                                "budget_cap",
+                                Some(&status),
+                                details,
+                            )
+                            .await?
+                        {
+                            return Ok(false);
+                        }
+                        continue;
+                    }
+                    request.requested_token_extension =
+                        Some(needed.saturating_sub(available).max(1));
+                    missing.push("tokens");
+                }
+            }
+
+            if !self.owns_turns {
+                if let Some(remaining) = status.remaining_cost_usd {
+                    let estimate = status.forecast.avg_cost_usd_per_call;
+                    let available = (remaining - budget.reserved_cost()).max(0.0);
+                    let short = if estimate.is_finite() && estimate > 0.0 {
+                        // The forecast is the average of recent calls, so one
+                        // more call at that average is the conservative fit.
+                        available + f64::EPSILON < estimate
+                    } else {
+                        // No usable price sample: only an exhausted cost
+                        // budget is an unambiguous cap hit.
+                        available <= 0.0
+                    };
+                    if short {
+                        if status.hard_cost_cap_usd.is_none() {
+                            let details = self.request_fit_pause_details(
+                                &["cost"],
+                                needed,
+                                &status,
+                                budget.reserved_tokens(),
+                            );
+                            if !self
+                                .pause_and_wait(
+                                    engine,
+                                    session,
+                                    spec,
+                                    control,
+                                    budget,
+                                    "budget_cap",
+                                    Some(&status),
+                                    details,
+                                )
+                                .await?
+                            {
+                                return Ok(false);
+                            }
+                            continue;
+                        }
+                        let required = if estimate.is_finite() && estimate > 0.0 {
+                            (estimate - available).max(0.01)
+                        } else {
+                            0.01
+                        };
+                        request.requested_cost_extension_usd = Some(required);
+                        missing.push("cost");
+                    }
+                }
+                if let Some(remaining) = status.remaining_secs
+                    && remaining < MIN_CHILD_REQUEST_TIME_RUNWAY_SECS
+                {
+                    if status.hard_wall_clock_secs.is_none() {
+                        let details = self.request_fit_pause_details(
+                            &["time"],
+                            needed,
+                            &status,
+                            budget.reserved_tokens(),
+                        );
+                        if !self
+                            .pause_and_wait(
+                                engine,
+                                session,
+                                spec,
+                                control,
+                                budget,
+                                "budget_cap",
+                                Some(&status),
+                                details,
+                            )
+                            .await?
+                        {
+                            return Ok(false);
+                        }
+                        continue;
+                    }
+                    request.requested_wall_clock_extension_secs =
+                        Some(MIN_CHILD_REQUEST_TIME_RUNWAY_SECS - remaining);
+                    missing.push("time");
+                }
+            }
+
+            if missing.is_empty() {
+                return Ok(true);
+            }
+
+            let requested_tokens = request.requested_token_extension.is_some();
+            let requested_cost = request.requested_cost_extension_usd.is_some();
+            let requested_time = request.requested_wall_clock_extension_secs.is_some();
             let result = engine
                 .extend_session_auto_budget(&session.id, request)
                 .await?;
@@ -2962,23 +3076,52 @@ impl AutoBudgetRuntime {
                 .arm_preemption_deadline(budget.wall_clock_deadline(), control.preemption_policy());
             if result.extended {
                 self.warned_low = false;
-                let committed = budget.spent().saturating_add(budget.reserved_tokens());
-                if result
-                    .new_token_budget
-                    .is_some_and(|new_budget| new_budget >= needed.saturating_add(committed))
-                {
-                    return Ok(true);
+                // A requested dimension that did not move is at its ceiling or
+                // cannot be extended. Continuing would start the call below a
+                // hard cap even if another dimension extended successfully.
+                let stuck = (requested_tokens
+                    && !option_increased(result.old_token_budget, result.new_token_budget))
+                    || (requested_cost
+                        && !option_increased(
+                            result.old_cost_budget_usd,
+                            result.new_cost_budget_usd,
+                        ))
+                    || (requested_time
+                        && !option_increased(
+                            result.old_time_budget_secs,
+                            result.new_time_budget_secs,
+                        ));
+                if stuck {
+                    let details = self.request_fit_pause_details(
+                        &missing,
+                        needed,
+                        &result.budget,
+                        budget.reserved_tokens(),
+                    );
+                    if !self
+                        .pause_and_wait(
+                            engine,
+                            session,
+                            spec,
+                            control,
+                            budget,
+                            "budget_cap",
+                            Some(&result.budget),
+                            details,
+                        )
+                        .await?
+                    {
+                        return Ok(false);
+                    }
                 }
                 continue;
             }
-            let details = json!({
-                "code": "AUTO_BUDGET_CAP_REACHED",
-                "missing": budget_missing_dimensions(&result.budget),
-                "request_estimate": needed,
-                "remaining_tokens": result.budget.remaining_tokens,
-                "hard_token_cap": hard_cap,
-                "extensions": self.state.extensions,
-            });
+            let details = self.request_fit_pause_details(
+                &missing,
+                needed,
+                &result.budget,
+                budget.reserved_tokens(),
+            );
             if !self
                 .pause_and_wait(
                     engine,
@@ -3345,6 +3488,19 @@ fn auto_budget_extension_request(
         requested_wall_clock_extension_secs,
         reason: Some(reason),
         forecast: Some(status.forecast.clone()),
+    }
+}
+
+/// A child provider call must not start with less than this much wall clock
+/// left. The top-level Leader's per-turn runway extension owns cost/time, so
+/// this bound only protects child request-fit between Leader turns.
+const MIN_CHILD_REQUEST_TIME_RUNWAY_SECS: u64 = 30;
+
+fn option_increased<T: PartialOrd>(old: Option<T>, new: Option<T>) -> bool {
+    match (old, new) {
+        (Some(old), Some(new)) => new > old,
+        (None, Some(_)) => true,
+        _ => false,
     }
 }
 

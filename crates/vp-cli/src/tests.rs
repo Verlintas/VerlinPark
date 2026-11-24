@@ -5314,6 +5314,19 @@ mod effect_cli_tests {
         let lines = effect_lines(&policy).unwrap();
         assert!(lines[0].contains("prj-1"));
         assert!(lines[0].contains("external_only"));
+        let run_policy = json!({
+            "project_id": "prj-1",
+            "policy": {
+                "default_profile": "fast",
+                "completion_reserve_ratio": 0.2,
+                "attention_cap": 20,
+                "stop_policy": {}
+            }
+        });
+        assert!(
+            effect_lines(&run_policy).is_none(),
+            "a project RunPolicy must not render as an effect policy"
+        );
         let sweep = json!({"swept": 2});
         assert!(effect_lines(&sweep).unwrap()[0].contains("2 stale intent"));
     }
@@ -8681,6 +8694,51 @@ mod auto_budget_cli_tests {
 
         assert!(budget_lines(&json!({"session_id": "ses-1"})).is_none());
         assert!(budget_lines(&json!({"policy": {"enabled": true}})).is_none());
+    }
+
+    #[test]
+    fn project_run_policy_renderer_does_not_look_like_an_effect_policy() {
+        let value = json!({
+            "project_id": "prj-1",
+            "updated_at": "2026-11-24T00:00:00Z",
+            "policy": {
+                "default_profile": "fast",
+                "completion_reserve_ratio": 0.25,
+                "attention_cap": 9,
+                "stop_policy": {
+                    "require_evidence": true,
+                    "no_progress_turns": 4,
+                    "marginal_value_ratio": 0.2,
+                    "partial_delivery": true
+                }
+            }
+        });
+        let text = budget_lines(&value)
+            .expect("project run policy lines")
+            .join("\n");
+        assert!(text.contains("project prj-1 Run Contract defaults"));
+        assert!(text.contains("updated 2026-11-24T00:00:00Z"));
+        assert!(text.contains("profile     fast"));
+        assert!(text.contains("reserve     25%"));
+        assert!(text.contains("attention   cap 9"));
+        assert!(text.contains("no-progress 4 turn(s)"));
+        assert!(!text.contains("effects enabled"));
+
+        let defaults = json!({
+            "project_id": "prj-1",
+            "policy": {
+                "default_profile": "balanced",
+                "completion_reserve_ratio": 0.2,
+                "attention_cap": 20,
+                "stop_policy": {}
+            }
+        });
+        let text = budget_lines(&defaults)
+            .expect("default policy lines")
+            .join("\n");
+        assert!(text.contains("built-in defaults"));
+        assert!(text.contains("evidence required"));
+        assert!(text.contains("partial delivery allowed"));
     }
 
     #[test]

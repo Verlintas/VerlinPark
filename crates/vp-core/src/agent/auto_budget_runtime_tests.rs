@@ -318,6 +318,136 @@ async fn seed_session_tokens(
     }
 }
 
+async fn seed_session_cost(harness: &Harness, session: &Session, cost_usd: f64) {
+    harness
+        .engine
+        .record_agent_usage(
+            &session.id,
+            "seed-cost",
+            "Seed Cost",
+            "worker",
+            None,
+            None,
+            "test",
+            0,
+            0,
+            false,
+            cost_usd,
+        )
+        .await
+        .unwrap();
+}
+
+/// Run one Worker provider call directly through the shared run loop. The
+/// scripted provider never touches the network; the helper keeps cost/time
+/// request-fit tests focused on the budget path.
+async fn run_child_worker(
+    harness: &Harness,
+    session: &Session,
+    control: &RunControl,
+    prompt: &str,
+) -> LoopOutcome {
+    let session_record = harness
+        .engine
+        .store()
+        .get_session(&session.id)
+        .unwrap()
+        .unwrap();
+    let project_record = harness
+        .engine
+        .store()
+        .get_project(&harness.project.id)
+        .unwrap()
+        .unwrap();
+    let config = harness
+        .service
+        .config
+        .read()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .clone();
+    let worktree = PathBuf::from(
+        session_record
+            .worktree
+            .clone()
+            .expect("auto session has a worktree"),
+    );
+    let branch = session_record.branch.clone().unwrap_or_default();
+    let spec = AgentSpec {
+        id: "worker-request-fit".into(),
+        role: AgentRole::Worker,
+        name: "Worker".into(),
+        depth: 1,
+        parent_name: Some("Manager".into()),
+        title: Some("Worker".into()),
+        task_id: None,
+        department: Some("engineering".into()),
+        identity_id: None,
+        identity_generation: None,
+        profile: AgentProfile::Coding,
+        allow_delegation: true,
+        task_kind: Some("coding".into()),
+        auto_approve: false,
+        worktree: worktree.clone(),
+        branch: branch.clone(),
+        session_worktree: worktree.clone(),
+        session_branch: branch,
+        write_scope: Vec::new(),
+        base_commit: session_record.base_commit.clone().unwrap_or_default(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
+    };
+    let status = harness.engine.session_budget(&session.id).await.unwrap();
+    let mut budget = SessionBudget::new(
+        session_record.token_budget,
+        session_record.tokens_in + session_record.tokens_out,
+        AgentCaps {
+            managers: config.max_managers,
+            workers: config.max_workers,
+            labour: config.max_labour,
+        },
+    )
+    .with_cost(
+        session_record.cost_budget_usd,
+        session_record.cost_spent_usd,
+    )
+    .with_time(session_record.time_budget_secs)
+    .with_unlimited_flag(
+        harness
+            .engine
+            .unlimited_flag(&session_record.id, session_record.unlimited),
+    );
+    budget = budget.with_cumulative_elapsed(
+        status
+            .state
+            .as_ref()
+            .map(|state| state.elapsed_secs)
+            .unwrap_or(0),
+    );
+    budget.apply_status(&status);
+    budget.set_remaining_time(status.remaining_secs);
+    let mut conversation = vec![ChatMessage::user(prompt)];
+    run_loop(
+        &harness.engine,
+        &config,
+        &session_record,
+        &project_record,
+        control,
+        &budget,
+        &spec,
+        prompt,
+        &mut conversation,
+        None,
+        false,
+        None,
+    )
+    .await
+    .unwrap()
+}
+
 fn messages_extend(previous: &[ChatMessage], next: &[ChatMessage]) -> bool {
     next.len() >= previous.len()
         && previous.iter().zip(next).all(|(left, right)| {
@@ -1967,106 +2097,8 @@ async fn worker_request_fit_extends_the_auto_budget_without_owning_turns() {
         )
         .await
         .unwrap();
-    let session_record = harness
-        .engine
-        .store()
-        .get_session(&session.id)
-        .unwrap()
-        .unwrap();
-    let project_record = harness
-        .engine
-        .store()
-        .get_project(&harness.project.id)
-        .unwrap()
-        .unwrap();
-    let config = harness
-        .service
-        .config
-        .read()
-        .unwrap()
-        .as_ref()
-        .unwrap()
-        .clone();
-    let worktree = PathBuf::from(
-        session_record
-            .worktree
-            .clone()
-            .expect("auto session has a worktree"),
-    );
-    let branch = session_record.branch.clone().unwrap_or_default();
-    let spec = AgentSpec {
-        id: "worker-request-fit".into(),
-        role: AgentRole::Worker,
-        name: "Worker".into(),
-        depth: 1,
-        parent_name: Some("Manager".into()),
-        title: Some("Worker".into()),
-        task_id: None,
-        department: Some("engineering".into()),
-        identity_id: None,
-        identity_generation: None,
-        profile: AgentProfile::Coding,
-        allow_delegation: true,
-        task_kind: Some("coding".into()),
-        auto_approve: false,
-        worktree: worktree.clone(),
-        branch: branch.clone(),
-        session_worktree: worktree.clone(),
-        session_branch: branch,
-        write_scope: Vec::new(),
-        base_commit: session_record.base_commit.clone().unwrap_or_default(),
-
-        workspace_id: None,
-        session_workspace_id: None,
-        parent_workspace_id: None,
-    };
-    let status = harness.engine.session_budget(&session.id).await.unwrap();
-    let mut budget = SessionBudget::new(
-        session_record.token_budget,
-        session_record.tokens_in + session_record.tokens_out,
-        AgentCaps {
-            managers: config.max_managers,
-            workers: config.max_workers,
-            labour: config.max_labour,
-        },
-    )
-    .with_cost(
-        session_record.cost_budget_usd,
-        session_record.cost_spent_usd,
-    )
-    .with_time(session_record.time_budget_secs)
-    .with_unlimited_flag(
-        harness
-            .engine
-            .unlimited_flag(&session_record.id, session_record.unlimited),
-    );
-    budget = budget.with_cumulative_elapsed(
-        status
-            .state
-            .as_ref()
-            .map(|state| state.elapsed_secs)
-            .unwrap_or(0),
-    );
-    budget.apply_status(&status);
-    budget.set_remaining_time(status.remaining_secs);
     let control = RunControl::new();
-    let mut conversation = vec![ChatMessage::user("worker request fit")];
-    let outcome = run_loop(
-        &harness.engine,
-        &config,
-        &session_record,
-        &project_record,
-        &control,
-        &budget,
-        &spec,
-        "worker request fit",
-        &mut conversation,
-        None,
-        false,
-        None,
-    )
-    .await
-    .unwrap();
+    let outcome = run_child_worker(&harness, &session, &control, "worker request fit").await;
     assert!(matches!(outcome, LoopOutcome::Final(_)));
     assert_eq!(harness.provider.calls(), 1);
 
@@ -2102,6 +2134,205 @@ async fn worker_request_fit_extends_the_auto_budget_without_owning_turns() {
     assert_eq!(record.state.turns_without_progress, 3);
     assert_eq!(record.state.last_progress_seq, 11);
     assert_eq!(record.state.extensions, 1);
+}
+
+#[tokio::test]
+async fn cost_only_auto_child_request_fit_extends_the_cost_budget() {
+    let harness = harness(vec![final_turn("cost child complete", 40, 8)], 10).await;
+    let policy = AutoBudgetPolicy {
+        enabled: true,
+        initial_cost_budget_usd: Some(1.0),
+        hard_cost_cap_usd: Some(10.0),
+        min_runway_turns: 4,
+        max_turns_per_run: 10,
+        no_progress_turns: 100,
+        ..AutoBudgetPolicy::default()
+    };
+    let session = harness.create_auto(policy).await;
+    // A child that starts with five cents left and a $0.95 forecast per call
+    // must extend before the provider request instead of crossing the cap.
+    seed_session_cost(&harness, &session, 0.95).await;
+    let control = RunControl::new();
+    let outcome = run_child_worker(&harness, &session, &control, "cost child").await;
+    assert!(matches!(outcome, LoopOutcome::Final(_)));
+    assert_eq!(harness.provider.calls(), 1);
+
+    let events = session_events(&harness.engine, &session.id).await;
+    let extension = events
+        .iter()
+        .find(|event| {
+            event.kind == "session.budget.auto_extended" && event.payload["reason"] == "request_fit"
+        })
+        .expect("cost request-fit auto extension");
+    assert!(
+        extension.payload["new"]["cost_budget_usd"]
+            .as_f64()
+            .is_some_and(|budget| budget > 1.0),
+        "the child request must extend the shared cost budget: {extension:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "session.auto_paused"),
+        "a successful cost extension must not pause the session"
+    );
+    let record = harness
+        .engine
+        .session_auto_budget(&session.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.state.extensions, 1);
+    assert_eq!(
+        record.state.total_turns, 0,
+        "a child run must not advance Leader-owned turn accounting"
+    );
+}
+
+#[tokio::test]
+async fn time_only_auto_child_request_fit_extends_the_wall_clock() {
+    let harness = harness(vec![final_turn("time child complete", 40, 8)], 10).await;
+    let policy = AutoBudgetPolicy {
+        enabled: true,
+        initial_wall_clock_secs: Some(1_000),
+        hard_wall_clock_secs: Some(4_000),
+        min_runway_turns: 4,
+        max_turns_per_run: 10,
+        no_progress_turns: 100,
+        ..AutoBudgetPolicy::default()
+    };
+    let session = harness.create_auto(policy).await;
+    harness
+        .engine
+        .update_session_auto_budget_state(
+            &session.id,
+            SessionAutoBudgetState {
+                elapsed_secs: 980,
+                total_turns: 5,
+                ..SessionAutoBudgetState::default()
+            },
+        )
+        .await
+        .unwrap();
+    let control = RunControl::new();
+    let outcome = run_child_worker(&harness, &session, &control, "time child").await;
+    assert!(matches!(outcome, LoopOutcome::Final(_)));
+    assert_eq!(harness.provider.calls(), 1);
+
+    let events = session_events(&harness.engine, &session.id).await;
+    let extension = events
+        .iter()
+        .find(|event| {
+            event.kind == "session.budget.auto_extended" && event.payload["reason"] == "request_fit"
+        })
+        .expect("time request-fit auto extension");
+    assert!(
+        extension.payload["new"]["time_budget_secs"]
+            .as_u64()
+            .is_some_and(|budget| budget > 1_000),
+        "the child request must extend the shared wall clock: {extension:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "session.auto_paused"),
+        "a successful time extension must not pause the session"
+    );
+    let record = harness
+        .engine
+        .session_auto_budget(&session.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.state.extensions, 1);
+    assert_eq!(record.state.total_turns, 5);
+}
+
+#[tokio::test]
+async fn cost_only_auto_child_request_fit_pauses_at_the_hard_cost_cap() {
+    let harness = harness(vec![final_turn("must not be requested", 10, 1)], 10).await;
+    let policy = AutoBudgetPolicy {
+        enabled: true,
+        initial_cost_budget_usd: Some(1.0),
+        hard_cost_cap_usd: Some(1.0),
+        min_runway_turns: 4,
+        max_turns_per_run: 10,
+        no_progress_turns: 100,
+        ..AutoBudgetPolicy::default()
+    };
+    let session = harness.create_auto(policy).await;
+    seed_session_cost(&harness, &session, 1.0).await;
+    let control = RunControl::new();
+    let run = run_child_worker(&harness, &session, &control, "cost pause");
+    tokio::select! {
+        _ = run => panic!("child run returned instead of pausing at the cost cap"),
+        _ = wait_for_status(&harness.engine, &session.id, &["paused"]) => {}
+    }
+    assert_eq!(
+        harness.provider.calls(),
+        0,
+        "no provider call may run while the hard cost cap is reached"
+    );
+    let pauses = wait_for_event_count(&harness.engine, &session.id, "session.auto_paused", 1).await;
+    assert_eq!(pauses[0].payload["reason"], "budget_cap");
+    assert!(
+        pauses[0].payload["details"]["missing"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|dimension| dimension == "cost"),
+        "the pause must name the cost dimension: {}",
+        pauses[0].payload
+    );
+}
+
+#[tokio::test]
+async fn time_only_auto_child_request_fit_pauses_at_the_hard_wall_clock_cap() {
+    let harness = harness(vec![final_turn("must not be requested", 10, 1)], 10).await;
+    let policy = AutoBudgetPolicy {
+        enabled: true,
+        initial_wall_clock_secs: Some(1_000),
+        hard_wall_clock_secs: Some(1_000),
+        min_runway_turns: 4,
+        max_turns_per_run: 10,
+        no_progress_turns: 100,
+        ..AutoBudgetPolicy::default()
+    };
+    let session = harness.create_auto(policy).await;
+    harness
+        .engine
+        .update_session_auto_budget_state(
+            &session.id,
+            SessionAutoBudgetState {
+                elapsed_secs: 1_000,
+                total_turns: 5,
+                ..SessionAutoBudgetState::default()
+            },
+        )
+        .await
+        .unwrap();
+    let control = RunControl::new();
+    let run = run_child_worker(&harness, &session, &control, "time pause");
+    tokio::select! {
+        _ = run => panic!("child run returned instead of pausing at the time cap"),
+        _ = wait_for_status(&harness.engine, &session.id, &["paused"]) => {}
+    }
+    assert_eq!(
+        harness.provider.calls(),
+        0,
+        "no provider call may run while the hard wall-clock cap is reached"
+    );
+    let pauses = wait_for_event_count(&harness.engine, &session.id, "session.auto_paused", 1).await;
+    assert_eq!(pauses[0].payload["reason"], "budget_cap");
+    assert!(
+        pauses[0].payload["details"]["missing"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|dimension| dimension == "time"),
+        "the pause must name the time dimension: {}",
+        pauses[0].payload
+    );
 }
 
 #[tokio::test]

@@ -58,10 +58,18 @@ pre-dispatch deferral，不改变 approval/Verifier/merge 行为：
   operator resume/top-up；裸 resume 若 cap 未变会再次暂停，不静默放行。
   Verifier 与 trusted internal repair 豁免，保证已产生的 commit 仍可验证/
   合并；`readiness_blocked` 仍是 dispatch gate，不在 turn 暂停（否则会卡住
-  审批/effect 流程）。Auto Budget request-fit 现在也覆盖 Worker/Labour/
-  Verifier；只有 top-level Leader 拥有 cumulative turns/no-progress。
+  审批/effect 流程）。turn governor 走 lean 路径：只计算 attention/risk、
+  money/token/time cap、context 和 completion reserve，不再在每个 provider
+  turn 调用 readiness（`git status`）、task queue、merge queue 或 agent
+  roster；dispatch 与 turn 共用同一 action ladder。Auto Budget request-fit
+  覆盖所有 role 的 token，并为 Worker/Labour/Manager/Scout/Verifier 子 run
+  增加 cost/time fit；child 不拥有 cumulative turns/no-progress，cap 无法
+  扩展或已到 ceiling 时暂停而不是越过 hard cap。
 - R2b macOS：Stage Top Up sheet（tokens/cost/time + resume、capped/resumed
-  真实状态）、readiness caveats/remaining work/blockers、bounded report 复制；
+  真实状态）、readiness caveats/remaining work/blockers、bounded report 复制，
+  Manage Dash 增加 project RunPolicy card/editor；Stage resource card 在真实
+  `session.resource.paused` 事件且 session 为 paused 时显示 pause banner，
+  Resume 只报告 daemon 结果，由 resume 事件清除，不凭 bottleneck 伪造暂停。
   UI 不发明 cap、resume 或 merge 结论。
 - R2b 项目级 RunPolicy：`ProjectRunPolicy`（profile/reserve/attention/stop
   defaults）持久化到 SQLite `project_run_policies`，写入 manifest 并由
@@ -69,15 +77,30 @@ pre-dispatch deferral，不改变 approval/Verifier/merge 行为：
   `project-run-policy`/`project-run-policy-set`；`run_contract_view` /
   `session_resources` 在 session override 之后使用项目默认值，source 区分
   `session_override` / `project_policy` / `derived`。项目 policy 不能放宽任何
-  approval/sandbox/contract/capacity/Verifier/Integrator 门。
-- R2b 仍未做 attention batching/prompt、显式 partial-delivery action/rescue、
-  cost/time-only child request-fit 和 governor 快照缓存。
+  approval/sandbox/contract/capacity/Verifier/Integrator 门。stop-policy 的
+  no-progress/边际价值字段也做了 bounded validation。CLI human render 使用
+  Project RunPolicy 自己的形状，effect-policy 的通用 `{project_id, policy}`
+  匹配已收紧，避免把 RunPolicy 误渲染成 effects。
+- R2b GUI 修复：首次启动/首次选择项目后自动选中的 session 现在走完整
+  `selectSession` 路径，加载 budget/resources/events/plan/diff/checkpoint/
+  lineage/mailbox/questions，不再只赋值 session id 导致 Stage resource strip
+  空白；同时保留启动时的 resident mode，用户打开项目后才切到 project stage。
+  `session.resources` 失败时显示显式 Resources unavailable + Retry，不静默
+  隐藏。真实 GUI smoke 验证 resident 启动、打开 session 后 resource card
+  立即出现，Manage Dash Policies 的 Project RunPolicy card/editor 显示
+  25%/11/4 并可展开保存界面；live provider 未配置，因此 pause banner 未在
+  真实暂停中触发（Swift event 解析/清除测试覆盖）。
+- R2b 仍未做 attention batching/prompt、显式 partial-delivery action/rescue
+  和 governor 快照缓存。
 - 测试：R1 full workspace **4,546**；R2a 后 **4,551**；R2b core 后 **4,554**；
-  项目 RunPolicy 后最终 full workspace **4,559 passed / 0 failed / 6 ignored**，
+  项目 RunPolicy 后 **4,559**；R2b final（lean turn/cost-time/UI）后
+  **4,570 passed / 0 failed / 6 ignored**，
   `cargo clippy --workspace --all-targets -- -D warnings` 通过。targeted：
-  23 auto-budget、368 agent、8 resource、2 project-policy/rebuild、434 store、
-  52 daemon、187 CLI、11 Swift tests 均通过。宿主机 `syspolicyd`/XProtect
-  spin 已单独调查并记录在 `HOST_SYSPOLICYD_INVESTIGATION.md`，不是仓库 bug。
+  27 auto-budget、368 agent、12 resource、2 project-policy/rebuild、2 protocol
+  stop-policy、434 store、52 daemon、188 CLI、18 Swift
+  `ResourceGovernorTests`，full Swift **628**（496 app + 132 helper）均通过。
+  宿主机 `syspolicyd`/XProtect spin 已单独调查并记录在
+  `HOST_SYSPOLICYD_INVESTIGATION.md`，不是仓库 bug。
 
 ## 2026-11-23 真实 DeepSeek + GUI 验证与 two hardenings
 

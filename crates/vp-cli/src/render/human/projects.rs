@@ -196,34 +196,6 @@ pub(super) fn print(value: &Value) -> bool {
         }
         return true;
     }
-    if let Some(policy) = value.get("policy")
-        && policy.get("default_profile").is_some()
-    {
-        println!(
-            "project {}  run-policy profile={} reserve={} attention_cap={} updated={}",
-            value["project_id"].as_str().unwrap_or("?"),
-            policy["default_profile"].as_str().unwrap_or("balanced"),
-            policy["completion_reserve_ratio"]
-                .as_f64()
-                .map(|value| format!("{value:.2}"))
-                .unwrap_or_else(|| "0.20".to_string()),
-            policy["attention_cap"].as_u64().unwrap_or(20),
-            value["updated_at"].as_str().unwrap_or("-")
-        );
-        if let Some(stop) = policy.get("stop_policy") {
-            println!(
-                "  stop: require_evidence={} no_progress_turns={} marginal_value_ratio={} partial_delivery={}",
-                stop["require_evidence"].as_bool().unwrap_or(true),
-                stop["no_progress_turns"].as_u64().unwrap_or(6),
-                stop["marginal_value_ratio"]
-                    .as_f64()
-                    .map(|value| format!("{value:.2}"))
-                    .unwrap_or_else(|| "0.20".to_string()),
-                stop["partial_delivery"].as_bool().unwrap_or(true)
-            );
-        }
-        return true;
-    }
     if value.get("budget").is_some() && value.get("spent_tokens").is_some() {
         println!(
             "project {}  token-budget={}  cost-budget={}  spent-tokens={}  spent-usd={:.4}",

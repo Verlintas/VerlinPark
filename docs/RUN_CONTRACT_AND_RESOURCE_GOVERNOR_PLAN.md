@@ -1,6 +1,6 @@
 # Run Contract and Resource Governor plan
 
-- Status: Accepted; P0/R1/R2a/R2b core implemented (turn-boundary pause, Worker/Labour auto request-fit, project RunPolicy, macOS top-up/readiness); R2b attention batching/partial-delivery action and R3/R4 open
+- Status: Accepted; P0/R1/R2a/R2b core implemented (lean turn-boundary pause, child Auto request-fit incl. cost/time, project RunPolicy, macOS top-up/pause/project policy); R2b attention batching, partial-delivery action, governor snapshot caching, and R3/R4 open
 - Date: 2026-11-24
 - Owner: Verlintas
 - Scope: V1 single-project coding
@@ -430,10 +430,11 @@ Phase R2a (operator mutations implemented):
 Phase R2b (implemented core):
 
 - `project.run_policy.get/set` (persisted SQLite + manifest/rebuild).
-- True turn-boundary pause/wait, Auto Budget request-fit for every role.
-- macOS top-up/readiness.
-- Open: attention prompt/batching, explicit partial-delivery/rescue,
-  cost/time-only child request-fit, governor snapshot caching.
+- Lean true turn-boundary pause/wait (no readiness/git status on the run path),
+  Auto Budget token request-fit for every role plus cost/time fit for children.
+- macOS top-up/readiness, project policy editor, and event-derived pause banner.
+- Open: attention prompt/batching, explicit partial-delivery/rescue, governor
+  snapshot caching.
 
 ### 13.2 CLI
 
@@ -533,10 +534,19 @@ Implemented:
 - True turn-boundary pause/wait (`session.resource.paused`) for Leader,
   Manager, Worker, Labour, Scout; Verifier and trusted internal repair runs are
   exempt so already-produced work can still be verified/integrated.
-- Auto Budget request-fit for every role; child runs never own cumulative
-  turns/no-progress state.
+- Lean turn-boundary decision: attention/risk, money/token/time caps, context,
+  and completion reserve only. The turn path no longer runs
+  `session_readiness` (`git status`), task queue, merge queue, or the agent
+  roster; dispatch and turn share the same action ladder.
+- Auto Budget request-fit for every role (tokens) plus cost/time fit for child
+  runs; child runs never own cumulative turns/no-progress state and pause when
+  a dimension cannot be extended or is at its ceiling.
 - macOS Top Up sheet, capped/resumed truth, readiness caveats, bounded report
-  copy.
+  copy, project RunPolicy editor, and a resource-pause banner derived only
+  from real `session.resource.paused` / resume events. First selection now
+  loads the full session state (budget/resources/events/plan/diff/...), and a
+  resource RPC failure shows an explicit unavailable/Retry card instead of
+  silently hiding the strip.
 - Project-level Run Contract policy: persisted SQLite policy, manifest/rebuild,
   `project.run_policy.get/set`, CLI `project-run-policy`/`project-run-policy-set`,
   project defaults with session override precedence.
@@ -547,8 +557,6 @@ Remaining:
 
 - Attention prompt/batching and operator policy change workflow.
 - Explicit partial-delivery action and rescue/reallocation.
-- Cost-only/time-only Auto request-fit for Worker/Labour (current request-fit
-  extends tokens; Leader runway owns cost/time).
 - Governor snapshot caching for large worktrees/plans.
 
 ### R3 — Allocate (next)
@@ -609,10 +617,11 @@ Implemented **P0 + R1 + R2a + R2b core**:
   bounded report copy;
 - event-backed profile/contract override and bounded top-up;
 - pre-dispatch deferral on attention/risk/completion reserve;
-- turn-boundary resource pause/resume and Auto Budget request-fit for every
-  role (Leader owns turns/no-progress; children only extend);
+- lean turn-boundary resource pause/resume and Auto Budget token/cost/time
+  request-fit (Leader owns turns/no-progress; children only extend);
+- project-level run policy plus macOS project-policy editor and event-derived
+  pause banner;
 - ledger/docs updated with the multi-resource model.
 
-Next: attention prompt/batching, project-level run policy, explicit
-partial-delivery action/rescue, cost/time-only child request-fit, governor
-snapshot caching, then R3/R4.
+Next: attention prompt/batching, explicit partial-delivery action/rescue,
+governor snapshot caching, then R3/R4.

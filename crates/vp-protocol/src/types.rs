@@ -3591,6 +3591,29 @@ impl Default for RunStopPolicy {
     }
 }
 
+impl RunStopPolicy {
+    /// Bounded stop-policy fields. `no_progress_turns = 0` keeps the existing
+    /// "disabled" meaning; the ceiling protects the run from an unbounded scan
+    /// window when a future controller consumes this policy.
+    pub fn validate(&self) -> Result<(), BudgetValidationError> {
+        if self.no_progress_turns > 1_000 {
+            return Err(BudgetValidationError::new(
+                auto_budget_codes::INVALID_BUDGET,
+                "stop policy no_progress_turns must be at most 1000",
+            ));
+        }
+        if !self.marginal_value_ratio.is_finite()
+            || !(0.0..=1.0).contains(&self.marginal_value_ratio)
+        {
+            return Err(BudgetValidationError::new(
+                auto_budget_codes::INVALID_BUDGET,
+                "stop policy marginal_value_ratio must be between 0.0 and 1.0",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Derived, read-only view of the run contract. R1 does not persist overrides;
 /// the effective values come from the session budget, plan, approval mode, and
 /// project policies.
@@ -3691,6 +3714,9 @@ impl RunContractOverride {
                 "attention cap must be between 1 and 1000",
             ));
         }
+        if let Some(stop_policy) = &self.stop_policy {
+            stop_policy.validate()?;
+        }
         Ok(())
     }
 }
@@ -3746,6 +3772,7 @@ impl ProjectRunPolicy {
                 "project attention cap must be between 1 and 1000",
             ));
         }
+        self.stop_policy.validate()?;
         Ok(())
     }
 }
@@ -27327,5 +27354,69 @@ mod agent_inspector_protocol_tests {
             agent_operator_codes::AGENT_MESSAGE_INVALID,
             "AGENT_MESSAGE_INVALID"
         );
+    }
+
+    #[test]
+    fn run_stop_policy_validates_bounded_fields() {
+        let default = RunStopPolicy::default();
+        default.validate().unwrap();
+
+        let at_ceiling = RunStopPolicy {
+            no_progress_turns: 1_000,
+            marginal_value_ratio: 1.0,
+            ..RunStopPolicy::default()
+        };
+        at_ceiling.validate().unwrap();
+
+        let too_many_turns = RunStopPolicy {
+            no_progress_turns: 1_001,
+            ..RunStopPolicy::default()
+        };
+        let error = too_many_turns.validate().unwrap_err();
+        assert_eq!(error.code, auto_budget_codes::INVALID_BUDGET);
+
+        for ratio in [-0.01, 1.01] {
+            let invalid = RunStopPolicy {
+                marginal_value_ratio: ratio,
+                ..RunStopPolicy::default()
+            };
+            assert!(invalid.validate().is_err(), "{ratio}");
+        }
+    }
+
+    #[test]
+    fn project_and_session_run_policies_reject_invalid_stop_policy() {
+        let invalid_stop = RunStopPolicy {
+            no_progress_turns: 1_001,
+            ..RunStopPolicy::default()
+        };
+        let project = ProjectRunPolicy {
+            stop_policy: invalid_stop.clone(),
+            ..ProjectRunPolicy::default()
+        };
+        assert_eq!(
+            project.validate().unwrap_err().code,
+            auto_budget_codes::INVALID_BUDGET
+        );
+
+        let override_policy = RunContractOverride {
+            profile: RunProfile::Balanced,
+            completion_reserve_ratio: None,
+            attention_cap: None,
+            stop_policy: Some(invalid_stop),
+            updated_at: "2026-11-24T00:00:00Z".into(),
+            updated_by: None,
+        };
+        assert!(override_policy.validate().is_err());
+
+        let valid = RunContractOverride {
+            profile: RunProfile::Balanced,
+            completion_reserve_ratio: Some(0.2),
+            attention_cap: Some(20),
+            stop_policy: Some(RunStopPolicy::default()),
+            updated_at: "2026-11-24T00:00:00Z".into(),
+            updated_by: None,
+        };
+        valid.validate().unwrap();
     }
 }

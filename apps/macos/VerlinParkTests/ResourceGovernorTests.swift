@@ -314,6 +314,316 @@ final class ResourceGovernorTests: XCTestCase {
         XCTAssertTrue(smaller.contains("… (truncated)"))
     }
 
+    // MARK: - Project RunPolicy
+
+    func testProjectRunPolicyResultDecodesDefaultsAndExplicitPolicy() throws {
+        let defaultsJSON = try XCTUnwrap("""
+        {
+          "project_id": "prj-1",
+          "policy": {
+            "default_profile": "quality",
+            "completion_reserve_ratio": 0.25,
+            "attention_cap": 40,
+            "stop_policy": {
+              "require_evidence": false,
+              "no_progress_turns": 9,
+              "marginal_value_ratio": 0.1,
+              "partial_delivery": false
+            }
+          }
+        }
+        """.data(using: .utf8))
+        let defaults = try JSONDecoder().decode(ProjectRunPolicyResultView.self, from: defaultsJSON)
+        XCTAssertEqual(defaults.projectID, "prj-1")
+        XCTAssertFalse(defaults.isExplicit)
+        XCTAssertEqual(defaults.sourceLabel, "Built-in defaults")
+        XCTAssertNil(defaults.updatedLabel)
+        XCTAssertEqual(defaults.policy.defaultProfile, .quality)
+        XCTAssertEqual(defaults.policy.profileTitle, "Quality")
+        XCTAssertEqual(defaults.policy.reservePercentLabel, "25%")
+        XCTAssertEqual(defaults.policy.attentionLabel, "40")
+        XCTAssertEqual(defaults.policy.noProgressLabel, "9 turns")
+        XCTAssertEqual(defaults.policy.stopPolicy.marginalValueRatio, 0.1)
+        XCTAssertFalse(defaults.policy.stopPolicy.requireEvidence)
+        XCTAssertFalse(defaults.policy.stopPolicy.partialDelivery)
+
+        let explicitJSON = try XCTUnwrap("""
+        {
+          "project_id": "prj-1",
+          "updated_at": "2026-11-24T01:02:03Z",
+          "policy": {
+            "default_profile": "fast",
+            "completion_reserve_ratio": 0.15,
+            "attention_cap": 20,
+            "stop_policy": {}
+          }
+        }
+        """.data(using: .utf8))
+        let explicit = try JSONDecoder().decode(ProjectRunPolicyResultView.self, from: explicitJSON)
+        XCTAssertTrue(explicit.isExplicit)
+        XCTAssertEqual(explicit.sourceLabel, "Explicit project policy")
+        XCTAssertEqual(explicit.updatedLabel, "saved 2026-11-24T01:02:03Z")
+        XCTAssertEqual(explicit.policy.profileTitle, "Fast")
+        XCTAssertEqual(explicit.policy.stopPolicy.noProgressTurns, 6)
+    }
+
+    func testProjectRunPolicyValidationRejectsOutOfBoundsValues() throws {
+        try ProjectRunPolicyView().validate()
+        for ratio in [-0.01, 0.51, .infinity, .nan] {
+            XCTAssertThrowsError(
+                try ProjectRunPolicyView(completionReserveRatio: ratio).validate()
+            )
+        }
+        XCTAssertThrowsError(try ProjectRunPolicyView(attentionCap: 0).validate())
+        XCTAssertThrowsError(try ProjectRunPolicyView(attentionCap: 1001).validate())
+        XCTAssertThrowsError(
+            try ProjectRunPolicyView(
+                stopPolicy: RunStopPolicyView(
+                    requireEvidence: true,
+                    noProgressTurns: 1001,
+                    marginalValueRatio: 0.2,
+                    partialDelivery: true
+                )
+            ).validate()
+        )
+        XCTAssertThrowsError(
+            try ProjectRunPolicyView(
+                stopPolicy: RunStopPolicyView(
+                    requireEvidence: true,
+                    noProgressTurns: 6,
+                    marginalValueRatio: 1.5,
+                    partialDelivery: true
+                )
+            ).validate()
+        )
+    }
+
+    func testProjectRunPolicyDraftParsesAndPreservesStopPolicy() throws {
+        let loaded = ProjectRunPolicyView(
+            defaultProfile: .cheap,
+            completionReserveRatio: 0.125,
+            attentionCap: 7,
+            stopPolicy: RunStopPolicyView(
+                requireEvidence: false,
+                noProgressTurns: 9,
+                marginalValueRatio: 0.35,
+                partialDelivery: false
+            )
+        )
+        var draft = ProjectRunPolicyDraft(policy: loaded)
+        XCTAssertEqual(draft.completionReservePercentText, "12.5")
+        XCTAssertEqual(draft.attentionCapText, "7")
+        XCTAssertEqual(draft.noProgressTurnsText, "9")
+        XCTAssertNil(draft.validationIssue)
+        let saved = try draft.makePolicy()
+        XCTAssertEqual(saved.defaultProfile, .cheap)
+        XCTAssertEqual(saved.completionReserveRatio, 0.125)
+        XCTAssertEqual(saved.attentionCap, 7)
+        XCTAssertEqual(saved.stopPolicy.noProgressTurns, 9)
+        XCTAssertEqual(saved.stopPolicy.requireEvidence, false)
+        XCTAssertEqual(saved.stopPolicy.marginalValueRatio, 0.35)
+        XCTAssertEqual(saved.stopPolicy.partialDelivery, false)
+
+        let valid = draft
+        draft.completionReservePercentText = ""
+        XCTAssertNotNil(draft.validationIssue)
+        draft = valid
+        draft.completionReservePercentText = "51"
+        XCTAssertNotNil(draft.validationIssue)
+        draft = valid
+        draft.attentionCapText = "0"
+        XCTAssertNotNil(draft.validationIssue)
+        draft = valid
+        draft.attentionCapText = "1001"
+        XCTAssertNotNil(draft.validationIssue)
+        draft = valid
+        draft.noProgressTurnsText = "1001"
+        XCTAssertNotNil(draft.validationIssue)
+        draft = valid
+        draft.noProgressTurnsText = "not a number"
+        XCTAssertNotNil(draft.validationIssue)
+        draft = valid
+        draft.profile = .unattended
+        XCTAssertEqual(try draft.makePolicy().profileTitle, "Unattended")
+    }
+
+    func testProjectRunPolicyEncodesSnakeCaseWireFields() throws {
+        let policy = ProjectRunPolicyView(
+            defaultProfile: .unattended,
+            completionReserveRatio: 0.2,
+            attentionCap: 12,
+            stopPolicy: .standard
+        )
+        let object = try XCTUnwrap(policy.jsonValue().objectValue)
+        XCTAssertEqual(object["default_profile"]?.stringValue, "unattended")
+        XCTAssertEqual(object["completion_reserve_ratio"]?.doubleValue, 0.2)
+        XCTAssertEqual(object["attention_cap"]?.intValue, 12)
+        let stop = try XCTUnwrap(object["stop_policy"]?.objectValue)
+        XCTAssertEqual(stop["no_progress_turns"]?.intValue, 6)
+        XCTAssertEqual(stop["require_evidence"]?.boolValue, true)
+    }
+
+    // MARK: - Resource pause events
+
+    func testResourcePauseActiveUsesLatestEventAndRequiresDaemonEvents() throws {
+        let pause = pauseEvent(seq: 1, reason: "attention_cap", bottleneck: "attention")
+        let info = try XCTUnwrap(
+            ResourcePauseInfo.activePause(
+                in: [pause],
+                sessionID: "ses-1",
+                eventStreamAvailable: true
+            )
+        )
+        XCTAssertEqual(info.sequence, 1)
+        XCTAssertEqual(info.reason, "attention_cap")
+        XCTAssertEqual(info.roleLabel, "leader")
+        XCTAssertEqual(info.bottleneckLabel, "attention")
+        XCTAssertEqual(info.taskShortLabel, "task-123")
+        XCTAssertEqual(info.agentShortLabel, "leader-agent")
+        XCTAssertNil(
+            ResourcePauseInfo.activePause(
+                in: [pause],
+                sessionID: "ses-1",
+                eventStreamAvailable: false
+            )
+        )
+        XCTAssertNil(
+            ResourcePauseInfo.activePause(
+                in: [pause],
+                sessionID: "ses-2",
+                eventStreamAvailable: true
+            )
+        )
+
+        let resumed = sessionUpdatedEvent(seq: 3, status: "running")
+        XCTAssertNil(
+            ResourcePauseInfo.activePause(
+                in: [pause, sessionUpdatedEvent(seq: 2, status: "paused"), resumed],
+                sessionID: "ses-1",
+                eventStreamAvailable: true
+            )
+        )
+        let secondPause = pauseEvent(seq: 4, reason: "completion_reserve_low")
+        let latest = try XCTUnwrap(
+            ResourcePauseInfo.activePause(
+                in: [pause, resumed, secondPause],
+                sessionID: "ses-1",
+                eventStreamAvailable: true
+            )
+        )
+        XCTAssertEqual(latest.sequence, 4)
+        XCTAssertEqual(latest.reason, "completion_reserve_low")
+    }
+
+    func testResourcePauseClearingRulesDoNotInferFromBottleneckOrPausedStatus() {
+        XCTAssertFalse(ResourcePauseInfo.clearsPause(sessionUpdatedEvent(seq: 1, status: "paused")))
+        XCTAssertFalse(ResourcePauseInfo.clearsPause(agentEvent(seq: 2, type: "agent.paused")))
+        XCTAssertTrue(ResourcePauseInfo.clearsPause(agentEvent(seq: 3, type: "agent.resumed")))
+        XCTAssertTrue(ResourcePauseInfo.clearsPause(sessionUpdatedEvent(seq: 4, status: "running")))
+        XCTAssertTrue(ResourcePauseInfo.clearsPause(sessionUpdatedEvent(seq: 5, status: "resumed")))
+        XCTAssertTrue(ResourcePauseInfo.clearsPause(sessionUpdatedEvent(seq: 6, status: "failed")))
+        XCTAssertTrue(ResourcePauseInfo.clearsPause(sessionUpdatedEvent(seq: 7, status: "idle")))
+        XCTAssertFalse(ResourcePauseInfo.clearsPause(agentEvent(seq: 8, type: "session.resource.decision")))
+    }
+
+    func testResourcePauseRejectsWrongSchemaAndBoundsLabels() throws {
+        let wrongSchema = pauseEvent(seq: 1, schema: "other/v1")
+        XCTAssertNil(
+            ResourcePauseInfo.activePause(
+                in: [wrongSchema],
+                sessionID: "ses-1",
+                eventStreamAvailable: true
+            )
+        )
+        let longReason = String(repeating: "r", count: 400)
+        let info = try XCTUnwrap(
+            ResourcePauseInfo(event: pauseEvent(seq: 2, reason: longReason))
+        )
+        XCTAssertEqual(info.reasonLabel.count, 240)
+        let minimal = try XCTUnwrap(
+            ResourcePauseInfo(
+                event: pauseEvent(
+                    seq: 3,
+                    bottleneck: nil,
+                    role: nil,
+                    taskID: nil,
+                    agentID: nil
+                )
+            )
+        )
+        XCTAssertEqual(minimal.roleLabel, "role not reported")
+        XCTAssertEqual(minimal.bottleneckLabel, "bottleneck not reported")
+        XCTAssertNil(minimal.taskShortLabel)
+        XCTAssertNil(minimal.agentShortLabel)
+        XCTAssertTrue(
+            ResourcePauseInfo.resumeOutcomeNotice(resumed: true)
+                .contains("daemon reported")
+        )
+        XCTAssertTrue(
+            ResourcePauseInfo.resumeOutcomeNotice(resumed: false)
+                .contains("did not resume")
+        )
+    }
+
+    private func pauseEvent(
+        seq: UInt64,
+        sessionID: String = "ses-1",
+        schema: String = ResourcePauseInfo.schema,
+        reason: String = "attention_cap",
+        bottleneck: String? = "attention",
+        role: String? = "leader",
+        taskID: String? = "task-123",
+        agentID: String? = "leader-agent"
+    ) -> Event {
+        var payload: [String: JSONValue] = [
+            "schema": .string(schema),
+            "phase": .string("turn"),
+            "action": .string("pause_for_operator"),
+            "reason": .string(reason),
+            "generated_at": .string("2026-11-24T00:00:00Z"),
+        ]
+        payload["bottleneck"] = bottleneck.map(JSONValue.string)
+        payload["role"] = role.map(JSONValue.string)
+        payload["task_id"] = taskID.map(JSONValue.string)
+        payload["agent_id"] = agentID.map(JSONValue.string)
+        payload["details"] = .object([:])
+        return Event(
+            sessionId: sessionID,
+            seq: seq,
+            type: ResourcePauseInfo.eventKind,
+            payload: .object(payload),
+            createdAt: "2026-11-24T00:00:00Z"
+        )
+    }
+
+    private func sessionUpdatedEvent(
+        seq: UInt64,
+        status: String,
+        sessionID: String = "ses-1"
+    ) -> Event {
+        Event(
+            sessionId: sessionID,
+            seq: seq,
+            type: "session.updated",
+            payload: .object(["status": .string(status)]),
+            createdAt: "2026-11-24T00:00:00Z"
+        )
+    }
+
+    private func agentEvent(
+        seq: UInt64,
+        type: String,
+        sessionID: String = "ses-1"
+    ) -> Event {
+        Event(
+            sessionId: sessionID,
+            seq: seq,
+            type: type,
+            payload: .object([:]),
+            createdAt: "2026-11-24T00:00:00Z"
+        )
+    }
+
     private func readiness(
         level: String,
         commit: String? = nil,
