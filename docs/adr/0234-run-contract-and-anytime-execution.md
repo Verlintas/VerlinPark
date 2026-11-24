@@ -257,10 +257,11 @@ Negative and limits:
    R2b core adds a lean turn-boundary pause path (no readiness/`git status` on
    the run path), Auto Budget token request-fit for every role plus cost/time
    fit for children, project RunPolicy with manifest/rebuild, and macOS
-   top-up/readiness, project-policy editor, and an event-derived pause banner;
-   first selection loads the full session resource state and resource failures
-   are visible with an explicit retry. Attention batching, explicit
-   partial-delivery action, and rescue/reallocation remain.
+   top-up/readiness, project-policy editor, and an event-derived pause banner
+   that shows a bounded attention batch with Inbox/Policy actions; first
+   selection loads the full session resource state and resource failures are
+   visible with an explicit retry. Explicit partial-delivery action and
+   rescue/reallocation remain.
 4. **R3 allocate**: task/plan-aware allocation, rescue/reallocation, learning
    from actuals, metareasoning/replan.
 5. **R4 deliver**: anytime UI, trade-off frontier, calibrated trust, daily

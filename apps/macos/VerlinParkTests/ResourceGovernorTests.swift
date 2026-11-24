@@ -565,6 +565,71 @@ final class ResourceGovernorTests: XCTestCase {
         )
     }
 
+    func testResourcePauseDecodesBoundedAttentionBatch() throws {
+        let details: [String: JSONValue] = [
+            "attention_batch": .object([
+                "schema": .string(AttentionBatchView.schema),
+                "pending": .number(3),
+                "interrupts": .number(7),
+                "cap": .number(20),
+                "by_risk": .array([
+                    .object([
+                        "risk": .string("host_state"),
+                        "count": .number(2),
+                        "weight": .number(6),
+                    ]),
+                ]),
+                "items": .array([
+                    .object([
+                        "approval_id": .string("ap-1"),
+                        "tool": .string("shell"),
+                        "risk": .string("host_state"),
+                        "task_id": .string("task-123"),
+                        "priority": .number(4),
+                        "waiters": .number(2),
+                        "reason": .string("host change"),
+                    ]),
+                ]),
+                "truncated": .bool(true),
+            ]),
+        ]
+        let info = try XCTUnwrap(
+            ResourcePauseInfo(event: pauseEvent(seq: 10, details: details))
+        )
+        let batch = try XCTUnwrap(info.attentionBatch)
+        XCTAssertEqual(batch.pending, 3)
+        XCTAssertEqual(batch.interrupts, 7)
+        XCTAssertEqual(batch.cap, 20)
+        XCTAssertEqual(batch.items.count, 1)
+        XCTAssertEqual(batch.items[0].approvalID, "ap-1")
+        XCTAssertEqual(batch.items[0].tool, "shell")
+        XCTAssertEqual(batch.items[0].riskLabel, "HOST_STATE")
+        XCTAssertEqual(batch.items[0].taskShortLabel, "task-123")
+        XCTAssertEqual(batch.items[0].reasonLabel, "host change")
+        XCTAssertEqual(batch.remainingCount, 2)
+        XCTAssertTrue(batch.truncated)
+        XCTAssertEqual(batch.summaryLabel, "3 pending · 7/20 interrupts")
+        XCTAssertEqual(batch.riskSummary, "host_state 2")
+
+        let wrongSchema = try XCTUnwrap(
+            ResourcePauseInfo(
+                event: pauseEvent(
+                    seq: 11,
+                    details: [
+                        "attention_batch": .object([
+                            "schema": .string("other/v1"),
+                            "pending": .number(1),
+                        ]),
+                    ]
+                )
+            )
+        )
+        XCTAssertNil(wrongSchema.attentionBatch)
+
+        let noBatch = try XCTUnwrap(ResourcePauseInfo(event: pauseEvent(seq: 12)))
+        XCTAssertNil(noBatch.attentionBatch)
+    }
+
     private func pauseEvent(
         seq: UInt64,
         sessionID: String = "ses-1",
@@ -573,7 +638,8 @@ final class ResourceGovernorTests: XCTestCase {
         bottleneck: String? = "attention",
         role: String? = "leader",
         taskID: String? = "task-123",
-        agentID: String? = "leader-agent"
+        agentID: String? = "leader-agent",
+        details: [String: JSONValue] = [:]
     ) -> Event {
         var payload: [String: JSONValue] = [
             "schema": .string(schema),
@@ -586,7 +652,7 @@ final class ResourceGovernorTests: XCTestCase {
         payload["role"] = role.map(JSONValue.string)
         payload["task_id"] = taskID.map(JSONValue.string)
         payload["agent_id"] = agentID.map(JSONValue.string)
-        payload["details"] = .object([:])
+        payload["details"] = .object(details)
         return Event(
             sessionId: sessionID,
             seq: seq,

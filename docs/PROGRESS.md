@@ -105,19 +105,23 @@ pre-dispatch deferral，不改变 approval/Verifier/merge 行为：
   transcript 立即更新；纯文本保留原始字符和换行，Markdown 仍走 bounded
   renderer。GUI smoke 验证了默认状态以及切到 user markdown + agent plain
   后的即时变化，并已清理临时 smoke 的 UserDefaults。
-- R2b 仍未做 attention batching/prompt、显式 partial-delivery action/rescue
-  和 governor 快照缓存。
+- Attention batch prompt：turn-boundary pause 的 `details` 现在携带 bounded
+  `attention_batch`（pending、interrupts/cap、风险分组、最多 8 条 approval
+  元数据：tool/risk/task/priority/waiters/reason），不包含 raw tool input、
+  command 文本或文件内容。Stage pause banner 显示 batch 摘要和条目，提供
+  Inbox 与 Policy 入口；真正的批准/拒绝仍走现有 approval queue 与
+  batch-resolve，不会自动 grant/template/profile。GUI smoke 用真实
+  `session.resource.paused` 事件验证了 banner、batch 条目和 Policy 跳转。
+- R2b 仍未做显式 partial-delivery action/rescue 和 governor 快照缓存。
 - 测试：R1 full workspace **4,546**；R2a 后 **4,551**；R2b core 后 **4,554**；
   项目 RunPolicy 后 **4,559**；R2b final（lean turn/cost-time/UI）后
-  **4,570 passed / 0 failed / 6 ignored**，
-  `cargo clippy --workspace --all-targets -- -D warnings` 通过。targeted：
-  27 auto-budget、368 agent、12 resource、2 project-policy/rebuild、2 protocol
-  stop-policy、434 store、52 daemon、188 CLI、18 Swift
+  **4,570**；attention batch prompt 后 **4,571 passed / 0 failed / 6
+  ignored**，`cargo clippy --workspace --all-targets -- -D warnings` 通过。
+  targeted：27 auto-budget、368 agent、13 resource、2 project-policy/rebuild、
+  2 protocol stop-policy、434 store、52 daemon、188 CLI、19 Swift
   `ResourceGovernorTests`、6 Swift `MarkdownTranscriptTests`，full Swift
-  **634**（502 app + 132 helper）均通过。Rust full workspace 仍为
-  **4,570 passed / 0 failed / 6 ignored**（本轮仅改 macOS 客户端）。宿主机
-  `syspolicyd`/XProtect spin 已单独调查并记录在
-  `HOST_SYSPOLICYD_INVESTIGATION.md`，不是仓库 bug。
+  **635**（503 app + 132 helper）均通过。宿主机 `syspolicyd`/XProtect spin
+  已单独调查并记录在 `HOST_SYSPOLICYD_INVESTIGATION.md`，不是仓库 bug。
 
 ## 2026-11-23 真实 DeepSeek + GUI 验证与 two hardenings
 

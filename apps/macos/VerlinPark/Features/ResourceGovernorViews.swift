@@ -178,12 +178,24 @@ struct StageResourceCard: View {
                 .font(VPTheme.mono(6.5, weight: .medium))
                 .foregroundStyle(VPTheme.textSecondary)
                 .help("Open the Manage Dash approval and question inbox")
+                Button {
+                    model.openPolicyCenter()
+                } label: {
+                    Label("Policy", systemImage: "slider.horizontal.3")
+                }
+                .buttonStyle(.plain)
+                .font(VPTheme.mono(6.5, weight: .medium))
+                .foregroundStyle(VPTheme.textSecondary)
+                .help("Open Manage Dash → Policies to adjust the project RunPolicy.")
             }
             Text(pause.reasonLabel)
                 .font(VPTheme.mono(7.5))
                 .foregroundStyle(VPTheme.textSecondary)
                 .lineLimit(3)
                 .fixedSize(horizontal: false, vertical: true)
+            if let batch = pause.attentionBatch, batch.pending > 0 {
+                attentionBatchView(batch)
+            }
             HStack(spacing: 10) {
                 Text("role \(pause.roleLabel)")
                 Text("bottleneck \(pause.bottleneckLabel)")
@@ -222,6 +234,93 @@ struct StageResourceCard: View {
         .overlay {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .strokeBorder(VPTheme.warning.opacity(0.20), lineWidth: 1)
+        }
+    }
+
+    private func attentionBatchView(_ batch: AttentionBatchView) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 5) {
+                Text(L10n.t("ATTENTION BATCH"))
+                    .font(VPTheme.mono(6.2, weight: .semibold))
+                    .tracking(0.5)
+                    .foregroundStyle(VPTheme.warning)
+                Text(batch.summaryLabel)
+                    .font(VPTheme.mono(7))
+                    .foregroundStyle(VPTheme.textSecondary)
+                Spacer(minLength: 4)
+                if let risk = batch.riskSummary {
+                    Text(risk)
+                        .font(VPTheme.mono(6.5))
+                        .foregroundStyle(VPTheme.textTertiary)
+                        .lineLimit(1)
+                }
+            }
+            ForEach(Array(batch.items.prefix(3))) { item in
+                HStack(spacing: 6) {
+                    Text(item.tool)
+                        .font(VPTheme.mono(7, weight: .medium))
+                        .foregroundStyle(VPTheme.textSecondary)
+                        .lineLimit(1)
+                    Text(item.riskLabel)
+                        .font(VPTheme.mono(6.2, weight: .semibold))
+                        .foregroundStyle(batchRiskColor(item.risk))
+                    if let task = item.taskShortLabel {
+                        Text("task \(task)")
+                            .font(VPTheme.mono(6.2))
+                            .foregroundStyle(VPTheme.textTertiary)
+                    }
+                    if let reason = item.reasonLabel {
+                        Text(reason)
+                            .font(VPTheme.mono(6.2))
+                            .foregroundStyle(VPTheme.textTertiary)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 4)
+                    if item.waiters > 1 {
+                        Text("×\(item.waiters)")
+                            .font(VPTheme.mono(6.2))
+                            .foregroundStyle(VPTheme.textTertiary)
+                    }
+                    Text("p\(item.priority)")
+                        .font(VPTheme.mono(6.2))
+                        .foregroundStyle(VPTheme.textTertiary)
+                }
+            }
+            if batch.truncated || batch.remainingCount > 0 {
+                Button {
+                    model.openApprovalCenter()
+                } label: {
+                    Text(
+                        batch.remainingCount > 0
+                            ? L10n.format(
+                                "Review %lld more in Inbox",
+                                batch.remainingCount
+                            )
+                            : L10n.t("Review in Inbox")
+                    )
+                    .font(VPTheme.mono(6.5, weight: .medium))
+                    .foregroundStyle(VPTheme.accent)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(6)
+        .background(
+            VPTheme.surfaceSunken.opacity(0.55),
+            in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .strokeBorder(VPTheme.warning.opacity(0.14), lineWidth: 1)
+        }
+    }
+
+    private func batchRiskColor(_ risk: String?) -> Color {
+        switch risk {
+        case "destructive": VPTheme.danger
+        case "host_state", "mcp", "sensitive_gui": VPTheme.warning
+        case "external": VPTheme.info
+        default: VPTheme.textTertiary
         }
     }
 

@@ -740,6 +740,124 @@ struct ProjectRunPolicyDraft: Equatable, Sendable {
 
 // MARK: - Resource pause event
 
+struct AttentionBatchItemView: Codable, Equatable, Sendable, Identifiable {
+    let approvalID: String
+    let tool: String
+    let risk: String?
+    let taskID: String?
+    let priority: Int
+    let waiters: UInt32
+    let reason: String?
+
+    var id: String {
+        approvalID
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case tool, risk, priority, waiters, reason
+        case approvalID = "approval_id"
+        case taskID = "task_id"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        approvalID =
+            try container.decodeIfPresent(String.self, forKey: .approvalID) ?? ""
+        tool = try container.decodeIfPresent(String.self, forKey: .tool) ?? "unknown"
+        risk = try container.decodeIfPresent(String.self, forKey: .risk)
+        taskID = try container.decodeIfPresent(String.self, forKey: .taskID)
+        priority = try container.decodeIfPresent(Int.self, forKey: .priority) ?? 0
+        waiters = try container.decodeIfPresent(UInt32.self, forKey: .waiters) ?? 0
+        reason = try container.decodeIfPresent(String.self, forKey: .reason)
+    }
+
+    var riskLabel: String {
+        (risk ?? "unknown").uppercased()
+    }
+
+    var taskShortLabel: String? {
+        guard let taskID, !taskID.isEmpty else { return nil }
+        return String(taskID.prefix(18))
+    }
+
+    var reasonLabel: String? {
+        guard let reason else { return nil }
+        let trimmed = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : String(trimmed.prefix(160))
+    }
+}
+
+struct AttentionBatchRiskView: Codable, Equatable, Sendable, Identifiable {
+    let risk: String
+    let count: UInt32
+    let weight: UInt32
+
+    var id: String {
+        risk
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case risk, count, weight
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        risk = try container.decodeIfPresent(String.self, forKey: .risk) ?? "unknown"
+        count = try container.decodeIfPresent(UInt32.self, forKey: .count) ?? 0
+        weight = try container.decodeIfPresent(UInt32.self, forKey: .weight) ?? 0
+    }
+}
+
+/// Bounded attention prompt attached to a turn-boundary pause. It is metadata
+/// only: the approval queue remains the decision surface.
+struct AttentionBatchView: Codable, Equatable, Sendable {
+    static let schema = "verlinpark.attention_batch/v1"
+
+    let schema: String
+    let pending: UInt32
+    let interrupts: UInt32
+    let cap: UInt32
+    let byRisk: [AttentionBatchRiskView]
+    let items: [AttentionBatchItemView]
+    let truncated: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case schema, pending, interrupts, cap, items, truncated
+        case byRisk = "by_risk"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schema = try container.decodeIfPresent(String.self, forKey: .schema) ?? ""
+        pending = try container.decodeIfPresent(UInt32.self, forKey: .pending) ?? 0
+        interrupts = try container.decodeIfPresent(UInt32.self, forKey: .interrupts) ?? 0
+        cap = try container.decodeIfPresent(UInt32.self, forKey: .cap) ?? 0
+        byRisk =
+            try container.decodeIfPresent([AttentionBatchRiskView].self, forKey: .byRisk) ?? []
+        items =
+            try container.decodeIfPresent([AttentionBatchItemView].self, forKey: .items) ?? []
+        truncated = try container.decodeIfPresent(Bool.self, forKey: .truncated) ?? false
+    }
+
+    var summaryLabel: String {
+        L10n.format(
+            "%lld pending · %lld/%lld interrupts",
+            pending,
+            interrupts,
+            cap
+        )
+    }
+
+    var remainingCount: Int {
+        max(0, Int(pending) - items.count)
+    }
+
+    var riskSummary: String? {
+        let parts = byRisk.prefix(3).map { "\($0.risk) \($0.count)" }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+}
+
 /// Bounded projection of the newest `session.resource.paused` event for the
 /// selected session. A later resume/status event clears it; a bottleneck alone
 /// never creates one. If the event stream is unavailable the card must show
@@ -757,6 +875,7 @@ struct ResourcePauseInfo: Equatable, Sendable {
     let agentID: String?
     let taskID: String?
     let generatedAt: String?
+    let attentionBatch: AttentionBatchView?
 
     init?(event: Event) {
         guard event.type == Self.eventKind,
@@ -776,6 +895,14 @@ struct ResourcePauseInfo: Equatable, Sendable {
         agentID = payload["agent_id"]?.stringValue
         taskID = payload["task_id"]?.stringValue
         generatedAt = payload["generated_at"]?.stringValue
+        attentionBatch = payload["details"]?
+            .objectValue?["attention_batch"]
+            .flatMap { value in
+                guard let batch = try? value.decode(AttentionBatchView.self),
+                      batch.schema == AttentionBatchView.schema
+                else { return nil }
+                return batch
+            }
     }
 
     var reasonLabel: String {

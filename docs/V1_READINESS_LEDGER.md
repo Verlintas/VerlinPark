@@ -75,7 +75,7 @@ Verification gaps:
 | V1-D09 | S1 | A bare Python `unittest` project without pyproject/pytest metadata was reported as `PROJECT_UNSUPPORTED`, pushing Agent runs into shell guessing. | **CLOSED** | `project_profile` detects `tests/test_*.py` and proposes `python3 -m unittest discover -s tests -v`; regression test covers the bare fixture |
 | V1-D10 | S1 | Contract analysis treated scratch verification writes and absolute read-only git commands as host-state/scope violations, creating repeated approvals and `.scratch-proof` artifacts in the worktree. | **CLOSED (P0)** | Shell exports `$VERLINPARK_WORKTREE`/`$VERLINPARK_SCRATCH`; prompts/recipes say cwd is the worktree; contract allows the stable scratch/TMPDIR prefixes; absolute read-only git (`status/diff/log/show/rev-parse/...`) is ReadOnly; `clean`/`reset --hard` remains Destructive. Tests cover all paths. |
 | V1-D11 | S1 | Fixed token budgets charged cache-read input at full weight, ignored missing prices, starved verification, and failed solvable runs; the dashboard could not show the difference between cheap-but-stuck and expensive-near-completion. | **PARTIAL (R2a)** | R1 exposes raw vs weighted tokens, money with `pricing_source`, time, attention, risk, context, capacity, quality, and progress plus readiness/forecast. R2a adds operator top-up (clamped to caps) and pre-dispatch completion-reserve deferral. Raw token caps remain authoritative; cost-weighted settlement/automatic reallocation is R2b/R3. |
-| V1-D12 | S2 | Operator attention had no budget or governor: repeated host-state approvals could consume the run without triggering a policy decision. | **PARTIAL (R2b)** | Pre-dispatch deferral and a true turn-boundary pause (`session.resource.paused`) now stop new work at the attention cap; a bare resume re-pauses until the cap/policy changes. The card shows weighted interrupts, a profile menu, top-up, readiness caveats, and an event-derived pause banner; Manage Dash edits project defaults. Approval batching/prompt workflow remains open. |
+| V1-D12 | S2 | Operator attention had no budget or governor: repeated host-state approvals could consume the run without triggering a policy decision. | **PARTIAL (R2b)** | Pre-dispatch deferral and a true turn-boundary pause (`session.resource.paused`) now stop new work at the attention cap; a bare resume re-pauses until the cap/policy changes. The pause carries a bounded attention batch (risk groups + at most 8 approval metadata rows, no raw input) and the Stage banner opens Inbox or Policies. The existing approval queue, coalescing, and batch resolve remain the only decision path; no automatic grant/template/profile. Explicit partial delivery/rescue remains open. |
 
 ## Run Contract R1/R2a/R2b (2026-11-24)
 
@@ -117,8 +117,14 @@ Implemented the observe/operator slice from ADR-0234:
   of crossing an unextendable hard cap.
 - macOS adds a Top Up sheet, capped/resumed truth, readiness caveats, bounded
   report copy, a project RunPolicy editor, and an event-derived resource-pause
-  banner with Resume/Top Up/Approvals actions. It never removes a cap, infers a
-  pause from a bottleneck, or claims a resume/merge the daemon did not report.
+  banner with Resume/Top Up/Approvals/Policy actions. The banner also shows the
+  bounded attention batch from the pause details. It never removes a cap,
+  infers a pause from a bottleneck, or claims a resume/merge the daemon did not
+  report.
+- The turn pause carries a bounded `attention_batch` with pending/interrupts/
+  cap, risk groups, and up to 8 approval metadata rows (tool/risk/task/
+  priority/waiters/reason). Raw tool input, command text, and file contents are
+  excluded; approvals still resolve only through the existing queue/batch.
 - Project-level RunPolicy adds persisted defaults (profile/reserve/attention/
   stop), manifest recording and `db-rebuild` restore, RPC
   `project.run_policy.get/set`, and CLI `project-run-policy` /
@@ -141,13 +147,13 @@ Implemented the observe/operator slice from ADR-0234:
   (user plain, agent Markdown) plus the Settings → General → Transcript switch
   to user Markdown / agent plain text applying immediately.
 
-Tests: R2b targeted: 27 auto-budget runtime tests, 368 `agent::tests`, 12
+Tests: R2b targeted: 27 auto-budget runtime tests, 368 `agent::tests`, 13
 resource tests, 2 project-policy/rebuild tests, 2 protocol stop-policy tests,
-434 store tests, 52 daemon tests, 188 CLI tests, 18 targeted Swift
-`ResourceGovernorTests`, 6 Swift `MarkdownTranscriptTests`, and 634 full Swift
-tests (502 app + 132 helper); P0 tests remain. Final full workspace after the
+434 store tests, 52 daemon tests, 188 CLI tests, 19 targeted Swift
+`ResourceGovernorTests`, 6 Swift `MarkdownTranscriptTests`, and 635 full Swift
+tests (503 app + 132 helper); P0 tests remain. Final full workspace after the
 last R2b slice is recorded below;
-the final R2b governor/UI run was **4,570 passed, 0 failed, 6 ignored**;
+the final attention prompt run was **4,571 passed, 0 failed, 6 ignored**;
 clippy exit 0. R2b project policy was 4,559; R2b core before it 4,554; R2a 4,551. A live
 temp-daemon CLI smoke exercised `run-contract-set`, `resources`, `top-up`, and
 `readiness` end to end; a temp-daemon GUI smoke exercised first-selection
@@ -190,7 +196,7 @@ cargo test -p vp-core --lib steering
 cargo test -p vp-daemon --bin verlinpadd tests::agent_operator_rpc_tests
 # 3 passed, 0 failed (operator route, read-only snapshots, contract override/top-up RPCs)
 cargo test -p vp-core --lib engine::resources::tests
-# 12 passed, 0 failed (snapshot/readiness/attention/governor/override/top-up/project defaults/lean turn/readiness-dispatch-only)
+# 13 passed, 0 failed (snapshot/readiness/attention/governor/override/top-up/project defaults/lean turn/readiness-dispatch-only/attention batch)
 cargo test -p vp-core --lib project_run_policy
 # 2 passed, 0 failed (project defaults/override precedence + manifest rebuild)
 cargo test -p vp-protocol run_stop_policy
@@ -220,19 +226,19 @@ cargo test -p vp-cli
 # 188 unit + 10 integration + 1 governance passed
 ```
 
-Final full workspace after the R2b governor/UI slice (2026-11-24, healthy boot):
+Final full workspace after the attention prompt slice (2026-11-24, healthy boot):
 
 ```bash
 cargo test --workspace
-# 4,570 passed, 0 failed, 6 ignored
+# 4,571 passed, 0 failed, 6 ignored
 cargo clippy --workspace --all-targets -- -D warnings
 # exit 0
 ```
 
 R2b project policy was 4,559, R2b core before it 4,554, R2a 4,551, R1 4,546.
-Full Swift after the slice: 634 (502 app + 132 helper), including the
-Markdown transcript renderer and display-preference tests. The Markdown and
-settings changes are macOS-only; the Rust workspace count remains 4,570.
+Full Swift after the slice: 635 (503 app + 132 helper), including the
+Markdown transcript renderer, display preferences, and the attention batch
+prompt.
 
 The earlier full run before P0/R1 also passed every crate except the daemon
 operator test, which was fixed and is covered above. The host XProtect/

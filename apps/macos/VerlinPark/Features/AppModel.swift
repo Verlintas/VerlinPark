@@ -1191,6 +1191,14 @@ final class AppModel {
         Task { await loadPendingApprovals() }
     }
 
+    /// Opens Manage Dash -> Policies for the selected project so a paused
+    /// operator can adjust the project RunPolicy. It never changes a value.
+    func openPolicyCenter() {
+        requestedDashboardSection = .policies
+        approvalAttentionRequestID = UUID()
+        Task { await loadProjectRunPolicy(force: true) }
+    }
+
     private func scheduleReconnect() {
         guard started, reconnectTask == nil, connection != .connected else { return }
         reconnectTask = Task { [weak self] in

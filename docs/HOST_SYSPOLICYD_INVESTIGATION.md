@@ -117,7 +117,7 @@ Any output means the wedge is starting. Capture `sample <hung-pid> 2` and a
   binaries are the trigger" link rests on timing correlation plus the known
   exec-assessment mechanism, not a direct path in the log.
 - The current boot is healthy. The final full workspace passed on this boot:
-  4,570 passed, 0 failed, 6 ignored; clippy exit 0. This does not mean the host
+  4,571 passed, 0 failed, 6 ignored; clippy exit 0. This does not mean the host
   issue is fixed; it is intermittent and re-arms after the trigger conditions
   recur.
 

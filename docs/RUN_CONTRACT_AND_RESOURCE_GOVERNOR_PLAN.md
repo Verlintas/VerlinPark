@@ -1,6 +1,6 @@
 # Run Contract and Resource Governor plan
 
-- Status: Accepted; P0/R1/R2a/R2b core implemented (lean turn-boundary pause, child Auto request-fit incl. cost/time, project RunPolicy, macOS top-up/pause/project policy); R2b attention batching, partial-delivery action, governor snapshot caching, and R3/R4 open
+- Status: Accepted; P0/R1/R2a/R2b core implemented (lean turn-boundary pause, child Auto request-fit incl. cost/time, project RunPolicy, attention batch prompt, macOS top-up/pause/project policy); R2b partial-delivery action, governor snapshot caching, and R3/R4 open
 - Date: 2026-11-24
 - Owner: Verlintas
 - Scope: V1 single-project coding
@@ -432,9 +432,9 @@ Phase R2b (implemented core):
 - `project.run_policy.get/set` (persisted SQLite + manifest/rebuild).
 - Lean true turn-boundary pause/wait (no readiness/git status on the run path),
   Auto Budget token request-fit for every role plus cost/time fit for children.
-- macOS top-up/readiness, project policy editor, and event-derived pause banner.
-- Open: attention prompt/batching, explicit partial-delivery/rescue, governor
-  snapshot caching.
+- macOS top-up/readiness, project policy editor, event-derived pause banner,
+  and a bounded attention batch prompt with Inbox/Policy actions.
+- Open: explicit partial-delivery/rescue, governor snapshot caching.
 
 ### 13.2 CLI
 
@@ -550,12 +550,19 @@ Implemented:
 - Project-level Run Contract policy: persisted SQLite policy, manifest/rebuild,
   `project.run_policy.get/set`, CLI `project-run-policy`/`project-run-policy-set`,
   project defaults with session override precedence.
+- Attention batch prompt: a turn-boundary pause carries a bounded
+  `attention_batch` (pending count, weighted interrupts/cap, risk groups, and up
+  to 8 approval metadata rows with tool/risk/task/priority/waiters/reason). Raw
+  tool input, command text, and file contents are excluded. The Stage pause
+  banner shows the batch and opens the existing approval Inbox or Policies
+  surface; the existing approval queue, dedup/coalescing, and batch-resolve path
+  remain the only decision path. No grant, template, approval, or profile is
+  applied automatically.
 - Readiness-blocked remains a dispatch gate, not a turn pause (avoids
   deadlocking approval/effect flows in an active run).
 
 Remaining:
 
-- Attention prompt/batching and operator policy change workflow.
 - Explicit partial-delivery action and rescue/reallocation.
 - Governor snapshot caching for large worktrees/plans.
 
@@ -621,7 +628,8 @@ Implemented **P0 + R1 + R2a + R2b core**:
   request-fit (Leader owns turns/no-progress; children only extend);
 - project-level run policy plus macOS project-policy editor and event-derived
   pause banner;
+- bounded attention batch prompt with approval Inbox and policy actions;
 - ledger/docs updated with the multi-resource model.
 
-Next: attention prompt/batching, explicit partial-delivery action/rescue,
-governor snapshot caching, then R3/R4.
+Next: explicit partial-delivery action/rescue, governor snapshot caching, then
+R3/R4.

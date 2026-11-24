@@ -57,6 +57,10 @@
 "How your messages appear in the Stage transcript." = "你的消息在 Stage 对话记录中的显示方式。";
 "How Leader and delegated-agent messages appear." = "Leader 与委派智能体消息的显示方式。";
 "Display-only preference. Plain text preserves exact characters and line breaks; Markdown is bounded and never executes HTML. Changes apply to the open transcript immediately." = "仅影响显示。纯文本保留原始字符与换行；Markdown 渲染有边界且不会执行 HTML。更改会立即应用到当前对话记录。";
+"ATTENTION BATCH" = "注意力批次";
+"%lld pending · %lld/%lld interrupts" = "%lld 待处理 · %lld/%lld 次打断";
+"Review %lld more in Inbox" = "在收件箱中查看其余 %lld 项";
+"Review in Inbox" = "在收件箱中查看";
 "Language changes apply immediately. Daemon output and long technical provider messages may remain in English." = "语言切换立即生效。daemon 输出和较长的模型服务技术信息可能仍为英文。";
 "Appearance" = "外观";
 "Black crystal" = "黑晶玻璃";

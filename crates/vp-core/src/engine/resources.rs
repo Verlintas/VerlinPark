@@ -749,7 +749,7 @@ impl Engine {
             readiness_blocked: false,
         };
         let (action, reason) = resource_governor_action(&inputs);
-        let details = resource_governor_details(
+        let mut details = resource_governor_details(
             "turn",
             profile,
             bottleneck.as_deref(),
@@ -757,6 +757,7 @@ impl Engine {
             completion_reserve_ratio,
             &dimensions,
         );
+        details["attention_batch"] = attention_batch_details(&approvals, &attention, attention_cap);
         Ok(ResourceGovernorDecision {
             session_id: session_id.to_string(),
             phase: "turn".to_string(),
@@ -1118,6 +1119,66 @@ fn resource_bottleneck(
         }
     }
     None
+}
+
+/// Bounded operator prompt carried by a turn-boundary pause. It includes only
+/// approval metadata; raw tool input, command text, and file contents are
+/// deliberately excluded. The existing approval queue and batch-resolve path
+/// remain the only decision surfaces.
+fn attention_batch_details(
+    approvals: &[Approval],
+    attention: &ResourceAttention,
+    attention_cap: u32,
+) -> serde_json::Value {
+    let pending = approvals
+        .iter()
+        .filter(|approval| approval.status == "pending")
+        .collect::<Vec<_>>();
+    let mut by_risk: BTreeMap<String, (u32, u32)> = BTreeMap::new();
+    for approval in &pending {
+        let risk = approval
+            .approval_risk
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let weight = approval_risk_weight(approval.approval_risk.as_deref());
+        let entry = by_risk.entry(risk).or_insert((0, 0));
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = entry.1.saturating_add(weight);
+    }
+    let items = pending
+        .iter()
+        .take(8)
+        .map(|approval| {
+            serde_json::json!({
+                "approval_id": approval.id,
+                "tool": bounded_text(&approval.tool, 80),
+                "risk": approval.approval_risk.as_deref().unwrap_or("unknown"),
+                "task_id": approval.task_id.as_deref(),
+                "priority": approval.priority,
+                "waiters": approval.waiter_count,
+                "reason": approval.approval_reason.as_deref().map(|reason| bounded_text(reason, 160)),
+            })
+        })
+        .collect::<Vec<_>>();
+    let by_risk = by_risk
+        .into_iter()
+        .map(|(risk, (count, weight))| {
+            serde_json::json!({"risk": risk, "count": count, "weight": weight})
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "schema": "verlinpark.attention_batch/v1",
+        "pending": pending.len(),
+        "interrupts": attention.interrupts,
+        "cap": attention_cap,
+        "by_risk": by_risk,
+        "items": items,
+        "truncated": pending.len() > 8,
+    })
+}
+
+fn bounded_text(value: &str, max: usize) -> String {
+    value.chars().take(max).collect()
 }
 
 fn resource_attention(approvals: &[Approval], unknown_effects: u64) -> (ResourceAttention, u64) {
@@ -1725,6 +1786,62 @@ mod tests {
             .unwrap();
         assert_eq!(dispatch.action, "defer", "{dispatch:?}");
         assert_eq!(dispatch.reason, "resource_cap_tokens");
+    }
+
+    #[tokio::test]
+    async fn turn_attention_batch_is_bounded_and_excludes_raw_input() {
+        let (_data, _repo, engine, session) = fixture().await;
+        engine
+            .set_run_contract(SetRunContractParams {
+                session_id: session.id.clone(),
+                profile: RunProfile::Balanced,
+                completion_reserve_ratio: None,
+                attention_cap: Some(1),
+                stop_policy: None,
+                updated_by: None,
+            })
+            .await
+            .unwrap();
+        let mut receivers = Vec::new();
+        for index in 0..10 {
+            let (approval, receiver) = engine
+                .request_approval_with_risk(
+                    &session.id,
+                    &format!("call-batch-{index}"),
+                    "shell",
+                    json!({
+                        "command": format!("echo secret-token-{index}"),
+                        "path": format!("src/f{index}.rs"),
+                    }),
+                    None,
+                    Some("host_state"),
+                    Some("batch test approval"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(approval.status, "pending");
+            receivers.push(receiver);
+        }
+
+        let decision = engine
+            .resource_governor_turn_decision(&session.id)
+            .await
+            .unwrap();
+        assert_eq!(decision.reason, "attention_cap");
+        let batch = &decision.details["attention_batch"];
+        assert_eq!(batch["schema"], "verlinpark.attention_batch/v1");
+        assert_eq!(batch["pending"], 10);
+        assert_eq!(batch["cap"], 1);
+        assert_eq!(batch["items"].as_array().unwrap().len(), 8);
+        assert_eq!(batch["truncated"], true);
+        assert_eq!(batch["by_risk"][0]["risk"], "host_state");
+        assert_eq!(batch["by_risk"][0]["count"], 10);
+        assert_eq!(batch["items"][0]["tool"], "shell");
+        assert!(batch["items"][0].get("input").is_none());
+
+        let serialized = decision.details.to_string();
+        assert!(!serialized.contains("secret-token"));
+        assert!(!serialized.contains("src/f0.rs"));
     }
 
     #[tokio::test]
