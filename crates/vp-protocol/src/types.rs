@@ -4106,6 +4106,14 @@ pub struct AllocationTask {
     pub token_budget: Option<u64>,
     #[serde(default)]
     pub cost_budget_usd: Option<f64>,
+    /// Runtime effective budget after opt-in envelope reallocation. Equal to
+    /// the stored task budget unless `envelope_reallocated` is true.
+    #[serde(default)]
+    pub effective_token_budget: Option<u64>,
+    #[serde(default)]
+    pub effective_cost_budget_usd: Option<f64>,
+    #[serde(default)]
+    pub envelope_reallocated: bool,
     #[serde(default)]
     pub p50_tokens: Option<u64>,
     #[serde(default)]
@@ -28268,6 +28276,9 @@ mod rescue_protocol_tests {
                 priority: 5,
                 token_budget: Some(2_000),
                 cost_budget_usd: None,
+                effective_token_budget: Some(3_000),
+                effective_cost_budget_usd: None,
+                envelope_reallocated: true,
                 p50_tokens: Some(2_000),
                 p90_tokens: Some(2_000),
                 observed_calls: 1,

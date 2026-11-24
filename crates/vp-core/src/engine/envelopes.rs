@@ -18,10 +18,10 @@ const MAX_ENVELOPE_SOURCES: usize = 100;
 const ENVELOPE_REALLOCATION_REASON: &str = "completed_task_unused_envelope";
 const ENVELOPE_REALLOCATION_POLICY: &str = "auto_reallocate_envelopes";
 
-#[derive(Debug, Clone, Copy, Default)]
-struct EffectiveBudget {
-    tokens: Option<u64>,
-    cost_usd: Option<f64>,
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct EffectiveBudget {
+    pub(crate) tokens: Option<u64>,
+    pub(crate) cost_usd: Option<f64>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -30,6 +30,8 @@ struct ReallocationEvent {
     schema: String,
     #[serde(default)]
     target_task_id: String,
+    #[serde(default)]
+    plan_fingerprint: Option<String>,
     #[serde(default)]
     old_token_budget: Option<u64>,
     #[serde(default)]
@@ -42,13 +44,183 @@ struct ReallocationEvent {
     sources: Vec<ReallocationSource>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize)]
 struct ReallocationSource {
     #[serde(default)]
     task_id: String,
+    #[serde(default)]
+    released_tokens: u64,
+    #[serde(default)]
+    released_cost_usd: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ConsumedBudget {
+    tokens: u64,
+    cost_usd: f64,
+}
+
+/// Fold bounded reallocation events over the stored plan budgets. Returns the
+/// effective budgets, consumed per-source capacity, and targets that already
+/// received a valid override. Stale events (from a prior plan revision) still
+/// consume their sources but do not widen the revised plan.
+fn fold_reallocation_events(
+    plan: &TeamPlan,
+    events: Vec<Event>,
+) -> (
+    HashMap<String, EffectiveBudget>,
+    HashMap<String, ConsumedBudget>,
+    HashSet<String>,
+) {
+    let mut effective = plan
+        .tasks
+        .iter()
+        .map(|task| {
+            (
+                task.id.clone(),
+                EffectiveBudget {
+                    tokens: task.token_budget.filter(|budget| *budget > 0),
+                    cost_usd: task
+                        .cost_budget_usd
+                        .filter(|budget| budget.is_finite() && *budget > 0.0),
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let fingerprint = plan_fingerprint(plan);
+    let mut consumed: HashMap<String, ConsumedBudget> = HashMap::new();
+    let mut latest_targets = HashSet::new();
+    for event in events {
+        let Ok(payload) = serde_json::from_value::<ReallocationEvent>(event.payload) else {
+            continue;
+        };
+        if payload.schema != ENVELOPE_REALLOCATION_SCHEMA
+            || payload.target_task_id.trim().is_empty()
+        {
+            continue;
+        }
+        // Source capacity is consumed per dimension and stays consumed even
+        // when the target plan changed.
+        for source in payload.sources.iter().take(MAX_ENVELOPE_SOURCES) {
+            if source.task_id.trim().is_empty() {
+                continue;
+            }
+            let entry = consumed.entry(source.task_id.clone()).or_default();
+            entry.tokens = entry.tokens.saturating_add(source.released_tokens);
+            if source.released_cost_usd.is_finite() && source.released_cost_usd > 0.0 {
+                entry.cost_usd += source.released_cost_usd;
+            }
+        }
+        if payload
+            .plan_fingerprint
+            .as_deref()
+            .is_some_and(|value| value != fingerprint)
+        {
+            continue;
+        }
+        let current = effective
+            .get(&payload.target_task_id)
+            .copied()
+            .unwrap_or_default();
+        if payload.old_token_budget != current.tokens
+            || payload.old_cost_budget_usd != current.cost_usd
+        {
+            continue;
+        }
+        let reallocated = EffectiveBudget {
+            tokens: payload.new_token_budget.filter(|budget| *budget > 0),
+            cost_usd: payload
+                .new_cost_budget_usd
+                .filter(|budget| budget.is_finite() && *budget > 0.0),
+        };
+        if reallocated.tokens.is_none() && reallocated.cost_usd.is_none() {
+            continue;
+        }
+        latest_targets.insert(payload.target_task_id.clone());
+        if let Some(entry) = effective.get_mut(&payload.target_task_id) {
+            if reallocated.tokens.is_some() {
+                entry.tokens = reallocated.tokens;
+            }
+            if reallocated.cost_usd.is_some() {
+                entry.cost_usd = reallocated.cost_usd;
+            }
+        }
+    }
+    (effective, consumed, latest_targets)
+}
+
+/// Stable fingerprint of the budget-relevant plan shape. Any task/department
+/// budget change invalidates an old runtime override.
+fn plan_fingerprint(plan: &TeamPlan) -> String {
+    let mut parts = Vec::new();
+    for department in &plan.departments {
+        parts.push(format!(
+            "d:{}:{:?}:{:?}",
+            department.name,
+            department.token_budget,
+            department.cost_budget_usd.map(|value| value.to_bits())
+        ));
+    }
+    for task in &plan.tasks {
+        parts.push(format!(
+            "t:{}:{}:{:?}:{:?}",
+            task.id,
+            task.department,
+            task.token_budget,
+            task.cost_budget_usd.map(|value| value.to_bits())
+        ));
+    }
+    parts.sort();
+    crate::sha256_hex(parts.join("\n").as_bytes())
 }
 
 impl Engine {
+    /// Read-only effective budgets for the allocation preview. Historical
+    /// reallocation events still apply even when the policy is currently off;
+    /// the stored plan and caps are never changed.
+    pub(crate) async fn runtime_envelope_budgets(
+        &self,
+        session: &Session,
+        plan: &TeamPlan,
+    ) -> Result<HashMap<String, EffectiveBudget>> {
+        let events = self
+            .recent_events_of_kind(
+                &session.id,
+                SESSION_ENVELOPE_REALLOCATED_EVENT,
+                MAX_ENVELOPE_EVENTS,
+            )
+            .await?;
+        Ok(fold_reallocation_events(plan, events).0)
+    }
+
+    /// Read-only overlay for any task-scoped role (including Verifier/Scout).
+    /// Historical reallocation events still apply when the policy is off, so a
+    /// task that already spent reallocated capacity can still be verified.
+    pub(crate) async fn runtime_effective_plan(
+        &self,
+        session: &Session,
+        plan: &TeamPlan,
+        task_id: &str,
+    ) -> Result<Option<TeamPlan>> {
+        let events = self
+            .recent_events_of_kind(
+                &session.id,
+                SESSION_ENVELOPE_REALLOCATED_EVENT,
+                MAX_ENVELOPE_EVENTS,
+            )
+            .await?;
+        let (effective, _consumed, latest_targets) = fold_reallocation_events(plan, events);
+        if !latest_targets.contains(task_id) {
+            return Ok(None);
+        }
+        let Some(budget) = effective.get(task_id).copied() else {
+            return Ok(None);
+        };
+        let mut runtime_plan = plan.clone();
+        apply_effective_budget(&mut runtime_plan, task_id, budget);
+        Ok(Some(runtime_plan))
+    }
+
     /// Return a runtime-only plan whose target task budget includes unused
     /// completed-task capacity in the same department, or `None` when the
     /// policy is off, the target has no positive budget, nothing is available,
@@ -85,10 +257,12 @@ impl Engine {
             return Ok(None);
         }
 
-        // Serialize the event read + source selection + append. Concurrent
-        // task runs otherwise could both consume the same completed source or
-        // append two events for one target.
-        let _guard = self.envelope_reallocation_lock.lock().await;
+        // Serialize the event read + source selection + append per session.
+        // Concurrent task runs in one session otherwise could both consume the
+        // same completed source or append two events for one target; other
+        // sessions/projects remain parallel.
+        let envelope_lock = self.workspace_run_lock(&format!("envelope:{}", session.id));
+        let _guard = envelope_lock.lock().await;
         let events = self
             .recent_events_of_kind(
                 &session.id,
@@ -96,72 +270,7 @@ impl Engine {
                 MAX_ENVELOPE_EVENTS,
             )
             .await?;
-        let mut effective = plan
-            .tasks
-            .iter()
-            .map(|task| {
-                (
-                    task.id.clone(),
-                    EffectiveBudget {
-                        tokens: task.token_budget.filter(|budget| *budget > 0),
-                        cost_usd: task
-                            .cost_budget_usd
-                            .filter(|budget| budget.is_finite() && *budget > 0.0),
-                    },
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        let mut used_sources = HashSet::new();
-        let mut latest_targets = HashSet::new();
-        for event in events {
-            if event.session_id != session.id {
-                continue;
-            }
-            let Ok(payload) = serde_json::from_value::<ReallocationEvent>(event.payload) else {
-                continue;
-            };
-            if payload.schema != ENVELOPE_REALLOCATION_SCHEMA
-                || payload.target_task_id.trim().is_empty()
-            {
-                continue;
-            }
-            // Sources stay single-use even when the target plan changed.
-            for source in payload.sources.iter().take(MAX_ENVELOPE_SOURCES) {
-                if !source.task_id.trim().is_empty() {
-                    used_sources.insert(source.task_id.clone());
-                }
-            }
-            let current = effective
-                .get(&payload.target_task_id)
-                .copied()
-                .unwrap_or_default();
-            // A plan revision may have narrowed/changed the target budget. The
-            // old runtime override must not widen the new plan; ignore the
-            // event for replay while still treating its sources as consumed.
-            if payload.old_token_budget != current.tokens
-                || payload.old_cost_budget_usd != current.cost_usd
-            {
-                continue;
-            }
-            let reallocated = EffectiveBudget {
-                tokens: payload.new_token_budget.filter(|budget| *budget > 0),
-                cost_usd: payload
-                    .new_cost_budget_usd
-                    .filter(|budget| budget.is_finite() && *budget > 0.0),
-            };
-            if reallocated.tokens.is_none() && reallocated.cost_usd.is_none() {
-                continue;
-            }
-            latest_targets.insert(payload.target_task_id.clone());
-            if let Some(entry) = effective.get_mut(&payload.target_task_id) {
-                if reallocated.tokens.is_some() {
-                    entry.tokens = reallocated.tokens;
-                }
-                if reallocated.cost_usd.is_some() {
-                    entry.cost_usd = reallocated.cost_usd;
-                }
-            }
-        }
+        let (effective, consumed, latest_targets) = fold_reallocation_events(plan, events);
 
         // Idempotent replay: the target already consumed/received a
         // reallocation. Return the same runtime effective plan without another
@@ -198,6 +307,20 @@ impl Engine {
             .and_then(|department| department.cost_budget_usd)
             .filter(|budget| budget.is_finite() && *budget > 0.0);
 
+        let token_room = old_token
+            .map(|old| {
+                department_tokens
+                    .map(|cap| cap.saturating_sub(old))
+                    .unwrap_or(u64::MAX)
+            })
+            .unwrap_or(0);
+        let cost_room = old_cost
+            .map(|old| {
+                department_cost
+                    .map(|cap| (cap - old).max(0.0))
+                    .unwrap_or(f64::MAX)
+            })
+            .unwrap_or(0.0);
         let mut released_tokens = 0u64;
         let mut released_cost = 0.0f64;
         let mut sources = Vec::new();
@@ -208,8 +331,8 @@ impl Engine {
             if statuses.get(&candidate.id).map(String::as_str) != Some("completed") {
                 continue;
             }
-            if used_sources.contains(&candidate.id) {
-                continue;
+            if released_tokens >= token_room && released_cost >= cost_room {
+                break;
             }
             let effective_budget = effective.get(&candidate.id).copied().unwrap_or_default();
             let cap_tokens = old_token.and(effective_budget.tokens);
@@ -217,25 +340,31 @@ impl Engine {
             if cap_tokens.is_none() && cap_cost.is_none() {
                 continue;
             }
+            let already = consumed.get(&candidate.id).copied().unwrap_or_default();
             let (actual_tokens, actual_cost, _, _) = self
                 .usage_spent(&session.id, Some(&candidate.id), None)
                 .await?;
-            let source_tokens = cap_tokens
-                .map(|cap| cap.saturating_sub(actual_tokens))
+            let available_tokens = cap_tokens
+                .map(|cap| {
+                    cap.saturating_sub(actual_tokens)
+                        .saturating_sub(already.tokens)
+                })
                 .unwrap_or(0);
-            let source_cost = cap_cost
-                .map(|cap| (cap - actual_cost.max(0.0)).max(0.0))
+            let available_cost = cap_cost
+                .map(|cap| (cap - actual_cost.max(0.0) - already.cost_usd).max(0.0))
                 .filter(|cost| cost.is_finite())
                 .unwrap_or(0.0);
-            if source_tokens == 0 && source_cost <= 0.0 {
+            let take_tokens = available_tokens.min(token_room.saturating_sub(released_tokens));
+            let take_cost = available_cost.min((cost_room - released_cost).max(0.0));
+            if take_tokens == 0 && take_cost <= 0.0 {
                 continue;
             }
-            released_tokens = released_tokens.saturating_add(source_tokens);
-            released_cost += source_cost;
+            released_tokens = released_tokens.saturating_add(take_tokens);
+            released_cost += take_cost;
             sources.push(serde_json::json!({
                 "task_id": candidate.id,
-                "released_tokens": source_tokens,
-                "released_cost_usd": source_cost,
+                "released_tokens": take_tokens,
+                "released_cost_usd": take_cost,
             }));
             if sources.len() >= MAX_ENVELOPE_SOURCES {
                 break;
@@ -245,20 +374,10 @@ impl Engine {
             return Ok(None);
         }
 
-        let new_token = old_token.map(|old| {
-            let cap = department_tokens
-                .map(|cap| cap.max(old))
-                .unwrap_or(u64::MAX);
-            old.saturating_add(released_tokens).min(cap)
-        });
+        let new_token = old_token.map(|old| old.saturating_add(released_tokens));
         let new_cost = old_cost.map(|old| {
-            let cap = department_cost.map(|cap| cap.max(old)).unwrap_or(f64::MAX);
             let proposed = old + released_cost;
-            if proposed.is_finite() {
-                proposed.min(cap)
-            } else {
-                old
-            }
+            if proposed.is_finite() { proposed } else { old }
         });
         if new_token == old_token && new_cost == old_cost {
             return Ok(None);
@@ -271,6 +390,7 @@ impl Engine {
                 "schema": ENVELOPE_REALLOCATION_SCHEMA,
                 "target_task_id": target.id,
                 "department": target.department,
+                "plan_fingerprint": plan_fingerprint(plan),
                 "old_token_budget": old_token,
                 "new_token_budget": new_token,
                 "old_cost_budget_usd": old_cost,
@@ -278,6 +398,14 @@ impl Engine {
                 "sources": sources,
                 "released_tokens": released_tokens,
                 "released_cost_usd": released_cost,
+                "applied_tokens": new_token
+                    .zip(old_token)
+                    .map(|(new, old)| new.saturating_sub(old))
+                    .unwrap_or(0),
+                "applied_cost_usd": new_cost
+                    .zip(old_cost)
+                    .map(|(new, old)| (new - old).max(0.0))
+                    .unwrap_or(0.0),
                 "generated_at": now_rfc3339(),
                 "reason": ENVELOPE_REALLOCATION_REASON,
                 "policy": ENVELOPE_REALLOCATION_POLICY,
@@ -530,6 +658,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_only_overlay_survives_policy_disable_for_verifier_and_scout() {
+        let plan = plan(
+            vec![department("impl", None, None)],
+            vec![
+                task("T1", "impl", Some(5_000), None),
+                task("T2", "impl", Some(1_000), None),
+            ],
+        );
+        let (_data, _repo, engine, session) = setup(&plan, true).await;
+        complete_task(&engine, &session.id, "T1");
+        engine
+            .effective_plan_for_budget(&session, &plan, "T2")
+            .await
+            .unwrap()
+            .expect("new reallocation");
+        set_auto_reallocation(&engine, &session.project_id, false).await;
+        let runtime = engine
+            .runtime_effective_plan(&session, &plan, "T2")
+            .await
+            .unwrap()
+            .expect("recorded overlay must remain visible when policy is off");
+        assert_eq!(
+            runtime
+                .tasks
+                .iter()
+                .find(|task| task.id == "T2")
+                .unwrap()
+                .token_budget,
+            Some(6_000)
+        );
+        assert_eq!(event_count(&engine, &session.id).await, 1);
+    }
+
+    #[tokio::test]
     async fn dimensions_without_a_target_cap_are_not_invented() {
         let plan = plan(
             vec![department("impl", None, None)],
@@ -605,6 +767,58 @@ mod tests {
         assert_eq!(sources[0]["task_id"], "T2");
         assert_eq!(sources[0]["released_tokens"], 3_500);
         assert_eq!(event_count(&engine, &session.id).await, 2);
+    }
+
+    #[tokio::test]
+    async fn source_dimensions_are_consumed_independently() {
+        let plan = plan(
+            vec![department("impl", None, None)],
+            vec![
+                task("T1", "impl", Some(5_000), Some(1.0)),
+                task("T2", "impl", None, Some(0.2)),
+                task("T3", "impl", Some(1_000), None),
+            ],
+        );
+        let (_data, _repo, engine, session) = setup(&plan, true).await;
+        complete_task(&engine, &session.id, "T1");
+        record_usage(&engine, &session.id, "T1", "impl", 1_000, 0, 0.25).await;
+
+        let cost_only = engine
+            .effective_plan_for_budget(&session, &plan, "T2")
+            .await
+            .unwrap()
+            .expect("cost-only target uses cost capacity");
+        assert_eq!(
+            cost_only
+                .tasks
+                .iter()
+                .find(|task| task.id == "T2")
+                .unwrap()
+                .cost_budget_usd,
+            Some(0.95)
+        );
+        let event = engine
+            .latest_event_of_kind(&session.id, SESSION_ENVELOPE_REALLOCATED_EVENT)
+            .await
+            .unwrap()
+            .expect("cost event");
+        assert_eq!(event.payload["sources"][0]["released_tokens"], 0);
+        assert_eq!(event.payload["sources"][0]["released_cost_usd"], 0.75);
+
+        let token_only = engine
+            .effective_plan_for_budget(&session, &plan, "T3")
+            .await
+            .unwrap()
+            .expect("token capacity was not burned by the cost-only target");
+        assert_eq!(
+            token_only
+                .tasks
+                .iter()
+                .find(|task| task.id == "T3")
+                .unwrap()
+                .token_budget,
+            Some(5_000)
+        );
     }
 
     #[tokio::test]
@@ -688,6 +902,11 @@ mod tests {
             .unwrap()
             .expect("reallocation event");
         assert_eq!(event.payload["new_token_budget"], 6_000);
+        assert_eq!(
+            event.payload["sources"][0]["released_tokens"], 5_000,
+            "only the department-cap room is applied, not the source's full 6k"
+        );
+        assert_eq!(event.payload["released_tokens"], 5_000);
     }
 
     #[tokio::test]
@@ -730,6 +949,23 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "the old 6k override must not widen the revised 500-token plan"
+        );
+        assert_eq!(event_count(&engine, &session.id).await, 1);
+
+        let department_changed = plan(
+            vec![department("impl", Some(3_000), None)],
+            vec![
+                task("T1", "impl", Some(5_000), None),
+                task("T2", "impl", Some(1_000), None),
+            ],
+        );
+        assert!(
+            engine
+                .effective_plan_for_budget(&session, &department_changed, "T2")
+                .await
+                .unwrap()
+                .is_none(),
+            "a department-cap revision must invalidate the old runtime override"
         );
         assert_eq!(event_count(&engine, &session.id).await, 1);
     }

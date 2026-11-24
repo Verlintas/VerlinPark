@@ -2270,6 +2270,9 @@ struct AllocationInsightCard: View {
                 if task.criticalPath == true {
                     badge("CRITICAL PATH", tint: VPTheme.warning)
                 }
+                if task.envelopeReallocated {
+                    badge("RUNTIME ENVELOPE", tint: VPTheme.warning)
+                }
                 if let ready = task.readyLabel {
                     badge(ready, tint: task.ready == true ? VPTheme.success : VPTheme.textTertiary)
                 }
@@ -2284,6 +2287,10 @@ struct AllocationInsightCard: View {
                     Text("priority \(priority)")
                 }
                 Text(task.budgetLabel)
+                if let effective = task.effectiveBudgetLabel {
+                    Text(effective)
+                        .foregroundStyle(VPTheme.warning)
+                }
                 if let source = task.sourceLabel {
                     Text(source)
                 }

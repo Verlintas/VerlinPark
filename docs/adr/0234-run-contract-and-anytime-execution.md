@@ -198,7 +198,9 @@ The R3/R4 slice is read-only/advisory except for two explicit project opt-ins:
   reports `partial_estimate`, and an unestimated task is not reported as
   feasible. Critical-path failure is reported instead of silently labeling the
   all-task fallback as the path; token/cost/time reserve pressure is exposed as
-  bounded dimensions.
+  bounded dimensions. When an R3b event applies, each task also reports its
+  stored budget, runtime effective budget, and a reallocation flag so the
+  preview cannot imply the stored plan is the runtime cap.
 - `session.tradeoffs` / `vp tradeoffs` compares the five documented profile
   postures, reports the active contract reserve and its source separately from
   the documented per-profile posture, reports a bounded quality/reviewability
@@ -221,13 +223,19 @@ The R3/R4 slice is read-only/advisory except for two explicit project opt-ins:
   rather than leaving the reserve released.
 - `ProjectRunPolicy.auto_reallocate_envelopes` (default off) lets a
   Worker/Labour run use a runtime-only effective task budget built from unused
-  token/cost capacity of already-completed tasks in the same department. Each
-  source is single-use in an event-derived record; a target's prior event
-  replays idempotently, a completed target can become a source using its
-  effective budget, and a plan revision invalidates an old override instead of
-  widening the new plan. The stored TeamPlan and every department, session, and
-  project cap remain unchanged; the runtime plan is used only for task
-  admission/budget scope. A same-daemon lock serializes event read/append.
+  token/cost capacity of already-completed tasks in the same department.
+  Sources are consumed independently per token/cost dimension; only capacity
+  that actually fits under the department cap is taken and recorded. A target's
+  prior event replays idempotently, a completed target can become a source
+  using its effective budget, and a plan fingerprint over task/department
+  budgets invalidates an old override instead of widening the new plan. The
+  stored TeamPlan and every department, session, and project cap remain
+  unchanged; the runtime plan is used only for task admission/budget scope.
+  Every task-scoped role, including Verifier/Scout, sees the recorded read-only
+  overlay; only non-auto-approve Worker/Labour runs may append. A per-session
+  same-daemon lock serializes event read/append. The allocation preview reports
+  stored and effective budgets and uses effective values for estimates and
+  critical-path weight.
 - Both preview RPCs append no events and mutate nothing. The macOS cards load
   only when visible or explicitly refreshed and reject a response for a
   different session.
@@ -237,11 +245,11 @@ remain open; R3b is an event-derived runtime overlay for one department, not a
 TeamPlan rewrite or cross-department/session budget pool. It scans the newest
 1,000 reallocation events, so source single-use memory can be forgotten after
 very heavy plan revision (hard department/session/project caps still bound
-actual spend). Historical estimates
-are sparse and are not vendor token counts; confidence is a heuristic, not a
-calibrated probability; profile forecasts repeat the existing session forecast
-and are not per-profile guarantees; rescue and envelope serialization are
-same-daemon only.
+actual spend). Envelope serialization is per-session and same-daemon, not
+cross-host. Historical estimates are sparse and are not vendor token counts;
+confidence is a heuristic, not a calibrated probability; profile forecasts
+repeat the existing session forecast and are not per-profile guarantees;
+rescue serialization is same-daemon only.
 
 ## Consequences
 

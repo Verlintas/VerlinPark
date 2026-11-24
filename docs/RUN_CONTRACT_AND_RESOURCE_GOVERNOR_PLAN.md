@@ -622,7 +622,8 @@ Implemented (R3a):
   `p90_exceeds_reserve_headroom`, and `cost_unconfigured`. Per-task feasibility
   checks token and cost estimates against the task budget and session remaining,
   so a cost-only task is not reported as unestimated and an undersized task
-  budget is visible.
+  budget is visible. Task rows also report the runtime effective budget and a
+  reallocation flag when an R3b event applies; the stored budget remains visible.
 - Recommendations, metareasoning (diagnosis target, no-progress turns,
   stalled/failed/retrying tasks), and attention/trust calibration are bounded
   and advisory. The preview appends no event and changes no task envelope,
@@ -637,11 +638,18 @@ Implemented (R3a):
 - R3b `ProjectRunPolicy.auto_reallocate_envelopes` (default off) lets a
   Worker/Labour run use a runtime-only effective task budget built from unused
   token/cost capacity of already-completed tasks in the same department.
-  Sources are single-use event records; a target's prior event replays
-  idempotently; a completed target can become a source using its effective
-  budget. A plan revision invalidates an old override rather than widening the
-  new plan. The stored TeamPlan and department/session/project caps are never
-  changed, and the runtime plan is used only for task admission/budget scope.
+  Sources are consumed independently per token/cost dimension; only the
+  capacity that actually fits under the department cap is taken and recorded;
+  a target's prior event replays idempotently; a completed target can become a
+  source using its effective budget. A plan fingerprint over task/department
+  budgets invalidates old overrides on any plan revision instead of widening
+  the new plan. The stored TeamPlan and department/session/project caps are
+  never changed, and the runtime plan is used only for task admission/budget
+  scope. Every task-scoped role, including Verifier and Scout, sees the
+  recorded read-only overlay so already-spent reallocated capacity can still be
+  verified; only normal Worker/Labour runs (not auto-approve maintenance) may
+  append a new event. The allocation preview reports stored and effective
+  budgets and uses the effective values for estimates/critical-path weight.
 - CLI `--auto-rescue` / `--no-auto-rescue`,
   `--auto-reallocate-envelopes` / `--no-auto-reallocate-envelopes`, the macOS
   policy toggles, and the Manage Dash allocation/trade-off cards use only these
@@ -653,7 +661,8 @@ Remaining:
   not a TeamPlan rewrite; cross-department/session reallocation, reservation
   redistribution, and a revisioned plan budget remain open. Its 1,000-event
   source-single-use window can forget very old sources after heavy plan
-  revision, though hard caps still bound actual spend.
+  revision, though hard caps still bound actual spend. Serialization is
+  per-session and same-daemon, not cross-host.
 - Learning from actuals beyond deterministic project/department nearest-rank
   p50/p90; no model training or hidden routing.
 - LLM replanning; replan recommendations remain textual/advisory.

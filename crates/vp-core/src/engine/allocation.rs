@@ -16,6 +16,7 @@ use vp_protocol::types::{
 };
 
 use crate::critical_path::{CriticalPathInput, compute_critical_path, is_remaining_status};
+use crate::engine::envelopes::EffectiveBudget;
 
 pub(crate) const MAX_ALLOCATION_TASKS: usize = 100;
 pub(crate) const MAX_ALLOCATION_RECOMMENDATIONS: usize = 12;
@@ -188,6 +189,27 @@ impl Engine {
         let history = self
             .project_usage_history(&session.project_id, MAX_ALLOCATION_HISTORY)
             .await?;
+        let effective_budgets = match plan.as_ref() {
+            Some(plan) => self.runtime_envelope_budgets(&session, plan).await?,
+            None => HashMap::new(),
+        };
+        // The effective plan feeds estimates and critical-path weighting so a
+        // stored 1k task running with a 4.5k runtime cap is not shown as a
+        // 1k task.
+        let effective_plan = plan.as_ref().map(|plan| {
+            let mut runtime = plan.clone();
+            for task in &mut runtime.tasks {
+                if let Some(budget) = effective_budgets.get(&task.id) {
+                    if budget.tokens.is_some() {
+                        task.token_budget = budget.tokens;
+                    }
+                    if budget.cost_usd.is_some() {
+                        task.cost_budget_usd = budget.cost_usd;
+                    }
+                }
+            }
+            runtime
+        });
 
         let statuses = queue
             .iter()
@@ -205,21 +227,38 @@ impl Engine {
         let mut estimates: HashMap<String, TaskEstimate> = HashMap::new();
         let mut tasks = Vec::new();
         for row in &task_rows {
+            let effective =
+                effective_budgets
+                    .get(&row.task_id)
+                    .copied()
+                    .unwrap_or(EffectiveBudget {
+                        tokens: row.token_budget,
+                        cost_usd: row.cost_budget_usd,
+                    });
+            let mut estimate_row = row.clone();
+            estimate_row.token_budget = effective.tokens;
+            estimate_row.cost_budget_usd = effective.cost_usd;
             let estimate = estimate_task(
-                row,
+                &estimate_row,
                 &session_buckets,
                 &project_actuals,
                 &department_envelopes,
             );
             estimates.insert(row.task_id.clone(), estimate.clone());
-            tasks.push(allocation_task(row, &statuses, &budget, &estimate));
+            tasks.push(allocation_task(
+                row, &statuses, &budget, &estimate, effective,
+            ));
         }
         let raw_task_count = tasks.len();
         let task_truncated = raw_task_count > MAX_ALLOCATION_TASKS;
         tasks.truncate(MAX_ALLOCATION_TASKS);
 
-        let (critical_path_ids, critical_path_error) =
-            critical_path_tasks(&session, plan.as_ref(), &statuses, budget.remaining_tokens);
+        let (critical_path_ids, critical_path_error) = critical_path_tasks(
+            &session,
+            effective_plan.as_ref().or(plan.as_ref()),
+            &statuses,
+            budget.remaining_tokens,
+        );
         let path_available = critical_path_error.is_none();
         let focus_ids = allocation_focus_ids(
             plan.as_ref(),
@@ -460,11 +499,12 @@ fn allocation_task(
     statuses: &HashMap<String, String>,
     budget: &vp_protocol::types::SessionBudgetStatus,
     estimate: &TaskEstimate,
+    effective: EffectiveBudget,
 ) -> AllocationTask {
     let terminal = crate::critical_path::is_terminal_status(&row.status);
     let ready = allocation_task_ready(&row.status, &row.deps, statuses);
-    let token_limit = row.token_budget.or(budget.remaining_tokens);
-    let cost_limit = row.cost_budget_usd.or(budget.remaining_cost_usd);
+    let token_limit = effective.tokens.or(budget.remaining_tokens);
+    let cost_limit = effective.cost_usd.or(budget.remaining_cost_usd);
     let token_fit = estimate
         .p90_tokens
         .map(|p90| token_limit.is_none_or(|limit| p90 <= limit));
@@ -475,8 +515,8 @@ fn allocation_task(
     let (feasible, reason) = if terminal {
         (true, "terminal".to_string())
     } else if token_fit == Some(false) {
-        let reason = if row
-            .token_budget
+        let reason = if effective
+            .tokens
             .is_some_and(|limit| estimate.p90_tokens.is_some_and(|p90| p90 > limit))
         {
             "exceeds_task_tokens"
@@ -485,8 +525,8 @@ fn allocation_task(
         };
         (false, reason.to_string())
     } else if cost_fit == Some(false) {
-        let reason = if row
-            .cost_budget_usd
+        let reason = if effective
+            .cost_usd
             .is_some_and(|limit| estimate.p90_cost_usd.is_some_and(|p90| p90 > limit))
         {
             "exceeds_task_cost"
@@ -518,6 +558,10 @@ fn allocation_task(
         priority: row.priority,
         token_budget: row.token_budget,
         cost_budget_usd: row.cost_budget_usd,
+        effective_token_budget: effective.tokens,
+        effective_cost_budget_usd: effective.cost_usd,
+        envelope_reallocated: effective.tokens != row.token_budget
+            || effective.cost_usd != row.cost_budget_usd,
         p50_tokens: estimate.p50_tokens,
         p90_tokens: estimate.p90_tokens,
         observed_calls: estimate.observed_calls,
@@ -1845,6 +1889,7 @@ mod tests {
             &HashMap::new(),
             &budget(None, None, 0, None),
             &estimate,
+            EffectiveBudget::default(),
         );
         assert!(!task.feasible);
         assert_eq!(task.reason, "unestimated");
@@ -1875,7 +1920,13 @@ mod tests {
             source: Some(EstimateSource::ProjectActuals),
             ..TaskEstimate::default()
         };
-        let task = allocation_task(&row, &HashMap::new(), &cost_budget, &cost_estimate);
+        let task = allocation_task(
+            &row,
+            &HashMap::new(),
+            &cost_budget,
+            &cost_estimate,
+            EffectiveBudget::default(),
+        );
         assert!(task.feasible);
         assert_eq!(task.reason, "cost_only");
 
@@ -1883,7 +1934,13 @@ mod tests {
             p90_cost_usd: Some(2.0),
             ..cost_estimate.clone()
         };
-        let task = allocation_task(&row, &HashMap::new(), &cost_budget, &expensive);
+        let task = allocation_task(
+            &row,
+            &HashMap::new(),
+            &cost_budget,
+            &expensive,
+            EffectiveBudget::default(),
+        );
         assert!(!task.feasible);
         assert_eq!(task.reason, "exceeds_remaining_cost");
 
@@ -1900,9 +1957,36 @@ mod tests {
             &HashMap::new(),
             &budget(None, None, 0, None),
             &token_estimate,
+            EffectiveBudget {
+                tokens: Some(500),
+                cost_usd: None,
+            },
         );
         assert!(!task.feasible);
         assert_eq!(task.reason, "exceeds_task_tokens");
+
+        let mut stored = row.clone();
+        stored.token_budget = Some(1_000);
+        let estimate = TaskEstimate {
+            p50_tokens: Some(4_000),
+            p90_tokens: Some(4_000),
+            source: Some(EstimateSource::PlanEnvelope),
+            ..TaskEstimate::default()
+        };
+        let task = allocation_task(
+            &stored,
+            &HashMap::new(),
+            &budget(None, None, 0, None),
+            &estimate,
+            EffectiveBudget {
+                tokens: Some(4_500),
+                cost_usd: None,
+            },
+        );
+        assert!(task.feasible, "{task:?}");
+        assert_eq!(task.token_budget, Some(1_000));
+        assert_eq!(task.effective_token_budget, Some(4_500));
+        assert!(task.envelope_reallocated);
     }
 
     #[test]
@@ -2103,6 +2187,69 @@ mod tests {
         let (ids, reason) = critical_path_tasks(&session, None, &HashMap::new(), None);
         assert!(ids.is_empty());
         assert_eq!(reason.as_deref(), Some("no_plan"));
+    }
+
+    #[tokio::test]
+    async fn preview_reports_runtime_effective_budgets_from_reallocation_events() {
+        let (_data, _repo, engine, session) = fixture().await;
+        let plan = TeamPlan {
+            goal: "runtime envelopes".into(),
+            departments: vec![PlanDepartment {
+                name: "impl".into(),
+                manager_title: "Implementation".into(),
+                profile: "coding".into(),
+                objective: "build".into(),
+                token_budget: None,
+                cost_budget_usd: None,
+            }],
+            tasks: vec![task("T1", 1, Some(5_000)), task("T2", 1, Some(1_000))],
+        };
+        engine.submit_team_plan(&session.id, &plan).await.unwrap();
+        engine
+            .append_event(
+                &session.id,
+                "session.envelope.reallocated",
+                serde_json::json!({
+                    "schema": "verlinpark.envelope_reallocation/v1",
+                    "target_task_id": "T2",
+                    "department": "impl",
+                    "old_token_budget": 1_000,
+                    "new_token_budget": 6_000,
+                    "old_cost_budget_usd": null,
+                    "new_cost_budget_usd": null,
+                    "sources": [{
+                        "task_id": "T1",
+                        "released_tokens": 5_000,
+                        "released_cost_usd": 0.0
+                    }],
+                    "reason": "completed_task_unused_envelope",
+                    "policy": "auto_reallocate_envelopes"
+                }),
+            )
+            .await
+            .unwrap();
+        let preview = engine
+            .session_allocation(SessionAllocationParams {
+                session_id: session.id.clone(),
+            })
+            .await
+            .unwrap();
+        let target = preview
+            .tasks
+            .iter()
+            .find(|task| task.task_id == "T2")
+            .expect("T2");
+        assert_eq!(target.token_budget, Some(1_000));
+        assert_eq!(target.effective_token_budget, Some(6_000));
+        assert!(target.envelope_reallocated);
+        assert_eq!(target.source, "plan_envelope");
+        assert_eq!(target.p50_tokens, Some(6_000));
+        assert_eq!(target.p90_tokens, Some(6_000));
+        assert_eq!(
+            preview.feasibility.critical_path_tasks,
+            vec!["T2".to_string()],
+            "critical-path weight must use the runtime effective budget"
+        );
     }
 
     #[tokio::test]

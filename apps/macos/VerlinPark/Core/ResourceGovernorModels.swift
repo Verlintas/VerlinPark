@@ -2644,6 +2644,9 @@ struct AllocationTaskEnvelopeView: Codable, Sendable, Equatable {
     let priority: Int?
     let tokenBudget: UInt64?
     let costBudgetUSD: Double?
+    let effectiveTokenBudget: UInt64?
+    let effectiveCostBudgetUSD: Double?
+    let envelopeReallocated: Bool
     let p50Tokens: UInt64?
     let p90Tokens: UInt64?
     let observedCalls: UInt32?
@@ -2658,6 +2661,9 @@ struct AllocationTaskEnvelopeView: Codable, Sendable, Equatable {
         case taskID = "task_id"
         case tokenBudget = "token_budget"
         case costBudgetUSD = "cost_budget_usd"
+        case effectiveTokenBudget = "effective_token_budget"
+        case effectiveCostBudgetUSD = "effective_cost_budget_usd"
+        case envelopeReallocated = "envelope_reallocated"
         case p50Tokens = "p50_tokens"
         case p90Tokens = "p90_tokens"
         case observedCalls = "observed_calls"
@@ -2671,6 +2677,9 @@ struct AllocationTaskEnvelopeView: Codable, Sendable, Equatable {
         priority: Int? = nil,
         tokenBudget: UInt64? = nil,
         costBudgetUSD: Double? = nil,
+        effectiveTokenBudget: UInt64? = nil,
+        effectiveCostBudgetUSD: Double? = nil,
+        envelopeReallocated: Bool = false,
         p50Tokens: UInt64? = nil,
         p90Tokens: UInt64? = nil,
         observedCalls: UInt32? = nil,
@@ -2687,6 +2696,9 @@ struct AllocationTaskEnvelopeView: Codable, Sendable, Equatable {
         self.priority = priority
         self.tokenBudget = tokenBudget
         self.costBudgetUSD = costBudgetUSD
+        self.effectiveTokenBudget = effectiveTokenBudget
+        self.effectiveCostBudgetUSD = effectiveCostBudgetUSD
+        self.envelopeReallocated = envelopeReallocated
         self.p50Tokens = p50Tokens
         self.p90Tokens = p90Tokens
         self.observedCalls = observedCalls
@@ -2706,6 +2718,12 @@ struct AllocationTaskEnvelopeView: Codable, Sendable, Equatable {
         priority = try container.decodeIfPresent(Int.self, forKey: .priority)
         tokenBudget = try container.decodeIfPresent(UInt64.self, forKey: .tokenBudget)
         costBudgetUSD = try container.decodeIfPresent(Double.self, forKey: .costBudgetUSD)
+        effectiveTokenBudget =
+            try container.decodeIfPresent(UInt64.self, forKey: .effectiveTokenBudget)
+        effectiveCostBudgetUSD =
+            try container.decodeIfPresent(Double.self, forKey: .effectiveCostBudgetUSD)
+        envelopeReallocated =
+            try container.decodeIfPresent(Bool.self, forKey: .envelopeReallocated) ?? false
         p50Tokens = try container.decodeIfPresent(UInt64.self, forKey: .p50Tokens)
         p90Tokens = try container.decodeIfPresent(UInt64.self, forKey: .p90Tokens)
         observedCalls = try container.decodeIfPresent(UInt32.self, forKey: .observedCalls)
@@ -2741,6 +2759,17 @@ struct AllocationTaskEnvelopeView: Codable, Sendable, Equatable {
             seconds: nil,
             empty: "no task envelope reported"
         )
+    }
+
+    var effectiveBudgetLabel: String? {
+        guard envelopeReallocated else { return nil }
+        let value = BudgetFormatting.combined(
+            tokens: effectiveTokenBudget,
+            cost: effectiveCostBudgetUSD,
+            seconds: nil,
+            empty: ""
+        )
+        return value.isEmpty ? nil : "runtime \(value)"
     }
 
     var forecastLabel: String {

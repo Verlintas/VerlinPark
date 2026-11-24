@@ -1501,7 +1501,9 @@ final class ResourceGovernorTests: XCTestCase {
           },
           "tasks": [
             {"task_id":"T1","title":"Write model","department":"core","status":"pending",
-             "priority":5,"token_budget":30000,"cost_budget_usd":0.5,"p50_tokens":9000,
+             "priority":5,"token_budget":30000,"cost_budget_usd":0.5,
+             "effective_token_budget":36000,"effective_cost_budget_usd":0.6,
+             "envelope_reallocated":true,"p50_tokens":9000,
              "p90_tokens":16000,"observed_calls":4,"source":"history","critical_path":true,
              "ready":true,"feasible":true,"reason":"fits"},
             {"task_id":"T2","title":"Tests","department":"core","status":"pending"},
@@ -1571,6 +1573,13 @@ final class ResourceGovernorTests: XCTestCase {
         XCTAssertEqual(allocation.taskPreviews.count, 6)
         XCTAssertEqual(allocation.taskOverflow, 2)
         XCTAssertEqual(allocation.taskPreviews.first?.titleLabel, "Write model")
+        XCTAssertTrue(allocation.taskPreviews.first?.envelopeReallocated == true)
+        XCTAssertEqual(
+            allocation.taskPreviews.first?.effectiveBudgetLabel,
+            "runtime 36.0k tokens · $0.60"
+        )
+        XCTAssertFalse(allocation.taskPreviews[1].envelopeReallocated)
+        XCTAssertNil(allocation.taskPreviews[1].effectiveBudgetLabel)
         XCTAssertEqual(allocation.taskPreviews.first?.feasibleLabel, "FEASIBLE")
         XCTAssertEqual(allocation.taskPreviews.first?.readyLabel, "READY")
         XCTAssertEqual(allocation.taskPreviews[1].budgetLabel, "no task envelope reported")

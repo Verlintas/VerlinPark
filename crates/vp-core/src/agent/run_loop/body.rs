@@ -527,22 +527,20 @@ pub(in crate::agent) async fn run_loop_body(
     let mut team_plan = engine.get_team_plan(&session.id).await?;
     // Runtime-only effective budgets may use capacity released by completed
     // tasks in the same department. The original plan stays authoritative for
-    // prompt/context and is never mutated or persisted by this path.
-    let effective_budget_plan = if matches!(spec.role, AgentRole::Worker | AgentRole::Labour)
-        && let Some(task_id) = spec.task_id.as_deref()
-    {
+    // prompt/context and is never mutated or persisted by this path. Every
+    // task-scoped role (Verifier/Scout included) must see the recorded overlay;
+    // otherwise a task that spent more than its stored budget could never be
+    // verified. Only a normal Worker/Labour run may append a new event.
+    let runtime_budget_plan = if let Some(task_id) = spec.task_id.as_deref() {
         match team_plan.as_ref() {
-            Some(plan) => match engine
-                .effective_plan_for_budget(session, plan, task_id)
-                .await
-            {
+            Some(plan) => match engine.runtime_effective_plan(session, plan, task_id).await {
                 Ok(plan) => plan,
                 Err(error) => {
                     tracing::warn!(
                         %error,
                         session_id = %session.id,
                         task_id,
-                        "envelope reallocation failed; using the stored plan budget"
+                        "runtime envelope overlay failed; using the stored plan budget"
                     );
                     None
                 }
@@ -552,6 +550,34 @@ pub(in crate::agent) async fn run_loop_body(
     } else {
         None
     };
+    let effective_budget_plan =
+        if matches!(spec.role, AgentRole::Worker | AgentRole::Labour) && !spec.auto_approve {
+            if let Some(task_id) = spec.task_id.as_deref() {
+                match team_plan.as_ref() {
+                    Some(plan) => match engine
+                        .effective_plan_for_budget(session, plan, task_id)
+                        .await
+                    {
+                        Ok(Some(plan)) => Some(plan),
+                        Ok(None) => runtime_budget_plan,
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                session_id = %session.id,
+                                task_id,
+                                "envelope reallocation failed; using the recorded runtime overlay"
+                            );
+                            runtime_budget_plan
+                        }
+                    },
+                    None => runtime_budget_plan,
+                }
+            } else {
+                runtime_budget_plan
+            }
+        } else {
+            runtime_budget_plan
+        };
     let project_budget = engine.get_project_budget(&project.id).await?;
     let plan_budget = PlanBudgetScope::from_plan(
         effective_budget_plan.as_ref().or(team_plan.as_ref()),

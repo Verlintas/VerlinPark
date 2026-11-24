@@ -78,8 +78,21 @@ pub(crate) fn allocation_lines(value: &Value) -> Option<Vec<String>> {
         if truncated { " (truncated)" } else { "" }
     ));
     for task in tasks.iter().take(10) {
+        let runtime = if task
+            .get("envelope_reallocated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            format!(
+                " runtime_tokens={} runtime_cost=${}",
+                optional_number(task.get("effective_token_budget")),
+                optional_number(task.get("effective_cost_budget_usd"))
+            )
+        } else {
+            String::new()
+        };
         lines.push(format!(
-            "    {} p{} {:<10} ready={} critical={} feasible={} source={} p50={} p90={} calls={} {}",
+            "    {} p{} {:<10} ready={} critical={} feasible={} source={} p50={} p90={} calls={}{} {}",
             task.get("task_id").and_then(Value::as_str).unwrap_or("?"),
             task.get("priority").and_then(Value::as_i64).unwrap_or(0),
             task.get("status").and_then(Value::as_str).unwrap_or("?"),
@@ -94,6 +107,7 @@ pub(crate) fn allocation_lines(value: &Value) -> Option<Vec<String>> {
             optional_number(task.get("p50_tokens")),
             optional_number(task.get("p90_tokens")),
             optional_number(task.get("observed_calls")),
+            runtime,
             task.get("reason").and_then(Value::as_str).unwrap_or("")
         ));
     }
@@ -232,8 +246,11 @@ mod tests {
                 "department": "impl",
                 "status": "pending",
                 "priority": 5,
-                "token_budget": null,
+                "token_budget": 1000,
                 "cost_budget_usd": null,
+                "effective_token_budget": 4000,
+                "effective_cost_budget_usd": null,
+                "envelope_reallocated": true,
                 "p50_tokens": 2000,
                 "p90_tokens": 3000,
                 "observed_calls": 3,
@@ -280,6 +297,7 @@ mod tests {
         assert!(text.contains("feasibility: feasible=true reason=feasible"));
         assert!(text.contains("T1 p5 pending"));
         assert!(text.contains("critical=true"));
+        assert!(text.contains("runtime_tokens=4000"));
         assert!(text.contains("continue (medium)"));
         assert!(text.contains("diagnosis=no_failure"));
         assert!(text.contains("batch_routine"));

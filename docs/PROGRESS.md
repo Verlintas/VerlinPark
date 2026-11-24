@@ -33,7 +33,8 @@ Verifier 或 Integrator。
   不再被误报为 unestimated。critical path 可用时聚焦该路径，否则聚焦全部
   剩余 task；计算失败时返回 `critical_path_available=false` +
   `critical_path_reason`（例如 `BUDGET_PATH_UNKNOWN_TASK`），不静默伪装成
-  正常路径。推荐项最多 12 条，reason 最多 200 字符；metareasoning 只引用
+  正常路径。task 行同时显示 stored budget 和 R3b runtime effective budget /
+  `envelope_reallocated`，避免预览把 stored plan 误当成 runtime cap。推荐项最多 12 条，reason 最多 200 字符；metareasoning 只引用
   diagnosis target、no-progress、stalled/failed/retrying task；calibration
   只引用 pending approval 的 weighted interrupts、unknown effects、
   Verifier rejection、failed task 和 usage calls，并明确标注 advisory。
@@ -51,12 +52,16 @@ Verifier 或 Integrator。
   被重复标成 recommended，视图也从不切换 profile。
 - `ProjectRunPolicy.auto_reallocate_envelopes`（默认关闭）：Worker/Labour
   run 可以在同一 department 内复用已完成 task 未花掉的 token/cost capacity，
-  得到 runtime-only effective task budget。每个 source 在 event 中只能使用
-  一次；target 已有 event 时幂等重放；已完成 target 可以用它的 effective
-  budget 继续作为 source；plan revision 会使旧 override 失效，避免把新计划
-  重新放宽。stored TeamPlan、department/session/project caps、approval、
-  Verifier、Integrator 都不变，runtime plan 只供 task admission/budget
-  scope 使用；event 读取/追加有 same-daemon lock。
+  得到 runtime-only effective task budget。source 按 token/cost 维度分别消费，
+  只取 department cap 内实际可用的部分并记录 applied 数量；target 已有 event
+  时幂等重放；已完成 target 可以用它的 effective budget 继续作为 source；
+  plan fingerprint（task/department budgets）使旧 override 在任何预算修订后
+  失效，避免把新计划重新放宽。stored TeamPlan、department/session/project
+  caps、approval、Verifier、Integrator 都不变，runtime plan 只供 task
+  admission/budget scope 使用；Verifier/Scout 也读取已记录 overlay，只有
+  非 auto-approve 的 Worker/Labour 可以追加；event 读取/追加按 session 加锁；
+  allocation preview 显示 stored/effective budget 并用 effective 值做
+  estimate/critical-path weight。
 - `ProjectRunPolicy.auto_rescue`（默认关闭）：项目显式 opt-in 后，turn
   boundary 只有在暂停原因正好是 `completion_reserve_*`、session 为 fixed
   budget、readiness 处于 near-completion、存在 latest commit、
@@ -83,7 +88,7 @@ Verifier 或 Integrator。
   跨 host 不成立；project RunPolicy 保存仍是整包 read-modify-write，没有
   updated_at/CAS 前置条件。
 - 测试：targeted allocation/tradeoff/rescue/protocol/CLI/daemon + full
-  workspace **4,641 passed / 0 failed / 6 ignored**；Swift
+  workspace **4,644 passed / 0 failed / 6 ignored**；Swift
   **659 passed（527 app + 132 helper）**；`cargo fmt --check`、
   `cargo clippy --workspace --all-targets -- -D warnings`、`swiftformat --lint`
   和 `xcodebuild test` 通过。临时 daemon CLI smoke 覆盖 `project-run-policy-set`

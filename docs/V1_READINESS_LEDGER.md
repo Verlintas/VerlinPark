@@ -209,7 +209,9 @@ effect, Verifier, or merge row.
   against the task budget and session remaining (cost-only estimates are not
   treated as unestimated). Critical-path failure reports
   `critical_path_available=false` plus a bounded reason instead of silently
-  presenting the all-task fallback as the path.
+  presenting the all-task fallback as the path. Each task reports stored and
+  runtime effective budgets plus `envelope_reallocated` when an R3b event
+  applies.
 - `session.tradeoffs` / `vp tradeoffs` returns the five documented profile
   postures, the current profile, the **active contract reserve and its source**
   (profile rows are labeled posture, not an implicit reserve change), the
@@ -235,12 +237,17 @@ effect, Verifier, or merge row.
   the completion reserve for its 30-minute TTL.
 - `ProjectRunPolicy.auto_reallocate_envelopes` is off by default. When enabled,
   a Worker/Labour run gets a runtime-only effective task budget from unused
-  token/cost capacity of already-completed tasks in the same department. Sources
-  are single-use in `session.envelope.reallocated` events; a prior target event
-  replays idempotently, a completed target can become a source with its
-  effective budget, and a plan revision invalidates an old override instead of
-  widening the new plan. The stored TeamPlan and every department, session, and
-  project cap are unchanged; a same-daemon lock serializes event read/append.
+  token/cost capacity of already-completed tasks in the same department.
+  Sources are consumed independently per token/cost dimension; only capacity
+  that fits under the department cap is applied and recorded. A prior target
+  event replays idempotently, a completed target can become a source with its
+  effective budget, and a plan fingerprint over task/department budgets
+  invalidates an old override instead of widening the new plan. The stored
+  TeamPlan and every department, session, and project cap are unchanged;
+  Verifier/Scout see the recorded read-only overlay, only non-auto-approve
+  Worker/Labour runs may append, and a per-session same-daemon lock serializes
+  event read/append. The allocation preview reports stored/effective budgets
+  and uses effective values for estimates and critical-path weight.
 - macOS: Project RunPolicy toggles for completion-reserve rescue and runtime
   envelope reallocation, with the fixed-budget/no-bypass and
   stored-plan/caps-unchanged caveats, and Manage Dash → Usage & Budget Allocation
@@ -264,7 +271,7 @@ effect, Verifier, or merge row.
   turn-boundary auto rescue or runtime envelope reallocation was triggered
   (unit/daemon tests cover both paths).
 - Tests: targeted allocation, trade-off, auto-rescue, protocol, CLI, and
-  daemon tests; full workspace **4,641 passed / 0 failed / 6 ignored**;
+  daemon tests; full workspace **4,644 passed / 0 failed / 6 ignored**;
   Swift **659 passed (527 app + 132 helper)**; fmt, clippy,
   SwiftFormat, and `xcodebuild test` pass.
 - Limits: persisted plan-revision reallocation, cross-department/session
@@ -273,13 +280,13 @@ effect, Verifier, or merge row.
   scans the newest 1,000 reallocation events, so source single-use memory can
   be forgotten after very heavy plan revision (department/session/project caps
   still bound actual spend). Estimates are sparse historical heuristics, not
-  vendor token counts;
-  test-cache evidence may predate the latest commit; confidence is not a
-  calibrated probability; profile forecasts are not per-profile; profile
-  reserves are documented posture, not automatic contract changes; rescue and
-  envelope locks are same-daemon only; project RunPolicy saves remain a
-  whole-policy read-modify-write without a compare-and-set precondition, so
-  concurrent editors can lose the other field.
+  vendor token counts; test-cache evidence may predate the latest commit;
+  confidence is not a calibrated probability; profile forecasts are not
+  per-profile; profile reserves are documented posture, not automatic contract
+  changes; rescue is same-daemon and envelope serialization is per-session
+  same-daemon; project RunPolicy saves remain a whole-policy read-modify-write
+  without a compare-and-set precondition, so concurrent editors can lose the
+  other field.
 
 ## Carried findings from the V1 plan
 
