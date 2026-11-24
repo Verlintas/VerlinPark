@@ -174,4 +174,27 @@ final class MarkdownTranscriptTests: XCTestCase {
         XCTAssertTrue(MarkdownDocument.parse("").isEmpty)
         XCTAssertTrue(MarkdownDocument.parse("\n\n").isEmpty)
     }
+
+    func testTranscriptDisplayPreferenceDefaultsAndNormalization() {
+        XCTAssertEqual(TranscriptDisplayPreference.defaultUserFormat, .plainText)
+        XCTAssertEqual(TranscriptDisplayPreference.defaultAgentFormat, .markdown)
+        XCTAssertEqual(
+            TranscriptDisplayPreference.format(rawValue: "markdown", fallback: .plainText),
+            .markdown
+        )
+        XCTAssertEqual(
+            TranscriptDisplayPreference.format(rawValue: "plain_text", fallback: .markdown),
+            .plainText
+        )
+        XCTAssertEqual(
+            TranscriptDisplayPreference.format(rawValue: "legacy-value", fallback: .markdown),
+            .markdown
+        )
+        XCTAssertEqual(
+            TranscriptDisplayPreference.format(rawValue: "", fallback: .plainText),
+            .plainText
+        )
+        XCTAssertEqual(TranscriptDisplayFormat.plainText.rawValue, "plain_text")
+        XCTAssertEqual(TranscriptDisplayFormat.markdown.rawValue, "markdown")
+    }
 }

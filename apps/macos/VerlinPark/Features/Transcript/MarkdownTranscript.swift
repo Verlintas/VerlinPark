@@ -445,6 +445,28 @@ enum MarkdownInline {
     }
 }
 
+/// One transcript message in the operator-selected display format. Plain text
+/// preserves the exact characters and line breaks; Markdown uses the bounded
+/// renderer below. The preference is display-only and never mutates events.
+struct TranscriptMessageText: View {
+    let text: String
+    let format: TranscriptDisplayFormat
+    var citations: [SourceCitation] = []
+
+    var body: some View {
+        if format == .markdown {
+            MarkdownTranscriptView(text: text, citations: citations)
+        } else {
+            Text(text)
+                .font(VPTheme.font(12.5))
+                .foregroundStyle(VPTheme.textPrimary)
+                .lineSpacing(2.5)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
 /// Assistant transcript renderer. It never executes remote content, never
 /// loads images, and applies a fixed block budget so a pathological response
 /// cannot create an unbounded view tree.

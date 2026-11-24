@@ -231,6 +231,10 @@ struct GeneralSettingsView: View {
     @Environment(LanguageStore.self) private var language
     @Environment(WorkspaceLayoutStore.self) private var layout
     @Environment(AppModel.self) private var model
+    @AppStorage(TranscriptDisplayPreference.userFormatKey)
+    private var userFormatRaw = TranscriptDisplayPreference.defaultUserFormat.rawValue
+    @AppStorage(TranscriptDisplayPreference.agentFormatKey)
+    private var agentFormatRaw = TranscriptDisplayPreference.defaultAgentFormat.rawValue
     @State private var showSetupWizard = false
 
     var body: some View {
@@ -327,6 +331,30 @@ struct GeneralSettingsView: View {
                         }
                         .padding(.top, 4)
                     }
+                }
+
+                VStack(alignment: .leading, spacing: 9) {
+                    SectionLabel(title: L10n.t("Transcript"))
+                    transcriptFormatRow(
+                        title: L10n.t("User input"),
+                        detail: L10n.t("How your messages appear in the Stage transcript."),
+                        selection: $userFormatRaw,
+                        fallback: TranscriptDisplayPreference.defaultUserFormat
+                    )
+                    transcriptFormatRow(
+                        title: L10n.t("Agent output"),
+                        detail: L10n.t("How Leader and delegated-agent messages appear."),
+                        selection: $agentFormatRaw,
+                        fallback: TranscriptDisplayPreference.defaultAgentFormat
+                    )
+                    Text(
+                        L10n.t(
+                            "Display-only preference. Plain text preserves exact characters and line breaks; Markdown is bounded and never executes HTML. Changes apply to the open transcript immediately."
+                        )
+                    )
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(VPTheme.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
                 }
 
                 VStack(alignment: .leading, spacing: 9) {
@@ -622,6 +650,66 @@ struct GeneralSettingsView: View {
                 .foregroundStyle(VPTheme.textTertiary)
                 .frame(width: 48, alignment: .trailing)
                 .contentTransition(.numericText())
+        }
+    }
+
+    private func transcriptFormatRow(
+        title: String,
+        detail: String,
+        selection: Binding<String>,
+        fallback: TranscriptDisplayFormat
+    ) -> some View {
+        let selected = TranscriptDisplayPreference.format(
+            rawValue: selection.wrappedValue,
+            fallback: fallback
+        )
+        return HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(VPTheme.font(11.5, weight: .semibold))
+                    .foregroundStyle(VPTheme.textPrimary)
+                Text(detail)
+                    .font(VPTheme.mono(7.5))
+                    .foregroundStyle(VPTheme.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            HStack(spacing: 6) {
+                ForEach(TranscriptDisplayFormat.allCases) { format in
+                    let isSelected = format == selected
+                    Button {
+                        selection.wrappedValue = format.rawValue
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: format.icon)
+                                .font(.system(size: 9, weight: .semibold))
+                            Text(format.title)
+                                .font(VPTheme.mono(8, weight: .medium))
+                        }
+                        .foregroundStyle(isSelected ? VPTheme.accent : VPTheme.textSecondary)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 5)
+                        .background(
+                            isSelected ? VPTheme.accent.opacity(0.10) : VPTheme.surfaceRaised,
+                            in: Capsule()
+                        )
+                        .overlay {
+                            Capsule().strokeBorder(
+                                isSelected ? VPTheme.accent.opacity(0.30) : VPTheme.hairline,
+                                lineWidth: 1
+                            )
+                        }
+                    }
+                    .buttonStyle(VPPressableButtonStyle(scale: 0.97))
+                    .help(format.detail)
+                }
+            }
+        }
+        .padding(11)
+        .background(VPTheme.surface, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .strokeBorder(VPTheme.hairline, lineWidth: 1)
         }
     }
 

@@ -136,13 +136,16 @@ Implemented the observe/operator slice from ADR-0234:
   shows the resource card when the project/session is opened, and shows the
   Manage Dash Project RunPolicy card/editor with the daemon-reported policy;
   the pause banner itself was not triggered by a live pause in this smoke and
-  remains covered by Swift event tests plus core pause tests.
+  remains covered by Swift event tests plus core pause tests. A second smoke
+  injected real user/agent transcript events and verified the default display
+  (user plain, agent Markdown) plus the Settings → General → Transcript switch
+  to user Markdown / agent plain text applying immediately.
 
 Tests: R2b targeted: 27 auto-budget runtime tests, 368 `agent::tests`, 12
 resource tests, 2 project-policy/rebuild tests, 2 protocol stop-policy tests,
 434 store tests, 52 daemon tests, 188 CLI tests, 18 targeted Swift
-`ResourceGovernorTests`, 5 Swift `MarkdownTranscriptTests`, and 633 full Swift
-tests (501 app + 132 helper); P0 tests remain. Final full workspace after the
+`ResourceGovernorTests`, 6 Swift `MarkdownTranscriptTests`, and 634 full Swift
+tests (502 app + 132 helper); P0 tests remain. Final full workspace after the
 last R2b slice is recorded below;
 the final R2b governor/UI run was **4,570 passed, 0 failed, 6 ignored**;
 clippy exit 0. R2b project policy was 4,559; R2b core before it 4,554; R2a 4,551. A live
@@ -227,9 +230,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 R2b project policy was 4,559, R2b core before it 4,554, R2a 4,551, R1 4,546.
-Full Swift after the slice: 633 (501 app + 132 helper), including the
-Markdown transcript renderer tests. The Markdown change is macOS-only; the
-Rust workspace count remains 4,570.
+Full Swift after the slice: 634 (502 app + 132 helper), including the
+Markdown transcript renderer and display-preference tests. The Markdown and
+settings changes are macOS-only; the Rust workspace count remains 4,570.
 
 The earlier full run before P0/R1 also passed every crate except the daemon
 operator test, which was fixed and is covered above. The host XProtect/

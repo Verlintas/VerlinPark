@@ -98,6 +98,13 @@ pre-dispatch deferral，不改变 approval/Verifier/merge 行为：
   200 table row 上限；流式未闭合 code fence 仍按代码显示。GUI smoke 用真实
   transcript 验证了 heading、列表、代码块、表格、引用、链接和 citation 的
   排版。
+- Transcript display settings：Settings → General → Transcript 增加两个
+  独立选项：用户输入与 Agent 输出分别选择 Plain text / Markdown。默认保持
+  兼容行为（user plain、agent markdown），通过 `@AppStorage`
+  `verlinpark.transcript.userFormat` / `agentFormat` 持久化，打开中的
+  transcript 立即更新；纯文本保留原始字符和换行，Markdown 仍走 bounded
+  renderer。GUI smoke 验证了默认状态以及切到 user markdown + agent plain
+  后的即时变化，并已清理临时 smoke 的 UserDefaults。
 - R2b 仍未做 attention batching/prompt、显式 partial-delivery action/rescue
   和 governor 快照缓存。
 - 测试：R1 full workspace **4,546**；R2a 后 **4,551**；R2b core 后 **4,554**；
@@ -106,8 +113,8 @@ pre-dispatch deferral，不改变 approval/Verifier/merge 行为：
   `cargo clippy --workspace --all-targets -- -D warnings` 通过。targeted：
   27 auto-budget、368 agent、12 resource、2 project-policy/rebuild、2 protocol
   stop-policy、434 store、52 daemon、188 CLI、18 Swift
-  `ResourceGovernorTests`、5 Swift `MarkdownTranscriptTests`，full Swift
-  **633**（501 app + 132 helper）均通过。Rust full workspace 仍为
+  `ResourceGovernorTests`、6 Swift `MarkdownTranscriptTests`，full Swift
+  **634**（502 app + 132 helper）均通过。Rust full workspace 仍为
   **4,570 passed / 0 failed / 6 ignored**（本轮仅改 macOS 客户端）。宿主机
   `syspolicyd`/XProtect spin 已单独调查并记录在
   `HOST_SYSPOLICYD_INVESTIGATION.md`，不是仓库 bug。

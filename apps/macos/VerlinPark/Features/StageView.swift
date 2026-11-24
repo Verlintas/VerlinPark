@@ -1334,12 +1334,30 @@ private struct ForkSessionSheet: View {
 struct SessionChatView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @AppStorage(TranscriptDisplayPreference.userFormatKey)
+    private var userFormatRaw = TranscriptDisplayPreference.defaultUserFormat.rawValue
+    @AppStorage(TranscriptDisplayPreference.agentFormatKey)
+    private var agentFormatRaw = TranscriptDisplayPreference.defaultAgentFormat.rawValue
     let session: Session
     @State private var transcript: [TranscriptEntry] = []
     @State private var activeCitation: SourceCitation?
 
     private var entries: [TranscriptEntry] {
         transcript
+    }
+
+    private var userFormat: TranscriptDisplayFormat {
+        TranscriptDisplayPreference.format(
+            rawValue: userFormatRaw,
+            fallback: TranscriptDisplayPreference.defaultUserFormat
+        )
+    }
+
+    private var agentFormat: TranscriptDisplayFormat {
+        TranscriptDisplayPreference.format(
+            rawValue: agentFormatRaw,
+            fallback: TranscriptDisplayPreference.defaultAgentFormat
+        )
     }
 
     var body: some View {
@@ -1473,11 +1491,10 @@ struct SessionChatView: View {
         case let .user(_, text):
             HStack(alignment: .bottom, spacing: 8) {
                 Spacer(minLength: 80)
-                Text(text)
-                    .font(VPTheme.font(12.5))
-                    .foregroundStyle(VPTheme.textPrimary)
-                    .lineSpacing(2)
-                    .textSelection(.enabled)
+                TranscriptMessageText(text: text, format: userFormat)
+                    .environment(\.openURL, OpenURLAction { url in
+                        MarkdownLinkPolicy.allowsExternalOpen(url) ? .systemAction : .discarded
+                    })
                     .padding(.horizontal, 13)
                     .padding(.vertical, 10)
                     .background(
@@ -1569,22 +1586,26 @@ struct SessionChatView: View {
                 }
 
                 HStack(alignment: .bottom, spacing: 3) {
-                    MarkdownTranscriptView(text: text, citations: citations)
-                        .environment(\.openURL, OpenURLAction { url in
-                            guard url.scheme == "verlinpark",
-                                  url.host == "citation"
-                            else {
-                                return MarkdownLinkPolicy.allowsExternalOpen(url)
-                                    ? .systemAction
-                                    : .discarded
-                            }
-                            let key = url.lastPathComponent
-                            if let citation = citations.first(where: { $0.key == key }) {
-                                activeCitation = citation
-                                return .handled
-                            }
-                            return .discarded
-                        })
+                    TranscriptMessageText(
+                        text: text,
+                        format: agentFormat,
+                        citations: citations
+                    )
+                    .environment(\.openURL, OpenURLAction { url in
+                        guard url.scheme == "verlinpark",
+                              url.host == "citation"
+                        else {
+                            return MarkdownLinkPolicy.allowsExternalOpen(url)
+                                ? .systemAction
+                                : .discarded
+                        }
+                        let key = url.lastPathComponent
+                        if let citation = citations.first(where: { $0.key == key }) {
+                            activeCitation = citation
+                            return .handled
+                        }
+                        return .discarded
+                    })
                     if streaming {
                         VPStreamingCaret(tint: VPTheme.accent)
                     }

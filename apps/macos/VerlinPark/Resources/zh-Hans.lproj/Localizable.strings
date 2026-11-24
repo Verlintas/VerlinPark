@@ -47,6 +47,16 @@
 "Notification" = "通知";
 "Interface language" = "界面语言";
 "Interface language and the workspace appearance." = "界面语言与工作区外观。";
+"Transcript" = "对话记录";
+"User input" = "用户输入";
+"Agent output" = "智能体输出";
+"Plain text" = "纯文本";
+"Markdown" = "Markdown";
+"Exact characters and line breaks" = "保留原始字符与换行";
+"Headings, lists, code, links, and tables" = "标题、列表、代码、链接与表格";
+"How your messages appear in the Stage transcript." = "你的消息在 Stage 对话记录中的显示方式。";
+"How Leader and delegated-agent messages appear." = "Leader 与委派智能体消息的显示方式。";
+"Display-only preference. Plain text preserves exact characters and line breaks; Markdown is bounded and never executes HTML. Changes apply to the open transcript immediately." = "仅影响显示。纯文本保留原始字符与换行；Markdown 渲染有边界且不会执行 HTML。更改会立即应用到当前对话记录。";
 "Language changes apply immediately. Daemon output and long technical provider messages may remain in English." = "语言切换立即生效。daemon 输出和较长的模型服务技术信息可能仍为英文。";
 "Appearance" = "外观";
 "Black crystal" = "黑晶玻璃";
