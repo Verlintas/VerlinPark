@@ -227,7 +227,8 @@ pre-dispatch deferral，不改变 approval/Verifier/merge 行为：
   rescue grant 和所有 state-changing 操作仍走 fresh 路径；lean turn governor
   不使用该 cache。这样大 worktree 的 `git status` 只在显式资源视图重复调用时
   被复用，不会在 turn boundary 引入陈旧 readiness。
-- R2b 已完成；automatic task-envelope reallocation 按 ADR 归入 R3。
+- R2b 已完成；automatic task-envelope reallocation 按 ADR 归入 R3（后续 R3b
+  实现为 opt-in runtime-only overlay，persisted plan reallocation 仍未完成）。
 - 测试：R1 full workspace **4,546**；R2a 后 **4,551**；R2b core 后 **4,554**；
   项目 RunPolicy 后 **4,559**；R2b final（lean turn/cost-time/UI）后
   **4,570**；attention batch prompt 后 **4,571**；explicit partial delivery
