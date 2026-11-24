@@ -1,6 +1,6 @@
 # Run Contract and Resource Governor plan
 
-- Status: Accepted; P0/R1/R2a/R2b core implemented (lean turn-boundary pause, child Auto request-fit incl. cost/time, project RunPolicy, attention batch prompt, explicit partial delivery, macOS top-up/pause/project policy); R2b rescue/reallocation, governor snapshot caching, and R3/R4 open
+- Status: Accepted; P0/R1/R2a/R2b core implemented (lean turn-boundary pause, child Auto request-fit incl. cost/time, project RunPolicy, attention batch prompt, explicit partial delivery, rescue reserve + allocation preview, macOS top-up/pause/project policy); R2b automatic envelope reallocation, governor snapshot caching, and R3/R4 open
 - Date: 2026-11-24
 - Owner: Verlintas
 - Scope: V1 single-project coding
@@ -433,9 +433,9 @@ Phase R2b (implemented core):
 - Lean true turn-boundary pause/wait (no readiness/git status on the run path),
   Auto Budget token request-fit for every role plus cost/time fit for children.
 - macOS top-up/readiness, project policy editor, event-derived pause banner,
-  a bounded attention batch prompt with Inbox/Policy actions, and an explicit
-  partial-delivery record sheet.
-- Open: rescue/reallocation, governor snapshot caching.
+  a bounded attention batch prompt with Inbox/Policy actions, an explicit
+  partial-delivery record sheet, and a rescue-reserve confirmation surface.
+- Open: automatic envelope reallocation, governor snapshot caching.
 
 ### 13.2 CLI
 
@@ -568,18 +568,33 @@ Implemented:
   with typed `DELIVERY_*` codes. The record never commits, merges, approves,
   completes, resumes, changes budgets/capacity, or bypasses the Verifier/
   Integrator; it survives export/import and a newer record wins.
+- Rescue reserve + allocation preview: `session.rescue.status` reports
+  daemon-validated eligibility, reserve headroom, near-completion and looping
+  candidates, and bounded recommendations. `session.rescue` records a
+  short-lived (30 minute) event-only grant for a fixed-budget, clean
+  near-completion session with `no_progress_turns == 0`; running/queued/
+  imported/dirty/blocked/looping/auto/unlimited/no-headroom sessions are refused
+  with typed `RESCUE_*` codes. At the next non-pausing turn boundary the
+  governor releases only the completion-reserve ratio (hard caps, attention,
+  context, approvals, Verifier, and Integrator remain authoritative) and appends
+  one `session.resource.rescue.used` receipt. CLI `rescue-status`/`rescue` and
+  the Stage confirmation sheet surface it. The allocation preview's
+  reallocation recommendations are advisory only; no task envelope is mutated
+  automatically.
 - Readiness-blocked remains a dispatch gate, not a turn pause (avoids
   deadlocking approval/effect flows in an active run).
 
 Remaining:
 
-- Rescue/reallocation for near-completion work.
+- Automatic envelope reallocation (reduce exploration/low-value work and
+  reallocate budgets); the current preview only recommends it.
 - Governor snapshot caching for large worktrees/plans.
 
 ### R3 — Allocate (next)
 
-- Pre-dispatch feasibility, per-task envelopes, reallocation/rescue, p50/p90
-  from history, diagnosis/metareasoning, replan recommendations.
+- Pre-dispatch feasibility, per-task envelopes, automatic envelope
+  reallocation, p50/p90 from history, diagnosis/metareasoning, replan
+  recommendations.
 - Attention/trust calibration recommendations.
 
 ### R4 — Deliver (later)
@@ -640,6 +655,7 @@ Implemented **P0 + R1 + R2a + R2b core**:
   pause banner;
 - bounded attention batch prompt with approval Inbox and policy actions;
 - explicit partial-delivery record with RPC/CLI/Stage UI;
+- rescue reserve grant + read-only allocation preview with RPC/CLI/Stage UI;
 - ledger/docs updated with the multi-resource model.
 
-Next: rescue/reallocation, governor snapshot caching, then R3/R4.
+Next: automatic envelope reallocation, governor snapshot caching, then R3/R4.

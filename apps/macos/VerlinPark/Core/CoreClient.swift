@@ -1481,6 +1481,35 @@ actor CoreClient {
             .decode(TopUpSessionResourcesResult.self)
     }
 
+    /// Read-only eligibility/status for the completion-reserve rescue. `active`
+    /// and `eligible` are daemon authority; this client never infers either.
+    func rescueStatus(sessionID: String) async throws -> RescueStatusView {
+        try await request(
+            method: "session.rescue.status",
+            params: ["session_id": .string(sessionID)]
+        )
+        .decode(RescueStatusView.self)
+    }
+
+    /// One explicit rescue grant. `confirm` is always true and the daemon
+    /// revalidates eligibility. This never adds budget, removes a cap, or
+    /// resumes the session automatically.
+    func grantRescue(
+        sessionID: String,
+        reason: String?,
+        recordedBy: String?
+    ) async throws -> RescueResultView {
+        var params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "confirm": .bool(true),
+        ]
+        params["reason"] = RescueGrantView.normalizedReason(reason).map { .string($0) } ?? .null
+        params["recorded_by"] =
+            RescueGrantView.normalizedRecordedBy(recordedBy).map { .string($0) } ?? .null
+        return try await request(method: "session.rescue", params: params)
+            .decode(RescueResultView.self)
+    }
+
     func runContract(sessionID: String) async throws -> RunContractView {
         try await request(
             method: "session.run_contract.get",

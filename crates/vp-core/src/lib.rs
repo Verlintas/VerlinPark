@@ -218,6 +218,10 @@ pub use engine::leases::{ComputerLeaseGuard, RuntimeLeaseGuard, SessionLease};
 // typed error and its codes.
 pub use engine::delivery::{PartialDeliveryError, partial_delivery_codes};
 
+// Typed rescue failures carry a stable code for the daemon's RPC mapper. The
+// grant/receipt rows are event-only; the type itself lives in the protocol.
+pub use vp_protocol::types::{RescueError, rescue_codes};
+
 // Shared free helpers moved into `engine::support`; re-exported so existing
 // `crate::helper` paths used by sibling modules and tests keep resolving.
 pub(crate) use engine::support::*;

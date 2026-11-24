@@ -67,6 +67,24 @@ pub(super) async fn handle(
                 Err(response) => response_with_id(id, response),
             }
         }
+        "session.rescue.status" => {
+            match parse_params::<vp_protocol::types::RescueStatusParams>(request.params) {
+                Ok(params) => match state.engine.rescue_status(&params.session_id).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "session.rescue" => {
+            match parse_params::<vp_protocol::types::RescueParams>(request.params) {
+                Ok(params) => match state.engine.grant_rescue(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => rescue_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "session.run_contract.get" => {
             match parse_params::<vp_protocol::types::SessionRunContractParams>(request.params) {
                 Ok(params) => match state.engine.run_contract_view(&params.session_id).await {
@@ -1242,6 +1260,22 @@ fn partial_delivery_error(id: Option<serde_json::Value>, error: anyhow::Error) -
     internal_error(id, error)
 }
 
+/// Rescue failures carry a stable `RESCUE_*` code in `data.code` and map to
+/// `INVALID_PARAMS`; unexpected store/internal failures keep `INTERNAL_ERROR`.
+fn rescue_error(id: Option<serde_json::Value>, error: anyhow::Error) -> RpcResponse {
+    if let Some(typed) = error.downcast_ref::<vp_core::RescueError>() {
+        return RpcResponse::error(
+            id,
+            RpcError::with_data(
+                codes::INVALID_PARAMS,
+                typed.message.clone(),
+                json!({"code": typed.code}),
+            ),
+        );
+    }
+    internal_error(id, error)
+}
+
 #[cfg(test)]
 mod partial_delivery_rpc_tests {
     use super::*;
@@ -1296,9 +1330,7 @@ mod partial_delivery_rpc_tests {
             .error
             .unwrap_or_else(|| panic!("{method} unexpectedly succeeded"))
     }
-
-    #[tokio::test]
-    async fn delivery_rpcs_record_read_and_reject_unconfirmed_partial_delivery() {
+    async fn fixture() -> (TempDir, TempDir, AppState, vp_protocol::types::Session) {
         let repo = TempDir::new().unwrap();
         init_repo(repo.path());
         let data = TempDir::new().unwrap();
@@ -1306,28 +1338,104 @@ mod partial_delivery_rpc_tests {
         let project = store
             .add_project(repo.path().to_str().unwrap(), Some("delivery-rpc"))
             .unwrap();
-        let session = store
-            .create_session(&project.id, "partial delivery rpc")
-            .unwrap();
+        let session = store.create_session(&project.id, "rpc").unwrap();
         let engine = Engine::new(store);
         let session = engine.ensure_session_worktree(&session.id).await.unwrap();
         engine
             .store()
             .update_session_status(&session.id, "idle")
             .unwrap();
-        let worktree = session.worktree.as_deref().expect("session worktree");
-        std::fs::create_dir_all(Path::new(worktree).join("src")).unwrap();
-        std::fs::write(Path::new(worktree).join("src/lib.rs"), "pub fn a() {}\n").unwrap();
         let state = AppState {
             engine: engine.clone(),
-            agent: AgentService::from_env(engine.clone()),
+            agent: AgentService::from_env(engine),
             token: Arc::new("test-token".to_string()),
             data_dir: data.path().to_path_buf(),
             started_at: now_rfc3339(),
             started: Instant::now(),
             pid: std::process::id(),
         };
-
+        (data, repo, state, session)
+    }
+    fn commit_worktree(session: &vp_protocol::types::Session) {
+        let worktree = session.worktree.as_deref().expect("session worktree");
+        std::fs::create_dir_all(Path::new(worktree).join("src")).unwrap();
+        std::fs::write(Path::new(worktree).join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        for args in [
+            vec!["add", "-A"],
+            vec!["commit", "-q", "-m", "near completion"],
+        ] {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(worktree)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+    }
+    #[tokio::test]
+    async fn rescue_rpcs_preview_grant_and_require_confirmation() {
+        let (_data, _repo, state, session) = fixture().await;
+        state
+            .engine
+            .set_session_budget(vp_protocol::types::SetSessionBudgetParams {
+                session_id: session.id.clone(),
+                mode: Some(vp_protocol::types::BudgetMode::Fixed),
+                token_budget: Some(10_000),
+                ..vp_protocol::types::SetSessionBudgetParams::default()
+            })
+            .await
+            .unwrap();
+        commit_worktree(&session);
+        let status = call(
+            &state,
+            "session.rescue.status",
+            json!({"session_id": session.id}),
+        )
+        .await;
+        let status: vp_protocol::types::RescueStatus = serde_json::from_value(status).unwrap();
+        assert!(status.eligible, "{status:?}");
+        assert_eq!(status.reason, "eligible");
+        assert_eq!(status.readiness.level, "committed");
+        assert_eq!(status.near_completion[0].kind, "session");
+        assert_eq!(status.reserve.remaining_tokens, Some(10_000));
+        let unconfirmed =
+            call_error(&state, "session.rescue", json!({"session_id": session.id})).await;
+        assert_eq!(unconfirmed.code, codes::INVALID_PARAMS);
+        assert_eq!(
+            unconfirmed.data.expect("typed rescue error")["code"],
+            "RESCUE_CONFIRM_REQUIRED"
+        );
+        let granted = call(
+            &state,
+            "session.rescue",
+            json!({"session_id": session.id, "recorded_by": "operator", "confirm": true}),
+        )
+        .await;
+        let granted: vp_protocol::types::RescueResult = serde_json::from_value(granted).unwrap();
+        assert!(granted.grant.id.starts_with("rs-"));
+        assert_eq!(granted.grant.schema, "verlinpark.rescue_grant/v1");
+        assert!(granted.status.active);
+        assert_eq!(granted.status.reason, "active_grant");
+        let active = call(
+            &state,
+            "session.rescue.status",
+            json!({"session_id": session.id}),
+        )
+        .await;
+        let active: vp_protocol::types::RescueStatus = serde_json::from_value(active).unwrap();
+        assert!(active.active);
+        assert_eq!(
+            active.grant.as_ref().map(|grant| grant.id.as_str()),
+            Some(granted.grant.id.as_str())
+        );
+    }
+    #[tokio::test]
+    async fn delivery_rpcs_record_read_and_reject_unconfirmed_partial_delivery() {
+        let (_data, _repo, state, session) = fixture().await;
+        let worktree = session.worktree.as_deref().expect("session worktree");
+        std::fs::create_dir_all(Path::new(worktree).join("src")).unwrap();
+        std::fs::write(Path::new(worktree).join("src/lib.rs"), "pub fn a() {}\n").unwrap();
         let before = call(
             &state,
             "session.delivery",

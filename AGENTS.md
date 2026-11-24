@@ -6,7 +6,7 @@ This file is for coding agents working in this repository. Read it before changi
 
 - [docs/V1_FINAL_PLAN.md](docs/V1_FINAL_PLAN.md) — current V1 single-project coding scope, acceptance scenarios, defect gates, and live-validation update
 - [docs/V1_READINESS_LEDGER.md](docs/V1_READINESS_LEDGER.md) — current V1 findings/evidence ledger; open items must not be described as solved
-- [docs/RUN_CONTRACT_AND_RESOURCE_GOVERNOR_PLAN.md](docs/RUN_CONTRACT_AND_RESOURCE_GOVERNOR_PLAN.md) — Run Contract/anytime execution + multi-resource governor phases; P0/R1/R2a and R2b core (lean turn pause, token/cost/time child fit, project RunPolicy, attention batch prompt, explicit partial delivery, macOS operator surfaces) implemented, R2b remaining/R3/R4 open
+- [docs/RUN_CONTRACT_AND_RESOURCE_GOVERNOR_PLAN.md](docs/RUN_CONTRACT_AND_RESOURCE_GOVERNOR_PLAN.md) — Run Contract/anytime execution + multi-resource governor phases; P0/R1/R2a and R2b core (lean turn pause, token/cost/time child fit, project RunPolicy, attention batch prompt, explicit partial delivery, rescue reserve/allocation preview, macOS operator surfaces) implemented, R2b remaining/R3/R4 open
 - [docs/PLAN.md](docs/PLAN.md) — product direction, scope, milestones
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — target runtime/protocol invariants
 - [docs/DECISIONS.md](docs/DECISIONS.md) — accepted ADRs

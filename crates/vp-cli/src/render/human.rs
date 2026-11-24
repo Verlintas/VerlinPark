@@ -9,6 +9,7 @@ mod operator;
 mod orchestration;
 mod programs;
 mod projects;
+mod rescue;
 mod resources;
 mod sessions;
 mod sources;
@@ -109,6 +110,9 @@ pub(crate) fn print_human_for(hint: Option<&str>, value: &Value) {
         return;
     }
     if delivery::print(value) {
+        return;
+    }
+    if rescue::print(value) {
         return;
     }
     if resources::print(value) {

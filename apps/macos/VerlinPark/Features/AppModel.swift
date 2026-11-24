@@ -186,6 +186,12 @@ final class AppModel {
     var sessionResourceTopUpError: String?
     var sessionResourceTopUpNotice: String?
     var sessionResourceTopUpResult: TopUpSessionResourcesResult?
+    // Read-only completion-reserve rescue status. `active`/`eligible` are only
+    // ever the daemon's word; the grant action is explicit and one-shot.
+    var sessionRescue: RescueStatusView?
+    var rescueError: String?
+    var rescueBusy = false
+    var rescueNotice: String?
     // Explicit partial-delivery record for the selected session. Only daemon
     // responses populate this state; a partial record never means complete,
     // merged, approved, or resumable.
@@ -946,6 +952,36 @@ final class AppModel {
         return selectedSessionDelivery?.partialRecord(for: sessionID)
     }
 
+    /// The read-only rescue status for the selected session. A status for a
+    /// different session is never shown as current, and no grant is inferred
+    /// from local state.
+    var selectedSessionRescue: RescueStatusView? {
+        guard let sessionID = selectedSessionID, let sessionRescue,
+              sessionRescue.sessionID == sessionID
+        else {
+            return nil
+        }
+        return sessionRescue
+    }
+
+    /// A disabled rescue action must explain itself. This mirrors only the
+    /// client-side proof; daemon eligibility remains authoritative for every
+    /// allowed request.
+    var rescueActionBlockReason: String? {
+        RescueActionAvailability.blockReason(
+            sessionID: selectedSessionID,
+            sessionStatus: selectedSession?.status,
+            daemonConnected: connection == .connected,
+            busy: rescueBusy,
+            rescue: selectedSessionRescue,
+            error: rescueError
+        )
+    }
+
+    var canGrantRescue: Bool {
+        rescueActionBlockReason == nil
+    }
+
     /// A disabled action must explain itself. This mirrors only the client-side
     /// proof; the daemon remains authoritative for every eligibility rule.
     var partialDeliveryActionBlockReason: String? {
@@ -1136,6 +1172,10 @@ final class AppModel {
         partialDeliveryBusy = false
         partialDeliveryError = nil
         partialDeliveryStatus = nil
+        sessionRescue = nil
+        rescueError = nil
+        rescueBusy = false
+        rescueNotice = nil
         resourcePauseBusy = false
         resourcePauseNotice = nil
         resourcePauseError = nil
@@ -1669,6 +1709,7 @@ final class AppModel {
             await loadSessionBudget()
             await loadSessionResources(silent: true)
             await loadSessionDelivery(silent: true)
+            await loadSessionRescue(silent: true)
             await loadCheckpoints()
             await loadLineage()
             await loadTodos()
@@ -2180,6 +2221,7 @@ final class AppModel {
             await loadSessionBudget(silent: true)
             await loadSessionResources(silent: true)
             await loadSessionDelivery(silent: true)
+            await loadSessionRescue(silent: true)
         } catch {
             guard isCurrent(sessionID: sessionID, generation: generation) else { return }
             resourcePauseError = BudgetValidationIssue.from(error).displayText
@@ -4868,6 +4910,112 @@ final class AppModel {
         } catch {
             guard isCurrent(sessionID: sessionID, generation: generation) else { return }
             sessionDeliveryError = BudgetValidationIssue.from(error).displayText
+        }
+    }
+
+    /// Read-only completion-reserve rescue status for the selected session.
+    /// Nothing is inferred when the RPC fails; the last daemon response is kept
+    /// visible but `rescueError` blocks the explicit grant until a refresh.
+    func loadSessionRescue(silent: Bool = false) async {
+        guard let sessionID = selectedSessionID else {
+            sessionRescue = nil
+            rescueError = nil
+            rescueBusy = false
+            rescueNotice = nil
+            return
+        }
+        let generation = selectionGeneration
+        if !silent {
+            rescueBusy = true
+        }
+        defer {
+            if isCurrent(sessionID: sessionID, generation: generation) {
+                rescueBusy = false
+            }
+        }
+        do {
+            let status = try await core.rescueStatus(sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            guard status.sessionID == sessionID else {
+                sessionRescue = nil
+                rescueError = BudgetValidationIssue(
+                    code: "INVALID_RESCUE_RESPONSE",
+                    message: "The daemon returned rescue state for a different session; no local state was changed."
+                ).displayText
+                return
+            }
+            sessionRescue = status
+            rescueError = nil
+            if !status.active {
+                rescueNotice = nil
+            }
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            rescueError = BudgetValidationIssue.from(error).displayText
+        }
+    }
+
+    /// One explicit completion-reserve rescue. The daemon must already report
+    /// this exact session eligible; the result is applied only while the same
+    /// session selection generation is current. It never tops up a budget,
+    /// removes a cap, changes routing, resumes, or bypasses verification.
+    @discardableResult
+    func grantRescue(reason: String? = nil) async -> Bool {
+        guard let sessionID = selectedSessionID else {
+            rescueError = BudgetValidationIssue(
+                code: "SESSION_REQUIRED",
+                message: "Select a session before releasing a completion reserve."
+            ).displayText
+            return false
+        }
+        if let blockReason = rescueActionBlockReason {
+            rescueError = blockReason
+            return false
+        }
+        guard selectedSessionRescue?.eligible == true else {
+            rescueError = "The daemon has not reported this session eligible for a rescue reserve."
+            return false
+        }
+        let generation = selectionGeneration
+        rescueBusy = true
+        rescueError = nil
+        rescueNotice = nil
+        defer {
+            if isCurrent(sessionID: sessionID, generation: generation) {
+                rescueBusy = false
+            }
+        }
+        do {
+            let result = try await core.grantRescue(
+                sessionID: sessionID,
+                reason: reason,
+                recordedBy: nil
+            )
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return false }
+            guard result.isConsistent(for: sessionID) else {
+                rescueError = BudgetValidationIssue(
+                    code: "INVALID_RESCUE_RESPONSE",
+                    message: "The daemon returned a rescue result for a different or unrecognized session; no local state was changed."
+                ).displayText
+                return false
+            }
+            sessionRescue = result.status
+            rescueError = nil
+            rescueNotice = result.operatorNotice
+            showToast(
+                result.status.active ? "Completion reserve released" : "Rescue grant recorded",
+                detail: result.operatorNotice,
+                kind: result.status.active ? .success : .warning
+            )
+            await loadSessionResources(silent: true)
+            await loadSessionDelivery(silent: true)
+            await loadSessionRescue(silent: true)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return false }
+            return true
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return false }
+            rescueError = BudgetValidationIssue.from(error).displayText
+            return false
         }
     }
 
@@ -11869,6 +12017,21 @@ final class AppModel {
             resourcePauseError = nil
             refreshSessionBudgetSoon()
             Task {
+                await self.loadSessionResources(silent: true)
+                await self.loadSessionDelivery(silent: true)
+                await self.loadSessionRescue(silent: true)
+            }
+        }
+
+        if event.sessionId == selectedSessionID,
+           [RescueStatusView.grantEventKind, RescueStatusView.usedEventKind].contains(event.type)
+        {
+            if event.type == RescueStatusView.usedEventKind {
+                rescueNotice = nil
+            }
+            rescueError = nil
+            Task {
+                await self.loadSessionRescue(silent: true)
                 await self.loadSessionResources(silent: true)
                 await self.loadSessionDelivery(silent: true)
             }

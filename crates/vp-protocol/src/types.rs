@@ -3872,6 +3872,174 @@ pub struct SessionDeliveryResult {
     pub readiness: ReadinessSnapshot,
 }
 
+/// Stable schema marker for [`RescueGrant`]. A rescue grant is an explicit,
+/// short-lived operator release of the completion reserve for near-completion
+/// work. It never changes budgets, approvals, capacity, verification, or merge
+/// authority.
+pub const RESCUE_SCHEMA: &str = "verlinpark.rescue_grant/v1";
+/// Schema marker for the one-shot consumption receipt of a rescue grant.
+pub const RESCUE_USED_SCHEMA: &str = "verlinpark.rescue_used/v1";
+pub const SESSION_RESCUE_EVENT: &str = "session.resource.rescue";
+pub const SESSION_RESCUE_USED_EVENT: &str = "session.resource.rescue.used";
+
+fn default_rescue_schema() -> String {
+    RESCUE_SCHEMA.to_string()
+}
+
+/// Event-only rescue grant. It names the readiness snapshot that justified it
+/// and expires quickly; it is not a budget top-up and cannot raise a hard cap.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RescueGrant {
+    #[serde(default = "default_rescue_schema")]
+    pub schema: String,
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub recorded_at: String,
+    #[serde(default)]
+    pub expires_at: String,
+    #[serde(default)]
+    pub recorded_by: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub readiness_level: String,
+    #[serde(default)]
+    pub latest_commit: Option<String>,
+    #[serde(default)]
+    pub no_progress_turns: u32,
+}
+
+/// One bounded near-completion or looping-work candidate shown by the rescue
+/// status. The detail is derived, bounded text; file contents never enter it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RescueCandidate {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub detail: String,
+    #[serde(default)]
+    pub commit: Option<String>,
+}
+
+/// Remaining envelope and hard caps for the allocation preview.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RescueReserve {
+    #[serde(default)]
+    pub completion_reserve_ratio: f64,
+    #[serde(default)]
+    pub remaining_tokens: Option<u64>,
+    #[serde(default)]
+    pub remaining_cost_usd: Option<f64>,
+    #[serde(default)]
+    pub remaining_secs: Option<u64>,
+    #[serde(default)]
+    pub hard_token_cap: Option<u64>,
+    #[serde(default)]
+    pub hard_cost_cap_usd: Option<f64>,
+    #[serde(default)]
+    pub hard_wall_clock_secs: Option<u64>,
+}
+
+/// Read-only rescue/allocation preview. `eligible` means a new grant would be
+/// accepted now; `active` means a usable grant already exists.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RescueStatus {
+    pub session_id: String,
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub grant: Option<RescueGrant>,
+    #[serde(default)]
+    pub used_at: Option<String>,
+    #[serde(default)]
+    pub used_grant_id: Option<String>,
+    #[serde(default)]
+    pub eligible: bool,
+    #[serde(default)]
+    pub reason: String,
+    pub readiness: ReadinessSnapshot,
+    #[serde(default)]
+    pub no_progress_turns: u32,
+    #[serde(default)]
+    pub near_completion: Vec<RescueCandidate>,
+    #[serde(default)]
+    pub looping: Vec<RescueCandidate>,
+    #[serde(default)]
+    pub recommendations: Vec<String>,
+    #[serde(default)]
+    pub reserve: RescueReserve,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RescueParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub recorded_by: Option<String>,
+    /// Explicit operator confirmation. The engine rejects a missing or false
+    /// value with `RESCUE_CONFIRM_REQUIRED`.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RescueStatusParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RescueResult {
+    pub session_id: String,
+    pub grant: RescueGrant,
+    pub status: RescueStatus,
+}
+
+/// Stable typed codes for the rescue operation. The daemon maps them to
+/// `INVALID_PARAMS` without parsing message text.
+pub mod rescue_codes {
+    pub const RESCUE_CONFIRM_REQUIRED: &str = "RESCUE_CONFIRM_REQUIRED";
+    pub const RESCUE_IMPORTED: &str = "RESCUE_IMPORTED";
+    pub const RESCUE_SESSION_ACTIVE: &str = "RESCUE_SESSION_ACTIVE";
+    pub const RESCUE_ACTIVE: &str = "RESCUE_ACTIVE";
+    pub const RESCUE_NOT_ELIGIBLE: &str = "RESCUE_NOT_ELIGIBLE";
+}
+
+/// Typed rescue failure. It carries only a stable code and a bounded message;
+/// no file content, prompt text, or secret enters it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RescueError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl RescueError {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for RescueError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for RescueError {}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionRunContractParams {
     pub session_id: String,
@@ -27608,5 +27776,125 @@ mod partial_delivery_protocol_tests {
         let decoded: PartialDeliveryResult =
             serde_json::from_value(serde_json::to_value(&partial).unwrap()).unwrap();
         assert_eq!(decoded, partial);
+    }
+}
+
+#[cfg(test)]
+mod rescue_protocol_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn readiness() -> ReadinessSnapshot {
+        ReadinessSnapshot {
+            session_id: "ses-1".into(),
+            level: "committed".into(),
+            shippable: false,
+            mergeable: false,
+            latest_commit: Some("0123456789abcdef".into()),
+            latest_test: None,
+            verifier: None,
+            merge: None,
+            changed_paths: Vec::new(),
+            remaining_work: vec!["T1: pending".into()],
+            blockers: Vec::new(),
+            partial_delivery: None,
+            generated_at: "2026-11-24T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn rescue_grant_defaults_and_round_trips() {
+        let minimal: RescueGrant = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(minimal.schema, RESCUE_SCHEMA);
+        assert!(minimal.id.is_empty());
+        assert!(minimal.latest_commit.is_none());
+        assert_eq!(minimal.no_progress_turns, 0);
+
+        let grant = RescueGrant {
+            schema: RESCUE_SCHEMA.into(),
+            id: "rs-1".into(),
+            session_id: "ses-1".into(),
+            project_id: "prj-1".into(),
+            recorded_at: "2026-11-24T00:00:00Z".into(),
+            expires_at: "2026-11-24T00:30:00Z".into(),
+            recorded_by: "operator".into(),
+            reason: "reserve release".into(),
+            readiness_level: "committed".into(),
+            latest_commit: Some("0123456789abcdef".into()),
+            no_progress_turns: 0,
+        };
+        let encoded = serde_json::to_value(&grant).unwrap();
+        assert_eq!(encoded["schema"], RESCUE_SCHEMA);
+        let decoded: RescueGrant = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, grant);
+    }
+
+    #[test]
+    fn rescue_params_and_status_params_default_additively() {
+        let params: RescueParams = serde_json::from_value(json!({"session_id": "ses-1"})).unwrap();
+        assert_eq!(params.session_id, "ses-1");
+        assert!(params.reason.is_none());
+        assert!(params.recorded_by.is_none());
+        assert!(!params.confirm);
+
+        let status_params: RescueStatusParams =
+            serde_json::from_value(json!({"session_id": "ses-1"})).unwrap();
+        assert_eq!(status_params.session_id, "ses-1");
+
+        let status = RescueStatus {
+            session_id: "ses-1".into(),
+            active: false,
+            grant: None,
+            used_at: None,
+            used_grant_id: None,
+            eligible: true,
+            reason: "eligible".into(),
+            readiness: readiness(),
+            no_progress_turns: 0,
+            near_completion: vec![RescueCandidate {
+                kind: "session".into(),
+                id: "ses-1".into(),
+                status: "committed".into(),
+                detail: "latest commit awaiting verification".into(),
+                commit: Some("0123456789abcdef".into()),
+            }],
+            looping: Vec::new(),
+            recommendations: vec!["rescue_reserve".into()],
+            reserve: RescueReserve {
+                completion_reserve_ratio: 0.2,
+                remaining_tokens: Some(150),
+                remaining_cost_usd: None,
+                remaining_secs: None,
+                hard_token_cap: Some(1_000),
+                hard_cost_cap_usd: None,
+                hard_wall_clock_secs: None,
+            },
+            generated_at: "2026-11-24T00:00:00Z".into(),
+        };
+        let encoded = serde_json::to_value(&status).unwrap();
+        let decoded: RescueStatus = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, status);
+
+        let result = RescueResult {
+            session_id: "ses-1".into(),
+            grant: RescueGrant {
+                schema: RESCUE_SCHEMA.into(),
+                id: "rs-1".into(),
+                session_id: "ses-1".into(),
+                ..RescueGrant::default()
+            },
+            status,
+        };
+        let decoded: RescueResult =
+            serde_json::from_value(serde_json::to_value(&result).unwrap()).unwrap();
+        assert_eq!(decoded, result);
+        assert_eq!(RESCUE_USED_SCHEMA, "verlinpark.rescue_used/v1");
+    }
+
+    #[test]
+    fn rescue_error_codes_are_stable() {
+        let error = RescueError::new(rescue_codes::RESCUE_ACTIVE, "already active");
+        assert_eq!(error.code, "RESCUE_ACTIVE");
+        assert_eq!(error.to_string(), "RESCUE_ACTIVE: already active");
     }
 }

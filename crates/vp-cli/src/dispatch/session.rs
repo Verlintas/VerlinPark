@@ -40,6 +40,28 @@ fn partial_delivery_params(
     }))
 }
 
+/// Build the `session.rescue` params. `--yes` is required locally so an
+/// accidental command cannot append a rescue grant before the RPC.
+fn rescue_params(
+    session: String,
+    reason: Option<String>,
+    recorded_by: Option<String>,
+    yes: bool,
+) -> Result<Value> {
+    if !yes {
+        return Err(typed_local_error(
+            vp_core::rescue_codes::RESCUE_CONFIRM_REQUIRED,
+            "granting a rescue requires --yes; it releases the completion reserve but does not change budgets, caps, approvals, or verification",
+        ));
+    }
+    Ok(json!({
+        "session_id": session,
+        "reason": reason,
+        "recorded_by": recorded_by,
+        "confirm": true,
+    }))
+}
+
 fn validate_positive_tokens(label: &str, value: Option<u64>, cap: bool) -> Result<()> {
     if value == Some(0) {
         let code = if cap {
@@ -654,6 +676,23 @@ pub(super) async fn dispatch(
             )
             .await?
         }
+        Command::RescueStatus { session } => {
+            rpc(
+                &discovery,
+                "session.rescue.status",
+                json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::Rescue {
+            session,
+            reason,
+            recorded_by,
+            yes,
+        } => {
+            let params = rescue_params(session, reason, recorded_by, yes)?;
+            rpc(&discovery, "session.rescue", params).await?
+        }
         Command::PartialDelivery {
             session,
             summary,
@@ -1116,6 +1155,64 @@ mod tests {
         assert_eq!(
             typed.typed_code.as_deref(),
             Some(vp_core::partial_delivery_codes::DELIVERY_CONFIRM_REQUIRED)
+        );
+    }
+
+    #[test]
+    fn rescue_status_and_rescue_flags_parse_and_require_yes() {
+        use clap::Parser;
+
+        let cli = crate::cli::Cli::try_parse_from(["vp", "rescue-status", "ses-1"]).unwrap();
+        match cli.command {
+            Command::RescueStatus { session } => assert_eq!(session, "ses-1"),
+            other => panic!("expected rescue-status command, got {other:?}"),
+        }
+
+        let cli = crate::cli::Cli::try_parse_from([
+            "vp",
+            "rescue",
+            "ses-1",
+            "--reason",
+            "finish the verified merge",
+            "--recorded-by",
+            "operator",
+            "--yes",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Rescue {
+                session,
+                reason,
+                recorded_by,
+                yes,
+            } => {
+                assert_eq!(session, "ses-1");
+                assert_eq!(reason.as_deref(), Some("finish the verified merge"));
+                assert_eq!(recorded_by.as_deref(), Some("operator"));
+                assert!(yes);
+                let params = rescue_params(session, reason, recorded_by, yes).unwrap();
+                let decoded: vp_protocol::types::RescueParams =
+                    serde_json::from_value(params).unwrap();
+                assert_eq!(decoded.session_id, "ses-1");
+                assert!(decoded.confirm);
+                assert_eq!(decoded.reason.as_deref(), Some("finish the verified merge"));
+            }
+            other => panic!("expected rescue command, got {other:?}"),
+        }
+
+        let error = rescue_params(
+            "ses-1".into(),
+            Some("finish the verified merge".into()),
+            None,
+            false,
+        )
+        .expect_err("missing --yes must fail before the RPC");
+        let typed = error
+            .downcast_ref::<crate::rpc::CliRpcError>()
+            .expect("typed local CLI error");
+        assert_eq!(
+            typed.typed_code.as_deref(),
+            Some(vp_core::rescue_codes::RESCUE_CONFIRM_REQUIRED)
         );
     }
 }

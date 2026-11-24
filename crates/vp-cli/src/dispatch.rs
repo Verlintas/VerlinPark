@@ -305,6 +305,8 @@ pub(crate) async fn run_command(
         | Command::Resources { .. }
         | Command::Readiness { .. }
         | Command::Delivery { .. }
+        | Command::RescueStatus { .. }
+        | Command::Rescue { .. }
         | Command::PartialDelivery { .. }
         | Command::RunContract { .. }
         | Command::RunContractSet { .. }

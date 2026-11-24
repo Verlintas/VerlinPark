@@ -1571,6 +1571,620 @@ struct TopUpSessionResourcesResult: Codable, Sendable, Equatable {
     }
 }
 
+// MARK: - Completion-reserve rescue
+
+/// Daemon-issued one-shot rescue grant. The grant record alone is never
+/// "active"; only `RescueStatusView.active` from the daemon may say that.
+/// Display strings are bounded and unknown additive fields are ignored.
+struct RescueGrantView: Codable, Sendable, Equatable, Identifiable {
+    static let schema = "verlinpark.rescue_grant/v1"
+    static let reasonCharacterLimit = 240
+    static let recordedByCharacterLimit = 120
+
+    let schema: String
+    let id: String
+    let sessionID: String
+    let projectID: String
+    let recordedAt: String
+    let expiresAt: String
+    let recordedBy: String?
+    let reason: String?
+    let readinessLevel: String
+    let latestCommit: String?
+    let noProgressTurns: UInt32
+
+    enum CodingKeys: String, CodingKey {
+        case schema, id, reason
+        case sessionID = "session_id"
+        case projectID = "project_id"
+        case recordedAt = "recorded_at"
+        case expiresAt = "expires_at"
+        case recordedBy = "recorded_by"
+        case readinessLevel = "readiness_level"
+        case latestCommit = "latest_commit"
+        case noProgressTurns = "no_progress_turns"
+    }
+
+    init(
+        schema: String = RescueGrantView.schema,
+        id: String,
+        sessionID: String = "",
+        projectID: String = "",
+        recordedAt: String = "",
+        expiresAt: String = "",
+        recordedBy: String? = nil,
+        reason: String? = nil,
+        readinessLevel: String = "",
+        latestCommit: String? = nil,
+        noProgressTurns: UInt32 = 0
+    ) {
+        self.schema = schema
+        self.id = id
+        self.sessionID = sessionID
+        self.projectID = projectID
+        self.recordedAt = recordedAt
+        self.expiresAt = expiresAt
+        self.recordedBy = recordedBy
+        self.reason = reason
+        self.readinessLevel = readinessLevel
+        self.latestCommit = latestCommit
+        self.noProgressTurns = noProgressTurns
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schema =
+            try container.decodeIfPresent(String.self, forKey: .schema)
+                ?? RescueGrantView.schema
+        id = try container.decodeIfPresent(String.self, forKey: .id) ?? ""
+        sessionID = try container.decodeIfPresent(String.self, forKey: .sessionID) ?? ""
+        projectID = try container.decodeIfPresent(String.self, forKey: .projectID) ?? ""
+        recordedAt = try container.decodeIfPresent(String.self, forKey: .recordedAt) ?? ""
+        expiresAt = try container.decodeIfPresent(String.self, forKey: .expiresAt) ?? ""
+        recordedBy = try container.decodeIfPresent(String.self, forKey: .recordedBy)
+        reason = try container.decodeIfPresent(String.self, forKey: .reason)
+        readinessLevel =
+            try container.decodeIfPresent(String.self, forKey: .readinessLevel) ?? ""
+        latestCommit = try container.decodeIfPresent(String.self, forKey: .latestCommit)
+        noProgressTurns =
+            try container.decodeIfPresent(UInt32.self, forKey: .noProgressTurns) ?? 0
+    }
+
+    var isRecognized: Bool {
+        schema == Self.schema
+    }
+
+    var shortID: String {
+        guard !id.isEmpty else { return "unknown" }
+        return String(id.prefix(12))
+    }
+
+    var shortCommit: String? {
+        guard let latestCommit, !latestCommit.isEmpty else { return nil }
+        return String(latestCommit.prefix(12))
+    }
+
+    var recordedAtLabel: String {
+        Self.bounded(recordedAt, limit: 40) ?? "time not reported"
+    }
+
+    var expiresAtLabel: String {
+        Self.bounded(expiresAt, limit: 40) ?? "expiry not reported"
+    }
+
+    var recordedByLabel: String? {
+        Self.bounded(recordedBy, limit: Self.recordedByCharacterLimit)
+    }
+
+    var reasonLabel: String? {
+        Self.bounded(reason, limit: Self.reasonCharacterLimit)
+    }
+
+    var noProgressLabel: String {
+        noProgressTurns == 1 ? "1 no-progress turn" : "\(noProgressTurns) no-progress turns"
+    }
+
+    var readinessLabel: String {
+        let value = readinessLevel.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch value {
+        case "none": return "NONE"
+        case "dirty": return "DIRTY"
+        case "committed": return "COMMITTED"
+        case "tests_passed": return "TESTS PASSED"
+        case "verified": return "VERIFIED"
+        case "merged": return "MERGED"
+        case "partial": return "PARTIAL"
+        case "blocked": return "BLOCKED"
+        case "": return "NOT REPORTED"
+        default: return String(value.uppercased().prefix(24))
+        }
+    }
+
+    /// Trims and client-bounds an optional operator audit reason. The daemon
+    /// repeats validation; an empty value becomes null on the wire.
+    static func normalizedReason(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return String(trimmed.prefix(reasonCharacterLimit))
+    }
+
+    static func normalizedRecordedBy(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return String(trimmed.prefix(recordedByCharacterLimit))
+    }
+
+    private static func bounded(_ raw: String?, limit: Int) -> String? {
+        guard let raw else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return String(trimmed.prefix(max(0, limit)))
+    }
+}
+
+/// One daemon-reported near-completion or looping candidate. These are
+/// evidence for the operator; they are not reservations or scheduler actions.
+struct RescueCandidateView: Codable, Sendable, Equatable, Identifiable {
+    let kind: String
+    let id: String
+    let status: String
+    let detail: String
+    let commit: String?
+
+    enum CodingKeys: String, CodingKey {
+        case kind, id, status, detail, commit
+    }
+
+    init(
+        kind: String,
+        id: String,
+        status: String = "",
+        detail: String = "",
+        commit: String? = nil
+    ) {
+        self.kind = kind
+        self.id = id
+        self.status = status
+        self.detail = detail
+        self.commit = commit
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try container.decodeIfPresent(String.self, forKey: .kind) ?? ""
+        id = try container.decodeIfPresent(String.self, forKey: .id) ?? ""
+        status = try container.decodeIfPresent(String.self, forKey: .status) ?? ""
+        detail = try container.decodeIfPresent(String.self, forKey: .detail) ?? ""
+        commit = try container.decodeIfPresent(String.self, forKey: .commit)
+    }
+
+    var kindLabel: String {
+        Self.bounded(kind, limit: 24)?.uppercased() ?? "UNKNOWN"
+    }
+
+    var idLabel: String {
+        Self.bounded(id, limit: 24) ?? "unknown"
+    }
+
+    var statusLabel: String {
+        Self.bounded(status, limit: 32)?.uppercased() ?? "UNKNOWN"
+    }
+
+    var detailLabel: String? {
+        Self.bounded(detail, limit: 200)
+    }
+
+    var shortCommit: String? {
+        guard let commit, !commit.isEmpty else { return nil }
+        return String(commit.prefix(12))
+    }
+
+    var displayLabel: String {
+        "\(kindLabel) \(idLabel) · \(statusLabel)"
+    }
+
+    private static func bounded(_ raw: String?, limit: Int) -> String? {
+        guard let raw else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return String(trimmed.prefix(max(0, limit)))
+    }
+}
+
+/// Daemon-reported reserve headroom. Missing values stay nil; they are never
+/// displayed as a zero budget or an absent cap.
+struct RescueReserveView: Codable, Sendable, Equatable {
+    let completionReserveRatio: Double?
+    let remainingTokens: UInt64?
+    let remainingCostUSD: Double?
+    let remainingSecs: UInt64?
+    let hardTokenCap: UInt64?
+    let hardCostCapUSD: Double?
+    let hardWallClockSecs: UInt64?
+
+    enum CodingKeys: String, CodingKey {
+        case completionReserveRatio = "completion_reserve_ratio"
+        case remainingTokens = "remaining_tokens"
+        case remainingCostUSD = "remaining_cost_usd"
+        case remainingSecs = "remaining_secs"
+        case hardTokenCap = "hard_token_cap"
+        case hardCostCapUSD = "hard_cost_cap_usd"
+        case hardWallClockSecs = "hard_wall_clock_secs"
+    }
+
+    init(
+        completionReserveRatio: Double? = nil,
+        remainingTokens: UInt64? = nil,
+        remainingCostUSD: Double? = nil,
+        remainingSecs: UInt64? = nil,
+        hardTokenCap: UInt64? = nil,
+        hardCostCapUSD: Double? = nil,
+        hardWallClockSecs: UInt64? = nil
+    ) {
+        self.completionReserveRatio = completionReserveRatio
+        self.remainingTokens = remainingTokens
+        self.remainingCostUSD = remainingCostUSD
+        self.remainingSecs = remainingSecs
+        self.hardTokenCap = hardTokenCap
+        self.hardCostCapUSD = hardCostCapUSD
+        self.hardWallClockSecs = hardWallClockSecs
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        completionReserveRatio =
+            try container.decodeIfPresent(Double.self, forKey: .completionReserveRatio)
+        remainingTokens =
+            try container.decodeIfPresent(UInt64.self, forKey: .remainingTokens)
+        remainingCostUSD =
+            try container.decodeIfPresent(Double.self, forKey: .remainingCostUSD)
+        remainingSecs =
+            try container.decodeIfPresent(UInt64.self, forKey: .remainingSecs)
+        hardTokenCap =
+            try container.decodeIfPresent(UInt64.self, forKey: .hardTokenCap)
+        hardCostCapUSD =
+            try container.decodeIfPresent(Double.self, forKey: .hardCostCapUSD)
+        hardWallClockSecs =
+            try container.decodeIfPresent(UInt64.self, forKey: .hardWallClockSecs)
+    }
+
+    var completionReservePercentLabel: String {
+        guard let completionReserveRatio, completionReserveRatio.isFinite else {
+            return "not reported"
+        }
+        let percent = completionReserveRatio * 100
+        if percent.rounded() == percent {
+            return "\(Int(percent))%"
+        }
+        return String(format: "%.1f%%", percent)
+    }
+
+    var remainingLabel: String {
+        BudgetFormatting.combined(
+            tokens: remainingTokens,
+            cost: remainingCostUSD,
+            seconds: remainingSecs,
+            empty: "not reported"
+        )
+    }
+
+    var hardCapLabel: String {
+        BudgetFormatting.combined(
+            tokens: hardTokenCap,
+            cost: hardCostCapUSD,
+            seconds: hardWallClockSecs,
+            empty: "not reported"
+        )
+    }
+}
+
+/// Full `session.rescue.status` result. `active` and `eligible` are daemon
+/// authority only; this client never derives either from grant presence,
+/// readiness, or a local session status.
+struct RescueStatusView: Codable, Sendable, Equatable {
+    static let grantEventKind = "session.resource.rescue"
+    static let usedEventKind = "session.resource.rescue.used"
+    static let candidatePreviewLimit = 4
+    static let recommendationPreviewLimit = 4
+    static let recommendationCharacterLimit = 200
+
+    let sessionID: String
+    let active: Bool
+    let grant: RescueGrantView?
+    let usedAt: String?
+    let usedGrantID: String?
+    let eligible: Bool
+    let reason: String
+    let readiness: ReadinessSnapshotView
+    let noProgressTurns: UInt32
+    let nearCompletion: [RescueCandidateView]
+    let looping: [RescueCandidateView]
+    let recommendations: [String]
+    let reserve: RescueReserveView
+    let generatedAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case active, grant, eligible, reason, readiness, looping, recommendations, reserve
+        case sessionID = "session_id"
+        case usedAt = "used_at"
+        case usedGrantID = "used_grant_id"
+        case noProgressTurns = "no_progress_turns"
+        case nearCompletion = "near_completion"
+        case generatedAt = "generated_at"
+    }
+
+    init(
+        sessionID: String,
+        active: Bool = false,
+        grant: RescueGrantView? = nil,
+        usedAt: String? = nil,
+        usedGrantID: String? = nil,
+        eligible: Bool = false,
+        reason: String = "",
+        readiness: ReadinessSnapshotView,
+        noProgressTurns: UInt32 = 0,
+        nearCompletion: [RescueCandidateView] = [],
+        looping: [RescueCandidateView] = [],
+        recommendations: [String] = [],
+        reserve: RescueReserveView = RescueReserveView(),
+        generatedAt: String = ""
+    ) {
+        self.sessionID = sessionID
+        self.active = active
+        self.grant = grant
+        self.usedAt = usedAt
+        self.usedGrantID = usedGrantID
+        self.eligible = eligible
+        self.reason = reason
+        self.readiness = readiness
+        self.noProgressTurns = noProgressTurns
+        self.nearCompletion = nearCompletion
+        self.looping = looping
+        self.recommendations = recommendations
+        self.reserve = reserve
+        self.generatedAt = generatedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = try container.decodeIfPresent(String.self, forKey: .sessionID) ?? ""
+        active = try container.decodeIfPresent(Bool.self, forKey: .active) ?? false
+        grant = try container.decodeIfPresent(RescueGrantView.self, forKey: .grant)
+        usedAt = try container.decodeIfPresent(String.self, forKey: .usedAt)
+        usedGrantID = try container.decodeIfPresent(String.self, forKey: .usedGrantID)
+        eligible = try container.decodeIfPresent(Bool.self, forKey: .eligible) ?? false
+        reason = try container.decodeIfPresent(String.self, forKey: .reason) ?? ""
+        readiness = try container.decode(ReadinessSnapshotView.self, forKey: .readiness)
+        noProgressTurns =
+            try container.decodeIfPresent(UInt32.self, forKey: .noProgressTurns) ?? 0
+        nearCompletion =
+            try container.decodeIfPresent([RescueCandidateView].self, forKey: .nearCompletion)
+                ?? []
+        looping =
+            try container.decodeIfPresent([RescueCandidateView].self, forKey: .looping) ?? []
+        recommendations =
+            try container.decodeIfPresent([String].self, forKey: .recommendations) ?? []
+        reserve =
+            try container.decodeIfPresent(RescueReserveView.self, forKey: .reserve)
+                ?? RescueReserveView()
+        generatedAt = try container.decodeIfPresent(String.self, forKey: .generatedAt) ?? ""
+    }
+
+    /// The grant is returned only while the daemon says the rescue is active.
+    /// A leftover/grant record on an inactive status is never shown as active.
+    var activeGrant: RescueGrantView? {
+        guard active, let grant, grant.isRecognized,
+              grant.sessionID.isEmpty || grant.sessionID == sessionID else { return nil }
+        return grant
+    }
+
+    var statusLabel: String {
+        if active {
+            return "RESCUE ACTIVE"
+        }
+        if usedAt != nil {
+            return "RESCUE USED"
+        }
+        if grant != nil {
+            return "RESCUE INACTIVE"
+        }
+        if eligible {
+            return "RESCUE ELIGIBLE"
+        }
+        return "RESCUE UNAVAILABLE"
+    }
+
+    var usedAtLabel: String? {
+        guard let usedAt else { return nil }
+        let trimmed = usedAt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return String(trimmed.prefix(40))
+    }
+
+    var usedGrantShortLabel: String? {
+        guard let usedGrantID else { return nil }
+        let trimmed = usedGrantID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return String(trimmed.prefix(12))
+    }
+
+    var reasonLabel: String {
+        let value = reason.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch value {
+        case "eligible", "near_completion":
+            return "Eligible: clean near-completion work with a latest commit is ready to finish."
+        case "active_grant":
+            return "A rescue grant is already active."
+        case "dirty":
+            return "The worktree has uncommitted changes."
+        case "blocked":
+            return "Readiness is blocked; resolve blockers before rescuing."
+        case "none":
+            return "No near-completion task with a clean latest commit."
+        case "merged":
+            return "The session is already merged."
+        case "looping":
+            return "No-progress turns indicate a loop; rescue is reserved for clean near-completion work."
+        case "auto_budget":
+            return "Rescue applies to fixed budgets only; this session uses automatic budget."
+        case "unlimited":
+            return "Unlimited sessions have no completion reserve to release."
+        case "no_headroom":
+            return "No completion-reserve headroom remains."
+        case "no_commit":
+            return "No latest commit was reported; commit clean near-completion work first."
+        case "session_active":
+            return "The session is running; pause or wait until it is idle, failed, or cancelled."
+        case "imported":
+            return "Imported sessions are read-only."
+        case "":
+            return "The daemon reports this session is not eligible for a rescue reserve."
+        default:
+            return "Daemon reason: \(String(value.prefix(96)))"
+        }
+    }
+
+    var nearCompletionPreview: [RescueCandidateView] {
+        Array(nearCompletion.prefix(Self.candidatePreviewLimit))
+    }
+
+    var loopingPreview: [RescueCandidateView] {
+        Array(looping.prefix(Self.candidatePreviewLimit))
+    }
+
+    var nearCompletionOverflow: Int {
+        max(0, nearCompletion.count - Self.candidatePreviewLimit)
+    }
+
+    var loopingOverflow: Int {
+        max(0, looping.count - Self.candidatePreviewLimit)
+    }
+
+    var recommendationPreviews: [String] {
+        Array(
+            recommendations
+                .compactMap { value in
+                    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty else { return nil }
+                    return String(trimmed.prefix(Self.recommendationCharacterLimit))
+                }
+                .prefix(Self.recommendationPreviewLimit)
+        )
+    }
+
+    var recommendationOverflow: Int {
+        max(
+            0,
+            recommendations.filter {
+                !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }.count - Self.recommendationPreviewLimit
+        )
+    }
+}
+
+/// Exact wire result of `session.rescue`. Both the grant and the refreshed
+/// status are required; a partial response is a decode error.
+struct RescueResultView: Codable, Sendable, Equatable {
+    let sessionID: String
+    let grant: RescueGrantView
+    let status: RescueStatusView
+
+    enum CodingKeys: String, CodingKey {
+        case grant, status
+        case sessionID = "session_id"
+    }
+
+    init(sessionID: String, grant: RescueGrantView, status: RescueStatusView) {
+        self.sessionID = sessionID
+        self.grant = grant
+        self.status = status
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = try container.decodeIfPresent(String.self, forKey: .sessionID) ?? ""
+        grant = try container.decode(RescueGrantView.self, forKey: .grant)
+        status = try container.decode(RescueStatusView.self, forKey: .status)
+    }
+
+    /// True only when every returned object names the same selected session and
+    /// the grant uses the recognized schema. A mismatch applies no local state.
+    func isConsistent(for targetSessionID: String) -> Bool {
+        guard !targetSessionID.isEmpty,
+              status.sessionID == targetSessionID,
+              grant.isRecognized,
+              sessionID.isEmpty || sessionID == targetSessionID,
+              grant.sessionID.isEmpty || grant.sessionID == targetSessionID
+        else {
+            return false
+        }
+        return true
+    }
+
+    var operatorNotice: String {
+        if status.active {
+            return "The daemon reports the completion reserve released for the next turn only."
+        }
+        return "The daemon recorded a rescue grant but reports it inactive; no reserve is claimed."
+    }
+}
+
+/// Client-side mirror of the daemon eligibility gate. This only blocks an
+/// obviously unavailable action; every allowed request is still revalidated by
+/// the daemon, and no local condition can make a session eligible.
+enum RescueActionAvailability {
+    static let eligibleSessionStatuses: Set<String> = [
+        "paused", "idle", "failed", "cancelled",
+    ]
+
+    static func blockReason(
+        sessionID: String?,
+        sessionStatus: String?,
+        daemonConnected: Bool,
+        busy: Bool,
+        rescue: RescueStatusView?,
+        error: String?
+    ) -> String? {
+        guard let sessionID, !sessionID.isEmpty else {
+            return "Select a session before releasing a completion reserve."
+        }
+        guard daemonConnected else {
+            return "The daemon is not connected; reconnect before releasing the reserve."
+        }
+        if busy {
+            return "Rescue status is loading or a request is in progress."
+        }
+        guard let sessionStatus, !sessionStatus.isEmpty else {
+            return "Session status is unavailable; refresh the session list."
+        }
+        let status = sessionStatus.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard eligibleSessionStatuses.contains(status) else {
+            return "Rescue requires a paused, idle, failed, or cancelled session."
+        }
+        if let error {
+            let trimmed = error.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                return "Rescue status unavailable — \(String(trimmed.prefix(200)))"
+            }
+        }
+        guard let rescue else {
+            return "Rescue eligibility is unavailable; refresh resources to retry."
+        }
+        guard rescue.sessionID.isEmpty || rescue.sessionID == sessionID else {
+            return "The rescue status belongs to a different session; refresh resources to retry."
+        }
+        if rescue.active {
+            return "A rescue grant is already active."
+        }
+        guard rescue.eligible else {
+            return rescue.reasonLabel
+        }
+        return nil
+    }
+}
+
 private func matches(_ value: String, _ options: String...) -> Bool {
     options.contains(value)
 }

@@ -135,6 +135,17 @@ Implemented the observe/operator slice from ADR-0234:
   bypasses the Verifier/Integrator; export/import preserves the record and a
   newer record wins. It is advisory evidence and can become stale as newer work
   lands.
+- Rescue reserve + allocation preview: `session.rescue.status` returns
+  daemon-validated eligibility, reserve headroom, near-completion/looping
+  candidates, and bounded recommendations. `session.rescue` records a
+  30-minute event-only grant for fixed-budget, clean near-completion work with
+  zero no-progress turns; running/queued/imported/dirty/blocked/looping/auto/
+  unlimited/no-headroom sessions are refused with typed `RESCUE_*` codes. The
+  next non-pausing turn boundary releases only the completion-reserve ratio and
+  appends one `session.resource.rescue.used` receipt; hard caps, attention,
+  context, approvals, Verifier, and Integrator remain authoritative. CLI and
+  the Stage confirmation sheet surface it. Reallocation recommendations are
+  advisory only; automatic task-envelope reallocation is still open.
 - Project-level RunPolicy adds persisted defaults (profile/reserve/attention/
   stop), manifest recording and `db-rebuild` restore, RPC
   `project.run_policy.get/set`, and CLI `project-run-policy` /
@@ -159,13 +170,13 @@ Implemented the observe/operator slice from ADR-0234:
 
 Tests: R2b targeted: 27 auto-budget runtime tests, 368 `agent::tests`, 13
 resource tests, 2 project-policy/rebuild tests, 2 protocol stop-policy tests,
-434 store tests, 53 daemon tests, 191 CLI tests, 27 targeted Swift
+434 store tests, 54 daemon tests, 194 CLI tests, 35 targeted Swift
 `ResourceGovernorTests`, 6 Swift `MarkdownTranscriptTests`, 3 partial-delivery
-protocol tests, 6 delivery-engine tests, and 643 full Swift tests (511 app +
-132 helper); P0 tests remain. Final full workspace after the last R2b slice is
-recorded below; the final explicit partial-delivery run was **4,584 passed,
-0 failed, 6 ignored**; clippy exit 0. R2b project policy was 4,559; R2b core
-before it 4,554; R2a 4,551. A live
+protocol tests, 6 delivery-engine tests, 3 rescue protocol tests, 6
+rescue-engine tests, and 651 full Swift tests (519 app + 132 helper); P0 tests
+remain. Final full workspace after the last R2b slice is recorded below; the
+rescue reserve run is **4,597 passed, 0 failed, 6 ignored**; clippy exit 0.
+R2b project policy was 4,559; R2b core before it 4,554; R2a 4,551. A live
 temp-daemon CLI smoke exercised `run-contract-set`, `resources`, `top-up`, and
 `readiness` end to end; a temp-daemon GUI smoke exercised first-selection
 resource loading and the Project RunPolicy card/editor.
@@ -217,6 +228,10 @@ cargo test -p vp-protocol partial_delivery
 # 3 passed, 0 failed (params/record/result round-trip and additive defaults)
 cargo test -p vp-core --lib engine::delivery::tests
 # 6 passed, 0 failed (confirm/active/imported/empty/complete/bounds/export-import)
+cargo test -p vp-protocol rescue
+# 3 passed, 0 failed (grant/status params and stable error codes)
+cargo test -p vp-core --lib engine::rescue::tests
+# 6 passed, 0 failed (eligibility, one-shot reserve release, expiry, bounds)
 cargo test -p vp-store --lib
 # 434 passed, 0 failed (incl. project RunPolicy round-trip/validation)
 cargo test -p vp-core --lib agent::auto_budget_runtime_tests
@@ -236,29 +251,32 @@ cargo test -p vp-core --lib 'contract::tests::shell_scratch'
 cargo test -p vp-core --lib 'agent::plan::execute::tests'
 # 1 passed, 0 failed (EFFECT_UNKNOWN blocked classification)
 cargo test -p vp-daemon
-# 53 unit + 1 governance passed
+# 54 unit + 1 governance passed
 cargo test -p vp-daemon partial_delivery
 # 1 passed, 0 failed (RPC record/read/typed confirmation error)
+cargo test -p vp-daemon rescue
+# 1 passed, 0 failed (RPC preview/grant/typed confirmation error)
 cargo test -p vp-cli
-# 191 unit + 10 integration + 1 governance passed
+# 194 unit + 10 integration + 1 governance passed
 cargo test -p vp-cli --bin vp delivery
+# 3 passed, 0 failed (CLI parse/--yes/human render)
+cargo test -p vp-cli --bin vp rescue
 # 3 passed, 0 failed (CLI parse/--yes/human render)
 ```
 
-Final full workspace after the explicit partial-delivery slice (2026-11-24,
-healthy boot):
+Final full workspace after the rescue-reserve slice (2026-11-25, healthy boot):
 
 ```bash
 cargo test --workspace
-# 4,584 passed, 0 failed, 6 ignored
+# 4,597 passed, 0 failed, 6 ignored
 cargo clippy --workspace --all-targets -- -D warnings
 # exit 0
 ```
 
 R2b project policy was 4,559, R2b core before it 4,554, R2a 4,551, R1 4,546.
-Full Swift after the slice: 643 (511 app + 132 helper), including the Markdown
-transcript renderer, display preferences, attention batch prompt, and partial
-delivery sheet.
+Full Swift after the slice: 651 (519 app + 132 helper), including the Markdown
+transcript renderer, display preferences, attention batch prompt, partial
+delivery sheet, and rescue reserve surface.
 
 The earlier full run before P0/R1 also passed every crate except the daemon
 operator test, which was fixed and is covered above. The host XProtect/

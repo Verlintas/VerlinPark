@@ -2748,6 +2748,21 @@ pub(crate) enum Command {
     Readiness { session: String },
     /// Show the latest explicit partial-delivery record and current readiness.
     Delivery { session: String },
+    /// Show the rescue eligibility, allocation reserve, and near-completion preview.
+    RescueStatus { session: String },
+    /// Grant a short-lived completion-reserve release for near-completion work.
+    Rescue {
+        session: String,
+        /// Operator reason stored with the grant. Bounded to 500 characters.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Operator label stored with the grant (defaults to `operator`).
+        #[arg(long)]
+        recorded_by: Option<String>,
+        /// Required confirmation; does not change budgets, caps, or verification.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Record an explicit partial delivery for an inactive session.
     PartialDelivery {
         session: String,

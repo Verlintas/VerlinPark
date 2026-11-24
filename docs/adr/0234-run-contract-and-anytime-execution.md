@@ -262,9 +262,13 @@ Negative and limits:
    selection loads the full session resource state and resource failures are
    visible with an explicit retry. Explicit partial delivery is event-only
    (`session.partial_delivery`) with RPC/CLI/Stage surfaces; it never merges,
-   approves, completes, or resumes. Rescue/reallocation remains.
-4. **R3 allocate**: task/plan-aware allocation, rescue/reallocation, learning
-   from actuals, metareasoning/replan.
+   approves, completes, or resumes. A short-lived event-only rescue grant can
+   release only the completion reserve for clean near-completion fixed-budget
+   work, and an allocation preview recommends (but does not enact)
+   reallocation. Automatic envelope reallocation and governor snapshot caching
+   remain.
+4. **R3 allocate**: task/plan-aware allocation, automatic envelope
+   reallocation, learning from actuals, metareasoning/replan.
 5. **R4 deliver**: anytime UI, trade-off frontier, calibrated trust, daily
    attention scheduling.
 

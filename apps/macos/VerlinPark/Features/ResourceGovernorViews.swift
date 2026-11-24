@@ -59,6 +59,7 @@ struct StageResourceCard: View {
     @State private var expanded = false
     @State private var showingTopUp = false
     @State private var showingPartialDelivery = false
+    @State private var showingRescueConfirmation = false
 
     private var readiness: ReadinessSnapshotView? {
         resources.readiness
@@ -68,11 +69,29 @@ struct StageResourceCard: View {
         resources.attention
     }
 
+    /// The rescue action is offered only when the newest daemon pause reason is
+    /// a completion-reserve reason. Eligibility itself always comes from the
+    /// daemon status, never from the reason or local resource math.
+    private var showsRescueAvailability: Bool {
+        guard let pause = model.resourcePause else { return false }
+        let reason = pause.reason.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard reason.hasPrefix("completion_reserve_") else { return false }
+        return model.selectedSessionRescue?.active != true
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             header
+            if let rescue = model.selectedSessionRescue,
+               rescue.active || rescue.usedAt != nil || rescue.grant != nil
+            {
+                rescueStateRow(rescue)
+            }
             if let pause = model.resourcePause {
                 resourcePauseBanner(pause)
+            }
+            if showsRescueAvailability {
+                rescueAvailabilityRow
             }
             if expanded {
                 Divider().overlay(VPTheme.hairline)
@@ -129,6 +148,10 @@ struct StageResourceCard: View {
         }
         .sheet(isPresented: $showingPartialDelivery) {
             PartialDeliverySheet(sessionID: model.selectedSessionID ?? resources.sessionID)
+                .environment(model)
+        }
+        .sheet(isPresented: $showingRescueConfirmation) {
+            RescueReserveSheet(sessionID: model.selectedSessionID ?? resources.sessionID)
                 .environment(model)
         }
     }
@@ -249,6 +272,161 @@ struct StageResourceCard: View {
         .overlay {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .strokeBorder(VPTheme.warning.opacity(0.20), lineWidth: 1)
+        }
+    }
+
+    /// Compact daemon-authoritative rescue state. Presence of a grant record on
+    /// an inactive status is never rendered as an active rescue.
+    private func rescueStateRow(_ rescue: RescueStatusView) -> some View {
+        let active = rescue.active
+        let tint = active ? VPTheme.success : VPTheme.textTertiary
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Image(systemName: active ? "shield.lefthalf.filled" : "shield.slash")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(tint)
+                Text(rescue.statusLabel)
+                    .font(VPTheme.mono(6.5, weight: .semibold))
+                    .tracking(0.6)
+                    .foregroundStyle(tint)
+                if active {
+                    if let grant = rescue.activeGrant {
+                        Text("expires \(grant.expiresAtLabel)")
+                            .font(VPTheme.mono(6.5))
+                            .foregroundStyle(VPTheme.textTertiary)
+                            .lineLimit(1)
+                        if let by = grant.recordedByLabel {
+                            Text("by \(by)")
+                                .font(VPTheme.mono(6.5))
+                                .foregroundStyle(VPTheme.textTertiary)
+                                .lineLimit(1)
+                        } else {
+                            Text("by not reported")
+                                .font(VPTheme.mono(6.5))
+                                .foregroundStyle(VPTheme.textTertiary)
+                                .lineLimit(1)
+                        }
+                    } else {
+                        Text("grant details not reported")
+                            .font(VPTheme.mono(6.5))
+                            .foregroundStyle(VPTheme.textTertiary)
+                    }
+                } else if let used = rescue.usedAtLabel {
+                    Text("used \(used)")
+                        .font(VPTheme.mono(6.5))
+                        .foregroundStyle(VPTheme.textTertiary)
+                        .lineLimit(1)
+                    if let grantID = rescue.usedGrantShortLabel {
+                        Text("grant \(grantID)")
+                            .font(VPTheme.mono(6.5))
+                            .foregroundStyle(VPTheme.textTertiary)
+                            .lineLimit(1)
+                    }
+                } else if let grant = rescue.grant {
+                    Text("grant \(grant.shortID)")
+                        .font(VPTheme.mono(6.5))
+                        .foregroundStyle(VPTheme.textTertiary)
+                        .lineLimit(1)
+                    Text("expires \(grant.expiresAtLabel)")
+                        .font(VPTheme.mono(6.5))
+                        .foregroundStyle(VPTheme.textTertiary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 4)
+                if model.rescueBusy {
+                    ProgressView().controlSize(.mini)
+                }
+            }
+            if active {
+                Text(
+                    "One-shot completion-reserve release for the next turn — not a top-up or hard-cap bypass. It does not add budget, remove hard caps, change model routing, or bypass the Verifier or Integrator."
+                )
+                .font(VPTheme.mono(7))
+                .foregroundStyle(VPTheme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            } else if let used = rescue.usedAtLabel {
+                Text(
+                    "That one-shot grant was used at \(used). It did not add budget or remove any hard cap."
+                )
+                .font(VPTheme.mono(7))
+                .foregroundStyle(VPTheme.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+            if let notice = model.rescueNotice {
+                Text(notice)
+                    .font(VPTheme.mono(6.8))
+                    .foregroundStyle(VPTheme.info)
+                    .lineLimit(2)
+            }
+            if let error = model.rescueError {
+                Text(error)
+                    .font(VPTheme.mono(6.8))
+                    .foregroundStyle(VPTheme.warning)
+                    .lineLimit(2)
+            }
+        }
+        .padding(7)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            tint.opacity(active ? 0.07 : 0.04),
+            in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .strokeBorder(tint.opacity(active ? 0.20 : 0.12), lineWidth: 1)
+        }
+    }
+
+    /// The only rescue action surface. It exists solely for a daemon-reported
+    /// completion-reserve pause, and eligibility still comes from the status.
+    @ViewBuilder
+    private var rescueAvailabilityRow: some View {
+        if model.selectedSessionRescue?.eligible == true,
+           model.selectedSessionRescue?.active != true,
+           model.rescueError == nil
+        {
+            HStack(spacing: 7) {
+                Button {
+                    showingRescueConfirmation = true
+                } label: {
+                    Label("Rescue reserve", systemImage: "shield.lefthalf.filled")
+                }
+                .buttonStyle(.plain)
+                .font(VPTheme.mono(6.8, weight: .semibold))
+                .foregroundStyle(VPTheme.accent)
+                .disabled(!model.canGrantRescue)
+                .help("Release this session's completion reserve for the next turn only.")
+                if model.rescueBusy {
+                    ProgressView().controlSize(.mini)
+                }
+                Text(
+                    model.canGrantRescue
+                        ? "Release the completion reserve for the next turn only."
+                        : (model.rescueActionBlockReason ?? "Rescue is unavailable.")
+                )
+                .font(VPTheme.mono(6.5))
+                .foregroundStyle(VPTheme.textTertiary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 4)
+                Text("EXPLICIT · ONE-SHOT")
+                    .font(VPTheme.mono(6.2, weight: .semibold))
+                    .foregroundStyle(VPTheme.textTertiary)
+            }
+        } else {
+            HStack(spacing: 6) {
+                Image(systemName: "shield.slash")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(VPTheme.textTertiary)
+                Text(
+                    "Rescue unavailable · \(model.rescueActionBlockReason ?? "The daemon has not reported eligibility.")"
+                )
+                .font(VPTheme.mono(6.5))
+                .foregroundStyle(VPTheme.textTertiary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 4)
+            }
         }
     }
 
@@ -416,6 +594,7 @@ struct StageResourceCard: View {
                 Task {
                     await model.loadSessionResources()
                     await model.loadSessionDelivery()
+                    await model.loadSessionRescue()
                 }
             } label: {
                 Image(systemName: "arrow.clockwise")
@@ -1515,5 +1694,362 @@ struct PartialDeliverySheet: View {
             .overlay {
                 Capsule().strokeBorder(tint.opacity(0.22), lineWidth: 1)
             }
+    }
+}
+
+// MARK: - Completion-reserve rescue sheet
+
+/// One explicit completion-reserve release. The daemon owns eligibility and
+/// the refreshed status; this sheet only presents that evidence and an
+/// optional audit note. It never adds budget or changes execution gates.
+struct RescueReserveSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    let sessionID: String
+
+    @State private var reasonDraft = ""
+
+    private var rescue: RescueStatusView? {
+        model.selectedSessionRescue
+    }
+
+    private var sessionMatches: Bool {
+        !sessionID.isEmpty && model.selectedSessionID == sessionID
+    }
+
+    private var imported: Bool {
+        model.selectedSession?.status == "imported"
+    }
+
+    private var canSubmit: Bool {
+        sessionMatches && model.canGrantRescue
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            VPHairline()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 15) {
+                    warning
+                    summary
+                    reserve
+                    candidateSection(
+                        "NEAR COMPLETION",
+                        candidates: rescue?.nearCompletionPreview ?? [],
+                        overflow: rescue?.nearCompletionOverflow ?? 0
+                    )
+                    candidateSection(
+                        "LOOPING (NOT RESCUABLE)",
+                        candidates: rescue?.loopingPreview ?? [],
+                        overflow: rescue?.loopingOverflow ?? 0
+                    )
+                    recommendations
+                    reasonField
+                    validationLine
+                    feedback
+                }
+                .padding(20)
+            }
+            VPHairline()
+            footer
+        }
+        .frame(width: 580)
+        .frame(maxHeight: 740)
+        .background { VPCrystalBackdrop() }
+        .tint(VPTheme.accent)
+        .onChange(of: reasonDraft) { _, newValue in
+            if newValue.count > RescueGrantView.reasonCharacterLimit {
+                reasonDraft = String(newValue.prefix(RescueGrantView.reasonCharacterLimit))
+            }
+        }
+    }
+
+    private var header: some View {
+        HStack(alignment: .top, spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(VPTheme.success.opacity(0.12))
+                    .frame(width: 40, height: 40)
+                Image(systemName: "shield.lefthalf.filled")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(VPTheme.success)
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text("RELEASE COMPLETION RESERVE")
+                    .font(VPTheme.mono(7.5, weight: .semibold))
+                    .tracking(1.2)
+                    .foregroundStyle(VPTheme.success)
+                Text("One explicit rescue for the next turn")
+                    .font(VPTheme.font(18, weight: .semibold, rounded: true))
+                    .foregroundStyle(VPTheme.textPrimary)
+                    .lineLimit(2)
+                Text(
+                    "Session \(sessionID.isEmpty ? "—" : String(sessionID.prefix(8))) · daemon-validated eligibility"
+                )
+                .font(VPTheme.mono(8))
+                .foregroundStyle(VPTheme.textTertiary)
+            }
+            Spacer()
+            Button("Cancel") { dismiss() }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .keyboardShortcut(.cancelAction)
+        }
+        .padding(20)
+        .background(VPTheme.rail)
+    }
+
+    private var warning: some View {
+        Label(
+            "This releases the session's completion reserve for the next turn only. It does not add budget, remove a hard cap, change model routing, or bypass the Verifier or Integrator. The daemon can still pause again if the cap is unchanged.",
+            systemImage: "exclamationmark.shield.fill"
+        )
+        .font(VPTheme.mono(7.5))
+        .foregroundStyle(VPTheme.warning)
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(9)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(VPTheme.warning.opacity(0.07), in: RoundedRectangle(cornerRadius: 9))
+        .overlay {
+            RoundedRectangle(cornerRadius: 9)
+                .strokeBorder(VPTheme.warning.opacity(0.18), lineWidth: 1)
+        }
+    }
+
+    private var summary: some View {
+        HStack(alignment: .top, spacing: 12) {
+            metric("Readiness", rescue?.readiness.levelLabel ?? "Unavailable")
+            metric("Latest commit", rescue?.readiness.shortCommit ?? "none reported")
+            metric(
+                "No-progress turns",
+                rescue.map { "\($0.noProgressTurns)" } ?? "Unavailable"
+            )
+            metric("Daemon reason", rescue?.reasonLabel ?? "Unavailable")
+        }
+    }
+
+    private var reserve: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text("DAEMON-REPORTED RESERVE")
+                .font(VPTheme.mono(8, weight: .semibold))
+                .tracking(0.7)
+                .foregroundStyle(VPTheme.textSecondary)
+            HStack(alignment: .top, spacing: 12) {
+                metric("Completion reserve", rescue?.reserve.completionReservePercentLabel ?? "Unavailable")
+                metric("Remaining", rescue?.reserve.remainingLabel ?? "Unavailable")
+                metric("Hard cap", rescue?.reserve.hardCapLabel ?? "Unavailable")
+            }
+        }
+        .padding(9)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            VPTheme.surfaceSunken.opacity(0.55),
+            in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .strokeBorder(VPTheme.hairline, lineWidth: 1)
+        }
+    }
+
+    @ViewBuilder
+    private func candidateSection(
+        _ title: String,
+        candidates: [RescueCandidateView],
+        overflow: Int
+    ) -> some View {
+        if !candidates.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(VPTheme.mono(7.5, weight: .semibold))
+                    .tracking(0.6)
+                    .foregroundStyle(VPTheme.textTertiary)
+                ForEach(candidates) { candidate in
+                    VStack(alignment: .leading, spacing: 1) {
+                        HStack(spacing: 6) {
+                            Text(candidate.displayLabel)
+                                .font(VPTheme.mono(7.5, weight: .medium))
+                                .foregroundStyle(VPTheme.textSecondary)
+                                .lineLimit(1)
+                            if let commit = candidate.shortCommit {
+                                Text("commit \(commit)")
+                                    .font(VPTheme.mono(6.5))
+                                    .foregroundStyle(VPTheme.textTertiary)
+                                    .lineLimit(1)
+                            }
+                            Spacer(minLength: 4)
+                        }
+                        if let detail = candidate.detailLabel {
+                            Text(detail)
+                                .font(VPTheme.mono(6.8))
+                                .foregroundStyle(VPTheme.textTertiary)
+                                .lineLimit(2)
+                        }
+                    }
+                }
+                if overflow > 0 {
+                    Text("+ \(overflow) more")
+                        .font(VPTheme.mono(6.5))
+                        .foregroundStyle(VPTheme.textTertiary)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var recommendations: some View {
+        if let rescue, !rescue.recommendationPreviews.isEmpty {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("DAEMON RECOMMENDATIONS")
+                    .font(VPTheme.mono(7.5, weight: .semibold))
+                    .tracking(0.6)
+                    .foregroundStyle(VPTheme.textTertiary)
+                ForEach(Array(rescue.recommendationPreviews.enumerated()), id: \.offset) { _, item in
+                    Text("- \(item)")
+                        .font(VPTheme.mono(6.8))
+                        .foregroundStyle(VPTheme.textSecondary)
+                        .lineLimit(2)
+                }
+                if rescue.recommendationOverflow > 0 {
+                    Text("+ \(rescue.recommendationOverflow) more")
+                        .font(VPTheme.mono(6.5))
+                        .foregroundStyle(VPTheme.textTertiary)
+                }
+            }
+        }
+    }
+
+    private var reasonField: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("OPERATOR AUDIT REASON (OPTIONAL)")
+                    .font(VPTheme.mono(8, weight: .semibold))
+                    .tracking(0.7)
+                    .foregroundStyle(VPTheme.textSecondary)
+                Spacer()
+                Text("\(reasonDraft.count) / \(RescueGrantView.reasonCharacterLimit)")
+                    .font(VPTheme.mono(7))
+                    .foregroundStyle(VPTheme.textTertiary)
+            }
+            TextField("e.g. finish the verified near-completion task", text: $reasonDraft)
+                .textFieldStyle(.plain)
+                .font(VPTheme.mono(10))
+                .vpFieldSurface(radius: 8)
+                .accessibilityLabel("Operator audit reason")
+                .disabled(model.rescueBusy)
+        }
+    }
+
+    @ViewBuilder
+    private var validationLine: some View {
+        if !sessionMatches {
+            Label(
+                "The selected session changed; close this sheet and reopen it from the active session.",
+                systemImage: "arrow.triangle.2.circlepath"
+            )
+            .font(VPTheme.mono(7.5))
+            .foregroundStyle(VPTheme.warning)
+            .fixedSize(horizontal: false, vertical: true)
+        } else if imported {
+            Label(
+                "Imported sessions are read-only; rescue is unavailable.",
+                systemImage: "lock.fill"
+            )
+            .font(VPTheme.mono(7.5))
+            .foregroundStyle(VPTheme.textTertiary)
+        } else if let reason = model.rescueActionBlockReason {
+            Text(reason)
+                .font(VPTheme.mono(7.5))
+                .foregroundStyle(VPTheme.warning)
+                .fixedSize(horizontal: false, vertical: true)
+        } else {
+            Text(
+                "The daemon reports this session eligible. Confirming sends one request with confirm=true; nothing is retried automatically."
+            )
+            .font(VPTheme.mono(7))
+            .foregroundStyle(VPTheme.textTertiary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    @ViewBuilder
+    private var feedback: some View {
+        if let error = model.rescueError {
+            Label(error, systemImage: "exclamationmark.triangle.fill")
+                .font(VPTheme.mono(7.5))
+                .foregroundStyle(VPTheme.warning)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(9)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(VPTheme.warning.opacity(0.08), in: RoundedRectangle(cornerRadius: 9))
+        }
+        if let notice = model.rescueNotice {
+            Text(notice)
+                .font(VPTheme.mono(7.5))
+                .foregroundStyle(VPTheme.info)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(9)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(VPTheme.info.opacity(0.07), in: RoundedRectangle(cornerRadius: 9))
+        }
+    }
+
+    private var footer: some View {
+        HStack(spacing: 8) {
+            if model.rescueBusy {
+                ProgressView().controlSize(.small)
+                Text("Releasing…")
+                    .font(VPTheme.mono(7))
+                    .foregroundStyle(VPTheme.textSecondary)
+            } else {
+                Text(
+                    model.rescueActionBlockReason
+                        ?? "One explicit one-shot release · not a top-up or hard-cap bypass"
+                )
+                .font(VPTheme.mono(7))
+                .foregroundStyle(VPTheme.textTertiary)
+                .lineLimit(2)
+            }
+            Spacer()
+            Button("Cancel") { dismiss() }
+                .keyboardShortcut(.cancelAction)
+                .disabled(model.rescueBusy)
+            Button {
+                submit()
+            } label: {
+                Label("Release reserve", systemImage: "shield.lefthalf.filled")
+            }
+            .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
+            .keyboardShortcut(.defaultAction)
+            .disabled(!canSubmit || model.rescueBusy)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 13)
+        .background(VPTheme.rail)
+    }
+
+    private func submit() {
+        Task {
+            let granted = await model.grantRescue(reason: reasonDraft)
+            if granted {
+                dismiss()
+            }
+        }
+    }
+
+    private func metric(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title.uppercased())
+                .font(VPTheme.mono(6.5, weight: .semibold))
+                .tracking(0.4)
+                .foregroundStyle(VPTheme.textTertiary)
+            Text(value)
+                .font(VPTheme.mono(8))
+                .foregroundStyle(VPTheme.textSecondary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }

@@ -688,6 +688,15 @@ impl Engine {
             .as_ref()
             .and_then(|value| value.completion_reserve_ratio)
             .unwrap_or(project_run_policy.completion_reserve_ratio);
+        // A rescue grant releases only the completion reserve for this safe
+        // turn boundary. It never removes a hard cap, attention limit, or
+        // context limit: those still pause the run.
+        let active_rescue = self.active_rescue_grant(session_id).await?;
+        let effective_completion_reserve_ratio = if active_rescue.is_some() {
+            0.0
+        } else {
+            completion_reserve_ratio
+        };
         let context = self.session_context_status(session_id).await?;
         let approvals = self.list_approvals(Some(session_id.to_string())).await?;
         let effects = self.session_effects(session_id, None, false, 200).await?;
@@ -745,7 +754,7 @@ impl Engine {
             profile,
             attention_cap,
             attention_interrupts: attention.interrupts,
-            completion_reserve_ratio,
+            completion_reserve_ratio: effective_completion_reserve_ratio,
             hard_caps: &hard_caps,
             dimensions: &dimensions,
             readiness_blocked: false,
@@ -756,10 +765,17 @@ impl Engine {
             profile,
             bottleneck.as_deref(),
             attention_cap,
-            completion_reserve_ratio,
+            effective_completion_reserve_ratio,
             &dimensions,
         );
         details["attention_batch"] = attention_batch_details(&approvals, &attention, attention_cap);
+        if let Some(grant) = &active_rescue {
+            details["rescue"] = serde_json::json!({
+                "grant_id": grant.id.clone(),
+                "expires_at": grant.expires_at.clone(),
+                "original_completion_reserve_ratio": completion_reserve_ratio,
+            });
+        }
         Ok(ResourceGovernorDecision {
             session_id: session_id.to_string(),
             phase: "turn".to_string(),

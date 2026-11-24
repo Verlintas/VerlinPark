@@ -1010,6 +1010,490 @@ final class ResourceGovernorTests: XCTestCase {
         XCTAssertNil(emptySession.partialRecord(for: "ses-1"))
     }
 
+    // MARK: - Completion-reserve rescue
+
+    func testRescueStatusDecodesActiveGrantAndReserveWithAdditiveFields() throws {
+        let json = try XCTUnwrap("""
+        {
+          "session_id": "ses-1",
+          "active": true,
+          "grant": {
+            "schema": "verlinpark.rescue_grant/v1",
+            "id": "grant-1",
+            "session_id": "ses-1",
+            "project_id": "prj-1",
+            "recorded_at": "2026-11-24T00:00:00Z",
+            "expires_at": "2026-11-24T01:00:00Z",
+            "recorded_by": "operator",
+            "reason": "near_completion",
+            "readiness_level": "committed",
+            "latest_commit": "abcdef1234567890",
+            "no_progress_turns": 0,
+            "additive_future_field": {"ignored": true}
+          },
+          "used_at": null,
+          "used_grant_id": null,
+          "eligible": false,
+          "reason": "active_grant",
+          "readiness": {
+            "session_id": "ses-1",
+            "level": "committed",
+            "latest_commit": "abcdef1234567890"
+          },
+          "no_progress_turns": 0,
+          "near_completion": [
+            {"kind":"task","id":"T1","status":"completed","detail":"clean commit",
+             "commit":"abcdef1234567890"}
+          ],
+          "looping": [],
+          "recommendations": ["Finish T1"],
+          "reserve": {
+            "completion_reserve_ratio": 0.2,
+            "remaining_tokens": 12000,
+            "remaining_cost_usd": 1.5,
+            "remaining_secs": 600,
+            "hard_token_cap": 100000,
+            "hard_cost_cap_usd": 5.0,
+            "hard_wall_clock_secs": 3600
+          },
+          "generated_at": "2026-11-24T00:00:00Z"
+        }
+        """.data(using: .utf8))
+        let status = try JSONDecoder().decode(RescueStatusView.self, from: json)
+        XCTAssertEqual(status.sessionID, "ses-1")
+        XCTAssertTrue(status.active)
+        XCTAssertFalse(status.eligible)
+        XCTAssertEqual(status.statusLabel, "RESCUE ACTIVE")
+        XCTAssertEqual(status.grant?.id, "grant-1")
+        XCTAssertEqual(status.activeGrant?.shortID, "grant-1")
+        XCTAssertEqual(status.grant?.shortCommit, "abcdef123456")
+        XCTAssertEqual(status.grant?.recordedByLabel, "operator")
+        XCTAssertEqual(status.grant?.expiresAtLabel, "2026-11-24T01:00:00Z")
+        XCTAssertEqual(status.nearCompletion.count, 1)
+        XCTAssertEqual(status.nearCompletionPreview.first?.displayLabel, "TASK T1 · COMPLETED")
+        XCTAssertEqual(status.recommendationPreviews, ["Finish T1"])
+        XCTAssertEqual(status.reserve.completionReservePercentLabel, "20%")
+        XCTAssertEqual(status.reserve.remainingLabel, "12.0k tokens · $1.50 · 10m")
+        XCTAssertEqual(status.reserve.hardCapLabel, "100.0k tokens · $5.00 · 1h")
+    }
+
+    func testRescueStatusDoesNotInferActiveFromGrantPresenceOrMissingActiveField() throws {
+        let usedJSON = try XCTUnwrap("""
+        {
+          "session_id": "ses-1",
+          "active": false,
+          "grant": {
+            "schema": "verlinpark.rescue_grant/v1",
+            "id": "grant-2",
+            "session_id": "ses-1",
+            "expires_at": "2026-11-24T01:00:00Z"
+          },
+          "used_at": "2026-11-24T00:30:00Z",
+          "used_grant_id": "grant-2",
+          "eligible": false,
+          "reason": "none",
+          "readiness": {}
+        }
+        """.data(using: .utf8))
+        let used = try JSONDecoder().decode(RescueStatusView.self, from: usedJSON)
+        XCTAssertFalse(used.active)
+        XCTAssertNil(used.activeGrant)
+        XCTAssertEqual(used.statusLabel, "RESCUE USED")
+        XCTAssertEqual(used.usedAtLabel, "2026-11-24T00:30:00Z")
+        XCTAssertEqual(used.usedGrantShortLabel, "grant-2")
+
+        let inactiveJSON = try XCTUnwrap("""
+        {
+          "session_id": "ses-1",
+          "active": false,
+          "grant": {"schema": "verlinpark.rescue_grant/v1", "id": "grant-3"},
+          "eligible": false,
+          "reason": "none",
+          "readiness": {}
+        }
+        """.data(using: .utf8))
+        let inactive = try JSONDecoder().decode(RescueStatusView.self, from: inactiveJSON)
+        XCTAssertNotNil(inactive.grant)
+        XCTAssertNil(inactive.activeGrant)
+        XCTAssertEqual(inactive.statusLabel, "RESCUE INACTIVE")
+
+        let expiredJSON = try XCTUnwrap("""
+        {
+          "session_id": "ses-1",
+          "active": false,
+          "grant": {
+            "schema": "verlinpark.rescue_grant/v1",
+            "id": "grant-3b",
+            "session_id": "ses-1",
+            "expires_at": "2026-11-23T00:00:00Z"
+          },
+          "eligible": false,
+          "reason": "none",
+          "readiness": {}
+        }
+        """.data(using: .utf8))
+        let expired = try JSONDecoder().decode(RescueStatusView.self, from: expiredJSON)
+        XCTAssertFalse(expired.active)
+        XCTAssertNil(expired.activeGrant)
+        XCTAssertEqual(expired.statusLabel, "RESCUE INACTIVE")
+        XCTAssertEqual(expired.grant?.expiresAtLabel, "2026-11-23T00:00:00Z")
+
+        let missingActiveJSON = try XCTUnwrap("""
+        {
+          "session_id": "ses-1",
+          "grant": {"schema": "verlinpark.rescue_grant/v1", "id": "grant-4"},
+          "eligible": true,
+          "reason": "near_completion",
+          "readiness": {}
+        }
+        """.data(using: .utf8))
+        let missingActive = try JSONDecoder().decode(RescueStatusView.self, from: missingActiveJSON)
+        XCTAssertFalse(missingActive.active)
+        XCTAssertNil(missingActive.activeGrant)
+        XCTAssertEqual(missingActive.statusLabel, "RESCUE INACTIVE")
+    }
+
+    func testRescueStatusDecodesNullGrantAndConservativeDefaults() throws {
+        let json = try XCTUnwrap("""
+        {
+          "session_id": "ses-2",
+          "active": false,
+          "grant": null,
+          "used_at": null,
+          "eligible": false,
+          "reason": "dirty",
+          "readiness": {},
+          "near_completion": null,
+          "looping": null,
+          "recommendations": null
+        }
+        """.data(using: .utf8))
+        let status = try JSONDecoder().decode(RescueStatusView.self, from: json)
+        XCTAssertNil(status.grant)
+        XCTAssertNil(status.activeGrant)
+        XCTAssertFalse(status.active)
+        XCTAssertFalse(status.eligible)
+        XCTAssertEqual(status.statusLabel, "RESCUE UNAVAILABLE")
+        XCTAssertTrue(status.nearCompletion.isEmpty)
+        XCTAssertTrue(status.looping.isEmpty)
+        XCTAssertTrue(status.recommendationPreviews.isEmpty)
+        XCTAssertEqual(status.reserve.remainingLabel, "not reported")
+        XCTAssertEqual(status.reserve.hardCapLabel, "not reported")
+        XCTAssertEqual(status.reserve.completionReservePercentLabel, "not reported")
+    }
+
+    func testRescueResultRequiresDaemonStateAndSameSession() throws {
+        let json = try XCTUnwrap("""
+        {
+          "session_id": "ses-1",
+          "grant": {
+            "schema": "verlinpark.rescue_grant/v1",
+            "id": "grant-5",
+            "session_id": "ses-1",
+            "reason": "near_completion"
+          },
+          "status": {
+            "session_id": "ses-1",
+            "active": true,
+            "grant": {"schema": "verlinpark.rescue_grant/v1", "id": "grant-5",
+                      "session_id": "ses-1"},
+            "eligible": false,
+            "reason": "active_grant",
+            "readiness": {}
+          }
+        }
+        """.data(using: .utf8))
+        let result = try JSONDecoder().decode(RescueResultView.self, from: json)
+        XCTAssertEqual(result.sessionID, "ses-1")
+        XCTAssertEqual(result.grant.id, "grant-5")
+        XCTAssertTrue(result.status.active)
+        XCTAssertTrue(result.isConsistent(for: "ses-1"))
+        XCTAssertFalse(result.isConsistent(for: "ses-2"))
+        XCTAssertFalse(result.isConsistent(for: ""))
+        XCTAssertTrue(result.operatorNotice.contains("next turn only"))
+
+        let missingGrant = try XCTUnwrap("""
+        {"session_id":"ses-1","status":{"session_id":"ses-1","readiness":{}}}
+        """.data(using: .utf8))
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(RescueResultView.self, from: missingGrant)
+        )
+
+        let mismatched = try RescueResultView(
+            sessionID: "ses-2",
+            grant: RescueGrantView(id: "grant-6", sessionID: "ses-2"),
+            status: rescueStatus(sessionID: "ses-1", readiness: readiness(level: "committed"))
+        )
+        XCTAssertFalse(mismatched.isConsistent(for: "ses-1"))
+    }
+
+    func testRescueReasonLabelsAreTruthful() throws {
+        let readiness = try readiness(level: "committed")
+        let expectations: [(String, String)] = [
+            ("eligible", "near-completion"),
+            ("near_completion", "near-completion"),
+            ("active_grant", "already active"),
+            ("dirty", "uncommitted"),
+            ("blocked", "blocked"),
+            ("none", "No near-completion"),
+            ("merged", "already merged"),
+            ("looping", "loop"),
+            ("auto_budget", "fixed budgets"),
+            ("unlimited", "Unlimited"),
+            ("no_headroom", "headroom"),
+            ("no_commit", "commit"),
+            ("session_active", "running"),
+            ("imported", "read-only"),
+        ]
+        for (reason, fragment) in expectations {
+            let status = rescueStatus(
+                eligible: reason == "eligible" || reason == "near_completion",
+                reason: reason,
+                readiness: readiness
+            )
+            XCTAssertTrue(
+                status.reasonLabel.localizedCaseInsensitiveContains(fragment),
+                "\(reason): \(status.reasonLabel)"
+            )
+        }
+        let unknown = rescueStatus(reason: "custom_reason", readiness: readiness)
+        XCTAssertTrue(unknown.reasonLabel.contains("custom_reason"))
+    }
+
+    func testRescueActionBlockReasonRequiresDaemonEligibilityAndQuiescentSession() throws {
+        let readiness = try readiness(level: "committed")
+        let eligible = rescueStatus(eligible: true, reason: "near_completion", readiness: readiness)
+        XCTAssertNil(
+            RescueActionAvailability.blockReason(
+                sessionID: "ses-1",
+                sessionStatus: "paused",
+                daemonConnected: true,
+                busy: false,
+                rescue: eligible,
+                error: nil
+            )
+        )
+        for status in ["idle", "failed", "cancelled"] {
+            XCTAssertNil(
+                RescueActionAvailability.blockReason(
+                    sessionID: "ses-1",
+                    sessionStatus: status,
+                    daemonConnected: true,
+                    busy: false,
+                    rescue: eligible,
+                    error: nil
+                ),
+                status
+            )
+        }
+        XCTAssertNotNil(
+            RescueActionAvailability.blockReason(
+                sessionID: nil,
+                sessionStatus: "paused",
+                daemonConnected: true,
+                busy: false,
+                rescue: eligible,
+                error: nil
+            )
+        )
+        XCTAssertTrue(
+            try XCTUnwrap(
+                RescueActionAvailability.blockReason(
+                    sessionID: "ses-1",
+                    sessionStatus: "paused",
+                    daemonConnected: false,
+                    busy: false,
+                    rescue: eligible,
+                    error: nil
+                )
+            ).contains("not connected")
+        )
+        XCTAssertTrue(
+            try XCTUnwrap(
+                RescueActionAvailability.blockReason(
+                    sessionID: "ses-1",
+                    sessionStatus: "paused",
+                    daemonConnected: true,
+                    busy: true,
+                    rescue: eligible,
+                    error: nil
+                )
+            ).contains("in progress")
+        )
+        XCTAssertTrue(
+            try XCTUnwrap(
+                RescueActionAvailability.blockReason(
+                    sessionID: "ses-1",
+                    sessionStatus: "running",
+                    daemonConnected: true,
+                    busy: false,
+                    rescue: eligible,
+                    error: nil
+                )
+            ).contains("paused, idle, failed, or cancelled")
+        )
+        XCTAssertTrue(
+            try XCTUnwrap(
+                RescueActionAvailability.blockReason(
+                    sessionID: "ses-1",
+                    sessionStatus: "paused",
+                    daemonConnected: true,
+                    busy: false,
+                    rescue: nil,
+                    error: nil
+                )
+            ).contains("unavailable")
+        )
+
+        let dirty = rescueStatus(reason: "dirty", readiness: readiness)
+        XCTAssertEqual(
+            RescueActionAvailability.blockReason(
+                sessionID: "ses-1",
+                sessionStatus: "paused",
+                daemonConnected: true,
+                busy: false,
+                rescue: dirty,
+                error: nil
+            ),
+            dirty.reasonLabel
+        )
+
+        let active = rescueStatus(
+            active: true,
+            grant: RescueGrantView(id: "grant-7", sessionID: "ses-1"),
+            reason: "active_grant",
+            readiness: readiness
+        )
+        XCTAssertEqual(
+            RescueActionAvailability.blockReason(
+                sessionID: "ses-1",
+                sessionStatus: "paused",
+                daemonConnected: true,
+                busy: false,
+                rescue: active,
+                error: nil
+            ),
+            "A rescue grant is already active."
+        )
+
+        let errorReason = try XCTUnwrap(
+            RescueActionAvailability.blockReason(
+                sessionID: "ses-1",
+                sessionStatus: "paused",
+                daemonConnected: true,
+                busy: false,
+                rescue: eligible,
+                error: "RESCUE_STATUS_FAILED while refreshing"
+            )
+        )
+        XCTAssertTrue(errorReason.contains("RESCUE_STATUS_FAILED"))
+        XCTAssertNil(
+            RescueActionAvailability.blockReason(
+                sessionID: "ses-1",
+                sessionStatus: "paused",
+                daemonConnected: true,
+                busy: false,
+                rescue: eligible,
+                error: " "
+            )
+        )
+    }
+
+    func testRescuePreviewsAndLabelsAreBounded() throws {
+        let longDetail = String(repeating: "d", count: 500)
+        let candidates = (0 ..< 9).map { _ in
+            RescueCandidateView(
+                kind: String(repeating: "k", count: 60),
+                id: String(repeating: "i", count: 60),
+                status: String(repeating: "s", count: 60),
+                detail: longDetail,
+                commit: "abcdef1234567890"
+            )
+        }
+        let recommendations = (0 ..< 7).map { _ in String(repeating: "r", count: 500) }
+        let grant = RescueGrantView(
+            id: "grant-8",
+            sessionID: "ses-1",
+            recordedAt: String(repeating: "t", count: 100),
+            expiresAt: String(repeating: "e", count: 100),
+            recordedBy: String(repeating: "b", count: 300),
+            reason: String(repeating: "r", count: 600)
+        )
+        let status = try rescueStatus(
+            active: true,
+            grant: grant,
+            usedAt: nil,
+            eligible: false,
+            reason: "active_grant",
+            readiness: readiness(level: "committed"),
+            nearCompletion: candidates,
+            looping: candidates,
+            recommendations: recommendations
+        )
+        XCTAssertEqual(status.nearCompletionPreview.count, 4)
+        XCTAssertEqual(status.nearCompletionOverflow, 5)
+        XCTAssertEqual(status.loopingPreview.count, 4)
+        XCTAssertEqual(status.loopingOverflow, 5)
+        XCTAssertEqual(status.recommendationPreviews.count, 4)
+        XCTAssertEqual(status.recommendationOverflow, 3)
+        XCTAssertTrue(status.recommendationPreviews.allSatisfy { $0.count <= 200 })
+        XCTAssertTrue(status.nearCompletionPreview.allSatisfy { ($0.detailLabel?.count ?? 0) <= 200 })
+        XCTAssertTrue(status.nearCompletionPreview.allSatisfy { $0.kindLabel.count <= 24 })
+        XCTAssertTrue(status.nearCompletionPreview.allSatisfy { $0.shortCommit == "abcdef123456" })
+        XCTAssertLessThanOrEqual(status.grant?.reasonLabel?.count ?? 1000, 240)
+        XCTAssertLessThanOrEqual(status.grant?.recordedByLabel?.count ?? 1000, 120)
+        XCTAssertEqual(status.grant?.recordedAtLabel.count, 40)
+        XCTAssertEqual(status.grant?.expiresAtLabel.count, 40)
+    }
+
+    func testRescueGrantInputNormalizationTrimsAndBounds() {
+        XCTAssertNil(RescueGrantView.normalizedReason(nil))
+        XCTAssertNil(RescueGrantView.normalizedReason("   "))
+        XCTAssertNil(RescueGrantView.normalizedRecordedBy("\n"))
+        XCTAssertEqual(RescueGrantView.normalizedReason("  finish T1  "), "finish T1")
+        XCTAssertEqual(
+            RescueGrantView.normalizedReason(String(repeating: "r", count: 400))?.count,
+            RescueGrantView.reasonCharacterLimit
+        )
+        XCTAssertEqual(
+            RescueGrantView.normalizedRecordedBy(String(repeating: "b", count: 400))?.count,
+            RescueGrantView.recordedByCharacterLimit
+        )
+    }
+
+    private func rescueStatus(
+        sessionID: String = "ses-1",
+        active: Bool = false,
+        grant: RescueGrantView? = nil,
+        usedAt: String? = nil,
+        usedGrantID: String? = nil,
+        eligible: Bool = false,
+        reason: String = "none",
+        readiness: ReadinessSnapshotView,
+        noProgressTurns: UInt32 = 0,
+        nearCompletion: [RescueCandidateView] = [],
+        looping: [RescueCandidateView] = [],
+        recommendations: [String] = [],
+        reserve: RescueReserveView = RescueReserveView()
+    ) -> RescueStatusView {
+        RescueStatusView(
+            sessionID: sessionID,
+            active: active,
+            grant: grant,
+            usedAt: usedAt,
+            usedGrantID: usedGrantID,
+            eligible: eligible,
+            reason: reason,
+            readiness: readiness,
+            noProgressTurns: noProgressTurns,
+            nearCompletion: nearCompletion,
+            looping: looping,
+            recommendations: recommendations,
+            reserve: reserve,
+            generatedAt: "2026-11-24T00:00:00Z"
+        )
+    }
+
     private func pauseEvent(
         seq: UInt64,
         sessionID: String = "ses-1",
