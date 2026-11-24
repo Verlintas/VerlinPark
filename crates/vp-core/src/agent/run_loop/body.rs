@@ -525,9 +525,36 @@ pub(in crate::agent) async fn run_loop_body(
         ContextCalibration::default()
     };
     let mut team_plan = engine.get_team_plan(&session.id).await?;
+    // Runtime-only effective budgets may use capacity released by completed
+    // tasks in the same department. The original plan stays authoritative for
+    // prompt/context and is never mutated or persisted by this path.
+    let effective_budget_plan = if matches!(spec.role, AgentRole::Worker | AgentRole::Labour)
+        && let Some(task_id) = spec.task_id.as_deref()
+    {
+        match team_plan.as_ref() {
+            Some(plan) => match engine
+                .effective_plan_for_budget(session, plan, task_id)
+                .await
+            {
+                Ok(plan) => plan,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        session_id = %session.id,
+                        task_id,
+                        "envelope reallocation failed; using the stored plan budget"
+                    );
+                    None
+                }
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
     let project_budget = engine.get_project_budget(&project.id).await?;
     let plan_budget = PlanBudgetScope::from_plan(
-        team_plan.as_ref(),
+        effective_budget_plan.as_ref().or(team_plan.as_ref()),
         spec,
         Some(&project_budget.budget),
         &project.id,

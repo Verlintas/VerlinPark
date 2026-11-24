@@ -8706,6 +8706,7 @@ mod auto_budget_cli_tests {
                 "completion_reserve_ratio": 0.25,
                 "attention_cap": 9,
                 "auto_rescue": true,
+                "auto_reallocate_envelopes": true,
                 "stop_policy": {
                     "require_evidence": true,
                     "no_progress_turns": 4,
@@ -8723,6 +8724,8 @@ mod auto_budget_cli_tests {
         assert!(text.contains("reserve     25%"));
         assert!(text.contains("attention   cap 9"));
         assert!(text.contains("auto rescue enabled"));
+        assert!(text.contains("auto envelopes enabled"));
+        assert!(text.contains("stored caps unchanged"));
         assert!(text.contains("no-progress 4 turn(s)"));
         assert!(!text.contains("effects enabled"));
 
@@ -8740,6 +8743,7 @@ mod auto_budget_cli_tests {
             .join("\n");
         assert!(text.contains("built-in defaults"));
         assert!(text.contains("auto rescue disabled"));
+        assert!(text.contains("auto envelopes disabled"));
         assert!(text.contains("evidence required"));
         assert!(text.contains("partial delivery allowed"));
     }

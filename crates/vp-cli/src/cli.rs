@@ -2332,6 +2332,12 @@ pub(crate) enum Command {
         /// Disable automatic completion-reserve rescue.
         #[arg(long, conflicts_with = "auto_rescue")]
         no_auto_rescue: bool,
+        /// Opt in to runtime task-envelope reallocation from completed tasks.
+        #[arg(long, conflicts_with = "no_auto_reallocate_envelopes")]
+        auto_reallocate_envelopes: bool,
+        /// Disable runtime task-envelope reallocation.
+        #[arg(long, conflicts_with = "auto_reallocate_envelopes")]
+        no_auto_reallocate_envelopes: bool,
     },
     /// Enable or disable unlimited budget mode for a session.
     SessionUnlimited {

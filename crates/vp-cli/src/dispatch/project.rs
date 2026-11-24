@@ -329,6 +329,8 @@ pub(super) async fn dispatch(
             no_progress_turns,
             auto_rescue,
             no_auto_rescue,
+            auto_reallocate_envelopes,
+            no_auto_reallocate_envelopes,
         } => {
             if profile.is_none()
                 && reserve.is_none()
@@ -336,13 +338,20 @@ pub(super) async fn dispatch(
                 && no_progress_turns.is_none()
                 && !auto_rescue
                 && !no_auto_rescue
+                && !auto_reallocate_envelopes
+                && !no_auto_reallocate_envelopes
             {
                 bail!(
-                    "pass at least one of --profile, --reserve, --attention-cap, --no-progress-turns, --auto-rescue, or --no-auto-rescue"
+                    "pass at least one of --profile, --reserve, --attention-cap, --no-progress-turns, --auto-rescue, --no-auto-rescue, --auto-reallocate-envelopes, or --no-auto-reallocate-envelopes"
                 );
             }
             if auto_rescue && no_auto_rescue {
                 bail!("--auto-rescue and --no-auto-rescue are mutually exclusive");
+            }
+            if auto_reallocate_envelopes && no_auto_reallocate_envelopes {
+                bail!(
+                    "--auto-reallocate-envelopes and --no-auto-reallocate-envelopes are mutually exclusive"
+                );
             }
             // Read-modify-write: unspecified fields keep the stored policy.
             let current = rpc(
@@ -376,6 +385,12 @@ pub(super) async fn dispatch(
             }
             if no_auto_rescue {
                 policy.auto_rescue = false;
+            }
+            if auto_reallocate_envelopes {
+                policy.auto_reallocate_envelopes = true;
+            }
+            if no_auto_reallocate_envelopes {
+                policy.auto_reallocate_envelopes = false;
             }
             rpc(
                 &discovery,
@@ -858,6 +873,7 @@ mod tests {
             "--no-progress-turns",
             "4",
             "--auto-rescue",
+            "--auto-reallocate-envelopes",
         ])
         .unwrap();
         match cli.command {
@@ -869,6 +885,8 @@ mod tests {
                 no_progress_turns,
                 auto_rescue,
                 no_auto_rescue,
+                auto_reallocate_envelopes,
+                no_auto_reallocate_envelopes,
             } => {
                 assert_eq!(project, "proj-1");
                 assert_eq!(profile.as_deref(), Some("fast"));
@@ -877,6 +895,8 @@ mod tests {
                 assert_eq!(no_progress_turns, Some(4));
                 assert!(auto_rescue);
                 assert!(!no_auto_rescue);
+                assert!(auto_reallocate_envelopes);
+                assert!(!no_auto_reallocate_envelopes);
             }
             other => panic!("expected project-run-policy-set, got {other:?}"),
         }
@@ -895,6 +915,24 @@ mod tests {
             }
             other => panic!("expected project-run-policy-set, got {other:?}"),
         }
+        let cli = Cli::try_parse_from([
+            "vp",
+            "project-run-policy-set",
+            "proj-1",
+            "--no-auto-reallocate-envelopes",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::ProjectRunPolicySet {
+                auto_reallocate_envelopes,
+                no_auto_reallocate_envelopes,
+                ..
+            } => {
+                assert!(!auto_reallocate_envelopes);
+                assert!(no_auto_reallocate_envelopes);
+            }
+            other => panic!("expected project-run-policy-set, got {other:?}"),
+        }
         assert!(
             Cli::try_parse_from([
                 "vp",
@@ -905,6 +943,17 @@ mod tests {
             ])
             .is_err(),
             "the flags must be mutually exclusive"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "vp",
+                "project-run-policy-set",
+                "proj-1",
+                "--auto-reallocate-envelopes",
+                "--no-auto-reallocate-envelopes",
+            ])
+            .is_err(),
+            "the envelope flags must be mutually exclusive"
         );
     }
 }

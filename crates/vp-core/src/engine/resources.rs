@@ -1703,6 +1703,7 @@ mod tests {
                 ..RunStopPolicy::default()
             },
             auto_rescue: false,
+            auto_reallocate_envelopes: false,
         };
         let saved = engine
             .set_project_run_policy(SetProjectRunPolicyParams {

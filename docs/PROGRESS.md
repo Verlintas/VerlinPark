@@ -1,7 +1,7 @@
 # VerlinPark 进度
 
 > 最后更新：2026-11-25
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark + task contracts/intent authorization/MCP schema pins + effect receipts/postconditions + external gates/durable waits + runtime pinning/controller replay + reliability/OTel + project-scoped identities S1–S8 + failure attribution/cascade + production hardening rounds 1–3 (ADR-0213/0214/0215) + C7 bounded fan-out (ADR-0216) + C8 tool search v2 (ADR-0217) + C9 MCP async tasks (ADR-0218) + C10 Code Mode (ADR-0219) + C11 loopback A2A (ADR-0221) + C12 advisory progress ledger (ADR-0220) + M3.1 store split 已跑通 + Run Contract R3a allocation preview/R4a trade-off preview + opt-in one-shot auto rescue
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark + task contracts/intent authorization/MCP schema pins + effect receipts/postconditions + external gates/durable waits + runtime pinning/controller replay + reliability/OTel + project-scoped identities S1–S8 + failure attribution/cascade + production hardening rounds 1–3 (ADR-0213/0214/0215) + C7 bounded fan-out (ADR-0216) + C8 tool search v2 (ADR-0217) + C9 MCP async tasks (ADR-0218) + C10 Code Mode (ADR-0219) + C11 loopback A2A (ADR-0221) + C12 advisory progress ledger (ADR-0220) + M3.1 store split 已跑通 + Run Contract R3a allocation preview/R3b runtime envelope reallocation/R4a trade-off preview + opt-in one-shot auto rescue
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
@@ -49,6 +49,14 @@ Verifier 或 Integrator。
   risk/blocker/blocked effect 或 token/cost/time completion-reserve pressure
   等确定性证据存在时，才把另一个 profile 标为 recommended；当前 profile 不会
   被重复标成 recommended，视图也从不切换 profile。
+- `ProjectRunPolicy.auto_reallocate_envelopes`（默认关闭）：Worker/Labour
+  run 可以在同一 department 内复用已完成 task 未花掉的 token/cost capacity，
+  得到 runtime-only effective task budget。每个 source 在 event 中只能使用
+  一次；target 已有 event 时幂等重放；已完成 target 可以用它的 effective
+  budget 继续作为 source；plan revision 会使旧 override 失效，避免把新计划
+  重新放宽。stored TeamPlan、department/session/project caps、approval、
+  Verifier、Integrator 都不变，runtime plan 只供 task admission/budget
+  scope 使用；event 读取/追加有 same-daemon lock。
 - `ProjectRunPolicy.auto_rescue`（默认关闭）：项目显式 opt-in 后，turn
   boundary 只有在暂停原因正好是 `completion_reserve_*`、session 为 fixed
   budget、readiness 处于 near-completion、存在 latest commit、
@@ -66,15 +74,16 @@ Verifier 或 Integrator。
   显式刷新时加载，拒绝返回其他 session 的响应；不参与 selection sweep。
   最终 GUI smoke 还验证了 `active reserve 20% · project policy · profile rows
   are documented posture`、profile 行显示 `posture 25%`、`0/0 task(s)
-  estimated`，以及 CURRENT 不会同时出现 RECOMMENDED；policy editor 保存后
-  daemon 返回 `auto_rescue=true`。
-- 明确未完成：automatic per-task envelope reallocation（需要 event-backed plan
-  revision、reservation 交互和 no-widening 校验）、daily attention schedule、
-  更完整的 anytime UI、learned estimates/confidence。自动 rescue 的串行化是
-  same-daemon，跨 host 不成立；project RunPolicy 保存仍是整包
-  read-modify-write，没有 updated_at/CAS 前置条件。
+  estimated`，以及 CURRENT 不会同时出现 RECOMMENDED；policy editor 也显示 `AUTO ENVELOPES ON` 并保存两个 opt-in；daemon 返回
+  `auto_rescue=true` 和 `auto_reallocate_envelopes=true`。
+- 明确未完成：persisted plan-revision reallocation、跨 department/session 的
+  budget pooling、reservation 重分配、daily attention schedule、更完整的
+  anytime UI、learned estimates/confidence。R3b 是 event-derived runtime
+  overlay，不是 TeamPlan 重写；自动 rescue 与 envelope 串行化是 same-daemon，
+  跨 host 不成立；project RunPolicy 保存仍是整包 read-modify-write，没有
+  updated_at/CAS 前置条件。
 - 测试：targeted allocation/tradeoff/rescue/protocol/CLI/daemon + full
-  workspace **4,633 passed / 0 failed / 6 ignored**；Swift
+  workspace **4,641 passed / 0 failed / 6 ignored**；Swift
   **659 passed（527 app + 132 helper）**；`cargo fmt --check`、
   `cargo clippy --workspace --all-targets -- -D warnings`、`swiftformat --lint`
   和 `xcodebuild test` 通过。临时 daemon CLI smoke 覆盖 `project-run-policy-set`

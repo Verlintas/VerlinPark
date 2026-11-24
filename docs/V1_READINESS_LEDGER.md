@@ -75,7 +75,7 @@ Verification gaps:
 | V1-D09 | S1 | A bare Python `unittest` project without pyproject/pytest metadata was reported as `PROJECT_UNSUPPORTED`, pushing Agent runs into shell guessing. | **CLOSED** | `project_profile` detects `tests/test_*.py` and proposes `python3 -m unittest discover -s tests -v`; regression test covers the bare fixture |
 | V1-D10 | S1 | Contract analysis treated scratch verification writes and absolute read-only git commands as host-state/scope violations, creating repeated approvals and `.scratch-proof` artifacts in the worktree. | **CLOSED (P0)** | Shell exports `$VERLINPARK_WORKTREE`/`$VERLINPARK_SCRATCH`; prompts/recipes say cwd is the worktree; contract allows the stable scratch/TMPDIR prefixes; absolute read-only git (`status/diff/log/show/rev-parse/...`) is ReadOnly; `clean`/`reset --hard` remains Destructive. Tests cover all paths. |
 | V1-D11 | S1 | Fixed token budgets charged cache-read input at full weight, ignored missing prices, starved verification, and failed solvable runs; the dashboard could not show the difference between cheap-but-stuck and expensive-near-completion. | **PARTIAL (R2a)** | R1 exposes raw vs weighted tokens, money with `pricing_source`, time, attention, risk, context, capacity, quality, and progress plus readiness/forecast. R2a adds operator top-up (clamped to caps) and pre-dispatch completion-reserve deferral. Raw token caps remain authoritative; cost-weighted settlement/automatic reallocation is R2b/R3. |
-| V1-D12 | S2 | Operator attention had no budget or governor: repeated host-state approvals could consume the run without triggering a policy decision. | **PARTIAL (R2b)** | Pre-dispatch deferral and a true turn-boundary pause (`session.resource.paused`) now stop new work at the attention cap; a bare resume re-pauses until the cap/policy changes. The pause carries a bounded attention batch (risk groups + at most 8 approval metadata rows, no raw input) and the Stage banner opens Inbox or Policies. The existing approval queue, coalescing, and batch resolve remain the only decision path; no automatic grant/template/profile. Explicit partial delivery is event-only and available; rescue reserve is implemented, while automatic task-envelope reallocation remains an R3 item. |
+| V1-D12 | S2 | Operator attention had no budget or governor: repeated host-state approvals could consume the run without triggering a policy decision. | **PARTIAL (R2b)** | Pre-dispatch deferral and a true turn-boundary pause (`session.resource.paused`) now stop new work at the attention cap; a bare resume re-pauses until the cap/policy changes. The pause carries a bounded attention batch (risk groups + at most 8 approval metadata rows, no raw input) and the Stage banner opens Inbox or Policies. The existing approval queue, coalescing, and batch resolve remain the only decision path; no automatic grant/template/profile. Explicit partial delivery is event-only and available; rescue reserve and opt-in R3b runtime task-envelope reallocation are implemented; persisted plan-revision reallocation remains open. |
 
 ## Run Contract R1/R2a/R2b (2026-11-24)
 
@@ -145,8 +145,8 @@ Implemented the observe/operator slice from ADR-0234:
   appends one `session.resource.rescue.used` receipt; hard caps, attention,
   context, approvals, Verifier, and Integrator remain authoritative. CLI and
   the Stage confirmation sheet surface it. Reallocation recommendations are
-  advisory only; automatic task-envelope mutation belongs to R3 with per-task
-  envelope allocation.
+  advisory only; R3a adds per-task envelopes and R3b adds opt-in runtime
+  reallocation, while persisted plan-budget mutation remains open.
 - Readiness snapshot cache: `session_resources` reuses readiness for 2 seconds,
   keyed by the newest session event sequence, bounded to 64 sessions. Any new
   event invalidates it. `session.readiness`, partial-delivery/rescue actions,
@@ -187,11 +187,13 @@ temp-daemon CLI smoke exercised `run-contract-set`, `resources`, `top-up`, and
 `readiness` end to end; a temp-daemon GUI smoke exercised first-selection
 resource loading and the Project RunPolicy card/editor.
 
-## Run Contract R3a/R4a (2026-11-25)
+## Run Contract R3a/R3b/R4a (2026-11-25)
 
-R3/R4 now have read-only allocation and trade-off previews plus one explicit
-opt-in automatic action. No preview mutates a task envelope, budget, model
-route, approval, effect, Verifier, or merge row.
+R3/R4 now have read-only allocation and trade-off previews plus two explicit
+project opt-ins: one-shot completion-reserve rescue and runtime envelope
+reallocation. No preview mutates stored state; R3b uses a runtime-only plan
+copy and never rewrites the stored TeamPlan, budget, model route, approval,
+effect, Verifier, or merge row.
 
 - `session.allocation` / `vp allocation` reconciles the session envelope,
   stored TeamPlan DAG/critical path, task queue, bounded project usage history
@@ -231,13 +233,24 @@ route, approval, effect, Verifier, or merge row.
   the normal resource pause is kept, while a failure to persist the one-shot
   consumption receipt fails closed and stops the turn. The grant releases only
   the completion reserve for its 30-minute TTL.
-- macOS: Project RunPolicy toggle with the one-shot/fixed-budget/no-bypass
-  caveat, and Manage Dash → Usage & Budget Allocation insight and Trade-offs &
-  quality cards. The cards load only when visible or explicitly refreshed,
-  reject responses for another session, and fail closed to a visible error.
-- CLI: `project-run-policy-set --auto-rescue/--no-auto-rescue`, `allocation`,
-  and `tradeoffs`. The project RunPolicy human renderer now includes the auto
-  rescue state without changing the existing shape.
+- `ProjectRunPolicy.auto_reallocate_envelopes` is off by default. When enabled,
+  a Worker/Labour run gets a runtime-only effective task budget from unused
+  token/cost capacity of already-completed tasks in the same department. Sources
+  are single-use in `session.envelope.reallocated` events; a prior target event
+  replays idempotently, a completed target can become a source with its
+  effective budget, and a plan revision invalidates an old override instead of
+  widening the new plan. The stored TeamPlan and every department, session, and
+  project cap are unchanged; a same-daemon lock serializes event read/append.
+- macOS: Project RunPolicy toggles for completion-reserve rescue and runtime
+  envelope reallocation, with the fixed-budget/no-bypass and
+  stored-plan/caps-unchanged caveats, and Manage Dash → Usage & Budget Allocation
+  insight and Trade-offs & quality cards. The cards load only when visible or
+  explicitly refreshed, reject responses for another session, and fail closed to
+  a visible error.
+- CLI: `project-run-policy-set --auto-rescue/--no-auto-rescue`,
+  `--auto-reallocate-envelopes/--no-auto-reallocate-envelopes`, `allocation`,
+  and `tradeoffs`. The project RunPolicy human renderer includes both automatic
+  states with short caveats.
 - A temp-daemon CLI smoke exercised `project-run-policy-set --auto-rescue`,
   `project-run-policy`, `allocation`, and `tradeoffs` against a real daemon and
   temporary repository. A temp-daemon GUI smoke exercised the two cards and the
@@ -245,19 +258,26 @@ route, approval, effect, Verifier, or merge row.
   policy · profile rows are documented posture`, profile rows showed `posture
   25%` rather than an implied contract change, the allocation card showed
   `0/0 task(s) estimated`, and CURRENT was not duplicated by RECOMMENDED. The
-  policy editor saved auto rescue on and the daemon reported `true`. No provider
-  was configured, so no live turn-boundary auto rescue was triggered
-  (unit/daemon tests cover the grant path).
+  policy editor also showed `AUTO ENVELOPES ON`, saved both opt-ins, and the
+  daemon reported `auto_rescue=true` and
+  `auto_reallocate_envelopes=true`. No provider was configured, so no live
+  turn-boundary auto rescue or runtime envelope reallocation was triggered
+  (unit/daemon tests cover both paths).
 - Tests: targeted allocation, trade-off, auto-rescue, protocol, CLI, and
-  daemon tests; full workspace **4,633 passed / 0 failed / 6 ignored**;
+  daemon tests; full workspace **4,641 passed / 0 failed / 6 ignored**;
   Swift **659 passed (527 app + 132 helper)**; fmt, clippy,
   SwiftFormat, and `xcodebuild test` pass.
-- Limits: automatic per-task envelope reallocation and the daily attention
-  schedule remain open. Estimates are sparse historical heuristics, not vendor
-  token counts; test-cache evidence may predate the latest commit; confidence
-  is not a calibrated probability; profile forecasts are not per-profile;
-  profile reserves are documented posture, not automatic contract changes; the
-  auto-rescue lock is same-daemon only; project RunPolicy saves remain a
+- Limits: persisted plan-revision reallocation, cross-department/session
+  pooling, reservation redistribution, and the daily attention schedule remain
+  open. R3b is an event-derived runtime overlay, not a TeamPlan rewrite; it
+  scans the newest 1,000 reallocation events, so source single-use memory can
+  be forgotten after very heavy plan revision (department/session/project caps
+  still bound actual spend). Estimates are sparse historical heuristics, not
+  vendor token counts;
+  test-cache evidence may predate the latest commit; confidence is not a
+  calibrated probability; profile forecasts are not per-profile; profile
+  reserves are documented posture, not automatic contract changes; rescue and
+  envelope locks are same-daemon only; project RunPolicy saves remain a
   whole-policy read-modify-write without a compare-and-set precondition, so
   concurrent editors can lose the other field.
 

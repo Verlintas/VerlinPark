@@ -285,6 +285,10 @@ pub struct Engine {
     /// boundaries could observe zero prior grants and append two automatic
     /// grants, or consume the same grant twice.
     rescue_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes runtime envelope reallocation event reads and appends so two
+    /// task runs cannot consume one completed source twice or write two events
+    /// for the same target.
+    envelope_reallocation_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// In-process serialization for workspace-bound Worker runs. Cross-session
@@ -362,6 +366,7 @@ impl Engine {
             workspace_runs: Arc::new(WorkspaceRunLocks::default()),
             readiness_cache: Arc::new(Mutex::new(HashMap::new())),
             rescue_lock: Arc::new(tokio::sync::Mutex::new(())),
+            envelope_reallocation_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 

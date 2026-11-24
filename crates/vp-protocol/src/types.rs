@@ -3789,6 +3789,11 @@ pub struct ProjectRunPolicy {
     /// a clean near-completion commit. Default off.
     #[serde(default)]
     pub auto_rescue: bool,
+    /// Opt in to a runtime-only effective task budget that can use unused
+    /// token/cost capacity from already-completed tasks in the same department.
+    /// The stored TeamPlan and all hard caps remain unchanged. Default off.
+    #[serde(default)]
+    pub auto_reallocate_envelopes: bool,
 }
 
 fn default_project_run_completion_reserve_ratio() -> f64 {
@@ -3807,6 +3812,7 @@ impl Default for ProjectRunPolicy {
             attention_cap: default_project_run_attention_cap(),
             stop_policy: RunStopPolicy::default(),
             auto_rescue: false,
+            auto_reallocate_envelopes: false,
         }
     }
 }
@@ -27962,6 +27968,23 @@ mod agent_inspector_protocol_tests {
             updated_by: None,
         };
         valid.validate().unwrap();
+    }
+
+    #[test]
+    fn project_run_policy_auto_features_default_off_and_round_trip() {
+        let minimal: ProjectRunPolicy = serde_json::from_value(json!({})).unwrap();
+        assert!(!minimal.auto_rescue);
+        assert!(!minimal.auto_reallocate_envelopes);
+
+        let policy = ProjectRunPolicy {
+            auto_rescue: true,
+            auto_reallocate_envelopes: true,
+            ..ProjectRunPolicy::default()
+        };
+        let decoded: ProjectRunPolicy =
+            serde_json::from_value(serde_json::to_value(&policy).unwrap()).unwrap();
+        assert_eq!(decoded, policy);
+        assert!(decoded.auto_reallocate_envelopes);
     }
 }
 

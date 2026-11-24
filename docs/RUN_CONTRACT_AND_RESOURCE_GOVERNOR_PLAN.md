@@ -1,6 +1,6 @@
 # Run Contract and Resource Governor plan
 
-- Status: Accepted; P0/R1/R2a/R2b implemented plus the R3 allocation / R4 trade-off preview slice; automatic per-task envelope reallocation and the daily attention schedule remain open (see R3/R4 below)
+- Status: Accepted; P0/R1/R2a/R2b implemented plus the R3 allocation preview and opt-in runtime per-task envelope reallocation and the R4 trade-off/quality preview slice; persisted plan-revision reallocation and the daily attention schedule remain open (see R3/R4 below)
 - Date: 2026-11-24
 - Owner: Verlintas
 - Scope: V1 single-project coding
@@ -594,11 +594,11 @@ Implemented:
 
 Remaining:
 
-- None in R2b. The R3a preview now shows per-task envelopes and recommends
-  reallocation, but automatic task-envelope reallocation itself remains open in
-  R3 (see below).
+- None in R2b. R3a shows per-task envelopes and R3b adds opt-in event-backed
+  runtime reallocation from completed tasks; persisted plan-revision
+  reallocation remains open (see below).
 
-### R3 — Allocate (preview implemented; automatic reallocation open)
+### R3 — Allocate (preview + runtime reallocation implemented; persisted reallocation open)
 
 Implemented (R3a):
 
@@ -627,23 +627,33 @@ Implemented (R3a):
   stalled/failed/retrying tasks), and attention/trust calibration are bounded
   and advisory. The preview appends no event and changes no task envelope,
   budget, model, route, approval, effect, Verifier, or merge state.
-- `ProjectRunPolicy.auto_rescue` (default off) is the only automatic action in
-  this slice: at a turn boundary that pauses exactly on
-  `completion_reserve_*`, an eligible fixed-budget, near-completion session with
-  a latest commit, no no-progress turns, headroom, and no prior rescue grant may
-  receive one automatic grant. Concurrent boundaries are serialized in-process;
-  manual grants consume the same one-shot allowance. The grant releases only the
-  completion reserve for its normal TTL and never raises a hard cap.
-- CLI `--auto-rescue` / `--no-auto-rescue`, the macOS policy toggle, and the
-  Manage Dash allocation/trade-off cards use only these daemon surfaces.
+- `ProjectRunPolicy.auto_rescue` (default off) is the automatic reserve action:
+  at a turn boundary that pauses exactly on `completion_reserve_*`, an eligible
+  fixed-budget, near-completion session with a latest commit, no no-progress
+  turns, headroom, and no prior rescue grant may receive one automatic grant.
+  Manual/automatic grants and consumption share one in-process lock; a manual
+  grant consumes the one-shot allowance. The grant releases only the completion
+  reserve for its normal TTL and never raises a hard cap.
+- R3b `ProjectRunPolicy.auto_reallocate_envelopes` (default off) lets a
+  Worker/Labour run use a runtime-only effective task budget built from unused
+  token/cost capacity of already-completed tasks in the same department.
+  Sources are single-use event records; a target's prior event replays
+  idempotently; a completed target can become a source using its effective
+  budget. A plan revision invalidates an old override rather than widening the
+  new plan. The stored TeamPlan and department/session/project caps are never
+  changed, and the runtime plan is used only for task admission/budget scope.
+- CLI `--auto-rescue` / `--no-auto-rescue`,
+  `--auto-reallocate-envelopes` / `--no-auto-reallocate-envelopes`, the macOS
+  policy toggles, and the Manage Dash allocation/trade-off cards use only these
+  daemon surfaces.
 
 Remaining:
 
-- Automatic per-task envelope reallocation. The preview recommends
-  reallocation but never rewrites a plan/task budget. A safe implementation
-  needs event-backed plan revision semantics, reservation interaction, and
-  explicit no-widening checks; it is deliberately not inferred from the
-  preview.
+- Persisted plan-revision reallocation. R3b is an event-derived runtime overlay,
+  not a TeamPlan rewrite; cross-department/session reallocation, reservation
+  redistribution, and a revisioned plan budget remain open. Its 1,000-event
+  source-single-use window can forget very old sources after heavy plan
+  revision, though hard caps still bound actual spend.
 - Learning from actuals beyond deterministic project/department nearest-rank
   p50/p90; no model training or hidden routing.
 - LLM replanning; replan recommendations remain textual/advisory.
@@ -687,7 +697,7 @@ Remaining:
 | Area | Tests |
 |---|---|
 | Resource math | cache weighting, missing prices, output weight, clamping, p50/p90 |
-| Allocation (R3a) | estimate precedence, partial/insufficient estimates, critical-path focus/availability, token/cost/time pressure, task-budget and cost-only feasibility, no-event preview, serialized one-shot auto rescue |
+| Allocation (R3a/R3b) | estimate precedence, partial/insufficient estimates, critical-path focus/availability, token/cost/time pressure, task-budget and cost-only feasibility, no-event preview, serialized one-shot auto rescue, runtime envelope reallocation (single-use sources, idempotent replay, department caps, plan-revision invalidation) |
 | Trade-offs (R4a) | five profiles, active reserve vs posture, test-cache pass/fail, queued/merged distinction, confidence heuristic, deterministic recommended profile, no profile switch |
 | Contract | derive/validate/profile bounds/reserve/risk/attention/no widening |
 | Governor | pre-dispatch infeasibility, continue/throttle/reallocate/rescue/pause/stop/replan, no hidden routing |
@@ -723,7 +733,7 @@ Remaining:
 
 ## 20. Immediate implementation slice
 
-Implemented **P0 + R1 + R2a + R2b core + R3a/R4a previews**:
+Implemented **P0 + R1 + R2a + R2b core + R3a/R3b/R4a**:
 
 - tool friction fixes with tests;
 - read-only resource/readiness/contract RPCs and CLI;
@@ -744,10 +754,14 @@ Implemented **P0 + R1 + R2a + R2b core + R3a/R4a previews**:
   metareasoning, attention/trust calibration, RPC/CLI, and macOS card;
 - opt-in one-shot automatic completion-reserve rescue
   (`ProjectRunPolicy.auto_rescue`, CLI/GUI, serialized turn-boundary path);
+- R3b opt-in runtime per-task envelope reallocation
+  (`ProjectRunPolicy.auto_reallocate_envelopes`, CLI/GUI, event-backed
+  single-use completed-task capacity, department/session/project caps
+  unchanged, plan-revision invalidation);
 - R4a read-only trade-off frontier, quality/reviewability review, calibrated
   confidence, deterministic advisory profile recommendation, RPC/CLI, and
   macOS card;
 - ledger/docs updated with the multi-resource model.
 
-Next: R3 automatic per-task envelope reallocation (with plan-revision and
-reservation semantics), then the R4 daily attention schedule.
+Next: persisted plan-revision reallocation with reservation semantics, then the
+R4 daily attention schedule.

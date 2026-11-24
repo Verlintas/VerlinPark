@@ -438,6 +438,10 @@ struct ProjectRunPolicyCard: View {
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundStyle(policy.autoRescue ? VPTheme.warning : .secondary)
                     .fixedSize(horizontal: false, vertical: true)
+                Text(policy.autoReallocateDetail)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(policy.autoReallocateEnvelopes ? VPTheme.warning : .secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 if let error = model.projectRunPolicyError {
                     Label(error.displayText, systemImage: "exclamationmark.triangle.fill")
                         .font(.system(size: 9, design: .monospaced))
@@ -538,6 +542,16 @@ struct ProjectRunPolicyCard: View {
                     .background(VPTheme.warning.opacity(0.10), in: Capsule())
                     .help(policy?.autoRescueDetail ?? "")
             }
+            if policy?.autoReallocateEnvelopes == true {
+                Text("AUTO ENVELOPES ON")
+                    .font(.system(size: 7, weight: .semibold, design: .monospaced))
+                    .tracking(0.3)
+                    .foregroundStyle(VPTheme.warning)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(VPTheme.warning.opacity(0.10), in: Capsule())
+                    .help(policy?.autoReallocateDetail ?? "")
+            }
         }
     }
 
@@ -548,6 +562,7 @@ struct ProjectRunPolicyCard: View {
             policyMetric("Attention cap", policy.attentionLabel)
             policyMetric("No progress", policy.noProgressLabel)
             policyMetric("Auto rescue", policy.autoRescueLabel)
+            policyMetric("Auto envelopes", policy.autoReallocateLabel)
         }
     }
 
@@ -634,6 +649,7 @@ struct ProjectRunPolicySheet: View {
                     fields
                     stopPolicy
                     autoRescuePolicy
+                    autoEnvelopePolicy
                     validationLine
                     feedback
                     note
@@ -792,6 +808,24 @@ struct ProjectRunPolicySheet: View {
             .controlSize(.small)
             Text(
                 "Explicit project opt-in. The daemon grants at most one automatic completion-reserve rescue per session, only for eligible fixed-budget near-completion work. It never adds budget, removes caps, changes model routing, or bypasses Verifier/Integrator; approvals, sandbox, and task contracts still apply. Off by default."
+            )
+            .font(VPTheme.mono(7))
+            .foregroundStyle(VPTheme.textTertiary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+        .disabled(!projectMatches || model.projectRunPolicyBusy)
+    }
+
+    private var autoEnvelopePolicy: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Toggle(
+                "Reuse unused completed-task capacity at runtime",
+                isOn: valueBinding(\.autoReallocateEnvelopes)
+            )
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            Text(
+                "Explicit project opt-in. Worker/Labour runtime task budgets may reuse unused token/cost capacity from completed tasks in the same department. The stored TeamPlan and department/session/project caps are unchanged; approvals, Verifier, and Integrator still apply, and a plan revision invalidates an old runtime override. Off by default."
             )
             .font(VPTheme.mono(7))
             .foregroundStyle(VPTheme.textTertiary)

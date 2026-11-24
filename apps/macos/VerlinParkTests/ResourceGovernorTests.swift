@@ -1864,28 +1864,42 @@ final class ResourceGovernorTests: XCTestCase {
         let decoded = try JSONDecoder().decode(ProjectRunPolicyView.self, from: legacy)
         XCTAssertFalse(decoded.autoRescue)
         XCTAssertEqual(decoded.autoRescueLabel, "Off")
+        XCTAssertFalse(decoded.autoReallocateEnvelopes)
+        XCTAssertEqual(decoded.autoReallocateLabel, "Off")
         XCTAssertFalse(ProjectRunPolicyView().autoRescue)
         XCTAssertFalse(ProjectRunPolicyDraft().autoRescue)
+        XCTAssertFalse(ProjectRunPolicyView().autoReallocateEnvelopes)
+        XCTAssertFalse(ProjectRunPolicyDraft().autoReallocateEnvelopes)
 
         let enabled = try XCTUnwrap("""
         {"default_profile":"fast","completion_reserve_ratio":0.1,
-         "attention_cap":5,"stop_policy":{},"auto_rescue":true}
+         "attention_cap":5,"stop_policy":{},"auto_rescue":true,
+         "auto_reallocate_envelopes":true}
         """.data(using: .utf8))
         let decodedEnabled = try JSONDecoder().decode(ProjectRunPolicyView.self, from: enabled)
         XCTAssertTrue(decodedEnabled.autoRescue)
         XCTAssertEqual(decodedEnabled.autoRescueLabel, "On")
         XCTAssertTrue(decodedEnabled.autoRescueDetail.contains("at most one"))
+        XCTAssertTrue(decodedEnabled.autoReallocateEnvelopes)
+        XCTAssertEqual(decodedEnabled.autoReallocateLabel, "On")
+        XCTAssertTrue(decodedEnabled.autoReallocateDetail.contains("stored TeamPlan"))
 
         var draft = ProjectRunPolicyDraft(policy: decodedEnabled)
         XCTAssertTrue(draft.autoRescue)
+        XCTAssertTrue(draft.autoReallocateEnvelopes)
         XCTAssertEqual(try draft.makePolicy().autoRescue, true)
+        XCTAssertEqual(try draft.makePolicy().autoReallocateEnvelopes, true)
         draft.autoRescue = false
+        draft.autoReallocateEnvelopes = false
         XCTAssertEqual(try draft.makePolicy().autoRescue, false)
+        XCTAssertEqual(try draft.makePolicy().autoReallocateEnvelopes, false)
 
         let encoded = try XCTUnwrap(decodedEnabled.jsonValue().objectValue)
         XCTAssertEqual(encoded["auto_rescue"]?.boolValue, true)
+        XCTAssertEqual(encoded["auto_reallocate_envelopes"]?.boolValue, true)
         let encodedOff = try XCTUnwrap(ProjectRunPolicyView().jsonValue().objectValue)
         XCTAssertEqual(encodedOff["auto_rescue"]?.boolValue, false)
+        XCTAssertEqual(encodedOff["auto_reallocate_envelopes"]?.boolValue, false)
     }
 
     private func rescueStatus(

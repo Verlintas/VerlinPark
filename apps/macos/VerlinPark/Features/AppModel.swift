@@ -5648,7 +5648,7 @@ final class AppModel {
             projectRunPolicyStatus = "Project RunPolicy defaults saved."
             showToast(
                 "RunPolicy defaults saved",
-                detail: "\(result.policy.profileTitle) · reserve \(result.policy.reservePercentLabel) · attention \(result.policy.attentionLabel)",
+                detail: "\(result.policy.profileTitle) · reserve \(result.policy.reservePercentLabel) · attention \(result.policy.attentionLabel) · envelopes \(result.policy.autoReallocateLabel)",
                 kind: .success
             )
             return true

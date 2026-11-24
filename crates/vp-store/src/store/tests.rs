@@ -19773,6 +19773,7 @@ fn project_run_policy_round_trips_manifest_and_legacy_defaults() {
             ..vp_protocol::types::RunStopPolicy::default()
         },
         auto_rescue: true,
+        auto_reallocate_envelopes: true,
     };
     let saved_at = store.set_project_run_policy(&project.id, &policy).unwrap();
     assert!(!saved_at.is_empty());

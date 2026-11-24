@@ -182,9 +182,9 @@ Phase 1 adds read-only, bounded views:
 These views are additive in protocol v1. They do not expose prompts, raw tool
 output, secrets, or unbounded event payloads.
 
-### 10. Read-only allocation and trade-off surfaces (R3a/R4a)
+### 10. Allocation, runtime envelope reallocation, and trade-off surfaces (R3a/R3b/R4a)
 
-The first R3/R4 slice is deliberately read-only and advisory:
+The R3/R4 slice is read-only/advisory except for two explicit project opt-ins:
 
 - `session.allocation` / `vp allocation` reconciles the session envelope, the
   stored TeamPlan DAG and critical path, the task queue, bounded project usage
@@ -219,15 +219,29 @@ The first R3/R4 slice is deliberately read-only and advisory:
   approvals, contracts, the sandbox, the Verifier, or the Integrator. A failure
   to persist the one-shot consumption receipt fails closed and stops the turn
   rather than leaving the reserve released.
+- `ProjectRunPolicy.auto_reallocate_envelopes` (default off) lets a
+  Worker/Labour run use a runtime-only effective task budget built from unused
+  token/cost capacity of already-completed tasks in the same department. Each
+  source is single-use in an event-derived record; a target's prior event
+  replays idempotently, a completed target can become a source using its
+  effective budget, and a plan revision invalidates an old override instead of
+  widening the new plan. The stored TeamPlan and every department, session, and
+  project cap remain unchanged; the runtime plan is used only for task
+  admission/budget scope. A same-daemon lock serializes event read/append.
 - Both preview RPCs append no events and mutate nothing. The macOS cards load
   only when visible or explicitly refreshed and reject a response for a
   different session.
 
-Limits: automatic per-task envelope reallocation and the daily attention
-schedule remain open. Historical estimates are sparse and are not vendor token
-counts; confidence is a heuristic, not a calibrated probability; profile
-forecasts repeat the existing session forecast and are not per-profile
-guarantees; auto-rescue serialization is same-daemon only.
+Limits: persisted plan-revision reallocation and the daily attention schedule
+remain open; R3b is an event-derived runtime overlay for one department, not a
+TeamPlan rewrite or cross-department/session budget pool. It scans the newest
+1,000 reallocation events, so source single-use memory can be forgotten after
+very heavy plan revision (hard department/session/project caps still bound
+actual spend). Historical estimates
+are sparse and are not vendor token counts; confidence is a heuristic, not a
+calibrated probability; profile forecasts repeat the existing session forecast
+and are not per-profile guarantees; rescue and envelope serialization are
+same-daemon only.
 
 ## Consequences
 
@@ -318,8 +332,10 @@ Negative and limits:
 4. **R3 allocate**: R3a implements the read-only task/plan-aware allocation
    preview, critical-path feasibility, project/department p50/p90,
    diagnosis/metareasoning, and the opt-in one-shot automatic
-   completion-reserve rescue. Automatic per-task envelope reallocation,
-   reservation-aware plan revision, and learned estimates remain open.
+   completion-reserve rescue. R3b adds opt-in, event-backed, runtime-only
+   per-task envelope reallocation from completed same-department tasks.
+   Persisted plan-revision reallocation, cross-department/session pooling,
+   reservation-aware redistribution, and learned estimates remain open.
 5. **R4 deliver**: R4a implements the trade-off frontier, quality/reviewability
    review, calibrated-confidence heuristic, deterministic advisory profile
    recommendation, and macOS cards. The daily attention schedule and a broader

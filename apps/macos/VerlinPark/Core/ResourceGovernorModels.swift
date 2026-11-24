@@ -847,6 +847,9 @@ struct ProjectRunPolicyView: Codable, Sendable, Equatable {
     /// rescue per session. Off unless the daemon reports it on; it can never
     /// add budget, remove a cap, change routing, or bypass Verifier/Integrator.
     let autoRescue: Bool
+    /// Opt-in runtime-only reuse of unused completed-task capacity inside one
+    /// department. The stored plan and every hard cap stay unchanged.
+    let autoReallocateEnvelopes: Bool
 
     enum CodingKeys: String, CodingKey {
         case defaultProfile = "default_profile"
@@ -854,6 +857,7 @@ struct ProjectRunPolicyView: Codable, Sendable, Equatable {
         case attentionCap = "attention_cap"
         case stopPolicy = "stop_policy"
         case autoRescue = "auto_rescue"
+        case autoReallocateEnvelopes = "auto_reallocate_envelopes"
     }
 
     init(
@@ -861,13 +865,15 @@ struct ProjectRunPolicyView: Codable, Sendable, Equatable {
         completionReserveRatio: Double = 0.20,
         attentionCap: UInt32 = 20,
         stopPolicy: RunStopPolicyView = .standard,
-        autoRescue: Bool = false
+        autoRescue: Bool = false,
+        autoReallocateEnvelopes: Bool = false
     ) {
         self.defaultProfile = defaultProfile
         self.completionReserveRatio = completionReserveRatio
         self.attentionCap = attentionCap
         self.stopPolicy = stopPolicy
         self.autoRescue = autoRescue
+        self.autoReallocateEnvelopes = autoReallocateEnvelopes
     }
 
     init(from decoder: Decoder) throws {
@@ -882,6 +888,8 @@ struct ProjectRunPolicyView: Codable, Sendable, Equatable {
             try container.decodeIfPresent(RunStopPolicyView.self, forKey: .stopPolicy)
                 ?? .standard
         autoRescue = try container.decodeIfPresent(Bool.self, forKey: .autoRescue) ?? false
+        autoReallocateEnvelopes =
+            try container.decodeIfPresent(Bool.self, forKey: .autoReallocateEnvelopes) ?? false
     }
 
     var profileTitle: String {
@@ -925,6 +933,25 @@ struct ProjectRunPolicyView: Codable, Sendable, Equatable {
         On · at most one automatic completion-reserve rescue per session, only for eligible \
         fixed-budget near-completion work. It never adds budget, removes caps, changes routing, \
         or bypasses Verifier/Integrator.
+        """
+    }
+
+    var autoReallocateLabel: String {
+        autoReallocateEnvelopes ? "On" : "Off"
+    }
+
+    /// One caveat shared by the card and editor. Runtime task budgets may reuse
+    /// unused completed-task capacity in the same department; stored plans and
+    /// all hard caps remain authoritative.
+    var autoReallocateDetail: String {
+        guard autoReallocateEnvelopes else {
+            return "Off · no runtime task-envelope reallocation is permitted."
+        }
+        return """
+        On · a Worker/Labour runtime task budget may reuse unused token/cost capacity from \
+        completed tasks in the same department. The stored TeamPlan, department/session/project \
+        caps, approvals, Verifier, and Integrator are unchanged; a plan revision invalidates an \
+        old runtime override.
         """
     }
 
@@ -1020,6 +1047,7 @@ struct ProjectRunPolicyDraft: Equatable, Sendable {
     var partialDelivery = true
     var marginalValueRatio = 0.2
     var autoRescue = false
+    var autoReallocateEnvelopes = false
 
     init() {}
 
@@ -1032,6 +1060,7 @@ struct ProjectRunPolicyDraft: Equatable, Sendable {
         partialDelivery = policy.stopPolicy.partialDelivery
         marginalValueRatio = policy.stopPolicy.marginalValueRatio
         autoRescue = policy.autoRescue
+        autoReallocateEnvelopes = policy.autoReallocateEnvelopes
     }
 
     var validationIssue: BudgetValidationIssue? {
@@ -1088,7 +1117,8 @@ struct ProjectRunPolicyDraft: Equatable, Sendable {
                 marginalValueRatio: marginalValueRatio,
                 partialDelivery: partialDelivery
             ),
-            autoRescue: autoRescue
+            autoRescue: autoRescue,
+            autoReallocateEnvelopes: autoReallocateEnvelopes
         )
         try policy.validate()
         return policy

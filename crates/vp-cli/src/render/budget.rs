@@ -287,6 +287,18 @@ fn project_run_policy_lines(value: &Value, policy: &Value) -> Vec<String> {
             }
         ),
         format!(
+            "  auto envelopes {} (runtime task budget may reuse completed-task headroom; stored caps unchanged)",
+            if policy
+                .get("auto_reallocate_envelopes")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        ),
+        format!(
             "  stop        no-progress {} turn(s) · evidence {} · partial delivery {}",
             stop["no_progress_turns"].as_u64().unwrap_or(6),
             if stop

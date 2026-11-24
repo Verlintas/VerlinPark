@@ -15,6 +15,7 @@ pub(crate) mod checkpoints;
 pub(crate) mod collaboration;
 pub(crate) mod delivery;
 pub(crate) mod effects;
+pub(crate) mod envelopes;
 pub(crate) mod gui;
 pub(crate) mod intake;
 pub(crate) mod integrations;
