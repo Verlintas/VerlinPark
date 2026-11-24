@@ -844,6 +844,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_targets_do_not_consume_one_source_twice() {
+        let plan = plan(
+            vec![department("impl", None, None)],
+            vec![
+                task("T1", "impl", Some(5_000), None),
+                task("T2", "impl", Some(1_000), None),
+                task("T3", "impl", Some(1_000), None),
+            ],
+        );
+        let (_data, _repo, engine, session) = setup(&plan, true).await;
+        complete_task(&engine, &session.id, "T1");
+        let (first, second) = tokio::join!(
+            engine.effective_plan_for_budget(&session, &plan, "T2"),
+            engine.effective_plan_for_budget(&session, &plan, "T3"),
+        );
+        assert!(
+            first.unwrap().is_some() ^ second.unwrap().is_some(),
+            "one source may fund only one target"
+        );
+        assert_eq!(event_count(&engine, &session.id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_calls_for_one_target_append_one_event() {
+        let plan = plan(
+            vec![department("impl", None, None)],
+            vec![
+                task("T1", "impl", Some(5_000), None),
+                task("T2", "impl", Some(1_000), None),
+            ],
+        );
+        let (_data, _repo, engine, session) = setup(&plan, true).await;
+        complete_task(&engine, &session.id, "T1");
+        let (first, second) = tokio::join!(
+            engine.effective_plan_for_budget(&session, &plan, "T2"),
+            engine.effective_plan_for_budget(&session, &plan, "T2"),
+        );
+        let first = first.unwrap().expect("first target plan");
+        let second = second.unwrap().expect("replayed target plan");
+        assert_eq!(first, second);
+        assert_eq!(event_count(&engine, &session.id).await, 1);
+    }
+
+    #[tokio::test]
     async fn a_retry_envelope_covers_already_observed_spend() {
         let plan = plan(
             vec![department("impl", None, None)],

@@ -274,7 +274,7 @@ effect, Verifier, or merge row.
   turn-boundary auto rescue or runtime envelope reallocation was triggered
   (unit/daemon tests cover both paths).
 - Tests: targeted allocation, trade-off, auto-rescue, protocol, CLI, and
-  daemon tests; full workspace **4,649 passed / 0 failed / 6 ignored**;
+  daemon tests; full workspace **4,651 passed / 0 failed / 6 ignored**;
   Swift **659 passed (527 app + 132 helper)**; fmt, clippy,
   SwiftFormat, and `xcodebuild test` pass.
 - Limits: persisted plan-revision reallocation, cross-department/session
