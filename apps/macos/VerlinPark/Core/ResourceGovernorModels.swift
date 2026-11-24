@@ -945,7 +945,7 @@ struct ProjectRunPolicyView: Codable, Sendable, Equatable {
     /// all hard caps remain authoritative.
     var autoReallocateDetail: String {
         guard autoReallocateEnvelopes else {
-            return "Off · no runtime task-envelope reallocation is permitted."
+            return "Off · no new runtime task-envelope reallocation is permitted; recorded overlays still apply."
         }
         return """
         On · a Worker/Labour runtime task budget may reuse unused token/cost capacity from \

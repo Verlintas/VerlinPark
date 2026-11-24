@@ -641,13 +641,15 @@ Implemented (R3a):
   Sources are consumed independently per token/cost dimension; only the
   capacity that actually fits under the department cap is taken and recorded;
   a target's prior event replays idempotently; a completed target can become a
-  source using its effective budget. A plan fingerprint over task/department
-  budgets invalidates old overrides on any plan revision instead of widening
-  the new plan. The stored TeamPlan and department/session/project caps are
+  source using its effective budget. A per-target plan fingerprint over the target task and its
+  department budgets invalidates old overrides on a target/department budget
+  revision instead of widening the new plan; unrelated task edits do not. The stored TeamPlan and department/session/project caps are
   never changed, and the runtime plan is used only for task admission/budget
-  scope. Every task-scoped role, including Verifier and Scout, sees the
-  recorded read-only overlay so already-spent reallocated capacity can still be
-  verified; only normal Worker/Labour runs (not auto-approve maintenance) may
+  scope. Every task-scoped role sees the recorded read-only overlay, but
+  Verifier/Scout are intentionally **not** bound by the implementation task
+  envelope: they keep department/session/project caps and the completion
+  reserve so a Worker that spent its task cap cannot make the task impossible
+  to verify. Only normal Worker/Labour runs (not auto-approve maintenance) may
   append a new event. The allocation preview reports stored and effective
   budgets and uses the effective values for estimates/critical-path weight.
 - CLI `--auto-rescue` / `--no-auto-rescue`,
@@ -662,7 +664,10 @@ Remaining:
   redistribution, and a revisioned plan budget remain open. Its 1,000-event
   source-single-use window can forget very old sources after heavy plan
   revision, though hard caps still bound actual spend. Serialization is
-  per-session and same-daemon, not cross-host.
+  per-session and same-daemon, not cross-host. If a target/department revision
+  invalidates an overlay and observed spend exceeds the revised stored cap, a
+  Worker retry needs a top-up or plan edit; Verifier/Scout are not task-cap
+  bound.
 - Learning from actuals beyond deterministic project/department nearest-rank
   p50/p90; no model training or hidden routing.
 - LLM replanning; replan recommendations remain textual/advisory.

@@ -551,7 +551,8 @@ pub(in crate::agent) async fn run_loop_body(
         None
     };
     let effective_budget_plan =
-        if matches!(spec.role, AgentRole::Worker | AgentRole::Labour) && !spec.auto_approve {
+        if crate::engine::envelopes::may_append_envelope_reallocation(spec.role, spec.auto_approve)
+        {
             if let Some(task_id) = spec.task_id.as_deref() {
                 match team_plan.as_ref() {
                     Some(plan) => match engine

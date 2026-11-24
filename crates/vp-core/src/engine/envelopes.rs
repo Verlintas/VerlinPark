@@ -87,7 +87,6 @@ fn fold_reallocation_events(
             )
         })
         .collect::<HashMap<_, _>>();
-    let fingerprint = plan_fingerprint(plan);
     let mut consumed: HashMap<String, ConsumedBudget> = HashMap::new();
     let mut latest_targets = HashSet::new();
     for event in events {
@@ -111,11 +110,8 @@ fn fold_reallocation_events(
                 entry.cost_usd += source.released_cost_usd;
             }
         }
-        if payload
-            .plan_fingerprint
-            .as_deref()
-            .is_some_and(|value| value != fingerprint)
-        {
+        let fingerprint = plan_fingerprint(plan, &payload.target_task_id);
+        if payload.plan_fingerprint.as_deref() != Some(fingerprint.as_str()) {
             continue;
         }
         let current = effective
@@ -149,11 +145,25 @@ fn fold_reallocation_events(
     (effective, consumed, latest_targets)
 }
 
-/// Stable fingerprint of the budget-relevant plan shape. Any task/department
-/// budget change invalidates an old runtime override.
-fn plan_fingerprint(plan: &TeamPlan) -> String {
-    let mut parts = Vec::new();
-    for department in &plan.departments {
+/// Fingerprint of the target task's budget and its department cap. Unrelated
+/// task edits must not invalidate an overlay; a target or department budget
+/// revision must.
+pub(crate) fn plan_fingerprint(plan: &TeamPlan, target_task_id: &str) -> String {
+    let Some(task) = plan.tasks.iter().find(|task| task.id == target_task_id) else {
+        return "missing-target".to_string();
+    };
+    let department = plan
+        .departments
+        .iter()
+        .find(|department| department.name == task.department);
+    let mut parts = vec![format!(
+        "t:{}:{}:{:?}:{:?}",
+        task.id,
+        task.department,
+        task.token_budget,
+        task.cost_budget_usd.map(|value| value.to_bits())
+    )];
+    if let Some(department) = department {
         parts.push(format!(
             "d:{}:{:?}:{:?}",
             department.name,
@@ -161,17 +171,19 @@ fn plan_fingerprint(plan: &TeamPlan) -> String {
             department.cost_budget_usd.map(|value| value.to_bits())
         ));
     }
-    for task in &plan.tasks {
-        parts.push(format!(
-            "t:{}:{}:{:?}:{:?}",
-            task.id,
-            task.department,
-            task.token_budget,
-            task.cost_budget_usd.map(|value| value.to_bits())
-        ));
-    }
-    parts.sort();
     crate::sha256_hex(parts.join("\n").as_bytes())
+}
+
+/// Only normal implementation runs may append new reallocations. Verifier,
+/// Scout, Manager, and auto-approve maintenance runs may read the overlay.
+pub(crate) fn may_append_envelope_reallocation(
+    role: crate::agent::AgentRole,
+    auto_approve: bool,
+) -> bool {
+    matches!(
+        role,
+        crate::agent::AgentRole::Worker | crate::agent::AgentRole::Labour
+    ) && !auto_approve
 }
 
 impl Engine {
@@ -307,17 +319,24 @@ impl Engine {
             .and_then(|department| department.cost_budget_usd)
             .filter(|budget| budget.is_finite() && *budget > 0.0);
 
-        let token_room = old_token
-            .map(|old| {
+        // A retry may already have overshot the stored task cap. The new cap
+        // must cover observed spend, or the event would be immediately
+        // unusable and would consume sources for nothing.
+        let (target_actual_tokens, target_actual_cost, _, _) =
+            self.usage_spent(&session.id, Some(task_id), None).await?;
+        let base_token = old_token.map(|old| old.max(target_actual_tokens));
+        let base_cost = old_cost.map(|old| old.max(target_actual_cost.max(0.0)));
+        let token_room = base_token
+            .map(|base| {
                 department_tokens
-                    .map(|cap| cap.saturating_sub(old))
+                    .map(|cap| cap.saturating_sub(base))
                     .unwrap_or(u64::MAX)
             })
             .unwrap_or(0);
-        let cost_room = old_cost
-            .map(|old| {
+        let cost_room = base_cost
+            .map(|base| {
                 department_cost
-                    .map(|cap| (cap - old).max(0.0))
+                    .map(|cap| (cap - base).max(0.0))
                     .unwrap_or(f64::MAX)
             })
             .unwrap_or(0.0);
@@ -374,10 +393,10 @@ impl Engine {
             return Ok(None);
         }
 
-        let new_token = old_token.map(|old| old.saturating_add(released_tokens));
-        let new_cost = old_cost.map(|old| {
-            let proposed = old + released_cost;
-            if proposed.is_finite() { proposed } else { old }
+        let new_token = base_token.map(|base| base.saturating_add(released_tokens));
+        let new_cost = base_cost.map(|base| {
+            let proposed = base + released_cost;
+            if proposed.is_finite() { proposed } else { base }
         });
         if new_token == old_token && new_cost == old_cost {
             return Ok(None);
@@ -390,7 +409,7 @@ impl Engine {
                 "schema": ENVELOPE_REALLOCATION_SCHEMA,
                 "target_task_id": target.id,
                 "department": target.department,
-                "plan_fingerprint": plan_fingerprint(plan),
+                "plan_fingerprint": plan_fingerprint(plan, &target.id),
                 "old_token_budget": old_token,
                 "new_token_budget": new_token,
                 "old_cost_budget_usd": old_cost,
@@ -601,6 +620,30 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn only_normal_implementation_runs_may_append_reallocations() {
+        assert!(may_append_envelope_reallocation(
+            crate::agent::AgentRole::Worker,
+            false
+        ));
+        assert!(may_append_envelope_reallocation(
+            crate::agent::AgentRole::Labour,
+            false
+        ));
+        assert!(!may_append_envelope_reallocation(
+            crate::agent::AgentRole::Worker,
+            true
+        ));
+        assert!(!may_append_envelope_reallocation(
+            crate::agent::AgentRole::Verifier,
+            false
+        ));
+        assert!(!may_append_envelope_reallocation(
+            crate::agent::AgentRole::Scout,
+            false
+        ));
+    }
+
     #[tokio::test]
     async fn completed_task_releases_unused_token_and_cost_budget_once() {
         let plan = plan(
@@ -770,6 +813,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_retry_envelope_covers_already_observed_spend() {
+        let plan = plan(
+            vec![department("impl", None, None)],
+            vec![
+                task("T1", "impl", Some(1_000), None),
+                task("T2", "impl", Some(1_000), None),
+            ],
+        );
+        let (_data, _repo, engine, session) = setup(&plan, true).await;
+        complete_task(&engine, &session.id, "T1");
+        record_usage(&engine, &session.id, "T2", "impl", 2_500, 0, 0.0).await;
+        let runtime = engine
+            .effective_plan_for_budget(&session, &plan, "T2")
+            .await
+            .unwrap()
+            .expect("retry gets a usable cap");
+        assert_eq!(
+            runtime
+                .tasks
+                .iter()
+                .find(|task| task.id == "T2")
+                .unwrap()
+                .token_budget,
+            Some(3_500),
+            "base must cover observed 2.5k plus released 1k"
+        );
+        let event = engine
+            .latest_event_of_kind(&session.id, SESSION_ENVELOPE_REALLOCATED_EVENT)
+            .await
+            .unwrap()
+            .expect("event");
+        assert_eq!(event.payload["applied_tokens"], 2_500);
+        assert_eq!(event.payload["released_tokens"], 1_000);
+    }
+
+    #[tokio::test]
     async fn source_dimensions_are_consumed_independently() {
         let plan = plan(
             vec![department("impl", None, None)],
@@ -927,6 +1006,28 @@ mod tests {
             .expect("T1 funds T2");
         assert_eq!(
             runtime
+                .tasks
+                .iter()
+                .find(|task| task.id == "T2")
+                .unwrap()
+                .token_budget,
+            Some(6_000)
+        );
+
+        let unrelated_changed = plan(
+            vec![department("impl", None, None)],
+            vec![
+                task("T1", "impl", Some(4_000), None),
+                task("T2", "impl", Some(1_000), None),
+            ],
+        );
+        let replay = engine
+            .effective_plan_for_budget(&session, &unrelated_changed, "T2")
+            .await
+            .unwrap()
+            .expect("an unrelated task edit must not invalidate T2's overlay");
+        assert_eq!(
+            replay
                 .tasks
                 .iter()
                 .find(|task| task.id == "T2")

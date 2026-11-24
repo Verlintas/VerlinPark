@@ -3921,9 +3921,17 @@ impl PlanBudgetScope {
         project_budget: Option<&vp_protocol::types::ProjectBudget>,
         project_id: &str,
     ) -> Self {
-        let task = spec.task_id.as_deref().and_then(|task_id| {
-            plan.and_then(|plan| plan.tasks.iter().find(|task| task.id == task_id))
-        });
+        // Verification and Scout runs are necessary evidence work, not new
+        // implementation. They keep department/session/project caps but do not
+        // consume the implementation task's envelope, so a Worker that spent
+        // its cap cannot make the task impossible to verify.
+        let task = if matches!(spec.role, AgentRole::Verifier | AgentRole::Scout) {
+            None
+        } else {
+            spec.task_id.as_deref().and_then(|task_id| {
+                plan.and_then(|plan| plan.tasks.iter().find(|task| task.id == task_id))
+            })
+        };
         let department = spec.department.as_deref().and_then(|name| {
             plan.and_then(|plan| {
                 plan.departments

@@ -241,13 +241,16 @@ effect, Verifier, or merge row.
   Sources are consumed independently per token/cost dimension; only capacity
   that fits under the department cap is applied and recorded. A prior target
   event replays idempotently, a completed target can become a source with its
-  effective budget, and a plan fingerprint over task/department budgets
-  invalidates an old override instead of widening the new plan. The stored
+  effective budget, and a per-target plan fingerprint over the target task and its
+  department budgets invalidates an old override instead of widening the new
+  plan; unrelated task edits do not. The stored
   TeamPlan and every department, session, and project cap are unchanged;
-  Verifier/Scout see the recorded read-only overlay, only non-auto-approve
-  Worker/Labour runs may append, and a per-session same-daemon lock serializes
-  event read/append. The allocation preview reports stored/effective budgets
-  and uses effective values for estimates and critical-path weight.
+  Verifier/Scout see the recorded read-only overlay but are not bound by the
+  implementation task envelope (they keep department/session/project caps and
+  the completion reserve); only non-auto-approve Worker/Labour runs may append,
+  and a per-session same-daemon lock serializes event read/append. The
+  allocation preview reports stored/effective budgets and uses effective values
+  for estimates and critical-path weight.
 - macOS: Project RunPolicy toggles for completion-reserve rescue and runtime
   envelope reallocation, with the fixed-budget/no-bypass and
   stored-plan/caps-unchanged caveats, and Manage Dash → Usage & Budget Allocation
@@ -271,7 +274,7 @@ effect, Verifier, or merge row.
   turn-boundary auto rescue or runtime envelope reallocation was triggered
   (unit/daemon tests cover both paths).
 - Tests: targeted allocation, trade-off, auto-rescue, protocol, CLI, and
-  daemon tests; full workspace **4,644 passed / 0 failed / 6 ignored**;
+  daemon tests; full workspace **4,647 passed / 0 failed / 6 ignored**;
   Swift **659 passed (527 app + 132 helper)**; fmt, clippy,
   SwiftFormat, and `xcodebuild test` pass.
 - Limits: persisted plan-revision reallocation, cross-department/session
@@ -279,8 +282,11 @@ effect, Verifier, or merge row.
   open. R3b is an event-derived runtime overlay, not a TeamPlan rewrite; it
   scans the newest 1,000 reallocation events, so source single-use memory can
   be forgotten after very heavy plan revision (department/session/project caps
-  still bound actual spend). Estimates are sparse historical heuristics, not
-  vendor token counts; test-cache evidence may predate the latest commit;
+  still bound actual spend). A target/department budget revision invalidates an
+  old overlay; a Worker retry may then need a top-up or plan edit, while
+  Verifier/Scout are not task-cap bound. Estimates are sparse historical
+  heuristics, not vendor token counts; test-cache evidence may predate the latest
+  commit;
   confidence is not a calibrated probability; profile forecasts are not
   per-profile; profile reserves are documented posture, not automatic contract
   changes; rescue is same-daemon and envelope serialization is per-session

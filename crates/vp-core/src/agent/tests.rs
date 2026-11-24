@@ -5168,6 +5168,58 @@ fn plan_budget_scope_includes_the_project_pool() {
 }
 
 #[test]
+fn verification_and_scout_runs_exclude_the_implementation_task_envelope() {
+    let plan = TeamPlan {
+        goal: "verification headroom".into(),
+        departments: vec![PlanDepartment {
+            name: "impl".into(),
+            manager_title: "Implementation".into(),
+            profile: "coding".into(),
+            objective: "build".into(),
+            token_budget: Some(5_000),
+            cost_budget_usd: None,
+        }],
+        tasks: vec![PlanTask {
+            id: "T1".into(),
+            department: "impl".into(),
+            title: "Build".into(),
+            kind: "coding".into(),
+            priority: 1,
+            profile: Some("coding".into()),
+            deps: Vec::new(),
+            write_scope: vec!["src/lib.rs".into()],
+            acceptance: vec!["tests pass".into()],
+            token_budget: Some(1_000),
+            cost_budget_usd: None,
+            parent_task_id: None,
+            fanout_key: None,
+            fanout_join_for: None,
+        }],
+    };
+    for role in [AgentRole::Verifier, AgentRole::Scout] {
+        let mut spec = help_spec(role, AgentProfile::Coding);
+        spec.task_id = Some("T1".into());
+        spec.department = Some("impl".into());
+        let scope = PlanBudgetScope::from_plan(Some(&plan), &spec, None, "project-1");
+        assert_eq!(scope.task_tokens, None, "{role:?}");
+        assert_eq!(scope.task_cost, None, "{role:?}");
+        assert_eq!(scope.department_tokens, Some(5_000), "{role:?}");
+        let requests = scope.requests("session-1", (0, 0.0), (0, 0.0), (0, 0.0), 0.0, 0.0);
+        assert!(
+            requests.iter().all(|request| request.scope != "task"),
+            "{role:?} must not consume the implementation task envelope"
+        );
+        assert!(requests.iter().any(|request| request.scope == "department"));
+    }
+
+    let mut worker = help_spec(AgentRole::Worker, AgentProfile::Coding);
+    worker.task_id = Some("T1".into());
+    worker.department = Some("impl".into());
+    let scope = PlanBudgetScope::from_plan(Some(&plan), &worker, None, "project-1");
+    assert_eq!(scope.task_tokens, Some(1_000));
+}
+
+#[test]
 fn unlimited_flag_bypasses_budget_gates_and_can_be_revoked() {
     let flag = Arc::new(AtomicBool::new(true));
     let budget = SessionBudget::new(

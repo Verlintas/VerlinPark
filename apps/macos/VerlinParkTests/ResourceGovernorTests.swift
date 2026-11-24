@@ -1875,6 +1875,7 @@ final class ResourceGovernorTests: XCTestCase {
         XCTAssertEqual(decoded.autoRescueLabel, "Off")
         XCTAssertFalse(decoded.autoReallocateEnvelopes)
         XCTAssertEqual(decoded.autoReallocateLabel, "Off")
+        XCTAssertTrue(decoded.autoReallocateDetail.contains("recorded overlays still apply"))
         XCTAssertFalse(ProjectRunPolicyView().autoRescue)
         XCTAssertFalse(ProjectRunPolicyDraft().autoRescue)
         XCTAssertFalse(ProjectRunPolicyView().autoReallocateEnvelopes)

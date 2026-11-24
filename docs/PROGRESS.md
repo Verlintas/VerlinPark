@@ -88,7 +88,7 @@ Verifier 或 Integrator。
   跨 host 不成立；project RunPolicy 保存仍是整包 read-modify-write，没有
   updated_at/CAS 前置条件。
 - 测试：targeted allocation/tradeoff/rescue/protocol/CLI/daemon + full
-  workspace **4,644 passed / 0 failed / 6 ignored**；Swift
+  workspace **4,647 passed / 0 failed / 6 ignored**；Swift
   **659 passed（527 app + 132 helper）**；`cargo fmt --check`、
   `cargo clippy --workspace --all-targets -- -D warnings`、`swiftformat --lint`
   和 `xcodebuild test` 通过。临时 daemon CLI smoke 覆盖 `project-run-policy-set`
@@ -218,8 +218,9 @@ pre-dispatch deferral，不改变 approval/Verifier/merge 行为：
   `RESCUE_*`）。在下一个非暂停 turn boundary，governor 只解除 completion
   reserve（hard cap、attention、context、approval、Verifier、Integrator 不变），
   并追加一次 `session.resource.rescue.used` receipt。CLI `rescue-status` /
-  `rescue` 和 Stage confirmation sheet 已接入。allocation preview 的
-  reallocation 只是 recommendation，不自动修改 task envelope。
+  `rescue` 和 Stage confirmation sheet 已接入。R2b 时 allocation preview 的
+  reallocation 只是 recommendation；后续 R3b 增加了 runtime-only effective
+  budget，但仍不改 stored TeamPlan/task envelope。
 - Governor snapshot cache：`session_resources` 的 readiness 使用 2 秒 TTL、
   以 session 最新 event seq 为 key、最多 64 个 session 的 in-process cache；
   任何新 event 都会因 seq 改变而失效。`session.readiness`、partial delivery、

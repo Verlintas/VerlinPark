@@ -221,7 +221,11 @@ impl Engine {
             .map(|bucket| (bucket.key.clone(), bucket.clone()))
             .collect::<HashMap<_, _>>();
         let project_actuals = ProjectActuals::from_entries(&history);
-        let department_envelopes = plan.as_ref().map(department_envelopes).unwrap_or_default();
+        let department_envelopes = effective_plan
+            .as_ref()
+            .or(plan.as_ref())
+            .map(department_envelopes)
+            .unwrap_or_default();
 
         let task_rows = allocation_task_rows(plan.as_ref(), &queue);
         let mut estimates: HashMap<String, TaskEstimate> = HashMap::new();
@@ -2205,12 +2209,14 @@ mod tests {
             tasks: vec![task("T1", 1, Some(5_000)), task("T2", 1, Some(1_000))],
         };
         engine.submit_team_plan(&session.id, &plan).await.unwrap();
+        let fingerprint = crate::engine::envelopes::plan_fingerprint(&plan, "T2");
         engine
             .append_event(
                 &session.id,
                 "session.envelope.reallocated",
                 serde_json::json!({
                     "schema": "verlinpark.envelope_reallocation/v1",
+                    "plan_fingerprint": fingerprint,
                     "target_task_id": "T2",
                     "department": "impl",
                     "old_token_budget": 1_000,
@@ -2245,6 +2251,7 @@ mod tests {
         assert_eq!(target.source, "plan_envelope");
         assert_eq!(target.p50_tokens, Some(6_000));
         assert_eq!(target.p90_tokens, Some(6_000));
+        assert!(target.feasible, "{target:?}");
         assert_eq!(
             preview.feasibility.critical_path_tasks,
             vec!["T2".to_string()],

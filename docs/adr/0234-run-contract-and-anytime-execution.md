@@ -227,15 +227,18 @@ The R3/R4 slice is read-only/advisory except for two explicit project opt-ins:
   Sources are consumed independently per token/cost dimension; only capacity
   that actually fits under the department cap is taken and recorded. A target's
   prior event replays idempotently, a completed target can become a source
-  using its effective budget, and a plan fingerprint over task/department
-  budgets invalidates an old override instead of widening the new plan. The
+  using its effective budget, and a per-target plan fingerprint over the target task and its
+  department budgets invalidates an old override instead of widening the new
+  plan; unrelated task edits do not. The
   stored TeamPlan and every department, session, and project cap remain
   unchanged; the runtime plan is used only for task admission/budget scope.
-  Every task-scoped role, including Verifier/Scout, sees the recorded read-only
-  overlay; only non-auto-approve Worker/Labour runs may append. A per-session
-  same-daemon lock serializes event read/append. The allocation preview reports
-  stored and effective budgets and uses effective values for estimates and
-  critical-path weight.
+  Every task-scoped role sees the recorded read-only overlay, but Verifier/Scout
+  are intentionally not bound by the implementation task envelope; they keep
+  department/session/project caps and the completion reserve, so a Worker that
+  spent its task cap cannot make verification impossible. Only non-auto-approve
+  Worker/Labour runs may append. A per-session same-daemon lock serializes event
+  read/append. The allocation preview reports stored and effective budgets and
+  uses effective values for estimates and critical-path weight.
 - Both preview RPCs append no events and mutate nothing. The macOS cards load
   only when visible or explicitly refreshed and reject a response for a
   different session.
@@ -246,7 +249,9 @@ TeamPlan rewrite or cross-department/session budget pool. It scans the newest
 1,000 reallocation events, so source single-use memory can be forgotten after
 very heavy plan revision (hard department/session/project caps still bound
 actual spend). Envelope serialization is per-session and same-daemon, not
-cross-host. Historical estimates are sparse and are not vendor token counts;
+cross-host. A target/department revision can invalidate an overlay; a Worker
+retry then needs a top-up or plan edit if observed spend exceeds the revised
+stored cap, while Verifier/Scout are not task-cap bound. Historical estimates are sparse and are not vendor token counts;
 confidence is a heuristic, not a calibrated probability; profile forecasts
 repeat the existing session forecast and are not per-profile guarantees;
 rescue serialization is same-daemon only.
