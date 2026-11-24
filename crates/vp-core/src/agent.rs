@@ -1113,6 +1113,22 @@ pub(in crate::agent) async fn pause_for_resource_block(
             }
             return Ok(true);
         };
+        // A project policy may release the completion reserve once at this
+        // safe boundary. The helper is a no-op unless the pause is exactly on
+        // `completion_reserve_*`, the session is eligible, and no rescue grant
+        // was ever recorded. On success, re-evaluate immediately so the active
+        // grant is consumed by the normal non-pausing branch above.
+        if reason.starts_with("completion_reserve_") {
+            match engine.maybe_auto_rescue(&session.id, &reason).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => tracing::warn!(
+                    %error,
+                    session_id = %session.id,
+                    "auto rescue eligibility failed; keeping the normal resource pause"
+                ),
+            }
+        }
         engine.record_resource_decision(&decision).await?;
         engine
             .append_event(

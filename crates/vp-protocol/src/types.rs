@@ -3779,6 +3779,11 @@ pub struct ProjectRunPolicy {
     pub attention_cap: u32,
     #[serde(default)]
     pub stop_policy: RunStopPolicy,
+    /// Opt in to one automatic completion-reserve rescue at a turn boundary
+    /// when the session pauses only on `completion_reserve_*` and already has
+    /// a clean near-completion commit. Default off.
+    #[serde(default)]
+    pub auto_rescue: bool,
 }
 
 fn default_project_run_completion_reserve_ratio() -> f64 {
@@ -3796,6 +3801,7 @@ impl Default for ProjectRunPolicy {
             completion_reserve_ratio: default_project_run_completion_reserve_ratio(),
             attention_cap: default_project_run_attention_cap(),
             stop_policy: RunStopPolicy::default(),
+            auto_rescue: false,
         }
     }
 }
@@ -4039,6 +4045,263 @@ impl std::fmt::Display for RescueError {
 }
 
 impl std::error::Error for RescueError {}
+
+/// Read-only R3 allocation preview request. The preview never mutates task
+/// envelopes, budgets, approvals, capacity, or routing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionAllocationParams {
+    pub session_id: String,
+}
+
+/// Effective session envelope reported by the allocation preview.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AllocationEnvelope {
+    #[serde(default)]
+    pub token_budget: Option<u64>,
+    #[serde(default)]
+    pub spent_tokens: u64,
+    #[serde(default)]
+    pub remaining_tokens: Option<u64>,
+    #[serde(default)]
+    pub cost_budget_usd: Option<f64>,
+    #[serde(default)]
+    pub spent_cost_usd: f64,
+    #[serde(default)]
+    pub remaining_cost_usd: Option<f64>,
+    #[serde(default)]
+    pub time_budget_secs: Option<u64>,
+    #[serde(default)]
+    pub remaining_secs: Option<u64>,
+    #[serde(default)]
+    pub completion_reserve_ratio: f64,
+}
+
+/// One task's bounded allocation estimate. `source` is one of
+/// `session_actuals`, `plan_envelope`, `project_actuals`,
+/// `department_envelope`, or `prior`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AllocationTask {
+    #[serde(default)]
+    pub task_id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub department: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub priority: i32,
+    #[serde(default)]
+    pub token_budget: Option<u64>,
+    #[serde(default)]
+    pub cost_budget_usd: Option<f64>,
+    #[serde(default)]
+    pub p50_tokens: Option<u64>,
+    #[serde(default)]
+    pub p90_tokens: Option<u64>,
+    #[serde(default)]
+    pub observed_calls: u32,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub critical_path: bool,
+    #[serde(default)]
+    pub ready: bool,
+    #[serde(default)]
+    pub feasible: bool,
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// Bounded feasibility estimate for the remaining critical path.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AllocationFeasibility {
+    #[serde(default)]
+    pub feasible: bool,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub p50_tokens: Option<u64>,
+    #[serde(default)]
+    pub p90_tokens: Option<u64>,
+    #[serde(default)]
+    pub p50_cost_usd: Option<f64>,
+    #[serde(default)]
+    pub p90_cost_usd: Option<f64>,
+    #[serde(default)]
+    pub sample_calls: u32,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub reserve_tokens: Option<u64>,
+    #[serde(default)]
+    pub headroom_tokens: Option<u64>,
+    #[serde(default)]
+    pub critical_path_tasks: Vec<String>,
+}
+
+/// One advisory allocation recommendation. `action` never executes by itself.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AllocationRecommendation {
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub confidence: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+}
+
+/// Bounded diagnosis/progress summary used as metareasoning context.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AllocationMetareasoning {
+    #[serde(default)]
+    pub diagnosis_status: String,
+    #[serde(default)]
+    pub diagnosis_reason: Option<String>,
+    #[serde(default)]
+    pub diagnosis_target: Option<String>,
+    #[serde(default)]
+    pub no_progress_turns: u32,
+    #[serde(default)]
+    pub stalled_tasks: Vec<String>,
+    #[serde(default)]
+    pub failed_tasks: Vec<String>,
+    #[serde(default)]
+    pub retrying_tasks: Vec<String>,
+    #[serde(default)]
+    pub recommendations: Vec<AllocationRecommendation>,
+}
+
+/// Attention/trust calibration derived from approvals, diagnosis, and task
+/// outcomes. It is advisory and never changes approval mode or model routing.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AllocationCalibration {
+    #[serde(default)]
+    pub attention_recommendation: String,
+    #[serde(default)]
+    pub trust_recommendation: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub confidence: String,
+    #[serde(default)]
+    pub pending_approvals: u32,
+    #[serde(default)]
+    pub attention_interrupts: u32,
+    #[serde(default)]
+    pub attention_cap: u32,
+    #[serde(default)]
+    pub verifier_rejections: u32,
+    #[serde(default)]
+    pub failed_tasks: u32,
+}
+
+/// Read-only R3 allocation preview. It appends no events.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AllocationPreview {
+    pub session_id: String,
+    pub generated_at: String,
+    pub profile: String,
+    pub readiness: ReadinessSnapshot,
+    pub envelope: AllocationEnvelope,
+    pub feasibility: AllocationFeasibility,
+    #[serde(default)]
+    pub tasks: Vec<AllocationTask>,
+    #[serde(default)]
+    pub recommendations: Vec<AllocationRecommendation>,
+    pub metareasoning: AllocationMetareasoning,
+    pub calibration: AllocationCalibration,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// Read-only R4 trade-off request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionTradeoffsParams {
+    pub session_id: String,
+}
+
+/// One documented RunProfile trade-off. Projected turns/cost come from the
+/// existing budget forecast and are not per-profile guarantees.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProfileTradeoff {
+    #[serde(default)]
+    pub profile: String,
+    #[serde(default)]
+    pub primary_goal: String,
+    #[serde(default)]
+    pub completion_reserve_ratio: f64,
+    #[serde(default)]
+    pub attention_posture: String,
+    #[serde(default)]
+    pub quality_posture: String,
+    #[serde(default)]
+    pub projected_turns: Option<u32>,
+    #[serde(default)]
+    pub projected_cost_usd: Option<f64>,
+    #[serde(default)]
+    pub recommended: bool,
+}
+
+/// Bounded quality/reviewability projection. It does not replace the Verifier.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct QualityReview {
+    #[serde(default)]
+    pub readiness_level: String,
+    #[serde(default)]
+    pub latest_commit: Option<String>,
+    #[serde(default)]
+    pub latest_test: Option<String>,
+    #[serde(default)]
+    pub verifier: Option<String>,
+    #[serde(default)]
+    pub merge: Option<String>,
+    #[serde(default)]
+    pub completed_tasks: u32,
+    #[serde(default)]
+    pub total_tasks: u32,
+    #[serde(default)]
+    pub merged_entries: u32,
+    #[serde(default)]
+    pub changed_paths: Vec<String>,
+    #[serde(default)]
+    pub blockers: Vec<String>,
+    #[serde(default)]
+    pub reviewability: String,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+}
+
+/// Explicitly heuristic confidence for the trade-off view.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CalibratedConfidence {
+    #[serde(default)]
+    pub level: String,
+    #[serde(default)]
+    pub score: f64,
+    #[serde(default)]
+    pub sample_calls: u32,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+}
+
+/// Read-only R4 trade-off view. Recommendations are advisory only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TradeoffView {
+    pub session_id: String,
+    pub generated_at: String,
+    pub current_profile: String,
+    #[serde(default)]
+    pub profiles: Vec<ProfileTradeoff>,
+    pub quality: QualityReview,
+    pub confidence: CalibratedConfidence,
+    #[serde(default)]
+    pub recommendations: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionRunContractParams {
@@ -27896,5 +28159,150 @@ mod rescue_protocol_tests {
         let error = RescueError::new(rescue_codes::RESCUE_ACTIVE, "already active");
         assert_eq!(error.code, "RESCUE_ACTIVE");
         assert_eq!(error.to_string(), "RESCUE_ACTIVE: already active");
+    }
+
+    #[test]
+    fn allocation_and_tradeoff_views_round_trip_additively() {
+        let params = SessionAllocationParams {
+            session_id: "ses-1".into(),
+        };
+        let decoded: SessionAllocationParams =
+            serde_json::from_value(serde_json::to_value(&params).unwrap()).unwrap();
+        assert_eq!(decoded, params);
+
+        let allocation = AllocationPreview {
+            session_id: "ses-1".into(),
+            generated_at: "2026-11-24T00:00:00Z".into(),
+            profile: "balanced".into(),
+            readiness: readiness(),
+            envelope: AllocationEnvelope {
+                token_budget: Some(10_000),
+                spent_tokens: 4_000,
+                remaining_tokens: Some(6_000),
+                cost_budget_usd: Some(2.0),
+                spent_cost_usd: 0.5,
+                remaining_cost_usd: Some(1.5),
+                time_budget_secs: Some(600),
+                remaining_secs: Some(300),
+                completion_reserve_ratio: 0.2,
+            },
+            feasibility: AllocationFeasibility {
+                feasible: true,
+                reason: "feasible".into(),
+                p50_tokens: Some(2_000),
+                p90_tokens: Some(3_000),
+                p50_cost_usd: Some(0.2),
+                p90_cost_usd: Some(0.3),
+                sample_calls: 4,
+                source: "session_actuals".into(),
+                reserve_tokens: Some(2_000),
+                headroom_tokens: Some(4_000),
+                critical_path_tasks: vec!["T1".into()],
+            },
+            tasks: vec![AllocationTask {
+                task_id: "T1".into(),
+                title: "Build it".into(),
+                department: "impl".into(),
+                status: "pending".into(),
+                priority: 5,
+                token_budget: Some(2_000),
+                cost_budget_usd: None,
+                p50_tokens: Some(2_000),
+                p90_tokens: Some(2_000),
+                observed_calls: 1,
+                source: "session_actuals".into(),
+                critical_path: true,
+                ready: true,
+                feasible: true,
+                reason: "within_envelope".into(),
+            }],
+            recommendations: vec![AllocationRecommendation {
+                action: "continue".into(),
+                reason: "critical path fits".into(),
+                confidence: "high".into(),
+                task_id: None,
+            }],
+            metareasoning: AllocationMetareasoning {
+                diagnosis_status: "no_failure".into(),
+                diagnosis_reason: None,
+                diagnosis_target: None,
+                no_progress_turns: 0,
+                stalled_tasks: Vec::new(),
+                failed_tasks: Vec::new(),
+                retrying_tasks: Vec::new(),
+                recommendations: Vec::new(),
+            },
+            calibration: AllocationCalibration {
+                attention_recommendation: "batch_routine".into(),
+                trust_recommendation: "standard".into(),
+                reason: "no rejection evidence".into(),
+                confidence: "medium".into(),
+                pending_approvals: 0,
+                attention_interrupts: 0,
+                attention_cap: 20,
+                verifier_rejections: 0,
+                failed_tasks: 0,
+            },
+            truncated: false,
+        };
+        let decoded: AllocationPreview =
+            serde_json::from_value(serde_json::to_value(&allocation).unwrap()).unwrap();
+        assert_eq!(decoded, allocation);
+
+        let tradeoffs = TradeoffView {
+            session_id: "ses-1".into(),
+            generated_at: "2026-11-24T00:00:00Z".into(),
+            current_profile: "balanced".into(),
+            profiles: vec![ProfileTradeoff {
+                profile: "balanced".into(),
+                primary_goal: "default".into(),
+                completion_reserve_ratio: 0.2,
+                attention_posture: "moderate".into(),
+                quality_posture: "tests + Verifier".into(),
+                projected_turns: Some(6),
+                projected_cost_usd: Some(0.4),
+                recommended: true,
+            }],
+            quality: QualityReview {
+                readiness_level: "committed".into(),
+                latest_commit: Some("abc123".into()),
+                latest_test: None,
+                verifier: None,
+                merge: None,
+                completed_tasks: 1,
+                total_tasks: 2,
+                merged_entries: 0,
+                changed_paths: vec!["src/lib.rs".into()],
+                blockers: Vec::new(),
+                reviewability: "watch".into(),
+                reasons: vec!["no_tests".into()],
+            },
+            confidence: CalibratedConfidence {
+                level: "medium".into(),
+                score: 0.5,
+                sample_calls: 3,
+                reasons: vec!["commit evidence".into()],
+            },
+            recommendations: vec!["add_tests".into()],
+            warnings: Vec::new(),
+        };
+        let decoded: TradeoffView =
+            serde_json::from_value(serde_json::to_value(&tradeoffs).unwrap()).unwrap();
+        assert_eq!(decoded, tradeoffs);
+
+        // Optional fields remain additive for older payloads.
+        let minimal: AllocationPreview = serde_json::from_value(json!({
+            "session_id": "ses-1",
+            "generated_at": "2026-11-24T00:00:00Z",
+            "profile": "balanced",
+            "readiness": serde_json::to_value(readiness()).unwrap(),
+            "envelope": {},
+            "feasibility": {},
+            "metareasoning": {},
+            "calibration": {}
+        }))
+        .unwrap();
+        assert!(minimal.tasks.is_empty());
+        assert!(!minimal.truncated);
     }
 }

@@ -1,7 +1,7 @@
 # VerlinPark V1 readiness ledger
 
 - Status: Active
-- Date: 2026-11-23
+- Date: 2026-11-25
 - Owner: Verlintas
 - Scope: single-project coding V1
 - Plan: [V1_FINAL_PLAN.md](V1_FINAL_PLAN.md)
@@ -186,6 +186,58 @@ R2b project policy was 4,559; R2b core before it 4,554; R2a 4,551. A live
 temp-daemon CLI smoke exercised `run-contract-set`, `resources`, `top-up`, and
 `readiness` end to end; a temp-daemon GUI smoke exercised first-selection
 resource loading and the Project RunPolicy card/editor.
+
+## Run Contract R3a/R4a (2026-11-25)
+
+R3/R4 now have read-only allocation and trade-off previews plus one explicit
+opt-in automatic action. No preview mutates a task envelope, budget, model
+route, approval, effect, Verifier, or merge row.
+
+- `session.allocation` / `vp allocation` reconciles the session envelope,
+  stored TeamPlan DAG/critical path, task queue, bounded project usage history
+  (newest 1,000 rows), readiness, approvals, effects, failure diagnosis, and
+  stall observations. Per-task estimate precedence is session actuals, plan
+  task envelope, project department actuals (nearest-rank p50/p90), department
+  envelope, then an explicit unknown prior. An unknown estimate is `None`, not
+  zero; a path with no estimate is `insufficient_estimate`, and an unestimated
+  task is not feasible. Cost feasibility is evaluated independently of token
+  estimates.
+- `session.tradeoffs` / `vp tradeoffs` returns the five documented profile
+  postures, the current profile, the existing session turn/cost forecast
+  (repeated, not a per-profile guarantee), a bounded quality/reviewability
+  review, and a heuristic calibrated confidence score. A different profile is
+  badged recommended only for deterministic evidence (quality for
+  risk/blockers/blocked effects, cost under completion-reserve pressure); the
+  current profile is never double-badged and no profile is switched.
+- `ProjectRunPolicy.auto_rescue` is off by default. When enabled, at most one
+  automatic completion-reserve grant is appended per session, only when the
+  turn pause is exactly `completion_reserve_*`, the session is fixed-budget and
+  near-completion eligible (latest commit, zero no-progress turns, headroom, no
+  prior grant). Eligibility reads run outside the lock; the count/append is
+  serialized in-process, and a manual grant consumes the same one-shot
+  allowance. An auto-rescue store/readiness error is logged and the normal
+  resource pause is kept rather than aborting the run. The grant releases only
+  the completion reserve for its 30-minute TTL.
+- macOS: Project RunPolicy toggle with the one-shot/fixed-budget/no-bypass
+  caveat, and Manage Dash → Usage & Budget Allocation insight and Trade-offs &
+  quality cards. The cards load only when visible or explicitly refreshed,
+  reject responses for another session, and fail closed to a visible error.
+- CLI: `project-run-policy-set --auto-rescue/--no-auto-rescue`, `allocation`,
+  and `tradeoffs`. The project RunPolicy human renderer now includes the auto
+  rescue state without changing the existing shape.
+- A temp-daemon CLI smoke exercised `project-run-policy-set --auto-rescue`,
+  `project-run-policy`, `allocation`, and `tradeoffs` against a real daemon and
+  temporary repository. A temp-daemon GUI smoke exercised the two cards and the
+  policy toggle; no provider was configured, so no live turn-boundary auto
+  rescue was triggered (unit/daemon tests cover the grant path).
+- Tests: targeted allocation, trade-off, auto-rescue, protocol, CLI, and
+  daemon tests; full workspace **4,624 passed / 0 failed / 6 ignored**;
+  Swift **659 passed (527 app + 132 helper)**; fmt, clippy,
+  SwiftFormat, and `xcodebuild test` pass.
+- Limits: automatic per-task envelope reallocation and the daily attention
+  schedule remain open. Estimates are sparse historical heuristics, not vendor
+  token counts; confidence is not a calibrated probability; profile forecasts
+  are not per-profile; the auto-rescue lock is same-daemon only.
 
 ## Carried findings from the V1 plan
 

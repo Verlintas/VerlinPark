@@ -437,6 +437,10 @@ struct DashboardView: View {
         case .usage:
             if let project = model.selectedProject {
                 EfficiencyCard(project: project)
+                if model.selectedSessionID != nil {
+                    AllocationInsightCard()
+                    TradeoffQualityCard()
+                }
                 ProgressCard(
                     ledger: model.sessionProgress,
                     style: .expanded,
@@ -561,6 +565,10 @@ struct DashboardView: View {
             await model.loadEfficiency()
             await model.loadProgress()
             await model.loadProjectBudget()
+            if model.selectedSessionID != nil {
+                await model.loadSessionAllocation(silent: true)
+                await model.loadSessionTradeoffs(silent: true)
+            }
         case .git:
             await model.loadProjectForkForest()
             await model.loadLineage()

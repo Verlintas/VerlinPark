@@ -1600,6 +1600,7 @@ mod tests {
                 no_progress_turns: 4,
                 ..RunStopPolicy::default()
             },
+            auto_rescue: false,
         };
         let saved = engine
             .set_project_run_policy(SetProjectRunPolicyParams {

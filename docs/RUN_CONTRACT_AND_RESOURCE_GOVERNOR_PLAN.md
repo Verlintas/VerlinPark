@@ -1,6 +1,6 @@
 # Run Contract and Resource Governor plan
 
-- Status: Accepted; P0/R1/R2a/R2b implemented (lean turn-boundary pause, child Auto request-fit incl. cost/time, project RunPolicy, attention batch prompt, explicit partial delivery, rescue reserve + allocation advisory, readiness snapshot cache, macOS operator surfaces); R3 automatic envelope reallocation/per-task envelopes and R4 open
+- Status: Accepted; P0/R1/R2a/R2b implemented plus the R3 allocation / R4 trade-off preview slice; automatic per-task envelope reallocation and the daily attention schedule remain open (see R3/R4 below)
 - Date: 2026-11-24
 - Owner: Verlintas
 - Scope: V1 single-project coding
@@ -592,27 +592,88 @@ Implemented:
 
 Remaining:
 
-- None in R2b. Automatic task-envelope reallocation is deliberately R3, where
-  it belongs with per-task envelope allocation; the current allocation preview
-  only recommends it.
+- None in R2b. The R3a preview now shows per-task envelopes and recommends
+  reallocation, but automatic task-envelope reallocation itself remains open in
+  R3 (see below).
 
-### R3 — Allocate (next)
+### R3 — Allocate (preview implemented; automatic reallocation open)
 
-- Pre-dispatch feasibility, per-task envelopes, automatic envelope
-  reallocation, p50/p90 from history, diagnosis/metareasoning, replan
-  recommendations.
-- Attention/trust calibration recommendations.
+Implemented (R3a):
 
-### R4 — Deliver (later)
+- `session.allocation` / `vp allocation` is a read-only preview over the
+  session envelope, stored TeamPlan DAG and critical path, task queue, bounded
+  project usage history (latest 1,000 ledger rows), readiness, approvals,
+  effects, failure diagnosis, and stall observations.
+- Per-task estimates use deterministic precedence: session actuals for the
+  task, the plan task envelope, project department actuals (nearest-rank
+  p50/p90 across tasks), the department envelope, then an explicit unknown
+  prior. Unknown is `None`, not zero.
+- Feasibility focuses on the remaining critical path when available and
+  otherwise on all remaining tasks. It reports p50/p90 tokens/cost, the
+  completion reserve, headroom, and a bounded reason
+  (`insufficient_estimate`, `remaining_below_completion_reserve`,
+  `p90_exceeds_reserve_headroom`, `cost_unconfigured`, and related codes). A
+  task with no estimate is not reported as feasible.
+- Recommendations, metareasoning (diagnosis target, no-progress turns,
+  stalled/failed/retrying tasks), and attention/trust calibration are bounded
+  and advisory. The preview appends no event and changes no task envelope,
+  budget, model, route, approval, effect, Verifier, or merge state.
+- `ProjectRunPolicy.auto_rescue` (default off) is the only automatic action in
+  this slice: at a turn boundary that pauses exactly on
+  `completion_reserve_*`, an eligible fixed-budget, near-completion session with
+  a latest commit, no no-progress turns, headroom, and no prior rescue grant may
+  receive one automatic grant. Concurrent boundaries are serialized in-process;
+  manual grants consume the same one-shot allowance. The grant releases only the
+  completion reserve for its normal TTL and never raises a hard cap.
+- CLI `--auto-rescue` / `--no-auto-rescue`, the macOS policy toggle, and the
+  Manage Dash allocation/trade-off cards use only these daemon surfaces.
 
-- Trade-off frontier, anytime UI, daily attention schedule, quality/review
-  dashboard, calibrated confidence.
+Remaining:
+
+- Automatic per-task envelope reallocation. The preview recommends
+  reallocation but never rewrites a plan/task budget. A safe implementation
+  needs event-backed plan revision semantics, reservation interaction, and
+  explicit no-widening checks; it is deliberately not inferred from the
+  preview.
+- Learning from actuals beyond deterministic project/department nearest-rank
+  p50/p90; no model training or hidden routing.
+- LLM replanning; replan recommendations remain textual/advisory.
+
+### R4 — Deliver (preview implemented; scheduling open)
+
+Implemented (R4a):
+
+- `session.tradeoffs` / `vp tradeoffs` returns the five documented profile
+  postures (quality/balanced/fast/cheap/unattended), the current profile, the
+  session's existing turn/cost forecast repeated without per-profile
+  guarantees, a bounded quality/reviewability review, and an explicitly
+  heuristic calibrated confidence score.
+- Quality review reports readiness, latest commit/test/Verifier/merge evidence,
+  completed/total tasks, merged entries, changed paths, blockers, and
+  `ok|watch|risk` reviewability. It never replaces the Verifier.
+- A different profile is marked recommended only from deterministic evidence:
+  `quality` for risk/blockers/blocked effects, `cost` under completion-reserve
+  pressure. The current profile is not double-badged, and the view never
+  switches it.
+- Manage Dash → Usage & Budget has read-only Allocation insight and Trade-offs &
+  quality cards; both reject a response for a different session and neither is
+  loaded by the selection sweep.
+
+Remaining:
+
+- Daily attention schedule / quiet-window batching beyond the existing
+  attention batch prompt; no cron or operator-calendar integration.
+- Anytime UI beyond the advisory cards; the existing pause/partial-delivery
+  flow remains the execution surface.
+- Learned confidence calibration; the current score is a documented heuristic.
 
 ## 17. Test matrix
 
 | Area | Tests |
 |---|---|
 | Resource math | cache weighting, missing prices, output weight, clamping, p50/p90 |
+| Allocation (R3a) | estimate precedence, unknown/insufficient estimates, critical-path focus, cost/token feasibility, no-event preview, serialized one-shot auto rescue |
+| Trade-offs (R4a) | five profiles, quality/reviewability, confidence heuristic, deterministic recommended profile, no profile switch |
 | Contract | derive/validate/profile bounds/reserve/risk/attention/no widening |
 | Governor | pre-dispatch infeasibility, continue/throttle/reallocate/rescue/pause/stop/replan, no hidden routing |
 | Readiness | none/dirty/committed/tests/verified/merged/partial/blocked, stale evidence, unresolved effect |
@@ -647,7 +708,7 @@ Remaining:
 
 ## 20. Immediate implementation slice
 
-Implemented **P0 + R1 + R2a + R2b core**:
+Implemented **P0 + R1 + R2a + R2b core + R3a/R4a previews**:
 
 - tool friction fixes with tests;
 - read-only resource/readiness/contract RPCs and CLI;
@@ -663,7 +724,15 @@ Implemented **P0 + R1 + R2a + R2b core**:
 - explicit partial-delivery record with RPC/CLI/Stage UI;
 - rescue reserve grant + read-only allocation preview with RPC/CLI/Stage UI;
 - readiness snapshot cache for explicit resource views;
+- R3a read-only allocation preview with bounded per-task envelopes,
+  critical-path feasibility, project/department p50/p90, diagnosis and
+  metareasoning, attention/trust calibration, RPC/CLI, and macOS card;
+- opt-in one-shot automatic completion-reserve rescue
+  (`ProjectRunPolicy.auto_rescue`, CLI/GUI, serialized turn-boundary path);
+- R4a read-only trade-off frontier, quality/reviewability review, calibrated
+  confidence, deterministic advisory profile recommendation, RPC/CLI, and
+  macOS card;
 - ledger/docs updated with the multi-resource model.
 
-Next: R3 allocate (per-task envelopes and automatic envelope reallocation),
-then R4 deliver.
+Next: R3 automatic per-task envelope reallocation (with plan-revision and
+reservation semantics), then the R4 daily attention schedule.

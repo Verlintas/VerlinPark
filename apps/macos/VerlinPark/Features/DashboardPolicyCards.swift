@@ -434,6 +434,10 @@ struct ProjectRunPolicyCard: View {
             header
             if let policy {
                 metrics(policy)
+                Text(policy.autoRescueDetail)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(policy.autoRescue ? VPTheme.warning : .secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 if let error = model.projectRunPolicyError {
                     Label(error.displayText, systemImage: "exclamationmark.triangle.fill")
                         .font(.system(size: 9, design: .monospaced))
@@ -524,6 +528,16 @@ struct ProjectRunPolicyCard: View {
                         in: Capsule()
                     )
             }
+            if policy?.autoRescue == true {
+                Text("AUTO RESCUE ON")
+                    .font(.system(size: 7, weight: .semibold, design: .monospaced))
+                    .tracking(0.3)
+                    .foregroundStyle(VPTheme.warning)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(VPTheme.warning.opacity(0.10), in: Capsule())
+                    .help(policy?.autoRescueDetail ?? "")
+            }
         }
     }
 
@@ -533,6 +547,7 @@ struct ProjectRunPolicyCard: View {
             policyMetric("Reserve", policy.reservePercentLabel)
             policyMetric("Attention cap", policy.attentionLabel)
             policyMetric("No progress", policy.noProgressLabel)
+            policyMetric("Auto rescue", policy.autoRescueLabel)
         }
     }
 
@@ -618,6 +633,7 @@ struct ProjectRunPolicySheet: View {
                     sourceLine
                     fields
                     stopPolicy
+                    autoRescuePolicy
                     validationLine
                     feedback
                     note
@@ -758,6 +774,24 @@ struct ProjectRunPolicySheet: View {
             .controlSize(.small)
             Text(
                 "The marginal-value ratio \(String(format: "%.2f", model.projectRunPolicyDraft.marginalValueRatio)) is preserved from the loaded policy; this sheet does not edit it."
+            )
+            .font(VPTheme.mono(7))
+            .foregroundStyle(VPTheme.textTertiary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+        .disabled(!projectMatches || model.projectRunPolicyBusy)
+    }
+
+    private var autoRescuePolicy: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Toggle(
+                "Allow one automatic completion-reserve rescue per session",
+                isOn: valueBinding(\.autoRescue)
+            )
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            Text(
+                "Explicit project opt-in. The daemon grants at most one automatic completion-reserve rescue per session, only for eligible fixed-budget near-completion work. It never adds budget, removes caps, changes model routing, or bypasses Verifier/Integrator; approvals, sandbox, and task contracts still apply. Off by default."
             )
             .font(VPTheme.mono(7))
             .foregroundStyle(VPTheme.textTertiary)

@@ -179,6 +179,7 @@ mod artifact_mailbox;
 mod backup_forge;
 mod daemon;
 mod gui_process;
+mod insight;
 mod mcp_acp;
 mod memory_source;
 mod policy;
@@ -193,6 +194,7 @@ enum Family {
     BackupForge,
     Daemon,
     GuiProcess,
+    Insight,
     McpAcp,
     MemorySource,
     Policy,
@@ -205,6 +207,19 @@ fn family(method: &str) -> Option<Family> {
     match method {
         "auth" | "ping" => return Some(Family::Daemon),
         "task.stalls" => return Some(Family::Session),
+        "session.budget.governor"
+        | "session.contract"
+        | "session.resources"
+        | "session.resources.top_up"
+        | "session.readiness"
+        | "session.delivery"
+        | "session.delivery.partial"
+        | "session.allocation"
+        | "session.tradeoffs"
+        | "session.rescue.status"
+        | "session.rescue"
+        | "session.run_contract.get"
+        | "session.run_contract.set" => return Some(Family::Insight),
         _ => {}
     }
     let prefix = method.split_once('.').map(|(prefix, _)| prefix)?;
@@ -237,6 +252,7 @@ pub(crate) async fn dispatch(state: &AppState, request: RpcRequest) -> RpcRespon
         Some(Family::BackupForge) => backup_forge::handle(state, id, request).await,
         Some(Family::Daemon) => daemon::handle(state, id, request).await,
         Some(Family::GuiProcess) => gui_process::handle(state, id, request).await,
+        Some(Family::Insight) => insight::handle(state, id, request).await,
         Some(Family::McpAcp) => mcp_acp::handle(state, id, request).await,
         Some(Family::MemorySource) => memory_source::handle(state, id, request).await,
         Some(Family::Policy) => policy::handle(state, id, request).await,

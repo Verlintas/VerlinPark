@@ -1,5 +1,6 @@
 //! Ordered human renderer dispatch.
 
+mod allocation;
 mod briefs;
 mod delivery;
 mod maintenance;
@@ -14,6 +15,7 @@ mod resources;
 mod sessions;
 mod sources;
 mod status;
+mod tradeoffs;
 
 #[allow(unused_imports)]
 pub(crate) use operator::{agent_inspect_lines, agent_message_lines};
@@ -110,6 +112,12 @@ pub(crate) fn print_human_for(hint: Option<&str>, value: &Value) {
         return;
     }
     if delivery::print(value) {
+        return;
+    }
+    if allocation::print(value) {
+        return;
+    }
+    if tradeoffs::print(value) {
         return;
     }
     if rescue::print(value) {

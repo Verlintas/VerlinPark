@@ -1626,6 +1626,7 @@ mod project_run_policy_rebuild_tests {
                     no_progress_turns: 5,
                     ..RunStopPolicy::default()
                 },
+                auto_rescue: true,
             };
             engine
                 .set_project_run_policy(SetProjectRunPolicyParams {

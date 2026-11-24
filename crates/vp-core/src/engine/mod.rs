@@ -7,6 +7,7 @@
 use super::*;
 
 pub(crate) mod agents;
+pub(crate) mod allocation;
 pub(crate) mod approvals;
 pub(crate) mod artifacts;
 pub(crate) mod auto_budget;
@@ -31,5 +32,6 @@ pub(crate) mod sessions;
 pub(crate) mod sources;
 pub(crate) mod support;
 pub(crate) mod surfaces;
+pub(crate) mod tradeoffs;
 pub(crate) mod usage;
 pub(crate) mod worktrees;

@@ -1420,6 +1420,27 @@ actor CoreClient {
         .decode(ReadinessSnapshotView.self)
     }
 
+    /// Read-only R3 allocation preview: envelopes, feasibility, task forecasts,
+    /// recommendations, metareasoning, and calibration. Nothing here mutates a
+    /// budget, task envelope, model, or route.
+    func sessionAllocation(sessionID: String) async throws -> AllocationPreviewView {
+        try await request(
+            method: "session.allocation",
+            params: ["session_id": .string(sessionID)]
+        )
+        .decode(AllocationPreviewView.self)
+    }
+
+    /// Read-only R4 trade-off/quality view: profile frontier, delivery review,
+    /// and calibrated confidence. The client never selects a profile.
+    func sessionTradeoffs(sessionID: String) async throws -> TradeoffView {
+        try await request(
+            method: "session.tradeoffs",
+            params: ["session_id": .string(sessionID)]
+        )
+        .decode(TradeoffView.self)
+    }
+
     func sessionDelivery(sessionID: String) async throws -> SessionDeliveryResultView {
         try await request(
             method: "session.delivery",

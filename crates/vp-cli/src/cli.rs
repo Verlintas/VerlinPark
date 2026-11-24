@@ -2326,6 +2326,12 @@ pub(crate) enum Command {
         /// No-progress turn limit inherited by the contract view.
         #[arg(long)]
         no_progress_turns: Option<u32>,
+        /// Opt in to one automatic completion-reserve rescue per session.
+        #[arg(long, conflicts_with = "no_auto_rescue")]
+        auto_rescue: bool,
+        /// Disable automatic completion-reserve rescue.
+        #[arg(long, conflicts_with = "auto_rescue")]
+        no_auto_rescue: bool,
     },
     /// Enable or disable unlimited budget mode for a session.
     SessionUnlimited {
@@ -2748,6 +2754,10 @@ pub(crate) enum Command {
     Readiness { session: String },
     /// Show the latest explicit partial-delivery record and current readiness.
     Delivery { session: String },
+    /// Show the read-only per-task allocation/feasibility preview (R3).
+    Allocation { session: String },
+    /// Show the read-only profile trade-off and quality view (R4).
+    Tradeoffs { session: String },
     /// Show the rescue eligibility, allocation reserve, and near-completion preview.
     RescueStatus { session: String },
     /// Grant a short-lived completion-reserve release for near-completion work.

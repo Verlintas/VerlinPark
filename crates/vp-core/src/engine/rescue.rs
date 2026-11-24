@@ -264,19 +264,13 @@ impl Engine {
             .map(|value| bounded_rescue_text(value, MAX_RESCUE_RECORDED_BY_CHARS))
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "operator".to_string());
-        let grant = RescueGrant {
-            schema: RESCUE_SCHEMA.to_string(),
-            id: format!("rs-{}", Uuid::now_v7()),
-            session_id: session.id.clone(),
-            project_id: session.project_id.clone(),
-            recorded_at: now_rfc3339(),
-            expires_at: rescue_timestamp_after(RESCUE_TTL_SECS),
+        let grant = build_rescue_grant(
+            &session,
+            &status.readiness,
+            status.no_progress_turns,
             recorded_by,
             reason,
-            readiness_level: status.readiness.level.clone(),
-            latest_commit: status.readiness.latest_commit.clone(),
-            no_progress_turns: status.no_progress_turns,
-        };
+        );
 
         self.append_event(
             &session.id,
@@ -292,6 +286,91 @@ impl Engine {
             status,
         })
     }
+
+    /// Turn-boundary automatic rescue owned by an explicit project policy.
+    ///
+    /// The auto path is deliberately one-shot per session: any prior
+    /// `session.resource.rescue` grant (manual or automatic) consumes the
+    /// automatic allowance. The grant still only releases the completion
+    /// reserve for the normal 30-minute TTL; it never raises a hard cap,
+    /// changes attention/approval policy, approves, verifies, merges, or routes
+    /// a model. Ineligible work, including dirty/blocked/looping/auto/unlimited
+    /// sessions, imported archives, no-headroom sessions, and sessions without
+    /// a latest commit, is never auto-granted.
+    pub(crate) async fn maybe_auto_rescue(&self, session_id: &str, reason: &str) -> Result<bool> {
+        if !reason.trim().starts_with("completion_reserve_") {
+            return Ok(false);
+        }
+        let session = self.rescue_session(session_id).await?;
+        let policy = self
+            .get_project_run_policy(&session.project_id)
+            .await?
+            .policy;
+        if !policy.auto_rescue {
+            return Ok(false);
+        }
+        // Readiness and budget reads can be slow, so do them before taking the
+        // one-shot critical section. The turn loop is concurrent for
+        // Leader/Manager/Worker/Labour; only the count and append must be
+        // serialized or two children can both observe zero grants. Manual
+        // `session.rescue` deliberately stays outside this process-wide lock.
+        let budget = self.session_budget(&session.id).await?;
+        let readiness = self.session_readiness(&session.id).await?;
+        let no_progress_turns = budget
+            .state
+            .as_ref()
+            .map(|state| state.turns_without_progress)
+            .unwrap_or(0);
+        let (eligible, _) =
+            rescue_eligibility_internal(&session, &budget, &readiness, no_progress_turns, true);
+        if !eligible {
+            return Ok(false);
+        }
+        let _auto_rescue_guard = self.auto_rescue_lock.lock().await;
+        if self
+            .count_events_of_kind(&session.id, SESSION_RESCUE_EVENT)
+            .await?
+            > 0
+        {
+            return Ok(false);
+        }
+        let grant = build_rescue_grant(
+            &session,
+            &readiness,
+            no_progress_turns,
+            "policy:auto_rescue".to_string(),
+            "automatic completion-reserve reallocation (project policy)".to_string(),
+        );
+        self.append_event(
+            &session.id,
+            SESSION_RESCUE_EVENT,
+            serde_json::to_value(&grant)?,
+        )
+        .await?;
+        Ok(true)
+    }
+}
+
+fn build_rescue_grant(
+    session: &Session,
+    readiness: &vp_protocol::types::ReadinessSnapshot,
+    no_progress_turns: u32,
+    recorded_by: String,
+    reason: String,
+) -> RescueGrant {
+    RescueGrant {
+        schema: RESCUE_SCHEMA.to_string(),
+        id: format!("rs-{}", Uuid::now_v7()),
+        session_id: session.id.clone(),
+        project_id: session.project_id.clone(),
+        recorded_at: now_rfc3339(),
+        expires_at: rescue_timestamp_after(RESCUE_TTL_SECS),
+        recorded_by,
+        reason,
+        readiness_level: readiness.level.clone(),
+        latest_commit: readiness.latest_commit.clone(),
+        no_progress_turns,
+    }
 }
 
 fn rescue_eligibility(
@@ -300,13 +379,28 @@ fn rescue_eligibility(
     readiness: &vp_protocol::types::ReadinessSnapshot,
     no_progress_turns: u32,
 ) -> (bool, String) {
+    rescue_eligibility_internal(session, budget, readiness, no_progress_turns, false)
+}
+
+/// Shared eligibility for the operator path and the turn-boundary auto-rescue
+/// path. Only the auto path may treat the still-`running` session as eligible;
+/// every other gate (imported/dirty/blocked/looping/auto/unlimited/headroom/
+/// no-commit) is identical.
+fn rescue_eligibility_internal(
+    session: &Session,
+    budget: &vp_protocol::types::SessionBudgetStatus,
+    readiness: &vp_protocol::types::ReadinessSnapshot,
+    no_progress_turns: u32,
+    allow_running: bool,
+) -> (bool, String) {
     if session.status == "imported" {
         return (false, "imported".to_string());
     }
-    if !matches!(
+    let allowed_status = matches!(
         session.status.as_str(),
         "paused" | "idle" | "failed" | "cancelled"
-    ) {
+    ) || (allow_running && session.status == "running");
+    if !allowed_status {
         let reason = if session.status == "draft" {
             "no_commit"
         } else {
@@ -484,7 +578,10 @@ mod tests {
     use std::path::Path;
     use std::process::Command;
     use tempfile::TempDir;
-    use vp_protocol::types::{AutoBudgetPolicy, SessionAutoBudgetState, SetSessionBudgetParams};
+    use vp_protocol::types::{
+        AutoBudgetPolicy, ProjectRunPolicy, SessionAutoBudgetState, SetProjectRunPolicyParams,
+        SetSessionBudgetParams,
+    };
 
     fn init_repo(path: &Path) {
         std::fs::write(path.join("README.md"), "hello\n").unwrap();
@@ -624,6 +721,300 @@ mod tests {
 
     fn code(error: &anyhow::Error) -> Option<&'static str> {
         error.downcast_ref::<RescueError>().map(|typed| typed.code)
+    }
+
+    async fn set_auto_rescue(engine: &Engine, project_id: &str, enabled: bool) {
+        let current = engine
+            .get_project_run_policy(project_id)
+            .await
+            .unwrap()
+            .policy;
+        engine
+            .set_project_run_policy(SetProjectRunPolicyParams {
+                project_id: project_id.to_string(),
+                policy: ProjectRunPolicy {
+                    auto_rescue: enabled,
+                    ..current
+                },
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn auto_rescue_policy_is_off_by_default_and_one_shot() {
+        let (_data, _repo, engine, session) = fixture(Some(10_000)).await;
+        engine
+            .store()
+            .update_session_status(&session.id, "running")
+            .unwrap();
+        record_usage(&engine, &session.id, 9_000, 0).await;
+        let decision = engine
+            .resource_governor_turn_decision(&session.id)
+            .await
+            .unwrap();
+        assert!(decision.should_block(), "{decision:?}");
+        assert_eq!(decision.reason, "completion_reserve_tokens");
+        assert!(
+            !engine
+                .maybe_auto_rescue(&session.id, &decision.reason)
+                .await
+                .unwrap(),
+            "the project policy is off by default; the turn must pause"
+        );
+        assert_eq!(
+            engine
+                .count_events_of_kind(&session.id, SESSION_RESCUE_EVENT)
+                .await
+                .unwrap(),
+            0
+        );
+
+        set_auto_rescue(&engine, &session.project_id, true).await;
+        assert!(
+            engine
+                .maybe_auto_rescue(&session.id, &decision.reason)
+                .await
+                .unwrap(),
+            "an eligible running session is auto-granted once"
+        );
+        let event = engine
+            .latest_event_of_kind(&session.id, SESSION_RESCUE_EVENT)
+            .await
+            .unwrap()
+            .expect("automatic rescue event");
+        assert_eq!(event.payload["recorded_by"], "policy:auto_rescue");
+        assert_eq!(
+            event.payload["reason"],
+            "automatic completion-reserve reallocation (project policy)"
+        );
+        let grant = engine
+            .active_rescue_grant(&session.id)
+            .await
+            .unwrap()
+            .expect("active auto grant");
+        assert_eq!(grant.recorded_by, "policy:auto_rescue");
+        assert!(grant.id.starts_with("rs-"));
+
+        let decision = engine
+            .resource_governor_turn_decision(&session.id)
+            .await
+            .unwrap();
+        assert!(!decision.should_block(), "{decision:?}");
+        assert!(!decision.reason.starts_with("completion_reserve_"));
+        assert!(
+            engine
+                .consume_rescue_grant(&session.id, &grant.id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !engine
+                .consume_rescue_grant(&session.id, &grant.id)
+                .await
+                .unwrap(),
+            "the grant is consumed exactly once"
+        );
+        assert_eq!(
+            engine
+                .count_events_of_kind(&session.id, SESSION_RESCUE_EVENT)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            !engine
+                .maybe_auto_rescue(&session.id, "completion_reserve_tokens")
+                .await
+                .unwrap(),
+            "the automatic/manual grant cap is one per session"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_rescue_is_serialized_across_concurrent_turn_boundaries() {
+        let (_data, _repo, engine, session) = fixture(Some(10_000)).await;
+        set_auto_rescue(&engine, &session.project_id, true).await;
+        engine
+            .store()
+            .update_session_status(&session.id, "running")
+            .unwrap();
+        record_usage(&engine, &session.id, 9_000, 0).await;
+
+        let (first, second) = tokio::join!(
+            engine.maybe_auto_rescue(&session.id, "completion_reserve_tokens"),
+            engine.maybe_auto_rescue(&session.id, "completion_reserve_tokens"),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert!(
+            first ^ second,
+            "exactly one concurrent boundary may append the automatic grant"
+        );
+        assert_eq!(
+            engine
+                .count_events_of_kind(&session.id, SESSION_RESCUE_EVENT)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_rescue_never_grants_for_ineligible_work() {
+        // Dirty worktree.
+        let (_data, _repo, engine, session) = fixture(Some(10_000)).await;
+        set_auto_rescue(&engine, &session.project_id, true).await;
+        engine
+            .store()
+            .update_session_status(&session.id, "running")
+            .unwrap();
+        record_usage(&engine, &session.id, 9_000, 0).await;
+        let worktree = session.worktree.as_deref().expect("session worktree");
+        std::fs::write(
+            Path::new(worktree).join("src/pending.rs"),
+            "pub fn wip() {}\n",
+        )
+        .unwrap();
+        assert!(
+            !engine
+                .maybe_auto_rescue(&session.id, "completion_reserve_tokens")
+                .await
+                .unwrap()
+        );
+
+        // Looping work.
+        let (_data, _repo, engine, session) = fixture(Some(10_000)).await;
+        set_auto_rescue(&engine, &session.project_id, true).await;
+        engine
+            .store()
+            .update_session_status(&session.id, "running")
+            .unwrap();
+        record_usage(&engine, &session.id, 9_000, 0).await;
+        engine
+            .update_session_auto_budget_state(
+                &session.id,
+                SessionAutoBudgetState {
+                    turns_without_progress: 2,
+                    ..SessionAutoBudgetState::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            !engine
+                .maybe_auto_rescue(&session.id, "completion_reserve_tokens")
+                .await
+                .unwrap()
+        );
+
+        // Auto budget owns its own reserve.
+        let (_data, _repo, engine, session) = auto_fixture().await;
+        set_auto_rescue(&engine, &session.project_id, true).await;
+        engine
+            .store()
+            .update_session_status(&session.id, "running")
+            .unwrap();
+        assert!(
+            !engine
+                .maybe_auto_rescue(&session.id, "completion_reserve_tokens")
+                .await
+                .unwrap()
+        );
+
+        // Unlimited sessions have no economic reserve to release.
+        let (_data, _repo, engine, session) = fixture(Some(10_000)).await;
+        set_auto_rescue(&engine, &session.project_id, true).await;
+        engine
+            .set_session_unlimited(&session.id, true)
+            .await
+            .unwrap();
+        engine
+            .store()
+            .update_session_status(&session.id, "running")
+            .unwrap();
+        record_usage(&engine, &session.id, 9_000, 0).await;
+        assert!(
+            !engine
+                .maybe_auto_rescue(&session.id, "completion_reserve_tokens")
+                .await
+                .unwrap()
+        );
+
+        // No remaining headroom.
+        let (_data, _repo, engine, session) = fixture(Some(10_000)).await;
+        set_auto_rescue(&engine, &session.project_id, true).await;
+        engine
+            .store()
+            .update_session_status(&session.id, "running")
+            .unwrap();
+        record_usage(&engine, &session.id, 10_000, 0).await;
+        assert!(
+            !engine
+                .maybe_auto_rescue(&session.id, "completion_reserve_tokens")
+                .await
+                .unwrap()
+        );
+
+        // Imported archives are read-only even when the policy opts in.
+        let (_data, _repo, engine, session) = fixture(Some(10_000)).await;
+        set_auto_rescue(&engine, &session.project_id, true).await;
+        engine
+            .store()
+            .update_session_status(&session.id, "imported")
+            .unwrap();
+        assert!(
+            !engine
+                .maybe_auto_rescue(&session.id, "completion_reserve_tokens")
+                .await
+                .unwrap()
+        );
+
+        // No latest commit.
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let store = Store::open(data.path()).unwrap();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("auto-no-commit"))
+            .unwrap();
+        let session = store.create_session(&project.id, "no commit").unwrap();
+        let engine = Engine::new(store);
+        set_auto_rescue(&engine, &project.id, true).await;
+        engine
+            .set_session_budget(SetSessionBudgetParams {
+                session_id: session.id.clone(),
+                mode: Some(BudgetMode::Fixed),
+                token_budget: Some(10_000),
+                ..SetSessionBudgetParams::default()
+            })
+            .await
+            .unwrap();
+        engine
+            .store()
+            .update_session_status(&session.id, "running")
+            .unwrap();
+        record_usage(&engine, &session.id, 9_000, 0).await;
+        assert!(
+            !engine
+                .maybe_auto_rescue(&session.id, "completion_reserve_tokens")
+                .await
+                .unwrap()
+        );
+
+        // A non-completion-reserve reason is never auto-rescued.
+        let (_data, _repo, engine, session) = fixture(Some(10_000)).await;
+        set_auto_rescue(&engine, &session.project_id, true).await;
+        engine
+            .store()
+            .update_session_status(&session.id, "running")
+            .unwrap();
+        assert!(
+            !engine
+                .maybe_auto_rescue(&session.id, "resource_cap_tokens")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

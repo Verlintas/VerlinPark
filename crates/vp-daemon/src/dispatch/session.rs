@@ -6,138 +6,6 @@ pub(super) async fn handle(
     request: RpcRequest,
 ) -> RpcResponse {
     match request.method.as_str() {
-        "session.budget.governor" => match parse_params::<GovernorStatusParams>(request.params) {
-            Ok(params) => match state
-                .engine
-                .budget_governor_status(&params.session_id, params.limit.unwrap_or(20))
-                .await
-            {
-                Ok(status) => RpcResponse::success(id, status),
-                Err(error) => internal_error(id, error),
-            },
-            Err(response) => response_with_id(id, response),
-        },
-        "session.contract" => match parse_params::<SessionContractParams>(request.params) {
-            Ok(params) => {
-                let task = params.task_id.as_deref();
-                match state
-                    .engine
-                    .session_contract_status(&params.session_id, task)
-                    .await
-                {
-                    Ok(result) => RpcResponse::success(id, result),
-                    Err(error) => internal_error(id, error),
-                }
-            }
-            Err(response) => response_with_id(id, response),
-        },
-        "session.resources" => {
-            match parse_params::<vp_protocol::types::SessionResourcesParams>(request.params) {
-                Ok(params) => match state.engine.session_resources(&params.session_id).await {
-                    Ok(result) => RpcResponse::success(id, result),
-                    Err(error) => internal_error(id, error),
-                },
-                Err(response) => response_with_id(id, response),
-            }
-        }
-        "session.readiness" => {
-            match parse_params::<vp_protocol::types::SessionReadinessParams>(request.params) {
-                Ok(params) => match state.engine.session_readiness(&params.session_id).await {
-                    Ok(result) => RpcResponse::success(id, result),
-                    Err(error) => internal_error(id, error),
-                },
-                Err(response) => response_with_id(id, response),
-            }
-        }
-        "session.delivery" => {
-            match parse_params::<vp_protocol::types::SessionDeliveryParams>(request.params) {
-                Ok(params) => match state.engine.session_delivery(params).await {
-                    Ok(result) => RpcResponse::success(id, result),
-                    Err(error) => internal_error(id, error),
-                },
-                Err(response) => response_with_id(id, response),
-            }
-        }
-        "session.delivery.partial" => {
-            match parse_params::<vp_protocol::types::PartialDeliveryParams>(request.params) {
-                Ok(params) => match state.engine.record_partial_delivery(params).await {
-                    Ok(result) => RpcResponse::success(id, result),
-                    Err(error) => partial_delivery_error(id, error),
-                },
-                Err(response) => response_with_id(id, response),
-            }
-        }
-        "session.rescue.status" => {
-            match parse_params::<vp_protocol::types::RescueStatusParams>(request.params) {
-                Ok(params) => match state.engine.rescue_status(&params.session_id).await {
-                    Ok(result) => RpcResponse::success(id, result),
-                    Err(error) => internal_error(id, error),
-                },
-                Err(response) => response_with_id(id, response),
-            }
-        }
-        "session.rescue" => {
-            match parse_params::<vp_protocol::types::RescueParams>(request.params) {
-                Ok(params) => match state.engine.grant_rescue(params).await {
-                    Ok(result) => RpcResponse::success(id, result),
-                    Err(error) => rescue_error(id, error),
-                },
-                Err(response) => response_with_id(id, response),
-            }
-        }
-        "session.run_contract.get" => {
-            match parse_params::<vp_protocol::types::SessionRunContractParams>(request.params) {
-                Ok(params) => match state.engine.run_contract_view(&params.session_id).await {
-                    Ok(result) => RpcResponse::success(id, result),
-                    Err(error) => internal_error(id, error),
-                },
-                Err(response) => response_with_id(id, response),
-            }
-        }
-        "session.run_contract.set" => {
-            match parse_params::<vp_protocol::types::SetRunContractParams>(request.params) {
-                Ok(params) => match state.engine.set_run_contract(params).await {
-                    Ok(result) => RpcResponse::success(id, result),
-                    Err(error) => internal_error(id, error),
-                },
-                Err(response) => response_with_id(id, response),
-            }
-        }
-        "session.resources.top_up" => {
-            match parse_params::<vp_protocol::types::TopUpSessionResourcesParams>(request.params) {
-                Ok(params) => {
-                    let session_id = params.session_id.clone();
-                    let resume = params.resume;
-                    match state.engine.top_up_session_budget(params).await {
-                        Ok((budget, capped)) => {
-                            let resumed = if resume {
-                                match state.agent.resume(&session_id).await {
-                                    Ok(resumed) => resumed,
-                                    Err(error) => return internal_error(id, error),
-                                }
-                            } else {
-                                false
-                            };
-                            match state.engine.session_resources(&session_id).await {
-                                Ok(resources) => RpcResponse::success(
-                                    id,
-                                    vp_protocol::types::TopUpSessionResourcesResult {
-                                        session_id,
-                                        budget,
-                                        resumed,
-                                        capped,
-                                        resources,
-                                    },
-                                ),
-                                Err(error) => internal_error(id, error),
-                            }
-                        }
-                        Err(error) => internal_error(id, error),
-                    }
-                }
-                Err(response) => response_with_id(id, response),
-            }
-        }
         "session.effects" => match parse_params::<SessionEffectsParams>(request.params) {
             Ok(params) => {
                 let include_settled = params.include_settled.unwrap_or(true);
@@ -1243,39 +1111,6 @@ pub(super) async fn handle(
     }
 }
 
-/// Partial-delivery failures carry a stable `DELIVERY_*` code in `data.code`
-/// and map to `INVALID_PARAMS`; unexpected store/internal failures keep the
-/// ordinary `INTERNAL_ERROR`.
-fn partial_delivery_error(id: Option<serde_json::Value>, error: anyhow::Error) -> RpcResponse {
-    if let Some(typed) = error.downcast_ref::<vp_core::PartialDeliveryError>() {
-        return RpcResponse::error(
-            id,
-            RpcError::with_data(
-                codes::INVALID_PARAMS,
-                typed.message.clone(),
-                json!({"code": typed.code}),
-            ),
-        );
-    }
-    internal_error(id, error)
-}
-
-/// Rescue failures carry a stable `RESCUE_*` code in `data.code` and map to
-/// `INVALID_PARAMS`; unexpected store/internal failures keep `INTERNAL_ERROR`.
-fn rescue_error(id: Option<serde_json::Value>, error: anyhow::Error) -> RpcResponse {
-    if let Some(typed) = error.downcast_ref::<vp_core::RescueError>() {
-        return RpcResponse::error(
-            id,
-            RpcError::with_data(
-                codes::INVALID_PARAMS,
-                typed.message.clone(),
-                json!({"code": typed.code}),
-            ),
-        );
-    }
-    internal_error(id, error)
-}
-
 #[cfg(test)]
 mod partial_delivery_rpc_tests {
     use super::*;
@@ -1430,6 +1265,100 @@ mod partial_delivery_rpc_tests {
             Some(granted.grant.id.as_str())
         );
     }
+    #[tokio::test]
+    async fn allocation_and_tradeoff_rpcs_are_bounded_and_read_only() {
+        let (_data, _repo, state, session) = fixture().await;
+        let plan = vp_protocol::types::TeamPlan {
+            goal: "allocation rpc".into(),
+            departments: vec![vp_protocol::types::PlanDepartment {
+                name: "impl".into(),
+                manager_title: "Implementation".into(),
+                profile: "coding".into(),
+                objective: "build it".into(),
+                token_budget: Some(8_000),
+                cost_budget_usd: None,
+            }],
+            tasks: vec![vp_protocol::types::PlanTask {
+                id: "T1".into(),
+                department: "impl".into(),
+                title: "Build it".into(),
+                kind: "coding".into(),
+                priority: 5,
+                profile: Some("coding".into()),
+                deps: Vec::new(),
+                write_scope: vec!["src/lib.rs".into()],
+                acceptance: vec!["tests pass".into()],
+                token_budget: None,
+                cost_budget_usd: None,
+                parent_task_id: None,
+                fanout_key: None,
+                fanout_join_for: None,
+            }],
+        };
+        state
+            .engine
+            .submit_team_plan(&session.id, &plan)
+            .await
+            .unwrap();
+        let before = state
+            .engine
+            .list_events(session.id.clone(), 0, 200)
+            .await
+            .unwrap()
+            .len();
+        let allocation = call(
+            &state,
+            "session.allocation",
+            json!({"session_id": session.id}),
+        )
+        .await;
+        let allocation: vp_protocol::types::AllocationPreview =
+            serde_json::from_value(allocation).unwrap();
+        assert_eq!(allocation.session_id, session.id);
+        assert_eq!(allocation.tasks.len(), 1);
+        assert_eq!(allocation.tasks[0].task_id, "T1");
+        assert!(
+            allocation.tasks[0].critical_path,
+            "the only pending plan task is on the critical path"
+        );
+        assert_eq!(allocation.tasks[0].source, "department_envelope");
+        assert_eq!(allocation.feasibility.reserve_tokens, None);
+        assert!(!allocation.metareasoning.diagnosis_status.is_empty());
+        assert!(allocation.recommendations.len() <= 12);
+
+        let tradeoffs = call(
+            &state,
+            "session.tradeoffs",
+            json!({"session_id": session.id}),
+        )
+        .await;
+        let tradeoffs: vp_protocol::types::TradeoffView =
+            serde_json::from_value(tradeoffs).unwrap();
+        assert_eq!(tradeoffs.session_id, session.id);
+        assert_eq!(tradeoffs.profiles.len(), 5);
+        assert_eq!(tradeoffs.current_profile, "balanced");
+        assert_eq!(
+            tradeoffs
+                .profiles
+                .iter()
+                .filter(|profile| profile.recommended)
+                .count(),
+            0,
+            "the current profile is not automatically badged as recommended"
+        );
+        assert!(tradeoffs.recommendations.len() <= 12);
+        let after = state
+            .engine
+            .list_events(session.id.clone(), 0, 200)
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(
+            after, before,
+            "allocation and trade-off previews must append no events"
+        );
+    }
+
     #[tokio::test]
     async fn delivery_rpcs_record_read_and_reject_unconfirmed_partial_delivery() {
         let (_data, _repo, state, session) = fixture().await;

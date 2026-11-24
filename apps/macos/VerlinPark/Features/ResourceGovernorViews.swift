@@ -2053,3 +2053,833 @@ struct RescueReserveSheet: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
+
+// MARK: - R3 allocation insight
+
+/// Read-only Manage Dash card for `session.allocation`. Every feasibility,
+/// forecast, envelope, recommendation, metareasoning, and calibration value is
+/// daemon-provided. The card has one explicit Refresh action and never applies
+/// a recommendation, changes a budget/task envelope/model, or resumes a run.
+struct AllocationInsightCard: View {
+    @Environment(AppModel.self) private var model
+
+    private var allocation: AllocationPreviewView? {
+        model.selectedSessionAllocation
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            header
+            if let error = model.sessionAllocationError {
+                errorRow(error)
+            }
+            if let allocation {
+                content(allocation)
+            } else if model.sessionAllocationBusy {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.mini)
+                    Text("Loading the daemon allocation preview…")
+                        .font(VPTheme.mono(8))
+                        .foregroundStyle(VPTheme.textSecondary)
+                }
+            } else {
+                notReported(
+                    "No allocation preview is loaded. Refresh to ask the daemon; no feasibility or forecast is inferred locally."
+                )
+            }
+            footer
+        }
+        .padding(14)
+        .background(
+            .white.opacity(0.035),
+            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .task(id: model.selectedSessionID) {
+            guard model.selectedSessionID != nil else { return }
+            await model.loadSessionAllocation()
+        }
+    }
+
+    private var header: some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: "chart.bar.doc.horizontal")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(VPTheme.accent)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                SectionLabel(title: "Allocation insight")
+                Text(model.selectedSession?.goal ?? "No session selected")
+                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 4)
+            Text("READ-ONLY · ADVISORY")
+                .font(VPTheme.mono(6.5, weight: .semibold))
+                .tracking(0.4)
+                .foregroundStyle(VPTheme.textTertiary)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(VPTheme.textTertiary.opacity(0.10), in: Capsule())
+            if model.sessionAllocationBusy {
+                ProgressView().controlSize(.mini)
+            }
+            Button {
+                Task { await model.refreshSessionAllocation() }
+            } label: {
+                Label("Refresh", systemImage: "arrow.clockwise")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(model.sessionAllocationBusy || model.selectedSessionID == nil)
+        }
+    }
+
+    private func content(_ allocation: AllocationPreviewView) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 8) {
+                Text(allocation.profileTitle)
+                    .font(VPTheme.mono(7.5, weight: .medium))
+                    .foregroundStyle(VPTheme.textSecondary)
+                Text("readiness \(allocation.readinessLabel)")
+                    .font(VPTheme.mono(7))
+                    .foregroundStyle(VPTheme.textTertiary)
+                if allocation.truncated {
+                    badge("DAEMON TRUNCATED", tint: VPTheme.warning)
+                }
+                Spacer(minLength: 4)
+            }
+            feasibilitySection(allocation.feasibility)
+            envelopeSection(allocation.envelope)
+            taskSection(allocation)
+            recommendationSection(
+                allocation.recommendationPreviews,
+                overflow: allocation.recommendationOverflow
+            )
+            metareasoningSection(allocation.metareasoning)
+            calibrationSection(allocation.calibration)
+        }
+    }
+
+    @ViewBuilder
+    private func feasibilitySection(_ feasibility: AllocationFeasibilityView?) -> some View {
+        sectionTitle("FEASIBILITY")
+        if let feasibility {
+            HStack(spacing: 7) {
+                badge(feasibility.statusLabel, tint: feasibilityTint(feasibility))
+                Spacer(minLength: 4)
+                Text(feasibility.forecastLabel)
+                    .font(VPTheme.mono(7))
+                    .foregroundStyle(VPTheme.textTertiary)
+                    .lineLimit(2)
+            }
+            Text(feasibility.reasonLabel)
+                .font(VPTheme.mono(7.5))
+                .foregroundStyle(VPTheme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 10) {
+                Text(feasibility.reserveHeadroomLabel)
+                    .font(VPTheme.mono(7))
+                    .foregroundStyle(VPTheme.textTertiary)
+                if !feasibility.criticalPathPreviews.isEmpty {
+                    Text("critical path: \(criticalPathLabel(feasibility))")
+                        .font(VPTheme.mono(7))
+                        .foregroundStyle(VPTheme.textTertiary)
+                        .lineLimit(1)
+                }
+            }
+        } else {
+            notReported("The daemon returned no feasibility result; no local estimate is invented.")
+        }
+    }
+
+    private func criticalPathLabel(_ feasibility: AllocationFeasibilityView) -> String {
+        var text = feasibility.criticalPathPreviews.joined(separator: ", ")
+        if feasibility.criticalPathOverflow > 0 {
+            text += " +\(feasibility.criticalPathOverflow)"
+        }
+        return text
+    }
+
+    @ViewBuilder
+    private func envelopeSection(_ envelope: AllocationEnvelopeView?) -> some View {
+        sectionTitle("ENVELOPE")
+        if let envelope {
+            HStack(alignment: .top, spacing: 14) {
+                metric("Remaining", envelope.remainingLabel)
+                metric("Budget", envelope.budgetLabel)
+                metric("Spent", envelope.spentLabel)
+                metric("Reserve", envelope.reservePercentLabel)
+            }
+        } else {
+            notReported("The daemon returned no session envelope.")
+        }
+    }
+
+    @ViewBuilder
+    private func taskSection(_ allocation: AllocationPreviewView) -> some View {
+        sectionTitle("TASK ENVELOPES (\(allocation.tasks.count))")
+        if allocation.tasks.isEmpty {
+            notReported("No task envelopes were returned.")
+        } else {
+            VStack(alignment: .leading, spacing: 7) {
+                ForEach(Array(allocation.taskPreviews.enumerated()), id: \.offset) { _, task in
+                    taskRow(task)
+                }
+                if allocation.taskOverflow > 0 {
+                    Text("… \(allocation.taskOverflow) more task envelopes")
+                        .font(VPTheme.mono(7))
+                        .foregroundStyle(VPTheme.textTertiary)
+                }
+            }
+        }
+    }
+
+    private func taskRow(_ task: AllocationTaskEnvelopeView) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                Text(task.taskIDLabel)
+                    .font(VPTheme.mono(6.5, weight: .semibold))
+                    .foregroundStyle(VPTheme.accent)
+                Text(task.titleLabel)
+                    .font(VPTheme.mono(8, weight: .medium))
+                    .foregroundStyle(VPTheme.textPrimary)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                if task.criticalPath == true {
+                    badge("CRITICAL PATH", tint: VPTheme.warning)
+                }
+                if let ready = task.readyLabel {
+                    badge(ready, tint: task.ready == true ? VPTheme.success : VPTheme.textTertiary)
+                }
+                if let feasible = task.feasibleLabel {
+                    badge(feasible, tint: task.feasible == true ? VPTheme.success : VPTheme.danger)
+                }
+            }
+            HStack(spacing: 10) {
+                Text(task.departmentLabel)
+                Text(task.statusLabel)
+                if let priority = task.priority {
+                    Text("priority \(priority)")
+                }
+                Text(task.budgetLabel)
+                if let source = task.sourceLabel {
+                    Text(source)
+                }
+                Spacer(minLength: 4)
+                Text(task.forecastLabel)
+            }
+            .font(VPTheme.mono(6.5))
+            .foregroundStyle(VPTheme.textTertiary)
+            .lineLimit(1)
+            if let reason = task.reasonLabel {
+                Text(reason)
+                    .font(VPTheme.mono(7))
+                    .foregroundStyle(VPTheme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(8)
+        .background(VPTheme.surfaceSunken.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    @ViewBuilder
+    private func recommendationSection(
+        _ recommendations: [AllocationRecommendationView],
+        overflow: Int,
+        title: String = "RECOMMENDATIONS"
+    ) -> some View {
+        sectionTitle(title)
+        if recommendations.isEmpty {
+            notReported("No advisory recommendations were returned.")
+        } else {
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(Array(recommendations.enumerated()), id: \.offset) { _, recommendation in
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Text(recommendation.actionLabel)
+                                .font(VPTheme.mono(7.5, weight: .medium))
+                                .foregroundStyle(VPTheme.textPrimary)
+                            badge(
+                                recommendation.confidenceLabel,
+                                tint: confidenceTint(recommendation.confidenceLabel)
+                            )
+                            if let taskID = recommendation.taskIDLabel {
+                                Text(taskID)
+                                    .font(VPTheme.mono(6.5))
+                                    .foregroundStyle(VPTheme.accent)
+                            }
+                            Spacer(minLength: 4)
+                        }
+                        Text(recommendation.reasonLabel)
+                            .font(VPTheme.mono(7))
+                            .foregroundStyle(VPTheme.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                if overflow > 0 {
+                    Text("… \(overflow) more recommendations")
+                        .font(VPTheme.mono(7))
+                        .foregroundStyle(VPTheme.textTertiary)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func metareasoningSection(_ metareasoning: AllocationMetareasoningView?) -> some View {
+        sectionTitle("METAREASONING")
+        if let metareasoning, !metareasoning.isEmpty {
+            HStack(spacing: 7) {
+                badge(metareasoning.diagnosisStatusLabel, tint: VPTheme.textTertiary)
+                if let target = metareasoning.diagnosisTargetLabel {
+                    Text("target \(target)")
+                        .font(VPTheme.mono(6.5))
+                        .foregroundStyle(VPTheme.textTertiary)
+                }
+                if let noProgress = metareasoning.noProgressLabel {
+                    Text(noProgress)
+                        .font(VPTheme.mono(6.5))
+                        .foregroundStyle(VPTheme.textTertiary)
+                }
+                Spacer(minLength: 4)
+            }
+            if let reason = metareasoning.diagnosisReasonLabel {
+                Text(reason)
+                    .font(VPTheme.mono(7))
+                    .foregroundStyle(VPTheme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            taskListRow("stalled", metareasoning.stalledPreviews, overflow: metareasoning.stalledOverflow)
+            taskListRow("failed", metareasoning.failedPreviews, overflow: metareasoning.failedOverflow)
+            taskListRow(
+                "retrying",
+                metareasoning.retryingPreviews,
+                overflow: metareasoning.retryingOverflow
+            )
+            if !metareasoning.recommendationPreviews.isEmpty {
+                recommendationSection(
+                    metareasoning.recommendationPreviews,
+                    overflow: metareasoning.recommendationOverflow,
+                    title: "META RECOMMENDATIONS"
+                )
+            }
+        } else if metareasoning != nil {
+            notReported("The daemon returned an empty metareasoning summary.")
+        } else {
+            notReported("The daemon returned no metareasoning summary.")
+        }
+    }
+
+    @ViewBuilder
+    private func taskListRow(_ title: String, _ values: [String], overflow: Int) -> some View {
+        if !values.isEmpty {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(title.uppercased())
+                    .font(VPTheme.mono(6, weight: .semibold))
+                    .foregroundStyle(VPTheme.textTertiary)
+                    .frame(width: 52, alignment: .leading)
+                Text(values.joined(separator: ", "))
+                    .font(VPTheme.mono(7))
+                    .foregroundStyle(VPTheme.textSecondary)
+                    .lineLimit(1)
+                if overflow > 0 {
+                    Text("+\(overflow)")
+                        .font(VPTheme.mono(6.5))
+                        .foregroundStyle(VPTheme.textTertiary)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func calibrationSection(_ calibration: AllocationCalibrationView?) -> some View {
+        sectionTitle("ATTENTION & TRUST CALIBRATION")
+        if let calibration, !calibration.isEmpty {
+            HStack(alignment: .top, spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("ATTENTION")
+                        .font(VPTheme.mono(6, weight: .semibold))
+                        .foregroundStyle(VPTheme.textTertiary)
+                    Text(calibration.attentionLabel)
+                        .font(VPTheme.mono(7.5))
+                        .foregroundStyle(VPTheme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("TRUST")
+                        .font(VPTheme.mono(6, weight: .semibold))
+                        .foregroundStyle(VPTheme.textTertiary)
+                    Text(calibration.trustLabel)
+                        .font(VPTheme.mono(7.5))
+                        .foregroundStyle(VPTheme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                badge(
+                    calibration.confidenceLabel,
+                    tint: confidenceTint(calibration.confidenceLabel)
+                )
+            }
+            if let reason = calibration.reasonLabel {
+                Text(reason)
+                    .font(VPTheme.mono(7))
+                    .foregroundStyle(VPTheme.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let counts = calibration.countLabel {
+                Text(counts)
+                    .font(VPTheme.mono(6.5))
+                    .foregroundStyle(VPTheme.textTertiary)
+            }
+        } else if calibration != nil {
+            notReported("The daemon returned an empty calibration summary.")
+        } else {
+            notReported("The daemon returned no attention/trust calibration.")
+        }
+    }
+
+    private var footer: some View {
+        Text(
+            "Daemon estimates and advisory recommendations only. This card does not add budget, change a task envelope or model, alter routing, or bypass approvals, Verifier, or Integrator."
+        )
+        .font(VPTheme.mono(6.5))
+        .foregroundStyle(VPTheme.textTertiary)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func sectionTitle(_ title: String) -> some View {
+        Text(title)
+            .font(VPTheme.mono(6.5, weight: .semibold))
+            .tracking(0.5)
+            .foregroundStyle(VPTheme.textTertiary)
+            .padding(.top, 2)
+    }
+
+    private func badge(_ title: String, tint: Color) -> some View {
+        Text(title)
+            .font(VPTheme.mono(6, weight: .semibold))
+            .tracking(0.3)
+            .foregroundStyle(tint)
+            .lineLimit(1)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(tint.opacity(0.10), in: Capsule())
+    }
+
+    private func metric(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title.uppercased())
+                .font(VPTheme.mono(6, weight: .semibold))
+                .foregroundStyle(VPTheme.textTertiary)
+            Text(value)
+                .font(VPTheme.mono(7.5))
+                .foregroundStyle(VPTheme.textSecondary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func notReported(_ text: String) -> some View {
+        Text(text)
+            .font(VPTheme.mono(7.5))
+            .foregroundStyle(VPTheme.textTertiary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func errorRow(_ message: String) -> some View {
+        Label(String(message.prefix(280)), systemImage: "exclamationmark.triangle.fill")
+            .font(VPTheme.mono(7.5))
+            .foregroundStyle(VPTheme.warning)
+            .lineLimit(2)
+    }
+
+    private func feasibilityTint(_ feasibility: AllocationFeasibilityView) -> Color {
+        guard let feasible = feasibility.feasible else { return VPTheme.textTertiary }
+        guard feasible else { return VPTheme.danger }
+        // `feasible` only means no known hard-budget violation. Reasons such as
+        // `cost_unconfigured`, `token_unestimated`, or `unbounded_envelope` are
+        // caveats, not a green guarantee.
+        let reason = feasibility.reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch reason {
+        case "", "feasible", "no_remaining_tasks":
+            return VPTheme.success
+        default:
+            return VPTheme.warning
+        }
+    }
+
+    private func confidenceTint(_ label: String) -> Color {
+        switch label {
+        case "HIGH": VPTheme.success
+        case "MEDIUM": VPTheme.warning
+        case "LOW": VPTheme.danger
+        default: VPTheme.textTertiary
+        }
+    }
+}
+
+// MARK: - R4 trade-offs and quality
+
+/// Read-only Manage Dash card for `session.tradeoffs`. It shows every profile
+/// returned by the daemon, the delivery/quality review, and calibrated
+/// confidence. It is advisory: no profile is selected, no routing changes, and
+/// no completion/quality claim is derived locally.
+struct TradeoffQualityCard: View {
+    @Environment(AppModel.self) private var model
+
+    private var tradeoffs: TradeoffView? {
+        model.selectedSessionTradeoffs
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            header
+            if let error = model.sessionTradeoffsError {
+                errorRow(error)
+            }
+            if let tradeoffs {
+                content(tradeoffs)
+            } else if model.sessionTradeoffsBusy {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.mini)
+                    Text("Loading the daemon trade-off view…")
+                        .font(VPTheme.mono(8))
+                        .foregroundStyle(VPTheme.textSecondary)
+                }
+            } else {
+                notReported(
+                    "No trade-off view is loaded. Refresh to ask the daemon; no quality or confidence claim is inferred locally."
+                )
+            }
+            footer
+        }
+        .padding(14)
+        .background(
+            .white.opacity(0.035),
+            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
+        }
+        .vpHoverLift(scale: 1.003, lift: 1)
+        .task(id: model.selectedSessionID) {
+            guard model.selectedSessionID != nil else { return }
+            await model.loadSessionTradeoffs()
+        }
+    }
+
+    private var header: some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: "arrow.left.arrow.right.circle")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(VPTheme.accent)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                SectionLabel(title: "Trade-offs & quality")
+                Text(model.selectedSession?.goal ?? "No session selected")
+                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 4)
+            Text("ADVISORY")
+                .font(VPTheme.mono(6.5, weight: .semibold))
+                .tracking(0.4)
+                .foregroundStyle(VPTheme.textTertiary)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(VPTheme.textTertiary.opacity(0.10), in: Capsule())
+            if model.sessionTradeoffsBusy {
+                ProgressView().controlSize(.mini)
+            }
+            Button {
+                Task { await model.refreshSessionTradeoffs() }
+            } label: {
+                Label("Refresh", systemImage: "arrow.clockwise")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(model.sessionTradeoffsBusy || model.selectedSessionID == nil)
+        }
+    }
+
+    private func content(_ tradeoffs: TradeoffView) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 8) {
+                Text("current profile")
+                    .font(VPTheme.mono(6.5))
+                    .foregroundStyle(VPTheme.textTertiary)
+                Text(tradeoffs.currentProfileTitle)
+                    .font(VPTheme.mono(7.5, weight: .medium))
+                    .foregroundStyle(VPTheme.textSecondary)
+                Spacer(minLength: 4)
+            }
+            profileSection(tradeoffs)
+            qualitySection(tradeoffs.quality)
+            confidenceSection(tradeoffs.confidence)
+            recommendationSection(
+                "RECOMMENDATIONS",
+                tradeoffs.recommendationPreviews,
+                overflow: tradeoffs.recommendationOverflow,
+                tint: VPTheme.accent
+            )
+            recommendationSection(
+                "WARNINGS",
+                tradeoffs.warningPreviews,
+                overflow: tradeoffs.warningOverflow,
+                tint: VPTheme.warning
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func profileSection(_ tradeoffs: TradeoffView) -> some View {
+        sectionTitle("PROFILES (\(tradeoffs.profiles.count))")
+        if tradeoffs.profiles.isEmpty {
+            notReported("The daemon returned no profile frontier.")
+        } else {
+            VStack(alignment: .leading, spacing: 7) {
+                ForEach(Array(tradeoffs.profilePreviews.enumerated()), id: \.offset) { _, profile in
+                    profileRow(profile, currentProfile: tradeoffs.currentProfile)
+                }
+                if tradeoffs.profileOverflow > 0 {
+                    Text("… \(tradeoffs.profileOverflow) more profiles")
+                        .font(VPTheme.mono(7))
+                        .foregroundStyle(VPTheme.textTertiary)
+                }
+            }
+        }
+    }
+
+    private func profileRow(_ profile: ProfileTradeoffView, currentProfile: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                Text(profile.profileTitle)
+                    .font(VPTheme.mono(8, weight: .medium))
+                    .foregroundStyle(VPTheme.textPrimary)
+                if profile.isCurrent(currentProfile) {
+                    badge("CURRENT", tint: VPTheme.accent)
+                }
+                if profile.isRecommended {
+                    badge("RECOMMENDED", tint: VPTheme.success)
+                }
+                Spacer(minLength: 4)
+                Text(profile.reservePercentLabel)
+                    .font(VPTheme.mono(6.5))
+                    .foregroundStyle(VPTheme.textTertiary)
+            }
+            Text(profile.primaryGoalLabel)
+                .font(VPTheme.mono(7))
+                .foregroundStyle(VPTheme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 10) {
+                Text("attention \(profile.attentionLabel)")
+                Text("quality \(profile.qualityLabel)")
+                Spacer(minLength: 4)
+                Text(profile.forecastLabel)
+            }
+            .font(VPTheme.mono(6.5))
+            .foregroundStyle(VPTheme.textTertiary)
+            .lineLimit(1)
+        }
+        .padding(8)
+        .background(VPTheme.surfaceSunken.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    @ViewBuilder
+    private func qualitySection(_ quality: QualityReviewView?) -> some View {
+        sectionTitle("QUALITY REVIEW")
+        if let quality, !quality.isEmpty {
+            HStack(spacing: 6) {
+                badge(quality.readinessLabel, tint: readinessTint(quality.readinessLabel))
+                badge(quality.reviewabilityLabel, tint: reviewabilityTint(quality.reviewabilityLabel))
+                Spacer(minLength: 4)
+                Text(quality.taskProgressLabel)
+                    .font(VPTheme.mono(7))
+                    .foregroundStyle(VPTheme.textTertiary)
+            }
+            HStack(spacing: 12) {
+                metric("Commit", quality.commitLabel ?? "not reported")
+                metric("Latest test", quality.testLabel ?? "not reported")
+                metric("Verifier", quality.verifierLabel ?? "not reported")
+                metric("Merge", quality.mergeLabel ?? "not reported")
+            }
+            if let merged = quality.mergedEntriesLabel {
+                Text(merged)
+                    .font(VPTheme.mono(6.5))
+                    .foregroundStyle(VPTheme.textTertiary)
+            }
+            qualityList("changed paths", quality.changedPathPreviews, overflow: quality.changedPathOverflow)
+            qualityList("blockers", quality.blockerPreviews, overflow: quality.blockerOverflow)
+            qualityList("reasons", quality.reasonPreviews, overflow: quality.reasonOverflow)
+        } else if quality != nil {
+            notReported("The daemon returned an empty quality review.")
+        } else {
+            notReported("The daemon returned no quality review.")
+        }
+    }
+
+    @ViewBuilder
+    private func qualityList(_ title: String, _ values: [String], overflow: Int) -> some View {
+        if !values.isEmpty {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title.uppercased())
+                    .font(VPTheme.mono(6, weight: .semibold))
+                    .foregroundStyle(VPTheme.textTertiary)
+                ForEach(Array(values.enumerated()), id: \.offset) { _, value in
+                    Text("• \(value)")
+                        .font(VPTheme.mono(7))
+                        .foregroundStyle(VPTheme.textSecondary)
+                        .lineLimit(1)
+                }
+                if overflow > 0 {
+                    Text("… \(overflow) more")
+                        .font(VPTheme.mono(6.5))
+                        .foregroundStyle(VPTheme.textTertiary)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func confidenceSection(_ confidence: TradeoffConfidenceView?) -> some View {
+        sectionTitle("CALIBRATED CONFIDENCE")
+        if let confidence {
+            HStack(spacing: 7) {
+                badge(confidence.levelLabel, tint: confidenceTint(confidence.levelLabel))
+                Text(confidence.scoreLabel)
+                    .font(VPTheme.mono(7))
+                    .foregroundStyle(VPTheme.textSecondary)
+                if let sample = confidence.sampleLabel {
+                    Text(sample)
+                        .font(VPTheme.mono(6.5))
+                        .foregroundStyle(VPTheme.textTertiary)
+                }
+                Spacer(minLength: 4)
+            }
+            qualityList("reasons", confidence.reasonPreviews, overflow: confidence.reasonOverflow)
+        } else {
+            notReported("The daemon returned no calibrated confidence.")
+        }
+    }
+
+    @ViewBuilder
+    private func recommendationSection(
+        _ title: String,
+        _ values: [String],
+        overflow: Int,
+        tint: Color
+    ) -> some View {
+        if !values.isEmpty {
+            sectionTitle(title)
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(Array(values.enumerated()), id: \.offset) { _, value in
+                    HStack(alignment: .firstTextBaseline, spacing: 5) {
+                        Image(systemName: "circle.fill")
+                            .font(.system(size: 4))
+                            .foregroundStyle(tint)
+                        Text(value)
+                            .font(VPTheme.mono(7.5))
+                            .foregroundStyle(VPTheme.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                if overflow > 0 {
+                    Text("… \(overflow) more")
+                        .font(VPTheme.mono(6.5))
+                        .foregroundStyle(VPTheme.textTertiary)
+                }
+            }
+        }
+    }
+
+    private var footer: some View {
+        Text(
+            "Advisory only. Profiles are compared but none is selected; confidence and quality are daemon-reported and do not change routing, approvals, verification, or merge."
+        )
+        .font(VPTheme.mono(6.5))
+        .foregroundStyle(VPTheme.textTertiary)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func sectionTitle(_ title: String) -> some View {
+        Text(title)
+            .font(VPTheme.mono(6.5, weight: .semibold))
+            .tracking(0.5)
+            .foregroundStyle(VPTheme.textTertiary)
+            .padding(.top, 2)
+    }
+
+    private func badge(_ title: String, tint: Color) -> some View {
+        Text(title)
+            .font(VPTheme.mono(6, weight: .semibold))
+            .tracking(0.3)
+            .foregroundStyle(tint)
+            .lineLimit(1)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(tint.opacity(0.10), in: Capsule())
+    }
+
+    private func metric(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title.uppercased())
+                .font(VPTheme.mono(6, weight: .semibold))
+                .foregroundStyle(VPTheme.textTertiary)
+            Text(value)
+                .font(VPTheme.mono(7))
+                .foregroundStyle(VPTheme.textSecondary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func notReported(_ text: String) -> some View {
+        Text(text)
+            .font(VPTheme.mono(7.5))
+            .foregroundStyle(VPTheme.textTertiary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func errorRow(_ message: String) -> some View {
+        Label(String(message.prefix(280)), systemImage: "exclamationmark.triangle.fill")
+            .font(VPTheme.mono(7.5))
+            .foregroundStyle(VPTheme.warning)
+            .lineLimit(2)
+    }
+
+    private func readinessTint(_ label: String) -> Color {
+        switch label {
+        case "MERGED", "VERIFIED", "TESTS PASSED", "COMMITTED": VPTheme.success
+        case "PARTIAL", "DIRTY": VPTheme.warning
+        case "BLOCKED": VPTheme.danger
+        default: VPTheme.textTertiary
+        }
+    }
+
+    private func reviewabilityTint(_ label: String) -> Color {
+        switch label {
+        case "OK": VPTheme.success
+        case "WATCH": VPTheme.warning
+        case "RISK": VPTheme.danger
+        default: VPTheme.textTertiary
+        }
+    }
+
+    private func confidenceTint(_ label: String) -> Color {
+        switch label {
+        case "HIGH": VPTheme.success
+        case "MEDIUM": VPTheme.warning
+        case "LOW": VPTheme.danger
+        default: VPTheme.textTertiary
+        }
+    }
+}

@@ -676,6 +676,22 @@ pub(super) async fn dispatch(
             )
             .await?
         }
+        Command::Allocation { session } => {
+            rpc(
+                &discovery,
+                "session.allocation",
+                json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::Tradeoffs { session } => {
+            rpc(
+                &discovery,
+                "session.tradeoffs",
+                json!({"session_id": session}),
+            )
+            .await?
+        }
         Command::RescueStatus { session } => {
             rpc(
                 &discovery,
@@ -1156,6 +1172,20 @@ mod tests {
             typed.typed_code.as_deref(),
             Some(vp_core::partial_delivery_codes::DELIVERY_CONFIRM_REQUIRED)
         );
+    }
+
+    #[test]
+    fn allocation_and_tradeoffs_commands_parse() {
+        let cli = crate::cli::Cli::try_parse_from(["vp", "allocation", "ses-1"]).unwrap();
+        match cli.command {
+            Command::Allocation { session } => assert_eq!(session, "ses-1"),
+            other => panic!("expected allocation command, got {other:?}"),
+        }
+        let cli = crate::cli::Cli::try_parse_from(["vp", "tradeoffs", "ses-1"]).unwrap();
+        match cli.command {
+            Command::Tradeoffs { session } => assert_eq!(session, "ses-1"),
+            other => panic!("expected tradeoffs command, got {other:?}"),
+        }
     }
 
     #[test]

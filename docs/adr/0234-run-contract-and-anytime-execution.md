@@ -182,6 +182,43 @@ Phase 1 adds read-only, bounded views:
 These views are additive in protocol v1. They do not expose prompts, raw tool
 output, secrets, or unbounded event payloads.
 
+### 10. Read-only allocation and trade-off surfaces (R3a/R4a)
+
+The first R3/R4 slice is deliberately read-only and advisory:
+
+- `session.allocation` / `vp allocation` reconciles the session envelope, the
+  stored TeamPlan DAG and critical path, the task queue, bounded project usage
+  history, readiness, approvals/effects, failure diagnosis, and stall
+  observations into bounded per-task p50/p90 estimates, a remaining-path
+  feasibility result, advisory recommendations, metareasoning, and
+  attention/trust calibration. Estimate precedence is session actuals, plan
+  task envelope, project department actuals (nearest-rank p50/p90), department
+  envelope, then an explicit unknown prior. Unknown estimates are not zero: a
+  path with no estimate reports `insufficient_estimate`, and an unestimated task
+  is not reported as feasible.
+- `session.tradeoffs` / `vp tradeoffs` compares the five documented profile
+  postures, reports a bounded quality/reviewability review and an explicitly
+  heuristic confidence score, and marks a different profile recommended only
+  from deterministic evidence (quality for risk/blockers/blocked effects, cost
+  under completion-reserve pressure). It never switches a profile.
+- `ProjectRunPolicy.auto_rescue` (default off) permits at most one automatic
+  completion-reserve grant per session at a turn boundary when the pause is
+  exactly `completion_reserve_*`, the session is fixed-budget and eligible
+  (near-completion readiness, latest commit, no no-progress turns, headroom, and
+  no prior grant). Concurrent boundaries are serialized in-process; a manual
+  grant also consumes the one-shot allowance. The grant releases only the
+  completion reserve for its normal TTL and never raises a hard cap or bypasses
+  approvals, contracts, the sandbox, the Verifier, or the Integrator.
+- Both preview RPCs append no events and mutate nothing. The macOS cards load
+  only when visible or explicitly refreshed and reject a response for a
+  different session.
+
+Limits: automatic per-task envelope reallocation and the daily attention
+schedule remain open. Historical estimates are sparse and are not vendor token
+counts; confidence is a heuristic, not a calibrated probability; profile
+forecasts repeat the existing session forecast and are not per-profile
+guarantees; auto-rescue serialization is same-daemon only.
+
 ## Consequences
 
 Positive:
@@ -268,10 +305,15 @@ Negative and limits:
    reallocation. A bounded 2-second readiness snapshot cache serves explicit
    resource views, keyed by the newest event sequence; the turn governor never
    reads it. Automatic task-envelope reallocation is R3.
-4. **R3 allocate**: task/plan-aware allocation, automatic envelope
-   reallocation, learning from actuals, metareasoning/replan.
-5. **R4 deliver**: anytime UI, trade-off frontier, calibrated trust, daily
-   attention scheduling.
+4. **R3 allocate**: R3a implements the read-only task/plan-aware allocation
+   preview, critical-path feasibility, project/department p50/p90,
+   diagnosis/metareasoning, and the opt-in one-shot automatic
+   completion-reserve rescue. Automatic per-task envelope reallocation,
+   reservation-aware plan revision, and learned estimates remain open.
+5. **R4 deliver**: R4a implements the trade-off frontier, quality/reviewability
+   review, calibrated-confidence heuristic, deterministic advisory profile
+   recommendation, and macOS cards. The daily attention schedule and a broader
+   anytime UI remain open.
 
 The detailed scope, formulas, surfaces, migration, and acceptance criteria are
 in [RUN_CONTRACT_AND_RESOURCE_GOVERNOR_PLAN.md](../RUN_CONTRACT_AND_RESOURCE_GOVERNOR_PLAN.md).

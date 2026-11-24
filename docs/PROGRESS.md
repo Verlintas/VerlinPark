@@ -1,12 +1,66 @@
 # VerlinPark 进度
 
-> 最后更新：2026-11-24
-> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark + task contracts/intent authorization/MCP schema pins + effect receipts/postconditions + external gates/durable waits + runtime pinning/controller replay + reliability/OTel + project-scoped identities S1–S8 + failure attribution/cascade + production hardening rounds 1–3 (ADR-0213/0214/0215) + C7 bounded fan-out (ADR-0216) + C8 tool search v2 (ADR-0217) + C9 MCP async tasks (ADR-0218) + C10 Code Mode (ADR-0219) + C11 loopback A2A (ADR-0221) + C12 advisory progress ledger (ADR-0220) + M3.1 store split 已跑通
+> 最后更新：2026-11-25
+> 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark + task contracts/intent authorization/MCP schema pins + effect receipts/postconditions + external gates/durable waits + runtime pinning/controller replay + reliability/OTel + project-scoped identities S1–S8 + failure attribution/cascade + production hardening rounds 1–3 (ADR-0213/0214/0215) + C7 bounded fan-out (ADR-0216) + C8 tool search v2 (ADR-0217) + C9 MCP async tasks (ADR-0218) + C10 Code Mode (ADR-0219) + C11 loopback A2A (ADR-0221) + C12 advisory progress ledger (ADR-0220) + M3.1 store split 已跑通 + Run Contract R3a allocation preview/R4a trade-off preview + opt-in one-shot auto rescue
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
 
 ---
+
+## 2026-11-25 R3 allocation preview + R4 trade-offs + opt-in auto rescue
+
+按 ADR-0234 / `RUN_CONTRACT_AND_RESOURCE_GOVERNOR_PLAN.md` 继续 Run
+Contract。R3/R4 这一轮只做只读、bounded、可审计的预览，以及唯一一个显式
+opt-in 的自动动作；不自动改 task envelope、budget、model routing、approval、
+Verifier 或 Integrator。
+
+- `session.allocation` / `vp allocation`：把 session envelope、已存 TeamPlan
+  DAG/critical path、task queue、最多 1,000 条 project usage history、
+  readiness、approvals、effects、failure diagnosis 和 stall 观察汇总成
+  bounded 的 per-task p50/p90 envelope、remaining-path feasibility、建议、
+  metareasoning 和 attention/trust calibration。估计优先级固定为 session
+  actuals → plan task envelope → project department actuals（nearest-rank
+  p50/p90）→ department envelope → 显式 unknown prior；unknown 是 `None`
+  而不是 0，完全无估计的路径报 `insufficient_estimate`，无估计的 task 不再
+  显示为 feasible。预览不追加 event、不改任何 budget/envelope/model/route/
+  approval/effect/Verifier/merge 状态。
+- feasibility 同时检查 token/cost reserve 与 cost 未配置/未定价的 caveat；
+  critical path 可用时聚焦该路径，否则聚焦全部剩余 task。推荐项最多 12 条，
+  reason 最多 200 字符；metareasoning 只引用 diagnosis target、no-progress、
+  stalled/failed/retrying task；calibration 只引用 pending/weighted approvals、
+  Verifier rejection、failed task 和 usage calls，并明确标注 advisory。
+- `session.tradeoffs` / `vp tradeoffs`：返回 5 个 profile 的文档化 posture、
+  当前 profile、现有 session turn/cost forecast（重复展示，不声称 per-profile
+  保证）、bounded quality/reviewability（readiness、commit/test/Verifier/
+  merge、task 进度、changed paths、blockers、`ok|watch|risk`）和显式
+  heuristic calibrated confidence（0–1）。只有当 risk/blocker/blocked effect
+  或 completion-reserve pressure 等确定性证据存在时，才把另一个 profile 标为
+  recommended；当前 profile 不会被重复标成 recommended，视图也从不切换
+  profile。
+- `ProjectRunPolicy.auto_rescue`（默认关闭）：项目显式 opt-in 后，turn
+  boundary 只有在暂停原因正好是 `completion_reserve_*`、session 为 fixed
+  budget、readiness 处于 near-completion、存在 latest commit、
+  `no_progress_turns == 0`、有 headroom 且从未有过 rescue grant 时，才允许
+  最多一次自动 completion-reserve grant。并发 turn boundary 在进程内串行化；
+  manual grant 也消耗同一 one-shot 额度。grant 只释放 completion reserve
+  的 30 分钟 TTL，不提高 hard cap，不绕过 approval/contract/sandbox/
+  Verifier/Integrator；auto-rescue 的存储/readiness 错误会降级为普通 resource
+  pause，不会打断用户 run。
+- CLI `project-run-policy-set --auto-rescue/--no-auto-rescue`、`vp allocation`、
+  `vp tradeoffs`；macOS Project RunPolicy 开关和 Manage Dash → Usage & Budget
+  的 Allocation insight / Trade-offs & quality 两张只读卡片。卡片只在可见或
+  显式刷新时加载，拒绝返回其他 session 的响应；不参与 selection sweep。
+- 明确未完成：automatic per-task envelope reallocation（需要 event-backed plan
+  revision、reservation 交互和 no-widening 校验）、daily attention schedule、
+  更完整的 anytime UI、learned estimates/confidence。自动 rescue 的串行化是
+  same-daemon，跨 host 不成立。
+- 测试：targeted allocation/tradeoff/rescue/protocol/CLI/daemon + full
+  workspace **4,624 passed / 0 failed / 6 ignored**；Swift
+  **659 passed（527 app + 132 helper）**；`cargo fmt --check`、
+  `cargo clippy --workspace --all-targets -- -D warnings`、`swiftformat --lint`
+  和 `xcodebuild test` 通过。临时 daemon CLI smoke 覆盖 `project-run-policy-set`
+  auto rescue、`allocation`、`tradeoffs`；GUI smoke 覆盖两张卡片和 policy 开关。
 
 ## 2026-11-24 P0 tool friction + R1/R2a Run Contract governance
 

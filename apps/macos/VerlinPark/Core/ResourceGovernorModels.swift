@@ -843,24 +843,31 @@ struct ProjectRunPolicyView: Codable, Sendable, Equatable {
     let completionReserveRatio: Double
     let attentionCap: UInt32
     let stopPolicy: RunStopPolicyView
+    /// Explicit project opt-in for at most one automatic completion-reserve
+    /// rescue per session. Off unless the daemon reports it on; it can never
+    /// add budget, remove a cap, change routing, or bypass Verifier/Integrator.
+    let autoRescue: Bool
 
     enum CodingKeys: String, CodingKey {
         case defaultProfile = "default_profile"
         case completionReserveRatio = "completion_reserve_ratio"
         case attentionCap = "attention_cap"
         case stopPolicy = "stop_policy"
+        case autoRescue = "auto_rescue"
     }
 
     init(
         defaultProfile: RunProfile = .balanced,
         completionReserveRatio: Double = 0.20,
         attentionCap: UInt32 = 20,
-        stopPolicy: RunStopPolicyView = .standard
+        stopPolicy: RunStopPolicyView = .standard,
+        autoRescue: Bool = false
     ) {
         self.defaultProfile = defaultProfile
         self.completionReserveRatio = completionReserveRatio
         self.attentionCap = attentionCap
         self.stopPolicy = stopPolicy
+        self.autoRescue = autoRescue
     }
 
     init(from decoder: Decoder) throws {
@@ -874,6 +881,7 @@ struct ProjectRunPolicyView: Codable, Sendable, Equatable {
         stopPolicy =
             try container.decodeIfPresent(RunStopPolicyView.self, forKey: .stopPolicy)
                 ?? .standard
+        autoRescue = try container.decodeIfPresent(Bool.self, forKey: .autoRescue) ?? false
     }
 
     var profileTitle: String {
@@ -901,6 +909,23 @@ struct ProjectRunPolicyView: Codable, Sendable, Equatable {
         parts.append(stopPolicy.requireEvidence ? "evidence required" : "evidence optional")
         parts.append(stopPolicy.partialDelivery ? "partial delivery allowed" : "no partial delivery")
         return parts.joined(separator: " · ")
+    }
+
+    var autoRescueLabel: String {
+        autoRescue ? "On" : "Off"
+    }
+
+    /// One operator-facing caveat shared by the card and editor so the enabled
+    /// behavior cannot be described more broadly than the daemon implements.
+    var autoRescueDetail: String {
+        guard autoRescue else {
+            return "Off · no automatic completion-reserve rescue is permitted."
+        }
+        return """
+        On · at most one automatic completion-reserve rescue per session, only for eligible \
+        fixed-budget near-completion work. It never adds budget, removes caps, changes routing, \
+        or bypasses Verifier/Integrator.
+        """
     }
 
     /// Client-side mirror of the daemon validation. The daemon remains
@@ -994,6 +1019,7 @@ struct ProjectRunPolicyDraft: Equatable, Sendable {
     var requireEvidence = true
     var partialDelivery = true
     var marginalValueRatio = 0.2
+    var autoRescue = false
 
     init() {}
 
@@ -1005,6 +1031,7 @@ struct ProjectRunPolicyDraft: Equatable, Sendable {
         requireEvidence = policy.stopPolicy.requireEvidence
         partialDelivery = policy.stopPolicy.partialDelivery
         marginalValueRatio = policy.stopPolicy.marginalValueRatio
+        autoRescue = policy.autoRescue
     }
 
     var validationIssue: BudgetValidationIssue? {
@@ -1060,7 +1087,8 @@ struct ProjectRunPolicyDraft: Equatable, Sendable {
                 noProgressTurns: noProgressTurns,
                 marginalValueRatio: marginalValueRatio,
                 partialDelivery: partialDelivery
-            )
+            ),
+            autoRescue: autoRescue
         )
         try policy.validate()
         return policy
@@ -2182,6 +2210,1460 @@ enum RescueActionAvailability {
             return rescue.reasonLabel
         }
         return nil
+    }
+}
+
+// MARK: - R3 allocation preview
+
+/// Bounded, read-only operator view of `session.allocation`. Every value is
+/// daemon-reported: the client never computes feasibility, p50/p90, reserve,
+/// headroom, or recommendations locally. Missing additive fields stay nil so
+/// the UI can say "not reported" instead of inventing a zero or `false`.
+struct AllocationPreviewView: Codable, Sendable, Equatable {
+    static let taskPreviewLimit = 6
+    static let recommendationPreviewLimit = 6
+    static let criticalPathPreviewLimit = 8
+
+    let sessionID: String
+    let generatedAt: String
+    let profile: String
+    let readiness: ReadinessSnapshotView?
+    let envelope: AllocationEnvelopeView?
+    let feasibility: AllocationFeasibilityView?
+    let tasks: [AllocationTaskEnvelopeView]
+    let recommendations: [AllocationRecommendationView]
+    let metareasoning: AllocationMetareasoningView?
+    let calibration: AllocationCalibrationView?
+    let truncated: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case profile, readiness, envelope, feasibility, tasks, recommendations
+        case metareasoning, calibration, truncated
+        case sessionID = "session_id"
+        case generatedAt = "generated_at"
+    }
+
+    init(
+        sessionID: String = "",
+        generatedAt: String = "",
+        profile: String = "",
+        readiness: ReadinessSnapshotView? = nil,
+        envelope: AllocationEnvelopeView? = nil,
+        feasibility: AllocationFeasibilityView? = nil,
+        tasks: [AllocationTaskEnvelopeView] = [],
+        recommendations: [AllocationRecommendationView] = [],
+        metareasoning: AllocationMetareasoningView? = nil,
+        calibration: AllocationCalibrationView? = nil,
+        truncated: Bool = false
+    ) {
+        self.sessionID = sessionID
+        self.generatedAt = generatedAt
+        self.profile = profile
+        self.readiness = readiness
+        self.envelope = envelope
+        self.feasibility = feasibility
+        self.tasks = tasks
+        self.recommendations = recommendations
+        self.metareasoning = metareasoning
+        self.calibration = calibration
+        self.truncated = truncated
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = try container.decodeIfPresent(String.self, forKey: .sessionID) ?? ""
+        generatedAt = try container.decodeIfPresent(String.self, forKey: .generatedAt) ?? ""
+        profile = try container.decodeIfPresent(String.self, forKey: .profile) ?? ""
+        readiness = try container.decodeIfPresent(ReadinessSnapshotView.self, forKey: .readiness)
+        envelope = try container.decodeIfPresent(AllocationEnvelopeView.self, forKey: .envelope)
+        feasibility =
+            try container.decodeIfPresent(AllocationFeasibilityView.self, forKey: .feasibility)
+        tasks = GovernorDecoding.elements(
+            AllocationTaskEnvelopeView.self,
+            from: container,
+            forKey: .tasks
+        )
+        recommendations = GovernorDecoding.recommendations(
+            from: container,
+            forKey: .recommendations
+        )
+        metareasoning =
+            try container.decodeIfPresent(AllocationMetareasoningView.self, forKey: .metareasoning)
+        calibration =
+            try container.decodeIfPresent(AllocationCalibrationView.self, forKey: .calibration)
+        truncated = try container.decodeIfPresent(Bool.self, forKey: .truncated) ?? false
+    }
+
+    var profileTitle: String {
+        GovernorDecoding.profileTitle(profile)
+    }
+
+    var taskPreviews: [AllocationTaskEnvelopeView] {
+        Array(tasks.prefix(Self.taskPreviewLimit))
+    }
+
+    var taskOverflow: Int {
+        max(0, tasks.count - Self.taskPreviewLimit)
+    }
+
+    var recommendationPreviews: [AllocationRecommendationView] {
+        Array(recommendations.prefix(Self.recommendationPreviewLimit))
+    }
+
+    var recommendationOverflow: Int {
+        max(0, recommendations.count - Self.recommendationPreviewLimit)
+    }
+
+    var readinessLabel: String {
+        readiness?.levelLabel ?? "NOT REPORTED"
+    }
+
+    /// Strict selection guard: a preview for another session is never applied.
+    func isForSession(_ targetSessionID: String) -> Bool {
+        let target = targetSessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty, !sessionID.isEmpty else { return false }
+        return sessionID == target
+    }
+}
+
+/// Daemon-reported budget envelope. Optional limits stay nil; they are never
+/// displayed as a zero budget or a missing cap.
+struct AllocationEnvelopeView: Codable, Sendable, Equatable {
+    let tokenBudget: UInt64?
+    let spentTokens: UInt64?
+    let remainingTokens: UInt64?
+    let costBudgetUSD: Double?
+    let spentCostUSD: Double?
+    let remainingCostUSD: Double?
+    let timeBudgetSecs: UInt64?
+    let remainingSecs: UInt64?
+    let completionReserveRatio: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case tokenBudget = "token_budget"
+        case spentTokens = "spent_tokens"
+        case remainingTokens = "remaining_tokens"
+        case costBudgetUSD = "cost_budget_usd"
+        case spentCostUSD = "spent_cost_usd"
+        case remainingCostUSD = "remaining_cost_usd"
+        case timeBudgetSecs = "time_budget_secs"
+        case remainingSecs = "remaining_secs"
+        case completionReserveRatio = "completion_reserve_ratio"
+    }
+
+    init(
+        tokenBudget: UInt64? = nil,
+        spentTokens: UInt64? = nil,
+        remainingTokens: UInt64? = nil,
+        costBudgetUSD: Double? = nil,
+        spentCostUSD: Double? = nil,
+        remainingCostUSD: Double? = nil,
+        timeBudgetSecs: UInt64? = nil,
+        remainingSecs: UInt64? = nil,
+        completionReserveRatio: Double? = nil
+    ) {
+        self.tokenBudget = tokenBudget
+        self.spentTokens = spentTokens
+        self.remainingTokens = remainingTokens
+        self.costBudgetUSD = costBudgetUSD
+        self.spentCostUSD = spentCostUSD
+        self.remainingCostUSD = remainingCostUSD
+        self.timeBudgetSecs = timeBudgetSecs
+        self.remainingSecs = remainingSecs
+        self.completionReserveRatio = completionReserveRatio
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        tokenBudget = try container.decodeIfPresent(UInt64.self, forKey: .tokenBudget)
+        spentTokens = try container.decodeIfPresent(UInt64.self, forKey: .spentTokens)
+        remainingTokens = try container.decodeIfPresent(UInt64.self, forKey: .remainingTokens)
+        costBudgetUSD = try container.decodeIfPresent(Double.self, forKey: .costBudgetUSD)
+        spentCostUSD = try container.decodeIfPresent(Double.self, forKey: .spentCostUSD)
+        remainingCostUSD = try container.decodeIfPresent(Double.self, forKey: .remainingCostUSD)
+        timeBudgetSecs = try container.decodeIfPresent(UInt64.self, forKey: .timeBudgetSecs)
+        remainingSecs = try container.decodeIfPresent(UInt64.self, forKey: .remainingSecs)
+        completionReserveRatio =
+            try container.decodeIfPresent(Double.self, forKey: .completionReserveRatio)
+    }
+
+    var budgetLabel: String {
+        BudgetFormatting.combined(
+            tokens: tokenBudget,
+            cost: costBudgetUSD,
+            seconds: timeBudgetSecs,
+            empty: "no budget reported"
+        )
+    }
+
+    var spentLabel: String {
+        BudgetFormatting.combined(
+            tokens: spentTokens,
+            cost: spentCostUSD,
+            seconds: nil,
+            empty: "no spend reported"
+        )
+    }
+
+    var remainingLabel: String {
+        BudgetFormatting.combined(
+            tokens: remainingTokens,
+            cost: remainingCostUSD,
+            seconds: remainingSecs,
+            empty: "no remaining budget reported"
+        )
+    }
+
+    var reservePercentLabel: String {
+        guard let completionReserveRatio, completionReserveRatio.isFinite else {
+            return "reserve not reported"
+        }
+        let percent = completionReserveRatio * 100
+        if percent.rounded() == percent {
+            return "\(Int(percent))%"
+        }
+        return String(format: "%.1f%%", percent)
+    }
+}
+
+/// Daemon-computed feasibility and forecast. `feasible` is optional so a
+/// missing additive field is not shown as a local "not feasible" claim.
+struct AllocationFeasibilityView: Codable, Sendable, Equatable {
+    let feasible: Bool?
+    let reason: String
+    let p50Tokens: UInt64?
+    let p90Tokens: UInt64?
+    let p50CostUSD: Double?
+    let p90CostUSD: Double?
+    let sampleCalls: UInt32?
+    let source: String
+    let reserveTokens: UInt64?
+    let headroomTokens: UInt64?
+    let criticalPathTasks: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case feasible, reason, source
+        case p50Tokens = "p50_tokens"
+        case p90Tokens = "p90_tokens"
+        case p50CostUSD = "p50_cost_usd"
+        case p90CostUSD = "p90_cost_usd"
+        case sampleCalls = "sample_calls"
+        case reserveTokens = "reserve_tokens"
+        case headroomTokens = "headroom_tokens"
+        case criticalPathTasks = "critical_path_tasks"
+    }
+
+    init(
+        feasible: Bool? = nil,
+        reason: String = "",
+        p50Tokens: UInt64? = nil,
+        p90Tokens: UInt64? = nil,
+        p50CostUSD: Double? = nil,
+        p90CostUSD: Double? = nil,
+        sampleCalls: UInt32? = nil,
+        source: String = "",
+        reserveTokens: UInt64? = nil,
+        headroomTokens: UInt64? = nil,
+        criticalPathTasks: [String] = []
+    ) {
+        self.feasible = feasible
+        self.reason = reason
+        self.p50Tokens = p50Tokens
+        self.p90Tokens = p90Tokens
+        self.p50CostUSD = p50CostUSD
+        self.p90CostUSD = p90CostUSD
+        self.sampleCalls = sampleCalls
+        self.source = source
+        self.reserveTokens = reserveTokens
+        self.headroomTokens = headroomTokens
+        self.criticalPathTasks = criticalPathTasks
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        feasible = try container.decodeIfPresent(Bool.self, forKey: .feasible)
+        reason = try container.decodeIfPresent(String.self, forKey: .reason) ?? ""
+        p50Tokens = try container.decodeIfPresent(UInt64.self, forKey: .p50Tokens)
+        p90Tokens = try container.decodeIfPresent(UInt64.self, forKey: .p90Tokens)
+        p50CostUSD = try container.decodeIfPresent(Double.self, forKey: .p50CostUSD)
+        p90CostUSD = try container.decodeIfPresent(Double.self, forKey: .p90CostUSD)
+        sampleCalls = try container.decodeIfPresent(UInt32.self, forKey: .sampleCalls)
+        source = try container.decodeIfPresent(String.self, forKey: .source) ?? ""
+        reserveTokens = try container.decodeIfPresent(UInt64.self, forKey: .reserveTokens)
+        headroomTokens = try container.decodeIfPresent(UInt64.self, forKey: .headroomTokens)
+        criticalPathTasks = GovernorDecoding.stringList(from: container, forKey: .criticalPathTasks)
+    }
+
+    var statusLabel: String {
+        guard let feasible else { return "FEASIBILITY NOT REPORTED" }
+        return feasible ? "FEASIBLE" : "NOT FEASIBLE"
+    }
+
+    var reasonLabel: String {
+        GovernorDecoding.bounded(reason, limit: 240) ?? "No reason reported"
+    }
+
+    var forecastLabel: String {
+        var parts: [String] = []
+        if let p50 = Self.forecast(tokens: p50Tokens, cost: p50CostUSD) {
+            parts.append("p50 \(p50)")
+        }
+        if let p90 = Self.forecast(tokens: p90Tokens, cost: p90CostUSD) {
+            parts.append("p90 \(p90)")
+        }
+        if let sampleCalls {
+            parts.append("\(sampleCalls) samples")
+        }
+        if let source = GovernorDecoding.bounded(source, limit: 40) {
+            parts.append(source)
+        }
+        return parts.isEmpty ? "No forecast reported" : parts.joined(separator: " · ")
+    }
+
+    var reserveHeadroomLabel: String {
+        var parts: [String] = []
+        if let reserveTokens {
+            parts.append("reserve \(BudgetFormatting.tokens(reserveTokens))")
+        }
+        if let headroomTokens {
+            parts.append("headroom \(BudgetFormatting.tokens(headroomTokens))")
+        }
+        return parts.isEmpty ? "Reserve/headroom not reported" : parts.joined(separator: " · ")
+    }
+
+    var criticalPathPreviews: [String] {
+        criticalPathTasks
+            .compactMap { GovernorDecoding.bounded($0, limit: 32) }
+            .prefix(AllocationPreviewView.criticalPathPreviewLimit)
+            .map(\.self)
+    }
+
+    var criticalPathOverflow: Int {
+        max(0, criticalPathTasks.count - AllocationPreviewView.criticalPathPreviewLimit)
+    }
+
+    static func forecast(tokens: UInt64?, cost: Double?) -> String? {
+        let value = BudgetFormatting.combined(
+            tokens: tokens,
+            cost: cost,
+            seconds: nil,
+            empty: ""
+        )
+        return value.isEmpty ? nil : value
+    }
+}
+
+/// One daemon-reported task envelope. Optional booleans keep an absent field
+/// from being presented as a definitive ready/feasible claim.
+struct AllocationTaskEnvelopeView: Codable, Sendable, Equatable {
+    let taskID: String
+    let title: String
+    let department: String
+    let status: String
+    let priority: Int?
+    let tokenBudget: UInt64?
+    let costBudgetUSD: Double?
+    let p50Tokens: UInt64?
+    let p90Tokens: UInt64?
+    let observedCalls: UInt32?
+    let source: String
+    let criticalPath: Bool?
+    let ready: Bool?
+    let feasible: Bool?
+    let reason: String
+
+    enum CodingKeys: String, CodingKey {
+        case title, department, status, priority, source, criticalPath, ready, feasible, reason
+        case taskID = "task_id"
+        case tokenBudget = "token_budget"
+        case costBudgetUSD = "cost_budget_usd"
+        case p50Tokens = "p50_tokens"
+        case p90Tokens = "p90_tokens"
+        case observedCalls = "observed_calls"
+    }
+
+    init(
+        taskID: String = "",
+        title: String = "",
+        department: String = "",
+        status: String = "",
+        priority: Int? = nil,
+        tokenBudget: UInt64? = nil,
+        costBudgetUSD: Double? = nil,
+        p50Tokens: UInt64? = nil,
+        p90Tokens: UInt64? = nil,
+        observedCalls: UInt32? = nil,
+        source: String = "",
+        criticalPath: Bool? = nil,
+        ready: Bool? = nil,
+        feasible: Bool? = nil,
+        reason: String = ""
+    ) {
+        self.taskID = taskID
+        self.title = title
+        self.department = department
+        self.status = status
+        self.priority = priority
+        self.tokenBudget = tokenBudget
+        self.costBudgetUSD = costBudgetUSD
+        self.p50Tokens = p50Tokens
+        self.p90Tokens = p90Tokens
+        self.observedCalls = observedCalls
+        self.source = source
+        self.criticalPath = criticalPath
+        self.ready = ready
+        self.feasible = feasible
+        self.reason = reason
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        taskID = try container.decodeIfPresent(String.self, forKey: .taskID) ?? ""
+        title = try container.decodeIfPresent(String.self, forKey: .title) ?? ""
+        department = try container.decodeIfPresent(String.self, forKey: .department) ?? ""
+        status = try container.decodeIfPresent(String.self, forKey: .status) ?? ""
+        priority = try container.decodeIfPresent(Int.self, forKey: .priority)
+        tokenBudget = try container.decodeIfPresent(UInt64.self, forKey: .tokenBudget)
+        costBudgetUSD = try container.decodeIfPresent(Double.self, forKey: .costBudgetUSD)
+        p50Tokens = try container.decodeIfPresent(UInt64.self, forKey: .p50Tokens)
+        p90Tokens = try container.decodeIfPresent(UInt64.self, forKey: .p90Tokens)
+        observedCalls = try container.decodeIfPresent(UInt32.self, forKey: .observedCalls)
+        source = try container.decodeIfPresent(String.self, forKey: .source) ?? ""
+        criticalPath = try container.decodeIfPresent(Bool.self, forKey: .criticalPath)
+        ready = try container.decodeIfPresent(Bool.self, forKey: .ready)
+        feasible = try container.decodeIfPresent(Bool.self, forKey: .feasible)
+        reason = try container.decodeIfPresent(String.self, forKey: .reason) ?? ""
+    }
+
+    var titleLabel: String {
+        GovernorDecoding.bounded(title, limit: 120)
+            ?? GovernorDecoding.bounded(taskID, limit: 32)
+            ?? "Untitled task"
+    }
+
+    var taskIDLabel: String {
+        GovernorDecoding.bounded(taskID, limit: 32) ?? "no task id"
+    }
+
+    var departmentLabel: String {
+        GovernorDecoding.bounded(department, limit: 64) ?? "department not reported"
+    }
+
+    var statusLabel: String {
+        GovernorDecoding.bounded(status, limit: 32)?.uppercased() ?? "STATUS NOT REPORTED"
+    }
+
+    var budgetLabel: String {
+        BudgetFormatting.combined(
+            tokens: tokenBudget,
+            cost: costBudgetUSD,
+            seconds: nil,
+            empty: "no task envelope reported"
+        )
+    }
+
+    var forecastLabel: String {
+        var parts: [String] = []
+        if let p50 = AllocationFeasibilityView.forecast(tokens: p50Tokens, cost: nil) {
+            parts.append("p50 \(p50)")
+        }
+        if let p90 = AllocationFeasibilityView.forecast(tokens: p90Tokens, cost: nil) {
+            parts.append("p90 \(p90)")
+        }
+        if let observedCalls {
+            parts.append("\(observedCalls) observed")
+        }
+        return parts.isEmpty ? "No task forecast reported" : parts.joined(separator: " · ")
+    }
+
+    var feasibleLabel: String? {
+        guard let feasible else { return nil }
+        return feasible ? "FEASIBLE" : "NOT FEASIBLE"
+    }
+
+    var readyLabel: String? {
+        guard let ready else { return nil }
+        return ready ? "READY" : "NOT READY"
+    }
+
+    var reasonLabel: String? {
+        GovernorDecoding.bounded(reason, limit: 200)
+    }
+
+    var sourceLabel: String? {
+        GovernorDecoding.bounded(source, limit: 40)
+    }
+}
+
+/// One advisory recommendation. `confidence` is daemon-provided; an unknown
+/// value is labeled truthfully and never upgraded to a medium/high default.
+struct AllocationRecommendationView: Codable, Sendable, Equatable {
+    let action: String
+    let reason: String
+    let confidence: String
+    let taskID: String?
+
+    enum CodingKeys: String, CodingKey {
+        case action, reason, confidence
+        case taskID = "task_id"
+    }
+
+    init(
+        action: String = "",
+        reason: String = "",
+        confidence: String = "",
+        taskID: String? = nil
+    ) {
+        self.action = action
+        self.reason = reason
+        self.confidence = confidence
+        self.taskID = taskID
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        action = try container.decodeIfPresent(String.self, forKey: .action) ?? ""
+        reason = try container.decodeIfPresent(String.self, forKey: .reason) ?? ""
+        confidence = try container.decodeIfPresent(String.self, forKey: .confidence) ?? ""
+        taskID = try container.decodeIfPresent(String.self, forKey: .taskID)
+    }
+
+    var actionLabel: String {
+        GovernorDecoding.humanizedToken(action, limit: 120) ?? "No action reported"
+    }
+
+    var reasonLabel: String {
+        GovernorDecoding.bounded(reason, limit: 240) ?? "No reason reported"
+    }
+
+    var confidenceLabel: String {
+        GovernorDecoding.confidenceLabel(confidence)
+    }
+
+    var taskIDLabel: String? {
+        GovernorDecoding.bounded(taskID, limit: 32)
+    }
+}
+
+/// Bounded diagnosis and metareasoning summary. Task references are decoded
+/// from either plain strings or objects carrying an id/title.
+struct AllocationMetareasoningView: Codable, Sendable, Equatable {
+    static let listPreviewLimit = 6
+    static let recommendationPreviewLimit = 4
+
+    let diagnosisStatus: String
+    let diagnosisReason: String?
+    let diagnosisTarget: String?
+    let noProgressTurns: UInt32?
+    let stalledTasks: [String]
+    let failedTasks: [String]
+    let retryingTasks: [String]
+    let recommendations: [AllocationRecommendationView]
+
+    enum CodingKeys: String, CodingKey {
+        case recommendations
+        case diagnosisStatus = "diagnosis_status"
+        case diagnosisReason = "diagnosis_reason"
+        case diagnosisTarget = "diagnosis_target"
+        case noProgressTurns = "no_progress_turns"
+        case stalledTasks = "stalled_tasks"
+        case failedTasks = "failed_tasks"
+        case retryingTasks = "retrying_tasks"
+    }
+
+    init(
+        diagnosisStatus: String = "",
+        diagnosisReason: String? = nil,
+        diagnosisTarget: String? = nil,
+        noProgressTurns: UInt32? = nil,
+        stalledTasks: [String] = [],
+        failedTasks: [String] = [],
+        retryingTasks: [String] = [],
+        recommendations: [AllocationRecommendationView] = []
+    ) {
+        self.diagnosisStatus = diagnosisStatus
+        self.diagnosisReason = diagnosisReason
+        self.diagnosisTarget = diagnosisTarget
+        self.noProgressTurns = noProgressTurns
+        self.stalledTasks = stalledTasks
+        self.failedTasks = failedTasks
+        self.retryingTasks = retryingTasks
+        self.recommendations = recommendations
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        diagnosisStatus =
+            try container.decodeIfPresent(String.self, forKey: .diagnosisStatus) ?? ""
+        diagnosisReason = try container.decodeIfPresent(String.self, forKey: .diagnosisReason)
+        diagnosisTarget = try container.decodeIfPresent(String.self, forKey: .diagnosisTarget)
+        noProgressTurns = try container.decodeIfPresent(UInt32.self, forKey: .noProgressTurns)
+        stalledTasks = GovernorDecoding.stringList(from: container, forKey: .stalledTasks)
+        failedTasks = GovernorDecoding.stringList(from: container, forKey: .failedTasks)
+        retryingTasks = GovernorDecoding.stringList(from: container, forKey: .retryingTasks)
+        recommendations = GovernorDecoding.recommendations(
+            from: container,
+            forKey: .recommendations
+        )
+    }
+
+    var diagnosisStatusLabel: String {
+        GovernorDecoding.humanizedToken(diagnosisStatus, limit: 40)?.uppercased()
+            ?? "DIAGNOSIS NOT REPORTED"
+    }
+
+    var diagnosisReasonLabel: String? {
+        GovernorDecoding.bounded(diagnosisReason, limit: 240)
+    }
+
+    var diagnosisTargetLabel: String? {
+        GovernorDecoding.bounded(diagnosisTarget, limit: 32)
+    }
+
+    var noProgressLabel: String? {
+        guard let noProgressTurns else { return nil }
+        return noProgressTurns == 1
+            ? "1 no-progress turn"
+            : "\(noProgressTurns) no-progress turns"
+    }
+
+    var stalledPreviews: [String] {
+        Self.previews(stalledTasks)
+    }
+
+    var failedPreviews: [String] {
+        Self.previews(failedTasks)
+    }
+
+    var retryingPreviews: [String] {
+        Self.previews(retryingTasks)
+    }
+
+    var stalledOverflow: Int {
+        max(0, stalledTasks.count - Self.listPreviewLimit)
+    }
+
+    var failedOverflow: Int {
+        max(0, failedTasks.count - Self.listPreviewLimit)
+    }
+
+    var retryingOverflow: Int {
+        max(0, retryingTasks.count - Self.listPreviewLimit)
+    }
+
+    var recommendationPreviews: [AllocationRecommendationView] {
+        Array(recommendations.prefix(Self.recommendationPreviewLimit))
+    }
+
+    var recommendationOverflow: Int {
+        max(0, recommendations.count - Self.recommendationPreviewLimit)
+    }
+
+    var isEmpty: Bool {
+        !GovernorDecoding.hasText(diagnosisStatus)
+            && !GovernorDecoding.hasText(diagnosisReason)
+            && !GovernorDecoding.hasText(diagnosisTarget)
+            && noProgressTurns == nil
+            && stalledTasks.isEmpty && failedTasks.isEmpty && retryingTasks.isEmpty
+            && recommendations.isEmpty
+    }
+
+    private static func previews(_ values: [String]) -> [String] {
+        values
+            .compactMap { GovernorDecoding.bounded($0, limit: 48) }
+            .prefix(listPreviewLimit)
+            .map(\.self)
+    }
+}
+
+/// Attention/trust calibration. All recommendations and counts are
+/// daemon-provided; the card presents them as advisory.
+struct AllocationCalibrationView: Codable, Sendable, Equatable {
+    let attentionRecommendation: String
+    let trustRecommendation: String
+    let reason: String
+    let confidence: String
+    let pendingApprovals: UInt32?
+    let attentionInterrupts: UInt32?
+    let attentionCap: UInt32?
+    let verifierRejections: UInt32?
+    let failedTasks: UInt32?
+
+    enum CodingKeys: String, CodingKey {
+        case reason, confidence
+        case attentionRecommendation = "attention_recommendation"
+        case trustRecommendation = "trust_recommendation"
+        case pendingApprovals = "pending_approvals"
+        case attentionInterrupts = "attention_interrupts"
+        case attentionCap = "attention_cap"
+        case verifierRejections = "verifier_rejections"
+        case failedTasks = "failed_tasks"
+    }
+
+    init(
+        attentionRecommendation: String = "",
+        trustRecommendation: String = "",
+        reason: String = "",
+        confidence: String = "",
+        pendingApprovals: UInt32? = nil,
+        attentionInterrupts: UInt32? = nil,
+        attentionCap: UInt32? = nil,
+        verifierRejections: UInt32? = nil,
+        failedTasks: UInt32? = nil
+    ) {
+        self.attentionRecommendation = attentionRecommendation
+        self.trustRecommendation = trustRecommendation
+        self.reason = reason
+        self.confidence = confidence
+        self.pendingApprovals = pendingApprovals
+        self.attentionInterrupts = attentionInterrupts
+        self.attentionCap = attentionCap
+        self.verifierRejections = verifierRejections
+        self.failedTasks = failedTasks
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        attentionRecommendation =
+            try container.decodeIfPresent(String.self, forKey: .attentionRecommendation) ?? ""
+        trustRecommendation =
+            try container.decodeIfPresent(String.self, forKey: .trustRecommendation) ?? ""
+        reason = try container.decodeIfPresent(String.self, forKey: .reason) ?? ""
+        confidence = try container.decodeIfPresent(String.self, forKey: .confidence) ?? ""
+        pendingApprovals =
+            try container.decodeIfPresent(UInt32.self, forKey: .pendingApprovals)
+        attentionInterrupts =
+            try container.decodeIfPresent(UInt32.self, forKey: .attentionInterrupts)
+        attentionCap = try container.decodeIfPresent(UInt32.self, forKey: .attentionCap)
+        verifierRejections =
+            try container.decodeIfPresent(UInt32.self, forKey: .verifierRejections)
+        failedTasks = try container.decodeIfPresent(UInt32.self, forKey: .failedTasks)
+    }
+
+    var attentionLabel: String {
+        GovernorDecoding.humanizedToken(attentionRecommendation, limit: 200)
+            ?? "Attention recommendation not reported"
+    }
+
+    var trustLabel: String {
+        GovernorDecoding.humanizedToken(trustRecommendation, limit: 200)
+            ?? "Trust recommendation not reported"
+    }
+
+    var reasonLabel: String? {
+        GovernorDecoding.bounded(reason, limit: 240)
+    }
+
+    var confidenceLabel: String {
+        GovernorDecoding.confidenceLabel(confidence)
+    }
+
+    var countLabel: String? {
+        var parts: [String] = []
+        if let attentionInterrupts {
+            if let attentionCap {
+                parts.append("\(attentionInterrupts)/\(attentionCap) interrupts")
+            } else {
+                parts.append("\(attentionInterrupts) interrupts")
+            }
+        } else if let attentionCap {
+            parts.append("cap \(attentionCap) interrupts")
+        }
+        if let pendingApprovals {
+            parts.append(
+                "\(pendingApprovals) pending "
+                    + (pendingApprovals == 1 ? "approval" : "approvals")
+            )
+        }
+        if let verifierRejections {
+            parts.append(
+                "\(verifierRejections) verifier "
+                    + (verifierRejections == 1 ? "rejection" : "rejections")
+            )
+        }
+        if let failedTasks {
+            parts.append(
+                "\(failedTasks) failed " + (failedTasks == 1 ? "task" : "tasks")
+            )
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    var isEmpty: Bool {
+        !GovernorDecoding.hasText(attentionRecommendation)
+            && !GovernorDecoding.hasText(trustRecommendation)
+            && !GovernorDecoding.hasText(reason)
+            && !GovernorDecoding.hasText(confidence)
+            && pendingApprovals == nil && attentionInterrupts == nil
+            && attentionCap == nil && verifierRejections == nil && failedTasks == nil
+    }
+}
+
+// MARK: - R4 trade-offs and quality
+
+/// Bounded, read-only view of `session.tradeoffs`. It carries the daemon's
+/// profile frontier, quality review, and calibrated confidence. Nothing here
+/// selects a profile, changes routing, or claims completion.
+struct TradeoffView: Codable, Sendable, Equatable {
+    static let profilePreviewLimit = 8
+    static let recommendationPreviewLimit = 6
+    static let warningPreviewLimit = 6
+
+    let sessionID: String
+    let generatedAt: String
+    let currentProfile: String
+    let profiles: [ProfileTradeoffView]
+    let quality: QualityReviewView?
+    let confidence: TradeoffConfidenceView?
+    let recommendations: [String]
+    let warnings: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case profiles, quality, confidence, recommendations, warnings
+        case sessionID = "session_id"
+        case generatedAt = "generated_at"
+        case currentProfile = "current_profile"
+    }
+
+    init(
+        sessionID: String = "",
+        generatedAt: String = "",
+        currentProfile: String = "",
+        profiles: [ProfileTradeoffView] = [],
+        quality: QualityReviewView? = nil,
+        confidence: TradeoffConfidenceView? = nil,
+        recommendations: [String] = [],
+        warnings: [String] = []
+    ) {
+        self.sessionID = sessionID
+        self.generatedAt = generatedAt
+        self.currentProfile = currentProfile
+        self.profiles = profiles
+        self.quality = quality
+        self.confidence = confidence
+        self.recommendations = recommendations
+        self.warnings = warnings
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = try container.decodeIfPresent(String.self, forKey: .sessionID) ?? ""
+        generatedAt = try container.decodeIfPresent(String.self, forKey: .generatedAt) ?? ""
+        currentProfile = try container.decodeIfPresent(String.self, forKey: .currentProfile) ?? ""
+        profiles = GovernorDecoding.elements(
+            ProfileTradeoffView.self,
+            from: container,
+            forKey: .profiles
+        )
+        quality = try container.decodeIfPresent(QualityReviewView.self, forKey: .quality)
+        confidence =
+            try container.decodeIfPresent(TradeoffConfidenceView.self, forKey: .confidence)
+        recommendations = GovernorDecoding.displayStringList(
+            from: container,
+            forKey: .recommendations
+        )
+        warnings = GovernorDecoding.displayStringList(from: container, forKey: .warnings)
+    }
+
+    var currentProfileTitle: String {
+        GovernorDecoding.profileTitle(currentProfile)
+    }
+
+    /// Presentation order only: known profiles follow `RunProfile.allCases`,
+    /// unknown values stay after them. No profile is added or removed.
+    var orderedProfiles: [ProfileTradeoffView] {
+        profiles.enumerated()
+            .sorted { lhs, rhs in
+                let left = lhs.element.profileRank
+                let right = rhs.element.profileRank
+                if left != right {
+                    return left < right
+                }
+                return lhs.offset < rhs.offset
+            }
+            .map(\.element)
+    }
+
+    var profilePreviews: [ProfileTradeoffView] {
+        Array(orderedProfiles.prefix(Self.profilePreviewLimit))
+    }
+
+    var profileOverflow: Int {
+        max(0, profiles.count - Self.profilePreviewLimit)
+    }
+
+    var recommendationPreviews: [String] {
+        Self.boundedStrings(
+            recommendations,
+            limit: Self.recommendationPreviewLimit,
+            characters: 240
+        )
+    }
+
+    var recommendationOverflow: Int {
+        max(0, recommendations.count - Self.recommendationPreviewLimit)
+    }
+
+    var warningPreviews: [String] {
+        Self.boundedStrings(
+            warnings,
+            limit: Self.warningPreviewLimit,
+            characters: 240
+        )
+    }
+
+    var warningOverflow: Int {
+        max(0, warnings.count - Self.warningPreviewLimit)
+    }
+
+    /// Strict selection guard: a view for another session is never applied.
+    func isForSession(_ targetSessionID: String) -> Bool {
+        let target = targetSessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty, !sessionID.isEmpty else { return false }
+        return sessionID == target
+    }
+
+    private static func boundedStrings(
+        _ values: [String],
+        limit: Int,
+        characters: Int
+    ) -> [String] {
+        values
+            .compactMap { GovernorDecoding.humanizedToken($0, limit: characters) }
+            .prefix(limit)
+            .map(\.self)
+    }
+}
+
+/// One profile on the trade-off frontier.
+struct ProfileTradeoffView: Codable, Sendable, Equatable {
+    let profile: String
+    let primaryGoal: String
+    let completionReserveRatio: Double?
+    let attentionPosture: String
+    let qualityPosture: String
+    let projectedTurns: UInt32?
+    let projectedCostUSD: Double?
+    let recommended: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case profile, recommended
+        case primaryGoal = "primary_goal"
+        case completionReserveRatio = "completion_reserve_ratio"
+        case attentionPosture = "attention_posture"
+        case qualityPosture = "quality_posture"
+        case projectedTurns = "projected_turns"
+        case projectedCostUSD = "projected_cost_usd"
+    }
+
+    init(
+        profile: String = "",
+        primaryGoal: String = "",
+        completionReserveRatio: Double? = nil,
+        attentionPosture: String = "",
+        qualityPosture: String = "",
+        projectedTurns: UInt32? = nil,
+        projectedCostUSD: Double? = nil,
+        recommended: Bool? = nil
+    ) {
+        self.profile = profile
+        self.primaryGoal = primaryGoal
+        self.completionReserveRatio = completionReserveRatio
+        self.attentionPosture = attentionPosture
+        self.qualityPosture = qualityPosture
+        self.projectedTurns = projectedTurns
+        self.projectedCostUSD = projectedCostUSD
+        self.recommended = recommended
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        profile = try container.decodeIfPresent(String.self, forKey: .profile) ?? ""
+        primaryGoal = try container.decodeIfPresent(String.self, forKey: .primaryGoal) ?? ""
+        completionReserveRatio =
+            try container.decodeIfPresent(Double.self, forKey: .completionReserveRatio)
+        attentionPosture =
+            try container.decodeIfPresent(String.self, forKey: .attentionPosture) ?? ""
+        qualityPosture = try container.decodeIfPresent(String.self, forKey: .qualityPosture) ?? ""
+        projectedTurns = try container.decodeIfPresent(UInt32.self, forKey: .projectedTurns)
+        projectedCostUSD =
+            try container.decodeIfPresent(Double.self, forKey: .projectedCostUSD)
+        recommended = try container.decodeIfPresent(Bool.self, forKey: .recommended)
+    }
+
+    var profileTitle: String {
+        GovernorDecoding.profileTitle(profile)
+    }
+
+    var isRecommended: Bool {
+        recommended == true
+    }
+
+    /// Exact case-insensitive comparison against the daemon's current profile
+    /// string. No profile is treated as current by default.
+    func isCurrent(_ currentProfile: String) -> Bool {
+        let current = currentProfile.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let candidate = profile.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !current.isEmpty && current == candidate
+    }
+
+    var primaryGoalLabel: String {
+        GovernorDecoding.bounded(primaryGoal, limit: 160) ?? "Goal not reported"
+    }
+
+    var reservePercentLabel: String {
+        guard let completionReserveRatio, completionReserveRatio.isFinite else {
+            return "reserve not reported"
+        }
+        let percent = completionReserveRatio * 100
+        if percent.rounded() == percent {
+            return "\(Int(percent))% reserve"
+        }
+        return String(format: "%.1f%% reserve", percent)
+    }
+
+    var attentionLabel: String {
+        GovernorDecoding.bounded(attentionPosture, limit: 80) ?? "attention not reported"
+    }
+
+    var qualityLabel: String {
+        GovernorDecoding.bounded(qualityPosture, limit: 80) ?? "quality not reported"
+    }
+
+    var forecastLabel: String {
+        BudgetFormatting.runway(
+            turns: projectedTurns,
+            seconds: nil,
+            cost: projectedCostUSD
+        )
+    }
+
+    var profileRank: Int {
+        RunProfile.allCases.firstIndex {
+            $0.rawValue == profile.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        } ?? RunProfile.allCases.count
+    }
+}
+
+/// Daemon-reported delivery/quality review. Missing evidence stays nil; the
+/// card never upgrades readiness or invents a passing test/verifier/merge.
+struct QualityReviewView: Codable, Sendable, Equatable {
+    static let changedPathPreviewLimit = 8
+    static let blockerPreviewLimit = 6
+    static let reasonPreviewLimit = 5
+
+    let readinessLevel: String
+    let latestCommit: String?
+    let latestTest: String?
+    let verifier: String?
+    let merge: String?
+    let completedTasks: UInt32?
+    let totalTasks: UInt32?
+    let mergedEntries: UInt32?
+    let changedPaths: [String]
+    let blockers: [String]
+    let reviewability: String
+    let reasons: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case verifier, merge, blockers, reasons, reviewability
+        case readinessLevel = "readiness_level"
+        case latestCommit = "latest_commit"
+        case latestTest = "latest_test"
+        case completedTasks = "completed_tasks"
+        case totalTasks = "total_tasks"
+        case mergedEntries = "merged_entries"
+        case changedPaths = "changed_paths"
+    }
+
+    init(
+        readinessLevel: String = "",
+        latestCommit: String? = nil,
+        latestTest: String? = nil,
+        verifier: String? = nil,
+        merge: String? = nil,
+        completedTasks: UInt32? = nil,
+        totalTasks: UInt32? = nil,
+        mergedEntries: UInt32? = nil,
+        changedPaths: [String] = [],
+        blockers: [String] = [],
+        reviewability: String = "",
+        reasons: [String] = []
+    ) {
+        self.readinessLevel = readinessLevel
+        self.latestCommit = latestCommit
+        self.latestTest = latestTest
+        self.verifier = verifier
+        self.merge = merge
+        self.completedTasks = completedTasks
+        self.totalTasks = totalTasks
+        self.mergedEntries = mergedEntries
+        self.changedPaths = changedPaths
+        self.blockers = blockers
+        self.reviewability = reviewability
+        self.reasons = reasons
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        readinessLevel =
+            try container.decodeIfPresent(String.self, forKey: .readinessLevel) ?? ""
+        latestCommit = try container.decodeIfPresent(String.self, forKey: .latestCommit)
+        latestTest = try container.decodeIfPresent(String.self, forKey: .latestTest)
+        verifier = try container.decodeIfPresent(String.self, forKey: .verifier)
+        merge = try container.decodeIfPresent(String.self, forKey: .merge)
+        completedTasks = try container.decodeIfPresent(UInt32.self, forKey: .completedTasks)
+        totalTasks = try container.decodeIfPresent(UInt32.self, forKey: .totalTasks)
+        mergedEntries = try container.decodeIfPresent(UInt32.self, forKey: .mergedEntries)
+        changedPaths = GovernorDecoding.stringList(from: container, forKey: .changedPaths)
+        blockers = GovernorDecoding.stringList(from: container, forKey: .blockers)
+        reviewability = try container.decodeIfPresent(String.self, forKey: .reviewability) ?? ""
+        reasons = GovernorDecoding.stringList(from: container, forKey: .reasons)
+    }
+
+    var readinessLabel: String {
+        let value = readinessLevel.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch value {
+        case "none": return "NONE"
+        case "dirty": return "DIRTY"
+        case "committed": return "COMMITTED"
+        case "tests_passed": return "TESTS PASSED"
+        case "verified": return "VERIFIED"
+        case "merged": return "MERGED"
+        case "partial": return "PARTIAL"
+        case "blocked": return "BLOCKED"
+        case "": return "NOT REPORTED"
+        default: return String(value.uppercased().prefix(24))
+        }
+    }
+
+    var reviewabilityLabel: String {
+        let value = reviewability.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch value {
+        case "ok": return "OK"
+        case "watch": return "WATCH"
+        case "risk": return "RISK"
+        case "": return "NOT REPORTED"
+        default: return String(value.uppercased().prefix(24))
+        }
+    }
+
+    var taskProgressLabel: String {
+        switch (completedTasks, totalTasks) {
+        case let (completed?, total?):
+            "\(completed) / \(total) tasks"
+        case let (completed?, nil):
+            "\(completed) tasks completed"
+        case let (nil, total?):
+            "\(total) total tasks"
+        case (nil, nil):
+            "tasks not reported"
+        }
+    }
+
+    var mergedEntriesLabel: String? {
+        guard let mergedEntries else { return nil }
+        return mergedEntries == 1 ? "1 merged entry" : "\(mergedEntries) merged entries"
+    }
+
+    var commitLabel: String? {
+        GovernorDecoding.bounded(latestCommit, limit: 16)
+    }
+
+    var testLabel: String? {
+        GovernorDecoding.bounded(latestTest, limit: 120)
+    }
+
+    var verifierLabel: String? {
+        GovernorDecoding.bounded(verifier, limit: 120)
+    }
+
+    var mergeLabel: String? {
+        GovernorDecoding.bounded(merge, limit: 120)
+    }
+
+    var changedPathPreviews: [String] {
+        Self.previews(changedPaths, limit: Self.changedPathPreviewLimit, characters: 160)
+    }
+
+    var changedPathOverflow: Int {
+        max(0, changedPaths.count - Self.changedPathPreviewLimit)
+    }
+
+    var blockerPreviews: [String] {
+        Self.previews(blockers, limit: Self.blockerPreviewLimit, characters: 180)
+    }
+
+    var blockerOverflow: Int {
+        max(0, blockers.count - Self.blockerPreviewLimit)
+    }
+
+    var reasonPreviews: [String] {
+        Self.previews(reasons, limit: Self.reasonPreviewLimit, characters: 200)
+    }
+
+    var reasonOverflow: Int {
+        max(0, reasons.count - Self.reasonPreviewLimit)
+    }
+
+    var isEmpty: Bool {
+        readinessLevel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && latestCommit == nil && latestTest == nil && verifier == nil && merge == nil
+            && completedTasks == nil && totalTasks == nil && mergedEntries == nil
+            && changedPaths.isEmpty && blockers.isEmpty
+            && reviewability.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && reasons.isEmpty
+    }
+
+    private static func previews(
+        _ values: [String],
+        limit: Int,
+        characters: Int
+    ) -> [String] {
+        values
+            .compactMap { GovernorDecoding.humanizedToken($0, limit: characters) }
+            .prefix(limit)
+            .map(\.self)
+    }
+}
+
+/// Calibrated confidence from the daemon. The score is shown as a numeric
+/// value; the client does not assume a 0–1 or 0–100 scale or derive a level.
+struct TradeoffConfidenceView: Codable, Sendable, Equatable {
+    static let reasonPreviewLimit = 5
+
+    let level: String
+    let score: Double?
+    let sampleCalls: UInt32?
+    let reasons: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case level, score, reasons
+        case sampleCalls = "sample_calls"
+    }
+
+    init(
+        level: String = "",
+        score: Double? = nil,
+        sampleCalls: UInt32? = nil,
+        reasons: [String] = []
+    ) {
+        self.level = level
+        self.score = score
+        self.sampleCalls = sampleCalls
+        self.reasons = reasons
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        level = try container.decodeIfPresent(String.self, forKey: .level) ?? ""
+        score = try container.decodeIfPresent(Double.self, forKey: .score)
+        sampleCalls = try container.decodeIfPresent(UInt32.self, forKey: .sampleCalls)
+        reasons = GovernorDecoding.stringList(from: container, forKey: .reasons)
+    }
+
+    var levelLabel: String {
+        GovernorDecoding.confidenceLabel(level)
+    }
+
+    var scoreLabel: String {
+        guard let score, score.isFinite else { return "score not reported" }
+        return String(format: "score %.2f", score)
+    }
+
+    var sampleLabel: String? {
+        guard let sampleCalls else { return nil }
+        return sampleCalls == 1 ? "1 sample call" : "\(sampleCalls) sample calls"
+    }
+
+    var reasonPreviews: [String] {
+        reasons
+            .compactMap { GovernorDecoding.bounded($0, limit: 200) }
+            .prefix(Self.reasonPreviewLimit)
+            .map(\.self)
+    }
+
+    var reasonOverflow: Int {
+        max(0, reasons.count - Self.reasonPreviewLimit)
+    }
+}
+
+// MARK: - Shared bounded decoding
+
+private enum GovernorDecoding {
+    static func bounded(_ raw: String?, limit: Int) -> String? {
+        guard let raw else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return String(trimmed.prefix(max(0, limit)))
+    }
+
+    /// Presentation only: daemon recommendation/reason tokens use snake_case.
+    /// Human sentences (which contain spaces) are left untouched.
+    static func humanizedToken(_ raw: String, limit: Int) -> String? {
+        guard let text = bounded(raw, limit: limit) else { return nil }
+        guard !text.contains(where: \.isWhitespace), text.contains("_") else {
+            return text
+        }
+        return text.replacingOccurrences(of: "_", with: " ")
+    }
+
+    static func hasText(_ raw: String?) -> Bool {
+        bounded(raw, limit: 1) != nil
+    }
+
+    /// Known profile titles use the canonical label; an unknown but non-empty
+    /// daemon value is shown bounded rather than silently dropped or relabeled.
+    static func profileTitle(_ raw: String) -> String {
+        if let title = RunProfile.exactTitle(fromWire: raw) {
+            return title
+        }
+        return bounded(raw, limit: 24)?.uppercased() ?? "Profile not reported"
+    }
+
+    static func confidenceLabel(_ raw: String) -> String {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch value {
+        case "high": return "HIGH"
+        case "medium": return "MEDIUM"
+        case "low": return "LOW"
+        case "": return "CONFIDENCE NOT REPORTED"
+        default: return String(value.uppercased().prefix(16))
+        }
+    }
+
+    static func stringList<K: CodingKey>(
+        from container: KeyedDecodingContainer<K>,
+        forKey key: K
+    ) -> [String] {
+        guard container.contains(key) else { return [] }
+        if (try? container.decodeNil(forKey: key)) == true {
+            return []
+        }
+        if let values = try? container.decode([String].self, forKey: key) {
+            return values
+        }
+        if let values = try? container.decode([JSONValue].self, forKey: key) {
+            return values.compactMap { value in
+                if let text = value.stringValue {
+                    return text
+                }
+                guard let object = value.objectValue else { return nil }
+                return object["task_id"]?.stringValue
+                    ?? object["id"]?.stringValue
+                    ?? object["label"]?.stringValue
+                    ?? object["title"]?.stringValue
+                    ?? object["message"]?.stringValue
+                    ?? object["reason"]?.stringValue
+            }
+        }
+        if let value = try? container.decode(String.self, forKey: key) {
+            return [value]
+        }
+        return []
+    }
+
+    /// Recommendations or warnings may be plain strings or objects.
+    static func displayStringList<K: CodingKey>(
+        from container: KeyedDecodingContainer<K>,
+        forKey key: K
+    ) -> [String] {
+        guard container.contains(key) else { return [] }
+        if (try? container.decodeNil(forKey: key)) == true {
+            return []
+        }
+        if let values = try? container.decode([String].self, forKey: key) {
+            return values
+        }
+        if let values = try? container.decode([JSONValue].self, forKey: key) {
+            return values.compactMap { value in
+                if let text = value.stringValue {
+                    return text
+                }
+                guard let object = value.objectValue else { return nil }
+                let primary = object["action"]?.stringValue
+                    ?? object["recommendation"]?.stringValue
+                    ?? object["text"]?.stringValue
+                    ?? object["message"]?.stringValue
+                    ?? object["summary"]?.stringValue
+                    ?? object["reason"]?.stringValue
+                    ?? object["title"]?.stringValue
+                guard let primary else { return nil }
+                var parts = [primary]
+                if let reason = object["reason"]?.stringValue, reason != primary {
+                    parts.append(reason)
+                }
+                if let confidence = object["confidence"]?.stringValue,
+                   !confidence.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                {
+                    parts.append(confidence.uppercased())
+                }
+                return parts.joined(separator: " · ")
+            }
+        }
+        if let value = try? container.decode(String.self, forKey: key) {
+            return [value]
+        }
+        return []
+    }
+
+    static func recommendations<K: CodingKey>(
+        from container: KeyedDecodingContainer<K>,
+        forKey key: K
+    ) -> [AllocationRecommendationView] {
+        guard container.contains(key) else { return [] }
+        if (try? container.decodeNil(forKey: key)) == true {
+            return []
+        }
+        if let values = try? container.decode([AllocationRecommendationView].self, forKey: key) {
+            return values
+        }
+        guard let values = try? container.decode([JSONValue].self, forKey: key) else {
+            if let value = try? container.decode(String.self, forKey: key) {
+                return [AllocationRecommendationView(action: value)]
+            }
+            return []
+        }
+        return values.compactMap { value in
+            if let text = value.stringValue {
+                return AllocationRecommendationView(action: text)
+            }
+            guard let data = try? JSONEncoder().encode(value) else { return nil }
+            return try? JSONDecoder().decode(AllocationRecommendationView.self, from: data)
+        }
+    }
+
+    /// Decodes elements leniently: a malformed entry is skipped instead of
+    /// discarding the whole preview. The daemon remains the source of truth.
+    static func elements<Element: Decodable, K: CodingKey>(
+        _ type: Element.Type,
+        from container: KeyedDecodingContainer<K>,
+        forKey key: K
+    ) -> [Element] {
+        guard container.contains(key) else { return [] }
+        if (try? container.decodeNil(forKey: key)) == true {
+            return []
+        }
+        if let values = try? container.decode([Element].self, forKey: key) {
+            return values
+        }
+        guard let values = try? container.decode([JSONValue].self, forKey: key) else {
+            return []
+        }
+        return values.compactMap { value in
+            guard let data = try? JSONEncoder().encode(value) else { return nil }
+            return try? JSONDecoder().decode(type, from: data)
+        }
+    }
+}
+
+/// Exact (case-insensitive) profile title lookup. Unlike `fromWire`, this does
+/// not silently substitute Balanced for an unknown or missing value.
+extension RunProfile {
+    static func exactTitle(fromWire value: String) -> String? {
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return nil }
+        return RunProfile(rawValue: normalized)?.title
     }
 }
 

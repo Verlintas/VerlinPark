@@ -327,15 +327,22 @@ pub(super) async fn dispatch(
             reserve,
             attention_cap,
             no_progress_turns,
+            auto_rescue,
+            no_auto_rescue,
         } => {
             if profile.is_none()
                 && reserve.is_none()
                 && attention_cap.is_none()
                 && no_progress_turns.is_none()
+                && !auto_rescue
+                && !no_auto_rescue
             {
                 bail!(
-                    "pass at least one of --profile, --reserve, --attention-cap, or --no-progress-turns"
+                    "pass at least one of --profile, --reserve, --attention-cap, --no-progress-turns, --auto-rescue, or --no-auto-rescue"
                 );
+            }
+            if auto_rescue && no_auto_rescue {
+                bail!("--auto-rescue and --no-auto-rescue are mutually exclusive");
             }
             // Read-modify-write: unspecified fields keep the stored policy.
             let current = rpc(
@@ -363,6 +370,12 @@ pub(super) async fn dispatch(
             }
             if let Some(no_progress_turns) = no_progress_turns {
                 policy.stop_policy.no_progress_turns = no_progress_turns;
+            }
+            if auto_rescue {
+                policy.auto_rescue = true;
+            }
+            if no_auto_rescue {
+                policy.auto_rescue = false;
             }
             rpc(
                 &discovery,
@@ -844,6 +857,7 @@ mod tests {
             "9",
             "--no-progress-turns",
             "4",
+            "--auto-rescue",
         ])
         .unwrap();
         match cli.command {
@@ -853,14 +867,44 @@ mod tests {
                 reserve,
                 attention_cap,
                 no_progress_turns,
+                auto_rescue,
+                no_auto_rescue,
             } => {
                 assert_eq!(project, "proj-1");
                 assert_eq!(profile.as_deref(), Some("fast"));
                 assert_eq!(reserve, Some(0.3));
                 assert_eq!(attention_cap, Some(9));
                 assert_eq!(no_progress_turns, Some(4));
+                assert!(auto_rescue);
+                assert!(!no_auto_rescue);
             }
             other => panic!("expected project-run-policy-set, got {other:?}"),
         }
+
+        let cli =
+            Cli::try_parse_from(["vp", "project-run-policy-set", "proj-1", "--no-auto-rescue"])
+                .unwrap();
+        match cli.command {
+            Command::ProjectRunPolicySet {
+                auto_rescue,
+                no_auto_rescue,
+                ..
+            } => {
+                assert!(!auto_rescue);
+                assert!(no_auto_rescue);
+            }
+            other => panic!("expected project-run-policy-set, got {other:?}"),
+        }
+        assert!(
+            Cli::try_parse_from([
+                "vp",
+                "project-run-policy-set",
+                "proj-1",
+                "--auto-rescue",
+                "--no-auto-rescue",
+            ])
+            .is_err(),
+            "the flags must be mutually exclusive"
+        );
     }
 }

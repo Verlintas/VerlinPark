@@ -1461,6 +1461,403 @@ final class ResourceGovernorTests: XCTestCase {
         )
     }
 
+    // MARK: - R3 allocation preview
+
+    func testAllocationPreviewDecodesFeasibilityEnvelopeTasksAndCalibration() throws {
+        let json = try XCTUnwrap("""
+        {
+          "session_id": "ses-1",
+          "generated_at": "2026-11-25T00:00:00Z",
+          "profile": "balanced",
+          "readiness": {"session_id": "ses-1", "level": "committed"},
+          "envelope": {
+            "token_budget": 120000,
+            "spent_tokens": 80000,
+            "remaining_tokens": 40000,
+            "cost_budget_usd": 2.5,
+            "spent_cost_usd": 1.5,
+            "remaining_cost_usd": 1.0,
+            "time_budget_secs": 3600,
+            "remaining_secs": 1800,
+            "completion_reserve_ratio": 0.2
+          },
+          "feasibility": {
+            "feasible": true,
+            "reason": "p90 fits the remaining envelope",
+            "p50_tokens": 10000,
+            "p90_tokens": 18000,
+            "p50_cost_usd": 0.1,
+            "p90_cost_usd": 0.2,
+            "sample_calls": 12,
+            "source": "task_history",
+            "reserve_tokens": 20000,
+            "headroom_tokens": 22000,
+            "critical_path_tasks": ["T1", "T2"]
+          },
+          "tasks": [
+            {"task_id":"T1","title":"Write model","department":"core","status":"pending",
+             "priority":5,"token_budget":30000,"cost_budget_usd":0.5,"p50_tokens":9000,
+             "p90_tokens":16000,"observed_calls":4,"source":"history","critical_path":true,
+             "ready":true,"feasible":true,"reason":"fits"},
+            {"task_id":"T2","title":"Tests","department":"core","status":"pending"},
+            {"task_id":"T3","title":"Review","department":"core","status":"pending"},
+            {"task_id":"T4","title":"Docs","department":"core","status":"pending"},
+            {"task_id":"T5","title":"Audit","department":"core","status":"pending"},
+            {"task_id":"T6","title":"Bench","department":"core","status":"pending"},
+            {"task_id":"T7","title":"Extra","department":"core","status":"pending"},
+            {"task_id":"T8","title":"Overflow","department":"core","status":"pending"}
+          ],
+          "recommendations": [
+            {"action":"reallocate","reason":"move 4k tokens to T2","confidence":"high","task_id":"T2"},
+            {"action":"split_task","reason":"T3 is large","confidence":"medium","task_id":"T3"},
+            {"action":"scout","reason":"unknown area","confidence":"low","task_id":null},
+            {"action":"noop","reason":"a","confidence":"unknown"},
+            {"action":"noop","reason":"b","confidence":""},
+            {"action":"noop","reason":"c","confidence":"high"},
+            {"action":"noop","reason":"d","confidence":"high"},
+            {"action":"noop","reason":"e","confidence":"high"}
+          ],
+          "metareasoning": {
+            "diagnosis_status": "stalled",
+            "diagnosis_reason": "T2 has no progress",
+            "diagnosis_target": "T2",
+            "no_progress_turns": 4,
+            "stalled_tasks": ["T2", {"task_id":"T4","title":"Docs"}, "T6", "T7", "T8", "T9", "T10"],
+            "failed_tasks": ["T5"],
+            "retrying_tasks": [{"id":"T3"}],
+            "recommendations": [
+              {"action":"replan","reason":"split T2","confidence":"medium","task_id":"T2"}
+            ]
+          },
+          "calibration": {
+            "attention_recommendation": "batch routine approvals",
+            "trust_recommendation": "keep Verifier strict",
+            "reason": "2 rejections in the last 5 tasks",
+            "confidence": "medium",
+            "pending_approvals": 2,
+            "attention_interrupts": 7,
+            "attention_cap": 20,
+            "verifier_rejections": 2,
+            "failed_tasks": 1
+          },
+          "truncated": true
+        }
+        """.data(using: .utf8))
+        let allocation = try JSONDecoder().decode(AllocationPreviewView.self, from: json)
+        XCTAssertEqual(allocation.sessionID, "ses-1")
+        XCTAssertEqual(allocation.profileTitle, "Balanced")
+        XCTAssertEqual(allocation.readinessLabel, "COMMITTED")
+        XCTAssertTrue(allocation.truncated)
+        XCTAssertEqual(allocation.envelope?.remainingTokens, 40000)
+        XCTAssertEqual(allocation.envelope?.remainingLabel, "40.0k tokens · $1.00 · 30m")
+        XCTAssertEqual(allocation.envelope?.reservePercentLabel, "20%")
+        XCTAssertEqual(allocation.feasibility?.statusLabel, "FEASIBLE")
+        XCTAssertTrue(allocation.feasibility?.feasible == true)
+        XCTAssertEqual(allocation.feasibility?.sampleCalls, 12)
+        XCTAssertEqual(allocation.feasibility?.source, "task_history")
+        XCTAssertTrue(allocation.feasibility?.forecastLabel.contains("p50") == true)
+        XCTAssertTrue(allocation.feasibility?.forecastLabel.contains("p90") == true)
+        XCTAssertTrue(allocation.feasibility?.forecastLabel.contains("12 samples") == true)
+        XCTAssertEqual(allocation.feasibility?.reserveHeadroomLabel, "reserve 20.0k · headroom 22.0k")
+        XCTAssertEqual(allocation.feasibility?.criticalPathPreviews, ["T1", "T2"])
+        XCTAssertEqual(allocation.taskPreviews.count, 6)
+        XCTAssertEqual(allocation.taskOverflow, 2)
+        XCTAssertEqual(allocation.taskPreviews.first?.titleLabel, "Write model")
+        XCTAssertEqual(allocation.taskPreviews.first?.feasibleLabel, "FEASIBLE")
+        XCTAssertEqual(allocation.taskPreviews.first?.readyLabel, "READY")
+        XCTAssertEqual(allocation.taskPreviews[1].budgetLabel, "no task envelope reported")
+        XCTAssertEqual(allocation.recommendationPreviews.count, 6)
+        XCTAssertEqual(allocation.recommendationOverflow, 2)
+        XCTAssertEqual(allocation.recommendationPreviews.first?.confidenceLabel, "HIGH")
+        XCTAssertEqual(allocation.recommendationPreviews[1].actionLabel, "split task")
+        XCTAssertEqual(allocation.recommendationPreviews[3].confidenceLabel, "UNKNOWN")
+        XCTAssertEqual(allocation.recommendationPreviews[4].confidenceLabel, "CONFIDENCE NOT REPORTED")
+        XCTAssertEqual(allocation.metareasoning?.diagnosisStatusLabel, "STALLED")
+        XCTAssertEqual(allocation.metareasoning?.diagnosisTargetLabel, "T2")
+        XCTAssertEqual(allocation.metareasoning?.noProgressLabel, "4 no-progress turns")
+        XCTAssertEqual(allocation.metareasoning?.stalledPreviews.count, 6)
+        XCTAssertEqual(allocation.metareasoning?.stalledOverflow, 1)
+        XCTAssertEqual(allocation.metareasoning?.stalledPreviews[1], "T4")
+        XCTAssertEqual(allocation.metareasoning?.retryingPreviews, ["T3"])
+        XCTAssertEqual(allocation.metareasoning?.recommendationPreviews.first?.actionLabel, "replan")
+        XCTAssertEqual(allocation.calibration?.attentionLabel, "batch routine approvals")
+        XCTAssertEqual(allocation.calibration?.trustLabel, "keep Verifier strict")
+        XCTAssertEqual(allocation.calibration?.confidenceLabel, "MEDIUM")
+        XCTAssertEqual(
+            allocation.calibration?.countLabel,
+            "7/20 interrupts · 2 pending approvals · 2 verifier rejections · 1 failed task"
+        )
+        XCTAssertTrue(allocation.isForSession("ses-1"))
+        XCTAssertFalse(allocation.isForSession("ses-2"))
+        XCTAssertFalse(allocation.isForSession(""))
+    }
+
+    func testAllocationPreviewDefaultsMissingNullAndUnknownFieldsWithoutInvention() throws {
+        let json = try XCTUnwrap("""
+        {
+          "session_id": "ses-2",
+          "profile": "custom",
+          "readiness": null,
+          "envelope": null,
+          "feasibility": {"reason": "unknown", "feasible": null, "tasks": null},
+          "tasks": null,
+          "recommendations": null,
+          "metareasoning": null,
+          "calibration": null
+        }
+        """.data(using: .utf8))
+        let allocation = try JSONDecoder().decode(AllocationPreviewView.self, from: json)
+        XCTAssertEqual(allocation.profileTitle, "CUSTOM")
+        XCTAssertNil(allocation.readiness)
+        XCTAssertEqual(allocation.readinessLabel, "NOT REPORTED")
+        XCTAssertNil(allocation.envelope)
+        XCTAssertEqual(allocation.feasibility?.statusLabel, "FEASIBILITY NOT REPORTED")
+        XCTAssertNil(allocation.feasibility?.feasible)
+        XCTAssertEqual(allocation.feasibility?.forecastLabel, "No forecast reported")
+        XCTAssertEqual(allocation.feasibility?.reserveHeadroomLabel, "Reserve/headroom not reported")
+        XCTAssertTrue(allocation.tasks.isEmpty)
+        XCTAssertTrue(allocation.recommendations.isEmpty)
+        XCTAssertNil(allocation.metareasoning)
+        XCTAssertNil(allocation.calibration)
+        XCTAssertFalse(allocation.truncated)
+        XCTAssertFalse(allocation.isForSession("ses-1"))
+    }
+
+    func testAllocationEmptyAndUnknownProfileHaveNoFeasibilityClaim() throws {
+        let json = try XCTUnwrap("{}".data(using: .utf8))
+        let allocation = try JSONDecoder().decode(AllocationPreviewView.self, from: json)
+        XCTAssertEqual(allocation.sessionID, "")
+        XCTAssertEqual(allocation.profileTitle, "Profile not reported")
+        XCTAssertNil(allocation.feasibility)
+        XCTAssertNil(allocation.envelope)
+        XCTAssertFalse(allocation.isForSession("ses-1"))
+        XCTAssertEqual(allocation.readinessLabel, "NOT REPORTED")
+    }
+
+    // MARK: - R4 trade-offs and quality
+
+    func testTradeoffViewDecodesFiveProfilesQualityAndCalibratedConfidence() throws {
+        let json = try XCTUnwrap("""
+        {
+          "session_id": "ses-1",
+          "generated_at": "2026-11-25T00:00:00Z",
+          "current_profile": "balanced",
+          "profiles": [
+            {"profile":"quality","primary_goal":"highest confidence",
+             "completion_reserve_ratio":0.3,"attention_posture":"high",
+             "quality_posture":"strict","projected_turns":20,
+             "projected_cost_usd":1.2,"recommended":false},
+            {"profile":"balanced","primary_goal":"balanced delivery",
+             "completion_reserve_ratio":0.2,"attention_posture":"medium",
+             "quality_posture":"standard","projected_turns":14,
+             "projected_cost_usd":0.8,"recommended":true},
+            {"profile":"fast","primary_goal":"shortest path",
+             "completion_reserve_ratio":0.1,"attention_posture":"low",
+             "quality_posture":"light","projected_turns":8,
+             "projected_cost_usd":0.5},
+            {"profile":"cheap","primary_goal":"lowest cost",
+             "completion_reserve_ratio":0.15,"attention_posture":"low",
+             "quality_posture":"standard","projected_turns":10,
+             "projected_cost_usd":0.3},
+            {"profile":"unattended","primary_goal":"minimal interrupts",
+             "completion_reserve_ratio":0.2,"attention_posture":"minimal",
+             "quality_posture":"standard","projected_turns":null,
+             "projected_cost_usd":null}
+          ],
+          "quality": {
+            "readiness_level": "verified",
+            "latest_commit": "abcdef1234567890",
+            "latest_test": "cargo test: pass",
+            "verifier": "approved",
+            "merge": "pending",
+            "completed_tasks": 3,
+            "total_tasks": 4,
+            "merged_entries": 0,
+            "changed_paths": ["Sources/A.swift", "Tests/A.swift"],
+            "blockers": [],
+            "reviewability": "watch",
+            "reasons": ["one task remains"]
+          },
+          "confidence": {
+            "level": "medium",
+            "score": 0.72,
+            "sample_calls": 9,
+            "reasons": ["small sample", "one provider"]
+          },
+          "recommendations": [
+            "finish T4 before landing",
+            {"action": "keep verifier", "reason": "high-risk paths", "confidence": "high"}
+          ],
+          "warnings": ["forecast is based on task history"]
+        }
+        """.data(using: .utf8))
+        let tradeoffs = try JSONDecoder().decode(TradeoffView.self, from: json)
+        XCTAssertEqual(tradeoffs.sessionID, "ses-1")
+        XCTAssertEqual(tradeoffs.currentProfileTitle, "Balanced")
+        XCTAssertEqual(tradeoffs.profiles.count, 5)
+        XCTAssertEqual(tradeoffs.profilePreviews.count, 5)
+        XCTAssertEqual(tradeoffs.profileOverflow, 0)
+        XCTAssertEqual(tradeoffs.profilePreviews.map(\.profileTitle), [
+            "Quality", "Balanced", "Fast", "Cheap", "Unattended",
+        ])
+        XCTAssertTrue(tradeoffs.profilePreviews[1].isCurrent(tradeoffs.currentProfile))
+        XCTAssertTrue(tradeoffs.profilePreviews[1].isRecommended)
+        XCTAssertFalse(tradeoffs.profilePreviews[2].isRecommended)
+        XCTAssertEqual(tradeoffs.profilePreviews[0].reservePercentLabel, "30% reserve")
+        XCTAssertEqual(tradeoffs.profilePreviews[0].forecastLabel, "~20 turns · $1.20")
+        XCTAssertEqual(tradeoffs.quality?.readinessLabel, "VERIFIED")
+        XCTAssertEqual(tradeoffs.quality?.reviewabilityLabel, "WATCH")
+        XCTAssertEqual(tradeoffs.quality?.taskProgressLabel, "3 / 4 tasks")
+        XCTAssertEqual(tradeoffs.quality?.commitLabel, "abcdef1234567890")
+        XCTAssertEqual(tradeoffs.quality?.changedPathPreviews.count, 2)
+        XCTAssertEqual(tradeoffs.confidence?.levelLabel, "MEDIUM")
+        XCTAssertEqual(tradeoffs.confidence?.scoreLabel, "score 0.72")
+        XCTAssertEqual(tradeoffs.confidence?.sampleLabel, "9 sample calls")
+        XCTAssertEqual(tradeoffs.recommendationPreviews.count, 2)
+        XCTAssertEqual(
+            tradeoffs.recommendationPreviews[1],
+            "keep verifier · high-risk paths · HIGH"
+        )
+        XCTAssertEqual(tradeoffs.warningPreviews, ["forecast is based on task history"])
+        XCTAssertTrue(tradeoffs.isForSession("ses-1"))
+        XCTAssertFalse(tradeoffs.isForSession("ses-2"))
+    }
+
+    func testTradeoffViewDefaultsMissingFieldsAndKeepsUnknownConfidenceTruthful() throws {
+        let json = try XCTUnwrap("""
+        {"session_id":"ses-3","current_profile":"experimental","profiles":null,
+         "quality":null,"confidence":{"level":"unspecified","score":null,"reasons":null},
+         "recommendations":null,"warnings":null}
+        """.data(using: .utf8))
+        let tradeoffs = try JSONDecoder().decode(TradeoffView.self, from: json)
+        XCTAssertEqual(tradeoffs.currentProfileTitle, "EXPERIMENTAL")
+        XCTAssertTrue(tradeoffs.profiles.isEmpty)
+        XCTAssertNil(tradeoffs.quality)
+        XCTAssertEqual(tradeoffs.confidence?.levelLabel, "UNSPECIFIED")
+        XCTAssertEqual(tradeoffs.confidence?.scoreLabel, "score not reported")
+        XCTAssertNil(tradeoffs.confidence?.sampleLabel)
+        XCTAssertTrue(tradeoffs.recommendationPreviews.isEmpty)
+        XCTAssertTrue(tradeoffs.warningPreviews.isEmpty)
+        XCTAssertEqual(tradeoffs.quality?.readinessLabel ?? "NOT REPORTED", "NOT REPORTED")
+        XCTAssertFalse(tradeoffs.isForSession("ses-1"))
+    }
+
+    func testTradeoffAndQualityListsAreBoundedWithTruncationCounts() throws {
+        let long = String(repeating: "x", count: 400)
+        let paths = (0 ..< 12).map { "Sources/File\($0).swift" }
+        let blockers = (0 ..< 9).map { "blocker-\($0)" }
+        let reasons = (0 ..< 8).map { "reason-\($0)" }
+        let warnings = (0 ..< 9).map { "warning-\($0)-\(long)" }
+        let recommendations = (0 ..< 8).map { "recommendation-\($0)-\(long)" }
+        let object: [String: Any] = [
+            "session_id": "ses-1",
+            "profiles": [],
+            "quality": [
+                "readiness_level": "blocked",
+                "changed_paths": paths,
+                "blockers": blockers,
+                "reviewability": "risk",
+                "reasons": reasons,
+            ],
+            "confidence": [
+                "level": "low",
+                "score": 0.2,
+                "reasons": reasons,
+            ],
+            "recommendations": recommendations,
+            "warnings": warnings,
+        ]
+        let data = try JSONSerialization.data(withJSONObject: object)
+        let tradeoffs = try JSONDecoder().decode(TradeoffView.self, from: data)
+        XCTAssertEqual(tradeoffs.recommendationPreviews.count, 6)
+        XCTAssertEqual(tradeoffs.recommendationOverflow, 2)
+        XCTAssertEqual(tradeoffs.warningPreviews.count, 6)
+        XCTAssertEqual(tradeoffs.warningOverflow, 3)
+        XCTAssertTrue(tradeoffs.recommendationPreviews.allSatisfy { $0.count <= 240 })
+        XCTAssertTrue(tradeoffs.warningPreviews.allSatisfy { $0.count <= 240 })
+        XCTAssertEqual(tradeoffs.quality?.changedPathPreviews.count, 8)
+        XCTAssertEqual(tradeoffs.quality?.changedPathOverflow, 4)
+        XCTAssertEqual(tradeoffs.quality?.blockerPreviews.count, 6)
+        XCTAssertEqual(tradeoffs.quality?.blockerOverflow, 3)
+        XCTAssertEqual(tradeoffs.quality?.reasonPreviews.count, 5)
+        XCTAssertEqual(tradeoffs.quality?.reasonOverflow, 3)
+        XCTAssertEqual(tradeoffs.confidence?.reasonPreviews.count, 5)
+        XCTAssertEqual(tradeoffs.confidence?.reasonOverflow, 3)
+    }
+
+    func testAllocationBoundsLongDisplayStringsAndRecommendationLists() throws {
+        let long = String(repeating: "r", count: 600)
+        var tasks: [[String: Any]] = []
+        for index in 0 ..< 9 {
+            tasks.append([
+                "task_id": "T\(index)",
+                "title": "T\(index)-\(long)",
+                "status": "pending",
+                "feasible": index == 0,
+            ])
+        }
+        let recommendations = (0 ..< 9).map { index in
+            ["action": "a\(index)-\(long)", "reason": long, "confidence": "high"]
+        }
+        let object: [String: Any] = [
+            "session_id": "ses-1",
+            "feasibility": [
+                "feasible": false,
+                "reason": long,
+                "critical_path_tasks": (0 ..< 12).map { "T\($0)" },
+            ],
+            "tasks": tasks,
+            "recommendations": recommendations,
+        ]
+        let data = try JSONSerialization.data(withJSONObject: object)
+        let allocation = try JSONDecoder().decode(AllocationPreviewView.self, from: data)
+        XCTAssertEqual(allocation.feasibility?.statusLabel, "NOT FEASIBLE")
+        XCTAssertEqual(allocation.feasibility?.reasonLabel.count, 240)
+        XCTAssertEqual(allocation.feasibility?.criticalPathPreviews.count, 8)
+        XCTAssertEqual(allocation.feasibility?.criticalPathOverflow, 4)
+        XCTAssertEqual(allocation.taskPreviews.count, 6)
+        XCTAssertEqual(allocation.taskOverflow, 3)
+        XCTAssertTrue(allocation.taskPreviews.allSatisfy { $0.titleLabel.count <= 120 })
+        XCTAssertEqual(allocation.recommendationPreviews.count, 6)
+        XCTAssertEqual(allocation.recommendationOverflow, 3)
+        XCTAssertTrue(allocation.recommendationPreviews.allSatisfy { $0.reasonLabel.count <= 240 })
+        XCTAssertTrue(allocation.recommendationPreviews.allSatisfy { $0.actionLabel.count <= 120 })
+    }
+
+    // MARK: - Project RunPolicy auto rescue
+
+    func testProjectRunPolicyAutoRescueDefaultsOffAndPreservesLoadedValue() throws {
+        let legacy = try XCTUnwrap("""
+        {"default_profile":"balanced","completion_reserve_ratio":0.2,
+         "attention_cap":20,"stop_policy":{}}
+        """.data(using: .utf8))
+        let decoded = try JSONDecoder().decode(ProjectRunPolicyView.self, from: legacy)
+        XCTAssertFalse(decoded.autoRescue)
+        XCTAssertEqual(decoded.autoRescueLabel, "Off")
+        XCTAssertFalse(ProjectRunPolicyView().autoRescue)
+        XCTAssertFalse(ProjectRunPolicyDraft().autoRescue)
+
+        let enabled = try XCTUnwrap("""
+        {"default_profile":"fast","completion_reserve_ratio":0.1,
+         "attention_cap":5,"stop_policy":{},"auto_rescue":true}
+        """.data(using: .utf8))
+        let decodedEnabled = try JSONDecoder().decode(ProjectRunPolicyView.self, from: enabled)
+        XCTAssertTrue(decodedEnabled.autoRescue)
+        XCTAssertEqual(decodedEnabled.autoRescueLabel, "On")
+        XCTAssertTrue(decodedEnabled.autoRescueDetail.contains("at most one"))
+
+        var draft = ProjectRunPolicyDraft(policy: decodedEnabled)
+        XCTAssertTrue(draft.autoRescue)
+        XCTAssertEqual(try draft.makePolicy().autoRescue, true)
+        draft.autoRescue = false
+        XCTAssertEqual(try draft.makePolicy().autoRescue, false)
+
+        let encoded = try XCTUnwrap(decodedEnabled.jsonValue().objectValue)
+        XCTAssertEqual(encoded["auto_rescue"]?.boolValue, true)
+        let encodedOff = try XCTUnwrap(ProjectRunPolicyView().jsonValue().objectValue)
+        XCTAssertEqual(encodedOff["auto_rescue"]?.boolValue, false)
+    }
+
     private func rescueStatus(
         sessionID: String = "ses-1",
         active: Bool = false,

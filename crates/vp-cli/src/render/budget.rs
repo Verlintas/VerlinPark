@@ -275,6 +275,18 @@ fn project_run_policy_lines(value: &Value, policy: &Value) -> Vec<String> {
             policy["attention_cap"].as_u64().unwrap_or(20)
         ),
         format!(
+            "  auto rescue {} (one grant per session when the turn pauses only on completion_reserve_*)",
+            if policy
+                .get("auto_rescue")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        ),
+        format!(
             "  stop        no-progress {} turn(s) · evidence {} · partial delivery {}",
             stop["no_progress_turns"].as_u64().unwrap_or(6),
             if stop

@@ -182,6 +182,15 @@ final class AppModel {
     var sessionResources: ResourceSnapshotView?
     var sessionResourcesError: String?
     var sessionResourcesBusy = false
+    // R3 allocation and R4 trade-off/quality are read-only daemon previews.
+    // They are loaded only by a visible card or an explicit refresh; selection
+    // changes clear them so values from another session are never shown.
+    var sessionAllocation: AllocationPreviewView?
+    var sessionAllocationError: String?
+    var sessionAllocationBusy = false
+    var sessionTradeoffs: TradeoffView?
+    var sessionTradeoffsError: String?
+    var sessionTradeoffsBusy = false
     var sessionResourceTopUpBusy = false
     var sessionResourceTopUpError: String?
     var sessionResourceTopUpNotice: String?
@@ -964,6 +973,27 @@ final class AppModel {
         return sessionRescue
     }
 
+    /// R3 allocation preview for the selected session only. Feasibility is
+    /// daemon authority; a preview for another session is never shown.
+    var selectedSessionAllocation: AllocationPreviewView? {
+        guard let sessionID = selectedSessionID, let sessionAllocation,
+              sessionAllocation.isForSession(sessionID)
+        else {
+            return nil
+        }
+        return sessionAllocation
+    }
+
+    /// R4 trade-off/quality view for the selected session only.
+    var selectedSessionTradeoffs: TradeoffView? {
+        guard let sessionID = selectedSessionID, let sessionTradeoffs,
+              sessionTradeoffs.isForSession(sessionID)
+        else {
+            return nil
+        }
+        return sessionTradeoffs
+    }
+
     /// A disabled rescue action must explain itself. This mirrors only the
     /// client-side proof; daemon eligibility remains authoritative for every
     /// allowed request.
@@ -1162,6 +1192,12 @@ final class AppModel {
         sessionResources = nil
         sessionResourcesError = nil
         sessionResourcesBusy = false
+        sessionAllocation = nil
+        sessionAllocationError = nil
+        sessionAllocationBusy = false
+        sessionTradeoffs = nil
+        sessionTradeoffsError = nil
+        sessionTradeoffsBusy = false
         sessionResourceTopUpBusy = false
         sessionResourceTopUpError = nil
         sessionResourceTopUpNotice = nil
@@ -4871,6 +4907,95 @@ final class AppModel {
             guard isCurrent(sessionID: sessionID, generation: generation) else { return }
             sessionResourcesError = error.localizedDescription
         }
+    }
+
+    /// Read-only R3 allocation preview for the selected session. It is loaded
+    /// only by the visible allocation card or an explicit refresh, never by a
+    /// selection sweep. A response for another session is rejected rather than
+    /// displayed, and nothing is inferred when the RPC fails.
+    func loadSessionAllocation(silent: Bool = false) async {
+        guard let sessionID = selectedSessionID else {
+            sessionAllocation = nil
+            sessionAllocationError = nil
+            sessionAllocationBusy = false
+            return
+        }
+        guard !sessionAllocationBusy else { return }
+        let generation = selectionGeneration
+        if !silent {
+            sessionAllocationBusy = true
+        }
+        defer {
+            if isCurrent(sessionID: sessionID, generation: generation) {
+                sessionAllocationBusy = false
+            }
+        }
+        do {
+            let preview = try await core.sessionAllocation(sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            guard preview.isForSession(sessionID) else {
+                sessionAllocation = nil
+                sessionAllocationError = BudgetValidationIssue(
+                    code: "INVALID_ALLOCATION_RESPONSE",
+                    message: "The daemon returned an allocation preview for a different session; no local state was changed."
+                ).displayText
+                return
+            }
+            sessionAllocation = preview
+            sessionAllocationError = nil
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            sessionAllocationError = BudgetValidationIssue.from(error).displayText
+        }
+    }
+
+    /// Explicit refresh for the visible allocation card.
+    func refreshSessionAllocation() async {
+        await loadSessionAllocation()
+    }
+
+    /// Read-only R4 trade-off/quality view for the selected session. The
+    /// daemon owns profile recommendations, quality review, and confidence;
+    /// the client applies no local inference and selects no profile.
+    func loadSessionTradeoffs(silent: Bool = false) async {
+        guard let sessionID = selectedSessionID else {
+            sessionTradeoffs = nil
+            sessionTradeoffsError = nil
+            sessionTradeoffsBusy = false
+            return
+        }
+        guard !sessionTradeoffsBusy else { return }
+        let generation = selectionGeneration
+        if !silent {
+            sessionTradeoffsBusy = true
+        }
+        defer {
+            if isCurrent(sessionID: sessionID, generation: generation) {
+                sessionTradeoffsBusy = false
+            }
+        }
+        do {
+            let view = try await core.sessionTradeoffs(sessionID: sessionID)
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            guard view.isForSession(sessionID) else {
+                sessionTradeoffs = nil
+                sessionTradeoffsError = BudgetValidationIssue(
+                    code: "INVALID_TRADEOFF_RESPONSE",
+                    message: "The daemon returned trade-offs for a different session; no local state was changed."
+                ).displayText
+                return
+            }
+            sessionTradeoffs = view
+            sessionTradeoffsError = nil
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else { return }
+            sessionTradeoffsError = BudgetValidationIssue.from(error).displayText
+        }
+    }
+
+    /// Explicit refresh for the visible trade-off/quality card.
+    func refreshSessionTradeoffs() async {
+        await loadSessionTradeoffs()
     }
 
     /// Read-only delivery state for the selected session. It carries the

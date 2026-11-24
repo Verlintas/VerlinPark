@@ -465,6 +465,52 @@ impl Store {
         Ok(entries)
     }
 
+    /// Bounded project-wide usage history for read-only allocation estimates.
+    /// Returns the newest `limit` entries (max 1000) in oldest-first order so a
+    /// caller can aggregate a task/department without loading a full project
+    /// ledger. No vector, prompt, or provider secret is returned.
+    pub fn list_project_usage_entries(
+        &self,
+        project_id: &str,
+        limit: u32,
+    ) -> Result<Vec<UsageEntry>> {
+        let limit = limit.clamp(1, 1_000);
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT u.id, u.session_id, u.agent_id, u.agent_name, u.role, u.task_id,
+                    u.department, u.model, u.input_tokens, u.output_tokens,
+                    u.cache_read_tokens, u.cache_write_tokens, u.estimated, u.cost_usd,
+                    u.created_at
+             FROM usage_ledger u
+             JOIN sessions s ON s.id = u.session_id
+             WHERE s.project_id = ?1
+             ORDER BY u.created_at DESC, u.id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![project_id, limit as i64], |row| {
+            Ok(UsageEntry {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                agent_id: row.get(2)?,
+                agent_name: row.get(3)?,
+                role: row.get(4)?,
+                task_id: row.get(5)?,
+                department: row.get(6)?,
+                model: row.get(7)?,
+                input_tokens: row.get::<_, i64>(8)? as u64,
+                output_tokens: row.get::<_, i64>(9)? as u64,
+                cache_read_tokens: row.get::<_, i64>(10)? as u64,
+                cache_write_tokens: row.get::<_, i64>(11)? as u64,
+                estimated: row.get::<_, i64>(12)? != 0,
+                cost_usd: row.get(13)?,
+                created_at: row.get(14)?,
+            })
+        })?;
+        let mut entries = rows.collect::<Result<Vec<_>, _>>()?;
+        entries.reverse();
+        Ok(entries)
+    }
+
     pub fn replace_usage_ledger(&self, session_id: &str, entries: &[UsageEntry]) -> Result<()> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
