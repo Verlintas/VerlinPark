@@ -146,6 +146,7 @@ struct ReadinessSnapshotView: Codable, Sendable, Equatable {
         switch level {
         case "merged": "MERGED"
         case "verified": "VERIFIED"
+        case "tests_passed": "TESTS PASSED"
         case "committed": "COMMITTED"
         case "dirty": "DIRTY"
         case "partial": "PARTIAL"
@@ -155,7 +156,108 @@ struct ReadinessSnapshotView: Codable, Sendable, Equatable {
     }
 
     var needsAttention: Bool {
-        level == "blocked" || level == "dirty" || !blockers.isEmpty
+        level == "blocked" || level == "dirty" || level == "partial"
+            || level == "tests_passed" || !blockers.isEmpty
+    }
+
+    /// Explicit, operator-facing caveat for a delivery that is not complete.
+    /// `nil` means the daemon-reported level does not need a partial-delivery
+    /// warning; the card must not infer mergeability or completion from it.
+    var deliveryCaveat: String? {
+        switch level {
+        case "partial":
+            "Partial delivery — remaining work is not complete; this is not mergeable."
+        case "committed":
+            "Committed locally — tests, Verifier approval, and integration are still pending."
+        case "dirty":
+            "Uncommitted changes — nothing is shippable or mergeable yet."
+        case "blocked":
+            "Blocked — resolve the blocker before this can be merged."
+        case "tests_passed":
+            "Tests passed locally — Verifier approval and integration are still pending."
+        default:
+            nil
+        }
+    }
+
+    /// True for levels that must show remaining work/blockers on the card,
+    /// even when the snapshot does not otherwise need attention.
+    var showsDeliveryDetail: Bool {
+        deliveryCaveat != nil
+    }
+
+    var shippabilityLabel: String {
+        shippable ? "shippable" : "not shippable"
+    }
+
+    var mergeabilityLabel: String {
+        mergeable ? "mergeable" : "not mergeable"
+    }
+
+    var shortCommit: String? {
+        guard let latestCommit, !latestCommit.isEmpty else { return nil }
+        return String(latestCommit.prefix(12))
+    }
+
+    /// Bounded plain-text snapshot for the "Copy readiness report" action.
+    /// Uses only daemon-provided fields; it never upgrades a level or claims a
+    /// merge that the snapshot did not report.
+    func boundedReport(maxItems: Int = 8, maxCharacters: Int = 2400) -> String {
+        let itemLimit = max(0, maxItems)
+        var lines = [
+            "VerlinPark readiness report",
+            "Level: \(levelLabel) (\(level))",
+            "Shippable: \(shippable ? "yes" : "no")",
+            "Mergeable: \(mergeable ? "yes" : "no")",
+        ]
+        if let latestCommit, !latestCommit.isEmpty {
+            lines.append("Commit: \(latestCommit)")
+        }
+        if let latestTest, !latestTest.isEmpty {
+            lines.append("Latest test: \(latestTest)")
+        }
+        if let verifier, !verifier.isEmpty {
+            lines.append("Verifier: \(verifier)")
+        }
+        if let merge, !merge.isEmpty {
+            lines.append("Merge: \(merge)")
+        }
+        if let caveat = deliveryCaveat {
+            lines.append("Note: \(caveat)")
+        }
+        if !changedPaths.isEmpty {
+            lines.append("Changed paths (\(changedPaths.count)):")
+            lines.append(contentsOf: changedPaths.prefix(itemLimit).map { "- \($0)" })
+            appendOverflow(changedPaths.count, limit: itemLimit, to: &lines)
+        }
+        lines.append("Remaining work (\(remainingWork.count)):")
+        if remainingWork.isEmpty {
+            lines.append("- none reported")
+        } else {
+            lines.append(contentsOf: remainingWork.prefix(itemLimit).map { "- \($0)" })
+            appendOverflow(remainingWork.count, limit: itemLimit, to: &lines)
+        }
+        lines.append("Blockers (\(blockers.count)):")
+        if blockers.isEmpty {
+            lines.append("- none reported")
+        } else {
+            lines.append(contentsOf: blockers.prefix(itemLimit).map { "- \($0)" })
+            appendOverflow(blockers.count, limit: itemLimit, to: &lines)
+        }
+        let text = lines.joined(separator: "\n")
+        let suffix = "\n… (truncated)"
+        guard text.count > maxCharacters else { return text }
+        let prefixCount = max(0, maxCharacters - suffix.count)
+        return String(text.prefix(prefixCount)) + suffix
+    }
+
+    private func appendOverflow(
+        _ total: Int,
+        limit: Int,
+        to lines: inout [String]
+    ) {
+        guard total > limit else { return }
+        lines.append("- … \(total - limit) more")
     }
 }
 
@@ -350,6 +452,215 @@ extension RunStopPolicyView {
         self.noProgressTurns = noProgressTurns
         self.marginalValueRatio = marginalValueRatio
         self.partialDelivery = partialDelivery
+    }
+}
+
+// MARK: - Operator resource top-up
+
+/// Additive operator top-up. The daemon clamps the resulting effective budget
+/// to existing hard caps; this request can never remove a cap, select
+/// Unlimited, or resume approval/verification/merge gates.
+struct TopUpSessionResourcesRequest: Equatable, Sendable {
+    let addTokens: UInt64?
+    let addCostUSD: Double?
+    let addTimeSecs: UInt64?
+    let resume: Bool
+    let reason: String?
+
+    init(
+        addTokens: UInt64? = nil,
+        addCostUSD: Double? = nil,
+        addTimeSecs: UInt64? = nil,
+        resume: Bool = false,
+        reason: String? = nil
+    ) {
+        self.addTokens = addTokens
+        self.addCostUSD = addCostUSD
+        self.addTimeSecs = addTimeSecs
+        self.resume = resume
+        self.reason = reason
+    }
+
+    var hasIncrement: Bool {
+        addTokens != nil || addCostUSD != nil || addTimeSecs != nil
+    }
+
+    /// Nil means valid. The daemon repeats these checks; the client validates
+    /// first so an empty or non-positive request never leaves the app.
+    var validationIssue: BudgetValidationIssue? {
+        do {
+            try validate()
+            return nil
+        } catch {
+            return error as? BudgetValidationIssue
+                ?? BudgetValidationIssue(
+                    code: "INVALID_RESOURCE_TOP_UP",
+                    message: error.localizedDescription
+                )
+        }
+    }
+
+    func validate() throws {
+        guard hasIncrement else {
+            throw BudgetValidationIssue(
+                code: "INVALID_RESOURCE_TOP_UP",
+                message: "Enter at least one positive token, cost, or time increment."
+            )
+        }
+        if let addTokens, addTokens == 0 {
+            throw BudgetValidationIssue(
+                code: "INVALID_RESOURCE_TOP_UP",
+                message: "Token top-up must be greater than zero."
+            )
+        }
+        if let addCostUSD, !addCostUSD.isFinite || addCostUSD <= 0 {
+            throw BudgetValidationIssue(
+                code: "INVALID_RESOURCE_TOP_UP",
+                message: "Cost top-up must be a positive finite USD amount."
+            )
+        }
+        if let addTimeSecs, addTimeSecs == 0 {
+            throw BudgetValidationIssue(
+                code: "INVALID_RESOURCE_TOP_UP",
+                message: "Time top-up must be greater than zero."
+            )
+        }
+    }
+}
+
+/// Pure text-field parsing for the Stage top-up sheet. Views own bindings only;
+/// numeric interpretation and validation stay here so they are testable.
+struct TopUpSessionResourcesDraft: Equatable, Sendable {
+    var tokensText = ""
+    var costUSDText = ""
+    var timeSecsText = ""
+    var resume = false
+
+    var hasAnyInput: Bool {
+        [tokensText, costUSDText, timeSecsText].contains {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
+    var validationIssue: BudgetValidationIssue? {
+        do {
+            _ = try validatedRequest()
+            return nil
+        } catch {
+            return error as? BudgetValidationIssue
+                ?? BudgetValidationIssue(
+                    code: "INVALID_RESOURCE_TOP_UP",
+                    message: error.localizedDescription
+                )
+        }
+    }
+
+    var request: TopUpSessionResourcesRequest? {
+        try? validatedRequest()
+    }
+
+    func validatedRequest(reason: String? = nil) throws -> TopUpSessionResourcesRequest {
+        let request = try TopUpSessionResourcesRequest(
+            addTokens: Self.positiveInteger(tokensText, label: "Token top-up"),
+            addCostUSD: Self.positiveCost(costUSDText),
+            addTimeSecs: Self.positiveInteger(timeSecsText, label: "Time top-up"),
+            resume: resume,
+            reason: reason
+        )
+        try request.validate()
+        return request
+    }
+
+    mutating func resetIncrements() {
+        tokensText = ""
+        costUSDText = ""
+        timeSecsText = ""
+    }
+
+    private static func positiveInteger(
+        _ raw: String,
+        label: String
+    ) throws -> UInt64? {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+        guard let value = UInt64(text), value > 0 else {
+            throw BudgetValidationIssue(
+                code: "INVALID_RESOURCE_TOP_UP",
+                message: "\(label) must be a whole number greater than zero."
+            )
+        }
+        return value
+    }
+
+    private static func positiveCost(_ raw: String) throws -> Double? {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+        guard let value = Double(text), value.isFinite, value > 0 else {
+            throw BudgetValidationIssue(
+                code: "INVALID_RESOURCE_TOP_UP",
+                message: "Cost top-up must be a positive USD amount."
+            )
+        }
+        return value
+    }
+}
+
+/// Exact wire result of `session.resources.top_up`. `budget` and `resources`
+/// are required: a partial response is a decode error, never a fabricated
+/// success. `resumed`/`capped` are conservative defaults for additive
+/// compatibility with an older daemon.
+struct TopUpSessionResourcesResult: Codable, Sendable, Equatable {
+    let sessionID: String
+    let budget: SessionBudgetStatus
+    let resumed: Bool
+    let capped: Bool
+    let resources: ResourceSnapshotView
+
+    enum CodingKeys: String, CodingKey {
+        case budget, resumed, capped, resources
+        case sessionID = "session_id"
+    }
+
+    init(
+        sessionID: String,
+        budget: SessionBudgetStatus,
+        resumed: Bool,
+        capped: Bool,
+        resources: ResourceSnapshotView
+    ) {
+        self.sessionID = sessionID
+        self.budget = budget
+        self.resumed = resumed
+        self.capped = capped
+        self.resources = resources
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = try container.decodeIfPresent(String.self, forKey: .sessionID) ?? ""
+        budget = try container.decode(SessionBudgetStatus.self, forKey: .budget)
+        resumed = try container.decodeIfPresent(Bool.self, forKey: .resumed) ?? false
+        capped = try container.decodeIfPresent(Bool.self, forKey: .capped) ?? false
+        resources = try container.decode(ResourceSnapshotView.self, forKey: .resources)
+    }
+
+    /// Truthful bounded outcome text for the sheet/toast. It never claims a
+    /// resume that the daemon did not report.
+    func operatorNotice(resumeRequested: Bool) -> String {
+        var parts: [String] = []
+        if budget.unlimited {
+            parts.append("Session is Unlimited; no cap was added or removed")
+        } else if capped {
+            parts.append("Budget clamped to the existing hard cap")
+        } else {
+            parts.append("Budget updated within existing caps")
+        }
+        if resumeRequested {
+            parts.append(resumed ? "session resumed" : "session not resumed")
+        } else if resumed {
+            parts.append("session resumed")
+        }
+        return parts.joined(separator: " · ")
     }
 }
 

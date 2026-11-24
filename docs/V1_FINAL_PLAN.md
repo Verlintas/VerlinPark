@@ -3,10 +3,10 @@
 - Status: Final plan; implementation in progress. Collab Agent
   Inspector/Direct Channel implemented (2026-11-22) and live-provider exercised
   (2026-11-23). Run Contract/resource observability R1, the P0 tool-friction
-  fixes, and the R2a profile/top-up/pre-dispatch guard are implemented
-  (2026-11-24); true turn-boundary pause/attention and Auto Budget
-  Worker/Labour expansion remain R2b. Open findings and live evidence are
-  tracked in
+  fixes, R2a profile/top-up/pre-dispatch, and R2b core turn-boundary pause +
+  Worker/Labour auto request-fit + macOS top-up are implemented (2026-11-24);
+  attention batching, project run policy, explicit partial-delivery action, and
+  R3/R4 remain. Open findings and live evidence are tracked in
   [V1_READINESS_LEDGER.md](V1_READINESS_LEDGER.md).
 - Date: 2026-11-22 (live validation update 2026-11-23)
 - Owner: Verlintas

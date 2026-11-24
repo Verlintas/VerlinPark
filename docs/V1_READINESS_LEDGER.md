@@ -75,9 +75,9 @@ Verification gaps:
 | V1-D09 | S1 | A bare Python `unittest` project without pyproject/pytest metadata was reported as `PROJECT_UNSUPPORTED`, pushing Agent runs into shell guessing. | **CLOSED** | `project_profile` detects `tests/test_*.py` and proposes `python3 -m unittest discover -s tests -v`; regression test covers the bare fixture |
 | V1-D10 | S1 | Contract analysis treated scratch verification writes and absolute read-only git commands as host-state/scope violations, creating repeated approvals and `.scratch-proof` artifacts in the worktree. | **CLOSED (P0)** | Shell exports `$VERLINPARK_WORKTREE`/`$VERLINPARK_SCRATCH`; prompts/recipes say cwd is the worktree; contract allows the stable scratch/TMPDIR prefixes; absolute read-only git (`status/diff/log/show/rev-parse/...`) is ReadOnly; `clean`/`reset --hard` remains Destructive. Tests cover all paths. |
 | V1-D11 | S1 | Fixed token budgets charged cache-read input at full weight, ignored missing prices, starved verification, and failed solvable runs; the dashboard could not show the difference between cheap-but-stuck and expensive-near-completion. | **PARTIAL (R2a)** | R1 exposes raw vs weighted tokens, money with `pricing_source`, time, attention, risk, context, capacity, quality, and progress plus readiness/forecast. R2a adds operator top-up (clamped to caps) and pre-dispatch completion-reserve deferral. Raw token caps remain authoritative; cost-weighted settlement/automatic reallocation is R2b/R3. |
-| V1-D12 | S2 | Operator attention had no budget or governor: repeated host-state approvals could consume the run without triggering a policy decision. | **PARTIAL (R2a)** | Pre-dispatch guard now defers new work at the attention cap and emits `session.resource.decision`; the card shows weighted interrupts and a profile menu. True turn-boundary pause/wait and approval batching are R2b. |
+| V1-D12 | S2 | Operator attention had no budget or governor: repeated host-state approvals could consume the run without triggering a policy decision. | **PARTIAL (R2b)** | Pre-dispatch deferral and a true turn-boundary pause (`session.resource.paused`) now stop new work at the attention cap; a bare resume re-pauses until the cap/policy changes. The card shows weighted interrupts, a profile menu, top-up, and readiness caveats. Approval batching/prompt workflow remains open. |
 
-## Run Contract R1/R2a (2026-11-24)
+## Run Contract R1/R2a/R2b (2026-11-24)
 
 Implemented the observe/operator slice from ADR-0234:
 
@@ -97,15 +97,30 @@ Implemented the observe/operator slice from ADR-0234:
   Stage profile menu. A pre-dispatch governor defers new plan work when
   readiness is blocked, the attention cap is reached, or the completion
   reserve is insufficient, and records `session.resource.decision`.
-- R2a does not pause an active run, rebalance/rescue, approve, reconcile, merge,
-  or route. It does not remove caps or select unlimited. Missing prices are
-  labeled `unconfigured`; readiness does not infer tests from raw shell output.
+- R2a itself does not pause an active run, rebalance/rescue, approve, reconcile,
+  merge, or route. It does not remove caps or select unlimited. Missing prices
+  are labeled `unconfigured`; readiness does not infer tests from raw shell
+  output.
+- R2b core adds a true provider-turn boundary pause (`session.resource.paused`)
+  for Leader/Manager/Worker/Labour/Scout when the governor blocks; the same run
+  waits for operator resume/top-up and re-pauses if the resource cap is
+  unchanged. Verifier and trusted internal repair runs are exempt so
+  already-produced work can still be verified/integrated. `readiness_blocked`
+  remains a new-work dispatch gate, not a turn pause, to avoid deadlocking
+  approvals/effects that the active run must finish.
+- Auto Budget request-fit now runs for Worker/Labour/Verifier too; only the
+  top-level Leader advances cumulative turns/no-progress. Child runtimes never
+  overwrite Leader-owned progress state.
+- macOS adds a Top Up sheet, capped/resumed truth, readiness caveats, bounded
+  report copy, and tests. It never removes a cap or claims a resume/merge the
+  daemon did not report.
 
-Tests: seven core resource/governor/override/top-up tests, three daemon RPC
-tests, four Swift decoder/profile tests, plus the P0 hash/scratch/permission/
-unittest/effect tests. Final full workspace after R2a: **4,551 passed, 0 failed,
-6 ignored**; clippy exit 0. A live temp-daemon CLI smoke exercised
-`run-contract-set`, `resources`, `top-up`, and `readiness` end to end.
+Tests: R2b targeted: 23 auto-budget runtime tests, 368 `agent::tests`, 7
+resource tests, 3 daemon RPC tests, 11 Swift `ResourceGovernorTests`; P0 tests
+remain. Final full workspace after R2b: **4,554 passed, 0 failed, 6 ignored**;
+clippy exit 0. R2a's final full run was 4,551 passed, 0 failed, 6 ignored; a
+live temp-daemon CLI smoke exercised `run-contract-set`, `resources`, `top-up`,
+and `readiness` end to end.
 
 ## Carried findings from the V1 plan
 
@@ -143,6 +158,10 @@ cargo test -p vp-daemon --bin verlinpadd tests::agent_operator_rpc_tests
 # 3 passed, 0 failed (operator route, read-only snapshots, contract override/top-up RPCs)
 cargo test -p vp-core --lib engine::resources::tests
 # 7 passed, 0 failed (snapshot/readiness/attention/governor/override/top-up)
+cargo test -p vp-core --lib agent::auto_budget_runtime_tests
+# 23 passed, 0 failed (child request-fit, turn pause/resume, no-progress, wall clock)
+cargo test -p vp-core --lib agent::tests
+# 368 passed, 0 failed (agent/daemon-agent integration filter)
 cargo test -p vp-core --lib 'tools::tests'
 # 28 passed, 0 failed (incl. full-hash, scratch env, shell confinement)
 cargo test -p vp-core --lib 'permissions::tests::read_only_git'
@@ -157,16 +176,17 @@ cargo test -p vp-core --lib 'agent::plan::execute::tests'
 # 1 passed, 0 failed (EFFECT_UNKNOWN blocked classification)
 ```
 
-Final full workspace after R2a (2026-11-24, healthy boot):
+Final full workspace after R2b (2026-11-24, healthy boot):
 
 ```bash
 cargo test --workspace
-# 4,551 passed, 0 failed, 6 ignored
+# 4,554 passed, 0 failed, 6 ignored
 cargo clippy --workspace --all-targets -- -D warnings
 # exit 0
 ```
 
-R1's earlier full run was 4,546 passed / 0 failed / 6 ignored.
+R2a's final run was 4,551 passed / 0 failed / 6 ignored; R1's earlier run was
+4,546 passed / 0 failed / 6 ignored.
 
 The earlier full run before P0/R1 also passed every crate except the daemon
 operator test, which was fixed and is covered above. The host XProtect/
@@ -182,7 +202,7 @@ cd apps/macos && xcodegen generate
 xcodebuild -project VerlinPark.xcodeproj -scheme VerlinPark \
   -destination 'platform=macOS,arch=arm64' \
   -only-testing:VerlinParkTests/ResourceGovernorTests test
-# 4 passed, 0 failed
+# 11 passed, 0 failed (top-up decoding/validation, readiness caveats/report)
 xcodebuild -project VerlinPark.xcodeproj -scheme VerlinPark \
   -destination 'platform=macOS,arch=arm64' \
   -only-testing:VerlinParkTests/RuntimeReliabilityTests test

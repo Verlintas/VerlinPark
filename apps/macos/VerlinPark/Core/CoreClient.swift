@@ -1394,6 +1394,38 @@ actor CoreClient {
         .decode(ReadinessSnapshotView.self)
     }
 
+    /// One explicit additive top-up. The daemon clamps to existing hard caps
+    /// and never selects Unlimited. `resume` only asks the daemon to resume a
+    /// paused/failed/cancelled session after the increment; it does not bypass
+    /// approvals, verification, or integration.
+    func topUpSessionResources(
+        sessionID: String,
+        addTokens: UInt64?,
+        addCostUSD: Double?,
+        addTimeSecs: UInt64?,
+        resume: Bool,
+        reason: String? = nil
+    ) async throws -> TopUpSessionResourcesResult {
+        var params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "resume": .bool(resume),
+        ]
+        if let addTokens {
+            params["add_tokens"] = .number(Double(addTokens))
+        }
+        if let addCostUSD {
+            params["add_cost_usd"] = .number(addCostUSD)
+        }
+        if let addTimeSecs {
+            params["add_time_secs"] = .number(Double(addTimeSecs))
+        }
+        if let reason, !reason.isEmpty {
+            params["reason"] = .string(String(reason.prefix(200)))
+        }
+        return try await request(method: "session.resources.top_up", params: params)
+            .decode(TopUpSessionResourcesResult.self)
+    }
+
     func runContract(sessionID: String) async throws -> RunContractView {
         try await request(
             method: "session.run_contract.get",

@@ -1,6 +1,6 @@
 # Run Contract and Resource Governor plan
 
-- Status: Accepted; P0/R1 implemented, R2a implemented (profile override, top-up, pre-dispatch deferral); R2b/R3/R4 open
+- Status: Accepted; P0/R1/R2a implemented, R2b core implemented (turn-boundary pause, Worker/Labour auto request-fit, macOS top-up/readiness); R2b attention batching/project run policy/partial-delivery action and R3/R4 open
 - Date: 2026-11-24
 - Owner: Verlintas
 - Scope: V1 single-project coding
@@ -522,13 +522,28 @@ secrets; no unbounded data.
 Acceptance: override validation/event replay, governor attention/reserve tests,
 fixed top-up clamping, daemon RPC tests, Swift profile tests.
 
-### R2b — Govern (next)
+### R2b — Govern (core implemented; remaining below)
 
-- True turn-boundary pause/wait and reallocation; readiness-aware stop.
-- Attention budget prompt/batching and Auto Budget extension for
-  Worker/Labour requests.
-- Project-level run policy and macOS top-up actions.
-- Partial-delivery operator flow.
+Implemented:
+
+- True turn-boundary pause/wait (`session.resource.paused`) for Leader,
+  Manager, Worker, Labour, Scout; Verifier and trusted internal repair runs are
+  exempt so already-produced work can still be verified/integrated.
+- Auto Budget request-fit for every role; child runs never own cumulative
+  turns/no-progress state.
+- macOS Top Up sheet, capped/resumed truth, readiness caveats, bounded report
+  copy.
+- Readiness-blocked remains a dispatch gate, not a turn pause (avoids
+  deadlocking approval/effect flows in an active run).
+
+Remaining:
+
+- Attention prompt/batching and operator policy change workflow.
+- Project-level run policy.
+- Explicit partial-delivery action and rescue/reallocation.
+- Cost-only/time-only Auto request-fit for Worker/Labour (current request-fit
+  extends tokens; Leader runway owns cost/time).
+- Governor snapshot caching for large worktrees/plans.
 
 ### R3 — Allocate (next)
 
@@ -580,16 +595,18 @@ fixed top-up clamping, daemon RPC tests, Swift profile tests.
 
 ## 20. Immediate implementation slice
 
-This round implements **P0 + R1 + R2a**:
+Implemented **P0 + R1 + R2a + R2b core**:
 
 - tool friction fixes with tests;
 - read-only resource/readiness/contract RPCs and CLI;
-- Swift resource card/models and profile menu;
+- Swift resource card/models, profile menu, Top Up sheet, readiness caveats and
+  bounded report copy;
 - event-backed profile/contract override and bounded top-up;
 - pre-dispatch deferral on attention/risk/completion reserve;
-- ledger/docs updated with the multi-resource model and remaining R2b/R3/R4
-  work.
+- turn-boundary resource pause/resume and Auto Budget request-fit for every
+  role (Leader owns turns/no-progress; children only extend);
+- ledger/docs updated with the multi-resource model.
 
-The next round starts with **R2b**: true turn-boundary pause/wait, attention
-prompt/batching, Auto Budget extension for Worker/Labour, project run policy,
-and macOS top-up/partial-delivery actions.
+Next: attention prompt/batching, project-level run policy, explicit
+partial-delivery action/rescue, cost/time-only child request-fit, governor
+snapshot caching, then R3/R4.

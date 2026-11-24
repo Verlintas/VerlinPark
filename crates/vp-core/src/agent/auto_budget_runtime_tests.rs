@@ -7,7 +7,7 @@
 use super::*;
 use async_trait::async_trait;
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::TempDir;
@@ -1886,4 +1886,321 @@ async fn soak_late_progress_before_the_decision_prevents_a_no_progress_pause() {
     let progress = record.state.progress.expect("persisted progress tracker");
     assert_eq!(progress["last_progress_kind"], "artifact_published");
     assert!(progress["evidence_count"].as_u64().unwrap_or(0) >= 1);
+}
+
+#[test]
+fn resource_governor_decisions_map_to_bounded_turn_pause_reasons() {
+    let decision =
+        |action: &str, reason: &str| crate::engine::resources::ResourceGovernorDecision {
+            session_id: "ses-resource".into(),
+            phase: "turn".into(),
+            action: action.into(),
+            reason: reason.into(),
+            bottleneck: Some("attention".into()),
+            details: serde_json::json!({"states": []}),
+            generated_at: "2026-11-24T00:00:00Z".into(),
+        };
+    assert!(
+        resource_turn_pause_reason(&decision("continue", ""), false).is_none(),
+        "continue never pauses"
+    );
+    assert!(
+        resource_turn_pause_reason(&decision("warn", "soft_resource_limit"), false).is_none(),
+        "warn is advisory and never pauses"
+    );
+    assert_eq!(
+        resource_turn_pause_reason(&decision("defer", "attention_cap"), false).as_deref(),
+        Some("attention_cap")
+    );
+    assert_eq!(
+        resource_turn_pause_reason(&decision("pause", ""), false).as_deref(),
+        Some("resource_pause")
+    );
+    assert_eq!(
+        resource_turn_pause_reason(&decision("stop", "risk_ceiling"), false).as_deref(),
+        Some("risk_ceiling")
+    );
+    // Readiness is the R2a new-work gate; an active run is already under the
+    // approval/effect/merge/Verifier gates and must be able to finish a turn.
+    assert!(resource_turn_pause_reason(&decision("defer", "readiness_blocked"), false).is_none());
+    // Auto budgets extend on demand, so a reserve measured against the hard
+    // cap must not pause a healthy fresh Auto session.
+    assert!(
+        resource_turn_pause_reason(&decision("defer", "completion_reserve_tokens"), true).is_none()
+    );
+    assert_eq!(
+        resource_turn_pause_reason(&decision("defer", "completion_reserve_tokens"), false)
+            .as_deref(),
+        Some("completion_reserve_tokens")
+    );
+    for role in [
+        AgentRole::Leader,
+        AgentRole::Manager,
+        AgentRole::Worker,
+        AgentRole::Labour,
+        AgentRole::Scout,
+    ] {
+        assert!(
+            resource_turn_pause_applies(role, false),
+            "{role:?} must respect a turn-boundary resource block"
+        );
+    }
+    assert!(!resource_turn_pause_applies(AgentRole::Verifier, false));
+    assert!(!resource_turn_pause_applies(AgentRole::Manager, true));
+}
+
+#[tokio::test]
+async fn worker_request_fit_extends_the_auto_budget_without_owning_turns() {
+    let harness = harness(vec![final_turn("worker complete", 40, 8)], 10).await;
+    let session = harness.create_auto(auto_policy(11_000, 100_000)).await;
+    harness
+        .engine
+        .update_session_auto_budget_state(
+            &session.id,
+            SessionAutoBudgetState {
+                elapsed_secs: 5,
+                total_turns: 7,
+                turns_without_progress: 3,
+                last_progress_seq: 11,
+                ..SessionAutoBudgetState::default()
+            },
+        )
+        .await
+        .unwrap();
+    let session_record = harness
+        .engine
+        .store()
+        .get_session(&session.id)
+        .unwrap()
+        .unwrap();
+    let project_record = harness
+        .engine
+        .store()
+        .get_project(&harness.project.id)
+        .unwrap()
+        .unwrap();
+    let config = harness
+        .service
+        .config
+        .read()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .clone();
+    let worktree = PathBuf::from(
+        session_record
+            .worktree
+            .clone()
+            .expect("auto session has a worktree"),
+    );
+    let branch = session_record.branch.clone().unwrap_or_default();
+    let spec = AgentSpec {
+        id: "worker-request-fit".into(),
+        role: AgentRole::Worker,
+        name: "Worker".into(),
+        depth: 1,
+        parent_name: Some("Manager".into()),
+        title: Some("Worker".into()),
+        task_id: None,
+        department: Some("engineering".into()),
+        identity_id: None,
+        identity_generation: None,
+        profile: AgentProfile::Coding,
+        allow_delegation: true,
+        task_kind: Some("coding".into()),
+        auto_approve: false,
+        worktree: worktree.clone(),
+        branch: branch.clone(),
+        session_worktree: worktree.clone(),
+        session_branch: branch,
+        write_scope: Vec::new(),
+        base_commit: session_record.base_commit.clone().unwrap_or_default(),
+
+        workspace_id: None,
+        session_workspace_id: None,
+        parent_workspace_id: None,
+    };
+    let status = harness.engine.session_budget(&session.id).await.unwrap();
+    let mut budget = SessionBudget::new(
+        session_record.token_budget,
+        session_record.tokens_in + session_record.tokens_out,
+        AgentCaps {
+            managers: config.max_managers,
+            workers: config.max_workers,
+            labour: config.max_labour,
+        },
+    )
+    .with_cost(
+        session_record.cost_budget_usd,
+        session_record.cost_spent_usd,
+    )
+    .with_time(session_record.time_budget_secs)
+    .with_unlimited_flag(
+        harness
+            .engine
+            .unlimited_flag(&session_record.id, session_record.unlimited),
+    );
+    budget = budget.with_cumulative_elapsed(
+        status
+            .state
+            .as_ref()
+            .map(|state| state.elapsed_secs)
+            .unwrap_or(0),
+    );
+    budget.apply_status(&status);
+    budget.set_remaining_time(status.remaining_secs);
+    let control = RunControl::new();
+    let mut conversation = vec![ChatMessage::user("worker request fit")];
+    let outcome = run_loop(
+        &harness.engine,
+        &config,
+        &session_record,
+        &project_record,
+        &control,
+        &budget,
+        &spec,
+        "worker request fit",
+        &mut conversation,
+        None,
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, LoopOutcome::Final(_)));
+    assert_eq!(harness.provider.calls(), 1);
+
+    let events = session_events(&harness.engine, &session.id).await;
+    let extension = events
+        .iter()
+        .find(|event| {
+            event.kind == "session.budget.auto_extended" && event.payload["reason"] == "request_fit"
+        })
+        .expect("worker request-fit auto extension");
+    assert!(
+        extension.payload["new"]["token_budget"]
+            .as_u64()
+            .is_some_and(|budget| budget > 11_000),
+        "the worker request must extend the shared effective budget: {extension:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "session.auto_paused"),
+        "a successful request-fit extension must not pause the session"
+    );
+    let record = harness
+        .engine
+        .session_auto_budget(&session.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.state.total_turns, 7,
+        "a child run must not advance Leader-owned turn accounting"
+    );
+    assert_eq!(record.state.turns_without_progress, 3);
+    assert_eq!(record.state.last_progress_seq, 11);
+    assert_eq!(record.state.extensions, 1);
+}
+
+#[tokio::test]
+async fn turn_boundary_resource_block_pauses_and_resumes_the_same_run() {
+    let harness = harness(vec![final_turn("resource pause complete", 10, 2)], 10).await;
+    let session = harness.create_fixed(Some(1_000_000)).await;
+    harness
+        .engine
+        .set_run_contract(vp_protocol::types::SetRunContractParams {
+            session_id: session.id.clone(),
+            profile: vp_protocol::types::RunProfile::Balanced,
+            completion_reserve_ratio: None,
+            attention_cap: Some(1),
+            stop_policy: None,
+            updated_by: None,
+        })
+        .await
+        .unwrap();
+    let (approval, _receiver) = harness
+        .engine
+        .request_approval_with_risk(
+            &session.id,
+            "call-resource-pause",
+            "shell",
+            serde_json::json!({"command": "git status"}),
+            None,
+            Some("host_state"),
+            Some("resource pause test"),
+        )
+        .await
+        .unwrap();
+    assert!(
+        harness
+            .engine
+            .resolve_approval(&approval.id, true)
+            .await
+            .unwrap()
+    );
+
+    harness
+        .service
+        .start(&session.id, "resource pause")
+        .await
+        .unwrap();
+    wait_for_status(&harness.engine, &session.id, &["paused"]).await;
+    let pauses = wait_for_event_count(
+        &harness.engine,
+        &session.id,
+        SESSION_RESOURCE_PAUSED_EVENT,
+        1,
+    )
+    .await;
+    assert_eq!(pauses[0].payload["phase"], "turn");
+    assert_eq!(pauses[0].payload["action"], "defer");
+    assert_eq!(pauses[0].payload["reason"], "attention_cap");
+    assert_eq!(
+        harness.provider.calls(),
+        0,
+        "no provider call may run after a turn-boundary resource block"
+    );
+
+    // A bare resume does not bypass an attention budget that is still at its
+    // cap; the same run pauses again instead of silently spending more.
+    assert!(harness.service.resume(&session.id).await.unwrap());
+    let pauses = wait_for_event_count(
+        &harness.engine,
+        &session.id,
+        SESSION_RESOURCE_PAUSED_EVENT,
+        2,
+    )
+    .await;
+    wait_for_status(&harness.engine, &session.id, &["paused"]).await;
+    assert_eq!(pauses[1].payload["reason"], "attention_cap");
+    assert_eq!(harness.provider.calls(), 0);
+
+    // Raising the operator attention cap releases the block. The same run
+    // continues without a new prompt or a restarted worktree.
+    harness
+        .engine
+        .set_run_contract(vp_protocol::types::SetRunContractParams {
+            session_id: session.id.clone(),
+            profile: vp_protocol::types::RunProfile::Balanced,
+            completion_reserve_ratio: None,
+            attention_cap: Some(100),
+            stop_policy: None,
+            updated_by: None,
+        })
+        .await
+        .unwrap();
+    assert!(harness.service.resume(&session.id).await.unwrap());
+    wait_for_status(&harness.engine, &session.id, &["idle"]).await;
+    assert_eq!(harness.provider.calls(), 1);
+    let events = session_events(&harness.engine, &session.id).await;
+    assert!(
+        events.iter().any(|event| event.kind == "agent.resumed"),
+        "the same run must visibly resume"
+    );
+    assert!(
+        !events.iter().any(|event| event.kind == "agent.cancelled"),
+        "a resource pause must never cancel or discard the run"
+    );
 }

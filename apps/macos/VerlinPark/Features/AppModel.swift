@@ -182,6 +182,10 @@ final class AppModel {
     var sessionResources: ResourceSnapshotView?
     var sessionResourcesError: String?
     var sessionResourcesBusy = false
+    var sessionResourceTopUpBusy = false
+    var sessionResourceTopUpError: String?
+    var sessionResourceTopUpNotice: String?
+    var sessionResourceTopUpResult: TopUpSessionResourcesResult?
     var sessionBudgetBusy = false
     var sessionBudgetError: BudgetValidationIssue?
     var sessionBudgetStatusMessage: String?
@@ -997,6 +1001,10 @@ final class AppModel {
         sessionResources = nil
         sessionResourcesError = nil
         sessionResourcesBusy = false
+        sessionResourceTopUpBusy = false
+        sessionResourceTopUpError = nil
+        sessionResourceTopUpNotice = nil
+        sessionResourceTopUpResult = nil
         sessionCacheStatus = nil
         sessionCacheCalls = []
         sessionCacheCallsTruncated = false
@@ -4655,6 +4663,114 @@ final class AppModel {
                 sessionResourcesError = error.localizedDescription
             }
         }
+    }
+
+    /// Explicit operator top-up. One request, no retries, no automatic
+    /// extension. The daemon result is applied only if the same session is
+    /// still selected, then the budget and resources are reloaded from the
+    /// daemon. Typed validation/RPC text is preserved for the sheet.
+    @discardableResult
+    func topUpSessionResources(
+        sessionID requestedSessionID: String? = nil,
+        addTokens: UInt64?,
+        addCostUSD: Double?,
+        addTimeSecs: UInt64?,
+        resume: Bool,
+        reason: String? = nil
+    ) async -> Bool {
+        guard let sessionID = selectedSessionID else {
+            sessionResourceTopUpError = BudgetValidationIssue(
+                code: "SESSION_REQUIRED",
+                message: "Select a session before topping up its resources."
+            ).displayText
+            return false
+        }
+        if let requestedSessionID, requestedSessionID != sessionID {
+            sessionResourceTopUpError = BudgetValidationIssue(
+                code: "SESSION_CHANGED",
+                message: "The selected session changed; reopen the top-up sheet."
+            ).displayText
+            return false
+        }
+        guard !sessionResourceTopUpBusy else { return false }
+        let request = TopUpSessionResourcesRequest(
+            addTokens: addTokens,
+            addCostUSD: addCostUSD,
+            addTimeSecs: addTimeSecs,
+            resume: resume,
+            reason: reason
+        )
+        if let issue = request.validationIssue {
+            sessionResourceTopUpError = issue.displayText
+            return false
+        }
+        let generation = selectionGeneration
+        sessionResourceTopUpBusy = true
+        sessionResourceTopUpError = nil
+        sessionResourceTopUpNotice = nil
+        sessionResourceTopUpResult = nil
+        defer {
+            if isCurrent(sessionID: sessionID, generation: generation) {
+                sessionResourceTopUpBusy = false
+            }
+        }
+        do {
+            let result = try await core.topUpSessionResources(
+                sessionID: sessionID,
+                addTokens: request.addTokens,
+                addCostUSD: request.addCostUSD,
+                addTimeSecs: request.addTimeSecs,
+                resume: request.resume,
+                reason: request.reason
+            )
+            guard isCurrent(sessionID: sessionID, generation: generation) else {
+                return false
+            }
+            guard result.sessionID == sessionID else {
+                sessionResourceTopUpError = BudgetValidationIssue(
+                    code: "INVALID_TOP_UP_RESPONSE",
+                    message: "The daemon returned a top-up result for a different session; no local state was changed."
+                ).displayText
+                return false
+            }
+            // Apply the daemon-returned state first, then reload both views so
+            // the card never shows a locally guessed budget.
+            sessionResources = result.resources
+            sessionBudgetStatus = result.budget
+            mergeBudgetIntoSessionRows(result.budget)
+            sessionBudgetError = nil
+            sessionBudgetStatusMessage = nil
+            sessionResourceTopUpResult = result
+            sessionResourceTopUpNotice = result.operatorNotice(
+                resumeRequested: request.resume
+            )
+            showToast(
+                result.capped ? "Resources topped up · capped" : "Resources topped up",
+                detail: sessionResourceTopUpNotice ?? "",
+                kind: result.capped ? .warning : .success
+            )
+            await loadSessionBudget(silent: true)
+            await loadSessionResources(silent: true)
+            guard isCurrent(sessionID: sessionID, generation: generation) else {
+                return false
+            }
+            return true
+        } catch {
+            guard isCurrent(sessionID: sessionID, generation: generation) else {
+                return false
+            }
+            let issue = BudgetValidationIssue.from(error)
+            sessionResourceTopUpError = issue.displayText
+            return false
+        }
+    }
+
+    /// Clears the previous top-up result/error when the operator edits a field,
+    /// so stale feedback is not mistaken for the current request.
+    func clearSessionResourceTopUpFeedback() {
+        sessionResourceTopUpError = nil
+        sessionResourceTopUpNotice = nil
+        sessionResourceTopUpResult = nil
     }
 
     private func refreshSessionBudgetSoon() {

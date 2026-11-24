@@ -50,15 +50,27 @@ pre-dispatch deferral，不改变 approval/Verifier/merge 行为：
   `session.resource.decision` 在 dispatch 前因 blocked readiness、attention
   cap 或 completion reserve 不足而 defer 新任务。CLI 增加
   `run-contract-set` / `top-up`，Stage profile 菜单可切换 profile。
-- R2a 仍不暂停 active run、不做 turn-boundary pause/rebalance、不自动批准/
-  merge；Auto Budget 对 Worker/Labour 的扩展、attention 批处理、项目级 run
-  policy 和 macOS top-up sheet 属于 R2b。
-- 测试：R1 的 full workspace 为 **4,546 passed / 0 failed / 6 ignored**；R2a 后
-  最终 full workspace 为 **4,551 passed / 0 failed / 6 ignored**，
-  `cargo clippy --workspace --all-targets -- -D warnings` 通过；R2a 新增
-  core resource/governor/override/top-up 7 tests、daemon RPC 3 tests、Swift
-  4 tests，另有 live temp-daemon CLI smoke。宿主机 `syspolicyd`/XProtect spin
-  已单独调查并记录在 `HOST_SYSPOLICYD_INVESTIGATION.md`，不是仓库 bug。
+- R2a 本身不暂停 active run、不做 rebalance、不自动批准/merge；Auto Budget
+  对 Worker/Labour 的扩展、attention 批处理、项目级 run policy 和 macOS
+  top-up sheet 属于 R2b。
+- R2b core：turn-boundary `session.resource.paused`，Leader/Manager/Worker/
+  Labour/Scout 在 attention/risk/固定预算 reserve 阻断时暂停同一 run，等待
+  operator resume/top-up；裸 resume 若 cap 未变会再次暂停，不静默放行。
+  Verifier 与 trusted internal repair 豁免，保证已产生的 commit 仍可验证/
+  合并；`readiness_blocked` 仍是 dispatch gate，不在 turn 暂停（否则会卡住
+  审批/effect 流程）。Auto Budget request-fit 现在也覆盖 Worker/Labour/
+  Verifier；只有 top-level Leader 拥有 cumulative turns/no-progress。
+- R2b macOS：Stage Top Up sheet（tokens/cost/time + resume、capped/resumed
+  真实状态）、readiness caveats/remaining work/blockers、bounded report 复制；
+  UI 不发明 cap、resume 或 merge 结论。R2b 仍未做 attention batching/prompt、
+  项目级 run policy、显式 partial-delivery action/rescue、cost/time-only child
+  request-fit 和 governor 快照缓存。
+- 测试：R1 full workspace **4,546**；R2a 后 **4,551**；R2b targeted 23
+  auto-budget + 368 agent + 7 resource + 3 daemon RPC + 11 Swift tests 均通过；
+  R2b 后最终 full workspace **4,554 passed / 0 failed / 6 ignored**，
+  `cargo clippy --workspace --all-targets -- -D warnings` 通过。宿主机
+  `syspolicyd`/XProtect spin 已单独调查并记录在
+  `HOST_SYSPOLICYD_INVESTIGATION.md`，不是仓库 bug。
 
 ## 2026-11-23 真实 DeepSeek + GUI 验证与 two hardenings
 

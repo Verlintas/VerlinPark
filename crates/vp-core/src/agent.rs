@@ -1026,6 +1026,119 @@ async fn wait_for_task_resume(
     }
 }
 
+/// Event kind for a turn-boundary pause requested by the deterministic
+/// resource governor. This is distinct from `session.auto_paused`, which means
+/// the auto-budget controller itself paused the run.
+pub(in crate::agent) const SESSION_RESOURCE_PAUSED_EVENT: &str = "session.resource.paused";
+
+/// Map a governor decision to a bounded pause reason at a safe turn boundary.
+/// Only block actions (`defer`, `pause`, `stop`) pause; `continue` and `warn`
+/// never do.
+pub(in crate::agent) fn resource_turn_pause_reason(
+    decision: &crate::engine::resources::ResourceGovernorDecision,
+    auto_budget_active: bool,
+) -> Option<String> {
+    if !decision.should_block() {
+        return None;
+    }
+    // Readiness is the R2a new-work dispatch gate. An active run is already
+    // subject to approval, effect, merge, Verifier, and land gates; pausing it
+    // on readiness would deadlock normal approval flow and mutating MCP
+    // receipts that the current run must be allowed to finish. New plan work
+    // still defers through `resource_governor_decision(.., "dispatch")`.
+    if decision.reason == "readiness_blocked" {
+        return None;
+    }
+    // An Auto policy measures its completion reserve against the hard cap,
+    // which is normally far above the current effective allowance. Applying
+    // that reserve at every turn would pause a healthy fresh Auto session, so
+    // the Auto controller's own runway protection owns that dimension. Fixed
+    // budgets keep the full reserve gate.
+    if auto_budget_active && decision.reason.starts_with("completion_reserve_") {
+        return None;
+    }
+    let reason = decision.reason.trim();
+    if reason.is_empty() {
+        Some(format!("resource_{}", decision.action))
+    } else {
+        Some(reason.chars().take(160).collect())
+    }
+}
+
+/// Verification and trusted internal repair runs protect already-produced work
+/// (the completion reserve) and keep running so a blocked session can still
+/// become mergeable. Everything that starts new work respects the turn-boundary
+/// resource block.
+pub(in crate::agent) fn resource_turn_pause_applies(role: AgentRole, auto_approve: bool) -> bool {
+    !auto_approve && !matches!(role, AgentRole::Verifier)
+}
+
+/// R2b true turn-boundary resource pause. Every user-work role observes the
+/// same deterministic session decision before a provider request. A block
+/// preserves the worktree/commit and waits for an explicit operator
+/// resume/top-up; it never runs a provider or tool call while paused. Returns
+/// `false` when the run was cancelled or preempted instead of resumed.
+pub(in crate::agent) async fn pause_for_resource_block(
+    engine: &Engine,
+    session: &Session,
+    spec: &AgentSpec,
+    control: &RunControl,
+    budget: &SessionBudget,
+    auto_budget_active: bool,
+) -> Result<bool> {
+    loop {
+        if control.is_cancelled() || control.is_preempted() {
+            return Ok(false);
+        }
+        let decision = engine
+            .resource_governor_decision(&session.id, "turn")
+            .await?;
+        let Some(reason) = resource_turn_pause_reason(&decision, auto_budget_active) else {
+            return Ok(true);
+        };
+        engine.record_resource_decision(&decision).await?;
+        engine
+            .append_event(
+                &session.id,
+                SESSION_RESOURCE_PAUSED_EVENT,
+                json!({
+                    "schema": "verlinpark.resource_pause/v1",
+                    "phase": "turn",
+                    "action": decision.action,
+                    "reason": reason,
+                    "bottleneck": decision.bottleneck,
+                    "generated_at": decision.generated_at,
+                    "role": spec.role.as_str(),
+                    "agent_id": spec.id,
+                    "task_id": spec.task_id,
+                    "details": decision.details,
+                }),
+            )
+            .await?;
+        control.pause();
+        // Operator decision time must not consume the wall-clock budget or
+        // race a preemption timer armed before the pause.
+        if !budget.is_clock_paused() {
+            budget.pause_clock();
+        }
+        control.arm_preemption_deadline(None, control.preemption_policy());
+        engine.update_session_status(&session.id, "paused").await?;
+        let resumed = wait_for_task_resume(engine, &session.id, spec, control).await?;
+        budget.resume_clock();
+        control.arm_preemption_deadline(budget.wall_clock_deadline(), control.preemption_policy());
+        if !resumed {
+            return Ok(false);
+        }
+        // Repair the pause/resume status race: an operator resume can land
+        // between `control.pause()` and the status write above.
+        engine.update_session_status(&session.id, "running").await?;
+        // Re-evaluate before the provider call. A resume without a resource
+        // change (no top-up, unchanged attention cap) must not bypass the
+        // block; a real resource change releases it. This loop is operator
+        // driven and never spins on its own.
+    }
+}
+
 async fn wait_for_cancel(control: &RunControl) {
     if control.is_cancelled() || control.is_preempted() {
         return;
@@ -2257,6 +2370,10 @@ pub(in crate::agent) struct AutoBudgetRuntime {
     /// One warning per threshold crossing. Cleared when the ratios recover or
     /// an auto extension succeeds.
     warned_low: bool,
+    /// Only the top-level Leader run owns cumulative turns and the no-progress
+    /// tracker. Worker/Labour/Verifier runtimes may extend the shared budget at
+    /// a request boundary, but they never advance or persist those fields.
+    owns_turns: bool,
 }
 
 impl AutoBudgetRuntime {
@@ -2278,6 +2395,7 @@ impl AutoBudgetRuntime {
             tracker,
             active: true,
             warned_low: false,
+            owns_turns: true,
         })
     }
 
@@ -2392,11 +2510,25 @@ impl AutoBudgetRuntime {
         Ok(())
     }
 
-    /// Apply the persisted state at run start without appending a lifecycle
-    /// event. Returns the runtime only when the session is explicitly auto.
-    pub(in crate::agent) async fn load(engine: &Engine, session: &Session) -> Result<Option<Self>> {
+    /// Load an Auto runtime for any role. `owns_turns` is true only for the
+    /// top-level Leader run; every other role gets request-fit extension
+    /// without the cumulative turn/no-progress state machine.
+    pub(in crate::agent) async fn load_for(
+        engine: &Engine,
+        session: &Session,
+        owns_turns: bool,
+    ) -> Result<Option<Self>> {
         let status = engine.session_budget(&session.id).await?;
-        Ok(Self::from_status(session, &status))
+        Ok(Self::from_status(session, &status).map(|mut runtime| {
+            runtime.owns_turns = owns_turns;
+            runtime
+        }))
+    }
+
+    /// True while the session is still in an auto budget mode. A stale runtime
+    /// becomes inactive when an operator switches to fixed/unlimited.
+    pub(in crate::agent) fn is_active(&self) -> bool {
+        self.active
     }
 
     fn pause_details(
@@ -2456,8 +2588,13 @@ impl AutoBudgetRuntime {
         if !resumed {
             return Ok(false);
         }
-        self.clear_paused_after_operator_resume(engine, &session.id)
-            .await?;
+        if self.owns_turns {
+            self.clear_paused_after_operator_resume(engine, &session.id)
+                .await?;
+        } else {
+            self.clear_shared_pause_marker(engine, &session.id, reason)
+                .await?;
+        }
         Ok(true)
     }
 
@@ -2477,28 +2614,83 @@ impl AutoBudgetRuntime {
         let now = vp_protocol::now_rfc3339();
         self.state.paused_reason = Some(reason.to_string());
         self.state.paused_at = Some(now.clone());
-        self.state.elapsed_secs = budget.elapsed_secs();
+        self.state.elapsed_secs = self.state.elapsed_secs.max(budget.elapsed_secs());
         if let Some(status) = status {
             self.state.last_forecast = Some(status.forecast.clone());
         }
-        self.sync_state_from_tracker();
         control.pause();
         engine.update_session_status(&session.id, "paused").await?;
+        // A non-owner runtime (Worker/Labour/Verifier) must never write its
+        // run-start copy of the Leader-owned turn/no-progress state over newer
+        // persisted state. Merge only the session-wide pause marker into the
+        // newest row; the Leader runtime keeps its full authoritative write.
+        let persisted = if self.owns_turns {
+            self.sync_state_from_tracker();
+            self.state.clone()
+        } else {
+            let current = engine.session_budget(&session.id).await?;
+            let mut state = current.state.clone().unwrap_or_default();
+            state.paused_reason = Some(reason.to_string());
+            state.paused_at = Some(now.clone());
+            state.elapsed_secs = state.elapsed_secs.max(budget.elapsed_secs());
+            if let Some(status) = status {
+                state.last_forecast = Some(status.forecast.clone());
+            }
+            state
+        };
+        self.state.paused_reason = persisted.paused_reason.clone();
+        self.state.paused_at = persisted.paused_at.clone();
         let mut payload = Self::pause_details(status, details);
         if let Some(object) = payload.as_object_mut() {
             object.insert("reason".into(), json!(reason));
             object.insert("session_id".into(), json!(session.id));
             object.insert("paused_at".into(), json!(now));
-            object.insert("total_turns".into(), json!(self.state.total_turns));
-            object.insert("elapsed_secs".into(), json!(self.state.elapsed_secs));
-            object.insert("extensions".into(), json!(self.state.extensions));
+            object.insert("total_turns".into(), json!(persisted.total_turns));
+            object.insert("elapsed_secs".into(), json!(persisted.elapsed_secs));
+            object.insert("extensions".into(), json!(persisted.extensions));
         }
         engine
             .update_session_auto_budget_state_with_event(
                 &session.id,
-                self.state.clone(),
+                persisted,
                 SESSION_AUTO_PAUSED_EVENT,
                 payload,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Best-effort clear of a pause marker written by a non-owner runtime after
+    /// the shared run resumes. It never resets the Leader's progress tracker and
+    /// only clears the marker when it still matches this runtime's reason.
+    async fn clear_shared_pause_marker(
+        &mut self,
+        engine: &Engine,
+        session_id: &str,
+        reason: &str,
+    ) -> Result<()> {
+        self.state.paused_reason = None;
+        self.state.paused_at = None;
+        let status = engine.session_budget(session_id).await?;
+        let Some(mut state) = status.state.clone() else {
+            return Ok(());
+        };
+        if state.paused_reason.as_deref() != Some(reason) {
+            return Ok(());
+        }
+        state.paused_reason = None;
+        state.paused_at = None;
+        engine
+            .update_session_auto_budget_state_with_event(
+                session_id,
+                state,
+                SESSION_AUTO_RESUMED_EVENT,
+                json!({
+                    "schema": "verlinpark.auto_resume/v1",
+                    "reason": reason,
+                    "operator_reset": false,
+                    "source": "shared_request_fit",
+                }),
             )
             .await?;
         Ok(())
@@ -2544,6 +2736,13 @@ impl AutoBudgetRuntime {
         control: &RunControl,
         budget: &SessionBudget,
     ) -> Result<bool> {
+        // Worker/Labour/Verifier runtimes never own cumulative turns or the
+        // no-progress tracker; their provider calls use `ensure_request_fits`
+        // only. This guard keeps a future call site from accidentally making a
+        // child run advance Leader state.
+        if !self.owns_turns {
+            return Ok(true);
+        }
         loop {
             if control.is_cancelled() || control.is_preempted() {
                 return Ok(false);
@@ -2711,7 +2910,13 @@ impl AutoBudgetRuntime {
             let Some(remaining) = status.remaining_tokens else {
                 return Ok(true);
             };
-            if remaining >= needed {
+            // Other agents in the same plan run hold reservations against the
+            // shared SessionBudget. The store reports spend only, so subtract
+            // live reservations here; otherwise parallel Workers can each see
+            // the same headroom and one of them fails the later reservation.
+            let reserved = budget.reserved_tokens();
+            let available = remaining.saturating_sub(reserved);
+            if available >= needed {
                 return Ok(true);
             }
             let Some(hard_cap) = status.hard_token_cap else {
@@ -2722,6 +2927,7 @@ impl AutoBudgetRuntime {
                     "missing": ["tokens"],
                     "request_estimate": needed,
                     "remaining_tokens": remaining,
+                    "reserved_tokens": reserved,
                     "extensions": self.state.extensions,
                 });
                 if !self
@@ -2742,7 +2948,7 @@ impl AutoBudgetRuntime {
                 continue;
             };
             let request = AutoBudgetExtension {
-                requested_token_extension: Some(needed.saturating_sub(remaining)),
+                requested_token_extension: Some(needed.saturating_sub(available)),
                 reason: Some("request_fit".to_string()),
                 forecast: Some(status.forecast.clone()),
                 ..AutoBudgetExtension::default()
@@ -2756,9 +2962,10 @@ impl AutoBudgetRuntime {
                 .arm_preemption_deadline(budget.wall_clock_deadline(), control.preemption_policy());
             if result.extended {
                 self.warned_low = false;
+                let committed = budget.spent().saturating_add(budget.reserved_tokens());
                 if result
                     .new_token_budget
-                    .is_some_and(|new_budget| new_budget >= needed.saturating_add(budget.spent()))
+                    .is_some_and(|new_budget| new_budget >= needed.saturating_add(committed))
                 {
                     return Ok(true);
                 }
@@ -2804,7 +3011,7 @@ impl AutoBudgetRuntime {
         turn: u32,
         allow_pause: bool,
     ) -> Result<bool> {
-        if !self.active {
+        if !self.active || !self.owns_turns {
             return Ok(true);
         }
         self.state.total_turns = self.state.total_turns.max(turn);

@@ -552,17 +552,20 @@ pub(in crate::agent) async fn run_loop_body(
         std::collections::BTreeSet::new();
     let mut tool_bundle_revision = 0u32;
     let mut active_bundle_hash = frozen_bundle.bundle_hash.clone();
-    // Only the top-level Leader owns the session auto-budget/turn/no-progress
-    // state. Parallel Workers/Labour/Verifier runs never mutate it.
-    let mut auto_budget = if top_level && spec.role == AgentRole::Leader {
-        AutoBudgetRuntime::load(engine, session).await?
+    // Every role in an Auto session gets a runtime so a Worker/Labour/Verifier
+    // request can extend the shared budget before a token reservation. Only
+    // the top-level Leader owns cumulative turns and the no-progress tracker;
+    // child runtimes are request-fit only.
+    let owns_turns = top_level && spec.role == AgentRole::Leader;
+    let mut auto_budget = AutoBudgetRuntime::load_for(engine, session, owns_turns).await?;
+    let max_turns = if owns_turns {
+        auto_budget
+            .as_ref()
+            .map(AutoBudgetRuntime::per_run_turn_limit)
+            .unwrap_or(config.max_turns)
     } else {
-        None
+        config.max_turns
     };
-    let max_turns = auto_budget
-        .as_ref()
-        .map(AutoBudgetRuntime::per_run_turn_limit)
-        .unwrap_or(config.max_turns);
 
     for turn in 0..max_turns {
         // A long plan can outlive the assignment/workspace lease taken when
@@ -614,18 +617,20 @@ pub(in crate::agent) async fn run_loop_body(
         if control.is_cancelled() {
             return Ok(LoopOutcome::Cancelled);
         }
-        // Auto budget is evaluated before every top-level Leader provider call.
-        // It may extend a low-runway budget, or pause at the hard cap and wait
-        // for an explicit operator resume/top-up. Fixed/unlimited sessions and
-        // scoped child runs skip this entirely.
-        if let Some(runtime) = auto_budget.as_mut()
+        // Auto budget turn accounting and no-progress decisions belong to the
+        // top-level Leader only. Child roles use `ensure_request_fits` below.
+        if owns_turns
+            && let Some(runtime) = auto_budget.as_mut()
             && !runtime
                 .before_turn(engine, session, spec, control, budget)
                 .await?
         {
             return Ok(LoopOutcome::Cancelled);
         }
-        if budget.exhausted() {
+        // Child Auto runs may be at the session limit because another agent
+        // spent the shared budget. Let the request-fit path extend or pause
+        // before the provider call instead of failing the run here.
+        if auto_budget.is_none() && budget.exhausted() {
             return Ok(LoopOutcome::BudgetExceeded(BudgetStop::session(budget)));
         }
         if auto_budget.is_none()
@@ -935,7 +940,9 @@ pub(in crate::agent) async fn run_loop_body(
             if control.is_cancelled() {
                 return Ok(LoopOutcome::Cancelled);
             }
-            if budget.exhausted() {
+            // Auto sessions are extended or paused by the request-fit path
+            // below, including child roles that do not own turn accounting.
+            if auto_budget.is_none() && budget.exhausted() {
                 return Ok(LoopOutcome::BudgetExceeded(BudgetStop::session(budget)));
             }
             let context_window = context_window_for(config, spec.role);
@@ -1022,6 +1029,26 @@ pub(in crate::agent) async fn run_loop_body(
         {
             return Ok(LoopOutcome::Cancelled);
         }
+        // R2b: after the Auto request-fit check, every role that starts new
+        // work re-checks the deterministic resource governor. A block pauses
+        // the shared run before any provider/tool intent and preserves the
+        // worktree/commit. Verifier and internal repair runs keep going so
+        // already-produced work can still become mergeable.
+        if resource_turn_pause_applies(spec.role, spec.auto_approve)
+            && !pause_for_resource_block(
+                engine,
+                session,
+                spec,
+                control,
+                budget,
+                auto_budget
+                    .as_ref()
+                    .is_some_and(AutoBudgetRuntime::is_active),
+            )
+            .await?
+        {
+            return Ok(LoopOutcome::Cancelled);
+        }
         let prices = role_prices(config, spec.role);
         let (input_price, output_price) = (prices.input, prices.output);
         let scope_spent = if plan_budget.active() && !budget.is_unlimited() {
@@ -1063,7 +1090,30 @@ pub(in crate::agent) async fn run_loop_body(
             warned_project = true;
         }
         let mut desired_output = if !budget.is_unlimited() && budget.token_limit().is_some() {
-            let remaining = budget.available_tokens().unwrap_or(0);
+            let mut remaining = budget.available_tokens().unwrap_or(0);
+            if remaining <= input_estimate.saturating_add(MIN_OUTPUT_TOKENS)
+                && let Some(runtime) = auto_budget.as_mut()
+            {
+                // Parallel Workers can reserve headroom between the earlier
+                // request-fit check and this reservation. Re-run the same
+                // extension path instead of failing a child run on a transient
+                // shortage; a real hard-cap shortage pauses here.
+                if !runtime
+                    .ensure_request_fits(
+                        engine,
+                        session,
+                        spec,
+                        control,
+                        budget,
+                        input_estimate,
+                        MIN_OUTPUT_TOKENS,
+                    )
+                    .await?
+                {
+                    return Ok(LoopOutcome::Cancelled);
+                }
+                remaining = budget.available_tokens().unwrap_or(0);
+            }
             if remaining <= input_estimate.saturating_add(MIN_OUTPUT_TOKENS) {
                 return Ok(LoopOutcome::BudgetExceeded(BudgetStop::session_tokens(
                     budget,
@@ -1684,7 +1734,7 @@ pub(in crate::agent) async fn run_loop_body(
                 serde_json::json!({"turn": turn + 1}),
             )
             .await?;
-            if let Some(runtime) = auto_budget.as_mut() {
+            if owns_turns && let Some(runtime) = auto_budget.as_mut() {
                 let current_turn = runtime.current_turn();
                 if !runtime
                     .finish_turn(engine, session, spec, control, budget, current_turn, false)
@@ -2069,7 +2119,7 @@ pub(in crate::agent) async fn run_loop_body(
                     serde_json::json!({"turn": turn + 1, "parallel": true}),
                 )
                 .await?;
-                if let Some(runtime) = auto_budget.as_mut() {
+                if owns_turns && let Some(runtime) = auto_budget.as_mut() {
                     let current_turn = runtime.current_turn();
                     if !runtime
                         .finish_turn(engine, session, spec, control, budget, current_turn, true)
@@ -2118,7 +2168,7 @@ pub(in crate::agent) async fn run_loop_body(
         {
             return Ok(outcome);
         }
-        if let Some(runtime) = auto_budget.as_mut() {
+        if owns_turns && let Some(runtime) = auto_budget.as_mut() {
             let current_turn = runtime.current_turn();
             if !runtime
                 .finish_turn(engine, session, spec, control, budget, current_turn, true)
