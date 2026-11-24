@@ -114,6 +114,38 @@ impl Engine {
             .await?
             .tasks;
         let approvals = self.list_approvals(Some(session_id.to_string())).await?;
+        // Test evidence is supplementary: a test-cache read failure must not
+        // fail readiness. Only `kind=test` counts; lint/check entries are not
+        // tests. Expired cache rows still prove that the run happened.
+        let latest_test_result = {
+            let store = self.store.clone();
+            let project_id = session.project_id.clone();
+            let session_id = session_id.to_string();
+            let now = vp_protocol::now_rfc3339();
+            tokio::task::spawn_blocking(move || {
+                store.list_test_results(
+                    &project_id,
+                    Some(&session_id),
+                    Some("test"),
+                    None,
+                    true,
+                    1,
+                    &now,
+                )
+            })
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .and_then(|rows| rows.into_iter().next())
+        };
+        let (latest_test, latest_test_passed) = match latest_test_result {
+            Some(entry) => {
+                let passed = entry.status == "passed";
+                let label = format!("{} {} · {}", entry.kind, entry.status, entry.created_at);
+                (Some(label.chars().take(200).collect()), Some(passed))
+            }
+            None => (None, None),
+        };
 
         let base_commit = session.base_commit.clone().unwrap_or_default();
         let (head, status) = match session.worktree.as_deref() {
@@ -218,7 +250,8 @@ impl Engine {
             shippable: matches!(level, "verified" | "merged") && blockers.is_empty(),
             mergeable: matches!(level, "verified" | "merged") && blockers.is_empty(),
             latest_commit,
-            latest_test: None,
+            latest_test,
+            latest_test_passed,
             verifier,
             merge,
             changed_paths,
@@ -368,7 +401,7 @@ impl Engine {
             .to_string(),
             source: "task queue/Verifier/Integrator".to_string(),
             note: Some(format!(
-                "{completed_tasks}/{total_tasks} tasks completed; {merged} merge(s); test evidence is not inferred in R1"
+                "{completed_tasks}/{total_tasks} tasks completed; {merged} merge(s); test evidence comes from the test cache when available, never from prose"
             )),
         });
         dimensions.push(ResourceDimension {
@@ -1528,6 +1561,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn readiness_reports_latest_test_evidence_and_tradeoffs_use_it() {
+        let (_data, _repo, engine, session) = fixture().await;
+        let session = engine.ensure_session_worktree(&session.id).await.unwrap();
+        let now = vp_protocol::now_rfc3339();
+        let entry = vp_protocol::test_cache::TestCacheEntry {
+            id: "tr-1".into(),
+            project_id: session.project_id.clone(),
+            session_id: session.id.clone(),
+            kind: "test".into(),
+            command: "cargo test".into(),
+            command_source: "project".into(),
+            key_version: 1,
+            cache_key: "key-1".into(),
+            inputs_hash: "inputs".into(),
+            impact_generation: "gen-1".into(),
+            status: "passed".into(),
+            exit_code: 0,
+            duration_ms: 10,
+            output_ref: None,
+            output_bytes: 0,
+            covered_paths: Vec::new(),
+            warnings: Vec::new(),
+            warning_count: 0,
+            failure_count: 0,
+            created_at: now,
+            expires_at: "2099-01-01T00:00:00Z".into(),
+            hit_count: 0,
+            last_hit_at: None,
+        };
+        engine
+            .store()
+            .replace_test_results(&session.id, &[entry])
+            .unwrap();
+
+        let readiness = engine.session_readiness(&session.id).await.unwrap();
+        assert_eq!(readiness.latest_test_passed, Some(true), "{readiness:?}");
+        assert!(
+            readiness
+                .latest_test
+                .as_deref()
+                .is_some_and(|test| test.contains("test passed")),
+            "{readiness:?}"
+        );
+
+        let tradeoffs = engine
+            .session_tradeoffs(vp_protocol::types::SessionTradeoffsParams {
+                session_id: session.id.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            tradeoffs
+                .quality
+                .reasons
+                .contains(&"tests_passed".to_string()),
+            "{:?}",
+            tradeoffs.quality.reasons
+        );
+        assert!(
+            tradeoffs
+                .confidence
+                .reasons
+                .contains(&"passing test evidence".to_string()),
+            "{:?}",
+            tradeoffs.confidence.reasons
+        );
+    }
+
+    #[tokio::test]
     async fn run_contract_override_is_event_backed_and_bounded() {
         let (_data, _repo, engine, session) = fixture().await;
         let before = engine
@@ -2099,6 +2201,7 @@ mod tests {
             mergeable: false,
             latest_commit: Some("abc123".into()),
             latest_test: None,
+            latest_test_passed: None,
             verifier: None,
             merge: None,
             changed_paths: Vec::new(),

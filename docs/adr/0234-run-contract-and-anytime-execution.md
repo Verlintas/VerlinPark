@@ -194,21 +194,31 @@ The first R3/R4 slice is deliberately read-only and advisory:
   attention/trust calibration. Estimate precedence is session actuals, plan
   task envelope, project department actuals (nearest-rank p50/p90), department
   envelope, then an explicit unknown prior. Unknown estimates are not zero: a
-  path with no estimate reports `insufficient_estimate`, and an unestimated task
-  is not reported as feasible.
+  path with no estimate reports `insufficient_estimate`, a partly estimated path
+  reports `partial_estimate`, and an unestimated task is not reported as
+  feasible. Critical-path failure is reported instead of silently labeling the
+  all-task fallback as the path; token/cost/time reserve pressure is exposed as
+  bounded dimensions.
 - `session.tradeoffs` / `vp tradeoffs` compares the five documented profile
-  postures, reports a bounded quality/reviewability review and an explicitly
-  heuristic confidence score, and marks a different profile recommended only
-  from deterministic evidence (quality for risk/blockers/blocked effects, cost
-  under completion-reserve pressure). It never switches a profile.
+  postures, reports the active contract reserve and its source separately from
+  the documented per-profile posture, reports a bounded quality/reviewability
+  review and an explicitly heuristic confidence score, and marks a different
+  profile recommended only from deterministic evidence (quality for
+  risk/blockers/blocked effects, cost under token/cost/time completion-reserve
+  pressure). Test evidence comes from the test cache with a pass/fail flag;
+  queued or conflicting merge entries are not labeled merged and do not add
+  merge confidence. It never switches a profile.
 - `ProjectRunPolicy.auto_rescue` (default off) permits at most one automatic
   completion-reserve grant per session at a turn boundary when the pause is
   exactly `completion_reserve_*`, the session is fixed-budget and eligible
-  (near-completion readiness, latest commit, no no-progress turns, headroom, and
-  no prior grant). Concurrent boundaries are serialized in-process; a manual
-  grant also consumes the one-shot allowance. The grant releases only the
+  (near-completion readiness, latest commit, no no-progress turns, token/cost
+  headroom, and no prior grant). Manual/automatic grants and consumption share
+  one in-process lock; a manual grant consumes the automatic allowance, and a
+  grant receipt is persisted at most once. The grant releases only the
   completion reserve for its normal TTL and never raises a hard cap or bypasses
-  approvals, contracts, the sandbox, the Verifier, or the Integrator.
+  approvals, contracts, the sandbox, the Verifier, or the Integrator. A failure
+  to persist the one-shot consumption receipt fails closed and stops the turn
+  rather than leaving the reserve released.
 - Both preview RPCs append no events and mutate nothing. The macOS cards load
   only when visible or explicitly refreshed and reject a response for a
   different session.

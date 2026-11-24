@@ -279,13 +279,12 @@ pub struct Engine {
     /// Bounded, in-process readiness cache for explicit resource/readiness
     /// views. It is never used by the lean turn governor.
     readiness_cache: Arc<Mutex<HashMap<String, CachedReadiness>>>,
-    /// Serializes the automatic rescue count/append sequence. Eligibility reads
-    /// run before the lock because readiness can be slow; the turn loop can run
-    /// concurrently for several roles, and without this lock two children could
-    /// both observe zero prior grants and append two automatic grants,
-    /// violating the one-shot cap. Manual `session.rescue` stays outside this
-    /// lock.
-    auto_rescue_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes rescue grant/consume check-and-append sequences across
+    /// manual and automatic paths. Eligibility reads run before the automatic
+    /// lock because readiness can be slow; without this lock concurrent turn
+    /// boundaries could observe zero prior grants and append two automatic
+    /// grants, or consume the same grant twice.
+    rescue_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// In-process serialization for workspace-bound Worker runs. Cross-session
@@ -362,7 +361,7 @@ impl Engine {
             pin_sync: Arc::new(tokio::sync::Mutex::new(())),
             workspace_runs: Arc::new(WorkspaceRunLocks::default()),
             readiness_cache: Arc::new(Mutex::new(HashMap::new())),
-            auto_rescue_lock: Arc::new(tokio::sync::Mutex::new(())),
+            rescue_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 

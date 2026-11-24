@@ -123,6 +123,11 @@ impl ProjectActuals {
             .map(|task| task.cost_usd)
             .filter(|cost| cost.is_finite() && *cost > 0.0)
             .collect::<Vec<_>>();
+        if tokens.is_empty() && costs.is_empty() {
+            // A zero-token/zero-cost ledger row is not a usable historical
+            // estimate; fall through to the department envelope instead.
+            return None;
+        }
         tokens.sort_unstable();
         costs.sort_by(f64::total_cmp);
         let observed_calls = tasks
@@ -213,8 +218,9 @@ impl Engine {
         let task_truncated = raw_task_count > MAX_ALLOCATION_TASKS;
         tasks.truncate(MAX_ALLOCATION_TASKS);
 
-        let (critical_path_ids, path_available) =
+        let (critical_path_ids, critical_path_error) =
             critical_path_tasks(&session, plan.as_ref(), &statuses, budget.remaining_tokens);
+        let path_available = critical_path_error.is_none();
         let focus_ids = allocation_focus_ids(
             plan.as_ref(),
             &queue,
@@ -225,7 +231,7 @@ impl Engine {
         for task in &mut tasks {
             task.critical_path = critical_path_ids.contains(&task.task_id);
         }
-        let feasibility = allocation_feasibility(
+        let mut feasibility = allocation_feasibility(
             &budget,
             &contract,
             &usage,
@@ -233,6 +239,8 @@ impl Engine {
             &focus_ids,
             &critical_path_ids,
         );
+        feasibility.critical_path_available = path_available;
+        feasibility.critical_path_reason = critical_path_error;
 
         let mut recommendations = allocation_recommendations(
             &budget,
@@ -397,14 +405,16 @@ fn estimate_task(
         let tokens = bucket.input_tokens.saturating_add(bucket.output_tokens);
         let cost =
             (bucket.cost_usd.is_finite() && bucket.cost_usd > 0.0).then_some(bucket.cost_usd);
-        return TaskEstimate {
-            p50_tokens: Some(tokens),
-            p90_tokens: Some(tokens),
-            p50_cost_usd: cost,
-            p90_cost_usd: cost,
-            observed_calls: bucket.calls.min(u32::MAX as u64) as u32,
-            source: Some(EstimateSource::SessionActuals),
-        };
+        if tokens > 0 || cost.is_some() {
+            return TaskEstimate {
+                p50_tokens: Some(tokens),
+                p90_tokens: Some(tokens),
+                p50_cost_usd: cost,
+                p90_cost_usd: cost,
+                observed_calls: bucket.calls.min(u32::MAX as u64) as u32,
+                source: Some(EstimateSource::SessionActuals),
+            };
+        }
     }
     if row.token_budget.is_some() || row.cost_budget_usd.is_some() {
         let tokens = row.token_budget.filter(|tokens| *tokens > 0);
@@ -453,17 +463,52 @@ fn allocation_task(
 ) -> AllocationTask {
     let terminal = crate::critical_path::is_terminal_status(&row.status);
     let ready = allocation_task_ready(&row.status, &row.deps, statuses);
+    let token_limit = row.token_budget.or(budget.remaining_tokens);
+    let cost_limit = row.cost_budget_usd.or(budget.remaining_cost_usd);
+    let token_fit = estimate
+        .p90_tokens
+        .map(|p90| token_limit.is_none_or(|limit| p90 <= limit));
+    let cost_fit = estimate
+        .p90_cost_usd
+        .filter(|value| value.is_finite())
+        .map(|p90| cost_limit.is_none_or(|limit| p90 <= limit));
     let (feasible, reason) = if terminal {
         (true, "terminal".to_string())
-    } else {
-        match (estimate.p90_tokens, budget.remaining_tokens) {
-            (Some(p90), Some(remaining)) if p90 > remaining => {
-                (false, "exceeds_remaining_tokens".to_string())
+    } else if token_fit == Some(false) {
+        let reason = if row
+            .token_budget
+            .is_some_and(|limit| estimate.p90_tokens.is_some_and(|p90| p90 > limit))
+        {
+            "exceeds_task_tokens"
+        } else {
+            "exceeds_remaining_tokens"
+        };
+        (false, reason.to_string())
+    } else if cost_fit == Some(false) {
+        let reason = if row
+            .cost_budget_usd
+            .is_some_and(|limit| estimate.p90_cost_usd.is_some_and(|p90| p90 > limit))
+        {
+            "exceeds_task_cost"
+        } else {
+            "exceeds_remaining_cost"
+        };
+        (false, reason.to_string())
+    } else if token_fit.is_some() || cost_fit.is_some() {
+        let reason = if token_limit.is_none() && cost_limit.is_none() {
+            "unbounded_envelope"
+        } else {
+            match (token_fit, cost_fit) {
+                (Some(true), Some(true)) => "within_envelope",
+                (Some(true), None) if estimate.p90_cost_usd.is_some() => "cost_unbounded",
+                (Some(true), None) => "token_only",
+                (None, Some(true)) => "cost_only",
+                _ => "within_envelope",
             }
-            (Some(_), Some(_)) => (true, "within_envelope".to_string()),
-            (Some(_), None) => (true, "unbounded_envelope".to_string()),
-            (None, _) => (false, "unestimated".to_string()),
-        }
+        };
+        (true, reason.to_string())
+    } else {
+        (false, "unestimated".to_string())
     };
     AllocationTask {
         task_id: row.task_id.clone(),
@@ -508,9 +553,9 @@ fn critical_path_tasks(
     plan: Option<&TeamPlan>,
     statuses: &HashMap<String, String>,
     remaining_budget_tokens: Option<u64>,
-) -> (BTreeSet<String>, bool) {
+) -> (BTreeSet<String>, Option<String>) {
     let Some(plan) = plan else {
-        return (BTreeSet::new(), false);
+        return (BTreeSet::new(), Some("no_plan".to_string()));
     };
     match compute_critical_path(CriticalPathInput {
         session_id: &session.id,
@@ -520,8 +565,8 @@ fn critical_path_tasks(
         statuses,
         remaining_budget_tokens,
     }) {
-        Ok(path) => (path.task_ids.into_iter().collect(), true),
-        Err(_) => (BTreeSet::new(), false),
+        Ok(path) => (path.task_ids.into_iter().collect(), None),
+        Err(error) => (BTreeSet::new(), Some(error.code.to_string())),
     }
 }
 
@@ -569,7 +614,11 @@ fn allocation_feasibility(
     let mut cost_p50 = 0.0f64;
     let mut cost_p90 = 0.0f64;
     let mut any_tokens = false;
+    let mut any_token_p90 = false;
     let mut any_cost = false;
+    let mut any_cost_p90 = false;
+    let mut estimated_tasks = 0u32;
+    let total_tasks = focus_ids.len().min(u32::MAX as usize) as u32;
     let mut sources = BTreeSet::new();
     for task_id in focus_ids {
         let Some(estimate) = estimates.get(task_id) else {
@@ -578,21 +627,35 @@ fn allocation_feasibility(
         if let Some(source) = estimate.source {
             sources.insert(source);
         }
+        let has_token = estimate.p90_tokens.is_some_and(|value| value > 0)
+            || estimate.p50_tokens.is_some_and(|value| value > 0);
+        let has_cost = estimate
+            .p90_cost_usd
+            .is_some_and(|value| value.is_finite() && value > 0.0)
+            || estimate
+                .p50_cost_usd
+                .is_some_and(|value| value.is_finite() && value > 0.0);
+        if has_token || has_cost {
+            estimated_tasks = estimated_tasks.saturating_add(1);
+        }
         if let Some(value) = estimate.p50_tokens {
             token_p50 = token_p50.saturating_add(value);
             any_tokens = true;
         }
         if let Some(value) = estimate.p90_tokens {
             token_p90 = token_p90.saturating_add(value);
+            any_token_p90 = true;
         }
-        if let Some(value) = estimate.p50_cost_usd {
+        if let Some(value) = estimate.p50_cost_usd.filter(|value| value.is_finite()) {
             cost_p50 += value;
             any_cost = true;
         }
-        if let Some(value) = estimate.p90_cost_usd {
+        if let Some(value) = estimate.p90_cost_usd.filter(|value| value.is_finite()) {
             cost_p90 += value;
+            any_cost_p90 = true;
         }
     }
+    let missing_estimates = total_tasks.saturating_sub(estimated_tasks);
     let source = match sources.len() {
         0 => "unavailable".to_string(),
         1 => sources
@@ -619,15 +682,39 @@ fn allocation_feasibility(
     // A USD cap alone is not price evidence. Only a positive observed cost (or
     // a positive estimate derived from configured prices) enables a cost
     // feasibility claim; otherwise the preview honestly says unconfigured.
-    let cost_configured = usage.cost_usd > 0.0 || any_cost;
+    let cost_configured = usage.cost_usd > 0.0 || any_cost || any_cost_p90;
+    let hard_time = budget
+        .hard_wall_clock_secs
+        .or(budget.effective_time_budget_secs);
+    let mut pressure_dimensions = Vec::new();
+    if let (Some(hard), Some(remaining)) = (hard_token, budget.remaining_tokens)
+        && (remaining as f64) < hard as f64 * contract.completion_reserve_ratio
+    {
+        pressure_dimensions.push("tokens".to_string());
+    }
+    if let (Some(hard), Some(remaining)) = (cost_budget, budget.remaining_cost_usd)
+        && remaining < hard * contract.completion_reserve_ratio
+    {
+        pressure_dimensions.push("money".to_string());
+    }
+    if let (Some(hard), Some(remaining)) = (hard_time, budget.remaining_secs)
+        && (remaining as f64) < hard as f64 * contract.completion_reserve_ratio
+    {
+        pressure_dimensions.push("time".to_string());
+    }
 
     let mut feasible = true;
     let mut reason = "feasible".to_string();
     if focus_ids.is_empty() {
         reason = "no_remaining_tasks".to_string();
-    } else if !any_tokens && !any_cost {
+    } else if estimated_tasks == 0 {
         feasible = false;
         reason = "insufficient_estimate".to_string();
+    } else if missing_estimates > 0 {
+        // Known estimates understate a partial path; never claim that the
+        // remaining critical path fits when some of its tasks are unknown.
+        feasible = false;
+        reason = "partial_estimate".to_string();
     } else if hard_token.is_none() || budget.remaining_tokens.is_none() {
         reason = "unbounded_envelope".to_string();
     } else if let (Some(remaining), Some(reserve)) = (budget.remaining_tokens, reserve_tokens)
@@ -635,7 +722,8 @@ fn allocation_feasibility(
     {
         feasible = false;
         reason = "remaining_below_completion_reserve".to_string();
-    } else if let (Some(p90), Some(headroom)) = (any_tokens.then_some(token_p90), headroom_tokens)
+    } else if let (Some(p90), Some(headroom)) =
+        (any_token_p90.then_some(token_p90), headroom_tokens)
         && p90 > headroom
     {
         feasible = false;
@@ -655,17 +743,17 @@ fn allocation_feasibility(
                 if remaining_cost < reserve_cost {
                     feasible = false;
                     reason = "remaining_below_cost_reserve".to_string();
-                } else if any_cost && cost_p90 > cost_headroom {
+                } else if any_cost_p90 && cost_p90 > cost_headroom {
                     feasible = false;
                     reason = "p90_cost_exceeds_reserve_headroom".to_string();
                 }
             } else if cost_budget.is_none() {
                 reason = "cost_unbounded".to_string();
             }
-        } else if any_tokens {
+        } else if any_token_p90 {
             reason = "cost_unconfigured".to_string();
         }
-        if feasible && reason == "feasible" && !any_tokens {
+        if feasible && reason == "feasible" && !any_token_p90 {
             reason = "token_unestimated".to_string();
         }
     }
@@ -674,9 +762,9 @@ fn allocation_feasibility(
         feasible,
         reason,
         p50_tokens: any_tokens.then_some(token_p50),
-        p90_tokens: any_tokens.then_some(token_p90),
+        p90_tokens: any_token_p90.then_some(token_p90),
         p50_cost_usd: any_cost.then_some(cost_p50),
-        p90_cost_usd: any_cost.then_some(cost_p90),
+        p90_cost_usd: any_cost_p90.then_some(cost_p90),
         sample_calls: usage.calls.min(u32::MAX as u64) as u32,
         source,
         reserve_tokens,
@@ -690,6 +778,13 @@ fn allocation_feasibility(
                 .cloned()
                 .collect()
         },
+        estimated_tasks,
+        total_tasks,
+        pressure_dimensions,
+        // The caller that has the plan/status inputs fills these; the pure
+        // feasibility function deliberately does not invent a path.
+        critical_path_available: false,
+        critical_path_reason: None,
     }
 }
 
@@ -736,11 +831,7 @@ fn allocation_recommendations(
         readiness.level.as_str(),
         "committed" | "tests_passed" | "verified"
     );
-    let reserve_pressure = budget.remaining_tokens.is_some_and(|remaining| {
-        feasibility
-            .reserve_tokens
-            .is_some_and(|reserve| remaining < reserve)
-    });
+    let reserve_pressure = !feasibility.pressure_dimensions.is_empty();
     let ready_non_critical = tasks
         .iter()
         .filter(|task| task.ready && !task.critical_path)
@@ -845,8 +936,10 @@ fn allocation_recommendations(
     {
         push(
             "rescue_reserve",
-            "clean near-completion work is pressured by the completion reserve; a short rescue grant may release only that reserve"
-                .to_string(),
+            format!(
+                "clean near-completion work is pressured by the completion reserve ({}); a short rescue grant may release only that reserve",
+                feasibility.pressure_dimensions.join(", ")
+            ),
             "medium",
             None,
         );
@@ -981,6 +1074,7 @@ fn allocation_calibration(
         .count() as u32;
     let attention_interrupts = approvals
         .iter()
+        .filter(|approval| approval.status == "pending")
         .map(|approval| approval_risk_weight(approval.approval_risk.as_deref()))
         .fold(0u32, u32::saturating_add)
         .saturating_add((effects.counts.unknown as u32).saturating_mul(5));
@@ -1292,6 +1386,7 @@ mod tests {
             mergeable: false,
             latest_commit: Some("abc123".into()),
             latest_test: None,
+            latest_test_passed: None,
             verifier: None,
             merge: None,
             changed_paths: Vec::new(),
@@ -1333,6 +1428,32 @@ mod tests {
         assert_eq!(estimate.p50_tokens, Some(1_000));
         assert_eq!(estimate.p90_tokens, Some(1_000));
         assert_eq!(estimate.observed_calls, 2);
+
+        let zero_departments = HashMap::from([(
+            "impl".to_string(),
+            DepartmentEnvelope {
+                tokens: Some(2_500),
+                cost_usd: None,
+            },
+        )]);
+        let zero_bucket = HashMap::from([(
+            "T1".to_string(),
+            UsageBucket {
+                key: "T1".into(),
+                calls: 1,
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_usd: 0.0,
+                ..UsageBucket::default()
+            },
+        )]);
+        let estimate = estimate_task(&row, &zero_bucket, &empty_actuals, &zero_departments);
+        assert_eq!(
+            estimate.source,
+            Some(EstimateSource::DepartmentEnvelope),
+            "a zero-token ledger row must not mask a usable department envelope"
+        );
+        assert_eq!(estimate.p50_tokens, Some(2_500));
 
         let mut plan_row = row.clone();
         plan_row.token_budget = Some(4_000);
@@ -1378,6 +1499,32 @@ mod tests {
         );
         let estimate = estimate_task(&row, &HashMap::new(), &actuals, &HashMap::new());
         assert_eq!(estimate.source, Some(EstimateSource::ProjectActuals));
+
+        let zero_history = vec![UsageEntry {
+            id: "u-zero".into(),
+            session_id: "ses-old".into(),
+            agent_id: "a".into(),
+            agent_name: "A".into(),
+            role: "worker".into(),
+            task_id: Some("T-zero".into()),
+            department: Some("impl".into()),
+            model: "m".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            estimated: false,
+            cost_usd: 0.0,
+            created_at: "2026-11-24T00:00:00Z".into(),
+        }];
+        let zero_actuals = ProjectActuals::from_entries(&zero_history);
+        let estimate = estimate_task(&row, &HashMap::new(), &zero_actuals, &departments);
+        assert_eq!(
+            estimate.source,
+            Some(EstimateSource::DepartmentEnvelope),
+            "zero-valued project history must fall through to the department envelope"
+        );
+
         let no_actuals = ProjectActuals::default();
         let estimate = estimate_task(&row, &HashMap::new(), &no_actuals, &departments);
         assert_eq!(estimate.source, Some(EstimateSource::DepartmentEnvelope));
@@ -1602,6 +1749,82 @@ mod tests {
     }
 
     #[test]
+    fn feasibility_reports_token_cost_and_time_reserve_pressure() {
+        let estimates = HashMap::from([(
+            "T1".to_string(),
+            TaskEstimate {
+                p50_tokens: Some(100),
+                p90_tokens: Some(100),
+                p50_cost_usd: Some(0.1),
+                p90_cost_usd: Some(0.1),
+                observed_calls: 1,
+                source: Some(EstimateSource::SessionActuals),
+            },
+        )]);
+        let mut pressured = budget(Some(10_000), Some(10_000), 9_000, Some(1_000));
+        pressured.effective_cost_budget_usd = Some(10.0);
+        pressured.hard_cost_cap_usd = Some(10.0);
+        pressured.remaining_cost_usd = Some(1.0);
+        pressured.effective_time_budget_secs = Some(3_600);
+        pressured.hard_wall_clock_secs = Some(3_600);
+        pressured.remaining_secs = Some(100);
+        let feasibility = allocation_feasibility(
+            &pressured,
+            &contract(0.2),
+            &UsageTotals::default(),
+            &estimates,
+            &["T1".to_string()],
+            &BTreeSet::from(["T1".to_string()]),
+        );
+        assert_eq!(
+            feasibility.pressure_dimensions,
+            vec![
+                "tokens".to_string(),
+                "money".to_string(),
+                "time".to_string()
+            ]
+        );
+        assert!(!feasibility.feasible);
+    }
+
+    #[test]
+    fn feasibility_fails_closed_when_part_of_the_path_is_unestimated() {
+        let estimates = HashMap::from([
+            (
+                "T1".to_string(),
+                TaskEstimate {
+                    p50_tokens: Some(1_000),
+                    p90_tokens: Some(1_000),
+                    p50_cost_usd: None,
+                    p90_cost_usd: None,
+                    observed_calls: 0,
+                    source: Some(EstimateSource::PlanEnvelope),
+                },
+            ),
+            (
+                "T2".to_string(),
+                TaskEstimate {
+                    source: Some(EstimateSource::Prior),
+                    ..TaskEstimate::default()
+                },
+            ),
+        ]);
+        let feasibility = allocation_feasibility(
+            &budget(Some(10_000), Some(10_000), 1_000, Some(9_000)),
+            &contract(0.2),
+            &UsageTotals::default(),
+            &estimates,
+            &["T1".to_string(), "T2".to_string()],
+            &BTreeSet::from(["T1".to_string(), "T2".to_string()]),
+        );
+        assert!(!feasibility.feasible);
+        assert_eq!(feasibility.reason, "partial_estimate");
+        assert_eq!(feasibility.estimated_tasks, 1);
+        assert_eq!(feasibility.total_tasks, 2);
+        assert_eq!(feasibility.p90_tokens, Some(1_000));
+    }
+
+    #[test]
     fn unknown_task_size_is_not_marked_feasible() {
         let row = AllocationRow {
             task_id: "T1".into(),
@@ -1626,6 +1849,60 @@ mod tests {
         assert!(!task.feasible);
         assert_eq!(task.reason, "unestimated");
         assert_eq!(task.source, "prior");
+    }
+
+    #[test]
+    fn task_feasibility_uses_cost_estimates_and_task_budget_caps() {
+        let row = AllocationRow {
+            task_id: "T1".into(),
+            title: "Task T1".into(),
+            department: "impl".into(),
+            status: "pending".into(),
+            priority: 1,
+            deps: Vec::new(),
+            token_budget: None,
+            cost_budget_usd: None,
+        };
+        let cost_budget = vp_protocol::types::SessionBudgetStatus {
+            effective_cost_budget_usd: Some(2.0),
+            hard_cost_cap_usd: Some(2.0),
+            remaining_cost_usd: Some(1.0),
+            ..budget(Some(10_000), Some(10_000), 0, Some(10_000))
+        };
+        let cost_estimate = TaskEstimate {
+            p50_cost_usd: Some(0.4),
+            p90_cost_usd: Some(0.5),
+            source: Some(EstimateSource::ProjectActuals),
+            ..TaskEstimate::default()
+        };
+        let task = allocation_task(&row, &HashMap::new(), &cost_budget, &cost_estimate);
+        assert!(task.feasible);
+        assert_eq!(task.reason, "cost_only");
+
+        let expensive = TaskEstimate {
+            p90_cost_usd: Some(2.0),
+            ..cost_estimate.clone()
+        };
+        let task = allocation_task(&row, &HashMap::new(), &cost_budget, &expensive);
+        assert!(!task.feasible);
+        assert_eq!(task.reason, "exceeds_remaining_cost");
+
+        let mut capped = row.clone();
+        capped.token_budget = Some(500);
+        let token_estimate = TaskEstimate {
+            p50_tokens: Some(1_000),
+            p90_tokens: Some(1_000),
+            source: Some(EstimateSource::PlanEnvelope),
+            ..TaskEstimate::default()
+        };
+        let task = allocation_task(
+            &capped,
+            &HashMap::new(),
+            &budget(None, None, 0, None),
+            &token_estimate,
+        );
+        assert!(!task.feasible);
+        assert_eq!(task.reason, "exceeds_task_tokens");
     }
 
     #[test]
@@ -1663,6 +1940,24 @@ mod tests {
         );
         assert!(!calibration.reason.contains("99 pending approval(s)"));
         assert!(calibration.reason.contains("99 ledger call(s)"));
+
+        let mut resolved = pending_approval();
+        resolved.status = "approved".into();
+        let calibration = allocation_calibration(
+            &contract(0.2),
+            &[resolved],
+            &no_effects(),
+            &vp_protocol::diagnosis::SessionDiagnosisResult::default(),
+            &[],
+            &UsageTotals::default(),
+        );
+        assert_eq!(calibration.pending_approvals, 0);
+        assert_eq!(
+            calibration.attention_interrupts, 0,
+            "resolved approvals are not current attention pressure"
+        );
+        assert_eq!(calibration.attention_recommendation, "batch_routine");
+        assert_eq!(calibration.trust_recommendation, "standard");
     }
 
     #[tokio::test]
@@ -1732,6 +2027,82 @@ mod tests {
         assert_eq!(preview.tasks[0].source, "plan_envelope");
         assert_eq!(preview.tasks[0].p50_tokens, Some(4_000));
         assert_eq!(preview.tasks[0].token_budget, Some(4_000));
+    }
+
+    #[tokio::test]
+    async fn preview_handles_a_full_hundred_task_plan_without_truncation() {
+        let (_data, _repo, engine, session) = fixture().await;
+        let tasks = (0..MAX_ALLOCATION_TASKS)
+            .map(|index| {
+                let deps = if index == 0 {
+                    Vec::new()
+                } else {
+                    vec![format!("T{:03}", index - 1)]
+                };
+                PlanTask {
+                    id: format!("T{index:03}"),
+                    department: "impl".into(),
+                    title: format!("Task {index}"),
+                    kind: "coding".into(),
+                    priority: 5,
+                    profile: Some("coding".into()),
+                    deps,
+                    write_scope: vec![format!("src/f{index}.rs")],
+                    acceptance: vec!["tests pass".into()],
+                    token_budget: Some(1_000),
+                    cost_budget_usd: None,
+                    parent_task_id: None,
+                    fanout_key: None,
+                    fanout_join_for: None,
+                }
+            })
+            .collect();
+        let plan = TeamPlan {
+            goal: "full allocation plan".into(),
+            departments: vec![PlanDepartment {
+                name: "impl".into(),
+                manager_title: "Implementation".into(),
+                profile: "coding".into(),
+                objective: "build".into(),
+                token_budget: Some((MAX_ALLOCATION_TASKS as u64) * 1_000),
+                cost_budget_usd: None,
+            }],
+            tasks,
+        };
+        engine.submit_team_plan(&session.id, &plan).await.unwrap();
+        let preview = engine
+            .session_allocation(SessionAllocationParams {
+                session_id: session.id.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(preview.tasks.len(), MAX_ALLOCATION_TASKS);
+        assert!(!preview.truncated);
+        assert!(
+            preview.tasks.iter().all(|task| task.critical_path),
+            "every task in a single-chain plan is on the critical path"
+        );
+        assert_eq!(
+            preview.feasibility.critical_path_tasks.len(),
+            MAX_ALLOCATION_TASKS
+        );
+        // The token envelope is unbounded, but the preview surfaces the
+        // actionable cost caveat because no prices or cost cap are configured.
+        assert_eq!(preview.feasibility.reason, "cost_unconfigured");
+    }
+
+    #[tokio::test]
+    async fn critical_path_unavailability_is_reported_not_silently_fallen_back() {
+        let (_data, _repo, _engine, session) = fixture().await;
+        let mut plan = plan_with_task(None);
+        plan.tasks[0].deps = vec!["T-missing".into()];
+        let (ids, reason) = critical_path_tasks(&session, Some(&plan), &HashMap::new(), None);
+        assert!(ids.is_empty());
+        assert_eq!(reason.as_deref(), Some("BUDGET_PATH_UNKNOWN_TASK"));
+
+        let (ids, reason) = critical_path_tasks(&session, None, &HashMap::new(), None);
+        assert!(ids.is_empty());
+        assert_eq!(reason.as_deref(), Some("no_plan"));
     }
 
     #[tokio::test]
@@ -1841,6 +2212,8 @@ mod tests {
             .unwrap();
         assert_eq!(preview.profiles.len(), 5);
         assert_eq!(preview.current_profile, "balanced");
+        assert_eq!(preview.effective_completion_reserve_ratio, 0.2);
+        assert_eq!(preview.reserve_source, "derived");
         assert_eq!(
             preview
                 .profiles

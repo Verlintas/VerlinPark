@@ -22,41 +22,59 @@ Verifier 或 Integrator。
   metareasoning 和 attention/trust calibration。估计优先级固定为 session
   actuals → plan task envelope → project department actuals（nearest-rank
   p50/p90）→ department envelope → 显式 unknown prior；unknown 是 `None`
-  而不是 0，完全无估计的路径报 `insufficient_estimate`，无估计的 task 不再
-  显示为 feasible。预览不追加 event、不改任何 budget/envelope/model/route/
-  approval/effect/Verifier/merge 状态。
-- feasibility 同时检查 token/cost reserve 与 cost 未配置/未定价的 caveat；
-  critical path 可用时聚焦该路径，否则聚焦全部剩余 task。推荐项最多 12 条，
-  reason 最多 200 字符；metareasoning 只引用 diagnosis target、no-progress、
-  stalled/failed/retrying task；calibration 只引用 pending/weighted approvals、
+  而不是 0，完全无估计的路径报 `insufficient_estimate`，只有部分 task 有估计
+  时 fail closed 报 `partial_estimate`，并返回 `estimated_tasks/total_tasks`；
+  无估计的 task 不再显示为 feasible。零 token/零 cost 的历史行会继续回退到
+  department envelope，而不是把有效 envelope 遮住。预览不追加 event、不改
+  任何 budget/envelope/model/route/approval/effect/Verifier/merge 状态。
+- feasibility 同时检查 token/cost reserve 与 cost 未配置/未定价的 caveat，
+  并返回 `pressure_dimensions`（tokens/money/time）；per-task feasible 同时
+  看 token/cost 估计、task 自身 budget 和 session remaining，cost-only 估计
+  不再被误报为 unestimated。critical path 可用时聚焦该路径，否则聚焦全部
+  剩余 task；计算失败时返回 `critical_path_available=false` +
+  `critical_path_reason`（例如 `BUDGET_PATH_UNKNOWN_TASK`），不静默伪装成
+  正常路径。推荐项最多 12 条，reason 最多 200 字符；metareasoning 只引用
+  diagnosis target、no-progress、stalled/failed/retrying task；calibration
+  只引用 pending approval 的 weighted interrupts、unknown effects、
   Verifier rejection、failed task 和 usage calls，并明确标注 advisory。
 - `session.tradeoffs` / `vp tradeoffs`：返回 5 个 profile 的文档化 posture、
-  当前 profile、现有 session turn/cost forecast（重复展示，不声称 per-profile
-  保证）、bounded quality/reviewability（readiness、commit/test/Verifier/
-  merge、task 进度、changed paths、blockers、`ok|watch|risk`）和显式
-  heuristic calibrated confidence（0–1）。只有当 risk/blocker/blocked effect
-  或 completion-reserve pressure 等确定性证据存在时，才把另一个 profile 标为
-  recommended；当前 profile 不会被重复标成 recommended，视图也从不切换
-  profile。
+  当前 profile、**active contract reserve + source**（profile 行只显示
+  “posture”，不会暗示切换 profile 会自动改 reserve）、现有 session
+  turn/cost forecast（重复展示，不声称 per-profile 保证）、bounded
+  quality/reviewability（readiness、commit/test/Verifier/merge、task 进度、
+  changed paths、blockers、`ok|watch|risk`）和显式 heuristic calibrated
+  confidence（0–1）。test evidence 直接来自 test cache：`latest_test_passed`
+  区分 pass/fail，quality review 不再永远显示 no_tests；queued/conflicting
+  merge entry 不再被写成 merged，也不再加 merge confidence。只有当
+  risk/blocker/blocked effect 或 token/cost/time completion-reserve pressure
+  等确定性证据存在时，才把另一个 profile 标为 recommended；当前 profile 不会
+  被重复标成 recommended，视图也从不切换 profile。
 - `ProjectRunPolicy.auto_rescue`（默认关闭）：项目显式 opt-in 后，turn
   boundary 只有在暂停原因正好是 `completion_reserve_*`、session 为 fixed
   budget、readiness 处于 near-completion、存在 latest commit、
-  `no_progress_turns == 0`、有 headroom 且从未有过 rescue grant 时，才允许
-  最多一次自动 completion-reserve grant。并发 turn boundary 在进程内串行化；
-  manual grant 也消耗同一 one-shot 额度。grant 只释放 completion reserve
-  的 30 分钟 TTL，不提高 hard cap，不绕过 approval/contract/sandbox/
-  Verifier/Integrator；auto-rescue 的存储/readiness 错误会降级为普通 resource
-  pause，不会打断用户 run。
+  `no_progress_turns == 0`、有 token/cost headroom 且从未有过 rescue grant 时，
+  才允许最多一次自动 completion-reserve grant。manual/auto grant 和 consume
+  共用同一进程内 lock；并发 turn boundary 不会产生两个 grant，也不会重复
+  消费同一 grant；manual grant 也消耗同一 one-shot 额度。grant 只释放
+  completion reserve 的 30 分钟 TTL，不提高 hard cap，不绕过 approval/
+  contract/sandbox/Verifier/Integrator；auto-rescue 的存储/readiness 错误会
+  降级为普通 resource pause，但 consume receipt 写入失败会 fail closed 停止
+  turn，避免 reserve 在无 receipt 的情况下被后续 boundary 继续使用。
 - CLI `project-run-policy-set --auto-rescue/--no-auto-rescue`、`vp allocation`、
   `vp tradeoffs`；macOS Project RunPolicy 开关和 Manage Dash → Usage & Budget
   的 Allocation insight / Trade-offs & quality 两张只读卡片。卡片只在可见或
   显式刷新时加载，拒绝返回其他 session 的响应；不参与 selection sweep。
+  最终 GUI smoke 还验证了 `active reserve 20% · project policy · profile rows
+  are documented posture`、profile 行显示 `posture 25%`、`0/0 task(s)
+  estimated`，以及 CURRENT 不会同时出现 RECOMMENDED；policy editor 保存后
+  daemon 返回 `auto_rescue=true`。
 - 明确未完成：automatic per-task envelope reallocation（需要 event-backed plan
   revision、reservation 交互和 no-widening 校验）、daily attention schedule、
   更完整的 anytime UI、learned estimates/confidence。自动 rescue 的串行化是
-  same-daemon，跨 host 不成立。
+  same-daemon，跨 host 不成立；project RunPolicy 保存仍是整包
+  read-modify-write，没有 updated_at/CAS 前置条件。
 - 测试：targeted allocation/tradeoff/rescue/protocol/CLI/daemon + full
-  workspace **4,624 passed / 0 failed / 6 ignored**；Swift
+  workspace **4,633 passed / 0 failed / 6 ignored**；Swift
   **659 passed（527 app + 132 helper）**；`cargo fmt --check`、
   `cargo clippy --workspace --all-targets -- -D warnings`、`swiftformat --lint`
   和 `xcodebuild test` 通过。临时 daemon CLI smoke 覆盖 `project-run-policy-set`

@@ -1492,7 +1492,12 @@ final class ResourceGovernorTests: XCTestCase {
             "source": "task_history",
             "reserve_tokens": 20000,
             "headroom_tokens": 22000,
-            "critical_path_tasks": ["T1", "T2"]
+            "critical_path_tasks": ["T1", "T2"],
+            "estimated_tasks": 8,
+            "total_tasks": 8,
+            "pressure_dimensions": ["tokens", "time"],
+            "critical_path_available": true,
+            "critical_path_reason": null
           },
           "tasks": [
             {"task_id":"T1","title":"Write model","department":"core","status":"pending",
@@ -1560,6 +1565,9 @@ final class ResourceGovernorTests: XCTestCase {
         XCTAssertTrue(allocation.feasibility?.forecastLabel.contains("12 samples") == true)
         XCTAssertEqual(allocation.feasibility?.reserveHeadroomLabel, "reserve 20.0k · headroom 22.0k")
         XCTAssertEqual(allocation.feasibility?.criticalPathPreviews, ["T1", "T2"])
+        XCTAssertEqual(allocation.feasibility?.estimateCoverageLabel, "8/8 task(s) estimated")
+        XCTAssertEqual(allocation.feasibility?.pressureLabel, "tokens, time")
+        XCTAssertNil(allocation.feasibility?.criticalPathWarning)
         XCTAssertEqual(allocation.taskPreviews.count, 6)
         XCTAssertEqual(allocation.taskOverflow, 2)
         XCTAssertEqual(allocation.taskPreviews.first?.titleLabel, "Write model")
@@ -1599,7 +1607,9 @@ final class ResourceGovernorTests: XCTestCase {
           "profile": "custom",
           "readiness": null,
           "envelope": null,
-          "feasibility": {"reason": "unknown", "feasible": null, "tasks": null},
+          "feasibility": {"reason": "unknown", "feasible": null, "tasks": null,
+                          "critical_path_available": false,
+                          "critical_path_reason": "BUDGET_PATH_UNKNOWN_TASK"},
           "tasks": null,
           "recommendations": null,
           "metareasoning": null,
@@ -1615,6 +1625,12 @@ final class ResourceGovernorTests: XCTestCase {
         XCTAssertNil(allocation.feasibility?.feasible)
         XCTAssertEqual(allocation.feasibility?.forecastLabel, "No forecast reported")
         XCTAssertEqual(allocation.feasibility?.reserveHeadroomLabel, "Reserve/headroom not reported")
+        XCTAssertNil(allocation.feasibility?.estimateCoverageLabel)
+        XCTAssertNil(allocation.feasibility?.pressureLabel)
+        XCTAssertEqual(
+            allocation.feasibility?.criticalPathWarning,
+            "critical path unavailable (BUDGET_PATH_UNKNOWN_TASK); feasibility falls back to all remaining tasks"
+        )
         XCTAssertTrue(allocation.tasks.isEmpty)
         XCTAssertTrue(allocation.recommendations.isEmpty)
         XCTAssertNil(allocation.metareasoning)
@@ -1642,6 +1658,8 @@ final class ResourceGovernorTests: XCTestCase {
           "session_id": "ses-1",
           "generated_at": "2026-11-25T00:00:00Z",
           "current_profile": "balanced",
+          "effective_completion_reserve_ratio": 0.2,
+          "reserve_source": "project_policy",
           "profiles": [
             {"profile":"quality","primary_goal":"highest confidence",
              "completion_reserve_ratio":0.3,"attention_posture":"high",
@@ -1694,6 +1712,12 @@ final class ResourceGovernorTests: XCTestCase {
         let tradeoffs = try JSONDecoder().decode(TradeoffView.self, from: json)
         XCTAssertEqual(tradeoffs.sessionID, "ses-1")
         XCTAssertEqual(tradeoffs.currentProfileTitle, "Balanced")
+        XCTAssertEqual(tradeoffs.effectiveReserveLabel, "20%")
+        XCTAssertEqual(tradeoffs.reserveSourceLabel, "project policy")
+        XCTAssertEqual(
+            tradeoffs.activeReserveSummary,
+            "active reserve 20% · project policy · profile rows are documented posture"
+        )
         XCTAssertEqual(tradeoffs.profiles.count, 5)
         XCTAssertEqual(tradeoffs.profilePreviews.count, 5)
         XCTAssertEqual(tradeoffs.profileOverflow, 0)
@@ -1702,8 +1726,14 @@ final class ResourceGovernorTests: XCTestCase {
         ])
         XCTAssertTrue(tradeoffs.profilePreviews[1].isCurrent(tradeoffs.currentProfile))
         XCTAssertTrue(tradeoffs.profilePreviews[1].isRecommended)
+        XCTAssertFalse(
+            tradeoffs.profilePreviews[1].showsRecommendedBadge(
+                currentProfile: tradeoffs.currentProfile
+            ),
+            "the current profile must never also render a RECOMMENDED badge"
+        )
         XCTAssertFalse(tradeoffs.profilePreviews[2].isRecommended)
-        XCTAssertEqual(tradeoffs.profilePreviews[0].reservePercentLabel, "30% reserve")
+        XCTAssertEqual(tradeoffs.profilePreviews[0].reservePercentLabel, "posture 30%")
         XCTAssertEqual(tradeoffs.profilePreviews[0].forecastLabel, "~20 turns · $1.20")
         XCTAssertEqual(tradeoffs.quality?.readinessLabel, "VERIFIED")
         XCTAssertEqual(tradeoffs.quality?.reviewabilityLabel, "WATCH")

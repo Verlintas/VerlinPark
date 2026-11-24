@@ -205,10 +205,12 @@ It is reported with confidence and never replaces the Verifier.
 
 ## 4. Profiles
 
-Profiles adjust soft targets, reserves, attention policy, and recommended
-behavior. They never relax hard gates.
+Profiles document a recommended posture for soft targets, reserve, attention,
+and quality. The active run contract still takes its reserve, attention, and
+stop values from the session override or project RunPolicy; selecting a profile
+does not silently change them. Profiles never relax hard gates.
 
-| Profile | Primary goal | Completion reserve | Attention | Time | Cost | Quality |
+| Profile | Primary goal | Documented reserve posture | Attention | Time | Cost | Quality |
 |---|---|---:|---|---|---|---|
 | `quality` | trustworthy completion | 25% | high tolerance | generous | secondary | tests + Verifier + reviewability |
 | `balanced` | default | 20% | moderate | moderate | moderate | tests + Verifier |
@@ -610,10 +612,17 @@ Implemented (R3a):
   prior. Unknown is `None`, not zero.
 - Feasibility focuses on the remaining critical path when available and
   otherwise on all remaining tasks. It reports p50/p90 tokens/cost, the
-  completion reserve, headroom, and a bounded reason
-  (`insufficient_estimate`, `remaining_below_completion_reserve`,
-  `p90_exceeds_reserve_headroom`, `cost_unconfigured`, and related codes). A
-  task with no estimate is not reported as feasible.
+  completion reserve, headroom, `estimated_tasks`/`total_tasks`, and
+  `pressure_dimensions` (`tokens`, `money`, `time`). A partly estimated path
+  fails closed as `partial_estimate`, not as a green result; a path with no
+  estimate is `insufficient_estimate`; critical-path computation failure
+  reports `critical_path_available=false` plus a bounded reason instead of
+  silently pretending the all-task fallback is the critical path. Other reasons
+  include `remaining_below_completion_reserve`,
+  `p90_exceeds_reserve_headroom`, and `cost_unconfigured`. Per-task feasibility
+  checks token and cost estimates against the task budget and session remaining,
+  so a cost-only task is not reported as unestimated and an undersized task
+  budget is visible.
 - Recommendations, metareasoning (diagnosis target, no-progress turns,
   stalled/failed/retrying tasks), and attention/trust calibration are bounded
   and advisory. The preview appends no event and changes no task envelope,
@@ -645,12 +654,18 @@ Implemented (R4a):
 
 - `session.tradeoffs` / `vp tradeoffs` returns the five documented profile
   postures (quality/balanced/fast/cheap/unattended), the current profile, the
-  session's existing turn/cost forecast repeated without per-profile
-  guarantees, a bounded quality/reviewability review, and an explicitly
-  heuristic calibrated confidence score.
+  active contract reserve and its source, the session's existing turn/cost
+  forecast repeated without per-profile guarantees, a bounded
+  quality/reviewability review, and an explicitly heuristic calibrated
+  confidence score. Profile reserve values are labeled posture; they do not
+  silently change the active contract reserve. Confidence gives test credit
+  only for a recorded pass, penalizes a failing test, and gives merge credit
+  only for a `merged` queue entry.
 - Quality review reports readiness, latest commit/test/Verifier/merge evidence,
   completed/total tasks, merged entries, changed paths, blockers, and
-  `ok|watch|risk` reviewability. It never replaces the Verifier.
+  `ok|watch|risk` reviewability. Test evidence comes from the test cache and is
+  shown with a pass/fail flag; a queued/conflicting merge entry is not labeled
+  merged and does not add merge confidence. It never replaces the Verifier.
 - A different profile is marked recommended only from deterministic evidence:
   `quality` for risk/blockers/blocked effects, `cost` under completion-reserve
   pressure. The current profile is not double-badged, and the view never
@@ -672,8 +687,8 @@ Remaining:
 | Area | Tests |
 |---|---|
 | Resource math | cache weighting, missing prices, output weight, clamping, p50/p90 |
-| Allocation (R3a) | estimate precedence, unknown/insufficient estimates, critical-path focus, cost/token feasibility, no-event preview, serialized one-shot auto rescue |
-| Trade-offs (R4a) | five profiles, quality/reviewability, confidence heuristic, deterministic recommended profile, no profile switch |
+| Allocation (R3a) | estimate precedence, partial/insufficient estimates, critical-path focus/availability, token/cost/time pressure, task-budget and cost-only feasibility, no-event preview, serialized one-shot auto rescue |
+| Trade-offs (R4a) | five profiles, active reserve vs posture, test-cache pass/fail, queued/merged distinction, confidence heuristic, deterministic recommended profile, no profile switch |
 | Contract | derive/validate/profile bounds/reserve/risk/attention/no widening |
 | Governor | pre-dispatch infeasibility, continue/throttle/reallocate/rescue/pause/stop/replan, no hidden routing |
 | Readiness | none/dirty/committed/tests/verified/merged/partial/blocked, stale evidence, unresolved effect |

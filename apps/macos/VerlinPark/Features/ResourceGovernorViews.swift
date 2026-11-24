@@ -2181,6 +2181,23 @@ struct AllocationInsightCard: View {
                 .font(VPTheme.mono(7.5))
                 .foregroundStyle(VPTheme.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
+            if let coverage = feasibility.estimateCoverageLabel {
+                Text(coverage)
+                    .font(VPTheme.mono(6.5))
+                    .foregroundStyle(VPTheme.textTertiary)
+            }
+            if let pressure = feasibility.pressureLabel {
+                Text("reserve pressure: \(pressure)")
+                    .font(VPTheme.mono(6.5))
+                    .foregroundStyle(VPTheme.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let warning = feasibility.criticalPathWarning {
+                Text(warning)
+                    .font(VPTheme.mono(6.5))
+                    .foregroundStyle(VPTheme.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             HStack(spacing: 10) {
                 Text(feasibility.reserveHeadroomLabel)
                     .font(VPTheme.mono(7))
@@ -2621,6 +2638,10 @@ struct TradeoffQualityCard: View {
                     .foregroundStyle(VPTheme.textSecondary)
                 Spacer(minLength: 4)
             }
+            Text(tradeoffs.activeReserveSummary)
+                .font(VPTheme.mono(6.5))
+                .foregroundStyle(VPTheme.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
             profileSection(tradeoffs)
             qualitySection(tradeoffs.quality)
             confidenceSection(tradeoffs.confidence)
@@ -2667,7 +2688,7 @@ struct TradeoffQualityCard: View {
                 if profile.isCurrent(currentProfile) {
                     badge("CURRENT", tint: VPTheme.accent)
                 }
-                if profile.isRecommended {
+                if profile.showsRecommendedBadge(currentProfile: currentProfile) {
                     badge("RECOMMENDED", tint: VPTheme.success)
                 }
                 Spacer(minLength: 4)

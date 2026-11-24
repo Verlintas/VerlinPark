@@ -118,6 +118,9 @@ impl Engine {
         session_id: &str,
         grant_id: &str,
     ) -> Result<bool> {
+        // One receipt per grant: concurrent Leader/Manager/Worker/Labour
+        // boundaries must not both observe the same unused grant.
+        let _rescue_guard = self.rescue_lock.lock().await;
         let Some(grant) = self.active_rescue_grant(session_id).await? else {
             return Ok(false);
         };
@@ -226,6 +229,10 @@ impl Engine {
             ));
         }
 
+        // Serialize manual grants with the automatic path and with each other.
+        // A concurrent manual grant must not create a second active grant or
+        // race the automatic one-shot count.
+        let _rescue_guard = self.rescue_lock.lock().await;
         let status = self.rescue_status(&params.session_id).await?;
         if status.active {
             return Err(rescue_error(
@@ -326,7 +333,19 @@ impl Engine {
         if !eligible {
             return Ok(false);
         }
-        let _auto_rescue_guard = self.auto_rescue_lock.lock().await;
+        // Releasing a token/cost completion reserve cannot help when a
+        // configured economic dimension has no headroom left. Time-only
+        // headroom must not consume the session's one automatic grant.
+        let token_headroom = budget
+            .remaining_tokens
+            .is_none_or(|remaining| remaining > 0);
+        let cost_headroom = budget
+            .remaining_cost_usd
+            .is_none_or(|remaining| remaining > 0.0);
+        if !token_headroom || !cost_headroom {
+            return Ok(false);
+        }
+        let _rescue_guard = self.rescue_lock.lock().await;
         if self
             .count_events_of_kind(&session.id, SESSION_RESCUE_EVENT)
             .await?
@@ -832,6 +851,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_manual_grant_consumes_the_automatic_allowance() {
+        let (_data, _repo, engine, session) = fixture(Some(10_000)).await;
+        set_auto_rescue(&engine, &session.project_id, true).await;
+        engine.grant_rescue(params(&session)).await.unwrap();
+        engine
+            .store()
+            .update_session_status(&session.id, "running")
+            .unwrap();
+        record_usage(&engine, &session.id, 9_000, 0).await;
+        assert!(
+            !engine
+                .maybe_auto_rescue(&session.id, "completion_reserve_tokens")
+                .await
+                .unwrap(),
+            "a prior manual grant blocks the automatic one-shot"
+        );
+        assert_eq!(
+            engine
+                .count_events_of_kind(&session.id, SESSION_RESCUE_EVENT)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn auto_rescue_is_serialized_across_concurrent_turn_boundaries() {
         let (_data, _repo, engine, session) = fixture(Some(10_000)).await;
         set_auto_rescue(&engine, &session.project_id, true).await;
@@ -944,6 +989,32 @@ mod tests {
         // No remaining headroom.
         let (_data, _repo, engine, session) = fixture(Some(10_000)).await;
         set_auto_rescue(&engine, &session.project_id, true).await;
+        engine
+            .store()
+            .update_session_status(&session.id, "running")
+            .unwrap();
+        record_usage(&engine, &session.id, 10_000, 0).await;
+        assert!(
+            !engine
+                .maybe_auto_rescue(&session.id, "completion_reserve_tokens")
+                .await
+                .unwrap()
+        );
+
+        // Time-only headroom must not consume the one automatic grant when the
+        // token dimension that paused the turn has no headroom left.
+        let (_data, _repo, engine, session) = fixture(Some(10_000)).await;
+        set_auto_rescue(&engine, &session.project_id, true).await;
+        engine
+            .set_session_budget(SetSessionBudgetParams {
+                session_id: session.id.clone(),
+                mode: Some(BudgetMode::Fixed),
+                token_budget: Some(10_000),
+                time_budget_secs: Some(3_600),
+                ..SetSessionBudgetParams::default()
+            })
+            .await
+            .unwrap();
         engine
             .store()
             .update_session_status(&session.id, "running")
@@ -1357,6 +1428,29 @@ mod tests {
         assert!(
             status.eligible,
             "the consumed grant no longer blocks a new one"
+        );
+    }
+
+    #[tokio::test]
+    async fn rescue_consumption_is_one_receipt_across_concurrent_boundaries() {
+        let (_data, _repo, engine, session) = fixture(Some(10_000)).await;
+        let granted = engine.grant_rescue(params(&session)).await.unwrap();
+        let (first, second) = tokio::join!(
+            engine.consume_rescue_grant(&session.id, &granted.grant.id),
+            engine.consume_rescue_grant(&session.id, &granted.grant.id),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert!(
+            first ^ second,
+            "exactly one concurrent consumer may persist the receipt"
+        );
+        assert_eq!(
+            engine
+                .count_events_of_kind(&session.id, SESSION_RESCUE_USED_EVENT)
+                .await
+                .unwrap(),
+            1
         );
     }
 

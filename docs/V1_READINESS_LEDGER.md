@@ -199,24 +199,37 @@ route, approval, effect, Verifier, or merge row.
   stall observations. Per-task estimate precedence is session actuals, plan
   task envelope, project department actuals (nearest-rank p50/p90), department
   envelope, then an explicit unknown prior. An unknown estimate is `None`, not
-  zero; a path with no estimate is `insufficient_estimate`, and an unestimated
-  task is not feasible. Cost feasibility is evaluated independently of token
-  estimates.
+  zero; a path with no estimate is `insufficient_estimate`, a partly estimated
+  path is `partial_estimate` (with `estimated_tasks`/`total_tasks`), and an
+  unestimated task is not feasible. Zero-token/zero-cost history falls through
+  to the department envelope. Token, cost, and time reserve pressure is exposed
+  as `pressure_dimensions`; per-task feasibility checks token/cost estimates
+  against the task budget and session remaining (cost-only estimates are not
+  treated as unestimated). Critical-path failure reports
+  `critical_path_available=false` plus a bounded reason instead of silently
+  presenting the all-task fallback as the path.
 - `session.tradeoffs` / `vp tradeoffs` returns the five documented profile
-  postures, the current profile, the existing session turn/cost forecast
-  (repeated, not a per-profile guarantee), a bounded quality/reviewability
-  review, and a heuristic calibrated confidence score. A different profile is
-  badged recommended only for deterministic evidence (quality for
-  risk/blockers/blocked effects, cost under completion-reserve pressure); the
-  current profile is never double-badged and no profile is switched.
+  postures, the current profile, the **active contract reserve and its source**
+  (profile rows are labeled posture, not an implicit reserve change), the
+  existing session turn/cost forecast (repeated, not a per-profile guarantee),
+  a bounded quality/reviewability review, and a heuristic calibrated
+  confidence score. Test evidence comes from the test cache with a pass/fail
+  flag; a failing test lowers reviewability/confidence, and a queued or
+  conflicting merge entry is not labeled merged and does not add merge
+  confidence. A different profile is badged recommended only for deterministic
+  evidence (quality for risk/blockers/blocked effects, cost under token/cost/
+  time completion-reserve pressure); the current profile is never double-badged
+  by the client and no profile is switched.
 - `ProjectRunPolicy.auto_rescue` is off by default. When enabled, at most one
   automatic completion-reserve grant is appended per session, only when the
   turn pause is exactly `completion_reserve_*`, the session is fixed-budget and
-  near-completion eligible (latest commit, zero no-progress turns, headroom, no
-  prior grant). Eligibility reads run outside the lock; the count/append is
-  serialized in-process, and a manual grant consumes the same one-shot
-  allowance. An auto-rescue store/readiness error is logged and the normal
-  resource pause is kept rather than aborting the run. The grant releases only
+  near-completion eligible (latest commit, zero no-progress turns, token/cost
+  headroom, no prior grant). Manual and automatic grants and consumption share
+  one in-process lock; eligibility reads run outside it. A manual grant consumes
+  the automatic allowance; concurrent boundaries cannot append two grants or
+  consume one grant twice. An auto-rescue store/readiness error is logged and
+  the normal resource pause is kept, while a failure to persist the one-shot
+  consumption receipt fails closed and stops the turn. The grant releases only
   the completion reserve for its 30-minute TTL.
 - macOS: Project RunPolicy toggle with the one-shot/fixed-budget/no-bypass
   caveat, and Manage Dash → Usage & Budget Allocation insight and Trade-offs &
@@ -228,16 +241,25 @@ route, approval, effect, Verifier, or merge row.
 - A temp-daemon CLI smoke exercised `project-run-policy-set --auto-rescue`,
   `project-run-policy`, `allocation`, and `tradeoffs` against a real daemon and
   temporary repository. A temp-daemon GUI smoke exercised the two cards and the
-  policy toggle; no provider was configured, so no live turn-boundary auto
-  rescue was triggered (unit/daemon tests cover the grant path).
+  policy toggle: the trade-off card showed `active reserve 20% · project
+  policy · profile rows are documented posture`, profile rows showed `posture
+  25%` rather than an implied contract change, the allocation card showed
+  `0/0 task(s) estimated`, and CURRENT was not duplicated by RECOMMENDED. The
+  policy editor saved auto rescue on and the daemon reported `true`. No provider
+  was configured, so no live turn-boundary auto rescue was triggered
+  (unit/daemon tests cover the grant path).
 - Tests: targeted allocation, trade-off, auto-rescue, protocol, CLI, and
-  daemon tests; full workspace **4,624 passed / 0 failed / 6 ignored**;
+  daemon tests; full workspace **4,633 passed / 0 failed / 6 ignored**;
   Swift **659 passed (527 app + 132 helper)**; fmt, clippy,
   SwiftFormat, and `xcodebuild test` pass.
 - Limits: automatic per-task envelope reallocation and the daily attention
   schedule remain open. Estimates are sparse historical heuristics, not vendor
-  token counts; confidence is not a calibrated probability; profile forecasts
-  are not per-profile; the auto-rescue lock is same-daemon only.
+  token counts; test-cache evidence may predate the latest commit; confidence
+  is not a calibrated probability; profile forecasts are not per-profile;
+  profile reserves are documented posture, not automatic contract changes; the
+  auto-rescue lock is same-daemon only; project RunPolicy saves remain a
+  whole-policy read-modify-write without a compare-and-set precondition, so
+  concurrent editors can lose the other field.
 
 ## Carried findings from the V1 plan
 

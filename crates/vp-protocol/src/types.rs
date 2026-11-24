@@ -3539,6 +3539,11 @@ pub struct ReadinessSnapshot {
     pub latest_commit: Option<String>,
     #[serde(default)]
     pub latest_test: Option<String>,
+    /// Whether the newest test-cache entry passed. `None` means no test
+    /// evidence or an entry whose status was not recognized; an unverified
+    /// presence must not be treated as a passing test.
+    #[serde(default)]
+    pub latest_test_passed: Option<bool>,
     #[serde(default)]
     pub verifier: Option<String>,
     #[serde(default)]
@@ -4138,6 +4143,25 @@ pub struct AllocationFeasibility {
     pub headroom_tokens: Option<u64>,
     #[serde(default)]
     pub critical_path_tasks: Vec<String>,
+    /// How many focus tasks had a token or cost estimate. `estimated_tasks <
+    /// total_tasks` means the p50/p90 sums are partial and feasibility fails
+    /// closed with `partial_estimate`.
+    #[serde(default)]
+    pub estimated_tasks: u32,
+    #[serde(default)]
+    pub total_tasks: u32,
+    /// Economic/time dimensions currently inside the completion reserve
+    /// (`tokens`, `money`, `time`). Empty means no reserve pressure.
+    #[serde(default)]
+    pub pressure_dimensions: Vec<String>,
+    /// False when no stored plan exists or the critical-path computation failed.
+    /// In that case `critical_path_tasks` is empty and the preview focuses on
+    /// all remaining tasks.
+    #[serde(default)]
+    pub critical_path_available: bool,
+    /// Bounded reason code when the critical path is unavailable.
+    #[serde(default)]
+    pub critical_path_reason: Option<String>,
 }
 
 /// One advisory allocation recommendation. `action` never executes by itself.
@@ -4293,6 +4317,13 @@ pub struct TradeoffView {
     pub session_id: String,
     pub generated_at: String,
     pub current_profile: String,
+    /// Active contract reserve. Profile rows are documented posture only and
+    /// do not silently change this value.
+    #[serde(default)]
+    pub effective_completion_reserve_ratio: f64,
+    /// `session_override`, `project_policy`, or `derived`.
+    #[serde(default)]
+    pub reserve_source: String,
     #[serde(default)]
     pub profiles: Vec<ProfileTradeoff>,
     pub quality: QualityReview,
@@ -27947,6 +27978,7 @@ mod partial_delivery_protocol_tests {
             mergeable: false,
             latest_commit: None,
             latest_test: None,
+            latest_test_passed: None,
             verifier: None,
             merge: None,
             changed_paths: vec!["src/lib.rs".into()],
@@ -28055,6 +28087,7 @@ mod rescue_protocol_tests {
             mergeable: false,
             latest_commit: Some("0123456789abcdef".into()),
             latest_test: None,
+            latest_test_passed: None,
             verifier: None,
             merge: None,
             changed_paths: Vec::new(),
@@ -28198,6 +28231,11 @@ mod rescue_protocol_tests {
                 reserve_tokens: Some(2_000),
                 headroom_tokens: Some(4_000),
                 critical_path_tasks: vec!["T1".into()],
+                estimated_tasks: 1,
+                total_tasks: 1,
+                pressure_dimensions: vec!["tokens".into()],
+                critical_path_available: true,
+                critical_path_reason: None,
             },
             tasks: vec![AllocationTask {
                 task_id: "T1".into(),
@@ -28253,6 +28291,8 @@ mod rescue_protocol_tests {
             session_id: "ses-1".into(),
             generated_at: "2026-11-24T00:00:00Z".into(),
             current_profile: "balanced".into(),
+            effective_completion_reserve_ratio: 0.2,
+            reserve_source: "derived".into(),
             profiles: vec![ProfileTradeoff {
                 profile: "balanced".into(),
                 primary_goal: "default".into(),

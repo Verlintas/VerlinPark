@@ -2440,6 +2440,11 @@ struct AllocationFeasibilityView: Codable, Sendable, Equatable {
     let reserveTokens: UInt64?
     let headroomTokens: UInt64?
     let criticalPathTasks: [String]
+    let estimatedTasks: UInt32?
+    let totalTasks: UInt32?
+    let pressureDimensions: [String]
+    let criticalPathAvailable: Bool?
+    let criticalPathReason: String?
 
     enum CodingKeys: String, CodingKey {
         case feasible, reason, source
@@ -2451,6 +2456,11 @@ struct AllocationFeasibilityView: Codable, Sendable, Equatable {
         case reserveTokens = "reserve_tokens"
         case headroomTokens = "headroom_tokens"
         case criticalPathTasks = "critical_path_tasks"
+        case estimatedTasks = "estimated_tasks"
+        case totalTasks = "total_tasks"
+        case pressureDimensions = "pressure_dimensions"
+        case criticalPathAvailable = "critical_path_available"
+        case criticalPathReason = "critical_path_reason"
     }
 
     init(
@@ -2464,7 +2474,12 @@ struct AllocationFeasibilityView: Codable, Sendable, Equatable {
         source: String = "",
         reserveTokens: UInt64? = nil,
         headroomTokens: UInt64? = nil,
-        criticalPathTasks: [String] = []
+        criticalPathTasks: [String] = [],
+        estimatedTasks: UInt32? = nil,
+        totalTasks: UInt32? = nil,
+        pressureDimensions: [String] = [],
+        criticalPathAvailable: Bool? = nil,
+        criticalPathReason: String? = nil
     ) {
         self.feasible = feasible
         self.reason = reason
@@ -2477,6 +2492,11 @@ struct AllocationFeasibilityView: Codable, Sendable, Equatable {
         self.reserveTokens = reserveTokens
         self.headroomTokens = headroomTokens
         self.criticalPathTasks = criticalPathTasks
+        self.estimatedTasks = estimatedTasks
+        self.totalTasks = totalTasks
+        self.pressureDimensions = pressureDimensions
+        self.criticalPathAvailable = criticalPathAvailable
+        self.criticalPathReason = criticalPathReason
     }
 
     init(from decoder: Decoder) throws {
@@ -2492,6 +2512,37 @@ struct AllocationFeasibilityView: Codable, Sendable, Equatable {
         reserveTokens = try container.decodeIfPresent(UInt64.self, forKey: .reserveTokens)
         headroomTokens = try container.decodeIfPresent(UInt64.self, forKey: .headroomTokens)
         criticalPathTasks = GovernorDecoding.stringList(from: container, forKey: .criticalPathTasks)
+        estimatedTasks = try container.decodeIfPresent(UInt32.self, forKey: .estimatedTasks)
+        totalTasks = try container.decodeIfPresent(UInt32.self, forKey: .totalTasks)
+        pressureDimensions = GovernorDecoding.stringList(
+            from: container,
+            forKey: .pressureDimensions
+        )
+        criticalPathAvailable =
+            try container.decodeIfPresent(Bool.self, forKey: .criticalPathAvailable)
+        criticalPathReason =
+            try container.decodeIfPresent(String.self, forKey: .criticalPathReason)
+    }
+
+    var estimateCoverageLabel: String? {
+        guard let estimatedTasks, let totalTasks else { return nil }
+        return "\(estimatedTasks)/\(totalTasks) task(s) estimated"
+    }
+
+    var pressureLabel: String? {
+        let values = pressureDimensions
+            .compactMap { GovernorDecoding.humanizedToken($0, limit: 24) }
+            .prefix(6)
+            .map(\.self)
+        return values.isEmpty ? nil : values.joined(separator: ", ")
+    }
+
+    var criticalPathWarning: String? {
+        guard criticalPathAvailable == false,
+              let reason = GovernorDecoding.bounded(criticalPathReason, limit: 80),
+              reason != "no_plan"
+        else { return nil }
+        return "critical path unavailable (\(reason)); feasibility falls back to all remaining tasks"
     }
 
     var statusLabel: String {
@@ -3012,6 +3063,9 @@ struct TradeoffView: Codable, Sendable, Equatable {
     let sessionID: String
     let generatedAt: String
     let currentProfile: String
+    /// Active contract reserve. Profile rows are documented posture only.
+    let effectiveCompletionReserveRatio: Double?
+    let reserveSource: String
     let profiles: [ProfileTradeoffView]
     let quality: QualityReviewView?
     let confidence: TradeoffConfidenceView?
@@ -3023,12 +3077,16 @@ struct TradeoffView: Codable, Sendable, Equatable {
         case sessionID = "session_id"
         case generatedAt = "generated_at"
         case currentProfile = "current_profile"
+        case effectiveCompletionReserveRatio = "effective_completion_reserve_ratio"
+        case reserveSource = "reserve_source"
     }
 
     init(
         sessionID: String = "",
         generatedAt: String = "",
         currentProfile: String = "",
+        effectiveCompletionReserveRatio: Double? = nil,
+        reserveSource: String = "",
         profiles: [ProfileTradeoffView] = [],
         quality: QualityReviewView? = nil,
         confidence: TradeoffConfidenceView? = nil,
@@ -3038,6 +3096,8 @@ struct TradeoffView: Codable, Sendable, Equatable {
         self.sessionID = sessionID
         self.generatedAt = generatedAt
         self.currentProfile = currentProfile
+        self.effectiveCompletionReserveRatio = effectiveCompletionReserveRatio
+        self.reserveSource = reserveSource
         self.profiles = profiles
         self.quality = quality
         self.confidence = confidence
@@ -3050,6 +3110,9 @@ struct TradeoffView: Codable, Sendable, Equatable {
         sessionID = try container.decodeIfPresent(String.self, forKey: .sessionID) ?? ""
         generatedAt = try container.decodeIfPresent(String.self, forKey: .generatedAt) ?? ""
         currentProfile = try container.decodeIfPresent(String.self, forKey: .currentProfile) ?? ""
+        effectiveCompletionReserveRatio =
+            try container.decodeIfPresent(Double.self, forKey: .effectiveCompletionReserveRatio)
+        reserveSource = try container.decodeIfPresent(String.self, forKey: .reserveSource) ?? ""
         profiles = GovernorDecoding.elements(
             ProfileTradeoffView.self,
             from: container,
@@ -3067,6 +3130,26 @@ struct TradeoffView: Codable, Sendable, Equatable {
 
     var currentProfileTitle: String {
         GovernorDecoding.profileTitle(currentProfile)
+    }
+
+    /// Active contract reserve; profile rows are documented posture only.
+    var effectiveReserveLabel: String {
+        guard let ratio = effectiveCompletionReserveRatio, ratio.isFinite else {
+            return "not reported"
+        }
+        let percent = ratio * 100
+        if percent.rounded() == percent {
+            return "\(Int(percent))%"
+        }
+        return String(format: "%.1f%%", percent)
+    }
+
+    var reserveSourceLabel: String {
+        GovernorDecoding.humanizedToken(reserveSource, limit: 40) ?? "not reported"
+    }
+
+    var activeReserveSummary: String {
+        "active reserve \(effectiveReserveLabel) · \(reserveSourceLabel) · profile rows are documented posture"
     }
 
     /// Presentation order only: known profiles follow `RunProfile.allCases`,
@@ -3199,6 +3282,12 @@ struct ProfileTradeoffView: Codable, Sendable, Equatable {
         recommended == true
     }
 
+    /// Defensive presentation guard: even a faulty/older daemon payload must
+    /// not show CURRENT and RECOMMENDED on the same row.
+    func showsRecommendedBadge(currentProfile: String) -> Bool {
+        isRecommended && !isCurrent(currentProfile)
+    }
+
     /// Exact case-insensitive comparison against the daemon's current profile
     /// string. No profile is treated as current by default.
     func isCurrent(_ currentProfile: String) -> Bool {
@@ -3213,13 +3302,13 @@ struct ProfileTradeoffView: Codable, Sendable, Equatable {
 
     var reservePercentLabel: String {
         guard let completionReserveRatio, completionReserveRatio.isFinite else {
-            return "reserve not reported"
+            return "posture not reported"
         }
         let percent = completionReserveRatio * 100
         if percent.rounded() == percent {
-            return "\(Int(percent))% reserve"
+            return "posture \(Int(percent))%"
         }
-        return String(format: "%.1f%% reserve", percent)
+        return String(format: "posture %.1f%%", percent)
     }
 
     var attentionLabel: String {

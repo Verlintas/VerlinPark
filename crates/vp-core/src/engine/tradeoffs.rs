@@ -130,7 +130,9 @@ impl Engine {
                 "No USD cap/prices are configured; projected cost is not a guarantee.".to_string(),
             );
         }
-        if readiness.latest_test.is_none() {
+        if readiness.latest_test_passed == Some(false) {
+            warnings.push("The latest test evidence is failing.".to_string());
+        } else if readiness.latest_test.is_none() {
             warnings.push("No post-commit test evidence is recorded.".to_string());
         }
         if readiness.latest_commit.is_some() && readiness.verifier.is_none() {
@@ -170,6 +172,8 @@ impl Engine {
             session_id: session.id,
             generated_at: now_rfc3339(),
             current_profile: current_profile.to_string(),
+            effective_completion_reserve_ratio: contract.completion_reserve_ratio,
+            reserve_source: contract.source.clone(),
             profiles,
             quality,
             confidence,
@@ -225,11 +229,24 @@ fn quality_review(
         }
         reasons.push("no_commit".to_string());
     }
-    if readiness.latest_test.is_none() {
-        if reviewability == "ok" {
-            reviewability = "watch";
+    match (readiness.latest_test.as_ref(), readiness.latest_test_passed) {
+        (Some(_), Some(true)) => reasons.push("tests_passed".to_string()),
+        (Some(_), Some(false)) => {
+            reviewability = "risk";
+            reasons.push("tests_failed".to_string());
         }
-        reasons.push("no_tests".to_string());
+        (Some(_), None) => {
+            if reviewability == "ok" {
+                reviewability = "watch";
+            }
+            reasons.push("test_evidence_unverified".to_string());
+        }
+        (None, _) => {
+            if reviewability == "ok" {
+                reviewability = "watch";
+            }
+            reasons.push("no_tests".to_string());
+        }
     }
     if readiness.verifier.is_none() {
         if reviewability == "ok" {
@@ -237,8 +254,22 @@ fn quality_review(
         }
         reasons.push("no_verifier".to_string());
     }
-    if readiness.merge.is_some() {
+    if readiness.merge.as_deref() == Some("merged") {
         reasons.push("merged".to_string());
+    } else if let Some(status) = readiness.merge.as_deref() {
+        if matches!(status, "conflict" | "failed" | "interrupted") {
+            reviewability = "risk";
+        } else if reviewability == "ok" {
+            reviewability = "watch";
+        }
+        reasons.push(format!(
+            "merge_{}",
+            status
+                .chars()
+                .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                .take(32)
+                .collect::<String>()
+        ));
     } else if readiness.verifier.is_some() {
         reasons.push("verified".to_string());
     }
@@ -298,11 +329,21 @@ fn calibrated_confidence(
     } else {
         reasons.push("no commit evidence".to_string());
     }
-    if readiness.latest_test.is_some() {
-        score += 0.15;
-        reasons.push("test evidence".to_string());
-    } else {
-        reasons.push("no test evidence".to_string());
+    match (readiness.latest_test.as_ref(), readiness.latest_test_passed) {
+        (Some(_), Some(true)) => {
+            score += 0.15;
+            reasons.push("passing test evidence".to_string());
+        }
+        (Some(_), Some(false)) => {
+            score -= 0.10;
+            reasons.push("failing test evidence".to_string());
+        }
+        (Some(_), None) => {
+            reasons.push("unverified test evidence".to_string());
+        }
+        (None, _) => {
+            reasons.push("no test evidence".to_string());
+        }
     }
     if readiness.verifier.is_some() {
         score += 0.20;
@@ -310,9 +351,12 @@ fn calibrated_confidence(
     } else {
         reasons.push("no Verifier evidence".to_string());
     }
-    if readiness.merge.is_some() {
+    if readiness.merge.as_deref() == Some("merged") {
         score += 0.15;
         reasons.push("merge evidence".to_string());
+    } else if let Some(status) = readiness.merge.as_deref() {
+        score -= 0.05;
+        reasons.push(format!("merge pending: {status}"));
     }
     score += (sample_calls.min(10) as f64 / 10.0) * 0.10;
     if sample_calls == 0 {
@@ -357,14 +401,29 @@ fn has_reserve_pressure(
     budget: &vp_protocol::types::SessionBudgetStatus,
     contract: &vp_protocol::types::RunContractView,
 ) -> bool {
-    budget.remaining_tokens.is_some_and(|remaining| {
+    let token_pressure = budget.remaining_tokens.is_some_and(|remaining| {
         budget
             .hard_token_cap
             .or(budget.effective_token_budget)
             .is_some_and(|hard| {
                 remaining < ((hard as f64) * contract.completion_reserve_ratio) as u64
             })
-    })
+    });
+    let cost_pressure = budget.remaining_cost_usd.is_some_and(|remaining| {
+        budget
+            .hard_cost_cap_usd
+            .or(budget.effective_cost_budget_usd)
+            .is_some_and(|hard| hard > 0.0 && remaining < hard * contract.completion_reserve_ratio)
+    });
+    let time_pressure = budget.remaining_secs.is_some_and(|remaining| {
+        budget
+            .hard_wall_clock_secs
+            .or(budget.effective_time_budget_secs)
+            .is_some_and(|hard| {
+                hard > 0 && (remaining as f64) < hard as f64 * contract.completion_reserve_ratio
+            })
+    });
+    token_pressure || cost_pressure || time_pressure
 }
 
 /// Advisory only: the runtime never switches the session profile. Quality is
@@ -457,9 +516,64 @@ fn bounded_tradeoff_text(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use vp_protocol::types::{
-        AutoBudgetCaps, ReadinessSnapshot, ResourceSoftTargets, RunContractView, RunProfile,
-        RunStopPolicy,
+        AutoBudgetCaps, BudgetForecast, BudgetMode, ReadinessSnapshot, ResourceSoftTargets,
+        RunContractView, RunProfile, RunStopPolicy, SessionBudgetStatus,
     };
+
+    fn budget(
+        token_cap: Option<u64>,
+        remaining_tokens: Option<u64>,
+        cost_cap: Option<f64>,
+        remaining_cost: Option<f64>,
+    ) -> SessionBudgetStatus {
+        SessionBudgetStatus {
+            session_id: "ses-1".into(),
+            mode: BudgetMode::Fixed,
+            unlimited: false,
+            effective_token_budget: token_cap,
+            effective_cost_budget_usd: cost_cap,
+            effective_time_budget_secs: None,
+            hard_token_cap: token_cap,
+            hard_cost_cap_usd: cost_cap,
+            hard_wall_clock_secs: None,
+            spent_tokens: 0,
+            spent_cost_usd: 0.0,
+            elapsed_secs: 0,
+            remaining_tokens,
+            remaining_cost_usd: remaining_cost,
+            remaining_secs: None,
+            policy: None,
+            state: None,
+            forecast: BudgetForecast::default(),
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn reserve_pressure_checks_token_and_cost_caps() {
+        let contract = contract();
+        assert!(!has_reserve_pressure(
+            &budget(Some(10_000), Some(9_000), Some(10.0), Some(9.0)),
+            &contract
+        ));
+        assert!(has_reserve_pressure(
+            &budget(Some(10_000), Some(1_000), Some(10.0), Some(9.0)),
+            &contract
+        ));
+        assert!(has_reserve_pressure(
+            &budget(Some(10_000), Some(9_000), Some(10.0), Some(1.0)),
+            &contract
+        ));
+        assert!(!has_reserve_pressure(
+            &budget(None, None, None, None),
+            &contract
+        ));
+
+        let mut time_budget = budget(Some(10_000), Some(9_000), None, None);
+        time_budget.hard_wall_clock_secs = Some(3_600);
+        time_budget.remaining_secs = Some(100);
+        assert!(has_reserve_pressure(&time_budget, &contract));
+    }
 
     fn readiness(level: &str) -> ReadinessSnapshot {
         ReadinessSnapshot {
@@ -469,6 +583,7 @@ mod tests {
             mergeable: false,
             latest_commit: Some("abc123".into()),
             latest_test: None,
+            latest_test_passed: None,
             verifier: None,
             merge: None,
             changed_paths: vec!["src/lib.rs".into()],
@@ -542,6 +657,30 @@ mod tests {
         let dirty = quality_review(&readiness("dirty"), &[], &[], &[], &effects());
         assert_eq!(dirty.reviewability, "watch");
         assert!(dirty.reasons.contains(&"dirty".to_string()));
+
+        let mut queued = readiness("verified");
+        queued.latest_test = Some("test passed".into());
+        queued.latest_test_passed = Some(true);
+        queued.verifier = Some("approved · queue entry".into());
+        queued.merge = Some("queued".into());
+        let review = quality_review(&queued, &[], &[], &[], &effects());
+        assert!(review.reasons.contains(&"merge_queued".to_string()));
+        assert!(!review.reasons.contains(&"merged".to_string()));
+        assert_eq!(review.reviewability, "watch");
+
+        let mut merged = queued.clone();
+        merged.merge = Some("merged".into());
+        let review = quality_review(&merged, &[], &[], &[], &effects());
+        assert!(review.reasons.contains(&"merged".to_string()));
+        assert!(!review.reasons.contains(&"merge_merged".to_string()));
+
+        let mut failing = merged.clone();
+        failing.latest_test_passed = Some(false);
+        failing.merge = Some("conflict".into());
+        let review = quality_review(&failing, &[], &[], &[], &effects());
+        assert_eq!(review.reviewability, "risk");
+        assert!(review.reasons.contains(&"tests_failed".to_string()));
+        assert!(review.reasons.contains(&"merge_conflict".to_string()));
     }
 
     #[test]
@@ -550,12 +689,25 @@ mod tests {
         assert_eq!(low.level, "low");
         assert!(low.score < 0.45);
         let mut strong_readiness = readiness("merged");
-        strong_readiness.latest_test = Some("tests passed".into());
+        strong_readiness.latest_test = Some("test passed".into());
+        strong_readiness.latest_test_passed = Some(true);
         strong_readiness.verifier = Some("approved".into());
         strong_readiness.merge = Some("merged".into());
         let strong = calibrated_confidence(&strong_readiness, &quality(), 12);
         assert_eq!(strong.level, "high");
         assert!(strong.score >= 0.75);
+
+        let mut failing_readiness = strong_readiness.clone();
+        failing_readiness.latest_test_passed = Some(false);
+        failing_readiness.merge = Some("conflict".into());
+        let failing = calibrated_confidence(&failing_readiness, &quality(), 12);
+        assert!(failing.score < strong.score);
+        assert!(
+            failing
+                .reasons
+                .iter()
+                .any(|reason| reason == "failing test evidence")
+        );
     }
 
     #[test]

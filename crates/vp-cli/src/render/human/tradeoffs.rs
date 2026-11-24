@@ -30,6 +30,18 @@ pub(crate) fn tradeoff_lines(value: &Value) -> Option<Vec<String>> {
             .unwrap_or("unknown")
     )];
     lines.push(format!(
+        "  active reserve: {}% · source {} (profile rows are documented posture)",
+        value
+            .get("effective_completion_reserve_ratio")
+            .and_then(Value::as_f64)
+            .map(|ratio| format!("{:.0}", ratio * 100.0))
+            .unwrap_or_else(|| "?".to_string()),
+        value
+            .get("reserve_source")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+    ));
+    lines.push(format!(
         "  quality: readiness={} reviewability={} tasks={}/{} merged_entries={}",
         quality
             .get("readiness_level")
@@ -163,6 +175,8 @@ mod tests {
             "session_id": "ses-1",
             "generated_at": "2026-11-24T00:00:00Z",
             "current_profile": "balanced",
+            "effective_completion_reserve_ratio": 0.2,
+            "reserve_source": "project_policy",
             "profiles": [{
                 "profile": "balanced",
                 "primary_goal": "default",
@@ -207,6 +221,8 @@ mod tests {
         });
         let text = tradeoff_lines(&value).expect("tradeoff lines").join("\n");
         assert!(text.contains("tradeoffs: session=ses-1 current=balanced"));
+        assert!(text.contains("active reserve: 20%"));
+        assert!(text.contains("source project_policy"));
         assert!(text.contains("reviewability=watch"));
         assert!(text.contains("confidence: level=medium"));
         assert!(text.contains("balanced *"));

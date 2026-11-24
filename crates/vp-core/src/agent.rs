@@ -1094,9 +1094,11 @@ pub(in crate::agent) async fn pause_for_resource_block(
         let Some(reason) = resource_turn_pause_reason(&decision, auto_budget_active) else {
             // The turn is not pausing, so an active rescue grant has done its
             // one job: release the completion reserve for this boundary. The
-            // receipt is one-shot and idempotent. A consume failure must never
-            // fail the user's turn, and a turn that still pauses on a hard cap
-            // never reaches this branch.
+            // receipt is one-shot and idempotent. If the receipt cannot be
+            // persisted, fail closed: continuing would leave the reserve
+            // released for later boundaries without a durable one-shot
+            // receipt. A turn that still pauses on a hard cap never reaches
+            // this branch.
             if let Some(grant_id) = decision
                 .details
                 .get("rescue")
@@ -1104,12 +1106,13 @@ pub(in crate::agent) async fn pause_for_resource_block(
                 .and_then(|value| value.as_str())
                 && let Err(error) = engine.consume_rescue_grant(&session.id, grant_id).await
             {
-                tracing::warn!(
+                tracing::error!(
                     %error,
                     session_id = %session.id,
                     grant_id,
-                    "failed to consume rescue grant"
+                    "failed to persist rescue grant receipt; stopping the turn"
                 );
+                return Ok(false);
             }
             return Ok(true);
         };
