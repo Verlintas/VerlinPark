@@ -4,6 +4,33 @@ import Foundation
 // `session.resources` / `session.readiness` / `session.run_contract.get`; the
 // client never derives a budget or readiness claim from local state.
 
+enum RunProfile: String, Codable, CaseIterable, Sendable, Identifiable {
+    case quality
+    case balanced
+    case fast
+    case cheap
+    case unattended
+
+    var id: String {
+        rawValue
+    }
+
+    var title: String {
+        switch self {
+        case .quality: "Quality"
+        case .balanced: "Balanced"
+        case .fast: "Fast"
+        case .cheap: "Cheap"
+        case .unattended: "Unattended"
+        }
+    }
+
+    static func fromWire(_ value: String) -> RunProfile {
+        RunProfile(rawValue: value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+            ?? .balanced
+    }
+}
+
 struct ResourceDimensionView: Codable, Sendable, Identifiable, Equatable {
     let key: String
     let label: String
@@ -174,6 +201,10 @@ struct ResourceSnapshotView: Codable, Sendable, Equatable {
 
     func dimension(_ key: String) -> ResourceDimensionView? {
         dimensions.first { $0.key == key }
+    }
+
+    var profileValue: RunProfile {
+        RunProfile.fromWire(profile)
     }
 
     var needsAttention: Bool {

@@ -4636,6 +4636,27 @@ final class AppModel {
         }
     }
 
+    /// Explicit operator profile change. The daemon validates and records an
+    /// event; the card then reloads the derived snapshot instead of guessing.
+    func setRunProfile(_ profile: RunProfile) async {
+        guard let sessionID = selectedSessionID else { return }
+        let generation = selectionGeneration
+        sessionResourcesBusy = true
+        defer {
+            if isCurrent(sessionID: sessionID, generation: generation) {
+                sessionResourcesBusy = false
+            }
+        }
+        do {
+            _ = try await core.setRunContract(sessionID: sessionID, profile: profile)
+            await loadSessionResources(silent: true)
+        } catch {
+            if isCurrent(sessionID: sessionID, generation: generation) {
+                sessionResourcesError = error.localizedDescription
+            }
+        }
+    }
+
     private func refreshSessionBudgetSoon() {
         sessionBudgetRefreshTask?.cancel()
         sessionBudgetRefreshTask = Task { [weak self] in

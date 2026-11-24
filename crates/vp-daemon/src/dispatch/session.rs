@@ -58,6 +58,50 @@ pub(super) async fn handle(
                 Err(response) => response_with_id(id, response),
             }
         }
+        "session.run_contract.set" => {
+            match parse_params::<vp_protocol::types::SetRunContractParams>(request.params) {
+                Ok(params) => match state.engine.set_run_contract(params).await {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "session.resources.top_up" => {
+            match parse_params::<vp_protocol::types::TopUpSessionResourcesParams>(request.params) {
+                Ok(params) => {
+                    let session_id = params.session_id.clone();
+                    let resume = params.resume;
+                    match state.engine.top_up_session_budget(params).await {
+                        Ok((budget, capped)) => {
+                            let resumed = if resume {
+                                match state.agent.resume(&session_id).await {
+                                    Ok(resumed) => resumed,
+                                    Err(error) => return internal_error(id, error),
+                                }
+                            } else {
+                                false
+                            };
+                            match state.engine.session_resources(&session_id).await {
+                                Ok(resources) => RpcResponse::success(
+                                    id,
+                                    vp_protocol::types::TopUpSessionResourcesResult {
+                                        session_id,
+                                        budget,
+                                        resumed,
+                                        capped,
+                                        resources,
+                                    },
+                                ),
+                                Err(error) => internal_error(id, error),
+                            }
+                        }
+                        Err(error) => internal_error(id, error),
+                    }
+                }
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "session.effects" => match parse_params::<SessionEffectsParams>(request.params) {
             Ok(params) => {
                 let include_settled = params.include_settled.unwrap_or(true);

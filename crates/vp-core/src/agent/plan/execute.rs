@@ -222,6 +222,31 @@ pub(in crate::agent) async fn execute_team_plan(
             }
             return Ok(PlanRunResult::BudgetExceeded(BudgetStop::session(budget)));
         }
+        // R2a resource gate: do not start new work when attention/risk or the
+        // completion reserve is already exhausted. This is a dispatch guard,
+        // not a merge/verification gate; existing work continues.
+        match engine
+            .resource_governor_decision(&session.id, "dispatch")
+            .await
+        {
+            Ok(decision) if decision.should_block() => {
+                engine.record_resource_decision(&decision).await?;
+                reports.push(format!(
+                    "resource governor deferred dispatch: {} ({})",
+                    decision.reason,
+                    decision.bottleneck.as_deref().unwrap_or("no bottleneck")
+                ));
+                deferred_by_governor = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                // The guard is advisory infrastructure; a read failure must not
+                // silently block an otherwise valid run. The error is logged
+                // and the existing budget/approval gates remain authoritative.
+                tracing::warn!(%error, session_id = %session.id, "resource governor dispatch check failed");
+            }
+        }
         let governor_budget = GovernorBudgetView::new(
             budget.token_limit(),
             budget.spent(),

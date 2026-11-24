@@ -8,7 +8,7 @@
 
 ---
 
-## 2026-11-24 P0 tool friction + R1 Run Contract/resource observability
+## 2026-11-24 P0 tool friction + R1/R2a Run Contract governance
 
 按 ADR-0234 / `RUN_CONTRACT_AND_RESOURCE_GOVERNOR_PLAN.md` 落地第一轮。P0
 先修 live run 里最贵的工具摩擦：
@@ -30,7 +30,8 @@
   “operator 必须先 reconcile”，不再作为普通 failed 自动重跑；保留已验证
   commit 与 reconcile 路径。
 
-R1 先做只读多资源观测，不改变任何 budget/approval/merge 行为：
+R1 先做只读多资源观测；R2a 在此基础上增加受控的 operator override/top-up/
+pre-dispatch deferral，不改变 approval/Verifier/merge 行为：
 
 - `ResourceSnapshot`（money/raw tokens/weighted tokens/time/attention/risk/
   context/capacity/quality/progress）、`ReadinessSnapshot`（none/dirty/
@@ -43,12 +44,21 @@ R1 先做只读多资源观测，不改变任何 budget/approval/merge 行为：
   展开后的全维度和 warnings），并增加 Swift 模型/decoder tests。
 - R1 不写入事件、不暂停/加预算/改 merge；pricing 未配置时明确显示
   `unconfigured` 并使用 weighted tokens fallback，不伪造 `$0.00`。
-- 测试：core resource/readiness tests、daemon RPC read-only test、P0 tool/
-  permission/contract/project tests、Swift ResourceGovernorTests；最终
-  `cargo test --workspace` **4,546 passed / 0 failed / 6 ignored**，
-  `cargo clippy --workspace --all-targets -- -D warnings` 通过，macOS app
-  构建成功。宿主机 `syspolicyd`/XProtect spin 已单独调查并记录在
-  `HOST_SYSPOLICYD_INVESTIGATION.md`，不是仓库 bug。
+- R2a：`session.run_contract.set` 以 `session.run_contract.updated` 事件持久化
+  profile / reserve / attention cap / stop policy；`session.resources.top_up`
+  给 fixed/auto 预算增加额度并 clamp 到现有 cap，可选 resume；
+  `session.resource.decision` 在 dispatch 前因 blocked readiness、attention
+  cap 或 completion reserve 不足而 defer 新任务。CLI 增加
+  `run-contract-set` / `top-up`，Stage profile 菜单可切换 profile。
+- R2a 仍不暂停 active run、不做 turn-boundary pause/rebalance、不自动批准/
+  merge；Auto Budget 对 Worker/Labour 的扩展、attention 批处理、项目级 run
+  policy 和 macOS top-up sheet 属于 R2b。
+- 测试：R1 的 full workspace 为 **4,546 passed / 0 failed / 6 ignored**；R2a 后
+  最终 full workspace 为 **4,551 passed / 0 failed / 6 ignored**，
+  `cargo clippy --workspace --all-targets -- -D warnings` 通过；R2a 新增
+  core resource/governor/override/top-up 7 tests、daemon RPC 3 tests、Swift
+  4 tests，另有 live temp-daemon CLI smoke。宿主机 `syspolicyd`/XProtect spin
+  已单独调查并记录在 `HOST_SYSPOLICYD_INVESTIGATION.md`，不是仓库 bug。
 
 ## 2026-11-23 真实 DeepSeek + GUI 验证与 two hardenings
 

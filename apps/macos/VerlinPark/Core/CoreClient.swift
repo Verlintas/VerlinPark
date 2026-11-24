@@ -1402,6 +1402,26 @@ actor CoreClient {
         .decode(RunContractView.self)
     }
 
+    func setRunContract(
+        sessionID: String,
+        profile: RunProfile,
+        completionReserveRatio: Double? = nil,
+        attentionCap: UInt32? = nil
+    ) async throws -> RunContractView {
+        var params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "profile": .string(profile.rawValue),
+        ]
+        if let completionReserveRatio {
+            params["completion_reserve_ratio"] = .number(completionReserveRatio)
+        }
+        if let attentionCap {
+            params["attention_cap"] = .number(Double(attentionCap))
+        }
+        return try await request(method: "session.run_contract.set", params: params)
+            .decode(RunContractView.self)
+    }
+
     func sessionGates(
         sessionID: String,
         state: String? = nil,

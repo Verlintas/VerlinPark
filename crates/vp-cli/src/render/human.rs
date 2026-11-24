@@ -107,10 +107,10 @@ pub(crate) fn print_human_for(hint: Option<&str>, value: &Value) {
         println!("{line}");
         return;
     }
-    if super::budget::print(value) {
+    if resources::print(value) {
         return;
     }
-    if resources::print(value) {
+    if super::budget::print(value) {
         return;
     }
     if briefs::print(value) {

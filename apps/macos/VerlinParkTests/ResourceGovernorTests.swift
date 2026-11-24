@@ -61,6 +61,14 @@ final class ResourceGovernorTests: XCTestCase {
         XCTAssertFalse(snapshot.needsAttention)
     }
 
+    func testRunProfileWireMappingIsConservative() {
+        XCTAssertEqual(RunProfile.fromWire("quality"), .quality)
+        XCTAssertEqual(RunProfile.fromWire("FAST"), .fast)
+        XCTAssertEqual(RunProfile.fromWire("unattended"), .unattended)
+        XCTAssertEqual(RunProfile.fromWire("not-a-profile"), .balanced)
+        XCTAssertEqual(RunProfile.allCases.count, 5)
+    }
+
     func testRunContractDecodesCapsAndStopPolicy() throws {
         let json = try XCTUnwrap("""
         {"session_id":"ses-1","project_id":"prj-1","profile":"quality",

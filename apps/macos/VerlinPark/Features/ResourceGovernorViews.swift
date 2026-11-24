@@ -81,16 +81,30 @@ struct StageResourceCard: View {
                 .font(VPTheme.mono(7, weight: .semibold))
                 .tracking(1.0)
                 .foregroundStyle(VPTheme.textTertiary)
-            Text(resources.profile.uppercased())
-                .font(VPTheme.mono(7, weight: .semibold))
-                .tracking(0.5)
-                .foregroundStyle(tint)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                .background(tint.opacity(0.11), in: Capsule())
-                .overlay {
-                    Capsule().strokeBorder(tint.opacity(0.22), lineWidth: 1)
+            Menu {
+                ForEach(RunProfile.allCases) { profile in
+                    Button {
+                        Task { await model.setRunProfile(profile) }
+                    } label: {
+                        Text("\(profile.title) profile")
+                    }
                 }
+            } label: {
+                Text(resources.profileValue.title.uppercased())
+                    .font(VPTheme.mono(7, weight: .semibold))
+                    .tracking(0.5)
+                    .foregroundStyle(tint)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(tint.opacity(0.11), in: Capsule())
+                    .overlay {
+                        Capsule().strokeBorder(tint.opacity(0.22), lineWidth: 1)
+                    }
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .disabled(model.sessionResourcesBusy)
+            .help("Change the session Run Contract profile")
             if let readiness {
                 Text(readiness.levelLabel)
                     .font(VPTheme.mono(7, weight: .semibold))

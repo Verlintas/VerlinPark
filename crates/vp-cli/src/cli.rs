@@ -2727,6 +2727,33 @@ pub(crate) enum Command {
     Readiness { session: String },
     /// Show the derived Run Contract envelope.
     RunContract { session: String },
+    /// Set a bounded session Run Contract override (profile/reserve/attention).
+    RunContractSet {
+        session: String,
+        #[arg(long)]
+        profile: String,
+        /// Completion reserve ratio (0.0-0.5); verification/merge may spend it.
+        #[arg(long)]
+        reserve: Option<f64>,
+        /// Maximum weighted operator interrupts before dispatch/turn pause.
+        #[arg(long)]
+        attention_cap: Option<u32>,
+        /// No-progress turn limit for the contract view.
+        #[arg(long)]
+        no_progress_turns: Option<u32>,
+    },
+    /// Add budget and optionally resume a paused/blocked session. Never removes caps.
+    TopUp {
+        session: String,
+        #[arg(long)]
+        tokens: Option<u64>,
+        #[arg(long)]
+        cost: Option<f64>,
+        #[arg(long)]
+        time: Option<u64>,
+        #[arg(long)]
+        resume: bool,
+    },
     /// Show session cache-read telemetry and the prompt-prefix generation.
     Cache { session: String },
     /// Show the finalized stable cache epoch, cross-session reuse, and the

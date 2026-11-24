@@ -302,7 +302,9 @@ pub(crate) async fn run_command(
         | Command::Usage { .. }
         | Command::Resources { .. }
         | Command::Readiness { .. }
-        | Command::RunContract { .. } => session::dispatch(command, discovery, json).await,
+        | Command::RunContract { .. }
+        | Command::RunContractSet { .. }
+        | Command::TopUp { .. } => session::dispatch(command, discovery, json).await,
         Command::Scheduler { .. }
         | Command::Programs { .. }
         | Command::ProgramStatus { .. }

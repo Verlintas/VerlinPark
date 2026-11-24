@@ -347,12 +347,25 @@ pub(super) async fn dispatch(
     discovery: Discovery,
     _json: bool,
 ) -> Result<Option<Value>> {
-    let value =
-        match command {
-            Command::Sessions { project } => {
-                rpc(&discovery, "session.list", json!({"project_id": project})).await?
-            }
-            Command::SessionNew {
+    let value = match command {
+        Command::Sessions { project } => {
+            rpc(&discovery, "session.list", json!({"project_id": project})).await?
+        }
+        Command::SessionNew {
+            project,
+            goal,
+            priority,
+            token_budget,
+            cost_budget_usd,
+            time_budget_secs,
+            unlimited,
+            budget_mode,
+            auto,
+            max_token,
+            max_usd,
+            max_hours,
+        } => {
+            let params = session_new_params(
                 project,
                 goal,
                 priority,
@@ -365,40 +378,43 @@ pub(super) async fn dispatch(
                 max_token,
                 max_usd,
                 max_hours,
-            } => {
-                let params = session_new_params(
-                    project,
-                    goal,
-                    priority,
-                    token_budget,
-                    cost_budget_usd,
-                    time_budget_secs,
-                    unlimited,
-                    budget_mode,
-                    auto,
-                    max_token,
-                    max_usd,
-                    max_hours,
-                )?;
-                rpc(&discovery, "session.create", params).await?
-            }
-            Command::SessionBudget { session, .. } => {
-                rpc(
-                    &discovery,
-                    "session.budget.get",
-                    json!({"session_id": session}),
-                )
-                .await?
-            }
-            Command::SessionBudgetForecast { session, .. } => {
-                rpc(
-                    &discovery,
-                    "session.budget.forecast",
-                    json!({"session_id": session}),
-                )
-                .await?
-            }
-            Command::SessionBudgetSet {
+            )?;
+            rpc(&discovery, "session.create", params).await?
+        }
+        Command::SessionBudget { session, .. } => {
+            rpc(
+                &discovery,
+                "session.budget.get",
+                json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::SessionBudgetForecast { session, .. } => {
+            rpc(
+                &discovery,
+                "session.budget.forecast",
+                json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::SessionBudgetSet {
+            session,
+            mode,
+            token_budget,
+            cost_budget_usd,
+            time_budget_secs,
+            hard_token_cap,
+            hard_cost_cap_usd,
+            hard_wall_clock_secs,
+            clear_token_budget,
+            clear_cost_budget,
+            clear_time_budget,
+            clear_hard_token_cap,
+            clear_hard_cost_cap,
+            clear_hard_wall_clock_cap,
+            unlimited,
+        } => {
+            let params = session_budget_update_params(
                 session,
                 mode,
                 token_budget,
@@ -414,223 +430,255 @@ pub(super) async fn dispatch(
                 clear_hard_cost_cap,
                 clear_hard_wall_clock_cap,
                 unlimited,
-            } => {
-                let params = session_budget_update_params(
-                    session,
-                    mode,
-                    token_budget,
-                    cost_budget_usd,
-                    time_budget_secs,
-                    hard_token_cap,
-                    hard_cost_cap_usd,
-                    hard_wall_clock_secs,
-                    clear_token_budget,
-                    clear_cost_budget,
-                    clear_time_budget,
-                    clear_hard_token_cap,
-                    clear_hard_cost_cap,
-                    clear_hard_wall_clock_cap,
-                    unlimited,
-                )?;
-                rpc(&discovery, "session.budget.set", params).await?
-            }
-            Command::SessionUnlimited { session, enabled } => {
-                let params = session_budget_update_params(
-                    session,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    false,
-                    false,
-                    false,
-                    false,
-                    false,
-                    false,
-                    Some(enabled.unwrap_or(true)),
-                )?;
-                rpc(&discovery, "session.budget.set", params).await?
-            }
-            Command::SessionPriority { session, priority } => {
-                rpc(
-                    &discovery,
-                    "session.priority.set",
-                    json!({"session_id": session, "priority": priority}),
-                )
-                .await?
-            }
-            Command::Search {
-                query,
-                project,
-                limit,
-            } => {
-                rpc(
-                    &discovery,
-                    "session.search",
-                    json!({"query": query, "project_id": project, "limit": limit}),
-                )
-                .await?
-            }
-            Command::Events {
+            )?;
+            rpc(&discovery, "session.budget.set", params).await?
+        }
+        Command::SessionUnlimited { session, enabled } => {
+            let params = session_budget_update_params(
                 session,
-                since,
-                limit,
-            } => {
-                rpc(
-                    &discovery,
-                    "event.list",
-                    json!({"session_id": session, "since_seq": since, "limit": limit}),
-                )
-                .await?
-            }
-            Command::Prompt {
-                session,
-                content,
-                operation_id,
-            } => rpc(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                Some(enabled.unwrap_or(true)),
+            )?;
+            rpc(&discovery, "session.budget.set", params).await?
+        }
+        Command::SessionPriority { session, priority } => {
+            rpc(
+                &discovery,
+                "session.priority.set",
+                json!({"session_id": session, "priority": priority}),
+            )
+            .await?
+        }
+        Command::Search {
+            query,
+            project,
+            limit,
+        } => {
+            rpc(
+                &discovery,
+                "session.search",
+                json!({"query": query, "project_id": project, "limit": limit}),
+            )
+            .await?
+        }
+        Command::Events {
+            session,
+            since,
+            limit,
+        } => {
+            rpc(
+                &discovery,
+                "event.list",
+                json!({"session_id": session, "since_seq": since, "limit": limit}),
+            )
+            .await?
+        }
+        Command::Prompt {
+            session,
+            content,
+            operation_id,
+        } => {
+            rpc(
                 &discovery,
                 "session.prompt",
                 json!({"session_id": session, "content": content, "operation_id": operation_id}),
             )
-            .await?,
-            Command::Cancel { session } => {
-                rpc(&discovery, "session.cancel", json!({"session_id": session})).await?
+            .await?
+        }
+        Command::Cancel { session } => {
+            rpc(&discovery, "session.cancel", json!({"session_id": session})).await?
+        }
+        Command::Pause { session } => {
+            rpc(&discovery, "session.pause", json!({"session_id": session})).await?
+        }
+        Command::Resume { session } => {
+            rpc(&discovery, "session.resume", json!({"session_id": session})).await?
+        }
+        Command::ResumePlan { session } => {
+            rpc(
+                &discovery,
+                "session.plan_resume",
+                json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::Compatibility { session, run } => {
+            let mut params = json!({"session_id": session});
+            if let Some(run) = run {
+                params["run_id"] = json!(run);
             }
-            Command::Pause { session } => {
-                rpc(&discovery, "session.pause", json!({"session_id": session})).await?
-            }
-            Command::Resume { session } => {
-                rpc(&discovery, "session.resume", json!({"session_id": session})).await?
-            }
-            Command::ResumePlan { session } => {
+            rpc(&discovery, "session.compatibility", params).await?
+        }
+        Command::Diagnose {
+            session,
+            task,
+            limit,
+            graph,
+            record,
+            history,
+        } => {
+            if history {
                 rpc(
                     &discovery,
-                    "session.plan_resume",
-                    json!({"session_id": session}),
+                    "session.attributions",
+                    json!({"session_id": session, "limit": limit}),
                 )
                 .await?
-            }
-            Command::Compatibility { session, run } => {
-                let mut params = json!({"session_id": session});
-                if let Some(run) = run {
-                    params["run_id"] = json!(run);
-                }
-                rpc(&discovery, "session.compatibility", params).await?
-            }
-            Command::Diagnose {
-                session,
-                task,
-                limit,
-                graph,
-                record,
-                history,
-            } => {
-                if history {
-                    rpc(
-                        &discovery,
-                        "session.attributions",
-                        json!({"session_id": session, "limit": limit}),
-                    )
-                    .await?
+            } else {
+                let method = if record {
+                    "session.diagnosis.record"
                 } else {
-                    let method = if record {
-                        "session.diagnosis.record"
-                    } else {
-                        "session.diagnosis"
-                    };
-                    rpc(
-                        &discovery,
-                        method,
-                        json!({
-                            "session_id": session,
-                            "target_task_id": task,
-                            "limit": limit,
-                            "include_graph": graph,
-                        }),
-                    )
-                    .await?
-                }
-            }
-            Command::Context { session } => {
-                rpc(
-                    &discovery,
-                    "session.context",
-                    json!({"session_id": session}),
-                )
-                .await?
-            }
-            Command::Compact { session } => {
-                rpc(
-                    &discovery,
-                    "session.compact",
-                    json!({"session_id": session}),
-                )
-                .await?
-            }
-            Command::Todos { session } => {
-                rpc(&discovery, "session.todos", json!({"session_id": session})).await?
-            }
-            Command::CitationAudit { session } => {
-                rpc(
-                    &discovery,
-                    "session.citation_audit",
-                    json!({"session_id": session}),
-                )
-                .await?
-            }
-            Command::Citations { session, message } => {
-                rpc(
-                    &discovery,
-                    "session.citations",
-                    json!({"session_id": session, "message_id": message}),
-                )
-                .await?
-            }
-            Command::Transcript { session } => {
-                rpc(
-                    &discovery,
-                    "session.transcript",
-                    json!({"session_id": session}),
-                )
-                .await?
-            }
-            Command::Usage { session, csv } => {
-                let method = if csv {
-                    "session.usage_csv"
-                } else {
-                    "session.usage"
+                    "session.diagnosis"
                 };
-                rpc(&discovery, method, json!({"session_id": session})).await?
-            }
-            Command::Resources { session } => {
                 rpc(
                     &discovery,
-                    "session.resources",
-                    json!({"session_id": session}),
+                    method,
+                    json!({
+                        "session_id": session,
+                        "target_task_id": task,
+                        "limit": limit,
+                        "include_graph": graph,
+                    }),
                 )
                 .await?
             }
-            Command::Readiness { session } => {
-                rpc(
-                    &discovery,
-                    "session.readiness",
-                    json!({"session_id": session}),
-                )
-                .await?
-            }
-            Command::RunContract { session } => {
-                rpc(
-                    &discovery,
-                    "session.run_contract.get",
-                    json!({"session_id": session}),
-                )
-                .await?
-            }
-            _ => unreachable!("command routed to the wrong dispatch family"),
-        };
+        }
+        Command::Context { session } => {
+            rpc(
+                &discovery,
+                "session.context",
+                json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::Compact { session } => {
+            rpc(
+                &discovery,
+                "session.compact",
+                json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::Todos { session } => {
+            rpc(&discovery, "session.todos", json!({"session_id": session})).await?
+        }
+        Command::CitationAudit { session } => {
+            rpc(
+                &discovery,
+                "session.citation_audit",
+                json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::Citations { session, message } => {
+            rpc(
+                &discovery,
+                "session.citations",
+                json!({"session_id": session, "message_id": message}),
+            )
+            .await?
+        }
+        Command::Transcript { session } => {
+            rpc(
+                &discovery,
+                "session.transcript",
+                json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::Usage { session, csv } => {
+            let method = if csv {
+                "session.usage_csv"
+            } else {
+                "session.usage"
+            };
+            rpc(&discovery, method, json!({"session_id": session})).await?
+        }
+        Command::Resources { session } => {
+            rpc(
+                &discovery,
+                "session.resources",
+                json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::Readiness { session } => {
+            rpc(
+                &discovery,
+                "session.readiness",
+                json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::RunContract { session } => {
+            rpc(
+                &discovery,
+                "session.run_contract.get",
+                json!({"session_id": session}),
+            )
+            .await?
+        }
+        Command::RunContractSet {
+            session,
+            profile,
+            reserve,
+            attention_cap,
+            no_progress_turns,
+        } => {
+            let profile = vp_protocol::types::RunProfile::parse(&profile).ok_or_else(|| {
+                anyhow::anyhow!("profile must be quality, balanced, fast, cheap, or unattended")
+            })?;
+            let stop_policy = no_progress_turns.map(|turns| vp_protocol::types::RunStopPolicy {
+                no_progress_turns: turns,
+                ..vp_protocol::types::RunStopPolicy::default()
+            });
+            rpc(
+                &discovery,
+                "session.run_contract.set",
+                json!({
+                    "session_id": session,
+                    "profile": profile,
+                    "completion_reserve_ratio": reserve,
+                    "attention_cap": attention_cap,
+                    "stop_policy": stop_policy,
+                }),
+            )
+            .await?
+        }
+        Command::TopUp {
+            session,
+            tokens,
+            cost,
+            time,
+            resume,
+        } => {
+            rpc(
+                &discovery,
+                "session.resources.top_up",
+                json!({
+                    "session_id": session,
+                    "add_tokens": tokens,
+                    "add_cost_usd": cost,
+                    "add_time_secs": time,
+                    "resume": resume,
+                }),
+            )
+            .await?
+        }
+        _ => unreachable!("command routed to the wrong dispatch family"),
+    };
     Ok(Some(value))
 }
 

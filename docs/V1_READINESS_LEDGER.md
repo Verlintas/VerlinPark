@@ -74,12 +74,12 @@ Verification gaps:
 | V1-D08 | S1 | `read_files` rendered a 12-character sha256 prefix while `edit_file`/`write_file` required the full hash; the resulting `HASH_MISMATCH` looked like a concurrent edit and caused repeated re-read loops. | **CLOSED** | `read_files` now prints the full hash; write/edit errors include `actual_sha256`, a truncation-specific message, and an actionable hint; tool tests cover both paths |
 | V1-D09 | S1 | A bare Python `unittest` project without pyproject/pytest metadata was reported as `PROJECT_UNSUPPORTED`, pushing Agent runs into shell guessing. | **CLOSED** | `project_profile` detects `tests/test_*.py` and proposes `python3 -m unittest discover -s tests -v`; regression test covers the bare fixture |
 | V1-D10 | S1 | Contract analysis treated scratch verification writes and absolute read-only git commands as host-state/scope violations, creating repeated approvals and `.scratch-proof` artifacts in the worktree. | **CLOSED (P0)** | Shell exports `$VERLINPARK_WORKTREE`/`$VERLINPARK_SCRATCH`; prompts/recipes say cwd is the worktree; contract allows the stable scratch/TMPDIR prefixes; absolute read-only git (`status/diff/log/show/rev-parse/...`) is ReadOnly; `clean`/`reset --hard` remains Destructive. Tests cover all paths. |
-| V1-D11 | S1 | Fixed token budgets charged cache-read input at full weight, ignored missing prices, starved verification, and failed solvable runs; the dashboard could not show the difference between cheap-but-stuck and expensive-near-completion. | **PARTIAL** | R1 now exposes raw vs weighted tokens, money with `pricing_source`, time, attention, risk, context, capacity, quality, and progress plus readiness/forecast. Raw token caps remain authoritative until R2 governor/cost-weighted settlement; see ADR-0234 plan. |
-| V1-D12 | S2 | Operator attention had no budget or governor: repeated host-state approvals could consume the run without triggering a policy decision. | **OPEN (R2)** | R1 counts weighted interrupts and exposes an attention dimension/cap view; no automatic pause or policy prompt yet |
+| V1-D11 | S1 | Fixed token budgets charged cache-read input at full weight, ignored missing prices, starved verification, and failed solvable runs; the dashboard could not show the difference between cheap-but-stuck and expensive-near-completion. | **PARTIAL (R2a)** | R1 exposes raw vs weighted tokens, money with `pricing_source`, time, attention, risk, context, capacity, quality, and progress plus readiness/forecast. R2a adds operator top-up (clamped to caps) and pre-dispatch completion-reserve deferral. Raw token caps remain authoritative; cost-weighted settlement/automatic reallocation is R2b/R3. |
+| V1-D12 | S2 | Operator attention had no budget or governor: repeated host-state approvals could consume the run without triggering a policy decision. | **PARTIAL (R2a)** | Pre-dispatch guard now defers new work at the attention cap and emits `session.resource.decision`; the card shows weighted interrupts and a profile menu. True turn-boundary pause/wait and approval batching are R2b. |
 
-## Run Contract R1 (2026-11-24)
+## Run Contract R1/R2a (2026-11-24)
 
-Implemented the observe-only first slice from ADR-0234:
+Implemented the observe/operator slice from ADR-0234:
 
 - `session.resources` returns a bounded multi-resource snapshot (money, raw and
   cache-weighted tokens, time, attention, risk, context, capacity, quality,
@@ -90,17 +90,22 @@ Implemented the observe-only first slice from ADR-0234:
 - `session.run_contract.get` returns the derived profile, hard/soft targets,
   completion reserve, attention cap, acceptance, stop policy, and warnings.
 - `vp resources`, `vp readiness`, and `vp run-contract` use the same RPCs; the
-  macOS Stage has a read-only resource strip/card backed only by
-  `session.resources`.
-- R1 does not pause, spend, top up, approve, reconcile, merge, or route. It
-  appends no events. Missing prices are labeled `unconfigured`; readiness does
-  not infer tests from raw shell output.
+  macOS Stage has a resource strip/card backed only by `session.resources`.
+- R2a adds `session.run_contract.set` (event-backed profile/reserve/attention/
+  stop-policy override), `session.resources.top_up` (fixed/auto budgets clamped
+  to existing caps; optional resume), CLI `run-contract-set` / `top-up`, and a
+  Stage profile menu. A pre-dispatch governor defers new plan work when
+  readiness is blocked, the attention cap is reached, or the completion
+  reserve is insufficient, and records `session.resource.decision`.
+- R2a does not pause an active run, rebalance/rescue, approve, reconcile, merge,
+  or route. It does not remove caps or select unlimited. Missing prices are
+  labeled `unconfigured`; readiness does not infer tests from raw shell output.
 
-Tests: three core resource/readiness tests, two daemon RPC read-only tests,
-three Swift decoder tests, plus the P0 hash/scratch/permission/unittest/effect
-tests. Final full workspace: **4,546 passed, 0 failed, 6 ignored**; clippy exit
-0. The host `syspolicyd` spin is documented separately and is not a code
-failure.
+Tests: seven core resource/governor/override/top-up tests, three daemon RPC
+tests, four Swift decoder/profile tests, plus the P0 hash/scratch/permission/
+unittest/effect tests. Final full workspace after R2a: **4,551 passed, 0 failed,
+6 ignored**; clippy exit 0. A live temp-daemon CLI smoke exercised
+`run-contract-set`, `resources`, `top-up`, and `readiness` end to end.
 
 ## Carried findings from the V1 plan
 
@@ -129,15 +134,15 @@ ledger does not claim they are fixed.
 
 ## Verification commands
 
-Rust targeted final (after the last steering guard and P0/R1):
+Rust targeted final (after the last steering guard and P0/R1/R2a):
 
 ```bash
 cargo test -p vp-core --lib steering
 # 8 passed, 0 failed (includes the 7 operator-route tests and the inspector test)
 cargo test -p vp-daemon --bin verlinpadd tests::agent_operator_rpc_tests
-# 2 passed, 0 failed (operator route + read-only resources/readiness/contract RPCs)
+# 3 passed, 0 failed (operator route, read-only snapshots, contract override/top-up RPCs)
 cargo test -p vp-core --lib engine::resources::tests
-# 3 passed, 0 failed (snapshot/readiness/attention math)
+# 7 passed, 0 failed (snapshot/readiness/attention/governor/override/top-up)
 cargo test -p vp-core --lib 'tools::tests'
 # 28 passed, 0 failed (incl. full-hash, scratch env, shell confinement)
 cargo test -p vp-core --lib 'permissions::tests::read_only_git'
@@ -152,14 +157,16 @@ cargo test -p vp-core --lib 'agent::plan::execute::tests'
 # 1 passed, 0 failed (EFFECT_UNKNOWN blocked classification)
 ```
 
-Final full workspace (2026-11-24, healthy boot, after the clippy `vec!` fix):
+Final full workspace after R2a (2026-11-24, healthy boot):
 
 ```bash
 cargo test --workspace
-# 4,546 passed, 0 failed, 6 ignored
+# 4,551 passed, 0 failed, 6 ignored
 cargo clippy --workspace --all-targets -- -D warnings
 # exit 0
 ```
+
+R1's earlier full run was 4,546 passed / 0 failed / 6 ignored.
 
 The earlier full run before P0/R1 also passed every crate except the daemon
 operator test, which was fixed and is covered above. The host XProtect/
@@ -175,7 +182,7 @@ cd apps/macos && xcodegen generate
 xcodebuild -project VerlinPark.xcodeproj -scheme VerlinPark \
   -destination 'platform=macOS,arch=arm64' \
   -only-testing:VerlinParkTests/ResourceGovernorTests test
-# 3 passed, 0 failed
+# 4 passed, 0 failed
 xcodebuild -project VerlinPark.xcodeproj -scheme VerlinPark \
   -destination 'platform=macOS,arch=arm64' \
   -only-testing:VerlinParkTests/RuntimeReliabilityTests test

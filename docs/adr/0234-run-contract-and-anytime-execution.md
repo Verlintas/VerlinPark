@@ -252,8 +252,10 @@ Negative and limits:
    blocked/reconcile path, duplicate/no-progress guard.
 2. **R1 observe**: multi-resource snapshot, readiness, forecasts, profiles in
    read-only form; no behavior change.
-3. **R2 govern**: soft/hard thresholds, attention budget, completion reserve,
-   pause/top-up/resume, profile defaults.
+3. **R2 govern**: R2a implements event-backed profile/contract overrides,
+   bounded top-up, and pre-dispatch attention/risk/completion-reserve deferral;
+   R2b adds true turn-boundary pause/wait, attention prompts, Auto Budget
+   Worker/Labour extension, and project run policy.
 4. **R3 allocate**: task/plan-aware allocation, rescue/reallocation, learning
    from actuals, metareasoning/replan.
 5. **R4 deliver**: anytime UI, trade-off frontier, calibrated trust, daily

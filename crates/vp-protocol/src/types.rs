@@ -3534,6 +3534,14 @@ pub struct ResourceSnapshot {
     pub pricing_source: String,
 }
 
+impl ResourceSnapshot {
+    pub fn dimension(&self, key: &str) -> Option<&ResourceDimension> {
+        self.dimensions
+            .iter()
+            .find(|dimension| dimension.key == key)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResourceSoftTargets {
     #[serde(default)]
@@ -3608,6 +3616,88 @@ pub struct RunContractView {
     pub generated_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RunProfile {
+    Quality,
+    #[default]
+    Balanced,
+    Fast,
+    Cheap,
+    Unattended,
+}
+
+impl RunProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Quality => "quality",
+            Self::Balanced => "balanced",
+            Self::Fast => "fast",
+            Self::Cheap => "cheap",
+            Self::Unattended => "unattended",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "quality" => Some(Self::Quality),
+            "balanced" => Some(Self::Balanced),
+            "fast" => Some(Self::Fast),
+            "cheap" => Some(Self::Cheap),
+            "unattended" => Some(Self::Unattended),
+            _ => None,
+        }
+    }
+
+    /// Unknown values decode as `balanced` for additive protocol compatibility.
+    pub fn from_wire(value: &str) -> Self {
+        Self::parse(value).unwrap_or(Self::Balanced)
+    }
+}
+
+/// Session-scoped operator override for the derived Run Contract. The latest
+/// `session.run_contract.updated` event is the durable source; R2a does not add
+/// a separate projection table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunContractOverride {
+    pub profile: RunProfile,
+    #[serde(default)]
+    pub completion_reserve_ratio: Option<f64>,
+    #[serde(default)]
+    pub attention_cap: Option<u32>,
+    #[serde(default)]
+    pub stop_policy: Option<RunStopPolicy>,
+    pub updated_at: String,
+    #[serde(default)]
+    pub updated_by: Option<String>,
+}
+
+impl RunContractOverride {
+    pub fn validate(&self) -> Result<(), BudgetValidationError> {
+        if let Some(ratio) = self.completion_reserve_ratio
+            && (!ratio.is_finite() || !(0.0..=0.50).contains(&ratio))
+        {
+            return Err(BudgetValidationError::new(
+                auto_budget_codes::INVALID_BUDGET,
+                "completion reserve ratio must be between 0.0 and 0.5",
+            ));
+        }
+        if self
+            .attention_cap
+            .is_some_and(|cap| cap == 0 || cap > 1_000)
+        {
+            return Err(BudgetValidationError::new(
+                auto_budget_codes::INVALID_BUDGET,
+                "attention cap must be between 1 and 1000",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub const SESSION_RUN_CONTRACT_UPDATED_EVENT: &str = "session.run_contract.updated";
+pub const SESSION_RESOURCE_DECISION_EVENT: &str = "session.resource.decision";
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionResourcesParams {
     pub session_id: String,
@@ -3621,6 +3711,47 @@ pub struct SessionReadinessParams {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionRunContractParams {
     pub session_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetRunContractParams {
+    pub session_id: String,
+    pub profile: RunProfile,
+    #[serde(default)]
+    pub completion_reserve_ratio: Option<f64>,
+    #[serde(default)]
+    pub attention_cap: Option<u32>,
+    #[serde(default)]
+    pub stop_policy: Option<RunStopPolicy>,
+    #[serde(default)]
+    pub updated_by: Option<String>,
+}
+
+/// Additive budget top-up. Values are added to the effective budgets, clamped
+/// to the configured hard caps; this never removes a cap or switches to
+/// unlimited.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TopUpSessionResourcesParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub add_tokens: Option<u64>,
+    #[serde(default)]
+    pub add_cost_usd: Option<f64>,
+    #[serde(default)]
+    pub add_time_secs: Option<u64>,
+    #[serde(default)]
+    pub resume: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopUpSessionResourcesResult {
+    pub session_id: String,
+    pub budget: SessionBudgetStatus,
+    pub resumed: bool,
+    pub capped: bool,
+    pub resources: ResourceSnapshot,
 }
 
 /// One atomic auto-budget extension request. Requested values are additional

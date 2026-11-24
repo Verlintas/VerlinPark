@@ -3,6 +3,23 @@
 use super::*;
 
 pub(crate) fn print(value: &Value) -> bool {
+    if let Some(resources) = value.get("resources")
+        && let Some(dimensions) = resources.get("dimensions").and_then(Value::as_array)
+    {
+        println!(
+            "top-up: resumed={} capped={}",
+            value
+                .get("resumed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            value
+                .get("capped")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        );
+        print_resources(resources, dimensions);
+        return true;
+    }
     if let Some(dimensions) = value.get("dimensions").and_then(Value::as_array) {
         print_resources(value, dimensions);
         return true;

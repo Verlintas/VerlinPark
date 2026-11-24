@@ -284,6 +284,75 @@ async fn agent_inspect_and_direct_message_route_with_truthful_typed_errors() {
 }
 
 #[tokio::test]
+async fn run_contract_override_and_budget_top_up_rpcs_are_bounded() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let project = store
+        .add_project(repo.path().to_str().unwrap(), Some("contract-rpc"))
+        .unwrap();
+    let session = store.create_session(&project.id, "contract RPCs").unwrap();
+    let engine = Engine::new(store);
+    let state = app_state(data.path(), engine.clone());
+
+    let budget = call(
+        &state,
+        "session.budget.set",
+        json!({
+            "session_id": session.id,
+            "mode": "fixed",
+            "token_budget": 1000,
+            "hard_token_cap": 1200,
+        }),
+    )
+    .await;
+    assert!(budget.error.is_none(), "{:?}", budget.error);
+
+    let contract = call(
+        &state,
+        "session.run_contract.set",
+        json!({
+            "session_id": session.id,
+            "profile": "quality",
+            "completion_reserve_ratio": 0.3,
+            "attention_cap": 5,
+        }),
+    )
+    .await;
+    assert!(contract.error.is_none(), "{:?}", contract.error);
+    let contract = contract.result.unwrap();
+    assert_eq!(contract["profile"], "quality");
+    assert_eq!(contract["source"], "session_override");
+    assert_eq!(contract["completion_reserve_ratio"], 0.3);
+    assert_eq!(contract["attention_cap"], 5);
+
+    let resources = call(
+        &state,
+        "session.resources",
+        json!({"session_id": session.id}),
+    )
+    .await;
+    assert!(resources.error.is_none(), "{:?}", resources.error);
+    assert_eq!(resources.result.unwrap()["profile"], "quality");
+
+    let top_up = call(
+        &state,
+        "session.resources.top_up",
+        json!({
+            "session_id": session.id,
+            "add_tokens": 500,
+            "resume": false,
+        }),
+    )
+    .await;
+    assert!(top_up.error.is_none(), "{:?}", top_up.error);
+    let top_up = top_up.result.unwrap();
+    assert_eq!(top_up["capped"], true);
+    assert_eq!(top_up["budget"]["effective_token_budget"], 1200);
+    assert_eq!(top_up["resources"]["profile"], "quality");
+}
+
+#[tokio::test]
 async fn session_resource_readiness_and_contract_rpcs_are_read_only() {
     let data = TempDir::new().unwrap();
     let repo = TempDir::new().unwrap();

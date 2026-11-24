@@ -1,6 +1,6 @@
 # Run Contract and Resource Governor plan
 
-- Status: Accepted; P0/R1 implementation in progress
+- Status: Accepted; P0/R1 implemented, R2a implemented (profile override, top-up, pre-dispatch deferral); R2b/R3/R4 open
 - Date: 2026-11-24
 - Owner: Verlintas
 - Scope: V1 single-project coding
@@ -415,34 +415,50 @@ Phase R1 (read-only):
 - `session.readiness { session_id }` → `ReadinessSnapshot`.
 - `session.run_contract.get { session_id }` → derived `RunContract`.
 
-Phase R2 (operator mutations):
+Phase R2a (operator mutations implemented):
 
-- `session.run_contract.set { session_id, patch, expected_updated_at? }`.
+- `session.run_contract.set { session_id, profile, completion_reserve_ratio?,
+  attention_cap?, stop_policy?, updated_by? }` → updated `RunContractView`.
+- `session.resources.top_up { session_id, add_tokens?, add_cost_usd?,
+  add_time_secs?, resume, reason? }` → `TopUpSessionResourcesResult`.
+  Fixed sessions set a clamped effective budget; Auto sessions use the atomic
+  auto-extension path. Caps are never removed and unlimited is never selected.
+- A pre-dispatch governor decision (`continue`, `warn`, `defer`) is appended as
+  `session.resource.decision` only when it changes; it blocks new plan work but
+  does not pause/rebalance an active run or bypass verification.
+
+Phase R2b (open):
+
 - `project.run_policy.get/set`.
-- `session.resources.pause/resume/top_up` (or reuse existing budget/pause RPCs
-  with a governor reason).
+- True turn-boundary pause/wait, attention budget prompt, reallocation/rescue,
+  Auto Budget extension for Worker/Labour requests.
 
 ### 13.2 CLI
+
+Implemented:
 
 - `vp resources <session> [--json]`
 - `vp readiness <session> [--json]`
 - `vp run-contract <session> [--json]`
-- later: `vp run-contract-set`, `vp run-profile`, `vp top-up`.
+- `vp run-contract-set <session> --profile ... [--reserve ...] [--attention-cap ...] [--no-progress-turns ...]`
+- `vp top-up <session> [--tokens N] [--cost N] [--time N] [--resume]`
 
 ### 13.3 macOS
 
 - Stage/Manage Dash card: readiness, bottleneck, money/time/attention/risk,
   forecast, reserve, options.
 - No fake precision; show sample size/pricing source.
-- The card is read-only in R1; actions in R2.
+- The card is read-only except the profile menu in R2a; top-up/pause actions
+  remain CLI/Stage budget surfaces until R2b.
 
 ## 14. Persistence, events, replay
 
 - R1 snapshots are derived, bounded, and not events.
-- R2 contract overrides: `session_run_contracts` table + event
-  `session.run_contract.updated`; replay/repair/bundle/db-rebuild support.
-- Governor decisions: `session.governor.decision` event with reason/forecast/
-  options; bounded payload; replay/repair.
+- R2a contract overrides are **event-only**: the newest
+  `session.run_contract.updated` payload is the source, so replay/import carry
+  it without a new projection table. An imported session rejects `set`.
+- Governor decisions: `session.resource.decision` event with reason/forecast/
+  states; bounded payload; only non-`continue` actions are appended.
 - Readiness level changes: `session.readiness.changed` only on level changes,
   not every refresh.
 - Resource history: bounded rows/aggregates; no prompt/tool content/secrets.
@@ -461,7 +477,7 @@ Phase R2 (operator mutations):
 
 ## 16. Phases and acceptance
 
-### P0 — Tool friction (this round)
+### P0 — Tool friction (implemented)
 
 Deliver:
 
@@ -481,7 +497,7 @@ Acceptance: unit/integration tests for each; a focused fake/live scenario
 shows no repeated hash/scratch/read-only approval loop; existing budgets,
 approvals, Verifier, and merge tests unchanged.
 
-### R1 — Observe (this round)
+### R1 — Observe (implemented)
 
 Deliver:
 
@@ -495,13 +511,24 @@ Acceptance: a real/fake session shows money/weighted tokens/time/attention/
 risk/context/capacity/quality/progress/readiness; no behavior change; no
 secrets; no unbounded data.
 
-### R2 — Govern (next)
+### R2a — Govern (implemented)
 
-- Persist profile/contract overrides.
-- Soft/hard multi-resource thresholds, completion reserve, attention cap.
-- Pause/top-up/resume; partial delivery; readiness-aware stop.
-- Auto Budget covers TeamPlan Worker/Labour and reserves verification.
-- macOS actions.
+- Event-backed profile/contract override (`session.run_contract.updated`).
+- Completion reserve and attention/risk pre-dispatch deferral.
+- `session.resources.top_up` for fixed/auto budgets, clamped to caps.
+- CLI `run-contract-set` / `top-up`; macOS profile menu.
+- `session.resource.decision` for defer/warn decisions; no hidden gate bypass.
+
+Acceptance: override validation/event replay, governor attention/reserve tests,
+fixed top-up clamping, daemon RPC tests, Swift profile tests.
+
+### R2b — Govern (next)
+
+- True turn-boundary pause/wait and reallocation; readiness-aware stop.
+- Attention budget prompt/batching and Auto Budget extension for
+  Worker/Labour requests.
+- Project-level run policy and macOS top-up actions.
+- Partial-delivery operator flow.
 
 ### R3 — Allocate (next)
 
@@ -535,10 +562,11 @@ secrets; no unbounded data.
 - Existing sessions: no contract override; derived profile `balanced` unless an
   explicit auto policy/budget says otherwise.
 - Existing fixed/auto/unlimited budgets keep their current hard semantics in
-  R1. R2 may add soft profiles but must not widen a hard cap.
-- New schema is additive; old DBs migrate in place; bundle/import preserves
-  contracts/decisions as bounded evidence; imported sessions cannot mutate.
-- No secrets in the new tables/events.
+  R1/R2a. R2a top-up never removes a cap or selects unlimited.
+- R2a adds no new SQLite table: contract overrides and resource decisions are
+  event-only and bounded; bundle/import preserves them as bounded evidence;
+  imported sessions cannot mutate.
+- No secrets in the new events.
 
 ## 19. Non-goals
 
@@ -552,13 +580,16 @@ secrets; no unbounded data.
 
 ## 20. Immediate implementation slice
 
-This round implements **P0 + R1**:
+This round implements **P0 + R1 + R2a**:
 
 - tool friction fixes with tests;
 - read-only resource/readiness/contract RPCs and CLI;
-- Swift read-only card/models;
-- no governor behavior change yet (observe only);
-- ledger/docs updated with the multi-resource model and remaining R2/R3 work.
+- Swift resource card/models and profile menu;
+- event-backed profile/contract override and bounded top-up;
+- pre-dispatch deferral on attention/risk/completion reserve;
+- ledger/docs updated with the multi-resource model and remaining R2b/R3/R4
+  work.
 
-The next round starts with R2: persist overrides, soft/hard attention/risk/time
-thresholds, completion reserve, and pause/top-up/resume.
+The next round starts with **R2b**: true turn-boundary pause/wait, attention
+prompt/batching, Auto Budget extension for Worker/Labour, project run policy,
+and macOS top-up/partial-delivery actions.
