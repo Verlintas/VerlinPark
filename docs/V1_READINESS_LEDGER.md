@@ -141,8 +141,9 @@ Implemented the observe/operator slice from ADR-0234:
 Tests: R2b targeted: 27 auto-budget runtime tests, 368 `agent::tests`, 12
 resource tests, 2 project-policy/rebuild tests, 2 protocol stop-policy tests,
 434 store tests, 52 daemon tests, 188 CLI tests, 18 targeted Swift
-`ResourceGovernorTests`, and 628 full Swift tests (496 app + 132 helper); P0
-tests remain. Final full workspace after the last R2b slice is recorded below;
+`ResourceGovernorTests`, 5 Swift `MarkdownTranscriptTests`, and 633 full Swift
+tests (501 app + 132 helper); P0 tests remain. Final full workspace after the
+last R2b slice is recorded below;
 the final R2b governor/UI run was **4,570 passed, 0 failed, 6 ignored**;
 clippy exit 0. R2b project policy was 4,559; R2b core before it 4,554; R2a 4,551. A live
 temp-daemon CLI smoke exercised `run-contract-set`, `resources`, `top-up`, and
@@ -226,7 +227,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 R2b project policy was 4,559, R2b core before it 4,554, R2a 4,551, R1 4,546.
-Full Swift after the slice: 628 (496 app + 132 helper).
+Full Swift after the slice: 633 (501 app + 132 helper), including the
+Markdown transcript renderer tests. The Markdown change is macOS-only; the
+Rust workspace count remains 4,570.
 
 The earlier full run before P0/R1 also passed every crate except the daemon
 operator test, which was fixed and is covered above. The host XProtect/

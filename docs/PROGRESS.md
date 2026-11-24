@@ -90,6 +90,14 @@ pre-dispatch deferral，不改变 approval/Verifier/merge 行为：
   立即出现，Manage Dash Policies 的 Project RunPolicy card/editor 显示
   25%/11/4 并可展开保存界面；live provider 未配置，因此 pause banner 未在
   真实暂停中触发（Swift event 解析/清除测试覆盖）。
+- 对话 Markdown：assistant 消息不再用纯文本显示。新增 bounded
+  `MarkdownTranscript` 解析/渲染，覆盖 heading、段落、粗体/斜体/删除线、
+  inline code、fenced code（语言标签 + 横向滚动）、bullet/ordered/nested
+  list、quote、rule、简单 table、链接和 citation `[c1]`；不支持不执行 raw
+  HTML，不上传/加载远程内容。解析有 400 block、80k 字符、200 list item、
+  200 table row 上限；流式未闭合 code fence 仍按代码显示。GUI smoke 用真实
+  transcript 验证了 heading、列表、代码块、表格、引用、链接和 citation 的
+  排版。
 - R2b 仍未做 attention batching/prompt、显式 partial-delivery action/rescue
   和 governor 快照缓存。
 - 测试：R1 full workspace **4,546**；R2a 后 **4,551**；R2b core 后 **4,554**；
@@ -98,8 +106,10 @@ pre-dispatch deferral，不改变 approval/Verifier/merge 行为：
   `cargo clippy --workspace --all-targets -- -D warnings` 通过。targeted：
   27 auto-budget、368 agent、12 resource、2 project-policy/rebuild、2 protocol
   stop-policy、434 store、52 daemon、188 CLI、18 Swift
-  `ResourceGovernorTests`，full Swift **628**（496 app + 132 helper）均通过。
-  宿主机 `syspolicyd`/XProtect spin 已单独调查并记录在
+  `ResourceGovernorTests`、5 Swift `MarkdownTranscriptTests`，full Swift
+  **633**（501 app + 132 helper）均通过。Rust full workspace 仍为
+  **4,570 passed / 0 failed / 6 ignored**（本轮仅改 macOS 客户端）。宿主机
+  `syspolicyd`/XProtect spin 已单独调查并记录在
   `HOST_SYSPOLICYD_INVESTIGATION.md`，不是仓库 bug。
 
 ## 2026-11-23 真实 DeepSeek + GUI 验证与 two hardenings

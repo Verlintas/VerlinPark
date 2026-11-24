@@ -1569,22 +1569,21 @@ struct SessionChatView: View {
                 }
 
                 HStack(alignment: .bottom, spacing: 3) {
-                    Text(citationAttributedText(text, citations: citations))
-                        .font(VPTheme.font(12.5))
-                        .foregroundStyle(VPTheme.textPrimary)
-                        .lineSpacing(3)
-                        .tint(VPTheme.accent)
-                        .textSelection(.enabled)
+                    MarkdownTranscriptView(text: text, citations: citations)
                         .environment(\.openURL, OpenURLAction { url in
                             guard url.scheme == "verlinpark",
                                   url.host == "citation"
-                            else { return .systemAction }
+                            else {
+                                return MarkdownLinkPolicy.allowsExternalOpen(url)
+                                    ? .systemAction
+                                    : .discarded
+                            }
                             let key = url.lastPathComponent
                             if let citation = citations.first(where: { $0.key == key }) {
                                 activeCitation = citation
                                 return .handled
                             }
-                            return .systemAction
+                            return .discarded
                         })
                     if streaming {
                         VPStreamingCaret(tint: VPTheme.accent)
@@ -1612,40 +1611,6 @@ struct SessionChatView: View {
 
             Spacer(minLength: 40)
         }
-    }
-
-    private func citationAttributedText(
-        _ text: String,
-        citations: [SourceCitation]
-    ) -> AttributedString {
-        guard !citations.isEmpty else { return AttributedString(text) }
-        let keys = Set(citations.map(\.key))
-        let regex = try? NSRegularExpression(pattern: "\\[(c\\d+)\\]")
-        guard let regex else { return AttributedString(text) }
-        var result = AttributedString()
-        var cursor = text.startIndex
-        let fullRange = NSRange(text.startIndex..., in: text)
-        for match in regex.matches(in: text, range: fullRange) {
-            guard let range = Range(match.range, in: text),
-                  let keyRange = Range(match.range(at: 1), in: text)
-            else { continue }
-            result += AttributedString(String(text[cursor ..< range.lowerBound]))
-            let key = String(text[keyRange])
-            if keys.contains(key) {
-                var marker = AttributedString("[\(key)]")
-                marker.link = URL(string: "verlinpark://citation/\(key)")
-                marker.foregroundColor = VPTheme.accent
-                marker.font = VPTheme.mono(9.5, weight: .semibold)
-                result += marker
-            } else {
-                result += AttributedString(String(text[range]))
-            }
-            cursor = range.upperBound
-        }
-        if cursor < text.endIndex {
-            result += AttributedString(String(text[cursor...]))
-        }
-        return result
     }
 
     private func citationStrip(_ citations: [SourceCitation]) -> some View {
