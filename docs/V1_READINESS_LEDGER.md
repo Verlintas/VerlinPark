@@ -274,7 +274,7 @@ effect, Verifier, or merge row.
   turn-boundary auto rescue or runtime envelope reallocation was triggered
   (unit/daemon tests cover both paths).
 - Tests: targeted allocation, trade-off, auto-rescue, protocol, CLI, and
-  daemon tests; full workspace **4,647 passed / 0 failed / 6 ignored**;
+  daemon tests; full workspace **4,649 passed / 0 failed / 6 ignored**;
   Swift **659 passed (527 app + 132 helper)**; fmt, clippy,
   SwiftFormat, and `xcodebuild test` pass.
 - Limits: persisted plan-revision reallocation, cross-department/session
@@ -284,9 +284,13 @@ effect, Verifier, or merge row.
   be forgotten after very heavy plan revision (department/session/project caps
   still bound actual spend). A target/department budget revision invalidates an
   old overlay; a Worker retry may then need a top-up or plan edit, while
-  Verifier/Scout are not task-cap bound. Estimates are sparse historical
-  heuristics, not vendor token counts; test-cache evidence may predate the latest
-  commit;
+  Verifier/Scout are not task-cap bound. Reallocation events are schema v2 with
+  source fingerprints; pre-v2/legacy events without a matching fingerprint are
+  ignored (their sources remain consumed). R3b binds sources before the first
+  governor/approval gate; a run denied at admission leaves the event for its
+  retry. Estimates are sparse historical heuristics, not vendor token counts; task feasibility is a plan-envelope
+  forecast, not a next-call reservation; test-cache evidence may predate the
+  latest commit;
   confidence is not a calibrated probability; profile forecasts are not
   per-profile; profile reserves are documented posture, not automatic contract
   changes; rescue is same-daemon and envelope serialization is per-session

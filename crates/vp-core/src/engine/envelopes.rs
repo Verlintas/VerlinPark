@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use vp_protocol::types::TeamPlan;
 
 pub(crate) const SESSION_ENVELOPE_REALLOCATED_EVENT: &str = "session.envelope.reallocated";
-pub(crate) const ENVELOPE_REALLOCATION_SCHEMA: &str = "verlinpark.envelope_reallocation/v1";
+pub(crate) const ENVELOPE_REALLOCATION_SCHEMA: &str = "verlinpark.envelope_reallocation/v2";
 const MAX_ENVELOPE_EVENTS: u32 = 1_000;
 const MAX_ENVELOPE_SOURCES: usize = 100;
 const ENVELOPE_REALLOCATION_REASON: &str = "completed_task_unused_envelope";
@@ -100,17 +100,19 @@ fn fold_reallocation_events(
         }
         // Source capacity is consumed per dimension and stays consumed even
         // when the target plan changed.
+        let mut source_ids = Vec::new();
         for source in payload.sources.iter().take(MAX_ENVELOPE_SOURCES) {
             if source.task_id.trim().is_empty() {
                 continue;
             }
+            source_ids.push(source.task_id.clone());
             let entry = consumed.entry(source.task_id.clone()).or_default();
             entry.tokens = entry.tokens.saturating_add(source.released_tokens);
             if source.released_cost_usd.is_finite() && source.released_cost_usd > 0.0 {
                 entry.cost_usd += source.released_cost_usd;
             }
         }
-        let fingerprint = plan_fingerprint(plan, &payload.target_task_id);
+        let fingerprint = plan_fingerprint(plan, &payload.target_task_id, &source_ids);
         if payload.plan_fingerprint.as_deref() != Some(fingerprint.as_str()) {
             continue;
         }
@@ -148,7 +150,11 @@ fn fold_reallocation_events(
 /// Fingerprint of the target task's budget and its department cap. Unrelated
 /// task edits must not invalidate an overlay; a target or department budget
 /// revision must.
-pub(crate) fn plan_fingerprint(plan: &TeamPlan, target_task_id: &str) -> String {
+pub(crate) fn plan_fingerprint(
+    plan: &TeamPlan,
+    target_task_id: &str,
+    source_task_ids: &[String],
+) -> String {
     let Some(task) = plan.tasks.iter().find(|task| task.id == target_task_id) else {
         return "missing-target".to_string();
     };
@@ -170,6 +176,22 @@ pub(crate) fn plan_fingerprint(plan: &TeamPlan, target_task_id: &str) -> String 
             department.token_budget,
             department.cost_budget_usd.map(|value| value.to_bits())
         ));
+    }
+    let mut sources = source_task_ids.to_vec();
+    sources.sort();
+    sources.dedup();
+    for source_id in sources {
+        if let Some(source) = plan.tasks.iter().find(|task| task.id == source_id) {
+            parts.push(format!(
+                "s:{}:{}:{:?}:{:?}",
+                source.id,
+                source.department,
+                source.token_budget,
+                source.cost_budget_usd.map(|value| value.to_bits())
+            ));
+        } else {
+            parts.push(format!("s:{source_id}:missing"));
+        }
     }
     crate::sha256_hex(parts.join("\n").as_bytes())
 }
@@ -283,16 +305,25 @@ impl Engine {
             )
             .await?;
         let (effective, consumed, latest_targets) = fold_reallocation_events(plan, events);
+        let (target_actual_tokens, target_actual_cost, _, _) =
+            self.usage_spent(&session.id, Some(task_id), None).await?;
 
-        // Idempotent replay: the target already consumed/received a
-        // reallocation. Return the same runtime effective plan without another
-        // event, and keep the stored plan untouched.
+        // Idempotent replay: the target already received a reallocation and
+        // still has headroom. If that cap is exhausted, fall through to allow
+        // a new top-up event from sources that have not been consumed yet.
         if latest_targets.contains(task_id) {
-            let mut runtime_plan = plan.clone();
-            if let Some(budget) = effective.get(task_id) {
-                apply_effective_budget(&mut runtime_plan, task_id, *budget);
+            let current = effective.get(task_id).copied().unwrap_or_default();
+            let token_exhausted = current
+                .tokens
+                .is_some_and(|cap| target_actual_tokens >= cap);
+            let cost_exhausted = current
+                .cost_usd
+                .is_some_and(|cap| target_actual_cost >= cap);
+            if !token_exhausted && !cost_exhausted {
+                let mut runtime_plan = plan.clone();
+                apply_effective_budget(&mut runtime_plan, task_id, current);
+                return Ok(Some(runtime_plan));
             }
-            return Ok(Some(runtime_plan));
         }
 
         let statuses = self
@@ -322,8 +353,6 @@ impl Engine {
         // A retry may already have overshot the stored task cap. The new cap
         // must cover observed spend, or the event would be immediately
         // unusable and would consume sources for nothing.
-        let (target_actual_tokens, target_actual_cost, _, _) =
-            self.usage_spent(&session.id, Some(task_id), None).await?;
         let base_token = old_token.map(|old| old.max(target_actual_tokens));
         let base_cost = old_cost.map(|old| old.max(target_actual_cost.max(0.0)));
         let token_room = base_token
@@ -343,6 +372,7 @@ impl Engine {
         let mut released_tokens = 0u64;
         let mut released_cost = 0.0f64;
         let mut sources = Vec::new();
+        let mut source_ids = Vec::new();
         for candidate in &plan.tasks {
             if candidate.id == task_id || candidate.department != target.department {
                 continue;
@@ -380,6 +410,7 @@ impl Engine {
             }
             released_tokens = released_tokens.saturating_add(take_tokens);
             released_cost += take_cost;
+            source_ids.push(candidate.id.clone());
             sources.push(serde_json::json!({
                 "task_id": candidate.id,
                 "released_tokens": take_tokens,
@@ -409,7 +440,7 @@ impl Engine {
                 "schema": ENVELOPE_REALLOCATION_SCHEMA,
                 "target_task_id": target.id,
                 "department": target.department,
-                "plan_fingerprint": plan_fingerprint(plan, &target.id),
+                "plan_fingerprint": plan_fingerprint(plan, &target.id, &source_ids),
                 "old_token_budget": old_token,
                 "new_token_budget": new_token,
                 "old_cost_budget_usd": old_cost,
@@ -849,6 +880,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_exhausted_overlay_can_be_topped_up_from_new_sources() {
+        let plan = plan(
+            vec![department("impl", None, None)],
+            vec![
+                task("T1", "impl", Some(5_000), None),
+                task("T2", "impl", Some(1_000), None),
+                task("T3", "impl", Some(1_000), None),
+            ],
+        );
+        let (_data, _repo, engine, session) = setup(&plan, true).await;
+        complete_task(&engine, &session.id, "T1");
+        let first = engine
+            .effective_plan_for_budget(&session, &plan, "T2")
+            .await
+            .unwrap()
+            .expect("first reallocation");
+        assert_eq!(
+            first
+                .tasks
+                .iter()
+                .find(|task| task.id == "T2")
+                .unwrap()
+                .token_budget,
+            Some(6_000)
+        );
+        record_usage(&engine, &session.id, "T2", "impl", 6_000, 0, 0.0).await;
+        complete_task(&engine, &session.id, "T3");
+
+        let topped_up = engine
+            .effective_plan_for_budget(&session, &plan, "T2")
+            .await
+            .unwrap()
+            .expect("new T3 capacity tops up the exhausted target");
+        assert_eq!(
+            topped_up
+                .tasks
+                .iter()
+                .find(|task| task.id == "T2")
+                .unwrap()
+                .token_budget,
+            Some(7_000)
+        );
+        assert_eq!(event_count(&engine, &session.id).await, 2);
+    }
+
+    #[tokio::test]
     async fn source_dimensions_are_consumed_independently() {
         let plan = plan(
             vec![department("impl", None, None)],
@@ -1017,8 +1094,9 @@ mod tests {
         let unrelated_changed = plan(
             vec![department("impl", None, None)],
             vec![
-                task("T1", "impl", Some(4_000), None),
+                task("T1", "impl", Some(5_000), None),
                 task("T2", "impl", Some(1_000), None),
+                task("T3", "impl", Some(1_000), None),
             ],
         );
         let replay = engine
@@ -1034,6 +1112,23 @@ mod tests {
                 .unwrap()
                 .token_budget,
             Some(6_000)
+        );
+
+        let source_changed = plan(
+            vec![department("impl", None, None)],
+            vec![
+                task("T1", "impl", Some(4_000), None),
+                task("T2", "impl", Some(1_000), None),
+                task("T3", "impl", Some(1_000), None),
+            ],
+        );
+        assert!(
+            engine
+                .effective_plan_for_budget(&session, &source_changed, "T2")
+                .await
+                .unwrap()
+                .is_none(),
+            "a source-budget revision must invalidate the old target overlay"
         );
 
         let narrowed = plan(

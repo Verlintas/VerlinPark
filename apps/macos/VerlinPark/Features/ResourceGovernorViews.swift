@@ -2470,7 +2470,7 @@ struct AllocationInsightCard: View {
 
     private var footer: some View {
         Text(
-            "Daemon estimates and advisory recommendations only. This card does not add budget, change a task envelope or model, alter routing, or bypass approvals, Verifier, or Integrator."
+            "Daemon estimates and advisory recommendations only. This card does not add budget, change a task envelope or model, alter routing, or bypass approvals, Verifier, or Integrator. Task feasibility is a forecast against the effective envelope, not a next-call reservation."
         )
         .font(VPTheme.mono(6.5))
         .foregroundStyle(VPTheme.textTertiary)

@@ -2209,13 +2209,14 @@ mod tests {
             tasks: vec![task("T1", 1, Some(5_000)), task("T2", 1, Some(1_000))],
         };
         engine.submit_team_plan(&session.id, &plan).await.unwrap();
-        let fingerprint = crate::engine::envelopes::plan_fingerprint(&plan, "T2");
+        let fingerprint =
+            crate::engine::envelopes::plan_fingerprint(&plan, "T2", &["T1".to_string()]);
         engine
             .append_event(
                 &session.id,
                 "session.envelope.reallocated",
                 serde_json::json!({
-                    "schema": "verlinpark.envelope_reallocation/v1",
+                    "schema": "verlinpark.envelope_reallocation/v2",
                     "plan_fingerprint": fingerprint,
                     "target_task_id": "T2",
                     "department": "impl",

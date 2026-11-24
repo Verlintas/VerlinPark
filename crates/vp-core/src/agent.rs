@@ -1073,6 +1073,14 @@ pub(in crate::agent) fn resource_turn_pause_applies(role: AgentRole, auto_approv
     !auto_approve && !matches!(role, AgentRole::Verifier)
 }
 
+/// Verification/Scout evidence work is not admitted by the critical-path
+/// governor; it keeps department/session/project budgets and the completion
+/// reserve. This preserves the pre-R3b no-deferral behavior after those roles
+/// stopped consuming the implementation task envelope.
+pub(in crate::agent) fn critical_path_gate_applies(role: AgentRole) -> bool {
+    !matches!(role, AgentRole::Verifier | AgentRole::Scout)
+}
+
 /// R2b true turn-boundary resource pause. Every user-work role observes the
 /// same deterministic session decision before a provider request. A block
 /// preserves the worktree/commit and waits for an explicit operator

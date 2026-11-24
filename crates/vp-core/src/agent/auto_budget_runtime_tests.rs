@@ -2079,6 +2079,16 @@ fn resource_governor_decisions_map_to_bounded_turn_pause_reasons() {
     assert!(!resource_turn_pause_applies(AgentRole::Manager, true));
 }
 
+#[test]
+fn critical_path_gate_does_not_defer_verification_or_scout() {
+    assert!(critical_path_gate_applies(AgentRole::Leader));
+    assert!(critical_path_gate_applies(AgentRole::Manager));
+    assert!(critical_path_gate_applies(AgentRole::Worker));
+    assert!(critical_path_gate_applies(AgentRole::Labour));
+    assert!(!critical_path_gate_applies(AgentRole::Verifier));
+    assert!(!critical_path_gate_applies(AgentRole::Scout));
+}
+
 #[tokio::test]
 async fn worker_request_fit_extends_the_auto_budget_without_owning_turns() {
     let harness = harness(vec![final_turn("worker complete", 40, 8)], 10).await;

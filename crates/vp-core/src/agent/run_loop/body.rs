@@ -1191,7 +1191,8 @@ pub(in crate::agent) async fn run_loop_body(
         let governor_gate = governor_context
             .as_ref()
             .and_then(|context| context.gate(governor_budget.0, governor_budget.1));
-        if !plan_budget.active()
+        if critical_path_gate_applies(spec.role)
+            && !plan_budget.active()
             && !budget.is_unlimited()
             && let Some(gate) = governor_gate.as_ref()
         {

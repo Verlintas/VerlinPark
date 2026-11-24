@@ -88,7 +88,7 @@ Verifier 或 Integrator。
   跨 host 不成立；project RunPolicy 保存仍是整包 read-modify-write，没有
   updated_at/CAS 前置条件。
 - 测试：targeted allocation/tradeoff/rescue/protocol/CLI/daemon + full
-  workspace **4,647 passed / 0 failed / 6 ignored**；Swift
+  workspace **4,649 passed / 0 failed / 6 ignored**；Swift
   **659 passed（527 app + 132 helper）**；`cargo fmt --check`、
   `cargo clippy --workspace --all-targets -- -D warnings`、`swiftformat --lint`
   和 `xcodebuild test` 通过。临时 daemon CLI smoke 覆盖 `project-run-policy-set`

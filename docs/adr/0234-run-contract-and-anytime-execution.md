@@ -249,9 +249,13 @@ TeamPlan rewrite or cross-department/session budget pool. It scans the newest
 1,000 reallocation events, so source single-use memory can be forgotten after
 very heavy plan revision (hard department/session/project caps still bound
 actual spend). Envelope serialization is per-session and same-daemon, not
-cross-host. A target/department revision can invalidate an overlay; a Worker
+cross-host. Task feasibility is a plan-envelope forecast, not a next-call
+reservation. A target/department revision can invalidate an overlay; a Worker
 retry then needs a top-up or plan edit if observed spend exceeds the revised
-stored cap, while Verifier/Scout are not task-cap bound. Historical estimates are sparse and are not vendor token counts;
+stored cap, while Verifier/Scout are not task-cap bound. Reallocation events
+use schema v2 with source fingerprints; pre-v2 events are ignored and their
+sources remain consumed. R3b binds sources before the first governor/approval
+gate; a run denied at admission leaves the event for its retry. Historical estimates are sparse and are not vendor token counts;
 confidence is a heuristic, not a calibrated probability; profile forecasts
 repeat the existing session forecast and are not per-profile guarantees;
 rescue serialization is same-daemon only.
