@@ -1073,6 +1073,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_sessions_only_include_pending_or_interrupted_tasks() {
+        let (_dir, store_one, _project, session) = store();
+        let scheduler = TaskScheduler::new_with_aging(store_one, Duration::ZERO);
+        scheduler
+            .store
+            .update_session_status(&session.id, "idle")
+            .unwrap();
+        let plan_one = plan(vec![task("a", 0, vec![])]);
+        let (seq, _) = scheduler.sync_plan(&session, &plan_one).await.unwrap();
+        scheduler
+            .claim(&session.id, seq, &["a".into()])
+            .await
+            .unwrap();
+        scheduler
+            .finish(&session.id, seq, "a", "blocked", Some("budget exhausted"))
+            .await
+            .unwrap();
+        assert!(
+            scheduler
+                .store
+                .pending_task_sessions(true, 0)
+                .unwrap()
+                .is_empty(),
+            "a blocked-only session must not be scheduled"
+        );
+        scheduler
+            .store
+            .schedule_plan_task_retry_with_event(
+                &session.id,
+                seq,
+                "a",
+                &vp_protocol::now_rfc3339(),
+                "explicit retry",
+            )
+            .unwrap();
+        assert_eq!(
+            scheduler
+                .store
+                .pending_task_sessions(true, 0)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let (_dir, store_two, _project, session) = store();
+        let scheduler = TaskScheduler::new_with_aging(store_two, Duration::ZERO);
+        scheduler
+            .store
+            .update_session_status(&session.id, "idle")
+            .unwrap();
+        let plan_two = plan(vec![task("a", 0, vec![])]);
+        let (seq, _) = scheduler.sync_plan(&session, &plan_two).await.unwrap();
+        scheduler
+            .claim(&session.id, seq, &["a".into()])
+            .await
+            .unwrap();
+        scheduler
+            .finish(&session.id, seq, "a", "failed", Some("failed"))
+            .await
+            .unwrap();
+        assert!(
+            scheduler
+                .store
+                .pending_task_sessions(true, 0)
+                .unwrap()
+                .is_empty(),
+            "failed work needs the orchestration retry transition"
+        );
+        scheduler
+            .store
+            .schedule_plan_task_retry_with_event(
+                &session.id,
+                seq,
+                "a",
+                &vp_protocol::now_rfc3339(),
+                "retry",
+            )
+            .unwrap();
+        assert_eq!(
+            scheduler
+                .store
+                .pending_task_sessions(true, 0)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn blocked_and_cancelled_tasks_are_not_scheduler_ready() {
         let (_dir, store, _project, session) = store();
         let scheduler = TaskScheduler::new_with_aging(store, Duration::ZERO);
