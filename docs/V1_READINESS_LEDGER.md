@@ -598,3 +598,43 @@ passed / 0 failed / 6 ignored; Swift `xcodebuild test` 659 passed / 0 failed;
 and `swiftformat --lint` passed. The built site was copied to the target
 project's `site/xeno/` for visual review and is not part of this repository's
 commit.
+
+### 2026-11-26 live PDfuji spatial-instrument run (completed E2E)
+
+A second real `deepseek-flash` run on the `PDfuji` test project completed the
+four-tier path with a deliberately non-human spatial output.
+
+- Session `01a21441-936c-728a-8f90-232468cfffa1`, temporary data dir
+  `vp-live-xeno2`. Runtime was 1,000,000 context tokens, 32,768 output tokens,
+  60 turns, unattended approvals, and session-unlimited after the completion
+  reserve paused the run.
+- Plan: one Manager department `xeno-spatial` and one coding task `T1`
+  (`write_scope: site/xeno/`). No separate verification plan task.
+- The Manager/Worker produced the chamber, core, spine, console, CSS, and
+  seven strata. A Labour agent (`xeno-instrument-js`) wrote the 30 KB
+  behavioural script and browser-tested language switching, keyboard digits,
+  and linear mode. The final Worker hit max turns before committing the last
+  three files, so the task was revised to a finalize-only objective; the next
+  Worker committed them without rewriting the design.
+- Commits: `40efe88` (script.js), `bdce113` (index.html, style.css,
+  README.md), merge `c5ae960` into the session branch. The Verifier returned
+  `APPROVED` with `merged: true`; the deterministic Integrator recorded
+  `merged; diff check passed`; task `T1` is `completed`.
+- Output: single-viewport irregular lens, orbital core/canvas field, numbered
+  glyph spine, floating console; seven strata (Signal, Profile, Mechanism,
+  Containment, Lattice, Log, Provenance); EN/中文 copy with 137/137
+  `data-en`/`data-zh` pairs; spatial and linear modes; native `<details>` log;
+  no external fonts, images, CDNs, trackers, or network requests. The five
+  host-relative dossier links returned HTTP 200 when served beside the
+  existing `site/dossier.html` tree.
+- Live cost was very high: about 11.86M input / 201.7K output tokens for one
+  task. Most of it was exploratory browser testing, repeated budget pauses,
+  and the finalize retry. This run is evidence that the path can complete, not
+  an efficiency claim.
+- The target project `/Users/apple/orca/projects/TEST` was not modified in
+  this round; the successful output lives in the VerlinPark session worktree
+  and session branch, not in the target repository.
+- Verifier non-blocking notes: the desktop English facet values wrap in narrow
+  columns; the skip link, noscript note, and four aria labels are English-only;
+  dossier fact-to-source tracing was not re-checkable from the task worktree.
+  These are open polish items, not completion claims.
