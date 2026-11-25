@@ -140,10 +140,15 @@ pub fn plan_actions(input: ControllerInput<'_>) -> Vec<ControllerAction> {
         if status != "blocked" {
             continue;
         }
-        if rows
-            .get(task.id.as_str())
-            .is_some_and(|row| waiting_for_gate(row))
-        {
+        let Some(row) = rows.get(task.id.as_str()) else {
+            continue;
+        };
+        // Only dependency blocks and legacy blocks without a reason are
+        // released by this cleanup. A task blocked by budget exhaustion, an
+        // external gate, or another terminal condition must stay blocked
+        // until an operator/resource path clears it; unblocking it here would
+        // cause a hot retry loop.
+        if !blocked_for_dependency(row) {
             continue;
         }
         if task.deps.iter().all(|dep| completed.contains(dep.as_str())) {
@@ -273,7 +278,7 @@ pub fn plan_actions(input: ControllerInput<'_>) -> Vec<ControllerAction> {
         }) {
             continue;
         }
-        if waiting_for_gate(row) {
+        if !blocked_for_dependency(row) {
             continue;
         }
         let Some(task) = input.plan.tasks.iter().find(|task| task.id == row.task_id) else {
@@ -295,6 +300,19 @@ fn waiting_for_gate(row: &ScheduledTask) -> bool {
     row.last_error
         .as_deref()
         .is_some_and(|reason| reason.starts_with("waiting for external gate"))
+}
+
+/// The stale-block cleanup may only release a block that was caused by an
+/// uncompleted dependency (or a legacy block with no recorded reason). Budget,
+/// gate, and other terminal blocks have their own recovery paths.
+fn blocked_for_dependency(row: &ScheduledTask) -> bool {
+    if waiting_for_gate(row) {
+        return false;
+    }
+    match row.last_error.as_deref() {
+        None => true,
+        Some(reason) => reason.starts_with("dependency "),
+    }
 }
 
 fn direct_dependents(plan: &TeamPlan, task_id: &str) -> Vec<String> {

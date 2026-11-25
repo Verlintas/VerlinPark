@@ -274,7 +274,7 @@ effect, Verifier, or merge row.
   turn-boundary auto rescue or runtime envelope reallocation was triggered
   (unit/daemon tests cover both paths).
 - Tests: targeted allocation, trade-off, auto-rescue, protocol, CLI, and
-  daemon tests; full workspace **4,651 passed / 0 failed / 6 ignored**;
+  daemon tests; full workspace **4,652 passed / 0 failed / 6 ignored**;
   Swift **659 passed (527 app + 132 helper)**; fmt, clippy,
   SwiftFormat, and `xcodebuild test` pass.
 - Live DeepSeek evidence (2026-11-25): the explicit smoke passed with
@@ -291,7 +291,17 @@ effect, Verifier, or merge row.
   returned 5 profiles, active reserve 20% from `project_policy`, no recommended
   profile, dirty/watch quality, low confidence (0.29, 4 samples), and honest
   warnings. Per-task effective/reallocation was not exercised by that live
-  session; unit/daemon tests cover it.
+  session; unit/daemon tests cover it. A two-task live plan attempt with
+  30k/30k task budgets exposed a real hot retry loop: T1 wrote the file but
+  exhausted its task budget at 24,877 spent before the next 12k request, then
+  the orchestration stale-block cleanup unblocked it 43 times because its
+  dependencies were complete; the controller now only releases dependency
+  blocks (or legacy blocks with no reason), never budget/gate blocks. A second
+  attempt with 80k/80k budgets completed T1 and started the Verifier, but the
+  session hit its 900s wall-clock budget before T2; 24 calls, 317,308 input /
+  7,367 output / 87.66% cache hit, T1 completed, T2 blocked. No
+  `session.envelope.reallocated` event was emitted before the deadline; the
+  runtime reallocation path remains unit/daemon-tested rather than live-proven.
 - Limits: persisted plan-revision reallocation, cross-department/session
   pooling, reservation redistribution, and the daily attention schedule remain
   open. R3b is an event-derived runtime overlay, not a TeamPlan rewrite; it

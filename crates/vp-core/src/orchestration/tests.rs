@@ -571,6 +571,29 @@ fn controller_keeps_a_gate_deferred_task_blocked() {
 }
 
 #[test]
+fn controller_keeps_budget_blocked_tasks_blocked() {
+    let first = task("a", &[]);
+    let plan = plan(vec![first.clone()]);
+    let mut blocked = row(&first, "blocked", 1);
+    blocked.last_error = Some("task a tokens budget exhausted".to_string());
+    let actions = plan_actions(ControllerInput {
+        session: &session(),
+        plan: &plan,
+        scheduled: &[blocked],
+        events: &[],
+        notes: &[],
+        policy: &policy(),
+        budget_exhausted: false,
+    });
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, ControllerAction::Unblock { .. })),
+        "budget exhaustion must not be released by the stale-block cleanup"
+    );
+}
+
+#[test]
 fn controller_resolves_blockers_for_completed_tasks() {
     let task = task("a", &[]);
     let plan = plan(vec![task.clone()]);

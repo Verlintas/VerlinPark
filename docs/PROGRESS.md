@@ -96,9 +96,17 @@ Verifier 或 Integrator。
   因简单目标没有 TeamPlan 返回 no_remaining_tasks；tradeoffs 返回 5 profiles、
   active reserve 20% project_policy、0 recommended、dirty/watch quality、
   low confidence 0.29/4 samples 和诚实 warnings。该 live session 没有触发
-  per-task effective/reallocation，后者由单元/daemon 测试覆盖。
+  per-task effective/reallocation，后者由单元/daemon 测试覆盖。另一次两任务
+  live plan（30k/30k task budgets）暴露了真实 hot retry loop：T1 在 24,877
+  tokens 后耗尽 task budget，orchestration 的 stale-block cleanup 因依赖已完成
+  连续 unblock 43 次；现已改为只释放 dependency block（或无 reason 的 legacy
+  block），budget/gate block 保持 blocked。第二次 80k/80k 重跑完成 T1 并启动
+  Verifier，但 900s wall-clock budget 在 T2 前耗尽（24 calls，317,308 input /
+  7,367 output / 87.66% cache hit；T1 completed，T2 blocked）；没有在 deadline
+  前产生 `session.envelope.reallocated`，runtime reallocation 仍以单元/daemon
+  测试为证据。
 - 测试：targeted allocation/tradeoff/rescue/protocol/CLI/daemon + full
-  workspace **4,651 passed / 0 failed / 6 ignored**；Swift
+  workspace **4,652 passed / 0 failed / 6 ignored**；Swift
   **659 passed（527 app + 132 helper）**；`cargo fmt --check`、
   `cargo clippy --workspace --all-targets -- -D warnings`、`swiftformat --lint`
   和 `xcodebuild test` 通过。临时 daemon CLI smoke 覆盖 `project-run-policy-set`
