@@ -670,7 +670,8 @@ Implemented (R3a):
   closed instead of widening the new plan. It persists only the latest effective
   token/cost values for one task, supports an optional expected-revision
   precondition, creates no new capacity, and is never invoked automatically by
-  the scheduler, orchestration controller, or an LLM.
+  the scheduler, orchestration controller, or an LLM. It writes budget only;
+  a target already blocked/failed still needs an explicit `task.retry`.
 - CLI `--auto-rescue` / `--no-auto-rescue`,
   `--auto-reallocate-envelopes` / `--no-auto-reallocate-envelopes`, the macOS
   policy toggles, and the Manage Dash allocation/trade-off cards use only these
