@@ -253,6 +253,9 @@ async fn run(cli: Cli) -> Result<()> {
                     print_json(&value)?;
                 } else {
                     print_human(&value);
+                    println!(
+                        "note: v1 ZIP backup covers VerlinPark metadata/events, not Git worktrees or source; land/push and use --repository for encrypted incremental backups"
+                    );
                 }
             }
             (None, Some(repository)) => {
@@ -292,6 +295,9 @@ async fn run(cli: Cli) -> Result<()> {
                     print_json(&value)?;
                 } else {
                     print_repository_backup(&value);
+                    println!(
+                        "note: repository backup covers VerlinPark data and optional artifacts, not Git worktrees or source; keep a remote and use Git for source recovery"
+                    );
                 }
             }
             (Some(_), Some(_)) => {

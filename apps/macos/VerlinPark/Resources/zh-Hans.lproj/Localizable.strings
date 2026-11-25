@@ -833,3 +833,4 @@
 "Check credentials" = "检查凭据";
 "Runs the read-only provider preflight. It never pushes a branch or opens a pull request." = "运行只读的服务商预检。不会推送分支或创建拉取请求。";
 "Preflight passed" = "预检通过";
+"Backup covers VerlinPark metadata/events and optional artifacts, not Git worktrees or source. Land/push and keep an encrypted repository backup for recovery." = "备份只覆盖 VerlinPark 元数据/事件和可选 artifacts，不包含 Git worktrees 或源代码。请 landing/push，并保留加密的 repository backup 用于恢复。";

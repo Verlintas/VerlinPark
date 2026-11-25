@@ -1,12 +1,41 @@
 # VerlinPark 进度
 
-> 最后更新：2026-11-25
+> 最后更新：2026-11-26
 > 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark + task contracts/intent authorization/MCP schema pins + effect receipts/postconditions + external gates/durable waits + runtime pinning/controller replay + reliability/OTel + project-scoped identities S1–S8 + failure attribution/cascade + production hardening rounds 1–3 (ADR-0213/0214/0215) + C7 bounded fan-out (ADR-0216) + C8 tool search v2 (ADR-0217) + C9 MCP async tasks (ADR-0218) + C10 Code Mode (ADR-0219) + C11 loopback A2A (ADR-0221) + C12 advisory progress ledger (ADR-0220) + M3.1 store split 已跑通 + Run Contract R3a allocation preview/R3b runtime envelope reallocation/explicit envelope persistence/R4a trade-off preview + opt-in one-shot auto rescue
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
 
 ---
+
+## 2026-11-26 V1 Phase 1 closure batch
+
+按 `V1_FINAL_PLAN.md` Phase 1 gate 先关闭一组本地可验证的 S0/S1：
+
+- 非法 `VERLINPARK_APPROVAL_MODE` 现在 fail closed 到 `strict`，不再静默变成
+  `smart`；未设置时保持默认。
+- remote ACP 的 cleartext `http`/`ws` endpoint 现在拒绝，只有 loopback 允许；
+  redirect 已禁用；credential-like header 只接受精确 `${ENV_VAR}` 引用
+  （可带 Bearer/Basic 前缀）或 `auth_header_env`，mixed literal 会被拒绝。
+- store 记录并检查 `PRAGMA user_version`；打开 newer schema 直接拒绝，避免旧
+  binary 降级写入。
+- imported archive 的 `repair_session` / `rebuild_session` / event-log restore
+  统一拒绝，不再对只读归档做原地修复。
+- backup verification 在 100k blob cap 未覆盖全部 blob 时报告 `partial` 并
+  使 `valid=false`，不推进 anti-rollback anchor；list 报告同样区分。代码路径
+  已有 mode test，100k cap/valid/list/anchor 的完整 fixture 仍未补。
+- CLI 与 Settings 明确 backup 只覆盖 VerlinPark 数据/可选 artifacts，不包含
+  Git worktrees/source；建议 landing/push + encrypted repository backup。
+- 复审确认 `db-rebuild` 对 malformed/truncated manifest fail closed；
+  malformed session mirror 会 abort rebuild；missing/malformed
+  `session.created` 会写入 `skipped`，不会静默当作有效 session。
+
+仍未完成：Phase 0 真实 target project baseline；Phase 1 的 tool-secret
+redaction、safe shell/fetch defaults、native computer/Code Mode gating、in-run
+plan revision、first-run preflights、live multi-Worker Auto Budget evidence；
+Phase 2 的 100-task/10-Worker、fault injection、72h soak、performance budgets
+和 acceptance scenarios。测试：**4,686 Rust passed / 0 failed / 6 ignored**；
+Swift 659 passed；fmt/clippy/SwiftFormat/xcodebuild 通过。
 
 ## 2026-11-25 R3 allocation preview + R4 trade-offs + opt-in auto rescue
 

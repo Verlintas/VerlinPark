@@ -241,3 +241,4 @@
 "Check credentials" = "Check credentials";
 "Runs the read-only provider preflight. It never pushes a branch or opens a pull request." = "Runs the read-only provider preflight. It never pushes a branch or opens a pull request.";
 "Preflight passed" = "Preflight passed";
+"Backup covers VerlinPark metadata/events and optional artifacts, not Git worktrees or source. Land/push and keep an encrypted repository backup for recovery." = "Backup covers VerlinPark metadata/events and optional artifacts, not Git worktrees or source. Land/push and keep an encrypted repository backup for recovery.";

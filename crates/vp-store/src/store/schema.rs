@@ -19,6 +19,7 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
+        let schema_version = super::schema_guard::check_downgrade(&conn)?;
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS store_meta (
@@ -2986,6 +2987,7 @@ impl Store {
         // projection; events remain authoritative.
         super::agent_events::backfill_agent_event_index(&conn)?;
         let daemon_identity = crate::store::lease::load_or_create_daemon_identity(&conn)?;
+        super::schema_guard::mark_current(&conn, schema_version)?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),

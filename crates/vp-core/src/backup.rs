@@ -575,13 +575,26 @@ fn extract_entry(
 fn verify_sqlite_header(path: &Path) -> Result<()> {
     let mut file = File::open(path)
         .with_context(|| format!("opening restored database {}", path.display()))?;
-    let mut header = [0u8; 16];
+    let mut header = [0u8; 100];
     file.read_exact(&mut header)
         .with_context(|| format!("reading restored database {}", path.display()))?;
-    if &header != b"SQLite format 3\0" {
+    if &header[..16] != b"SQLite format 3\0" {
         bail!(
             "restored database {} does not have a SQLite header",
             path.display()
+        );
+    }
+    let user_version = u32::from_be_bytes(
+        header[60..64]
+            .try_into()
+            .map_err(|_| anyhow!("restored database has an invalid schema header"))?,
+    );
+    if i64::from(user_version) > vp_store::STORE_SCHEMA_VERSION {
+        bail!(
+            "restored database {} uses schema version {user_version}, newer than this build \
+             supports ({}); restore refused",
+            path.display(),
+            vp_store::STORE_SCHEMA_VERSION
         );
     }
     Ok(())
@@ -1463,4 +1476,18 @@ mod tests {
         );
         assert!(target.join("run/daemon.json").exists());
     }
+}
+
+#[test]
+fn restored_database_schema_is_checked_before_swap() {
+    let dir = std::env::temp_dir().join(format!("vp-schema-test-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("verlinpark.db");
+    let mut header = [0u8; 100];
+    header[..16].copy_from_slice(b"SQLite format 3\0");
+    header[60..64].copy_from_slice(&(vp_store::STORE_SCHEMA_VERSION as u32 + 1).to_be_bytes());
+    std::fs::write(&path, header).unwrap();
+    let error = verify_sqlite_header(&path).unwrap_err();
+    assert!(error.to_string().contains("restore refused"), "{error}");
+    let _ = std::fs::remove_dir_all(dir);
 }

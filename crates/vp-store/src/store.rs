@@ -2727,6 +2727,8 @@ fn allowed_session_transition(current: &str, next: &str) -> bool {
     }
 }
 
+pub const STORE_SCHEMA_VERSION: i64 = schema_guard::STORE_SCHEMA_VERSION;
+
 impl Store {
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
@@ -6759,6 +6761,7 @@ mod runs;
 mod runtime;
 mod scheduler;
 mod schema;
+mod schema_guard;
 mod schema_run_policy;
 mod sessions;
 mod sources;

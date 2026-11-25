@@ -343,6 +343,9 @@ pub(crate) async fn ensure_session_not_active(
     let session = tokio::task::spawn_blocking(move || store.get_session(&id))
         .await??
         .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+    if session.status == "imported" {
+        anyhow::bail!("imported sessions are read-only archives; {action} is refused");
+    }
     if matches!(
         session.status.as_str(),
         "queued" | "running" | "paused" | "waiting_input"

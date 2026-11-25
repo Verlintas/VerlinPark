@@ -54,11 +54,32 @@ impl Engine {
         Ok(AcpAgentListResult { agents })
     }
 
-    /// Resolve an ACP agent by id or by its unique display name.
+    /// Resolve an ACP agent by id or by its unique display name. Stored rows
+    /// are revalidated before use so a pre-hardening configuration cannot
+    /// bypass the cleartext/credential checks.
     pub async fn resolve_acp_agent(&self, identifier: &str) -> Result<Option<AcpAgent>> {
         let store = self.store.clone();
         let identifier = identifier.to_string();
-        tokio::task::spawn_blocking(move || store.find_acp_agent(&identifier)).await?
+        let agent =
+            tokio::task::spawn_blocking(move || store.find_acp_agent(&identifier)).await??;
+        if let Some(agent) = &agent {
+            validate_acp_agent_config(AcpAgentConfig {
+                name: agent.name.clone(),
+                command: agent.command.clone(),
+                args: agent.args.clone(),
+                env: agent.env.clone(),
+                enabled: agent.enabled,
+                auto_approve: agent.auto_approve,
+                timeout_secs: agent.timeout_secs,
+                transport: agent.transport,
+                endpoint: agent.endpoint.clone(),
+                auth_header_env: agent.auth_header_env.clone(),
+                headers: agent.headers.clone(),
+                connect_timeout_secs: agent.connect_timeout_secs,
+                allow_remote: agent.allow_remote,
+            })?;
+        }
+        Ok(agent)
     }
 
     /// Add an ACP agent using the full transport-aware configuration.

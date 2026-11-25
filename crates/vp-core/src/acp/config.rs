@@ -217,6 +217,11 @@ pub fn validate_acp_endpoint(transport: AcpTransport, endpoint: &str) -> Result<
     if url.host_str().is_none_or(str::is_empty) {
         bail!("ACP endpoint must include a host");
     }
+    if matches!(scheme.as_str(), "http" | "ws") && !is_loopback_host(&url) {
+        bail!(
+            "cleartext remote ACP endpoints are not allowed; use https/wss or a loopback endpoint"
+        );
+    }
     if !url.username().is_empty() || url.password().is_some() {
         bail!(
             "ACP endpoint must not embed credentials; use auth_header_env or a ${{ENV_VAR}} header reference"
@@ -238,6 +243,58 @@ pub fn validate_acp_endpoint(transport: AcpTransport, endpoint: &str) -> Result<
         }
     }
     Ok(url.to_string())
+}
+
+fn is_credential_like_header(name: &str) -> bool {
+    [
+        "auth",
+        "bearer",
+        "cookie",
+        "credential",
+        "jwt",
+        "key",
+        "password",
+        "passwd",
+        "secret",
+        "session",
+        "sig",
+        "token",
+    ]
+    .iter()
+    .any(|hint| name.contains(hint))
+}
+
+/// Credential-like header values must be exactly one `${ENV_VAR}` reference,
+/// optionally prefixed by a standard scheme word. Mixed literals such as
+/// `sk-live-${SUFFIX}` are still secret material.
+fn is_env_reference_only(value: &str) -> bool {
+    let value = value.trim();
+    let value = value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+        .or_else(|| value.strip_prefix("Basic "))
+        .or_else(|| value.strip_prefix("basic "))
+        .unwrap_or(value);
+    let Some(inner) = value
+        .strip_prefix("${")
+        .and_then(|remaining| remaining.strip_suffix('}'))
+    else {
+        return false;
+    };
+    validate_env_name(inner.trim()).is_ok()
+}
+
+fn is_loopback_host(url: &reqwest::Url) -> bool {
+    url.host_str()
+        .map(|host| {
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .map(|ip| ip.is_loopback())
+                    .unwrap_or(false)
+        })
+        .unwrap_or(false)
 }
 
 fn validate_env_map(env: &BTreeMap<String, String>) -> Result<()> {
@@ -303,6 +360,11 @@ pub fn validate_headers(headers: &BTreeMap<String, String>) -> Result<BTreeMap<S
         }
         if value.contains(['\r', '\n', '\0']) {
             bail!("ACP header '{lower}' contains a forbidden control character");
+        }
+        if is_credential_like_header(&lower) && !is_env_reference_only(value) {
+            bail!(
+                "ACP header '{lower}' looks credential-like; use a ${{ENV_VAR}} reference or auth_header_env"
+            );
         }
         validate_env_references(value)?;
         total = total.saturating_add(value.len());
@@ -530,12 +592,25 @@ mod tests {
             validate_acp_endpoint(AcpTransport::StreamableHttp, "http://127.0.0.1:9/acp").is_ok()
         );
         assert!(
+            validate_acp_endpoint(AcpTransport::StreamableHttp, "http://[::1]:9/acp").is_ok(),
+            "IPv6 loopback is a loopback endpoint"
+        );
+        assert!(
+            validate_acp_endpoint(AcpTransport::StreamableHttp, "http://acp.example.test/acp")
+                .is_err(),
+            "cleartext remote HTTP must be rejected"
+        );
+        assert!(
             validate_acp_endpoint(AcpTransport::StreamableHttp, "ws://127.0.0.1:9/acp").is_err()
         );
         assert!(
             validate_acp_endpoint(AcpTransport::Websocket, "wss://acp.example.test/acp").is_ok()
         );
         assert!(validate_acp_endpoint(AcpTransport::Websocket, "ws://127.0.0.1:9/acp").is_ok());
+        assert!(
+            validate_acp_endpoint(AcpTransport::Websocket, "ws://acp.example.test/acp").is_err(),
+            "cleartext remote WebSocket must be rejected"
+        );
         assert!(
             validate_acp_endpoint(AcpTransport::Websocket, "https://acp.example.test/acp").is_err()
         );
@@ -575,6 +650,15 @@ mod tests {
             validate_acp_endpoint(AcpTransport::StreamableHttp, "HTTPS://ACP.EXAMPLE.TEST/acp")
                 .unwrap();
         assert_eq!(normalized, "https://acp.example.test/acp");
+    }
+
+    #[test]
+    fn literal_credential_headers_are_rejected() {
+        let mut config = base_config(AcpTransport::StreamableHttp);
+        config.headers = BTreeMap::from([("x-api-key".into(), "sk-literal".into())]);
+        assert!(validate_agent_config(config.clone()).is_err());
+        config.headers = BTreeMap::from([("x-api-key".into(), "Bearer ${ACP_TOKEN}".into())]);
+        assert!(validate_agent_config(config).is_ok());
     }
 
     #[test]

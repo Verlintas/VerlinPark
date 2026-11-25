@@ -1,5 +1,36 @@
 use super::*;
 
+/// Invalid approval modes fail closed to `strict` instead of silently
+/// downgrading to `smart`. An unset variable keeps the normal default.
+fn resolve_approval_mode(value: Option<&str>) -> ApprovalMode {
+    match value {
+        None => ApprovalMode::default(),
+        Some(value) => match ApprovalMode::parse(value) {
+            Some(mode) => mode,
+            None => {
+                tracing::warn!(
+                    value = %value,
+                    "invalid VERLINPARK_APPROVAL_MODE; falling back to strict (fail closed)"
+                );
+                ApprovalMode::Strict
+            }
+        },
+    }
+}
+
+fn approval_mode_from_env() -> ApprovalMode {
+    match env::var("VERLINPARK_APPROVAL_MODE") {
+        Ok(value) => resolve_approval_mode(Some(&value)),
+        Err(env::VarError::NotPresent) => resolve_approval_mode(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            tracing::warn!(
+                "non-Unicode VERLINPARK_APPROVAL_MODE; falling back to strict (fail closed)"
+            );
+            ApprovalMode::Strict
+        }
+    }
+}
+
 impl AgentService {
     pub fn from_env(engine: Engine) -> Self {
         let base_url = env::var("VERLINPARK_BASE_URL")
@@ -73,10 +104,7 @@ impl AgentService {
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(1800)
                     .clamp(60, 86400),
-                approval_mode: env::var("VERLINPARK_APPROVAL_MODE")
-                    .ok()
-                    .and_then(|value| ApprovalMode::parse(&value))
-                    .unwrap_or_default(),
+                approval_mode: approval_mode_from_env(),
                 approval_timeout_secs: env::var("VERLINPARK_APPROVAL_TIMEOUT_SECS")
                     .ok()
                     .and_then(|value| value.parse().ok())
@@ -183,14 +211,7 @@ impl AgentService {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(1800)
                 .clamp(60, 86400),
-            approval_mode: params
-                .approval_mode
-                .or_else(|| {
-                    env::var("VERLINPARK_APPROVAL_MODE")
-                        .ok()
-                        .and_then(|value| ApprovalMode::parse(&value))
-                })
-                .unwrap_or_default(),
+            approval_mode: params.approval_mode.unwrap_or_else(approval_mode_from_env),
             approval_timeout_secs: env::var("VERLINPARK_APPROVAL_TIMEOUT_SECS")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -417,5 +438,20 @@ impl AgentService {
             output_tokens: usage.1,
             text: truncate(&text),
         })
+    }
+}
+
+#[cfg(test)]
+mod approval_mode_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_approval_mode_falls_back_to_strict() {
+        assert_eq!(resolve_approval_mode(None), ApprovalMode::Smart);
+        assert_eq!(resolve_approval_mode(Some("bogus")), ApprovalMode::Strict);
+        assert_eq!(
+            resolve_approval_mode(Some("unattended")),
+            ApprovalMode::Unattended
+        );
     }
 }

@@ -10,6 +10,27 @@ fn test_store() -> (TempDir, Store, TempDir) {
 }
 
 #[test]
+fn refuses_a_newer_database_schema_version() {
+    let data = TempDir::new().unwrap();
+    let db_path = data.path().join("verlinpark.db");
+    {
+        let store = Store::open(data.path()).unwrap();
+        drop(store);
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let recorded: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(recorded, STORE_SCHEMA_VERSION);
+        conn.pragma_update(None, "user_version", 99).unwrap();
+    }
+    let error = match Store::open(data.path()) {
+        Ok(_) => panic!("downgrade must fail closed"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("downgrade refused"), "{error:#}");
+}
+
+#[test]
 fn adds_and_lists_projects() {
     let (_data, store, repo) = test_store();
     let project = store

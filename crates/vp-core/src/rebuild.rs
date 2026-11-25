@@ -639,6 +639,7 @@ fn read_mirrors(data_dir: &Path) -> Result<Vec<(String, Vec<Event>)>> {
         let id = entry.file_name().to_string_lossy().to_string();
         let path = entry.path().join("events.jsonl");
         if !path.is_file() {
+            mirrors.push((id, Vec::new()));
             continue;
         }
         let file = std::fs::File::open(&path)
@@ -652,9 +653,7 @@ fn read_mirrors(data_dir: &Path) -> Result<Vec<(String, Vec<Event>)>> {
             let event: Event = serde_json::from_str(&line).context("parsing event mirror line")?;
             events.push(event);
         }
-        if !events.is_empty() {
-            mirrors.push((id, events));
-        }
+        mirrors.push((id, events));
     }
     Ok(mirrors)
 }
@@ -948,6 +947,14 @@ mod tests {
         let policy = store.get_preemption_policy(&project.id).unwrap();
         assert_eq!(policy.provider_grace_ms, 500);
         assert_eq!(policy.tool_grace_ms, 1_000);
+
+        std::fs::create_dir_all(data.path().join("sessions/orphan")).unwrap();
+        let dry = rebuild_database(data.path(), true).await.unwrap();
+        assert!(
+            dry.skipped.iter().any(|entry| entry.contains("orphan")),
+            "an empty/missing session mirror must be reported: {:?}",
+            dry.skipped
+        );
         assert_eq!(policy.kill_escalation_ms, 250);
         assert_eq!(policy.tool_deadline_secs, Some(45));
         let session = store.get_session(&session_id).unwrap().unwrap();

@@ -86,6 +86,8 @@ pub struct RepositoryVerifyReport {
     pub blobs_missing: usize,
     pub blobs_verified: usize,
     pub blobs_corrupt: usize,
+    #[serde(default)]
+    pub blobs_unverified: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollback: Option<RollbackCheck>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -99,6 +101,14 @@ pub struct RepositoryVerifyReport {
 }
 
 /// Verify a repository without restoring it.
+fn blob_verification_mode(verify_blobs: bool, unverified: usize) -> &'static str {
+    match (verify_blobs, unverified) {
+        (false, _) => "presence",
+        (true, 0) => "full",
+        (true, _) => "partial",
+    }
+}
+
 pub fn verify_repository(
     repository: &Path,
     options: RepositoryVerifyOptions<'_>,
@@ -226,6 +236,22 @@ pub fn verify_repository(
             }
         }
     }
+    let blobs_unverified = if options.verify_blobs {
+        blobs_present.saturating_sub(blobs_verified.saturating_add(blobs_corrupt))
+    } else {
+        0
+    };
+    if blobs_unverified > 0 {
+        push_issue(
+            &mut issues,
+            format!(
+                "blob verification is partial: {blobs_unverified} referenced blob(s) were not \
+                 decrypted/hashed (the 100000-blob verification cap was reached); use a full \
+                 verification or restore drill before relying on this result"
+            ),
+        );
+        entries_valid = false;
+    }
     if blobs_missing > 0 || blobs_corrupt > 0 {
         entries_valid = false;
     }
@@ -347,15 +373,13 @@ pub fn verify_repository(
         entries_valid,
         signed_head_consistent,
         head_issues,
-        blob_verification: if options.verify_blobs {
-            "full".to_string()
-        } else {
-            "presence".to_string()
-        },
+        blob_verification: blob_verification_mode(options.verify_blobs, blobs_unverified)
+            .to_string(),
         blobs_present,
         blobs_missing,
         blobs_verified,
         blobs_corrupt,
+        blobs_unverified,
         rollback,
         anchor_update,
         revoked_signature_warnings,
@@ -363,4 +387,16 @@ pub fn verify_repository(
         issues,
         checked_at: now_rfc3339(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::blob_verification_mode;
+
+    #[test]
+    fn partial_blob_verification_is_not_reported_as_full() {
+        assert_eq!(blob_verification_mode(true, 0), "full");
+        assert_eq!(blob_verification_mode(true, 1), "partial");
+        assert_eq!(blob_verification_mode(false, 99), "presence");
+    }
 }

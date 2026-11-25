@@ -353,6 +353,9 @@ async fn run_http(config: RemoteTransportConfig, channel: Channel) -> Result<()>
         .cookie_provider(jar)
         .connect_timeout(config.connect_timeout)
         .user_agent(config.user_agent.clone())
+        // A configured https endpoint must not redirect to cleartext or a
+        // different host without revalidation.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
     {
         Ok(client) => client,

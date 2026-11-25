@@ -395,10 +395,18 @@ pub(super) async fn delegate_acp(
         timeout,
         resume_session_id,
     } = request;
-    let Some(acp_agent) = engine.resolve_acp_agent(&agent_ref).await? else {
-        return Ok(AcpDelegation::Output(ToolOutput::error(format!(
-            "ACP agent not found: {agent_ref}"
-        ))));
+    let acp_agent = match engine.resolve_acp_agent(&agent_ref).await {
+        Ok(Some(agent)) => agent,
+        Ok(None) => {
+            return Ok(AcpDelegation::Output(ToolOutput::error(format!(
+                "ACP agent not found: {agent_ref}"
+            ))));
+        }
+        Err(error) => {
+            return Ok(AcpDelegation::Output(ToolOutput::error(format!(
+                "ACP agent {agent_ref} configuration is invalid: {error:#}"
+            ))));
+        }
     };
     if !acp_agent.enabled {
         return Ok(AcpDelegation::Output(ToolOutput::error(format!(

@@ -120,12 +120,13 @@ pub(crate) fn print_repository_list(value: &Value) {
     );
     let validation = &value["validation"];
     println!(
-        "  validation valid={}  blobs present={} missing={} verified={} corrupt={}  mode={}",
+        "  validation valid={}  blobs present={} missing={} verified={} corrupt={} unverified={}  mode={}",
         validation["valid"].as_bool().unwrap_or(false),
         validation["blobs_present"].as_u64().unwrap_or(0),
         validation["blobs_missing"].as_u64().unwrap_or(0),
         validation["blobs_verified"].as_u64().unwrap_or(0),
         validation["blobs_corrupt"].as_u64().unwrap_or(0),
+        validation["blobs_unverified"].as_u64().unwrap_or(0),
         validation["blob_verification"].as_str().unwrap_or("?")
     );
     if validation["revoked_signatures"].as_u64().unwrap_or(0) > 0 {
@@ -240,14 +241,15 @@ pub(crate) fn print_repository_verify(value: &Value) {
         value["signed_head_consistent"].as_bool().unwrap_or(false)
     );
     println!(
-        "  chain_valid={}  tombstones_valid={}  entries_valid={}  blobs present={} missing={} verified={} corrupt={}",
+        "  chain_valid={}  tombstones_valid={}  entries_valid={}  blobs present={} missing={} verified={} corrupt={} unverified={}",
         value["chain_valid"].as_bool().unwrap_or(false),
         value["tombstones_valid"].as_bool().unwrap_or(false),
         value["entries_valid"].as_bool().unwrap_or(false),
         value["blobs_present"].as_u64().unwrap_or(0),
         value["blobs_missing"].as_u64().unwrap_or(0),
         value["blobs_verified"].as_u64().unwrap_or(0),
-        value["blobs_corrupt"].as_u64().unwrap_or(0)
+        value["blobs_corrupt"].as_u64().unwrap_or(0),
+        value["blobs_unverified"].as_u64().unwrap_or(0)
     );
     if value["rollback"].is_object() {
         println!(

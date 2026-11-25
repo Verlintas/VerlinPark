@@ -1,7 +1,7 @@
 # VerlinPark V1 readiness ledger
 
 - Status: Active
-- Date: 2026-11-25
+- Date: 2026-11-26
 - Owner: Verlintas
 - Scope: single-project coding V1
 - Plan: [V1_FINAL_PLAN.md](V1_FINAL_PLAN.md)
@@ -75,7 +75,7 @@ Verification gaps:
 | V1-D09 | S1 | A bare Python `unittest` project without pyproject/pytest metadata was reported as `PROJECT_UNSUPPORTED`, pushing Agent runs into shell guessing. | **CLOSED** | `project_profile` detects `tests/test_*.py` and proposes `python3 -m unittest discover -s tests -v`; regression test covers the bare fixture |
 | V1-D10 | S1 | Contract analysis treated scratch verification writes and absolute read-only git commands as host-state/scope violations, creating repeated approvals and `.scratch-proof` artifacts in the worktree. | **CLOSED (P0)** | Shell exports `$VERLINPARK_WORKTREE`/`$VERLINPARK_SCRATCH`; prompts/recipes say cwd is the worktree; contract allows the stable scratch/TMPDIR prefixes; absolute read-only git (`status/diff/log/show/rev-parse/...`) is ReadOnly; `clean`/`reset --hard` remains Destructive. Tests cover all paths. |
 | V1-D11 | S1 | Fixed token budgets charged cache-read input at full weight, ignored missing prices, starved verification, and failed solvable runs; the dashboard could not show the difference between cheap-but-stuck and expensive-near-completion. | **PARTIAL (R2a)** | R1 exposes raw vs weighted tokens, money with `pricing_source`, time, attention, risk, context, capacity, quality, and progress plus readiness/forecast. R2a adds operator top-up (clamped to caps) and pre-dispatch completion-reserve deferral. Raw token caps remain authoritative; cost-weighted settlement/automatic reallocation is R2b/R3. |
-| V1-D12 | S2 | Operator attention had no budget or governor: repeated host-state approvals could consume the run without triggering a policy decision. | **PARTIAL (R2b)** | Pre-dispatch deferral and a true turn-boundary pause (`session.resource.paused`) now stop new work at the attention cap; a bare resume re-pauses until the cap/policy changes. The pause carries a bounded attention batch (risk groups + at most 8 approval metadata rows, no raw input) and the Stage banner opens Inbox or Policies. The existing approval queue, coalescing, and batch resolve remain the only decision path; no automatic grant/template/profile. Explicit partial delivery is event-only and available; rescue reserve, opt-in R3b runtime task-envelope reallocation, and explicit operator-confirmed persistence of one recorded overlay are implemented; automatic persisted plan-revision reallocation remains open. |
+| V1-D12 | S2 | Operator attention had no budget or governor: repeated host-state approvals could consume the run without triggering a policy decision. | **PARTIAL (R2b)** | Pre-dispatch deferral and a true turn-boundary pause (`session.resource.paused`) now stop new work at the attention cap; a bare resume re-pauses until the cap/policy changes. The pause carries a bounded attention batch (risk groups + at most 8 approval metadata rows, no raw input) and the Stage banner opens Inbox or Policies. The existing approval queue, coalescing, and batch resolve remain the only decision path; no automatic grant/template/profile. Explicit partial delivery is event-only and available; rescue reserve, opt-in R3b runtime task-envelope reallocation, and explicit operator-confirmed persistence of one recorded overlay, and opt-in pre-run auto-persistence are implemented; automatic reallocation with reservation semantics remains open. |
 
 ## Run Contract R1/R2a/R2b (2026-11-24)
 
@@ -391,6 +391,46 @@ is quiescent.
   without a compare-and-set precondition, so concurrent editors can lose the
   other field.
 
+## V1 Phase 1 closure batch (2026-11-26)
+
+The following carried items have closure evidence; the backup cap drill
+remains partial, and this is not a claim that Phase 1 is complete.
+
+- **Approval mode fail-open**: an invalid `VERLINPARK_APPROVAL_MODE` now resolves
+  to `strict` (fail closed) instead of silently becoming `smart`; unset keeps
+  the normal default. Test: `agent::service::constructors::approval_mode_tests`.
+- **Remote ACP cleartext/credentials**: remote `http`/`ws` ACP endpoints are
+  rejected; cleartext is allowed only for loopback (`localhost`/loopback IP),
+  redirects are disabled, and credential-like header values must be an exact
+  `${ENV_VAR}` reference (an optional Bearer/Basic prefix is allowed) or use
+  `auth_header_env`. Tests: `endpoint_schemes_match_the_profile`,
+  `literal_credential_headers_are_rejected`.
+- **Schema downgrade guard**: `Store::open` records `PRAGMA user_version` and
+  refuses to open a database written by a newer schema. Test:
+  `refuses_a_newer_database_schema_version` and `schema_guard::tests`.
+- **Imported archive repair**: `repair_session`/`rebuild_session`/event-log
+  restore now reject `imported` sessions through the shared quiescence guard.
+  Test: import/repair assertion in the bundle round-trip test.
+- **Backup verification cap (PARTIAL)**: blob verification reports `partial`
+  and fails `valid` when the 100k blob cap leaves referenced blobs unverified;
+  the anti-rollback anchor is not advanced by a partial verification. The list
+  report uses the same classification. Only the mode mapping has a unit test;
+  the 100k cap/valid/list/anchor drill still needs a fixture or configurable
+  limit.
+- **Backup scope truthfulness**: CLI human output and Settings now state that
+  backup covers VerlinPark data/optional artifacts, not Git worktrees or
+  source, and recommend landing/pushing plus encrypted repository backups.
+- **db-rebuild malformed sources**: `read_project_manifest` already fails closed
+  on malformed/truncated manifest lines and version-capped streams. Missing or
+  empty session mirrors and mirrors without a valid `session.created` now reach
+  the `skipped` report; malformed JSON lines still abort the rebuild rather than
+  being silently ignored. Regression coverage: the rebuild round-trip test adds
+  an orphan session directory.
+
+Tests: **4,686 Rust passed / 0 failed / 6 ignored**; `vp-store` 436; Swift
+659; clippy/fmt/SwiftFormat/xcodebuild pass. Remaining carried groups are
+listed below; Phase 0/2 live and scale evidence is still required.
+
 ## Carried findings from the V1 plan
 
 The following groups are carried from [V1_FINAL_PLAN.md](V1_FINAL_PLAN.md) §6.
@@ -398,14 +438,11 @@ They stay `OPEN (carried)` until a dedicated audit records evidence. This
 ledger does not claim they are fixed.
 
 - **Data safety/security**: tool-secret redaction; safe shell/fetch defaults;
-  backup-verify cap/anchor; backup scope warning; remote ACP cleartext/headers;
-  invalid approval mode fail-open; native computer/Code Mode experimental
-  gating; schema downgrade guard.
+  native computer/Code Mode experimental gating.
 - **Core runtime**: Auto Budget across TeamPlan Workers/Labour (R2b adds
   token/cost/time request-fit, but first-call pricing, parallel reservation
   accuracy, and live multi-Worker evidence remain open); in-run plan revision;
-  db-rebuild silent skips; imported archive repair semantics; backup-verify/
-  source rebuild regression tests.
+  source rebuild regression coverage.
 - **First-run/local usability**: provider configured without a key; text-only
   probe; wizard without a project; non-Git project add; Git identity preflight;
   New Session Auto cap/provider gate; project removal; wizard/daemon startup
@@ -443,7 +480,7 @@ cargo test -p vp-protocol rescue
 cargo test -p vp-core --lib engine::rescue::tests
 # 6 passed, 0 failed (eligibility, one-shot reserve release, expiry, bounds)
 cargo test -p vp-store --lib
-# 434 passed, 0 failed (incl. project RunPolicy round-trip/validation)
+# 436 passed, 0 failed (incl. project RunPolicy round-trip/validation and schema guard)
 cargo test -p vp-core --lib agent::auto_budget_runtime_tests
 # 27 passed, 0 failed (token/cost/time child request-fit, turn pause/resume, no-progress, wall clock)
 cargo test -p vp-core --lib agent::tests

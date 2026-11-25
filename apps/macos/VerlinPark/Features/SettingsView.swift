@@ -2029,6 +2029,14 @@ struct AboutSettingsView: View {
                     .help(L10n.t("Refresh backup status"))
                     .disabled(model.backupStatusBusy)
                 }
+                Text(
+                    L10n.t(
+                        "Backup covers VerlinPark metadata/events and optional artifacts, not Git worktrees or source. Land/push and keep an encrypted repository backup for recovery."
+                    )
+                )
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
                 if model.backupStatusBusy, model.backupStatus == nil {
                     ProgressView().controlSize(.small)
                 } else if let status = model.backupStatus {

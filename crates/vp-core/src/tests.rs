@@ -3904,6 +3904,30 @@ async fn replay_checks_critical_projections() {
     let imported = imported_engine.import_session(bundle).await.unwrap();
     assert_eq!(imported.session_id, session.id);
     assert_eq!(imported.status, "imported");
+    let repair_error = imported_engine
+        .repair_session(&session.id)
+        .await
+        .expect_err("imported archives must not be repaired in place");
+    assert!(
+        repair_error.to_string().contains("read-only archives"),
+        "{repair_error:#}"
+    );
+    let rebuild_error = imported_engine
+        .rebuild_session(&session.id)
+        .await
+        .expect_err("imported archives must not be rebuilt in place");
+    assert!(
+        rebuild_error.to_string().contains("read-only archives"),
+        "{rebuild_error:#}"
+    );
+    let restore_error = imported_engine
+        .restore_session_log(&session.id)
+        .await
+        .expect_err("imported archives must not restore their event log");
+    assert!(
+        restore_error.to_string().contains("read-only archives"),
+        "{restore_error:#}"
+    );
     assert!(
         imported_engine
             .store()
@@ -4225,6 +4249,35 @@ async fn manages_and_probes_acp_agents() {
     assert!(probe.session_created);
     assert!(engine.remove_acp_agent(&agent.id).await.unwrap());
     assert!(engine.list_acp_agents().await.unwrap().agents.is_empty());
+}
+
+#[tokio::test]
+async fn resolve_revalidates_a_stored_acp_configuration() {
+    let data = TempDir::new().unwrap();
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let stored = engine
+        .store()
+        .add_acp_agent_config(&AcpAgentConfig {
+            name: "legacy-cleartext".into(),
+            command: String::new(),
+            args: Vec::new(),
+            env: Default::default(),
+            enabled: true,
+            auto_approve: false,
+            timeout_secs: 900,
+            transport: AcpTransport::StreamableHttp,
+            endpoint: Some("http://agent.example.test/acp".into()),
+            auth_header_env: Some("ACP_TOKEN".into()),
+            headers: Default::default(),
+            connect_timeout_secs: 15,
+            allow_remote: true,
+        })
+        .unwrap();
+    let error = engine
+        .resolve_acp_agent(&stored.id)
+        .await
+        .expect_err("stored cleartext config must fail closed");
+    assert!(error.to_string().contains("cleartext"), "{error:#}");
 }
 
 #[tokio::test]

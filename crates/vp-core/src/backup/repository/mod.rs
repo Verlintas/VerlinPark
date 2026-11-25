@@ -253,6 +253,8 @@ pub struct RepositoryValidationReport {
     pub blobs_missing: usize,
     pub blobs_verified: usize,
     pub blobs_corrupt: usize,
+    #[serde(default)]
+    pub blobs_unverified: usize,
     pub issues: Vec<String>,
     #[serde(default)]
     pub signature_verification: String,
@@ -944,7 +946,22 @@ pub fn list_repository_snapshots_with_policy(
     }
     let signed = session.metadata.format_version >= 3;
     let signing_status = if signed { "signed" } else { "unsigned" }.to_string();
-    let valid = blobs_missing == 0 && blobs_corrupt == 0 && issues.is_empty();
+    let blobs_unverified = if verify_blobs {
+        blobs_present.saturating_sub(blobs_verified.saturating_add(blobs_corrupt))
+    } else {
+        0
+    };
+    if blobs_unverified > 0 {
+        push_issue(
+            &mut issues,
+            format!(
+                "blob verification is partial: {blobs_unverified} referenced blob(s) were not \
+                 verified because the 100000-blob verification cap was reached"
+            ),
+        );
+    }
+    let valid =
+        blobs_missing == 0 && blobs_corrupt == 0 && blobs_unverified == 0 && issues.is_empty();
     Ok(RepositoryListReport {
         repository: session.root.to_string_lossy().to_string(),
         format_version: session.metadata.format_version,
@@ -965,11 +982,21 @@ pub fn list_repository_snapshots_with_policy(
             manifests_valid: true,
             chain_valid: true,
             nonce_table_valid,
-            blob_verification: if verify_blobs { "full" } else { "presence" }.to_string(),
+            blob_verification: if verify_blobs {
+                if blobs_unverified == 0 {
+                    "full"
+                } else {
+                    "partial"
+                }
+                .to_string()
+            } else {
+                "presence".to_string()
+            },
             blobs_present,
             blobs_missing,
             blobs_verified,
             blobs_corrupt,
+            blobs_unverified,
             issues,
             signature_verification: if signed {
                 "manifest-signatures".to_string()
@@ -1378,6 +1405,7 @@ pub fn prune_repository_with_signing(
         blobs_missing: 0,
         blobs_verified: 0,
         blobs_corrupt: 0,
+        blobs_unverified: 0,
         issues: Vec::new(),
         signature_verification: if session.metadata.format_version >= 3 {
             "manifest-signatures".to_string()
