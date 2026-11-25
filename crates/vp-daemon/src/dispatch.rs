@@ -216,6 +216,7 @@ fn family(method: &str) -> Option<Family> {
         | "session.delivery.partial"
         | "session.allocation"
         | "session.tradeoffs"
+        | "session.envelope.persist"
         | "session.rescue.status"
         | "session.rescue"
         | "session.run_contract.get"

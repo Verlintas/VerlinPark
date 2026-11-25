@@ -2764,6 +2764,19 @@ pub(crate) enum Command {
     Allocation { session: String },
     /// Show the read-only profile trade-off and quality view (R4).
     Tradeoffs { session: String },
+    /// Persist the latest recorded runtime task envelope into a plan revision.
+    EnvelopePersist {
+        session: String,
+        /// Task whose recorded runtime envelope should be persisted.
+        #[arg(long)]
+        task: String,
+        /// Optimistic plan revision precondition.
+        #[arg(long)]
+        expected_revision: Option<u32>,
+        /// Explicit confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Show the rescue eligibility, allocation reserve, and near-completion preview.
     RescueStatus { session: String },
     /// Grant a short-lived completion-reserve release for near-completion work.

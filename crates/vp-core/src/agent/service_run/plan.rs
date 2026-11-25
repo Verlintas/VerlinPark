@@ -27,6 +27,25 @@ impl AgentService {
             .await
     }
 
+    /// Persist the latest recorded runtime envelope for one task into a normal
+    /// plan revision, using the configured Manager cap.
+    pub async fn persist_recorded_envelope(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        expected_revision: Option<u32>,
+    ) -> Result<ReviseTeamPlanResult> {
+        let max_managers = self
+            .config
+            .read()
+            .ok()
+            .and_then(|config| config.as_ref().map(|config| config.max_managers))
+            .unwrap_or(5);
+        self.engine
+            .persist_recorded_envelope(session_id, task_id, expected_revision, max_managers)
+            .await
+    }
+
     pub async fn plan_revision_detail(
         &self,
         session_id: &str,

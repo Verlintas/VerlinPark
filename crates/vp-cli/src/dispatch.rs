@@ -307,6 +307,7 @@ pub(crate) async fn run_command(
         | Command::Delivery { .. }
         | Command::Allocation { .. }
         | Command::Tradeoffs { .. }
+        | Command::EnvelopePersist { .. }
         | Command::RescueStatus { .. }
         | Command::Rescue { .. }
         | Command::PartialDelivery { .. }

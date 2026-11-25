@@ -4261,6 +4261,17 @@ pub struct SessionTradeoffsParams {
     pub session_id: String,
 }
 
+/// Explicitly persist a recorded R3b runtime envelope into a plan revision.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PersistEnvelopeParams {
+    pub session_id: String,
+    pub task_id: String,
+    #[serde(default)]
+    pub expected_revision: Option<u32>,
+    #[serde(default)]
+    pub confirm: bool,
+}
+
 /// One documented RunProfile trade-off. Projected turns/cost come from the
 /// existing budget forecast and are not per-profile guarantees.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

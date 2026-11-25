@@ -692,6 +692,27 @@ pub(super) async fn dispatch(
             )
             .await?
         }
+        Command::EnvelopePersist {
+            session,
+            task,
+            expected_revision,
+            yes,
+        } => {
+            if !yes {
+                bail!("persisting a runtime envelope requires --yes");
+            }
+            rpc(
+                &discovery,
+                "session.envelope.persist",
+                json!({
+                    "session_id": session,
+                    "task_id": task,
+                    "expected_revision": expected_revision,
+                    "confirm": true
+                }),
+            )
+            .await?
+        }
         Command::RescueStatus { session } => {
             rpc(
                 &discovery,
@@ -1185,6 +1206,31 @@ mod tests {
         match cli.command {
             Command::Tradeoffs { session } => assert_eq!(session, "ses-1"),
             other => panic!("expected tradeoffs command, got {other:?}"),
+        }
+        let cli = crate::cli::Cli::try_parse_from([
+            "vp",
+            "envelope-persist",
+            "ses-1",
+            "--task",
+            "T2",
+            "--expected-revision",
+            "3",
+            "--yes",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::EnvelopePersist {
+                session,
+                task,
+                expected_revision,
+                yes,
+            } => {
+                assert_eq!(session, "ses-1");
+                assert_eq!(task, "T2");
+                assert_eq!(expected_revision, Some(3));
+                assert!(yes);
+            }
+            other => panic!("expected envelope-persist, got {other:?}"),
         }
     }
 

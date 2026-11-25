@@ -478,6 +478,68 @@ impl Engine {
         }
         Ok(Some(runtime_plan))
     }
+
+    /// Explicitly persist the latest recorded runtime envelope for one target
+    /// into a normal plan revision. This does not create new capacity and is
+    /// allowed only while the session is quiescent.
+    pub async fn persist_recorded_envelope(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        expected_revision: Option<u32>,
+        max_managers: usize,
+    ) -> Result<vp_protocol::types::ReviseTeamPlanResult> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let session = tokio::task::spawn_blocking(move || store.get_session(&id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+        crate::ensure_session_quiescent(&session, "persist a runtime envelope")?;
+        let mut plan = self
+            .get_team_plan(session_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("session has no TeamPlan"))?;
+        let events = self
+            .recent_events_of_kind(
+                session_id,
+                SESSION_ENVELOPE_REALLOCATED_EVENT,
+                MAX_ENVELOPE_EVENTS,
+            )
+            .await?;
+        // Fold through the same validator the runtime uses, so a stale
+        // reallocation from a prior plan revision cannot be persisted as new
+        // stored budget. This also selects the latest effective overlay after
+        // chained top-ups.
+        let (effective, _, valid_targets) = fold_reallocation_events(&plan, events);
+        if !valid_targets.contains(task_id) {
+            anyhow::bail!("no recorded runtime envelope exists for task {task_id}");
+        }
+        let Some(target) = plan.tasks.iter_mut().find(|task| task.id == task_id) else {
+            anyhow::bail!("task {task_id} is not in the stored TeamPlan");
+        };
+        let recorded = effective.get(task_id).copied().unwrap_or_default();
+        let mut changed = false;
+        if recorded.tokens.is_some() && target.token_budget != recorded.tokens {
+            target.token_budget = recorded.tokens;
+            changed = true;
+        }
+        if recorded.cost_usd.is_some() && target.cost_budget_usd != recorded.cost_usd {
+            target.cost_budget_usd = recorded.cost_usd;
+            changed = true;
+        }
+        if !changed {
+            anyhow::bail!("task {task_id} already has the recorded envelope persisted");
+        }
+        self.revise_team_plan(
+            session_id,
+            plan,
+            "persist recorded runtime task envelope",
+            "operator:envelope",
+            expected_revision,
+            max_managers,
+        )
+        .await
+    }
 }
 
 fn apply_effective_budget(plan: &mut TeamPlan, task_id: &str, budget: EffectiveBudget) {
@@ -763,6 +825,96 @@ mod tests {
             Some(6_000)
         );
         assert_eq!(event_count(&engine, &session.id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn recorded_envelope_can_be_persisted_into_a_plan_revision() {
+        let plan = plan(
+            vec![department("impl", None, None)],
+            vec![
+                task("T1", "impl", Some(5_000), None),
+                task("T2", "impl", Some(1_000), None),
+            ],
+        );
+        let (_data, _repo, engine, session) = setup(&plan, true).await;
+        complete_task(&engine, &session.id, "T1");
+        engine
+            .effective_plan_for_budget(&session, &plan, "T2")
+            .await
+            .unwrap()
+            .expect("runtime overlay");
+        let persisted = engine
+            .persist_recorded_envelope(&session.id, "T2", Some(1), 4)
+            .await
+            .expect("persist recorded envelope");
+        assert_eq!(persisted.revision.revision, 2);
+        assert_eq!(
+            persisted
+                .plan
+                .tasks
+                .iter()
+                .find(|task| task.id == "T2")
+                .unwrap()
+                .token_budget,
+            Some(6_000)
+        );
+        let stored = engine.get_team_plan(&session.id).await.unwrap().unwrap();
+        assert_eq!(
+            stored
+                .tasks
+                .iter()
+                .find(|task| task.id == "T2")
+                .unwrap()
+                .token_budget,
+            Some(6_000)
+        );
+        assert_eq!(event_count(&engine, &session.id).await, 1);
+        assert!(
+            engine
+                .persist_recorded_envelope(&session.id, "T2", Some(2), 4)
+                .await
+                .is_err(),
+            "persisting the same envelope twice fails closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_runtime_envelope_is_not_persisted_after_a_budget_revision() {
+        let plan = plan(
+            vec![department("impl", None, None)],
+            vec![
+                task("T1", "impl", Some(5_000), None),
+                task("T2", "impl", Some(1_000), None),
+            ],
+        );
+        let (_data, _repo, engine, session) = setup(&plan, true).await;
+        complete_task(&engine, &session.id, "T1");
+        engine
+            .effective_plan_for_budget(&session, &plan, "T2")
+            .await
+            .unwrap()
+            .expect("runtime overlay");
+        let mut revised = plan.clone();
+        revised.departments[0].token_budget = Some(9_000);
+        engine
+            .revise_team_plan(
+                &session.id,
+                revised,
+                "tighten the department cap",
+                "user",
+                Some(1),
+                4,
+            )
+            .await
+            .unwrap();
+        let error = engine
+            .persist_recorded_envelope(&session.id, "T2", Some(2), 4)
+            .await
+            .expect_err("stale overlay must fail closed");
+        assert!(
+            error.to_string().contains("no recorded runtime envelope"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

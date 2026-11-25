@@ -125,6 +125,31 @@ pub(super) async fn handle(
                 Err(response) => response_with_id(id, response),
             }
         }
+        "session.envelope.persist" => {
+            match parse_params::<vp_protocol::types::PersistEnvelopeParams>(request.params) {
+                Ok(params) if !params.confirm => RpcResponse::error(
+                    id,
+                    RpcError::with_data(
+                        codes::INVALID_PARAMS,
+                        "persisting a runtime envelope requires explicit confirmation",
+                        json!({"code": "ENVELOPE_CONFIRM_REQUIRED"}),
+                    ),
+                ),
+                Ok(params) => match state
+                    .agent
+                    .persist_recorded_envelope(
+                        &params.session_id,
+                        &params.task_id,
+                        params.expected_revision,
+                    )
+                    .await
+                {
+                    Ok(result) => RpcResponse::success(id, result),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "session.rescue.status" => {
             match parse_params::<vp_protocol::types::RescueStatusParams>(request.params) {
                 Ok(params) => match state.engine.rescue_status(&params.session_id).await {

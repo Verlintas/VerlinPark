@@ -1266,6 +1266,34 @@ mod partial_delivery_rpc_tests {
         );
     }
     #[tokio::test]
+    async fn envelope_persist_rpc_requires_explicit_confirmation() {
+        let (_data, _repo, state, session) = fixture().await;
+        let error = call_error(
+            &state,
+            "session.envelope.persist",
+            json!({"session_id": session.id, "task_id": "T1"}),
+        )
+        .await;
+        assert_eq!(error.code, codes::INVALID_PARAMS);
+        assert_eq!(
+            error.data.expect("typed envelope error")["code"],
+            "ENVELOPE_CONFIRM_REQUIRED"
+        );
+        let error = call_error(
+            &state,
+            "session.envelope.persist",
+            json!({"session_id": session.id, "task_id": "T1", "confirm": true}),
+        )
+        .await;
+        assert_eq!(error.code, codes::INTERNAL_ERROR);
+        assert!(
+            error.message.contains("no TeamPlan"),
+            "confirmed requests reach the engine: {}",
+            error.message
+        );
+    }
+
+    #[tokio::test]
     async fn allocation_and_tradeoff_rpcs_are_bounded_and_read_only() {
         let (_data, _repo, state, session) = fixture().await;
         let plan = vp_protocol::types::TeamPlan {
