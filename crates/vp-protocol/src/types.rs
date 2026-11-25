@@ -3799,6 +3799,10 @@ pub struct ProjectRunPolicy {
     /// budgets only; it creates no capacity and never changes a task status.
     #[serde(default)]
     pub auto_persist_envelopes: bool,
+    /// Allow R3b sources from other departments. The target department cap
+    /// still bounds how much can be applied. Default off.
+    #[serde(default)]
+    pub auto_reallocate_cross_department: bool,
 }
 
 fn default_project_run_completion_reserve_ratio() -> f64 {
@@ -3819,6 +3823,7 @@ impl Default for ProjectRunPolicy {
             auto_rescue: false,
             auto_reallocate_envelopes: false,
             auto_persist_envelopes: false,
+            auto_reallocate_cross_department: false,
         }
     }
 }

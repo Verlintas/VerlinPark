@@ -653,7 +653,9 @@ Implemented (R3a):
   reserve for its normal TTL and never raises a hard cap.
 - R3b `ProjectRunPolicy.auto_reallocate_envelopes` (default off) lets a
   Worker/Labour run use a runtime-only effective task budget built from unused
-  token/cost capacity of already-completed tasks in the same department.
+  token/cost capacity of already-completed tasks in the same department;
+  `auto_reallocate_cross_department` additionally enables sources from other
+  departments, with the target department cap still bounding what is applied.
   Sources are consumed independently per token/cost dimension; only the
   capacity that actually fits under the department cap is taken and recorded;
   a target's prior event replays idempotently; a completed target can become a
@@ -695,9 +697,8 @@ Remaining:
 - Automatic reallocation with reservation semantics. Explicit one-task
   persistence and opt-in pre-run auto-persistence of recorded overlays now
   exist, but R3b remains an event-derived runtime overlay by default rather
-  than an automatic reallocation controller; cross-department/session
-  reallocation, reservation redistribution, and a revisioned plan budget remain
-  open. Its 1,000-event
+  than an automatic reallocation controller; cross-session/project pooling,
+  reservation redistribution, and a revisioned plan budget remain open. Its 1,000-event
   source-single-use window can forget very old sources after heavy plan
   revision, though hard caps still bound actual spend. Serialization is
   per-session and same-daemon, not cross-host. If a target/department revision
@@ -807,7 +808,7 @@ Implemented **P0 + R1 + R2a + R2b core + R3a/R3b/R4a**:
 - R3b opt-in runtime per-task envelope reallocation
   (`ProjectRunPolicy.auto_reallocate_envelopes`, CLI/GUI, event-backed
   single-use completed-task capacity, department/session/project caps
-  unchanged, plan-revision invalidation);
+  unchanged, plan-revision invalidation, opt-in cross-department sources);
 - explicit operator-confirmed `session.envelope.persist` /
   `vp envelope-persist` into a plan revision for a validated, still-current
   recorded overlay (quiescent session, optional expected revision, no new

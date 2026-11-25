@@ -333,6 +333,8 @@ pub(super) async fn dispatch(
             no_auto_reallocate_envelopes,
             auto_persist_envelopes,
             no_auto_persist_envelopes,
+            auto_reallocate_cross_department,
+            no_auto_reallocate_cross_department,
         } => {
             if profile.is_none()
                 && reserve.is_none()
@@ -344,9 +346,11 @@ pub(super) async fn dispatch(
                 && !no_auto_reallocate_envelopes
                 && !auto_persist_envelopes
                 && !no_auto_persist_envelopes
+                && !auto_reallocate_cross_department
+                && !no_auto_reallocate_cross_department
             {
                 bail!(
-                    "pass at least one of --profile, --reserve, --attention-cap, --no-progress-turns, --auto-rescue, --no-auto-rescue, --auto-reallocate-envelopes, --no-auto-reallocate-envelopes, --auto-persist-envelopes, or --no-auto-persist-envelopes"
+                    "pass at least one of --profile, --reserve, --attention-cap, --no-progress-turns, --auto-rescue, --no-auto-rescue, --auto-reallocate-envelopes, --no-auto-reallocate-envelopes, --auto-persist-envelopes, --no-auto-persist-envelopes, --auto-reallocate-cross-department, or --no-auto-reallocate-cross-department"
                 );
             }
             if auto_rescue && no_auto_rescue {
@@ -360,6 +364,11 @@ pub(super) async fn dispatch(
             if auto_persist_envelopes && no_auto_persist_envelopes {
                 bail!(
                     "--auto-persist-envelopes and --no-auto-persist-envelopes are mutually exclusive"
+                );
+            }
+            if auto_reallocate_cross_department && no_auto_reallocate_cross_department {
+                bail!(
+                    "--auto-reallocate-cross-department and --no-auto-reallocate-cross-department are mutually exclusive"
                 );
             }
             // Read-modify-write: unspecified fields keep the stored policy.
@@ -406,6 +415,12 @@ pub(super) async fn dispatch(
             }
             if no_auto_persist_envelopes {
                 policy.auto_persist_envelopes = false;
+            }
+            if auto_reallocate_cross_department {
+                policy.auto_reallocate_cross_department = true;
+            }
+            if no_auto_reallocate_cross_department {
+                policy.auto_reallocate_cross_department = false;
             }
             rpc(
                 &discovery,
@@ -890,6 +905,7 @@ mod tests {
             "--auto-rescue",
             "--auto-reallocate-envelopes",
             "--auto-persist-envelopes",
+            "--auto-reallocate-cross-department",
         ])
         .unwrap();
         match cli.command {
@@ -905,6 +921,8 @@ mod tests {
                 no_auto_reallocate_envelopes,
                 auto_persist_envelopes,
                 no_auto_persist_envelopes,
+                auto_reallocate_cross_department,
+                no_auto_reallocate_cross_department,
             } => {
                 assert_eq!(project, "proj-1");
                 assert_eq!(profile.as_deref(), Some("fast"));
@@ -917,6 +935,8 @@ mod tests {
                 assert!(!no_auto_reallocate_envelopes);
                 assert!(auto_persist_envelopes);
                 assert!(!no_auto_persist_envelopes);
+                assert!(auto_reallocate_cross_department);
+                assert!(!no_auto_reallocate_cross_department);
             }
             other => panic!("expected project-run-policy-set, got {other:?}"),
         }

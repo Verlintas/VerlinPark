@@ -574,6 +574,7 @@ struct ProjectRunPolicyCard: View {
             policyMetric("Auto rescue", policy.autoRescueLabel)
             policyMetric("Auto envelopes", policy.autoReallocateLabel)
             policyMetric("Auto persist", policy.autoPersistLabel)
+            policyMetric("Cross-dept", policy.autoCrossDepartmentLabel)
         }
     }
 
@@ -849,6 +850,18 @@ struct ProjectRunPolicySheet: View {
             .controlSize(.small)
             Text(
                 "Explicit project opt-in. Still-valid recorded runtime envelopes are written into one plan revision before the next run. This records budgets the runtime already allowed; it does not create capacity, change a task status, or bypass approvals, Verifier, or Integrator. A failed persist never blocks the run. Off by default."
+            )
+            .font(VPTheme.mono(7))
+            .foregroundStyle(VPTheme.textTertiary)
+            .fixedSize(horizontal: false, vertical: true)
+            Toggle(
+                "Allow reallocation sources from other departments",
+                isOn: valueBinding(\.autoReallocateCrossDepartment)
+            )
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            Text(
+                "Only meaningful when runtime envelope reallocation is enabled. Completed tasks in other departments may provide unused token/cost capacity, but the target department, session, and project caps still bound what is applied. Off by default."
             )
             .font(VPTheme.mono(7))
             .foregroundStyle(VPTheme.textTertiary)

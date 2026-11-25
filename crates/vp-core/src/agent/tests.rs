@@ -4899,6 +4899,57 @@ async fn plan_resume_auto_persists_recorded_envelopes_before_starting() {
 }
 
 #[tokio::test]
+async fn deferred_intake_dispatch_reports_not_started_and_retries() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::new()),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    engine
+        .set_critical_path_policy(
+            &project.id,
+            &CriticalPathPolicy {
+                enabled: true,
+                min_task_budget: 5_000,
+                ..CriticalPathPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+    let task = engine
+        .create_intake_task(vp_protocol::types::IntakeCreateParams {
+            project_id: project.id.clone(),
+            title: "Deferred intake".into(),
+            instructions: "Do not report this as started.".into(),
+            profile: Some("coding".into()),
+            kind: Some("coding".into()),
+            priority: Some(0),
+            write_scope: vec!["src/deferred.txt".into()],
+            acceptance: vec!["done".into()],
+            deps: Vec::new(),
+            token_budget: Some(1_000),
+            cost_budget_usd: None,
+            time_budget_secs: None,
+            max_attempts: Some(2),
+            labels: Vec::new(),
+            origin: Some("test".into()),
+        })
+        .await
+        .unwrap();
+    let dispatched = service.dispatch_intake_task(&task.id).await.unwrap();
+    assert!(
+        !dispatched.started,
+        "a governor deferral must not be reported as started"
+    );
+    assert!(dispatched.task.next_attempt_at.is_some());
+    if let Some(session_id) = dispatched.session_id.as_deref()
+        && let Some(session) = engine.store().get_session(session_id).unwrap()
+    {
+        assert_eq!(session.status, "cancelled");
+    }
+}
+
+#[tokio::test]
 async fn task_cancel_during_verification_does_not_merge_or_complete() {
     let dir = TempDir::new().unwrap();
     let engine_slot = Arc::new(Mutex::new(None::<Engine>));
@@ -17184,6 +17235,88 @@ async fn program_start_fails_before_claim_without_a_provider() {
     );
     assert_eq!(stored.attempts, 0);
     assert!(stored.session_id.is_none());
+}
+
+#[tokio::test]
+async fn program_dispatch_deferral_fails_start_instead_of_leaving_running() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::new()),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    engine
+        .set_critical_path_policy(
+            &project.id,
+            &CriticalPathPolicy {
+                enabled: true,
+                min_task_budget: 5_000,
+                ..CriticalPathPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+    let program = engine
+        .create_program(vp_protocol::types::ProgramCreateParams {
+            project_id: project.id.clone(),
+            goal: "deferred program".into(),
+            policy: Some(vp_protocol::types::ProgramPolicy {
+                auto_dispatch: true,
+                max_attempts: 2,
+                retry_backoff_secs: 60,
+                dependency_failure: vp_protocol::types::DependencyFailurePolicy::Block,
+                token_budget: None,
+                cost_budget_usd: None,
+                max_parallel_milestones: 1,
+            }),
+            token_budget: None,
+            cost_budget_usd: None,
+            activate: true,
+        })
+        .await
+        .unwrap();
+    let milestone = engine
+        .create_program_milestone(vp_protocol::types::ProgramMilestoneCreateParams {
+            program_id: program.id.clone(),
+            key: Some("1".into()),
+            title: "Deferred milestone".into(),
+            objective: "Do not pretend this run started".into(),
+            acceptance: vec!["done".into()],
+            deps: Vec::new(),
+            priority: Some(0),
+            max_attempts: Some(2),
+            profile: Some("coding".into()),
+            write_scope: Vec::new(),
+            token_budget: Some(1_000),
+            cost_budget_usd: None,
+        })
+        .await
+        .unwrap();
+    let started = service
+        .start_program_milestone(&milestone.id)
+        .await
+        .unwrap();
+    assert_ne!(
+        started.status,
+        vp_protocol::types::ProgramMilestoneStatus::Running,
+        "a deferred dispatch must not remain Running: {started:?}"
+    );
+    if let Some(session_id) = started.session_id.as_deref()
+        && let Some(session) = engine.store().get_session(session_id).unwrap()
+    {
+        assert_eq!(session.status, "cancelled");
+        let events = engine
+            .list_events(session.id.clone(), 0, 200)
+            .await
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "program.milestone.dispatch_deferred"),
+            "deferral must be recorded: {events:?}"
+        );
+    } else {
+        panic!("deferred start must still report its cancelled session");
+    }
 }
 
 #[test]

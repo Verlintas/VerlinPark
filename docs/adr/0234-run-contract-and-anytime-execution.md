@@ -223,7 +223,9 @@ The R3/R4 slice is read-only/advisory except for two explicit project opt-ins:
   rather than leaving the reserve released.
 - `ProjectRunPolicy.auto_reallocate_envelopes` (default off) lets a
   Worker/Labour run use a runtime-only effective task budget built from unused
-  token/cost capacity of already-completed tasks in the same department.
+  token/cost capacity of already-completed tasks in the same department;
+  `auto_reallocate_cross_department` additionally enables other-department
+  sources, with the target department cap still bounding the applied amount.
   Sources are consumed independently per token/cost dimension; only capacity
   that actually fits under the department cap is taken and recorded. A target's
   prior event replays idempotently, a completed target can become a source
@@ -267,11 +269,11 @@ The R3/R4 slice is read-only/advisory except for two explicit project opt-ins:
   only when visible or explicitly refreshed and reject a response for a
   different session.
 
-Limits: automatic reallocation with reservation semantics, cross-department/
-session pooling, and the daily attention schedule remain open. Explicit
+Limits: automatic reallocation with reservation semantics, cross-session
+project pooling, and the daily attention schedule remain open. Explicit
 one-task and opt-in pre-run persistence record existing overlays; they do not
-make R3b an automatic reallocation controller, and it remains a one-department
-overlay rather than a cross-department/session budget pool. It scans the newest
+make R3b an automatic reallocation controller. Cross-department sources are
+opt-in but do not pool session/project capacity across hosts. It scans the newest
 1,000 reallocation events, so source single-use memory can be forgotten after
 very heavy plan revision (hard department/session/project caps still bound
 actual spend). Envelope serialization is per-session and same-daemon, not

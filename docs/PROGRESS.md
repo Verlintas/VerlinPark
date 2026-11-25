@@ -105,8 +105,9 @@ Verifier 或 Integrator。
   无关 sibling 一起 settle，session-scope budget stop 仍会；completion
   reserve 以 effective budget 计算，Auto 交给 Auto controller；plan revision
   删除后重新加入的 task 从新 projection 开始，不继承旧 failed/cancelled；
-  landed program session 仍可完成已验证的 milestone；cancelled intake 的
-  manual Run now 会先 reset 再 claim；auto pause 现在先写
+  landed program session 仍可完成已验证的 milestone；program/intake dispatch
+  被 governor defer 时不再假装 started，会取消空 session 并按策略重试；
+  cancelled intake 的 manual Run now 会先 reset 再 claim；auto pause 现在先写
   `session.auto_paused` event，再发布 paused projection，避免 drop/cancel
   时留下无 event 的 paused session。budget top-up 与
   `effect.reconcile` 仍要求对已 settled blocked 的 task 显式 retry。
@@ -119,8 +120,9 @@ Verifier 或 Integrator。
   estimated`，以及 CURRENT 不会同时出现 RECOMMENDED；policy editor 也显示 `AUTO ENVELOPES ON` 并保存两个 opt-in；daemon 返回
   `auto_rescue=true` 和 `auto_reallocate_envelopes=true`。
 - 明确未完成：automatic reallocation with reservation semantics（显式单
-  task + opt-in pre-run auto-persist 已实现）、跨 department/session 的
-  budget pooling、reservation 重分配、daily attention schedule、更完整的
+  task + opt-in pre-run auto-persist + opt-in cross-department source 已实现）、
+  跨 session/project 的 budget pooling、reservation 重分配、daily attention
+  schedule、更完整的
   anytime UI、learned estimates/confidence。R3b 是 event-derived runtime
   overlay，不是 TeamPlan 重写；自动 rescue 与 envelope 串行化是 same-daemon，
   跨 host 不成立；project RunPolicy 保存仍是整包 read-modify-write，没有
@@ -149,7 +151,7 @@ Verifier 或 Integrator。
   前产生 `session.envelope.reallocated`，runtime reallocation 仍以单元/daemon
   测试为证据。
 - 测试：targeted allocation/tradeoff/rescue/envelope-persist/protocol/CLI/
-  daemon + full workspace **4,676 passed / 0 failed / 6 ignored**；Swift
+  daemon + full workspace **4,679 passed / 0 failed / 6 ignored**；Swift
   **659 passed（527 app + 132 helper）**；`cargo fmt --check`、
   `cargo clippy --workspace --all-targets -- -D warnings`、`swiftformat --lint`
   和 `xcodebuild test` 通过。临时 daemon CLI smoke 覆盖 `project-run-policy-set`

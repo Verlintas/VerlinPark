@@ -2344,6 +2344,12 @@ pub(crate) enum Command {
         /// Disable automatic runtime-envelope persistence.
         #[arg(long, conflicts_with = "auto_persist_envelopes")]
         no_auto_persist_envelopes: bool,
+        /// Allow reallocation sources from other departments.
+        #[arg(long, conflicts_with = "no_auto_reallocate_cross_department")]
+        auto_reallocate_cross_department: bool,
+        /// Restrict reallocation sources to the target department.
+        #[arg(long, conflicts_with = "auto_reallocate_cross_department")]
+        no_auto_reallocate_cross_department: bool,
     },
     /// Enable or disable unlimited budget mode for a session.
     SessionUnlimited {

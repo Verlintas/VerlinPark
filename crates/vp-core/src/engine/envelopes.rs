@@ -386,7 +386,11 @@ impl Engine {
         let mut sources = Vec::new();
         let mut source_ids = Vec::new();
         for candidate in &plan.tasks {
-            if candidate.id == task_id || candidate.department != target.department {
+            if candidate.id == task_id {
+                continue;
+            }
+            if !policy.auto_reallocate_cross_department && candidate.department != target.department
+            {
                 continue;
             }
             if statuses.get(&candidate.id).map(String::as_str) != Some("completed") {
@@ -762,6 +766,24 @@ mod tests {
                 project_id: project_id.to_string(),
                 policy: ProjectRunPolicy {
                     auto_persist_envelopes: enabled,
+                    ..current
+                },
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn set_cross_department(engine: &Engine, project_id: &str, enabled: bool) {
+        let current = engine
+            .get_project_run_policy(project_id)
+            .await
+            .unwrap()
+            .policy;
+        engine
+            .set_project_run_policy(SetProjectRunPolicyParams {
+                project_id: project_id.to_string(),
+                policy: ProjectRunPolicy {
+                    auto_reallocate_cross_department: enabled,
                     ..current
                 },
             })
@@ -1328,6 +1350,42 @@ mod tests {
             Some(7_000)
         );
         assert_eq!(event_count(&engine, &session.id).await, 2);
+    }
+
+    #[tokio::test]
+    async fn cross_department_sources_are_opt_in() {
+        let plan = plan(
+            vec![department("a", None, None), department("b", None, None)],
+            vec![
+                task("T1", "a", Some(5_000), None),
+                task("T2", "b", Some(1_000), None),
+            ],
+        );
+        let (_data, _repo, engine, session) = setup(&plan, true).await;
+        complete_task(&engine, &session.id, "T1");
+        assert!(
+            engine
+                .effective_plan_for_budget(&session, &plan, "T2")
+                .await
+                .unwrap()
+                .is_none(),
+            "same-department sources are the default"
+        );
+        set_cross_department(&engine, &session.project_id, true).await;
+        let cross = engine
+            .effective_plan_for_budget(&session, &plan, "T2")
+            .await
+            .unwrap()
+            .expect("cross-department source");
+        assert_eq!(
+            cross
+                .tasks
+                .iter()
+                .find(|task| task.id == "T2")
+                .unwrap()
+                .token_budget,
+            Some(6_000)
+        );
     }
 
     #[tokio::test]

@@ -158,38 +158,74 @@ impl AgentService {
                 .await;
             return Err(error);
         }
-        if let Err(error) = self.resume_plan(&session.id).await {
-            let next = self.intake_retry_at(&claimed).await;
-            let _ = self
-                .engine
-                .update_session_status(&session.id, "failed")
-                .await;
-            let _ = self
-                .engine
-                .append_event(
-                    &session.id,
-                    "intake.dispatch_failed",
-                    serde_json::json!({
-                        "intake_task_id": claimed.id,
-                        "error": format!("{error:#}"),
-                    }),
-                )
-                .await;
-            let updated = self
-                .engine
-                .settle_intake_task(
-                    claimed.id.clone(),
-                    "failed".to_string(),
-                    None,
-                    Some(format!("could not start the task run: {error:#}")),
-                    next,
-                )
-                .await?;
-            return Ok(IntakeDispatchResult {
-                started: false,
-                task: updated.unwrap_or(claimed),
-                session_id: Some(session.id),
-            });
+        match self.resume_plan(&session.id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                let next = self.intake_retry_at(&claimed).await;
+                let _ = self
+                    .engine
+                    .update_session_status(&session.id, "cancelled")
+                    .await;
+                let _ = self
+                    .engine
+                    .append_event(
+                        &session.id,
+                        "intake.dispatch_deferred",
+                        serde_json::json!({
+                            "intake_task_id": claimed.id,
+                            "reason": "resource_governor",
+                        }),
+                    )
+                    .await;
+                let updated = self
+                    .engine
+                    .settle_intake_task(
+                        claimed.id.clone(),
+                        "failed".to_string(),
+                        None,
+                        Some("intake dispatch was deferred by the resource governor".to_string()),
+                        next,
+                    )
+                    .await?;
+                return Ok(IntakeDispatchResult {
+                    started: false,
+                    task: updated.unwrap_or(claimed),
+                    session_id: Some(session.id),
+                });
+            }
+            Err(error) => {
+                let next = self.intake_retry_at(&claimed).await;
+                let _ = self
+                    .engine
+                    .update_session_status(&session.id, "failed")
+                    .await;
+                let _ = self
+                    .engine
+                    .append_event(
+                        &session.id,
+                        "intake.dispatch_failed",
+                        serde_json::json!({
+                            "intake_task_id": claimed.id,
+                            "error": format!("{error:#}"),
+                        }),
+                    )
+                    .await;
+                let updated = self
+                    .engine
+                    .settle_intake_task(
+                        claimed.id.clone(),
+                        "failed".to_string(),
+                        None,
+                        Some(format!("could not start the task run: {error:#}")),
+                        next,
+                    )
+                    .await?;
+                return Ok(IntakeDispatchResult {
+                    started: false,
+                    task: updated.unwrap_or(claimed),
+                    session_id: Some(session.id),
+                });
+            }
         }
         let updated = self.engine.get_intake_task(claimed.id.clone()).await?;
         Ok(IntakeDispatchResult {

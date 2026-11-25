@@ -853,6 +853,8 @@ struct ProjectRunPolicyView: Codable, Sendable, Equatable {
     /// Opt-in pre-run persistence of recorded runtime envelopes into a plan
     /// revision. It records already-effective budgets only.
     let autoPersistEnvelopes: Bool
+    /// Opt-in cross-department sources for the runtime envelope overlay.
+    let autoReallocateCrossDepartment: Bool
 
     enum CodingKeys: String, CodingKey {
         case defaultProfile = "default_profile"
@@ -862,6 +864,7 @@ struct ProjectRunPolicyView: Codable, Sendable, Equatable {
         case autoRescue = "auto_rescue"
         case autoReallocateEnvelopes = "auto_reallocate_envelopes"
         case autoPersistEnvelopes = "auto_persist_envelopes"
+        case autoReallocateCrossDepartment = "auto_reallocate_cross_department"
     }
 
     init(
@@ -871,7 +874,8 @@ struct ProjectRunPolicyView: Codable, Sendable, Equatable {
         stopPolicy: RunStopPolicyView = .standard,
         autoRescue: Bool = false,
         autoReallocateEnvelopes: Bool = false,
-        autoPersistEnvelopes: Bool = false
+        autoPersistEnvelopes: Bool = false,
+        autoReallocateCrossDepartment: Bool = false
     ) {
         self.defaultProfile = defaultProfile
         self.completionReserveRatio = completionReserveRatio
@@ -880,6 +884,7 @@ struct ProjectRunPolicyView: Codable, Sendable, Equatable {
         self.autoRescue = autoRescue
         self.autoReallocateEnvelopes = autoReallocateEnvelopes
         self.autoPersistEnvelopes = autoPersistEnvelopes
+        self.autoReallocateCrossDepartment = autoReallocateCrossDepartment
     }
 
     init(from decoder: Decoder) throws {
@@ -898,6 +903,8 @@ struct ProjectRunPolicyView: Codable, Sendable, Equatable {
             try container.decodeIfPresent(Bool.self, forKey: .autoReallocateEnvelopes) ?? false
         autoPersistEnvelopes =
             try container.decodeIfPresent(Bool.self, forKey: .autoPersistEnvelopes) ?? false
+        autoReallocateCrossDepartment =
+            try container.decodeIfPresent(Bool.self, forKey: .autoReallocateCrossDepartment) ?? false
     }
 
     var profileTitle: String {
@@ -977,6 +984,22 @@ struct ProjectRunPolicyView: Codable, Sendable, Equatable {
         On · before the next plan run, still-valid recorded runtime envelopes are written into \
         one plan revision. This records budgets the runtime already allowed; it does not create \
         capacity, change a task status, or bypass approvals/Verifier/Integrator.
+        """
+    }
+
+    var autoCrossDepartmentLabel: String {
+        autoReallocateCrossDepartment ? "On" : "Off"
+    }
+
+    /// Cross-department sources still cannot exceed the target department cap.
+    var autoCrossDepartmentDetail: String {
+        guard autoReallocateCrossDepartment else {
+            return "Off · reallocation sources stay in the target task's department."
+        }
+        return """
+        On · completed tasks in other departments may provide unused token/cost capacity. The \
+        target department, session, and project caps still bound what is applied; approvals, \
+        Verifier, and Integrator still apply.
         """
     }
 
@@ -1074,6 +1097,7 @@ struct ProjectRunPolicyDraft: Equatable, Sendable {
     var autoRescue = false
     var autoReallocateEnvelopes = false
     var autoPersistEnvelopes = false
+    var autoReallocateCrossDepartment = false
 
     init() {}
 
@@ -1088,6 +1112,7 @@ struct ProjectRunPolicyDraft: Equatable, Sendable {
         autoRescue = policy.autoRescue
         autoReallocateEnvelopes = policy.autoReallocateEnvelopes
         autoPersistEnvelopes = policy.autoPersistEnvelopes
+        autoReallocateCrossDepartment = policy.autoReallocateCrossDepartment
     }
 
     var validationIssue: BudgetValidationIssue? {
@@ -1146,7 +1171,8 @@ struct ProjectRunPolicyDraft: Equatable, Sendable {
             ),
             autoRescue: autoRescue,
             autoReallocateEnvelopes: autoReallocateEnvelopes,
-            autoPersistEnvelopes: autoPersistEnvelopes
+            autoPersistEnvelopes: autoPersistEnvelopes,
+            autoReallocateCrossDepartment: autoReallocateCrossDepartment
         )
         try policy.validate()
         return policy

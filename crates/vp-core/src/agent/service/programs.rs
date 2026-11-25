@@ -218,29 +218,62 @@ impl AgentService {
             )?;
             return Err(error);
         }
-        if let Err(error) = self.resume_plan(&session.id).await {
-            let _ = self
-                .engine
-                .update_session_status(&session.id, "failed")
-                .await;
-            let _ = self
-                .engine
-                .append_event(
-                    &session.id,
-                    "program.milestone.dispatch_failed",
-                    serde_json::json!({
-                        "program_id": program.id,
-                        "milestone_id": milestone.id,
-                        "error": format!("{error:#}"),
-                    }),
-                )
-                .await;
-            controller.fail_start(
-                &program,
-                &milestone,
-                &format!("could not start the milestone run: {error:#}"),
-            )?;
-            return Err(error);
+        match self.resume_plan(&session.id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = self
+                    .engine
+                    .update_session_status(&session.id, "cancelled")
+                    .await;
+                let _ = self
+                    .engine
+                    .append_event(
+                        &session.id,
+                        "program.milestone.dispatch_deferred",
+                        serde_json::json!({
+                            "program_id": program.id,
+                            "milestone_id": milestone.id,
+                            "reason": "resource_governor",
+                        }),
+                    )
+                    .await;
+                controller.fail_start(
+                    &program,
+                    &milestone,
+                    "milestone dispatch was deferred by the resource governor",
+                )?;
+                let store = self.engine.store().clone();
+                let milestone_id = milestone.id.clone();
+                return Ok(tokio::task::spawn_blocking(move || {
+                    store.get_program_milestone(&milestone_id)
+                })
+                .await??
+                .unwrap_or(milestone));
+            }
+            Err(error) => {
+                let _ = self
+                    .engine
+                    .update_session_status(&session.id, "failed")
+                    .await;
+                let _ = self
+                    .engine
+                    .append_event(
+                        &session.id,
+                        "program.milestone.dispatch_failed",
+                        serde_json::json!({
+                            "program_id": program.id,
+                            "milestone_id": milestone.id,
+                            "error": format!("{error:#}"),
+                        }),
+                    )
+                    .await;
+                controller.fail_start(
+                    &program,
+                    &milestone,
+                    &format!("could not start the milestone run: {error:#}"),
+                )?;
+                return Err(error);
+            }
         }
         let store = self.engine.store().clone();
         let milestone_id = milestone.id.clone();

@@ -1786,6 +1786,7 @@ mod tests {
             auto_rescue: false,
             auto_reallocate_envelopes: false,
             auto_persist_envelopes: false,
+            auto_reallocate_cross_department: false,
         };
         let saved = engine
             .set_project_run_policy(SetProjectRunPolicyParams {

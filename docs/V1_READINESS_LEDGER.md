@@ -263,7 +263,9 @@ is quiescent.
   event replays idempotently, a completed target can become a source with its
   effective budget, and a per-target plan fingerprint over the target task and its
   department budgets invalidates an old override instead of widening the new
-  plan; unrelated task edits do not. The stored
+  plan; unrelated task edits do not. `auto_reallocate_cross_department`
+  (default off) additionally lets completed tasks in other departments supply
+  capacity, but the target department cap still bounds what is applied. The stored
   TeamPlan and every department, session, and project cap are unchanged;
   Verifier/Scout see the recorded read-only overlay but are not bound by the
   implementation task envelope (they keep department/session/project caps and
@@ -320,7 +322,7 @@ is quiescent.
   (unit/daemon tests cover both paths).
 - Tests: targeted allocation, trade-off, auto-rescue, envelope-persist,
   protocol, CLI, and daemon tests; full workspace
-  **4,676 passed / 0 failed / 6 ignored**;
+  **4,679 passed / 0 failed / 6 ignored**;
   Swift **659 passed (527 app + 132 helper)**; fmt, clippy,
   SwiftFormat, and `xcodebuild test` pass.
 - Live DeepSeek evidence (2026-11-25): the explicit smoke passed with
@@ -358,14 +360,16 @@ is quiescent.
   task, so an older failed attempt does not permanently block a successful
   retry. Auto pause now writes `session.auto_paused` before the paused status
   projection, so a dropped or cancelled run cannot leave a paused session
-  without its event. A second
+  without its event. Program and intake dispatches that the governor defers
+  now report not-started, cancel the empty session, and retry instead of
+  leaving a Running milestone or a fake started intake. A second
   attempt with 80k/80k budgets completed T1 and started the Verifier, but the
   session hit its 900s wall-clock budget before T2; 24 calls, 317,308 input /
   7,367 output / 87.66% cache hit, T1 completed, T2 blocked. No
   `session.envelope.reallocated` event was emitted before the deadline; the
   runtime reallocation path remains unit/daemon-tested rather than live-proven.
 - Limits: automatic reallocation with reservation semantics,
-  cross-department/session pooling, reservation redistribution, and the daily
+  cross-session/project pooling, reservation redistribution, and the daily
   attention schedule remain open. Explicit one-task and opt-in pre-run
   auto-persistence record existing overlays, but R3b remains an event-derived
   runtime overlay by default, not an automatic reallocation controller; it

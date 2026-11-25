@@ -311,6 +311,18 @@ fn project_run_policy_lines(value: &Value, policy: &Value) -> Vec<String> {
             }
         ),
         format!(
+            "  cross-dept reallocation {} (sources outside the target department; target caps still bound)",
+            if policy
+                .get("auto_reallocate_cross_department")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        ),
+        format!(
             "  stop        no-progress {} turn(s) · evidence {} · partial delivery {}",
             stop["no_progress_turns"].as_u64().unwrap_or(6),
             if stop
